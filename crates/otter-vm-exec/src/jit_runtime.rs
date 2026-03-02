@@ -456,7 +456,7 @@ fn run_background_worker(
         let compile_result = compiler
             .as_mut()
             .expect("jit compiler should be initialized")
-            .compile_function_with_constants_and_metadata(&request.function, &request.constants);
+            .compile_function_with_inlining(&request.function, &request.constants, &request.module_functions);
 
         match compile_result {
             Ok((artifact, deopt_metadata)) => {
@@ -549,7 +549,7 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
         .expect("jit compiler should be initialized");
 
     match compiler
-        .compile_function_with_constants_and_metadata(&request.function, &request.constants)
+        .compile_function_with_inlining(&request.function, &request.constants, &request.module_functions)
     {
         Ok((artifact, deopt_metadata)) => {
             let code_ptr = artifact.code_ptr as usize;

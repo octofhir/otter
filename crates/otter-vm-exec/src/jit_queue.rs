@@ -4,12 +4,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use otter_vm_bytecode::{Constant, Function, Module};
 use otter_vm_jit::translator::can_translate_function_with_helpers;
 
+/// Maximum instruction count for a function to be eligible for inlining.
+const INLINE_BUDGET: usize = 32;
+
 #[derive(Debug, Clone)]
 pub(crate) struct JitCompileRequest {
     pub(crate) module_id: u64,
     pub(crate) function_index: u32,
     pub(crate) constants: Vec<Constant>,
     pub(crate) function: Function,
+    /// Small eligible functions from the same module available for inlining.
+    /// Each entry is (function_index, Function).
+    pub(crate) module_functions: Vec<(u32, Function)>,
 }
 
 #[derive(Default)]
@@ -49,11 +55,42 @@ pub fn enqueue_hot_function(
         return false;
     }
 
+    // Collect small, inline-eligible functions from the same module.
+    let mut module_functions = Vec::new();
+    for (idx, func) in module.functions.iter().enumerate() {
+        let idx = idx as u32;
+        if idx == function_index {
+            continue; // Don't self-inline
+        }
+        let instrs = func.instructions.read();
+        if instrs.len() > INLINE_BUDGET {
+            continue;
+        }
+        if func.flags.is_async
+            || func.flags.is_generator
+            || func.flags.has_rest
+            || func.flags.uses_eval
+            || func.flags.uses_arguments
+            || !func.upvalues.is_empty()
+        {
+            continue;
+        }
+        // Check that the callee doesn't use LoadThis (this-binding differs when inlined)
+        let has_load_this = instrs.iter().any(|inst| {
+            matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. })
+        });
+        if has_load_this {
+            continue;
+        }
+        module_functions.push((idx, func.clone()));
+    }
+
     state.pending.push_back(JitCompileRequest {
         module_id: key.0,
         function_index,
         constants,
         function: function.clone(),
+        module_functions,
     });
 
     true
@@ -172,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_enqueue_functions_with_yield_bailout_stub_opcode() {
+    fn enqueues_functions_with_yield_opcode() {
         let _guard = crate::test_lock();
         clear_for_tests();
 
@@ -182,16 +219,16 @@ mod tests {
             .expect("test module should expose entry function");
 
         assert!(
-            !enqueue_hot_function(&module, 0, function),
-            "yield/await bailout stubs should not pass JIT eligibility"
+            enqueue_hot_function(&module, 0, function),
+            "functions with Yield opcode should be eligible for JIT (bail-on-yield)"
         );
-        assert_eq!(pending_count(), 0);
+        assert_eq!(pending_count(), 1);
 
         clear_for_tests();
     }
 
     #[test]
-    fn does_not_enqueue_async_or_generator_functions() {
+    fn does_not_enqueue_async_functions() {
         let _guard = crate::test_lock();
         clear_for_tests();
 
@@ -204,16 +241,25 @@ mod tests {
             "async functions must remain non-eligible for baseline JIT"
         );
 
+        assert_eq!(pending_count(), 0);
+        clear_for_tests();
+    }
+
+    #[test]
+    fn enqueues_generator_functions() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
         let generator_module = build_generator_flagged_module();
         let generator_function = generator_module
             .function(0)
             .expect("test module should expose entry function");
         assert!(
-            !enqueue_hot_function(&generator_module, 0, generator_function),
-            "generator functions must remain non-eligible for baseline JIT"
+            enqueue_hot_function(&generator_module, 0, generator_function),
+            "generator functions should be eligible for JIT (bail-on-yield)"
         );
 
-        assert_eq!(pending_count(), 0);
+        assert_eq!(pending_count(), 1);
         clear_for_tests();
     }
 }

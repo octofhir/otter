@@ -81,12 +81,17 @@ pub struct JitContext {
     pub deopt_regs_ptr: *mut i64,
     /// Number of register slots in the deopt buffer.
     pub deopt_regs_count: u32,
+    /// OSR entry PC.  `-1` = normal entry (start from PC 0).
+    /// `>= 0` = on-stack replacement: load locals/regs from deopt buffers
+    /// and jump directly to the loop header at this bytecode PC.
+    pub osr_entry_pc: i64,
 }
 
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
     JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+    JIT_CTX_OSR_ENTRY_PC_OFFSET,
 };
 const _: () = {
     assert!(
@@ -121,6 +126,10 @@ const _: () = {
         std::mem::offset_of!(JitContext, deopt_regs_count) as i32
             == JIT_CTX_DEOPT_REGS_COUNT_OFFSET,
         "JitContext::deopt_regs_count offset changed — update JIT_CTX_DEOPT_REGS_COUNT_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, osr_entry_pc) as i32 == JIT_CTX_OSR_ENTRY_PC_OFFSET,
+        "JitContext::osr_entry_pc offset changed — update JIT_CTX_OSR_ENTRY_PC_OFFSET in runtime_helpers.rs"
     );
 };
 
@@ -503,6 +512,7 @@ extern "C" fn otter_rt_call_function(
                         ctx.vm_ctx,
                         &closure.module.constants as *const _,
                         &closure.upvalues,
+                        None,
                     ) {
                         crate::jit_runtime::JitCallResult::Ok(value) => {
                             return value.to_jit_bits();

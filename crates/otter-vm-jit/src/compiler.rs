@@ -210,6 +210,19 @@ impl JitCompiler {
         function: &Function,
         constants: &[Constant],
     ) -> Result<(JitCompileArtifact, DeoptMetadata), JitError> {
+        self.compile_function_with_inlining(function, constants, &[])
+    }
+
+    /// Compile a bytecode function with inlining candidates from the same module.
+    ///
+    /// `module_functions` contains `(function_index, Function)` pairs for small
+    /// functions eligible for inlining at call sites.
+    pub fn compile_function_with_inlining(
+        &mut self,
+        function: &Function,
+        constants: &[Constant],
+        module_functions: &[(u32, Function)],
+    ) -> Result<(JitCompileArtifact, DeoptMetadata), JitError> {
         let mut signature = self.module.make_signature();
         // Signature: (ctx: I64, args_ptr: I64, argc: I32) -> I64
         signature.params.push(AbiParam::new(types::I64)); // ctx pointer
@@ -246,6 +259,7 @@ impl JitCompiler {
                 function,
                 constants,
                 helper_refs.as_ref(),
+                module_functions,
             )?;
             builder.finalize();
         }

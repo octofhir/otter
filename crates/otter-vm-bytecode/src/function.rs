@@ -705,14 +705,14 @@ impl Function {
         let prev = self.back_edge_count.fetch_add(1, Ordering::Relaxed);
         let new_count = prev.saturating_add(1);
 
-        if new_count >= threshold && prev < threshold {
-            if self
+        if new_count >= threshold
+            && prev < threshold
+            && self
                 .is_hot
                 .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
-            {
-                return true;
-            }
+        {
+            return true;
         }
         false
     }

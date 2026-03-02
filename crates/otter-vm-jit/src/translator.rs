@@ -17,9 +17,11 @@ use otter_vm_bytecode::{Constant, Function};
 
 use crate::JitError;
 use crate::bailout::{BAILOUT_SENTINEL, BailoutReason};
+use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
     JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+    JIT_CTX_OSR_ENTRY_PC_OFFSET,
 };
 use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
 use otter_vm_bytecode::function::InlineCacheState;
@@ -42,6 +44,178 @@ fn unsupported(pc: usize, instruction: &Instruction) -> JitError {
     JitError::UnsupportedInstruction {
         pc,
         opcode: opcode.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static callee resolution for function inlining
+// ---------------------------------------------------------------------------
+
+/// A statically resolved inline candidate.
+struct InlineCandidate<'a> {
+    /// The function to inline.
+    callee: &'a Function,
+    /// The function index in the module (for diagnostics).
+    #[allow(dead_code)]
+    function_index: u32,
+}
+
+/// Resolve which Call instructions have statically known callees eligible for inlining.
+///
+/// Tracks `Closure` → `SetLocal` → `GetLocal` → `Call` patterns to identify
+/// which register holds which function index at each Call site.
+fn resolve_inline_candidates<'a>(
+    instructions: &[Instruction],
+    module_functions: &'a [(u32, Function)],
+) -> std::collections::HashMap<usize, InlineCandidate<'a>> {
+    if module_functions.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    // Build index: function_index → &Function
+    let func_by_index: std::collections::HashMap<u32, &Function> = module_functions
+        .iter()
+        .map(|(idx, func)| (*idx, func))
+        .collect();
+
+    // Track which registers and locals hold known function indices.
+    // reg_func[reg] = Some(function_index) if the register holds a known closure.
+    // local_func[local] = Some(function_index) if the local holds a known closure.
+    let mut reg_func: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+    let mut local_func: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+    let mut result: std::collections::HashMap<usize, InlineCandidate<'a>> =
+        std::collections::HashMap::new();
+
+    for (pc, instruction) in instructions.iter().enumerate() {
+        match instruction {
+            // Closure loads a known function into a register
+            Instruction::Closure { dst, func } => {
+                reg_func.insert(dst.0, func.0);
+            }
+            // SetLocal: propagate function index from register to local
+            Instruction::SetLocal { idx, src } => {
+                if let Some(&func_idx) = reg_func.get(&src.0) {
+                    local_func.insert(idx.index(), func_idx);
+                } else {
+                    // Local now holds unknown value
+                    local_func.remove(&idx.index());
+                }
+            }
+            // GetLocal: propagate function index from local to register
+            Instruction::GetLocal { dst, idx } => {
+                if let Some(&func_idx) = local_func.get(&idx.index()) {
+                    reg_func.insert(dst.0, func_idx);
+                } else {
+                    reg_func.remove(&dst.0);
+                }
+            }
+            // Move: propagate register tracking
+            Instruction::Move { dst, src } => {
+                if let Some(&func_idx) = reg_func.get(&src.0) {
+                    reg_func.insert(dst.0, func_idx);
+                } else {
+                    reg_func.remove(&dst.0);
+                }
+            }
+            // Call: check if callee register has a known function index
+            Instruction::Call { func, .. } => {
+                if let Some(&func_idx) = reg_func.get(&func.0) {
+                    if let Some(&callee) = func_by_index.get(&func_idx) {
+                        // Verify all callee instructions are JIT-translatable
+                        let callee_instrs = callee.instructions.read();
+                        let all_translatable = callee_instrs.iter().all(|inst| {
+                            is_supported_baseline_opcode(inst)
+                        });
+                        if all_translatable {
+                            result.insert(pc, InlineCandidate {
+                                callee,
+                                function_index: func_idx,
+                            });
+                        }
+                    }
+                }
+            }
+            // Any instruction that writes to a register invalidates tracking
+            _ => {
+                // Clear register tracking for any dst register this instruction writes to
+                if let Some(dst_reg) = instruction_dst_register(instruction) {
+                    reg_func.remove(&dst_reg);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract the destination register index from an instruction, if any.
+fn instruction_dst_register(instruction: &Instruction) -> Option<u16> {
+    match instruction {
+        Instruction::LoadUndefined { dst }
+        | Instruction::LoadNull { dst }
+        | Instruction::LoadTrue { dst }
+        | Instruction::LoadFalse { dst }
+        | Instruction::LoadInt8 { dst, .. }
+        | Instruction::LoadInt32 { dst, .. }
+        | Instruction::LoadConst { dst, .. }
+        | Instruction::GetLocal { dst, .. }
+        | Instruction::GetUpvalue { dst, .. }
+        | Instruction::GetGlobal { dst, .. }
+        | Instruction::LoadThis { dst }
+        | Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::Mod { dst, .. }
+        | Instruction::Neg { dst, .. }
+        | Instruction::Inc { dst, .. }
+        | Instruction::Dec { dst, .. }
+        | Instruction::BitAnd { dst, .. }
+        | Instruction::BitOr { dst, .. }
+        | Instruction::BitXor { dst, .. }
+        | Instruction::BitNot { dst, .. }
+        | Instruction::Shl { dst, .. }
+        | Instruction::Shr { dst, .. }
+        | Instruction::Ushr { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::Eq { dst, .. }
+        | Instruction::Ne { dst, .. }
+        | Instruction::StrictEq { dst, .. }
+        | Instruction::StrictNe { dst, .. }
+        | Instruction::Lt { dst, .. }
+        | Instruction::Le { dst, .. }
+        | Instruction::Gt { dst, .. }
+        | Instruction::Ge { dst, .. }
+        | Instruction::GetPropConst { dst, .. }
+        | Instruction::GetProp { dst, .. }
+        | Instruction::GetElem { dst, .. }
+        | Instruction::GetLocalProp { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::NewObject { dst }
+        | Instruction::NewArray { dst, .. }
+        | Instruction::TypeOf { dst, .. }
+        | Instruction::TypeOfName { dst, .. }
+        | Instruction::Pow { dst, .. }
+        | Instruction::DeleteProp { dst, .. }
+        | Instruction::InstanceOf { dst, .. }
+        | Instruction::In { dst, .. }
+        | Instruction::Dup { dst, .. }
+        | Instruction::AddInt32 { dst, .. }
+        | Instruction::SubInt32 { dst, .. }
+        | Instruction::MulInt32 { dst, .. }
+        | Instruction::DivInt32 { dst, .. }
+        | Instruction::AddNumber { dst, .. }
+        | Instruction::SubNumber { dst, .. }
+        | Instruction::Closure { dst, .. }
+        | Instruction::ToNumber { dst, .. }
+        | Instruction::ToString { dst, .. }
+        | Instruction::Catch { dst }
+        | Instruction::CallWithReceiver { dst, .. }
+        | Instruction::CallMethodComputed { dst, .. }
+        | Instruction::GetPropQuickened { dst, .. } => Some(dst.0),
+        _ => None,
     }
 }
 
@@ -207,6 +381,7 @@ fn is_supported_with_helpers(instruction: &Instruction) -> bool {
                 | Instruction::Export { .. }
                 | Instruction::GetAsyncIterator { .. }
                 | Instruction::ForInNext { .. }
+                | Instruction::Yield { .. }
         )
 }
 
@@ -239,7 +414,6 @@ fn can_translate_impl(function: &Function, constants: &[Constant], has_helpers: 
         || function.flags.uses_arguments
         || function.flags.uses_eval
         || function.flags.is_async
-        || function.flags.is_generator
         || (!has_helpers && !function.upvalues.is_empty())
         || u16::from(function.param_count) > function.local_count
     {
@@ -612,7 +786,7 @@ pub fn translate_function(
     builder: &mut FunctionBuilder<'_>,
     function: &Function,
 ) -> Result<(), JitError> {
-    translate_function_with_constants(builder, function, &[], None)
+    translate_function_with_constants(builder, function, &[], None, &[])
 }
 
 /// Translate a bytecode function into Cranelift IR with constant pool access.
@@ -621,8 +795,11 @@ pub fn translate_function_with_constants(
     function: &Function,
     constants: &[Constant],
     helpers: Option<&HelperRefs>,
+    module_functions: &[(u32, Function)],
 ) -> Result<(), JitError> {
-    let instruction_count = function.instructions.read().len();
+    // Hold a reference to the instructions for the entire function.
+    let instructions_ref = function.instructions.read();
+    let instruction_count = instructions_ref.len();
     if instruction_count == 0 {
         let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
         builder.ins().return_(&[undef]);
@@ -689,9 +866,194 @@ pub fn translate_function_with_constants(
         };
         builder.ins().stack_store(init, local_slots[idx], 0);
     }
-    builder.ins().jump(blocks[0], &[]);
+    // --- Loop versioning: detect qualified loops and create optimized blocks ---
+    let versioned_loops = loop_analysis::detect_loops(&instructions_ref, &feedback_snapshot);
 
-    for (pc, instruction) in function.instructions.read().iter().enumerate() {
+    // For each qualified loop, create:
+    // - A pre-header block (type checks → branch to opt or guard path)
+    // - Optimized blocks for each PC in the loop body (one per instruction)
+    struct VersionedLoop {
+        header_pc: usize,
+        back_edge_pc: usize,
+        pre_header: cranelift_codegen::ir::Block,
+        /// Optimized blocks indexed by (body_pc - header_pc)
+        opt_blocks: Vec<cranelift_codegen::ir::Block>,
+        check_registers: Vec<u16>,
+    }
+
+    let mut versioned: Vec<VersionedLoop> = Vec::new();
+    // Map header_pc → index in `versioned` for redirecting loop entries
+    let mut header_to_preheader: std::collections::HashMap<usize, cranelift_codegen::ir::Block> =
+        std::collections::HashMap::new();
+
+    for info in &versioned_loops {
+        if !info.qualifies {
+            continue;
+        }
+        let pre_header = builder.create_block();
+        let body_len = info.back_edge_pc - info.header_pc + 1;
+        let mut opt_blocks = Vec::with_capacity(body_len);
+        for _ in 0..body_len {
+            opt_blocks.push(builder.create_block());
+        }
+        header_to_preheader.insert(info.header_pc, pre_header);
+        versioned.push(VersionedLoop {
+            header_pc: info.header_pc,
+            back_edge_pc: info.back_edge_pc,
+            pre_header,
+            opt_blocks,
+            check_registers: info.check_registers.clone(),
+        });
+    }
+
+    // Helper: resolve a jump target, redirecting loop headers to pre-headers
+    // when the jump originates from outside the loop.
+    let resolve_target = |source_pc: usize, target_pc: usize| -> cranelift_codegen::ir::Block {
+        if let Some(&pre_header) = header_to_preheader.get(&target_pc) {
+            // Only redirect if the source is outside this loop
+            let is_inside = versioned.iter().any(|vl| {
+                vl.header_pc == target_pc
+                    && source_pc >= vl.header_pc
+                    && source_pc <= vl.back_edge_pc
+            });
+            if !is_inside {
+                return pre_header;
+            }
+        }
+        blocks[target_pc]
+    };
+
+    // --- Function inlining: resolve static call targets ---
+    let inline_sites = resolve_inline_candidates(&instructions_ref, module_functions);
+
+    // --- OSR entry dispatch ---
+    // Collect ALL loop headers as valid OSR targets (not just qualifying ones).
+    // Qualifying loops get routed through pre-headers for type guard checks;
+    // non-qualifying loops jump directly to blocks[header_pc].
+    let osr_loop_headers: Vec<usize> = versioned_loops
+        .iter()
+        .map(|info| info.header_pc)
+        .collect();
+
+    if osr_loop_headers.is_empty() {
+        // No qualifying loops → always normal entry. Skip OSR dispatch entirely
+        // (ctx_ptr may be null in unit tests).
+        builder.ins().jump(blocks[0], &[]);
+    } else {
+        // Read osr_entry_pc from JitContext. If < 0 → normal entry.
+        // If >= 0 → OSR: load locals/regs from deopt buffers and jump to loop header.
+        let osr_pc_val = builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr,
+            JIT_CTX_OSR_ENTRY_PC_OFFSET,
+        );
+        let zero_i64 = builder.ins().iconst(types::I64, 0);
+        let is_normal_entry =
+            builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, osr_pc_val, zero_i64);
+
+        let normal_entry_block = builder.create_block();
+        let osr_entry_block = builder.create_block();
+
+        builder.ins().brif(
+            is_normal_entry,
+            normal_entry_block,
+            &[],
+            osr_entry_block,
+            &[],
+        );
+
+        // Normal entry: jump to blocks[0] as before.
+        builder.switch_to_block(normal_entry_block);
+        builder.ins().jump(blocks[0], &[]);
+
+        // OSR entry: load full frame state from deopt buffers, dispatch to loop header.
+        builder.switch_to_block(osr_entry_block);
+
+        // Load locals from deopt_locals buffer.
+        let locals_ptr = builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr,
+            JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
+        );
+        for i in 0..local_count {
+            let val = builder.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                locals_ptr,
+                (i * 8) as i32,
+            );
+            builder.ins().stack_store(val, local_slots[i], 0);
+        }
+
+        // Load registers from deopt_regs buffer.
+        let regs_ptr = builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr,
+            JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+        );
+        for i in 0..reg_count {
+            let val = builder.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                regs_ptr,
+                (i * 8) as i32,
+            );
+            builder.ins().stack_store(val, reg_slots[i], 0);
+        }
+
+        // Dispatch to the correct loop header via comparisons.
+        // OSR uses resolve_target to go through pre-headers for versioned loops.
+        // Use usize::MAX as a pseudo "outside" source_pc so resolve_target routes
+        // through the pre-header (type guard checks) like any external-to-loop jump.
+        let osr_source_pc = usize::MAX;
+        let mut remaining_headers = &osr_loop_headers[..];
+        while let Some((&header_pc, rest)) = remaining_headers.split_first() {
+            let target_block = resolve_target(osr_source_pc, header_pc);
+            let header_const = builder.ins().iconst(types::I64, header_pc as i64);
+            let is_match = builder.ins().icmp(IntCC::Equal, osr_pc_val, header_const);
+            if rest.is_empty() {
+                // Last header: if match jump there, otherwise bailout.
+                let match_block = builder.create_block();
+                let fallback_block = builder.create_block();
+                builder.ins().brif(
+                    is_match,
+                    match_block,
+                    &[],
+                    fallback_block,
+                    &[],
+                );
+                builder.switch_to_block(match_block);
+                builder.ins().jump(target_block, &[]);
+                builder.switch_to_block(fallback_block);
+                // Invalid OSR target → bailout.
+                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                builder.ins().return_(&[sentinel]);
+            } else {
+                // More headers to check: if match jump, else continue.
+                let match_block = builder.create_block();
+                let next_check = builder.create_block();
+                builder.ins().brif(
+                    is_match,
+                    match_block,
+                    &[],
+                    next_check,
+                    &[],
+                );
+                builder.switch_to_block(match_block);
+                builder.ins().jump(target_block, &[]);
+                builder.switch_to_block(next_check);
+            }
+            remaining_headers = rest;
+        }
+    }
+
+    for pc in 0..instruction_count {
+        let instruction = &instructions_ref[pc];
         builder.switch_to_block(blocks[pc]);
         let emit_bailout_return = |builder: &mut FunctionBuilder<'_>| {
             emit_bailout_return_with_state(
@@ -1175,7 +1537,8 @@ pub fn translate_function_with_constants(
             }
             Instruction::Jump { offset } => {
                 let target = jump_target(pc, offset.offset(), instruction_count)?;
-                builder.ins().jump(blocks[target], &[]);
+                let target_block = resolve_target(pc, target);
+                builder.ins().jump(target_block, &[]);
                 continue;
             }
             Instruction::JumpIfTrue { cond, offset } => {
@@ -1183,15 +1546,17 @@ pub fn translate_function_with_constants(
                 let truthy = type_guards::emit_is_truthy(builder, cond_val);
                 let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
+                let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
+                    let ft_block = resolve_target(pc, fallthrough);
                     builder
                         .ins()
-                        .brif(is_truthy, blocks[jump_to], &[], blocks[fallthrough], &[]);
+                        .brif(is_truthy, jump_block, &[], ft_block, &[]);
                 } else {
                     builder
                         .ins()
-                        .brif(is_truthy, blocks[jump_to], &[], exit, &[]);
+                        .brif(is_truthy, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
@@ -1200,15 +1565,17 @@ pub fn translate_function_with_constants(
                 let truthy = type_guards::emit_is_truthy(builder, cond_val);
                 let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
+                let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
+                    let ft_block = resolve_target(pc, fallthrough);
                     builder
                         .ins()
-                        .brif(is_truthy, blocks[fallthrough], &[], blocks[jump_to], &[]);
+                        .brif(is_truthy, ft_block, &[], jump_block, &[]);
                 } else {
                     builder
                         .ins()
-                        .brif(is_truthy, exit, &[], blocks[jump_to], &[]);
+                        .brif(is_truthy, exit, &[], jump_block, &[]);
                 }
                 continue;
             }
@@ -1216,15 +1583,17 @@ pub fn translate_function_with_constants(
                 let src_val = read_reg(builder, &reg_slots, *src);
                 let is_nullish = type_guards::emit_is_nullish(builder, src_val);
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
+                let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
+                    let ft_block = resolve_target(pc, fallthrough);
                     builder
                         .ins()
-                        .brif(is_nullish, blocks[jump_to], &[], blocks[fallthrough], &[]);
+                        .brif(is_nullish, jump_block, &[], ft_block, &[]);
                 } else {
                     builder
                         .ins()
-                        .brif(is_nullish, blocks[jump_to], &[], exit, &[]);
+                        .brif(is_nullish, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
@@ -1232,15 +1601,17 @@ pub fn translate_function_with_constants(
                 let src_val = read_reg(builder, &reg_slots, *src);
                 let is_nullish = type_guards::emit_is_nullish(builder, src_val);
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
+                let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
+                    let ft_block = resolve_target(pc, fallthrough);
                     builder
                         .ins()
-                        .brif(is_nullish, blocks[fallthrough], &[], blocks[jump_to], &[]);
+                        .brif(is_nullish, ft_block, &[], jump_block, &[]);
                 } else {
                     builder
                         .ins()
-                        .brif(is_nullish, exit, &[], blocks[jump_to], &[]);
+                        .brif(is_nullish, exit, &[], jump_block, &[]);
                 }
                 continue;
             }
@@ -1361,47 +1732,390 @@ pub fn translate_function_with_constants(
                 // SetPropConst doesn't write to a dst register
             }
             Instruction::Call { dst, func, argc } => {
-                let helper_ref = helpers
-                    .and_then(|h| h.get(HelperKind::CallFunction))
-                    .ok_or_else(|| unsupported(pc, instruction))?;
-                let callee_val = read_reg(builder, &reg_slots, *func);
-                let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+                // Check if this call site has a statically resolved inline candidate
+                if let Some(candidate) = inline_sites.get(&pc) {
+                    let callee = candidate.callee;
+                    let callee_instrs = callee.instructions.read();
+                    let callee_instr_count = callee_instrs.len();
 
-                // Build argument array on the stack
-                let argv_ptr = if *argc > 0 {
-                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        (*argc as u32) * 8,
-                        8,
-                    ));
-                    for i in 0..(*argc as u16) {
-                        let arg_val = read_reg(builder, &reg_slots, Register(func.0 + 1 + i));
-                        builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                    if callee_instr_count == 0 {
+                        // Empty function → return undefined
+                        let undef_val = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                        write_reg(builder, &reg_slots, *dst, undef_val);
+                    } else {
+                        // Create callee register and local slots
+                        let callee_reg_count = callee.register_count as usize;
+                        let mut callee_reg_slots = Vec::with_capacity(callee_reg_count);
+                        for _ in 0..callee_reg_count {
+                            callee_reg_slots.push(builder.create_sized_stack_slot(
+                                StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 8),
+                            ));
+                        }
+                        let callee_local_count = callee.local_count as usize;
+                        let mut callee_local_slots = Vec::with_capacity(callee_local_count);
+                        for _ in 0..callee_local_count {
+                            callee_local_slots.push(builder.create_sized_stack_slot(
+                                StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 8),
+                            ));
+                        }
+
+                        // Initialize callee registers to undefined
+                        let undef_val = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                        for idx in 0..callee_reg_count {
+                            builder.ins().stack_store(undef_val, callee_reg_slots[idx], 0);
+                        }
+
+                        // Map caller args → callee param locals
+                        let callee_param_count = callee.param_count as usize;
+                        for idx in 0..callee_local_count {
+                            let init = if idx < callee_param_count && idx < (*argc as usize) {
+                                // Read argument from caller's register layout
+                                // Args are in registers func.0+1, func.0+2, ...
+                                read_reg(builder, &reg_slots, Register(func.0 + 1 + idx as u16))
+                            } else {
+                                undef_val
+                            };
+                            builder.ins().stack_store(init, callee_local_slots[idx], 0);
+                        }
+
+                        // Create blocks for callee instructions + continuation
+                        let mut callee_blocks = Vec::with_capacity(callee_instr_count);
+                        for _ in 0..callee_instr_count {
+                            callee_blocks.push(builder.create_block());
+                        }
+                        let continuation = builder.create_block();
+                        builder.append_block_param(continuation, types::I64);
+
+                        // Jump to first callee block
+                        builder.ins().jump(callee_blocks[0], &[]);
+
+                        // Translate callee bytecode using callee's slots
+                        for (ci, callee_inst) in callee_instrs.iter().enumerate() {
+                            builder.switch_to_block(callee_blocks[ci]);
+
+                            match callee_inst {
+                                // Returns → jump to continuation with value
+                                Instruction::Return { src } => {
+                                    let out = read_reg(builder, &callee_reg_slots, *src);
+                                    builder.ins().jump(continuation, &[BlockArg::Value(out)]);
+                                    continue;
+                                }
+                                Instruction::ReturnUndefined => {
+                                    let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    continue;
+                                }
+                                // Constants
+                                Instruction::LoadUndefined { dst: d } => {
+                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadNull { dst: d } => {
+                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_NULL);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadTrue { dst: d } => {
+                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_TRUE);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadFalse { dst: d } => {
+                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_FALSE);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadInt8 { dst: d, value } => {
+                                    let v = type_guards::emit_box_int32_const(builder, i32::from(*value));
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadInt32 { dst: d, value } => {
+                                    let v = type_guards::emit_box_int32_const(builder, *value);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::LoadConst { dst: d, idx } => {
+                                    if let Some(bits) = resolve_const_bits(constants, *idx) {
+                                        let v = builder.ins().iconst(types::I64, bits);
+                                        write_reg(builder, &callee_reg_slots, *d, v);
+                                    } else {
+                                        // Can't resolve constant — bail out to runtime call
+                                        // Fall through to continuation with undefined
+                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                        continue;
+                                    }
+                                }
+                                // Variables (use callee's slots)
+                                Instruction::GetLocal { dst: d, idx } => {
+                                    let v = read_local(builder, &callee_local_slots, *idx);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                Instruction::SetLocal { idx, src } => {
+                                    let v = read_reg(builder, &callee_reg_slots, *src);
+                                    write_local(builder, &callee_local_slots, *idx, v);
+                                }
+                                Instruction::Move { dst: d, src } => {
+                                    let v = read_reg(builder, &callee_reg_slots, *src);
+                                    write_reg(builder, &callee_reg_slots, *d, v);
+                                }
+                                // Arithmetic (guarded, using callee's slots)
+                                Instruction::Add { dst: d, lhs, rhs, feedback_index }
+                                | Instruction::AddInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let callee_feedback = callee.feedback_vector.read();
+                                    let hint = SpecializationHint::from_type_flags(
+                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                    );
+                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Add, left, right, hint);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Sub { dst: d, lhs, rhs, feedback_index }
+                                | Instruction::SubInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let callee_feedback = callee.feedback_vector.read();
+                                    let hint = SpecializationHint::from_type_flags(
+                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                    );
+                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Sub, left, right, hint);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Mul { dst: d, lhs, rhs, feedback_index }
+                                | Instruction::MulInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let callee_feedback = callee.feedback_vector.read();
+                                    let hint = SpecializationHint::from_type_flags(
+                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                    );
+                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Mul, left, right, hint);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMul));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                // Inc/Dec
+                                Instruction::Inc { dst: d, src } => {
+                                    let val = read_reg(builder, &callee_reg_slots, *src);
+                                    let guarded = type_guards::emit_guarded_i32_inc(builder, val);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericInc));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, val],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Dec { dst: d, src } => {
+                                    let val = read_reg(builder, &callee_reg_slots, *src);
+                                    let guarded = type_guards::emit_guarded_i32_dec(builder, val);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDec));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, val],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                // Comparisons
+                                Instruction::Lt { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedLessThan, FloatCC::LessThan, left, right);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLt));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Le { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedLessThanOrEqual, FloatCC::LessThanOrEqual, left, right);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLe));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Gt { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedGreaterThan, FloatCC::GreaterThan, left, right);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGt));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Ge { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedGreaterThanOrEqual, FloatCC::GreaterThanOrEqual, left, right);
+                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGe));
+                                    let out = lower_guarded_with_generic_fallback(
+                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
+                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                    );
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::StrictEq { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let out = type_guards::emit_strict_eq(builder, left, right, false);
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::StrictNe { dst: d, lhs, rhs } => {
+                                    let left = read_reg(builder, &callee_reg_slots, *lhs);
+                                    let right = read_reg(builder, &callee_reg_slots, *rhs);
+                                    let out = type_guards::emit_strict_eq(builder, left, right, true);
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                Instruction::Not { dst: d, src } => {
+                                    let val = read_reg(builder, &callee_reg_slots, *src);
+                                    let truthy = type_guards::emit_is_truthy(builder, val);
+                                    let is_falsy = builder.ins().icmp_imm(IntCC::Equal, truthy, 0);
+                                    let out = type_guards::emit_bool_to_nanbox(builder, is_falsy);
+                                    write_reg(builder, &callee_reg_slots, *d, out);
+                                }
+                                // Jumps within the callee (relative to callee blocks)
+                                Instruction::Jump { offset } => {
+                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                        builder.ins().jump(callee_blocks[target], &[]);
+                                    } else {
+                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    }
+                                    continue;
+                                }
+                                Instruction::JumpIfTrue { cond, offset } => {
+                                    let cond_val = read_reg(builder, &callee_reg_slots, *cond);
+                                    let truthy = type_guards::emit_is_truthy(builder, cond_val);
+                                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                        let fallthrough = ci + 1;
+                                        let ft_block = if fallthrough < callee_instr_count {
+                                            callee_blocks[fallthrough]
+                                        } else {
+                                            // Past end → return undefined via continuation
+                                            let exit_block = builder.create_block();
+                                            builder.switch_to_block(exit_block);
+                                            let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                            builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                            // Switch back to emit the branch
+                                            builder.switch_to_block(callee_blocks[ci]);
+                                            exit_block
+                                        };
+                                        builder.ins().brif(is_truthy, callee_blocks[target], &[], ft_block, &[]);
+                                    } else {
+                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    }
+                                    continue;
+                                }
+                                Instruction::JumpIfFalse { cond, offset } => {
+                                    let cond_val = read_reg(builder, &callee_reg_slots, *cond);
+                                    let truthy = type_guards::emit_is_truthy(builder, cond_val);
+                                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                        let fallthrough = ci + 1;
+                                        let ft_block = if fallthrough < callee_instr_count {
+                                            callee_blocks[fallthrough]
+                                        } else {
+                                            let exit_block = builder.create_block();
+                                            builder.switch_to_block(exit_block);
+                                            let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                            builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                            builder.switch_to_block(callee_blocks[ci]);
+                                            exit_block
+                                        };
+                                        builder.ins().brif(is_truthy, ft_block, &[], callee_blocks[target], &[]);
+                                    } else {
+                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    }
+                                    continue;
+                                }
+                                Instruction::Nop => {}
+                                // Unsupported in inlined code → bail out (return undefined)
+                                _ => {
+                                    let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    continue;
+                                }
+                            }
+
+                            // Fallthrough within inlined callee
+                            let next_ci = ci + 1;
+                            if next_ci < callee_instr_count {
+                                builder.ins().jump(callee_blocks[next_ci], &[]);
+                            } else {
+                                // Past end of callee → implicit return undefined
+                                let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                            }
+                        }
+
+                        // Continuation: read inlined result
+                        builder.switch_to_block(continuation);
+                        let inline_result = builder.block_params(continuation)[0];
+                        write_reg(builder, &reg_slots, *dst, inline_result);
                     }
-                    builder.ins().stack_addr(types::I64, slot, 0)
                 } else {
-                    builder.ins().iconst(types::I64, 0) // null pointer
-                };
+                    // No inline candidate → use runtime helper as before
+                    let helper_ref = helpers
+                        .and_then(|h| h.get(HelperKind::CallFunction))
+                        .ok_or_else(|| unsupported(pc, instruction))?;
+                    let callee_val = read_reg(builder, &reg_slots, *func);
+                    let argc_val = builder.ins().iconst(types::I64, *argc as i64);
 
-                let call = builder
-                    .ins()
-                    .call(helper_ref, &[ctx_ptr, callee_val, argc_val, argv_ptr]);
-                let result = builder.inst_results(call)[0];
+                    // Build argument array on the stack
+                    let argv_ptr = if *argc > 0 {
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            (*argc as u32) * 8,
+                            8,
+                        ));
+                        for i in 0..(*argc as u16) {
+                            let arg_val = read_reg(builder, &reg_slots, Register(func.0 + 1 + i));
+                            builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                        }
+                        builder.ins().stack_addr(types::I64, slot, 0)
+                    } else {
+                        builder.ins().iconst(types::I64, 0) // null pointer
+                    };
 
-                // If helper returns BAILOUT_SENTINEL, bail out the whole function
-                let bail_block = builder.create_block();
-                let continue_block = builder.create_block();
-                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
-                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
-                builder
-                    .ins()
-                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+                    let call = builder
+                        .ins()
+                        .call(helper_ref, &[ctx_ptr, callee_val, argc_val, argv_ptr]);
+                    let result = builder.inst_results(call)[0];
 
-                builder.switch_to_block(bail_block);
-                emit_bailout_return(builder);
+                    // If helper returns BAILOUT_SENTINEL, bail out the whole function
+                    let bail_block = builder.create_block();
+                    let continue_block = builder.create_block();
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                    builder
+                        .ins()
+                        .brif(is_bailout, bail_block, &[], continue_block, &[]);
 
-                builder.switch_to_block(continue_block);
-                write_reg(builder, &reg_slots, *dst, result);
+                    builder.switch_to_block(bail_block);
+                    emit_bailout_return(builder);
+
+                    builder.switch_to_block(continue_block);
+                    write_reg(builder, &reg_slots, *dst, result);
+                }
             }
             Instruction::NewObject { dst } => {
                 let helper_ref = helpers
@@ -2441,13 +3155,15 @@ pub fn translate_function_with_constants(
                 let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
                 let is_done = builder.ins().icmp(IntCC::Equal, result, undef);
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
+                let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
+                    let ft_block = resolve_target(pc, fallthrough);
                     builder
                         .ins()
-                        .brif(is_done, blocks[jump_to], &[], blocks[fallthrough], &[]);
+                        .brif(is_done, jump_block, &[], ft_block, &[]);
                 } else {
-                    builder.ins().brif(is_done, blocks[jump_to], &[], exit, &[]);
+                    builder.ins().brif(is_done, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
@@ -2456,10 +3172,445 @@ pub fn translate_function_with_constants(
 
         let next_pc = pc + 1;
         if next_pc < instruction_count {
-            builder.ins().jump(blocks[next_pc], &[]);
+            let ft_block = resolve_target(pc, next_pc);
+            builder.ins().jump(ft_block, &[]);
         } else {
             let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
             builder.ins().return_(&[undef]);
+        }
+    }
+
+    // --- Emit loop versioning pre-headers and optimized bodies ---
+    for vl in &versioned {
+        // Pre-header: check that all relevant registers are int32
+        builder.switch_to_block(vl.pre_header);
+
+        // Check each register
+        let mut all_int32 = None;
+        for &reg_idx in &vl.check_registers {
+            if (reg_idx as usize) < reg_count {
+                let val = builder
+                    .ins()
+                    .stack_load(types::I64, reg_slots[reg_idx as usize], 0);
+                let is_i32 = type_guards::emit_is_int32(builder, val);
+                all_int32 = Some(match all_int32 {
+                    None => is_i32,
+                    Some(prev) => builder.ins().band(prev, is_i32),
+                });
+            }
+        }
+
+        if let Some(check) = all_int32 {
+            // Branch: all int32 → optimized, otherwise → guarded
+            builder.ins().brif(
+                check,
+                vl.opt_blocks[0],
+                &[],
+                blocks[vl.header_pc],
+                &[],
+            );
+        } else {
+            // No registers to check (shouldn't happen for qualified loops)
+            builder.ins().jump(blocks[vl.header_pc], &[]);
+        }
+
+        // Emit optimized loop body
+        let body_len = vl.back_edge_pc - vl.header_pc + 1;
+        for body_idx in 0..body_len {
+            let body_pc = vl.header_pc + body_idx;
+            let instruction = &instructions_ref[body_pc];
+            builder.switch_to_block(vl.opt_blocks[body_idx]);
+
+            match instruction {
+                // --- Constant loads (same as guarded) ---
+                Instruction::LoadUndefined { dst } => {
+                    let v = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadNull { dst } => {
+                    let v = builder.ins().iconst(types::I64, type_guards::TAG_NULL);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadTrue { dst } => {
+                    let v = builder.ins().iconst(types::I64, type_guards::TAG_TRUE);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadFalse { dst } => {
+                    let v = builder.ins().iconst(types::I64, type_guards::TAG_FALSE);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadInt8 { dst, value } => {
+                    let v = type_guards::emit_box_int32_const(builder, i32::from(*value));
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadInt32 { dst, value } => {
+                    let v = type_guards::emit_box_int32_const(builder, *value);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::LoadConst { dst, idx } => {
+                    if let Some(bits) = resolve_const_bits(constants, *idx) {
+                        let v = builder.ins().iconst(types::I64, bits);
+                        write_reg(builder, &reg_slots, *dst, v);
+                    } else {
+                        // Can't resolve → fall back to guarded
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                }
+                // --- Variable access (same as guarded) ---
+                Instruction::GetLocal { dst, idx } => {
+                    let v = read_local(builder, &local_slots, *idx);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                Instruction::SetLocal { idx, src } => {
+                    let v = read_reg(builder, &reg_slots, *src);
+                    write_local(builder, &local_slots, *idx, v);
+                }
+                Instruction::Move { dst, src } => {
+                    let v = read_reg(builder, &reg_slots, *src);
+                    write_reg(builder, &reg_slots, *dst, v);
+                }
+                // --- Bare arithmetic (no type guard, overflow only) ---
+                Instruction::Add { dst, lhs, rhs, .. }
+                | Instruction::AddInt32 { dst, lhs, rhs, .. } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded =
+                        type_guards::emit_bare_i32_arith(builder, ArithOp::Add, left, right);
+                    // On overflow: call generic helper → transfer to guarded path
+                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
+                    builder.switch_to_block(guarded.slow_block);
+                    if let Some(helper_ref) = generic_ref {
+                        let call = builder.ins().call(helper_ref, &[ctx_ptr, left, right]);
+                        let result = builder.inst_results(call)[0];
+                        // Write result and transfer to guarded version of next instruction
+                        write_reg(builder, &reg_slots, *dst, result);
+                        let next_guarded_pc = body_pc + 1;
+                        if next_guarded_pc < instruction_count {
+                            builder.ins().jump(blocks[next_guarded_pc], &[]);
+                        } else {
+                            builder.ins().return_(&[result]);
+                        }
+                    } else {
+                        emit_bailout_return_with_state(
+                            builder, ctx_ptr, body_pc,
+                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        );
+                    }
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Sub { dst, lhs, rhs, .. }
+                | Instruction::SubInt32 { dst, lhs, rhs, .. } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded =
+                        type_guards::emit_bare_i32_arith(builder, ArithOp::Sub, left, right);
+                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
+                    builder.switch_to_block(guarded.slow_block);
+                    if let Some(helper_ref) = generic_ref {
+                        let call = builder.ins().call(helper_ref, &[ctx_ptr, left, right]);
+                        let result = builder.inst_results(call)[0];
+                        write_reg(builder, &reg_slots, *dst, result);
+                        let next_guarded_pc = body_pc + 1;
+                        if next_guarded_pc < instruction_count {
+                            builder.ins().jump(blocks[next_guarded_pc], &[]);
+                        } else {
+                            builder.ins().return_(&[result]);
+                        }
+                    } else {
+                        emit_bailout_return_with_state(
+                            builder, ctx_ptr, body_pc,
+                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        );
+                    }
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Mul { dst, lhs, rhs, .. }
+                | Instruction::MulInt32 { dst, lhs, rhs, .. } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded =
+                        type_guards::emit_bare_i32_arith(builder, ArithOp::Mul, left, right);
+                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMul));
+                    builder.switch_to_block(guarded.slow_block);
+                    if let Some(helper_ref) = generic_ref {
+                        let call = builder.ins().call(helper_ref, &[ctx_ptr, left, right]);
+                        let result = builder.inst_results(call)[0];
+                        write_reg(builder, &reg_slots, *dst, result);
+                        let next_guarded_pc = body_pc + 1;
+                        if next_guarded_pc < instruction_count {
+                            builder.ins().jump(blocks[next_guarded_pc], &[]);
+                        } else {
+                            builder.ins().return_(&[result]);
+                        }
+                    } else {
+                        emit_bailout_return_with_state(
+                            builder, ctx_ptr, body_pc,
+                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        );
+                    }
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                // --- Inc/Dec (bare, overflow only) ---
+                Instruction::Inc { dst, src } => {
+                    let val = read_reg(builder, &reg_slots, *src);
+                    let guarded = type_guards::emit_bare_i32_inc(builder, val);
+                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericInc));
+                    builder.switch_to_block(guarded.slow_block);
+                    if let Some(helper_ref) = generic_ref {
+                        let call = builder.ins().call(helper_ref, &[ctx_ptr, val]);
+                        let result = builder.inst_results(call)[0];
+                        write_reg(builder, &reg_slots, *dst, result);
+                        let next_guarded_pc = body_pc + 1;
+                        if next_guarded_pc < instruction_count {
+                            builder.ins().jump(blocks[next_guarded_pc], &[]);
+                        } else {
+                            builder.ins().return_(&[result]);
+                        }
+                    } else {
+                        emit_bailout_return_with_state(
+                            builder, ctx_ptr, body_pc,
+                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        );
+                    }
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Dec { dst, src } => {
+                    let val = read_reg(builder, &reg_slots, *src);
+                    let guarded = type_guards::emit_bare_i32_dec(builder, val);
+                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDec));
+                    builder.switch_to_block(guarded.slow_block);
+                    if let Some(helper_ref) = generic_ref {
+                        let call = builder.ins().call(helper_ref, &[ctx_ptr, val]);
+                        let result = builder.inst_results(call)[0];
+                        write_reg(builder, &reg_slots, *dst, result);
+                        let next_guarded_pc = body_pc + 1;
+                        if next_guarded_pc < instruction_count {
+                            builder.ins().jump(blocks[next_guarded_pc], &[]);
+                        } else {
+                            builder.ins().return_(&[result]);
+                        }
+                    } else {
+                        emit_bailout_return_with_state(
+                            builder, ctx_ptr, body_pc,
+                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        );
+                    }
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                // --- Bare comparisons (no type guard needed) ---
+                Instruction::Lt { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded = type_guards::emit_bare_i32_cmp(
+                        builder, IntCC::SignedLessThan, left, right,
+                    );
+                    // slow_block is never reached for bare cmp, but seal it
+                    builder.switch_to_block(guarded.slow_block);
+                    emit_bailout_return_with_state(
+                        builder, ctx_ptr, body_pc,
+                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                    );
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Le { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded = type_guards::emit_bare_i32_cmp(
+                        builder, IntCC::SignedLessThanOrEqual, left, right,
+                    );
+                    builder.switch_to_block(guarded.slow_block);
+                    emit_bailout_return_with_state(
+                        builder, ctx_ptr, body_pc,
+                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                    );
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Gt { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded = type_guards::emit_bare_i32_cmp(
+                        builder, IntCC::SignedGreaterThan, left, right,
+                    );
+                    builder.switch_to_block(guarded.slow_block);
+                    emit_bailout_return_with_state(
+                        builder, ctx_ptr, body_pc,
+                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                    );
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                Instruction::Ge { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let guarded = type_guards::emit_bare_i32_cmp(
+                        builder, IntCC::SignedGreaterThanOrEqual, left, right,
+                    );
+                    builder.switch_to_block(guarded.slow_block);
+                    emit_bailout_return_with_state(
+                        builder, ctx_ptr, body_pc,
+                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                    );
+                    builder.switch_to_block(guarded.merge_block);
+                    write_reg(builder, &reg_slots, *dst, guarded.result);
+                }
+                // --- Strict eq/ne (same as guarded — no type guard needed) ---
+                Instruction::StrictEq { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let out = type_guards::emit_strict_eq(builder, left, right, false);
+                    write_reg(builder, &reg_slots, *dst, out);
+                }
+                Instruction::StrictNe { dst, lhs, rhs } => {
+                    let left = read_reg(builder, &reg_slots, *lhs);
+                    let right = read_reg(builder, &reg_slots, *rhs);
+                    let out = type_guards::emit_strict_eq(builder, left, right, true);
+                    write_reg(builder, &reg_slots, *dst, out);
+                }
+                // --- Not (same as guarded) ---
+                Instruction::Not { dst, src } => {
+                    let val = read_reg(builder, &reg_slots, *src);
+                    let truthy = type_guards::emit_is_truthy(builder, val);
+                    let is_falsy = builder.ins().icmp_imm(IntCC::Equal, truthy, 0);
+                    let out = type_guards::emit_bool_to_nanbox(builder, is_falsy);
+                    write_reg(builder, &reg_slots, *dst, out);
+                }
+                // --- Control flow in optimized body ---
+                Instruction::Jump { offset } => {
+                    let target = jump_target(body_pc, offset.offset(), instruction_count)?;
+                    // Back-edge → stay in optimized; exit → shared blocks
+                    if target == vl.header_pc {
+                        builder.ins().jump(vl.opt_blocks[0], &[]);
+                    } else if target >= vl.header_pc && target <= vl.back_edge_pc {
+                        builder.ins().jump(vl.opt_blocks[target - vl.header_pc], &[]);
+                    } else {
+                        builder.ins().jump(blocks[target], &[]);
+                    }
+                    continue;
+                }
+                Instruction::JumpIfTrue { cond, offset } => {
+                    let cond_val = read_reg(builder, &reg_slots, *cond);
+                    let truthy = type_guards::emit_is_truthy(builder, cond_val);
+                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                    let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
+                    let jump_block = if jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc {
+                        vl.opt_blocks[jump_to - vl.header_pc]
+                    } else {
+                        blocks[jump_to]
+                    };
+                    let fallthrough = body_pc + 1;
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                        vl.opt_blocks[fallthrough - vl.header_pc]
+                    } else if fallthrough < instruction_count {
+                        blocks[fallthrough]
+                    } else {
+                        exit
+                    };
+                    builder.ins().brif(is_truthy, jump_block, &[], ft_block, &[]);
+                    continue;
+                }
+                Instruction::JumpIfFalse { cond, offset } => {
+                    let cond_val = read_reg(builder, &reg_slots, *cond);
+                    let truthy = type_guards::emit_is_truthy(builder, cond_val);
+                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                    let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
+                    let jump_block = if jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc {
+                        vl.opt_blocks[jump_to - vl.header_pc]
+                    } else {
+                        blocks[jump_to]
+                    };
+                    let fallthrough = body_pc + 1;
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                        vl.opt_blocks[fallthrough - vl.header_pc]
+                    } else if fallthrough < instruction_count {
+                        blocks[fallthrough]
+                    } else {
+                        exit
+                    };
+                    builder.ins().brif(is_truthy, ft_block, &[], jump_block, &[]);
+                    continue;
+                }
+                Instruction::JumpIfNullish { src, offset } => {
+                    let src_val = read_reg(builder, &reg_slots, *src);
+                    let is_nullish = type_guards::emit_is_nullish(builder, src_val);
+                    let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
+                    let jump_block = if jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc {
+                        vl.opt_blocks[jump_to - vl.header_pc]
+                    } else {
+                        blocks[jump_to]
+                    };
+                    let fallthrough = body_pc + 1;
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                        vl.opt_blocks[fallthrough - vl.header_pc]
+                    } else if fallthrough < instruction_count {
+                        blocks[fallthrough]
+                    } else {
+                        exit
+                    };
+                    builder.ins().brif(is_nullish, jump_block, &[], ft_block, &[]);
+                    continue;
+                }
+                Instruction::JumpIfNotNullish { src, offset } => {
+                    let src_val = read_reg(builder, &reg_slots, *src);
+                    let is_nullish = type_guards::emit_is_nullish(builder, src_val);
+                    let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
+                    let jump_block = if jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc {
+                        vl.opt_blocks[jump_to - vl.header_pc]
+                    } else {
+                        blocks[jump_to]
+                    };
+                    let fallthrough = body_pc + 1;
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                        vl.opt_blocks[fallthrough - vl.header_pc]
+                    } else if fallthrough < instruction_count {
+                        blocks[fallthrough]
+                    } else {
+                        exit
+                    };
+                    builder.ins().brif(is_nullish, ft_block, &[], jump_block, &[]);
+                    continue;
+                }
+                // --- Return (same as guarded) ---
+                Instruction::Return { src } => {
+                    let out = read_reg(builder, &reg_slots, *src);
+                    builder.ins().return_(&[out]);
+                    continue;
+                }
+                Instruction::ReturnUndefined => {
+                    let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                    builder.ins().return_(&[undef]);
+                    continue;
+                }
+                Instruction::Nop => {}
+                // --- Anything else: transfer to guarded version ---
+                _ => {
+                    builder.ins().jump(blocks[body_pc], &[]);
+                    continue;
+                }
+            }
+
+            // Fallthrough within optimized body
+            let next_body_idx = body_idx + 1;
+            if next_body_idx < body_len {
+                builder.ins().jump(vl.opt_blocks[next_body_idx], &[]);
+            } else {
+                // Past the back-edge — shouldn't normally happen since back-edge
+                // is a Jump instruction, but handle gracefully
+                let post_pc = vl.back_edge_pc + 1;
+                if post_pc < instruction_count {
+                    builder.ins().jump(blocks[post_pc], &[]);
+                } else {
+                    let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                    builder.ins().return_(&[undef]);
+                }
+            }
         }
     }
 
@@ -2477,9 +3628,9 @@ mod tests {
     use otter_vm_bytecode::operand::{JumpOffset, Register};
 
     #[test]
-    fn helper_eligibility_rejects_yield_and_await() {
+    fn helper_eligibility_accepts_yield_rejects_await() {
         let yield_fn = Function::builder()
-            .name("yield_non_eligible")
+            .name("yield_eligible")
             .register_count(2)
             .instruction(Instruction::LoadInt32 {
                 dst: Register(1),
@@ -2491,7 +3642,7 @@ mod tests {
             })
             .instruction(Instruction::Return { src: Register(0) })
             .build();
-        assert!(!can_translate_function_with_helpers(&yield_fn, &[]));
+        assert!(can_translate_function_with_helpers(&yield_fn, &[]));
 
         let await_fn = Function::builder()
             .name("await_non_eligible")
@@ -2535,7 +3686,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_eligibility_rejects_async_and_generator_flags() {
+    fn helper_eligibility_rejects_async_accepts_generator_flags() {
         let async_fn = Function::builder()
             .name("async_flag_non_eligible")
             .register_count(1)
@@ -2545,11 +3696,11 @@ mod tests {
         assert!(!can_translate_function_with_helpers(&async_fn, &[]));
 
         let generator_fn = Function::builder()
-            .name("generator_flag_non_eligible")
+            .name("generator_flag_eligible")
             .register_count(1)
             .is_generator(true)
             .instruction(Instruction::ReturnUndefined)
             .build();
-        assert!(!can_translate_function_with_helpers(&generator_fn, &[]));
+        assert!(can_translate_function_with_helpers(&generator_fn, &[]));
     }
 }

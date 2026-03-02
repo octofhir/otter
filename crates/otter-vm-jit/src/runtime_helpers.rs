@@ -222,7 +222,8 @@ pub const HELPER_COUNT: usize = 84;
 ///         this_raw(56) callee_raw(64) home_object_raw(72) secondary_result(80)
 ///         bailout_reason(88) bailout_pc(96)
 ///         deopt_locals_ptr(104) deopt_locals_count:u32(112) pad(116)
-///         deopt_regs_ptr(120) deopt_regs_count:u32(128)
+///         deopt_regs_ptr(120) deopt_regs_count:u32(128) pad(132)
+///         osr_entry_pc(136)
 pub const JIT_CTX_SECONDARY_RESULT_OFFSET: i32 = 80;
 
 /// Byte offset of `bailout_reason` in JitContext (`#[repr(C)]`).
@@ -242,6 +243,10 @@ pub const JIT_CTX_DEOPT_REGS_PTR_OFFSET: i32 = 120;
 
 /// Byte offset of `deopt_regs_count` in JitContext (`#[repr(C)]`).
 pub const JIT_CTX_DEOPT_REGS_COUNT_OFFSET: i32 = 128;
+
+/// Byte offset of `osr_entry_pc` in JitContext (`#[repr(C)]`).
+/// Layout: deopt_regs_count:u32(128) pad(132) osr_entry_pc:i64(136)
+pub const JIT_CTX_OSR_ENTRY_PC_OFFSET: i32 = 136;
 
 impl HelperKind {
     /// Symbol name used for Cranelift import resolution.

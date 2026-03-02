@@ -368,7 +368,6 @@ impl Interpreter {
     #[inline]
     fn is_static_jit_candidate(function: &otter_vm_bytecode::Function) -> bool {
         !function.flags.is_async
-            && !function.flags.is_generator
             && !function.flags.has_rest
             && !function.flags.uses_arguments
             && !function.flags.uses_eval
@@ -379,9 +378,12 @@ impl Interpreter {
     /// counter. When the counter crosses the hot threshold, the function is
     /// marked hot and synchronously compiled by the JIT.
     ///
-    /// **Stage 2 — OSR restart:** If JIT code is already available for the
-    /// function, restarts the entire function in JIT. This "full restart"
-    /// approach re-executes setup code but lets the hot loop run in native code.
+    /// **Stage 2 — True OSR:** If JIT code is already available, enters JIT at
+    /// the loop header with the interpreter's full frame state (all locals +
+    /// registers). Unlike the old full-restart approach, setup code before the
+    /// loop is NOT re-executed.
+    ///
+    /// `target_pc` is the bytecode PC of the backward jump target (loop header).
     ///
     /// Returns `Some(value)` if OSR succeeded (the function completed in JIT),
     /// or `None` to continue interpreting.
@@ -391,6 +393,7 @@ impl Interpreter {
         ctx: &mut VmContext,
         module: &Arc<Module>,
         func: &otter_vm_bytecode::Function,
+        target_pc: usize,
     ) -> Option<Value> {
         // ---- Stage 1: back-edge counting + JIT enqueue ----
         let newly_hot =
@@ -407,7 +410,7 @@ impl Interpreter {
             }
         }
 
-        // ---- Stage 2: OSR attempt ----
+        // ---- Stage 2: True OSR at loop header ----
         if !otter_vm_exec::is_jit_enabled()
             || !func.is_hot_function()
             || func.is_deoptimized()
@@ -430,7 +433,18 @@ impl Interpreter {
         let upvalues = frame.upvalues.clone();
         // frame borrow ends here
 
-        // Extract current param values from locals.
+        // Extract ALL locals and registers for true OSR.
+        let local_count = func.local_count as usize;
+        let reg_count = func.register_count as usize;
+        let locals: Vec<Value> = (0..local_count)
+            .map(|i| ctx.get_local(i as u16).unwrap_or_else(|_| Value::undefined()))
+            .collect();
+        let registers: Vec<Value> = (0..reg_count)
+            .map(|i| ctx.get_register(i as u16).clone())
+            .collect();
+
+        // Build args from parameter locals (for JIT context argv, though OSR
+        // loads from deopt buffers instead).
         let param_count = func.param_count as usize;
         let argc = param_count.min(ctx.current_frame()?.argc);
         let args: Vec<Value> = (0..argc)
@@ -445,6 +459,12 @@ impl Interpreter {
 
         otter_vm_exec::record_osr_attempt();
 
+        let osr_state = crate::jit_runtime::OsrState {
+            entry_pc: target_pc as u32,
+            locals,
+            registers,
+        };
+
         let jit_interp: *const Self = self;
         let jit_ctx_ptr: *mut VmContext = ctx;
         match crate::jit_runtime::try_execute_jit(
@@ -457,6 +477,7 @@ impl Interpreter {
             jit_ctx_ptr,
             &module.constants as *const _,
             &upvalues,
+            Some(osr_state),
         ) {
             crate::jit_runtime::JitCallResult::Ok(value) => {
                 otter_vm_exec::record_osr_success();
@@ -977,8 +998,10 @@ impl Interpreter {
                 }
                 InstructionResult::Jump(offset) => {
                     if offset < 0 {
+                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
+                            + offset as i64) as usize;
                         if let Some(osr_value) =
-                            self.try_back_edge_osr(ctx, &current_module, func)
+                            self.try_back_edge_osr(ctx, &current_module, func, target_pc)
                         {
                             let return_reg = ctx
                                 .current_frame()
@@ -1081,6 +1104,7 @@ impl Interpreter {
                                 jit_ctx_ptr,
                                 &module.constants as *const _,
                                 &upvalues,
+                                None,
                             ) {
                                 crate::jit_runtime::JitCallResult::Ok(value) => {
                                     ctx.set_register(return_reg, value);
@@ -1387,8 +1411,10 @@ impl Interpreter {
                 }
                 InstructionResult::Jump(offset) => {
                     if offset < 0 {
+                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
+                            + offset as i64) as usize;
                         if let Some(osr_value) =
-                            self.try_back_edge_osr(ctx, module_ref, func)
+                            self.try_back_edge_osr(ctx, module_ref, func, target_pc)
                         {
                             if ctx.stack_depth() == 1 {
                                 ctx.set_running(false);
@@ -1547,6 +1573,7 @@ impl Interpreter {
                                 jit_ctx_ptr,
                                 &call_module.constants as *const _,
                                 &upvalues,
+                                None,
                             ) {
                                 crate::jit_runtime::JitCallResult::Ok(value) => {
                                     ctx.set_register(return_reg, value);
@@ -1886,8 +1913,10 @@ impl Interpreter {
                 }
                 InstructionResult::Jump(offset) => {
                     if offset < 0 {
+                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
+                            + offset as i64) as usize;
                         if let Some(osr_value) =
-                            self.try_back_edge_osr(ctx, module_ref, func)
+                            self.try_back_edge_osr(ctx, module_ref, func, target_pc)
                         {
                             if ctx.stack_depth() == 1 {
                                 return Ok(osr_value);
@@ -2041,6 +2070,7 @@ impl Interpreter {
                                 jit_ctx_ptr,
                                 &call_module.constants as *const _,
                                 &upvalues,
+                                None,
                             ) {
                                 crate::jit_runtime::JitCallResult::Ok(value) => {
                                     ctx.set_register(return_reg, value);
@@ -9282,6 +9312,7 @@ impl Interpreter {
                                 jit_ctx_ptr,
                                 &module.constants as *const _,
                                 &upvalues,
+                                None,
                             ) {
                                 crate::jit_runtime::JitCallResult::Ok(value) => {
                                     ctx.set_register(return_reg, value);
@@ -11213,6 +11244,83 @@ impl Interpreter {
         let this_value = generator.take_initial_this();
         let argc = args.len();
 
+        // Attempt JIT execution for the generator body (bail-on-yield strategy).
+        // This must happen before set_pending_args/this since those consume the values.
+        if otter_vm_exec::is_jit_enabled() && func.jit_entry_ptr() != 0 && !func.is_deoptimized() {
+            let jit_interp: *const Self = self;
+            let jit_ctx_ptr: *mut VmContext = ctx;
+            let upvalues = generator.upvalues.clone();
+            ctx.set_pending_this(this_value.clone());
+            match crate::jit_runtime::try_execute_jit(
+                generator.module.module_id,
+                generator.function_index,
+                func,
+                &args,
+                ctx.cached_proto_epoch,
+                jit_interp,
+                jit_ctx_ptr,
+                &generator.module.constants as *const _,
+                &upvalues,
+                None,
+            ) {
+                crate::jit_runtime::JitCallResult::Ok(value) => {
+                    generator.complete();
+                    return GeneratorResult::Returned(value);
+                }
+                crate::jit_runtime::JitCallResult::BailoutResume {
+                    bailout_pc,
+                    locals,
+                    registers,
+                } => {
+                    let instructions = func.instructions.read();
+                    if let Some(otter_vm_bytecode::Instruction::Yield { dst, src }) =
+                        instructions.get(bailout_pc as usize)
+                    {
+                        // Yield-bailout: build a GeneratorFrame from deopt state
+                        let yielded_value = registers
+                            .get(src.0 as usize)
+                            .cloned()
+                            .unwrap_or_else(Value::undefined);
+                        let try_stack = Self::reconstruct_try_stack(
+                            func,
+                            bailout_pc as usize,
+                            ctx.stack_depth() + 1,
+                        );
+                        let frame = crate::generator::GeneratorFrame::with_yield_dst(
+                            bailout_pc as usize + 1, // past the Yield instruction
+                            generator.function_index,
+                            Arc::clone(&generator.module),
+                            locals,
+                            registers,
+                            upvalues,
+                            try_stack,
+                            this_value,
+                            generator.is_construct(),
+                            0, // frame_id placeholder
+                            argc,
+                            dst.0,
+                        );
+                        generator.suspend_with_frame(frame);
+                        return GeneratorResult::Yielded(yielded_value);
+                    }
+                    // Non-yield bailout: fall through to interpreter
+                    drop(instructions);
+                }
+                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                    otter_vm_exec::enqueue_hot_function(
+                        &generator.module,
+                        generator.function_index,
+                        func,
+                    );
+                    otter_vm_exec::compile_one_pending_request(
+                        crate::jit_runtime::runtime_helpers(),
+                    );
+                }
+                crate::jit_runtime::JitCallResult::BailoutRestart
+                | crate::jit_runtime::JitCallResult::NotCompiled => {}
+            }
+        }
+
         // Set up pending args and push initial frame
         ctx.set_pending_realm_id(generator.realm_id);
         ctx.set_pending_args(args);
@@ -11449,6 +11557,186 @@ impl Interpreter {
         ))
     }
 
+    /// Reconstruct the try-stack by scanning instructions 0..target_pc for
+    /// TryStart/TryEnd pairs. Used to recover exception handler state from
+    /// JIT deopt buffers when building a GeneratorFrame.
+    fn reconstruct_try_stack(
+        func: &otter_vm_bytecode::Function,
+        target_pc: usize,
+        frame_depth: usize,
+    ) -> Vec<crate::generator::TryEntry> {
+        let instructions = func.instructions.read();
+        let mut stack = Vec::new();
+        for (pc, instruction) in instructions.iter().enumerate() {
+            if pc >= target_pc {
+                break;
+            }
+            match instruction {
+                otter_vm_bytecode::Instruction::TryStart { catch_offset } => {
+                    let catch_pc = (pc as isize + catch_offset.0 as isize) as usize;
+                    stack.push(crate::generator::TryEntry {
+                        catch_pc,
+                        frame_depth,
+                    });
+                }
+                otter_vm_bytecode::Instruction::TryEnd => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        stack
+    }
+
+    /// Attempt OSR into JIT code for a generator at a back-edge.
+    ///
+    /// Returns `Some(GeneratorResult)` if JIT handled the execution (either
+    /// completed, yielded, or bailed out with state restored to the frame).
+    /// Returns `None` to continue interpreting.
+    fn try_generator_osr(
+        &self,
+        ctx: &mut VmContext,
+        generator: &GcRef<JsGenerator>,
+        module: &Arc<Module>,
+        func: &otter_vm_bytecode::Function,
+        target_pc: usize,
+        initial_depth: usize,
+    ) -> Option<GeneratorResult> {
+        let newly_hot = func.record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
+        if newly_hot {
+            func.mark_hot();
+            if otter_vm_exec::is_jit_enabled() {
+                let func_index = ctx.current_frame()?.function_index;
+                otter_vm_exec::enqueue_hot_function(module, func_index, func);
+                otter_vm_exec::compile_one_pending_request(
+                    crate::jit_runtime::runtime_helpers(),
+                );
+                otter_vm_exec::record_back_edge_compilation();
+            }
+        }
+
+        if !otter_vm_exec::is_jit_enabled()
+            || !func.is_hot_function()
+            || func.is_deoptimized()
+            || func.jit_entry_ptr() == 0
+            || func.flags.has_rest
+            || func.flags.uses_arguments
+            || func.flags.uses_eval
+        {
+            return None;
+        }
+
+        let frame = ctx.current_frame()?;
+        if frame.is_construct || frame.is_async {
+            return None;
+        }
+        let func_index = frame.function_index;
+        let this_value = frame.this_value.clone();
+        let home_object = frame.home_object.clone();
+        let upvalues = frame.upvalues.clone();
+        let argc = frame.argc;
+
+        let local_count = func.local_count as usize;
+        let reg_count = func.register_count as usize;
+        let locals: Vec<Value> = (0..local_count)
+            .map(|i| ctx.get_local(i as u16).unwrap_or_else(|_| Value::undefined()))
+            .collect();
+        let registers: Vec<Value> = (0..reg_count)
+            .map(|i| ctx.get_register(i as u16).clone())
+            .collect();
+
+        let param_count = func.param_count as usize;
+        let arg_count = param_count.min(argc);
+        let args: Vec<Value> = (0..arg_count)
+            .map(|i| ctx.get_local(i as u16).unwrap_or_else(|_| Value::undefined()))
+            .collect();
+
+        ctx.set_pending_this(this_value.clone());
+        if let Some(home_obj) = home_object {
+            ctx.set_pending_home_object(home_obj);
+        }
+
+        otter_vm_exec::record_osr_attempt();
+
+        let osr_state = crate::jit_runtime::OsrState {
+            entry_pc: target_pc as u32,
+            locals,
+            registers,
+        };
+
+        let jit_interp: *const Self = self;
+        let jit_ctx_ptr: *mut VmContext = ctx;
+        match crate::jit_runtime::try_execute_jit(
+            module.module_id,
+            func_index,
+            func,
+            &args,
+            ctx.cached_proto_epoch,
+            jit_interp,
+            jit_ctx_ptr,
+            &module.constants as *const _,
+            &upvalues,
+            Some(osr_state),
+        ) {
+            crate::jit_runtime::JitCallResult::Ok(value) => {
+                otter_vm_exec::record_osr_success();
+                Some(GeneratorResult::Returned(value))
+            }
+            crate::jit_runtime::JitCallResult::BailoutResume {
+                bailout_pc,
+                locals,
+                registers,
+            } => {
+                let instructions = func.instructions.read();
+                if let Some(otter_vm_bytecode::Instruction::Yield { dst, src }) =
+                    instructions.get(bailout_pc as usize)
+                {
+                    // Yield-bailout: build GeneratorFrame from deopt state
+                    let yielded_value = registers
+                        .get(src.0 as usize)
+                        .cloned()
+                        .unwrap_or_else(Value::undefined);
+                    let try_stack = Self::reconstruct_try_stack(
+                        func,
+                        bailout_pc as usize,
+                        initial_depth + 1,
+                    );
+                    let frame = crate::generator::GeneratorFrame::with_yield_dst(
+                        bailout_pc as usize + 1,
+                        func_index,
+                        Arc::clone(module),
+                        locals,
+                        registers,
+                        upvalues,
+                        try_stack,
+                        this_value,
+                        generator.is_construct(),
+                        0,
+                        argc,
+                        dst.0,
+                    );
+                    generator.suspend_with_frame(frame);
+                    // Pop the generator's frame from context
+                    ctx.pop_frame();
+                    return Some(GeneratorResult::Yielded(yielded_value));
+                }
+                // Non-yield bailout: restore deopt state and continue interpreting
+                drop(instructions);
+                ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                None
+            }
+            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                otter_vm_exec::enqueue_hot_function(module, func_index, func);
+                otter_vm_exec::compile_one_pending_request(
+                    crate::jit_runtime::runtime_helpers(),
+                );
+                None
+            }
+            crate::jit_runtime::JitCallResult::BailoutRestart
+            | crate::jit_runtime::JitCallResult::NotCompiled => None,
+        }
+    }
+
     /// Run the generator execution loop until yield, return, or error
     ///
     /// `initial_depth` is the stack depth before the generator frame was pushed.
@@ -11596,6 +11884,56 @@ impl Interpreter {
                     ctx.advance_pc();
                 }
                 InstructionResult::Jump(offset) => {
+                    if offset < 0 {
+                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0)
+                            as i64
+                            + offset as i64) as usize;
+                        let is_generator_frame =
+                            ctx.stack_depth() == initial_depth + 1;
+                        if is_generator_frame {
+                            if let Some(result) = self.try_generator_osr(
+                                ctx,
+                                &generator,
+                                module_ref,
+                                func,
+                                target_pc,
+                                initial_depth,
+                            ) {
+                                match result {
+                                    GeneratorResult::Returned(v) => {
+                                        generator.complete();
+                                        while ctx.stack_depth() > initial_depth {
+                                            ctx.pop_frame();
+                                        }
+                                        return GeneratorResult::Returned(v);
+                                    }
+                                    GeneratorResult::Yielded(v) => {
+                                        // Frame already popped by try_generator_osr
+                                        return GeneratorResult::Yielded(v);
+                                    }
+                                    other => return other,
+                                }
+                            }
+                        } else if let Some(osr_value) =
+                            self.try_back_edge_osr(ctx, module_ref, func, target_pc)
+                        {
+                            // Inner function call completed via OSR — treat as return
+                            let return_reg = ctx
+                                .current_frame()
+                                .map(|f| f.return_register)
+                                .unwrap_or(None);
+                            ctx.pop_frame();
+                            if ctx.stack_depth() <= initial_depth {
+                                generator.complete();
+                                return GeneratorResult::Returned(osr_value);
+                            }
+                            if let Some(reg) = return_reg {
+                                ctx.set_register(reg, osr_value);
+                            }
+                            cached_frame_id = usize::MAX;
+                            continue;
+                        }
+                    }
                     ctx.jump(offset);
                 }
                 InstructionResult::Return(value) => {

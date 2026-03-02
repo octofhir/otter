@@ -7,6 +7,7 @@
 
 pub mod bailout;
 pub mod compiler;
+mod loop_analysis;
 pub mod runtime_helpers;
 pub mod translator;
 mod type_guards;

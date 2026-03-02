@@ -1499,6 +1499,147 @@ pub(crate) fn emit_specialized_cmp(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bare (unguarded) arithmetic for loop versioning
+// ---------------------------------------------------------------------------
+// These skip the type check entirely — the pre-header has already verified
+// that all loop-input registers are int32. Only overflow detection is kept.
+
+/// Emit bare i32 binary arithmetic (no type guard, overflow-only slow path).
+///
+/// The caller guarantees both operands are NaN-boxed int32. On overflow,
+/// branches to `slow_block` for the caller to fill in.
+pub(crate) fn emit_bare_i32_arith(
+    builder: &mut FunctionBuilder,
+    op: ArithOp,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let box_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    // No type guard — go directly to arithmetic
+    let l32 = emit_unbox_int32(builder, lhs);
+    let r32 = emit_unbox_int32(builder, rhs);
+    let l64 = builder.ins().sextend(types::I64, l32);
+    let r64 = builder.ins().sextend(types::I64, r32);
+
+    let result_i64 = match op {
+        ArithOp::Add => builder.ins().iadd(l64, r64),
+        ArithOp::Sub => builder.ins().isub(l64, r64),
+        ArithOp::Mul => builder.ins().imul(l64, r64),
+    };
+
+    // Overflow check: truncate to i32, sign-extend back, compare
+    let result_i32 = builder.ins().ireduce(types::I32, result_i64);
+    let check = builder.ins().sextend(types::I64, result_i32);
+    let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
+    builder
+        .ins()
+        .brif(no_overflow, box_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(box_block);
+    let boxed = emit_box_int32(builder, result_i32);
+    builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    let result = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
+}
+
+/// Emit bare i32 comparison (no type guard).
+///
+/// The caller guarantees both operands are NaN-boxed int32.
+/// Always succeeds — no slow path needed, but we keep the same GuardedResult
+/// pattern for uniformity (slow_block is never reached).
+pub(crate) fn emit_bare_i32_cmp(
+    builder: &mut FunctionBuilder,
+    cc: IntCC,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    // No type guard — directly compare
+    let l32 = emit_unbox_int32(builder, lhs);
+    let r32 = emit_unbox_int32(builder, rhs);
+    let cmp = builder.ins().icmp(cc, l32, r32);
+    let result = emit_bool_to_nanbox(builder, cmp);
+    builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
+
+    let result_val = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
+/// Emit bare i32 increment (no type guard, overflow-only slow path).
+///
+/// The caller guarantees the operand is NaN-boxed int32.
+pub(crate) fn emit_bare_i32_inc(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
+    let box_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    // No type guard — directly increment
+    let v32 = emit_unbox_int32(builder, val);
+    let int_max = builder.ins().iconst(types::I32, i32::MAX as i64);
+    let not_max = builder.ins().icmp(IntCC::NotEqual, v32, int_max);
+    builder.ins().brif(not_max, box_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(box_block);
+    let one = builder.ins().iconst(types::I32, 1);
+    let result = builder.ins().iadd(v32, one);
+    let boxed = emit_box_int32(builder, result);
+    builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    let result_val = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
+/// Emit bare i32 decrement (no type guard, overflow-only slow path).
+///
+/// The caller guarantees the operand is NaN-boxed int32.
+pub(crate) fn emit_bare_i32_dec(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
+    let box_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    // No type guard — directly decrement
+    let v32 = emit_unbox_int32(builder, val);
+    let int_min = builder.ins().iconst(types::I32, i32::MIN as i64);
+    let not_min = builder.ins().icmp(IntCC::NotEqual, v32, int_min);
+    builder.ins().brif(not_min, box_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(box_block);
+    let one = builder.ins().iconst(types::I32, 1);
+    let result = builder.ins().isub(v32, one);
+    let boxed = emit_box_int32(builder, result);
+    builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    let result_val = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

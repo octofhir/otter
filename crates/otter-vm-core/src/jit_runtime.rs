@@ -13,6 +13,17 @@ pub(crate) fn runtime_helpers() -> &'static RuntimeHelpers {
     RUNTIME_HELPERS.get_or_init(jit_helpers::build_runtime_helpers)
 }
 
+/// State for on-stack replacement: the interpreter's full frame snapshot
+/// to be loaded by JIT code at a loop header entry point.
+pub(crate) struct OsrState {
+    /// Bytecode PC of the loop header to enter.
+    pub entry_pc: u32,
+    /// All local variable values from the interpreter frame.
+    pub locals: Vec<Value>,
+    /// All register values from the interpreter frame.
+    pub registers: Vec<Value>,
+}
+
 /// Result of attempting JIT execution at the otter-vm-core level.
 ///
 /// Unlike `otter_vm_exec::JitExecResult`, this carries VM-level `Value` types
@@ -51,6 +62,7 @@ pub(crate) fn try_execute_jit(
     vm_ctx: *mut crate::context::VmContext,
     constants: *const otter_vm_bytecode::ConstantPool,
     upvalues: &[crate::value::UpvalueCell],
+    osr: Option<OsrState>,
 ) -> JitCallResult {
     let this_raw = if vm_ctx.is_null() {
         Value::undefined().to_jit_bits()
@@ -65,11 +77,29 @@ pub(crate) fn try_execute_jit(
         }
     };
 
-    // Allocate deopt state buffers for precise resume.
+    // Allocate deopt state buffers for precise resume / OSR input.
     let local_count = function.local_count as usize;
     let reg_count = function.register_count as usize;
     let mut deopt_locals = vec![0_i64; local_count];
     let mut deopt_regs = vec![0_i64; reg_count];
+
+    // For OSR entry, pre-fill deopt buffers with the interpreter's frame state.
+    // The JIT prologue will load these instead of reading from argv.
+    let osr_entry_pc: i64 = if let Some(ref state) = osr {
+        for (i, val) in state.locals.iter().enumerate() {
+            if i < local_count {
+                deopt_locals[i] = val.to_jit_bits();
+            }
+        }
+        for (i, val) in state.registers.iter().enumerate() {
+            if i < reg_count {
+                deopt_regs[i] = val.to_jit_bits();
+            }
+        }
+        state.entry_pc as i64
+    } else {
+        -1
+    };
 
     let jit_ctx = JitContext {
         function_ptr: function as *const Function,
@@ -116,6 +146,7 @@ pub(crate) fn try_execute_jit(
             std::ptr::null_mut()
         },
         deopt_regs_count: reg_count as u32,
+        osr_entry_pc,
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;

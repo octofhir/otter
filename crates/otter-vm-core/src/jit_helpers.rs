@@ -198,11 +198,11 @@ extern "C" fn otter_rt_get_prop_mono(obj_raw: i64, expected_shape: i64, offset: 
         None => return BAILOUT_SENTINEL,
     };
 
-    if obj_ref.shape_ptr_raw() != expected_shape as u64 {
+    if unsafe { obj_ref.shape_ptr_raw_unchecked() } != expected_shape as u64 {
         return BAILOUT_SENTINEL;
     }
 
-    match obj_ref.get_by_offset(offset as usize) {
+    match unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
         Some(val) => val.to_jit_bits(),
         None => BAILOUT_SENTINEL,
     }
@@ -255,7 +255,7 @@ extern "C" fn otter_rt_get_prop_const(
     }
 
     // Get shape pointer for comparison — avoids Arc clone (no atomic refcount).
-    let obj_shape_ptr = obj_ref.shape_ptr_raw();
+    let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
 
     // Read IC from feedback vector
     let function = unsafe { &*ctx.function_ptr };
@@ -294,7 +294,7 @@ extern "C" fn otter_rt_get_prop_const(
     };
 
     if let Some(offset) = cached_offset {
-        if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+        if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
             ic.record_hit();
             // MRU reordering for polymorphic
             if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
@@ -358,7 +358,7 @@ extern "C" fn otter_rt_get_prop_const(
                 }
                 _ => {}
             }
-            if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+            if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
                 return val.to_jit_bits();
             }
         }
@@ -414,7 +414,7 @@ extern "C" fn otter_rt_set_prop_const(
     let obj_ref = unsafe { &*(raw_ptr as *const JsObject) };
 
     // Get shape pointer — avoids Arc clone (no atomic refcount).
-    let obj_shape_ptr = obj_ref.shape_ptr_raw();
+    let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
 
     let function = unsafe { &*ctx.function_ptr };
     let feedback = function.feedback_vector.write();
@@ -648,14 +648,14 @@ extern "C" fn otter_rt_call_function(
         }
     }
 
-    let Some(args) = (unsafe { collect_args(argc, argv_ptr_raw) }) else {
-        return BAILOUT_SENTINEL;
-    };
-
     // Slow path: full interpreter re-entry
-    match interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), &args) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc, argv_ptr_raw, |args| {
+            interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), args)
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -964,13 +964,13 @@ unsafe fn extract_js_object(bits: u64) -> Option<&'static JsObject> {
         return None;
     }
     let header_offset = std::mem::offset_of!(GcAllocation<JsObject>, value);
-    let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
-    let tag = (*header_ptr).tag();
+    let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
+    let tag = unsafe { (*header_ptr).tag() };
     // Accept both OBJECT and ARRAY tags — arrays are JsObjects.
     if tag != gc_tags::OBJECT && tag != gc_tags::ARRAY {
         return None;
     }
-    Some(&*(raw_ptr as *const JsObject))
+    Some(unsafe { &*(raw_ptr as *const JsObject) })
 }
 
 // ---------------------------------------------------------------------------
@@ -981,13 +981,74 @@ unsafe fn collect_args(argc: usize, argv_ptr: i64) -> Option<Vec<crate::value::V
     let mut args = Vec::with_capacity(argc);
     if argc > 0 {
         let argv = argv_ptr as *const i64;
+        if argv.is_null() {
+            return None;
+        }
         for i in 0..argc {
-            let bits = *argv.add(i) as u64;
-            let arg = crate::value::Value::from_raw_bits_unchecked(bits)?;
+            let bits = unsafe { *argv.add(i) as u64 };
+            let arg = unsafe { crate::value::Value::from_raw_bits_unchecked(bits) }?;
             args.push(arg);
         }
     }
     Some(args)
+}
+
+/// Collect raw call arguments and pass them as a temporary slice.
+///
+/// For small arity calls, arguments live in a stack buffer to avoid heap
+/// allocation on the hottest call helper paths.
+#[allow(unsafe_code)]
+unsafe fn with_collected_args<R, F>(argc: usize, argv_ptr: i64, f: F) -> Option<R>
+where
+    F: FnOnce(&[crate::value::Value]) -> R,
+{
+    const STACK_ARG_CAP: usize = 8;
+
+    if argc == 0 {
+        return Some(f(&[]));
+    }
+
+    let argv = argv_ptr as *const i64;
+    if argv.is_null() {
+        return None;
+    }
+
+    if argc <= STACK_ARG_CAP {
+        let mut stack: [std::mem::MaybeUninit<crate::value::Value>; STACK_ARG_CAP] =
+            [const { std::mem::MaybeUninit::uninit() }; STACK_ARG_CAP];
+        let mut initialized = 0usize;
+
+        for i in 0..argc {
+            let bits = unsafe { *argv.add(i) as u64 };
+            let arg = match unsafe { crate::value::Value::from_raw_bits_unchecked(bits) } {
+                Some(v) => v,
+                None => {
+                    for slot in stack.iter_mut().take(initialized) {
+                        unsafe { slot.assume_init_drop() };
+                    }
+                    return None;
+                }
+            };
+            stack[i].write(arg);
+            initialized += 1;
+        }
+
+        let args =
+            unsafe { std::slice::from_raw_parts(stack.as_ptr() as *const crate::value::Value, argc) };
+        let result = f(args);
+        for slot in stack.iter_mut().take(initialized) {
+            unsafe { slot.assume_init_drop() };
+        }
+        Some(result)
+    } else {
+        let mut heap_args = Vec::with_capacity(argc);
+        for i in 0..argc {
+            let bits = unsafe { *argv.add(i) as u64 };
+            let arg = unsafe { crate::value::Value::from_raw_bits_unchecked(bits) }?;
+            heap_args.push(arg);
+        }
+        Some(f(&heap_args))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,7 +1242,7 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = obj_ref.shape_ptr_raw();
+        let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -1207,7 +1268,8 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
                     _ => None,
                 };
                 if let Some(offset) = cached_offset {
-                    if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
+                    {
                         ic.record_hit();
                         return val.to_jit_bits();
                     }
@@ -1291,7 +1353,7 @@ extern "C" fn otter_rt_set_elem(
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = obj_ref.shape_ptr_raw();
+        let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -1504,22 +1566,21 @@ extern "C" fn otter_rt_construct(
     }
 
     let argc = argc_raw as usize;
-    let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
-        Some(a) => a,
-        None => return BAILOUT_SENTINEL,
-    };
-
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    match interpreter.call_function_construct(
-        vm_ctx,
-        &callee,
-        crate::value::Value::undefined(),
-        &args,
-    ) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc, argv_ptr_raw, |args| {
+            interpreter.call_function_construct(
+                vm_ctx,
+                &callee,
+                crate::value::Value::undefined(),
+                args,
+            )
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -1555,10 +1616,6 @@ extern "C" fn otter_rt_call_method(
         None => return BAILOUT_SENTINEL,
     };
     let argc = argc_raw as usize;
-    let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
-        Some(a) => a,
-        None => return BAILOUT_SENTINEL,
-    };
 
     let constants = unsafe { &*ctx.constants };
     let method_name_units = match constants.get(method_name_idx as u32) {
@@ -1593,7 +1650,7 @@ extern "C" fn otter_rt_call_method(
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
             // IC fast path
             if !obj_ref.is_dictionary_mode() && ic.proto_epoch_matches(ctx.proto_epoch) {
-                let obj_shape_ptr = obj_ref.shape_ptr_raw();
+                let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
                 let cached_offset = match &mut ic.ic_state {
                     InlineCacheState::Monomorphic { shape_id, offset } => {
                         if obj_shape_ptr == *shape_id {
@@ -1619,7 +1676,8 @@ extern "C" fn otter_rt_call_method(
                     _ => None,
                 };
                 if let Some(offset) = cached_offset {
-                    if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
+                    {
                         ic.record_hit();
                         method = Some(val);
                     }
@@ -1629,7 +1687,7 @@ extern "C" fn otter_rt_call_method(
             // Slow path on IC miss: resolve method and update IC.
             if method.is_none() && !obj_ref.is_dictionary_mode() {
                 if let Some(offset) = obj_ref.shape().get_offset(&method_key) {
-                    let shape_ptr = obj_ref.shape_ptr_raw();
+                    let shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
                     let current_epoch = ctx.proto_epoch;
                     match &mut ic.ic_state {
                         InlineCacheState::Uninitialized => {
@@ -1671,7 +1729,7 @@ extern "C" fn otter_rt_call_method(
                         }
                         _ => {}
                     }
-                    method = obj_ref.get_by_offset(offset as usize);
+                    method = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) };
                 }
             }
         }
@@ -1718,9 +1776,13 @@ extern "C" fn otter_rt_call_method(
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    match interpreter.call_function(vm_ctx, &method, receiver, &args) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc, argv_ptr_raw, |args| {
+            interpreter.call_function(vm_ctx, &method, receiver, args)
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -1754,17 +1816,63 @@ extern "C" fn otter_rt_call_with_receiver(
     };
 
     let argc = argc_raw as usize;
-    let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
-        Some(a) => a,
-        None => return BAILOUT_SENTINEL,
-    };
 
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    match interpreter.call_function(vm_ctx, &callee, this_val, &args) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    // Fast path: direct JIT-to-JIT call for JS closures with compiled code.
+    if let Some(closure) = callee.as_function() {
+        if !closure.is_generator && !closure.is_async {
+            if let Some(func_info) = closure.module.function(closure.function_index) {
+                if !func_info.flags.has_rest {
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    if argc > 0 && args_ptr.is_null() {
+                        return BAILOUT_SENTINEL;
+                    }
+                    let this_raw_for_jit = if !func_info.flags.is_strict
+                        && (this_val.is_undefined() || this_val.is_null())
+                    {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    } else {
+                        this_val.to_jit_bits()
+                    };
+                    match crate::jit_runtime::try_execute_jit_from_raw_args(
+                        closure.module.module_id,
+                        closure.function_index,
+                        func_info,
+                        argc as u32,
+                        args_ptr,
+                        this_raw_for_jit,
+                        callee.to_jit_bits(),
+                        crate::value::Value::null().to_jit_bits(),
+                        vm_ctx.cached_proto_epoch,
+                        ctx.interpreter,
+                        ctx.vm_ctx,
+                        &closure.module.constants as *const _,
+                        &closure.upvalues,
+                    ) {
+                        crate::jit_runtime::JitCallResult::Ok(value) => {
+                            return value.to_jit_bits();
+                        }
+                        // Bailout or not compiled: fall through to interpreter path.
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    match unsafe {
+        with_collected_args(argc, argv_ptr_raw, |args| {
+            interpreter.call_function(vm_ctx, &callee, this_val, args)
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -1820,17 +1928,17 @@ extern "C" fn otter_rt_call_method_computed(
     };
 
     let argc = argc_raw as usize;
-    let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
-        Some(a) => a,
-        None => return BAILOUT_SENTINEL,
-    };
 
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    match interpreter.call_function(vm_ctx, &method, receiver, &args) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc, argv_ptr_raw, |args| {
+            interpreter.call_function(vm_ctx, &method, receiver, args)
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -2663,15 +2771,15 @@ extern "C" fn otter_rt_tail_call(ctx_raw: i64, callee_raw: i64, argc: i64, argv_
         return BAILOUT_SENTINEL;
     };
 
-    let Some(args) = (unsafe { collect_args(argc as usize, argv_ptr) }) else {
-        return BAILOUT_SENTINEL;
-    };
-
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-    match interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), &args) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc as usize, argv_ptr, |args| {
+            interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), args)
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 
@@ -2950,24 +3058,22 @@ extern "C" fn otter_rt_call_super(ctx_raw: i64, argc_raw: i64, argv_ptr_raw: i64
         return BAILOUT_SENTINEL;
     };
 
-    let argc = argc_raw as usize;
-    let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
-        Some(a) => a,
-        None => return BAILOUT_SENTINEL,
-    };
-
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
     // Call super constructor
-    match interpreter.call_function_construct(
-        vm_ctx,
-        &super_ctor,
-        crate::value::Value::undefined(),
-        &args,
-    ) {
-        Ok(result) => result.to_jit_bits(),
-        Err(_) => BAILOUT_SENTINEL,
+    match unsafe {
+        with_collected_args(argc_raw as usize, argv_ptr_raw, |args| {
+            interpreter.call_function_construct(
+                vm_ctx,
+                &super_ctor,
+                crate::value::Value::undefined(),
+                args,
+            )
+        })
+    } {
+        Some(Ok(result)) => result.to_jit_bits(),
+        _ => BAILOUT_SENTINEL,
     }
 }
 

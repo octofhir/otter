@@ -894,6 +894,27 @@ impl JsObject {
         }
     }
 
+    /// Get property value by offset without borrow tracking overhead.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee there is no active mutable borrow of the
+    /// corresponding property storage.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn get_by_offset_unchecked(&self, offset: usize) -> Option<Value> {
+        if offset < INLINE_PROPERTY_COUNT {
+            unsafe { self.inline_properties.get_unchecked() }
+                .get(offset)
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.desc.value().cloned())
+        } else {
+            unsafe { self.overflow_properties.get_unchecked() }
+                .get(offset - INLINE_PROPERTY_COUNT)
+                .and_then(|entry| entry.desc.value().cloned())
+        }
+    }
+
     /// Get property entry by offset (includes accessor properties)
     #[inline]
     pub fn get_property_entry_by_offset(&self, offset: usize) -> Option<PropertyDescriptor> {
@@ -1017,6 +1038,17 @@ impl JsObject {
         std::sync::Arc::as_ptr(&*borrow) as u64
     }
 
+    /// Get raw shape pointer without borrow tracking overhead.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee no active mutable borrow of `shape`.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn shape_ptr_raw_unchecked(&self) -> u64 {
+        std::sync::Arc::as_ptr(unsafe { self.shape.get_unchecked() }) as u64
+    }
+
     /// Check if object is in dictionary mode (IC-uncacheable).
     /// Objects in dictionary mode use HashMap storage instead of shape-based indexed storage.
     #[inline]
@@ -1088,7 +1120,10 @@ impl JsObject {
     /// Get property by key
     pub fn get(&self, key: &PropertyKey) -> Option<Value> {
         // Special handling for array "length" property.
-        if self.is_array() && let PropertyKey::String(s) = key && s.as_str() == "length" {
+        if self.is_array()
+            && let PropertyKey::String(s) = key
+            && s.as_str() == "length"
+        {
             let len = self.array_length();
             if len <= i32::MAX as usize {
                 return Some(Value::int32(len as i32));

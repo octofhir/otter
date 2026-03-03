@@ -1,11 +1,14 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use otter_vm_bytecode::function::InlineCacheState;
 use otter_vm_bytecode::{Constant, Function, Module};
 use otter_vm_jit::translator::can_translate_function_with_helpers;
 
 /// Maximum instruction count for a function to be eligible for inlining.
 const INLINE_BUDGET: usize = 32;
+/// Maximum number of dequeue deferrals for functions with completely empty feedback.
+const MAX_EMPTY_FEEDBACK_DEFERRALS: u8 = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct JitCompileRequest {
@@ -23,6 +26,7 @@ struct PendingJitCompileRequest {
     module: Arc<Module>,
     module_id: u64,
     function_index: u32,
+    empty_feedback_deferrals: u8,
 }
 
 #[derive(Default)]
@@ -41,6 +45,15 @@ fn lock_queue() -> std::sync::MutexGuard<'static, JitQueueState> {
     queue_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[inline]
+fn has_feedback_observations(function: &Function) -> bool {
+    function.feedback_vector.read().iter().any(|metadata| {
+        metadata.hit_count > 0
+            || metadata.type_observations != Default::default()
+            || !matches!(metadata.ic_state, InlineCacheState::Uninitialized)
+    })
 }
 
 /// Enqueue a hot function for JIT compilation.
@@ -66,6 +79,7 @@ pub fn enqueue_hot_function(
         module: Arc::clone(module),
         module_id: key.0,
         function_index,
+        empty_feedback_deferrals: 0,
     });
 
     true
@@ -73,13 +87,31 @@ pub fn enqueue_hot_function(
 
 pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
     let mut state = lock_queue();
-    while let Some(pending) = state.pending.pop_front() {
+    let mut remaining = state.pending.len();
+    while remaining > 0 {
+        remaining -= 1;
+        let Some(mut pending) = state.pending.pop_front() else {
+            break;
+        };
         let Some(function) = pending.module.function(pending.function_index) else {
             state
                 .enqueued
                 .remove(&(pending.module_id, pending.function_index));
             continue;
         };
+
+        // Defer compilation when the function has a feedback vector but nothing
+        // has been observed yet. This avoids freezing an "all-default" snapshot
+        // too early. Cap deferrals to prevent starvation for low-feedback code.
+        let feedback_len = function.feedback_vector.read().len();
+        if feedback_len > 0
+            && !has_feedback_observations(function)
+            && pending.empty_feedback_deferrals < MAX_EMPTY_FEEDBACK_DEFERRALS
+        {
+            pending.empty_feedback_deferrals = pending.empty_feedback_deferrals.saturating_add(1);
+            state.pending.push_back(pending);
+            continue;
+        }
 
         let constants: Vec<Constant> = pending.module.constants.iter().cloned().collect();
         if !can_translate_function_with_helpers(function, &constants) {
@@ -328,6 +360,91 @@ mod tests {
             request.function.feedback_vector.read()[0]
                 .type_observations
                 .seen_int32
+        );
+
+        mark_request_finished(module.module_id, 0);
+        clear_for_tests();
+    }
+
+    #[test]
+    fn defers_empty_feedback_until_observed() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let function = Function::builder()
+            .name("jit_queue_feedback_deferral")
+            .register_count(1)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 7,
+            })
+            .instruction(Instruction::Return { src: Register(0) })
+            .feedback_vector_size(1)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-feedback-deferral.js");
+        let index = builder.add_function(function);
+        let module = Arc::new(builder.entry_point(index).build());
+
+        let function = module
+            .function(0)
+            .expect("test module should expose entry function");
+        assert!(enqueue_hot_function(&module, 0, function));
+
+        // First dequeue should defer because feedback is still all-default.
+        assert!(pop_next_request().is_none());
+        assert_eq!(pending_count(), 1);
+
+        // Populate feedback and verify next dequeue snapshots the update.
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_int32();
+        let request = pop_next_request().expect("request should be available after feedback");
+        assert!(
+            request.function.feedback_vector.read()[0]
+                .type_observations
+                .seen_int32
+        );
+
+        mark_request_finished(module.module_id, 0);
+        clear_for_tests();
+    }
+
+    #[test]
+    fn empty_feedback_deferral_has_starvation_cap() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let function = Function::builder()
+            .name("jit_queue_feedback_deferral_cap")
+            .register_count(1)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 7,
+            })
+            .instruction(Instruction::Return { src: Register(0) })
+            .feedback_vector_size(1)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-feedback-deferral-cap.js");
+        let index = builder.add_function(function);
+        let module = Arc::new(builder.entry_point(index).build());
+
+        let function = module
+            .function(0)
+            .expect("test module should expose entry function");
+        assert!(enqueue_hot_function(&module, 0, function));
+
+        for _ in 0..MAX_EMPTY_FEEDBACK_DEFERRALS {
+            assert!(
+                pop_next_request().is_none(),
+                "request should still be deferred while under cap"
+            );
+        }
+
+        assert!(
+            pop_next_request().is_some(),
+            "request should compile after starvation cap even without feedback"
         );
 
         mark_request_finished(module.module_id, 0);

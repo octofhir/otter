@@ -2969,62 +2969,37 @@ pub fn translate_function_with_constants(
                 shape_id,
                 offset,
             } => {
-                let full_ref = helpers
-                    .and_then(|h| h.get(HelperKind::GetPropConst))
-                    .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_vars, *obj);
-
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
-
                 let result = if let Some(mono_helper) = mono_ref {
-                    // The macro expects `key` and `ic_index`. Since we skipped the IC lookup
-                    // we pass dummy values (0) because `emit_mono_prop_with_fallback`
-                    // is an abstraction that requires an `ic_index` to fallback to `GetPropConst`.
-                    // Wait! we need `name` and `ic_idx` to fallback. `GetPropQuickened` doesn't have them anymore.
-                    // For the JIT, if `GetPropQuickened` misses, we emit a bailout!
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
+
+                    let shape_const = builder.ins().iconst(types::I64, *shape_id as i64);
+                    let offset_const = builder.ins().iconst(types::I64, *offset as i64);
+                    let mono_call = builder
+                        .ins()
+                        .call(mono_helper, &[obj_val, shape_const, offset_const]);
+                    let mono_result = builder.inst_results(mono_call)[0];
+
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bailout = builder.ins().icmp(IntCC::Equal, mono_result, sentinel);
                     let bail_block = builder.create_block();
-                    let continue_block = builder.create_block();
-                    let is_object = type_guards::emit_is_object(builder, obj_val);
-                    // Check if object
-                    let shape_check_block = builder.create_block();
+                    let ok_block = builder.create_block();
                     builder
                         .ins()
-                        .brif(is_object, shape_check_block, &[], bail_block, &[]);
+                        .brif(is_bailout, bail_block, &[], ok_block, &[]);
 
-                    builder.switch_to_block(shape_check_block);
-                    // Extract ptr and check shape
-                    let obj_ptr = builder.ins().band_imm(obj_val, !type_guards::PTR_MASK);
-                    let shape_ptr_addr = builder.ins().iadd_imm(obj_ptr, 16); // shape is offset 16
-                    let current_shape =
-                        builder
-                            .ins()
-                            .load(types::I64, MemFlags::new(), shape_ptr_addr, 0);
-                    let expected_shape = builder.ins().iconst(types::I64, *shape_id as i64);
-                    let shape_match =
-                        builder
-                            .ins()
-                            .icmp(IntCC::Equal, current_shape, expected_shape);
-
-                    let load_block = builder.create_block();
+                    builder.switch_to_block(ok_block);
                     builder
                         .ins()
-                        .brif(shape_match, load_block, &[], bail_block, &[]);
-
-                    builder.switch_to_block(load_block);
-                    let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24); // properties is offset 24
-                    let props_ptr =
-                        builder
-                            .ins()
-                            .load(types::I64, MemFlags::new(), props_ptr_addr, 0);
-                    let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
-                    let val = builder.ins().load(types::I64, MemFlags::new(), val_addr, 0);
-                    builder.ins().jump(continue_block, &[BlockArg::Value(val)]);
+                        .jump(merge_block, &[BlockArg::Value(mono_result)]);
 
                     builder.switch_to_block(bail_block);
                     emit_bailout_return(builder);
 
-                    builder.switch_to_block(continue_block);
-                    builder.block_params(continue_block)[0]
+                    builder.switch_to_block(merge_block);
+                    builder.block_params(merge_block)[0]
                 } else {
                     // Fallback bailout
                     emit_bailout_return(builder);

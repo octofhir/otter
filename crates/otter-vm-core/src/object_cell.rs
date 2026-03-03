@@ -56,6 +56,19 @@ impl<T> ObjectCell<T> {
     pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
+
+    /// Get a shared reference to the inner value without borrow tracking.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee there is no active mutable borrow of this cell
+    /// for the duration of the returned reference.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn get_unchecked(&self) -> &T {
+        // SAFETY: Caller guarantees aliasing/borrow invariants.
+        unsafe { &*self.value.as_ptr() }
+    }
 }
 
 // SAFETY: ObjectCell is only ever accessed from a single thread.

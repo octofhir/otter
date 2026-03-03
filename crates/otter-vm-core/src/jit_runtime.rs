@@ -1,9 +1,9 @@
 use std::sync::OnceLock;
 
-use otter_vm_bytecode::function::BailoutAction;
 use otter_vm_bytecode::Function;
-use otter_vm_jit::{BAILOUT_SENTINEL, BailoutReason};
+use otter_vm_bytecode::function::BailoutAction;
 use otter_vm_jit::runtime_helpers::RuntimeHelpers;
+use otter_vm_jit::{BAILOUT_SENTINEL, BailoutReason};
 
 use crate::jit_helpers::{self, JitContext};
 use crate::value::Value;
@@ -228,7 +228,16 @@ pub(crate) fn try_execute_jit(
         )
     };
 
-    map_exec_result(exec_result, &deopt_locals, &deopt_regs)
+    let result = map_exec_result(exec_result, &deopt_locals, &deopt_regs);
+    if matches!(result, JitCallResult::NotCompiled)
+        && function.is_hot_function()
+        && !function.is_deoptimized()
+        && otter_vm_exec::pending_count() > 0
+    {
+        // Keep draining deferred compile requests for hot functions.
+        otter_vm_exec::compile_one_pending_request(runtime_helpers());
+    }
+    result
 }
 
 /// Try to execute JIT-compiled code with raw NaN-boxed argument bits.
@@ -294,17 +303,28 @@ pub(crate) fn try_execute_jit_from_raw_args(
         }
 
         let action = function.record_bailout(otter_vm_exec::jit_deopt_threshold());
-        if matches!(action, BailoutAction::Recompile | BailoutAction::PermanentDeopt) {
+        if matches!(
+            action,
+            BailoutAction::Recompile | BailoutAction::PermanentDeopt
+        ) {
             otter_vm_exec::invalidate_jit_code(module_id, function_index);
         }
         return match action {
             BailoutAction::Recompile => JitCallResult::NeedsRecompilation,
-            BailoutAction::Continue | BailoutAction::PermanentDeopt => JitCallResult::BailoutRestart,
+            BailoutAction::Continue | BailoutAction::PermanentDeopt => {
+                JitCallResult::BailoutRestart
+            }
         };
     }
 
-    let exec_result =
-        otter_vm_exec::try_execute_jit_raw(module_id, function_index, function, argc, args_ptr, ctx_ptr);
+    let exec_result = otter_vm_exec::try_execute_jit_raw(
+        module_id,
+        function_index,
+        function,
+        argc,
+        args_ptr,
+        ctx_ptr,
+    );
 
     map_exec_result(exec_result, &[], &[])
 }

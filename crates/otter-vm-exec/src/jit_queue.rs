@@ -18,9 +18,16 @@ pub(crate) struct JitCompileRequest {
     pub(crate) module_functions: Vec<(u32, Function)>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingJitCompileRequest {
+    module: Arc<Module>,
+    module_id: u64,
+    function_index: u32,
+}
+
 #[derive(Default)]
 struct JitQueueState {
-    pending: VecDeque<JitCompileRequest>,
+    pending: VecDeque<PendingJitCompileRequest>,
     enqueued: HashSet<(u64, u32)>,
 }
 
@@ -55,42 +62,10 @@ pub fn enqueue_hot_function(
         return false;
     }
 
-    // Collect small, inline-eligible functions from the same module.
-    let mut module_functions = Vec::new();
-    for (idx, func) in module.functions.iter().enumerate() {
-        let idx = idx as u32;
-        if idx == function_index {
-            continue; // Don't self-inline
-        }
-        let instrs = func.instructions.read();
-        if instrs.len() > INLINE_BUDGET {
-            continue;
-        }
-        if func.flags.is_async
-            || func.flags.is_generator
-            || func.flags.has_rest
-            || func.flags.uses_eval
-            || func.flags.uses_arguments
-            || !func.upvalues.is_empty()
-        {
-            continue;
-        }
-        // Check that the callee doesn't use LoadThis (this-binding differs when inlined)
-        let has_load_this = instrs
-            .iter()
-            .any(|inst| matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. }));
-        if has_load_this {
-            continue;
-        }
-        module_functions.push((idx, func.clone()));
-    }
-
-    state.pending.push_back(JitCompileRequest {
+    state.pending.push_back(PendingJitCompileRequest {
+        module: Arc::clone(module),
         module_id: key.0,
         function_index,
-        constants,
-        function: function.clone(),
-        module_functions,
     });
 
     true
@@ -98,7 +73,62 @@ pub fn enqueue_hot_function(
 
 pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
     let mut state = lock_queue();
-    state.pending.pop_front()
+    while let Some(pending) = state.pending.pop_front() {
+        let Some(function) = pending.module.function(pending.function_index) else {
+            state
+                .enqueued
+                .remove(&(pending.module_id, pending.function_index));
+            continue;
+        };
+
+        let constants: Vec<Constant> = pending.module.constants.iter().cloned().collect();
+        if !can_translate_function_with_helpers(function, &constants) {
+            state
+                .enqueued
+                .remove(&(pending.module_id, pending.function_index));
+            continue;
+        }
+
+        // Snapshot inline candidates at dequeue-time so feedback is as fresh as possible.
+        let mut module_functions = Vec::new();
+        for (idx, func) in pending.module.functions.iter().enumerate() {
+            let idx = idx as u32;
+            if idx == pending.function_index {
+                continue; // Don't self-inline
+            }
+            let instrs = func.instructions.read();
+            if instrs.len() > INLINE_BUDGET {
+                continue;
+            }
+            if func.flags.is_async
+                || func.flags.is_generator
+                || func.flags.has_rest
+                || func.flags.uses_eval
+                || func.flags.uses_arguments
+                || !func.upvalues.is_empty()
+            {
+                continue;
+            }
+            // Check that the callee doesn't use LoadThis (this-binding differs when inlined)
+            let has_load_this = instrs
+                .iter()
+                .any(|inst| matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. }));
+            if has_load_this {
+                continue;
+            }
+            module_functions.push((idx, func.clone()));
+        }
+
+        return Some(JitCompileRequest {
+            module_id: pending.module_id,
+            function_index: pending.function_index,
+            constants,
+            function: function.clone(),
+            module_functions,
+        });
+    }
+
+    None
 }
 
 pub(crate) fn mark_request_finished(module_id: u64, function_index: u32) {
@@ -260,6 +290,47 @@ mod tests {
         );
 
         assert_eq!(pending_count(), 1);
+        clear_for_tests();
+    }
+
+    #[test]
+    fn snapshots_feedback_at_dequeue_time() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let function = Function::builder()
+            .name("jit_queue_feedback_snapshot")
+            .register_count(1)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 7,
+            })
+            .instruction(Instruction::Return { src: Register(0) })
+            .feedback_vector_size(1)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-feedback-test.js");
+        let index = builder.add_function(function);
+        let module = Arc::new(builder.entry_point(index).build());
+
+        let function = module
+            .function(0)
+            .expect("test module should expose entry function");
+        assert!(enqueue_hot_function(&module, 0, function));
+
+        // Mutate feedback after enqueue; dequeue snapshot must include this update.
+        function.feedback_vector.write()[0]
+            .type_observations
+            .observe_int32();
+
+        let request = pop_next_request().expect("request should be available");
+        assert!(
+            request.function.feedback_vector.read()[0]
+                .type_observations
+                .seen_int32
+        );
+
+        mark_request_finished(module.module_id, 0);
         clear_for_tests();
     }
 }

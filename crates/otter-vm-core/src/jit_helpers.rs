@@ -245,13 +245,13 @@ extern "C" fn otter_rt_get_prop_const(
     let obj_ref = unsafe { &*(raw_ptr as *const JsObject) };
 
     // Fast path: array .length access (virtual property, not in shape/IC).
-    if tag == gc_tags::ARRAY && is_length_constant(ctx, name_idx) {
+    // Some array-like objects can carry OBJECT GC tag while still using array
+    // semantics (`flags.is_array`), so rely on the object flag, not only tag.
+    if is_length_constant(ctx, name_idx) {
         let flags = obj_ref.flags.borrow();
-        if let Some(sparse_len) = flags.sparse_array_length {
-            return crate::value::Value::int32(sparse_len as i32).to_jit_bits();
+        if flags.is_array {
+            return crate::value::Value::int32(obj_ref.array_length() as i32).to_jit_bits();
         }
-        drop(flags);
-        return crate::value::Value::int32(obj_ref.elements.borrow().len() as i32).to_jit_bits();
     }
 
     // Get shape pointer for comparison — avoids Arc clone (no atomic refcount).
@@ -594,21 +594,7 @@ extern "C" fn otter_rt_call_function(
         return BAILOUT_SENTINEL;
     }
 
-    // Collect arguments from the argv pointer
     let argc = argc_raw as usize;
-    let mut args = Vec::with_capacity(argc);
-    if argc > 0 {
-        let argv = argv_ptr_raw as *const i64;
-        for i in 0..argc {
-            let bits = unsafe { *argv.add(i) } as u64;
-            // Reconstruct each argument Value
-            let arg = match unsafe { crate::value::Value::from_raw_bits_unchecked(bits) } {
-                Some(v) => v,
-                None => return BAILOUT_SENTINEL,
-            };
-            args.push(arg);
-        }
-    }
 
     // SAFETY: interpreter and vm_ctx are valid pointers set by try_execute_jit.
     // The interpreter is paused (not executing instructions), and we have
@@ -623,17 +609,33 @@ extern "C" fn otter_rt_call_function(
         if !closure.is_generator && !closure.is_async {
             if let Some(func_info) = closure.module.function(closure.function_index) {
                 if !func_info.flags.has_rest {
-                    match crate::jit_runtime::try_execute_jit(
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    if argc > 0 && args_ptr.is_null() {
+                        return BAILOUT_SENTINEL;
+                    }
+                    let this_raw = if func_info.flags.is_strict {
+                        crate::value::Value::undefined().to_jit_bits()
+                    } else {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    };
+                    match crate::jit_runtime::try_execute_jit_from_raw_args(
                         closure.module.module_id,
                         closure.function_index,
                         func_info,
-                        &args,
+                        argc as u32,
+                        args_ptr,
+                        this_raw,
+                        callee.to_jit_bits(),
+                        crate::value::Value::null().to_jit_bits(),
                         vm_ctx.cached_proto_epoch,
                         ctx.interpreter,
                         ctx.vm_ctx,
                         &closure.module.constants as *const _,
                         &closure.upvalues,
-                        None,
                     ) {
                         crate::jit_runtime::JitCallResult::Ok(value) => {
                             return value.to_jit_bits();
@@ -645,6 +647,10 @@ extern "C" fn otter_rt_call_function(
             }
         }
     }
+
+    let Some(args) = (unsafe { collect_args(argc, argv_ptr_raw) }) else {
+        return BAILOUT_SENTINEL;
+    };
 
     // Slow path: full interpreter re-entry
     match interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), &args) {
@@ -669,16 +675,26 @@ extern "C" fn otter_rt_new_object(ctx_raw: i64) -> i64 {
 
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
-    // Get Object.prototype for proper prototype chain
+    // Fast path: resolve Object.prototype via realm intrinsics (no global lookup).
+    // Fallback to the global-property path only if realm metadata is unavailable.
+    let realm_id = vm_ctx
+        .current_frame()
+        .map(|frame| frame.realm_id)
+        .unwrap_or_else(|| vm_ctx.realm_id());
     let proto = vm_ctx
-        .global()
-        .get(&crate::object::PropertyKey::string("Object"))
-        .and_then(|obj_ctor| {
-            obj_ctor
-                .as_object()
-                .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
-        })
-        .and_then(|proto_val| proto_val.as_object());
+        .realm_intrinsics(realm_id)
+        .map(|intrinsics| intrinsics.object_prototype)
+        .or_else(|| {
+            vm_ctx
+                .global()
+                .get(&crate::object::PropertyKey::string("Object"))
+                .and_then(|obj_ctor| {
+                    obj_ctor
+                        .as_object()
+                        .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
+                })
+                .and_then(|proto_val| proto_val.as_object())
+        });
 
     let obj = crate::gc::GcRef::new(JsObject::new(
         proto
@@ -708,8 +724,17 @@ extern "C" fn otter_rt_new_array(ctx_raw: i64, len_raw: i64) -> i64 {
 
     let arr = crate::gc::GcRef::new(JsObject::array(len, vm_ctx.memory_manager().clone()));
 
-    // Attach Array.prototype for iterable support and methods
-    if let Some(array_obj) = vm_ctx.get_global("Array").and_then(|v| v.as_object()) {
+    // Fast path: realm intrinsics; fallback to global lookup.
+    let realm_id = vm_ctx
+        .current_frame()
+        .map(|frame| frame.realm_id)
+        .unwrap_or_else(|| vm_ctx.realm_id());
+    if let Some(array_proto) = vm_ctx
+        .realm_intrinsics(realm_id)
+        .map(|intrinsics| intrinsics.array_prototype)
+    {
+        arr.set_prototype(crate::value::Value::object(array_proto));
+    } else if let Some(array_obj) = vm_ctx.get_global("Array").and_then(|v| v.as_object()) {
         if let Some(array_proto) = array_obj
             .get(&crate::object::PropertyKey::string("prototype"))
             .and_then(|v| v.as_object())

@@ -248,8 +248,8 @@ pub(crate) enum ArithOp {
 /// Emit a guarded i32 binary arithmetic operation.
 ///
 /// Checks that both operands are NaN-boxed int32, unboxes them, performs the
-/// operation with overflow detection, and reboxes the result. On type-check
-/// failure or overflow, branches to `slow_block`.
+/// operation with overflow detection, and reboxes the result. On overflow,
+/// widens to f64 inline and returns a boxed number result.
 ///
 /// The caller must fill in `slow_block` with a generic fallback (e.g., runtime
 /// helper call) and jump to `merge_block` with the result.
@@ -261,6 +261,7 @@ pub(crate) fn emit_guarded_i32_arith(
 ) -> GuardedResult {
     let i32_fast = builder.create_block();
     let box_block = builder.create_block();
+    let overflow_f64_block = builder.create_block();
     let slow_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
@@ -288,12 +289,22 @@ pub(crate) fn emit_guarded_i32_arith(
     let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
     builder
         .ins()
-        .brif(no_overflow, box_block, &[], slow_block, &[]);
+        .brif(no_overflow, box_block, &[], overflow_f64_block, &[]);
 
     // Rebox the i32 result
     builder.switch_to_block(box_block);
     let boxed = emit_box_int32(builder, result_i32);
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    // Overflow path: widen to f64 inline (native JIT path, no helper call)
+    builder.switch_to_block(overflow_f64_block);
+    let widened_f64 = builder.ins().fcvt_from_sint(types::F64, result_i64);
+    let widened_bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlags::new(), widened_f64);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(widened_bits)]);
 
     let result = builder.block_params(merge_block)[0];
     GuardedResult {
@@ -1654,6 +1665,118 @@ pub(crate) fn emit_bare_i32_dec(builder: &mut FunctionBuilder, val: Value) -> Gu
     let result = builder.ins().isub(v32, one);
     let boxed = emit_box_int32(builder, result);
     builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+    let result_val = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw i32 arithmetic (unboxed inputs/outputs for versioned loop bodies)
+// ---------------------------------------------------------------------------
+
+/// Raw i32 arithmetic — inputs are raw i32 (NOT NaN-boxed), output is raw i32.
+///
+/// On overflow, branches to `slow_block` where the caller should fall back to
+/// the guarded (NaN-boxed) version at the same PC.
+/// The `merge_block` block param is `types::I32` (raw result).
+pub(crate) fn emit_raw_i32_arith(
+    builder: &mut FunctionBuilder,
+    op: ArithOp,
+    lhs: Value,
+    rhs: Value,
+) -> GuardedResult {
+    let box_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I32);
+
+    // Sign-extend to i64 for overflow detection
+    let l64 = builder.ins().sextend(types::I64, lhs);
+    let r64 = builder.ins().sextend(types::I64, rhs);
+
+    let result_i64 = match op {
+        ArithOp::Add => builder.ins().iadd(l64, r64),
+        ArithOp::Sub => builder.ins().isub(l64, r64),
+        ArithOp::Mul => builder.ins().imul(l64, r64),
+    };
+
+    // Overflow check: truncate to i32, sign-extend back, compare
+    let result_i32 = builder.ins().ireduce(types::I32, result_i64);
+    let check = builder.ins().sextend(types::I64, result_i32);
+    let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
+    builder
+        .ins()
+        .brif(no_overflow, box_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(box_block);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(result_i32)]);
+
+    let result = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result,
+    }
+}
+
+/// Raw i32 comparison — inputs are raw i32, output is NaN-boxed boolean (i64).
+pub(crate) fn emit_raw_i32_cmp(
+    builder: &mut FunctionBuilder,
+    cc: IntCC,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let cmp = builder.ins().icmp(cc, lhs, rhs);
+    emit_bool_to_nanbox(builder, cmp)
+}
+
+/// Raw i32 increment — input is raw i32, output is raw i32.
+/// On overflow (val == i32::MAX), branches to slow_block.
+pub(crate) fn emit_raw_i32_inc(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
+    let ok_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I32);
+
+    let int_max = builder.ins().iconst(types::I32, i32::MAX as i64);
+    let not_max = builder.ins().icmp(IntCC::NotEqual, val, int_max);
+    builder.ins().brif(not_max, ok_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(ok_block);
+    let one = builder.ins().iconst(types::I32, 1);
+    let result = builder.ins().iadd(val, one);
+    builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
+
+    let result_val = builder.block_params(merge_block)[0];
+    GuardedResult {
+        merge_block,
+        slow_block,
+        result: result_val,
+    }
+}
+
+/// Raw i32 decrement — input is raw i32, output is raw i32.
+/// On overflow (val == i32::MIN), branches to slow_block.
+pub(crate) fn emit_raw_i32_dec(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
+    let ok_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I32);
+
+    let int_min = builder.ins().iconst(types::I32, i32::MIN as i64);
+    let not_min = builder.ins().icmp(IntCC::NotEqual, val, int_min);
+    builder.ins().brif(not_min, ok_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(ok_block);
+    let one = builder.ins().iconst(types::I32, 1);
+    let result = builder.ins().isub(val, one);
+    builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
     let result_val = builder.block_params(merge_block)[0];
     GuardedResult {

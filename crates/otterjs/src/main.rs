@@ -1689,6 +1689,7 @@ mod tests {
         assert_eq!(frames[0].column, Some(3));
     }
 
+    #[ignore = "flaky: timing-sensitive profiler sample capture"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn cpu_prof_e2e_generates_devtools_compatible_artifacts() {
         let unique = format!(

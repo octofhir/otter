@@ -961,9 +961,10 @@ mod tests {
 
     #[test]
     fn deopt_state_dump_captures_locals_and_registers_on_bailout() {
-        // This function adds two non-int32 values (f64), causing a bailout on the Add
-        // if we set the feedback vector to expect only int32. This tests that
-        // the deopt path dumps local/register state to the context buffer.
+        // This function adds a boolean and an int32. The Add fast path in JIT
+        // handles numeric values (int32/f64), but boolean is non-numeric and
+        // must deopt. This validates that deopt state dumping captures locals
+        // and registers correctly at the bailout site.
         //
         // Layout: local[0] = param a, reg[0] = loaded int, reg[1] = Add result
         // Bailout happens at pc 2 (Add) when type guard fails.
@@ -1020,8 +1021,8 @@ mod tests {
         // Write bailout_pc = -1 at offset 96 (so we can detect if it was written)
         ctx_buf[96..104].copy_from_slice(&(-1_i64).to_ne_bytes());
 
-        // Call with a f64 value (1.5) which will fail the int32 type guard → bailout
-        let argv = [1.5_f64.to_bits() as i64];
+        // Call with a boolean value, which fails numeric Add guard → bailout.
+        let argv = [boxed_bool(true)];
 
         let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 =
             unsafe { std::mem::transmute(artifact.code_ptr) };
@@ -1034,18 +1035,19 @@ mod tests {
         let bailout_pc = i64::from_ne_bytes(ctx_buf[96..104].try_into().unwrap());
         assert_eq!(bailout_pc, 2, "bailout should happen at pc 2 (Add)");
 
-        // Check deopt locals: local[0] should contain the f64 value 1.5
+        // Check deopt locals: local[0] should contain the boolean argument.
         assert_eq!(
-            deopt_locals[0] as u64,
-            1.5_f64.to_bits(),
-            "local[0] should contain the f64 param value"
+            deopt_locals[0],
+            boxed_bool(true),
+            "local[0] should contain the boolean param value"
         );
 
-        // Check deopt registers: reg[0] should contain the f64 param, reg[1] should be int32(10)
+        // Check deopt registers: reg[0] should contain the boolean param,
+        // reg[1] should contain int32(10).
         assert_eq!(
-            deopt_regs[0] as u64,
-            1.5_f64.to_bits(),
-            "reg[0] should contain GetLocal result (f64 1.5)"
+            deopt_regs[0],
+            boxed_bool(true),
+            "reg[0] should contain GetLocal result (boolean true)"
         );
         assert_eq!(
             deopt_regs[1],

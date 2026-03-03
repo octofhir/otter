@@ -1278,22 +1278,47 @@ impl VmContext {
     /// Get a register value
     #[inline]
     pub fn get_register(&self, index: u16) -> &Value {
-        static UNDEFINED: Value = Value::undefined();
-        let frame = match self.current_frame() {
-            Some(f) => f,
-            None => return &UNDEFINED,
-        };
-        &self.registers[frame.register_base + index as usize]
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: Interpreter only reads registers with an active frame and
+            // bytecode-generated register indices that are within frame bounds.
+            let base = unsafe { self.call_stack.last().unwrap_unchecked().register_base };
+            return unsafe { self.registers.get_unchecked(base + index as usize) };
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            static UNDEFINED: Value = Value::undefined();
+            let frame = match self.current_frame() {
+                Some(f) => f,
+                None => return &UNDEFINED,
+            };
+            &self.registers[frame.register_base + index as usize]
+        }
     }
 
     /// Set a register value
     #[inline]
     pub fn set_register(&mut self, index: u16, value: Value) {
-        let base = match self.current_frame() {
-            Some(f) => f.register_base,
-            None => return,
-        };
-        self.registers[base + index as usize] = value;
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: Interpreter only writes registers with an active frame and
+            // bytecode-generated register indices that are within frame bounds.
+            let base = unsafe { self.call_stack.last().unwrap_unchecked().register_base };
+            unsafe {
+                *self.registers.get_unchecked_mut(base + index as usize) = value;
+            }
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let base = match self.current_frame() {
+                Some(f) => f.register_base,
+                None => return,
+            };
+            self.registers[base + index as usize] = value;
+        }
     }
 
     /// Get a local variable
@@ -1302,6 +1327,15 @@ impl VmContext {
         let frame = self
             .current_frame()
             .ok_or_else(|| VmError::internal("no call frame"))?;
+
+        // Fast path: most frames do not have captured locals.
+        if self.open_upvalues.is_empty() {
+            return frame
+                .locals
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| VmError::internal(format!("local index {} out of bounds", index)));
+        }
 
         // If this local has been captured and is still open, use the cell value.
         // This ensures shared mutable access between the parent function and closures.
@@ -1321,10 +1355,16 @@ impl VmContext {
     /// If this local has been captured by a closure, also update the shared cell
     #[inline]
     pub fn set_local(&mut self, index: u16, value: Value) -> VmResult<()> {
+        let has_open_upvalues = !self.open_upvalues.is_empty();
         let frame = self
             .current_frame_mut()
             .ok_or_else(|| VmError::internal("no call frame"))?;
         if (index as usize) < frame.locals.len() {
+            if !has_open_upvalues {
+                frame.locals[index as usize] = value;
+                return Ok(());
+            }
+
             frame.locals[index as usize] = value.clone();
             // If this local has been captured, update the cell too
             let frame_id = frame.frame_id;
@@ -1727,8 +1767,8 @@ impl VmContext {
             self.registers.resize(needed, Value::undefined());
         }
 
-        // Take pending arguments and copy to locals
-        let args = self.take_pending_args();
+        // Consume pending arguments into locals while keeping pending_args capacity.
+        let pending_arg_len = self.pending_args.len();
         let func = &module.functions[function_index as usize];
         let param_count = func.param_count as usize;
         let has_rest = func.flags.has_rest;
@@ -1743,30 +1783,43 @@ impl VmContext {
             param_count
         };
 
-        let extra_args_count = if args.len() > effective_param_count {
-            args.len() - effective_param_count
+        let extra_args_count = if pending_arg_len > effective_param_count {
+            pending_arg_len - effective_param_count
         } else {
             0
         };
 
-        let total_locals = local_count as usize + extra_args_count;
-        let mut locals = vec![Value::undefined(); total_locals];
-
-        for (i, arg) in args.into_iter().enumerate() {
-            if i < effective_param_count {
-                // Regular argument (or rest array) -> mapped to parameter local
-                if i < locals.len() {
-                    locals[i] = arg;
-                }
-            } else {
-                // Extra argument -> stored after all regular locals (including vars)
-                // This ensures we don't overwrite local variables with extra arguments
-                let target_idx = local_count as usize + (i - effective_param_count);
-                if target_idx < locals.len() {
-                    locals[target_idx] = arg;
+        let local_count = local_count as usize;
+        let total_locals = local_count + extra_args_count;
+        let locals = if extra_args_count == 0 {
+            // Common case: no spread/extra arguments. Avoid pre-filling and overwriting.
+            let mut locals = Vec::with_capacity(local_count);
+            for arg in self.pending_args.drain(..).take(local_count) {
+                locals.push(arg);
+            }
+            if locals.len() < local_count {
+                locals.resize(local_count, Value::undefined());
+            }
+            locals
+        } else {
+            let mut locals = vec![Value::undefined(); total_locals];
+            for (i, arg) in self.pending_args.drain(..).enumerate() {
+                if i < effective_param_count {
+                    // Regular argument (or rest array) -> mapped to parameter local
+                    if i < locals.len() {
+                        locals[i] = arg;
+                    }
+                } else {
+                    // Extra argument -> stored after all regular locals (including vars)
+                    // This ensures we don't overwrite local variables with extra arguments
+                    let target_idx = local_count + (i - effective_param_count);
+                    if target_idx < locals.len() {
+                        locals[target_idx] = arg;
+                    }
                 }
             }
-        }
+            locals
+        };
 
         if std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok() {
             if let Some(func) = module.functions.get(function_index as usize) {
@@ -1954,6 +2007,25 @@ impl VmContext {
         self.pending_args = args;
     }
 
+    /// Fill pending arguments from a contiguous register range.
+    ///
+    /// Reuses existing pending args allocation to avoid per-call Vec churn.
+    pub fn set_pending_args_from_register_range(&mut self, start: u16, count: u16) {
+        self.pending_args.clear();
+        let count = count as usize;
+        if count == 0 {
+            return;
+        }
+        let Some(frame) = self.current_frame() else {
+            return;
+        };
+        let start = frame.register_base + start as usize;
+        let end = start + count;
+        debug_assert!(end <= self.registers.len());
+        self.pending_args
+            .extend_from_slice(&self.registers[start..end]);
+    }
+
     /// Borrow pending arguments for the next function call.
     pub fn pending_args(&self) -> &[Value] {
         &self.pending_args
@@ -1961,7 +2033,9 @@ impl VmContext {
 
     /// Take pending arguments (transfers ownership)
     pub fn take_pending_args(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.pending_args)
+        let mut args = Vec::with_capacity(self.pending_args.len());
+        args.extend(self.pending_args.drain(..));
+        args
     }
 
     /// Set pending `this` value for next function call

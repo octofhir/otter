@@ -424,6 +424,17 @@ impl Interpreter {
             && !function.flags.uses_arguments
             && !function.flags.uses_eval
     }
+    #[inline]
+    fn has_feedback_observations(function: &otter_vm_bytecode::Function) -> bool {
+        function.feedback_vector.read().iter().any(|metadata| {
+            metadata.hit_count > 0
+                || metadata.type_observations != TypeFlags::default()
+                || !matches!(
+                    metadata.ic_state,
+                    otter_vm_bytecode::function::InlineCacheState::Uninitialized
+                )
+        })
+    }
     /// Handle a backward jump (back-edge) for loop-hot function detection and OSR.
     ///
     /// **Stage 1 — Back-edge counting:** Increments the function's back-edge
@@ -605,6 +616,9 @@ impl Interpreter {
                 continue;
             }
             if !Self::is_static_jit_candidate(function) || !Self::has_backward_jump(function) {
+                continue;
+            }
+            if !Self::has_feedback_observations(function) {
                 continue;
             }
             if otter_vm_exec::enqueue_hot_function(module, function_index, function) {
@@ -2922,7 +2936,19 @@ impl Interpreter {
             }
 
             Instruction::Inc { dst, src } => {
+                if let Some(value) = ctx.get_register(src.0).as_int32() {
+                    if let Some(result) = value.checked_add(1) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
                 let value = ctx.get_register(src.0).clone();
+                if let Some(num) = value.as_number() {
+                    ctx.set_register(dst.0, Value::number(num + 1.0));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let numeric = self.to_numeric(ctx, &value)?;
                 match numeric {
                     Numeric::BigInt(bigint) => {
@@ -2937,7 +2963,19 @@ impl Interpreter {
             }
 
             Instruction::Dec { dst, src } => {
+                if let Some(value) = ctx.get_register(src.0).as_int32() {
+                    if let Some(result) = value.checked_sub(1) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+
                 let value = ctx.get_register(src.0).clone();
+                if let Some(num) = value.as_number() {
+                    ctx.set_register(dst.0, Value::number(num - 1.0));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let numeric = self.to_numeric(ctx, &value)?;
                 match numeric {
                     Numeric::BigInt(bigint) => {
@@ -3150,24 +3188,43 @@ impl Interpreter {
             }
 
             Instruction::StrictEq { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                let result = self.strict_equal(&left, &right);
+                let result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    self.strict_equal(left, right)
+                };
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::StrictNe { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
-                let result = !self.strict_equal(&left, &right);
+                let result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    !self.strict_equal(left, right)
+                };
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::Lt { dst, lhs, rhs } => {
+                let fast_result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    if let (Some(left), Some(right)) = (left.as_int32(), right.as_int32()) {
+                        Some(left < right)
+                    } else if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                    {
+                        Some(left < right)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(result) = fast_result {
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let left_val = ctx.get_register(lhs.0).clone();
                 let right_val = ctx.get_register(rhs.0).clone();
                 let left = self.to_numeric(ctx, &left_val)?;
@@ -3179,6 +3236,23 @@ impl Interpreter {
             }
 
             Instruction::Le { dst, lhs, rhs } => {
+                let fast_result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    if let (Some(left), Some(right)) = (left.as_int32(), right.as_int32()) {
+                        Some(left <= right)
+                    } else if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                    {
+                        Some(left <= right)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(result) = fast_result {
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let left_val = ctx.get_register(lhs.0).clone();
                 let right_val = ctx.get_register(rhs.0).clone();
                 let left = self.to_numeric(ctx, &left_val)?;
@@ -3193,6 +3267,23 @@ impl Interpreter {
             }
 
             Instruction::Gt { dst, lhs, rhs } => {
+                let fast_result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    if let (Some(left), Some(right)) = (left.as_int32(), right.as_int32()) {
+                        Some(left > right)
+                    } else if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                    {
+                        Some(left > right)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(result) = fast_result {
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let left_val = ctx.get_register(lhs.0).clone();
                 let right_val = ctx.get_register(rhs.0).clone();
                 let left = self.to_numeric(ctx, &left_val)?;
@@ -3204,6 +3295,23 @@ impl Interpreter {
             }
 
             Instruction::Ge { dst, lhs, rhs } => {
+                let fast_result = {
+                    let left = ctx.get_register(lhs.0);
+                    let right = ctx.get_register(rhs.0);
+                    if let (Some(left), Some(right)) = (left.as_int32(), right.as_int32()) {
+                        Some(left >= right)
+                    } else if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                    {
+                        Some(left >= right)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(result) = fast_result {
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(InstructionResult::Continue);
+                }
+
                 let left_val = ctx.get_register(lhs.0).clone();
                 let right_val = ctx.get_register(rhs.0).clone();
                 let left = self.to_numeric(ctx, &left_val)?;
@@ -3502,8 +3610,7 @@ impl Interpreter {
             }
 
             Instruction::JumpIfFalse { cond, offset } => {
-                let cond_val = ctx.get_register(cond.0).clone();
-                if !cond_val.to_boolean() {
+                if !ctx.get_register(cond.0).to_boolean() {
                     Ok(InstructionResult::Jump(offset.0))
                 } else {
                     Ok(InstructionResult::Continue)
@@ -3935,6 +4042,30 @@ impl Interpreter {
             Instruction::Call { dst, func, argc } => {
                 let func_value = ctx.get_register(func.0).clone();
 
+                // Fast path: direct closure call (non-generator) avoids generic call dispatch.
+                if let Some(closure) = func_value.as_function()
+                    && !closure.is_generator
+                {
+                    ctx.set_pending_args_from_register_range(func.0 + 1, *argc as u16);
+                    let realm_id = self.realm_id_for_function(ctx, &func_value);
+                    ctx.set_pending_realm_id(realm_id);
+                    ctx.set_pending_this(Value::undefined());
+                    if let Some(ref home_object) = closure.home_object {
+                        ctx.set_pending_home_object(home_object.clone());
+                    }
+                    ctx.set_pending_callee_value(func_value.clone());
+
+                    return Ok(InstructionResult::Call {
+                        func_index: closure.function_index,
+                        module: Arc::clone(&closure.module),
+                        argc: *argc,
+                        return_reg: dst.0,
+                        is_construct: false,
+                        is_async: closure.is_async,
+                        upvalues: closure.upvalues.clone(),
+                    });
+                }
+
                 // Collect arguments upfront (used by multiple paths)
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
@@ -4071,6 +4202,30 @@ impl Interpreter {
             } => {
                 let func_value = ctx.get_register(func.0).clone();
                 let this_value = ctx.get_register(this.0).clone();
+
+                // Fast path: direct closure call (non-generator) with explicit receiver.
+                if let Some(closure) = func_value.as_function()
+                    && !closure.is_generator
+                {
+                    ctx.set_pending_args_from_register_range(func.0 + 1, *argc as u16);
+                    let realm_id = self.realm_id_for_function(ctx, &func_value);
+                    ctx.set_pending_realm_id(realm_id);
+                    ctx.set_pending_this(this_value);
+                    if let Some(ref home_object) = closure.home_object {
+                        ctx.set_pending_home_object(home_object.clone());
+                    }
+                    ctx.set_pending_callee_value(func_value.clone());
+
+                    return Ok(InstructionResult::Call {
+                        func_index: closure.function_index,
+                        module: Arc::clone(&closure.module),
+                        argc: *argc,
+                        return_reg: dst.0,
+                        is_construct: false,
+                        is_async: closure.is_async,
+                        upvalues: closure.upvalues.clone(),
+                    });
+                }
 
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
@@ -7383,14 +7538,17 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     if let Some(result) = l.checked_add(r) {
                         ctx.set_register(dst.0, Value::int32(result));
                         return Ok(InstructionResult::Continue);
                     }
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Add and execute generic path
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -7417,14 +7575,17 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     if let Some(result) = l.checked_sub(r) {
                         ctx.set_register(dst.0, Value::int32(result));
                         return Ok(InstructionResult::Continue);
                     }
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -7460,14 +7621,17 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     if let Some(result) = l.checked_mul(r) {
                         ctx.set_register(dst.0, Value::int32(result));
                         return Ok(InstructionResult::Continue);
                     }
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Mul
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -7503,9 +7667,10 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     if r != 0 {
                         let (result, rem) = (l / r, l % r);
                         // Only use int32 fast path if division is exact (no remainder)
@@ -7516,6 +7681,8 @@ impl Interpreter {
                         }
                     }
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Div
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -7554,12 +7721,15 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_number(),
+                    ctx.get_register(rhs.0).as_number(),
+                ) {
                     ctx.set_register(dst.0, Value::number(l + r));
                     return Ok(InstructionResult::Continue);
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Add
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -7586,12 +7756,15 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-                if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_number(),
+                    ctx.get_register(rhs.0).as_number(),
+                ) {
                     ctx.set_register(dst.0, Value::number(l - r));
                     return Ok(InstructionResult::Continue);
                 }
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
@@ -8618,64 +8791,100 @@ impl Interpreter {
 
             // ==================== Bitwise operators ====================
             Instruction::BitAnd { dst, lhs, rhs } => {
-                let l_val = ctx.get_register(lhs.0);
-                let r_val = ctx.get_register(rhs.0);
-
-                if let (Some(l), Some(r)) = (l_val.as_int32(), r_val.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     ctx.set_register(dst.0, Value::int32(l & r));
                     return Ok(InstructionResult::Continue);
                 }
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
-                let l = self.to_int32_from(self.coerce_number(ctx, l_val_cloned)?);
-                let r = self.to_int32_from(self.coerce_number(ctx, r_val_cloned)?);
-                ctx.set_register(dst.0, Value::number((l & r) as f64));
+                let l_numeric = self.to_numeric(ctx, &l_val)?;
+                let r_numeric = self.to_numeric(ctx, &r_val)?;
+                match (l_numeric, r_numeric) {
+                    (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                        ctx.set_register(dst.0, Value::bigint((l & r).to_string()));
+                    }
+                    (Numeric::Number(l), Numeric::Number(r)) => {
+                        let l = self.to_int32_from(l);
+                        let r = self.to_int32_from(r);
+                        ctx.set_register(dst.0, Value::number((l & r) as f64));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
+                }
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitOr { dst, lhs, rhs } => {
-                let l_val = ctx.get_register(lhs.0);
-                let r_val = ctx.get_register(rhs.0);
-
-                if let (Some(l), Some(r)) = (l_val.as_int32(), r_val.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     ctx.set_register(dst.0, Value::int32(l | r));
                     return Ok(InstructionResult::Continue);
                 }
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
-                let l = self.to_int32_from(self.coerce_number(ctx, l_val_cloned)?);
-                let r = self.to_int32_from(self.coerce_number(ctx, r_val_cloned)?);
-                ctx.set_register(dst.0, Value::number((l | r) as f64));
+                let l_numeric = self.to_numeric(ctx, &l_val)?;
+                let r_numeric = self.to_numeric(ctx, &r_val)?;
+                match (l_numeric, r_numeric) {
+                    (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                        ctx.set_register(dst.0, Value::bigint((l | r).to_string()));
+                    }
+                    (Numeric::Number(l), Numeric::Number(r)) => {
+                        let l = self.to_int32_from(l);
+                        let r = self.to_int32_from(r);
+                        ctx.set_register(dst.0, Value::number((l | r) as f64));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
+                }
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitXor { dst, lhs, rhs } => {
-                let l_val = ctx.get_register(lhs.0);
-                let r_val = ctx.get_register(rhs.0);
-
-                if let (Some(l), Some(r)) = (l_val.as_int32(), r_val.as_int32()) {
+                if let (Some(l), Some(r)) = (
+                    ctx.get_register(lhs.0).as_int32(),
+                    ctx.get_register(rhs.0).as_int32(),
+                ) {
                     ctx.set_register(dst.0, Value::int32(l ^ r));
                     return Ok(InstructionResult::Continue);
                 }
+                let l_val = ctx.get_register(lhs.0).clone();
+                let r_val = ctx.get_register(rhs.0).clone();
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
-                let l = self.to_int32_from(self.coerce_number(ctx, l_val_cloned)?);
-                let r = self.to_int32_from(self.coerce_number(ctx, r_val_cloned)?);
-                ctx.set_register(dst.0, Value::number((l ^ r) as f64));
+                let l_numeric = self.to_numeric(ctx, &l_val)?;
+                let r_numeric = self.to_numeric(ctx, &r_val)?;
+                match (l_numeric, r_numeric) {
+                    (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                        ctx.set_register(dst.0, Value::bigint((l ^ r).to_string()));
+                    }
+                    (Numeric::Number(l), Numeric::Number(r)) => {
+                        let l = self.to_int32_from(l);
+                        let r = self.to_int32_from(r);
+                        ctx.set_register(dst.0, Value::number((l ^ r) as f64));
+                    }
+                    _ => return Err(VmError::type_error("Cannot mix BigInt and other types")),
+                }
                 Ok(InstructionResult::Continue)
             }
             Instruction::BitNot { dst, src } => {
-                let v_val = ctx.get_register(src.0);
-
-                if let Some(v) = v_val.as_int32() {
+                if let Some(v) = ctx.get_register(src.0).as_int32() {
                     ctx.set_register(dst.0, Value::int32(!v));
                     return Ok(InstructionResult::Continue);
                 }
+                let v_val = ctx.get_register(src.0).clone();
 
-                let v_val_cloned = v_val.clone();
-                let v = self.to_int32_from(self.coerce_number(ctx, v_val_cloned)?);
-                ctx.set_register(dst.0, Value::number((!v) as f64));
+                let numeric = self.to_numeric(ctx, &v_val)?;
+                match numeric {
+                    Numeric::BigInt(v) => {
+                        ctx.set_register(dst.0, Value::bigint((!v).to_string()));
+                    }
+                    Numeric::Number(v) => {
+                        let v = self.to_int32_from(v);
+                        ctx.set_register(dst.0, Value::number((!v) as f64));
+                    }
+                }
                 Ok(InstructionResult::Continue)
             }
             Instruction::Shl { dst, lhs, rhs } => {

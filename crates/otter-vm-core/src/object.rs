@@ -743,6 +743,8 @@ pub struct ObjectFlags {
     /// Explicit array length, used when the array is sparse and elements.len()
     /// doesn't represent the true JS `.length`. `None` means use elements.len().
     pub sparse_array_length: Option<u32>,
+    /// Cached dense elements length for fast `.length` reads when not sparse.
+    pub dense_array_length_hint: u32,
     /// Whether array length is writable (None = true, default)
     pub array_length_writable: Option<bool>,
     /// String exotic object (new String("...")) — character indices are non-writable/non-configurable
@@ -787,8 +789,11 @@ impl JsObject {
         for unit in s.encode_utf16() {
             elements.push(Value::string(JsString::intern_utf16(&[unit])));
         }
+        let len = elements.len() as u32;
         drop(elements);
-        self.flags.borrow_mut().is_string_exotic = true;
+        let mut flags = self.flags.borrow_mut();
+        flags.is_string_exotic = true;
+        flags.dense_array_length_hint = len;
     }
 
     /// Set the argument mapping for mapped arguments objects
@@ -840,7 +845,9 @@ impl JsObject {
         const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
         let mut flags = obj.flags.borrow_mut();
         flags.is_array = true;
+        flags.dense_array_length_hint = 0;
         if length <= MAX_DENSE_PREALLOC {
+            flags.dense_array_length_hint = length as u32;
             drop(flags);
             // Use holes, not undefined: `new Array(5)` creates 5 absent slots.
             // `0 in arr` → false, `arr[0]` → undefined (via get() hole handling).
@@ -862,6 +869,7 @@ impl JsObject {
         const MAX_DENSE_PREALLOC: usize = 1 << 24;
         if length <= MAX_DENSE_PREALLOC {
             obj.elements.borrow_mut().resize(length, Value::undefined());
+            obj.flags.borrow_mut().dense_array_length_hint = length as u32;
         }
         // Note: is_array remains false (default)
         obj
@@ -1079,17 +1087,13 @@ impl JsObject {
 
     /// Get property by key
     pub fn get(&self, key: &PropertyKey) -> Option<Value> {
-        // Special handling for array "length" property
-        if self.is_array()
-            && let PropertyKey::String(s) = key
-            && s.as_str() == "length"
-        {
-            let flags = self.flags.borrow();
-            if let Some(sparse_len) = flags.sparse_array_length {
-                return Some(Value::number(sparse_len as f64));
+        // Special handling for array "length" property.
+        if self.is_array() && let PropertyKey::String(s) = key && s.as_str() == "length" {
+            let len = self.array_length();
+            if len <= i32::MAX as usize {
+                return Some(Value::int32(len as i32));
             }
-            drop(flags);
-            return Some(Value::int32(self.elements.borrow().len() as i32));
+            return Some(Value::number(len as f64));
         }
 
         // String exotic objects: synthesize "length" and character indices
@@ -1279,6 +1283,7 @@ impl JsObject {
                 values.push(val);
             }
         }
+        self.flags.borrow_mut().dense_array_length_hint = 0;
 
         // Clear prototype
         {
@@ -1471,17 +1476,23 @@ impl JsObject {
     /// Set property by key
     pub fn set(&self, key: PropertyKey, value: Value) -> Result<(), SetPropertyError> {
         let flags = self.flags.borrow();
+        let frozen = flags.frozen;
+        let is_array = flags.is_array;
+        let is_string_exotic = flags.is_string_exotic;
+        let extensible = flags.extensible;
+        let sealed = flags.sealed;
+        let is_dictionary = flags.is_dictionary;
+        drop(flags);
 
         // Frozen objects cannot have properties changed
-        if flags.frozen {
+        if frozen {
             return Err(SetPropertyError::Frozen);
         }
 
         // Array exotic: intercept `length` writes to truncate/extend
-        if flags.is_array {
+        if is_array {
             if let PropertyKey::String(s) = &key {
                 if s.as_str() == "length" {
-                    drop(flags);
                     let new_len = crate::globals::to_number(&value);
                     if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
                         return Err(SetPropertyError::InvalidArrayLength);
@@ -1495,7 +1506,7 @@ impl JsObject {
         }
 
         // String exotic objects: character indices are non-writable
-        if flags.is_string_exotic {
+        if is_string_exotic {
             if let PropertyKey::Index(i) = &key {
                 let idx = *i as usize;
                 if idx < self.elements.borrow().len() {
@@ -1528,7 +1539,7 @@ impl JsObject {
                 gc_write_barrier(&value);
                 elements[idx] = value;
                 return Ok(());
-            } else if flags.is_array && flags.extensible && !flags.sealed {
+            } else if is_array && extensible && !sealed {
                 // Cap dense element storage to avoid OOM on sparse arrays.
                 // Indices beyond this limit are stored as dictionary properties.
                 const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
@@ -1536,20 +1547,19 @@ impl JsObject {
                     gc_write_barrier(&value);
                     elements.resize(idx + 1, Value::hole());
                     elements[idx] = value;
+                    self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
                     return Ok(());
                 }
                 // Large sparse index — fall through to dictionary/string storage
             }
             drop(elements);
-            drop(flags);
             // For non-arrays, fall through to store as string property
             let string_key = PropertyKey::String(crate::string::JsString::intern(&i.to_string()));
             return self.set(string_key, value);
         }
 
         // Dictionary mode: use HashMap storage
-        if flags.is_dictionary {
-            drop(flags);
+        if is_dictionary {
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 // If the property already exists, check writability and preserve attributes
@@ -1598,15 +1608,12 @@ impl JsObject {
             if let Some(offset) = shape.get_offset(&key) {
                 // Property exists, use set_by_offset
                 drop(shape);
-                drop(flags);
                 return self.set_by_offset(offset, value);
             }
         }
 
         // New property addition
-        if flags.extensible && !flags.sealed {
-            drop(flags);
-
+        if extensible && !sealed {
             let mut shape_write = self.shape.borrow_mut();
             // Transition to new shape
             let next_shape = shape_write.transition(key);
@@ -1658,7 +1665,7 @@ impl JsObject {
                 overflow[overflow_idx] = entry;
             }
             Ok(())
-        } else if !flags.extensible {
+        } else if !extensible {
             Err(SetPropertyError::NonExtensible)
         } else {
             Err(SetPropertyError::Sealed)
@@ -1741,6 +1748,7 @@ impl JsObject {
                 }
                 let new_len = elements.len();
                 drop(elements); // Must drop before calling array_length()
+                self.flags.borrow_mut().dense_array_length_hint = new_len as u32;
                 // If trimming shortened the vec AND this is an array, preserve
                 // the original length so array_length() returns the spec-correct value.
                 // ES §10.4.2.1 [[Delete]](P): delete does NOT change length.
@@ -2757,6 +2765,7 @@ impl JsObject {
             }
             gc_write_barrier(&value);
             elements.push(value);
+            self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
         }
 
         // Step 3.f: If index >= oldLen, update length
@@ -2959,7 +2968,9 @@ impl JsObject {
     /// Mark this object as an array exotic object
     /// Used for Array.prototype per ES2026 §23.1.3
     pub fn mark_as_array(&self) {
-        self.flags.borrow_mut().is_array = true;
+        let mut flags = self.flags.borrow_mut();
+        flags.is_array = true;
+        flags.dense_array_length_hint = self.elements.borrow().len() as u32;
     }
 
     // ========================================================================
@@ -3178,6 +3189,7 @@ impl JsObject {
             elements.truncate(target);
             // Update sparse_array_length if it was set
             let mut flags = self.flags.borrow_mut();
+            flags.dense_array_length_hint = elements.len() as u32;
             if flags.sparse_array_length.is_some() {
                 if (new_len as usize) <= elements.len() {
                     flags.sparse_array_length = None;
@@ -3190,7 +3202,9 @@ impl JsObject {
             let new = new_len as usize;
             if new <= MAX_DENSE_PREALLOC {
                 self.elements.borrow_mut().resize(new, Value::hole());
-                self.flags.borrow_mut().sparse_array_length = None;
+                let mut flags = self.flags.borrow_mut();
+                flags.sparse_array_length = None;
+                flags.dense_array_length_hint = new_len;
             } else {
                 self.flags.borrow_mut().sparse_array_length = Some(new_len);
             }
@@ -3200,9 +3214,14 @@ impl JsObject {
 
     /// Get array length (for arrays)
     pub fn array_length(&self) -> usize {
-        if let Some(sparse_len) = self.flags.borrow().sparse_array_length {
+        let flags = self.flags.borrow();
+        if let Some(sparse_len) = flags.sparse_array_length {
             return sparse_len as usize;
         }
+        if flags.is_array {
+            return flags.dense_array_length_hint as usize;
+        }
+        drop(flags);
         self.elements.borrow().len()
     }
 
@@ -3231,11 +3250,13 @@ impl JsObject {
     /// Fast path for setting an element by index.
     /// Handles length updates and sparse-to-dense transitions.
     pub fn set_index(&self, index: usize, value: Value) -> Result<(), SetPropertyError> {
-        let flags = self.flags.borrow();
-        if flags.frozen {
+        let (is_frozen, is_extensible, is_sealed) = {
+            let flags = self.flags.borrow();
+            (flags.frozen, flags.extensible, flags.sealed)
+        };
+        if is_frozen {
             return Err(SetPropertyError::Frozen);
         }
-        drop(flags);
 
         let mut elements = self.elements.borrow_mut();
         if index < elements.len() {
@@ -3264,19 +3285,19 @@ impl JsObject {
             return Ok(());
         }
 
-        if flags.extensible && !flags.sealed {
+        if is_extensible && !is_sealed {
             // Cap dense element storage to avoid OOM on sparse arrays.
             const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
             if index < MAX_DENSE_LENGTH {
                 gc_write_barrier(&value);
                 elements.resize(index + 1, Value::hole());
                 elements[index] = value;
+                self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
                 return Ok(());
             }
         }
 
         drop(elements);
-        drop(flags);
 
         // Fallback to generic set for large sparse indices
         self.set(PropertyKey::Index(index as u32), value)
@@ -3286,12 +3307,15 @@ impl JsObject {
         gc_write_barrier(&value);
         let mut elements = self.elements.borrow_mut();
         elements.push(value);
-        elements.len()
+        let len = elements.len();
+        self.flags.borrow_mut().dense_array_length_hint = len as u32;
+        len
     }
 
     pub fn array_pop(&self) -> Value {
         let mut elements = self.elements.borrow_mut();
         let val = elements.pop().unwrap_or(Value::undefined());
+        self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
         if val.is_hole() {
             Value::undefined()
         } else {

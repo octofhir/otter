@@ -1023,9 +1023,8 @@ mod tests {
         // Call with a f64 value (1.5) which will fail the int32 type guard → bailout
         let argv = [1.5_f64.to_bits() as i64];
 
-        let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 = unsafe {
-            std::mem::transmute(artifact.code_ptr)
-        };
+        let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 =
+            unsafe { std::mem::transmute(artifact.code_ptr) };
         let result = func(ctx_buf.as_mut_ptr(), argv.as_ptr(), 1);
 
         // Should have bailed out

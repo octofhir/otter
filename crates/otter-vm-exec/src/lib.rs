@@ -14,10 +14,10 @@ mod jit_runtime;
 pub use jit_queue::{clear_for_tests, enqueue_hot_function, pending_count};
 pub use jit_runtime::{
     DeoptFrameSnapshot, DeoptResumeMode, JitBailoutSiteStat, JitExecResult, JitRuntimeStats,
-    compile_one_pending_request, deopt_metadata_snapshot, invalidate_jit_code,
-    is_jit_background_enabled, is_jit_eager_enabled, is_jit_enabled, jit_deopt_threshold,
-    jit_hot_threshold, record_back_edge_compilation, record_osr_attempt, record_osr_success,
-    stats_snapshot, try_execute_jit_raw,
+    compile_one_pending_request, deopt_metadata_snapshot, hydrate_jit_entry_ptr,
+    invalidate_jit_code, is_jit_background_enabled, is_jit_eager_enabled, is_jit_enabled,
+    jit_deopt_threshold, jit_hot_threshold, record_back_edge_compilation, record_osr_attempt,
+    record_osr_success, stats_snapshot, try_execute_jit_raw,
 };
 
 #[cfg(test)]

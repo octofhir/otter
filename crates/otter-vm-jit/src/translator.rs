@@ -20,8 +20,7 @@ use crate::bailout::{BAILOUT_SENTINEL, BailoutReason};
 use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
-    JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
-    JIT_CTX_OSR_ENTRY_PC_OFFSET,
+    JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
 };
 use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
 use otter_vm_bytecode::function::InlineCacheState;
@@ -123,14 +122,17 @@ fn resolve_inline_candidates<'a>(
                     if let Some(&callee) = func_by_index.get(&func_idx) {
                         // Verify all callee instructions are JIT-translatable
                         let callee_instrs = callee.instructions.read();
-                        let all_translatable = callee_instrs.iter().all(|inst| {
-                            is_supported_baseline_opcode(inst)
-                        });
+                        let all_translatable = callee_instrs
+                            .iter()
+                            .all(|inst| is_supported_baseline_opcode(inst));
                         if all_translatable {
-                            result.insert(pc, InlineCandidate {
-                                callee,
-                                function_index: func_idx,
-                            });
+                            result.insert(
+                                pc,
+                                InlineCandidate {
+                                    callee,
+                                    function_index: func_idx,
+                                },
+                            );
                         }
                     }
                 }
@@ -438,7 +440,11 @@ fn can_translate_impl(function: &Function, constants: &[Constant], has_helpers: 
 
         match instruction {
             Instruction::LoadConst { idx, .. } => {
-                if resolve_const_bits(constants, *idx).is_none() {
+                if has_helpers {
+                    if constants.get(idx.index() as usize).is_none() {
+                        return false;
+                    }
+                } else if resolve_const_bits(constants, *idx).is_none() {
                     return false;
                 }
             }
@@ -582,12 +588,9 @@ fn emit_record_bailout_with_state(
         builder.switch_to_block(dump_locals_block);
         for (i, &slot) in local_slots.iter().enumerate() {
             let val = builder.ins().stack_load(types::I64, slot, 0);
-            builder.ins().store(
-                MemFlags::trusted(),
-                val,
-                locals_ptr,
-                (i * 8) as i32,
-            );
+            builder
+                .ins()
+                .store(MemFlags::trusted(), val, locals_ptr, (i * 8) as i32);
         }
         builder.ins().jump(after_locals_block, &[]);
         builder.switch_to_block(after_locals_block);
@@ -613,12 +616,9 @@ fn emit_record_bailout_with_state(
         builder.switch_to_block(dump_regs_block);
         for (i, &slot) in reg_slots.iter().enumerate() {
             let val = builder.ins().stack_load(types::I64, slot, 0);
-            builder.ins().store(
-                MemFlags::trusted(),
-                val,
-                regs_ptr,
-                (i * 8) as i32,
-            );
+            builder
+                .ins()
+                .store(MemFlags::trusted(), val, regs_ptr, (i * 8) as i32);
         }
         builder.ins().jump(after_regs_block, &[]);
         builder.switch_to_block(after_regs_block);
@@ -705,7 +705,9 @@ fn lower_guarded_with_generic_fallback(
         builder.switch_to_block(bail_block);
         emit_bailout_return_with_state(builder, ctx_ptr, pc, reason, local_slots, reg_slots);
         builder.switch_to_block(ok_block);
-        builder.ins().jump(guarded.merge_block, &[BlockArg::Value(result)]);
+        builder
+            .ins()
+            .jump(guarded.merge_block, &[BlockArg::Value(result)]);
     } else {
         emit_bailout_return_with_state(
             builder,
@@ -743,7 +745,9 @@ fn emit_mono_prop_with_fallback(
     // Fast path: monomorphic helper
     let shape_const = builder.ins().iconst(types::I64, shape_id as i64);
     let offset_const = builder.ins().iconst(types::I64, offset as i64);
-    let mono_call = builder.ins().call(mono_ref, &[obj_val, shape_const, offset_const]);
+    let mono_call = builder
+        .ins()
+        .call(mono_ref, &[obj_val, shape_const, offset_const]);
     let mono_result = builder.inst_results(mono_call)[0];
 
     let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
@@ -754,13 +758,17 @@ fn emit_mono_prop_with_fallback(
 
     // Mono hit → merge
     builder.switch_to_block(mono_ok);
-    builder.ins().jump(merge_block, &[BlockArg::Value(mono_result)]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(mono_result)]);
 
     // Slow path: full GetPropConst
     builder.switch_to_block(slow_block);
     let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
     let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
-    let full_call = builder.ins().call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
     let full_result = builder.inst_results(full_call)[0];
 
     let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
@@ -772,7 +780,9 @@ fn emit_mono_prop_with_fallback(
     emit_bailout_return(builder);
 
     builder.switch_to_block(full_ok);
-    builder.ins().jump(merge_block, &[BlockArg::Value(full_result)]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(full_result)]);
 
     builder.switch_to_block(merge_block);
     builder.block_params(merge_block)[0]
@@ -930,10 +940,7 @@ pub fn translate_function_with_constants(
     // Collect ALL loop headers as valid OSR targets (not just qualifying ones).
     // Qualifying loops get routed through pre-headers for type guard checks;
     // non-qualifying loops jump directly to blocks[header_pc].
-    let osr_loop_headers: Vec<usize> = versioned_loops
-        .iter()
-        .map(|info| info.header_pc)
-        .collect();
+    let osr_loop_headers: Vec<usize> = versioned_loops.iter().map(|info| info.header_pc).collect();
 
     if osr_loop_headers.is_empty() {
         // No qualifying loops → always normal entry. Skip OSR dispatch entirely
@@ -949,10 +956,9 @@ pub fn translate_function_with_constants(
             JIT_CTX_OSR_ENTRY_PC_OFFSET,
         );
         let zero_i64 = builder.ins().iconst(types::I64, 0);
-        let is_normal_entry =
-            builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, osr_pc_val, zero_i64);
+        let is_normal_entry = builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, osr_pc_val, zero_i64);
 
         let normal_entry_block = builder.create_block();
         let osr_entry_block = builder.create_block();
@@ -980,12 +986,10 @@ pub fn translate_function_with_constants(
             JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
         );
         for i in 0..local_count {
-            let val = builder.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                locals_ptr,
-                (i * 8) as i32,
-            );
+            let val =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), locals_ptr, (i * 8) as i32);
             builder.ins().stack_store(val, local_slots[i], 0);
         }
 
@@ -997,12 +1001,9 @@ pub fn translate_function_with_constants(
             JIT_CTX_DEOPT_REGS_PTR_OFFSET,
         );
         for i in 0..reg_count {
-            let val = builder.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                regs_ptr,
-                (i * 8) as i32,
-            );
+            let val = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), regs_ptr, (i * 8) as i32);
             builder.ins().stack_store(val, reg_slots[i], 0);
         }
 
@@ -1020,13 +1021,9 @@ pub fn translate_function_with_constants(
                 // Last header: if match jump there, otherwise bailout.
                 let match_block = builder.create_block();
                 let fallback_block = builder.create_block();
-                builder.ins().brif(
-                    is_match,
-                    match_block,
-                    &[],
-                    fallback_block,
-                    &[],
-                );
+                builder
+                    .ins()
+                    .brif(is_match, match_block, &[], fallback_block, &[]);
                 builder.switch_to_block(match_block);
                 builder.ins().jump(target_block, &[]);
                 builder.switch_to_block(fallback_block);
@@ -1037,13 +1034,9 @@ pub fn translate_function_with_constants(
                 // More headers to check: if match jump, else continue.
                 let match_block = builder.create_block();
                 let next_check = builder.create_block();
-                builder.ins().brif(
-                    is_match,
-                    match_block,
-                    &[],
-                    next_check,
-                    &[],
-                );
+                builder
+                    .ins()
+                    .brif(is_match, match_block, &[], next_check, &[]);
                 builder.switch_to_block(match_block);
                 builder.ins().jump(target_block, &[]);
                 builder.switch_to_block(next_check);
@@ -1116,11 +1109,18 @@ pub fn translate_function_with_constants(
                 write_reg(builder, &reg_slots, *dst, v);
             }
             Instruction::LoadConst { dst, idx } => {
-                let Some(bits) = resolve_const_bits(constants, *idx) else {
-                    return Err(unsupported(pc, instruction));
-                };
-                let v = builder.ins().iconst(types::I64, bits);
-                write_reg(builder, &reg_slots, *dst, v);
+                if let Some(bits) = resolve_const_bits(constants, *idx) {
+                    let v = builder.ins().iconst(types::I64, bits);
+                    write_reg(builder, &reg_slots, *dst, v);
+                } else {
+                    let helper_ref = helpers
+                        .and_then(|h| h.get(HelperKind::LoadConst))
+                        .ok_or_else(|| unsupported(pc, instruction))?;
+                    let idx_val = builder.ins().iconst(types::I64, i64::from(idx.index()));
+                    let result =
+                        emit_helper_call_with_bailout(builder, helper_ref, &[ctx_ptr, idx_val]);
+                    write_reg(builder, &reg_slots, *dst, result);
+                }
             }
             Instruction::GetLocal { dst, idx } => {
                 let v = read_local(builder, &local_slots, *idx);
@@ -1147,8 +1147,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_specialized_arith(builder, ArithOp::Add, left, right, hint);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1165,8 +1172,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_specialized_arith(builder, ArithOp::Sub, left, right, hint);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1183,8 +1197,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_specialized_arith(builder, ArithOp::Mul, left, right, hint);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMul));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1207,8 +1228,15 @@ pub fn translate_function_with_constants(
                 };
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDiv));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1221,8 +1249,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_arith(builder, ArithOp::Add, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1233,8 +1268,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_arith(builder, ArithOp::Sub, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1245,8 +1287,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_arith(builder, ArithOp::Mul, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMul));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1256,8 +1305,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_div(builder, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDiv));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1268,8 +1324,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_f64_arith(builder, ArithOp::Add, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1280,8 +1343,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_f64_arith(builder, ArithOp::Sub, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1291,8 +1361,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_mod(builder, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMod));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1301,8 +1378,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_neg(builder, val);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericNeg));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, val],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, val],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1311,8 +1395,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_inc(builder, val);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericInc));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, val],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, val],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1321,8 +1412,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_dec(builder, val);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDec));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, val],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, val],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1334,8 +1432,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::And, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1347,8 +1452,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::Or, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1360,8 +1472,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::Xor, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1373,8 +1492,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::Shl, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1386,8 +1512,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::Shr, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1399,8 +1532,15 @@ pub fn translate_function_with_constants(
                     type_guards::emit_guarded_i32_bitwise(builder, BitwiseOp::Ushr, left, right);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitOp));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right, op_id],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right, op_id],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1409,8 +1549,15 @@ pub fn translate_function_with_constants(
                 let guarded = type_guards::emit_guarded_i32_bitnot(builder, val);
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericBitNot));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, val],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, val],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1426,8 +1573,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericEq));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1443,8 +1597,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericNeq));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1472,8 +1633,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLt));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1489,8 +1657,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLe));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1506,8 +1681,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGt));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1523,8 +1705,15 @@ pub fn translate_function_with_constants(
                 );
                 let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGe));
                 let out = lower_guarded_with_generic_fallback(
-                    builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                    ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                    builder,
+                    guarded,
+                    generic_ref,
+                    &[ctx_ptr, left, right],
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::HelperReturnedSentinel,
+                    &local_slots,
+                    &reg_slots,
                 );
                 write_reg(builder, &reg_slots, *dst, out);
             }
@@ -1554,9 +1743,7 @@ pub fn translate_function_with_constants(
                         .ins()
                         .brif(is_truthy, jump_block, &[], ft_block, &[]);
                 } else {
-                    builder
-                        .ins()
-                        .brif(is_truthy, jump_block, &[], exit, &[]);
+                    builder.ins().brif(is_truthy, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
@@ -1573,9 +1760,7 @@ pub fn translate_function_with_constants(
                         .ins()
                         .brif(is_truthy, ft_block, &[], jump_block, &[]);
                 } else {
-                    builder
-                        .ins()
-                        .brif(is_truthy, exit, &[], jump_block, &[]);
+                    builder.ins().brif(is_truthy, exit, &[], jump_block, &[]);
                 }
                 continue;
             }
@@ -1591,9 +1776,7 @@ pub fn translate_function_with_constants(
                         .ins()
                         .brif(is_nullish, jump_block, &[], ft_block, &[]);
                 } else {
-                    builder
-                        .ins()
-                        .brif(is_nullish, jump_block, &[], exit, &[]);
+                    builder.ins().brif(is_nullish, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
@@ -1609,9 +1792,7 @@ pub fn translate_function_with_constants(
                         .ins()
                         .brif(is_nullish, ft_block, &[], jump_block, &[]);
                 } else {
-                    builder
-                        .ins()
-                        .brif(is_nullish, exit, &[], jump_block, &[]);
+                    builder.ins().brif(is_nullish, exit, &[], jump_block, &[]);
                 }
                 continue;
             }
@@ -1647,19 +1828,28 @@ pub fn translate_function_with_constants(
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
 
-                let result = if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
-                    emit_mono_prop_with_fallback(
-                        builder, mono_helper, full_ref,
-                        obj_val, ctx_ptr, shape_id, offset,
-                        name.index(), *ic_index,
-                    )
-                } else {
-                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
-                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                    emit_helper_call_with_bailout(
-                        builder, full_ref, &[ctx_ptr, obj_val, name_idx, ic_idx],
-                    )
-                };
+                let result =
+                    if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                        emit_mono_prop_with_fallback(
+                            builder,
+                            mono_helper,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                        )
+                    } else {
+                        let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                        let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                        emit_helper_call_with_bailout(
+                            builder,
+                            full_ref,
+                            &[ctx_ptr, obj_val, name_idx, ic_idx],
+                        )
+                    };
                 write_reg(builder, &reg_slots, *dst, result);
             }
             // Superinstruction: fused GetLocal + GetPropConst
@@ -1683,19 +1873,28 @@ pub fn translate_function_with_constants(
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
 
-                let result = if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
-                    emit_mono_prop_with_fallback(
-                        builder, mono_helper, full_ref,
-                        obj_val, ctx_ptr, shape_id, offset,
-                        name.index(), *ic_index,
-                    )
-                } else {
-                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
-                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                    emit_helper_call_with_bailout(
-                        builder, full_ref, &[ctx_ptr, obj_val, name_idx, ic_idx],
-                    )
-                };
+                let result =
+                    if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                        emit_mono_prop_with_fallback(
+                            builder,
+                            mono_helper,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                        )
+                    } else {
+                        let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                        let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                        emit_helper_call_with_bailout(
+                            builder,
+                            full_ref,
+                            &[ctx_ptr, obj_val, name_idx, ic_idx],
+                        )
+                    };
                 write_reg(builder, &reg_slots, *dst, result);
             }
             Instruction::SetPropConst {
@@ -1740,7 +1939,8 @@ pub fn translate_function_with_constants(
 
                     if callee_instr_count == 0 {
                         // Empty function → return undefined
-                        let undef_val = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                        let undef_val =
+                            builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
                         write_reg(builder, &reg_slots, *dst, undef_val);
                     } else {
                         // Create callee register and local slots
@@ -1760,9 +1960,12 @@ pub fn translate_function_with_constants(
                         }
 
                         // Initialize callee registers to undefined
-                        let undef_val = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                        let undef_val =
+                            builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
                         for idx in 0..callee_reg_count {
-                            builder.ins().stack_store(undef_val, callee_reg_slots[idx], 0);
+                            builder
+                                .ins()
+                                .stack_store(undef_val, callee_reg_slots[idx], 0);
                         }
 
                         // Map caller args → callee param locals
@@ -1801,13 +2004,19 @@ pub fn translate_function_with_constants(
                                     continue;
                                 }
                                 Instruction::ReturnUndefined => {
-                                    let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                    builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    let undef_ret = builder
+                                        .ins()
+                                        .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    builder
+                                        .ins()
+                                        .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                     continue;
                                 }
                                 // Constants
                                 Instruction::LoadUndefined { dst: d } => {
-                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    let v = builder
+                                        .ins()
+                                        .iconst(types::I64, type_guards::TAG_UNDEFINED);
                                     write_reg(builder, &callee_reg_slots, *d, v);
                                 }
                                 Instruction::LoadNull { dst: d } => {
@@ -1819,11 +2028,15 @@ pub fn translate_function_with_constants(
                                     write_reg(builder, &callee_reg_slots, *d, v);
                                 }
                                 Instruction::LoadFalse { dst: d } => {
-                                    let v = builder.ins().iconst(types::I64, type_guards::TAG_FALSE);
+                                    let v =
+                                        builder.ins().iconst(types::I64, type_guards::TAG_FALSE);
                                     write_reg(builder, &callee_reg_slots, *d, v);
                                 }
                                 Instruction::LoadInt8 { dst: d, value } => {
-                                    let v = type_guards::emit_box_int32_const(builder, i32::from(*value));
+                                    let v = type_guards::emit_box_int32_const(
+                                        builder,
+                                        i32::from(*value),
+                                    );
                                     write_reg(builder, &callee_reg_slots, *d, v);
                                 }
                                 Instruction::LoadInt32 { dst: d, value } => {
@@ -1837,8 +2050,12 @@ pub fn translate_function_with_constants(
                                     } else {
                                         // Can't resolve constant — bail out to runtime call
                                         // Fall through to continuation with undefined
-                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                        let undef_ret = builder
+                                            .ins()
+                                            .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder
+                                            .ins()
+                                            .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                         continue;
                                     }
                                 }
@@ -1856,51 +2073,129 @@ pub fn translate_function_with_constants(
                                     write_reg(builder, &callee_reg_slots, *d, v);
                                 }
                                 // Arithmetic (guarded, using callee's slots)
-                                Instruction::Add { dst: d, lhs, rhs, feedback_index }
-                                | Instruction::AddInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                Instruction::Add {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                }
+                                | Instruction::AddInt32 {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
                                     let callee_feedback = callee.feedback_vector.read();
                                     let hint = SpecializationHint::from_type_flags(
-                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                        callee_feedback
+                                            .get(*feedback_index as usize)
+                                            .map(|m| &m.type_observations),
                                     );
-                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Add, left, right, hint);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericAdd));
+                                    let guarded = type_guards::emit_specialized_arith(
+                                        builder,
+                                        ArithOp::Add,
+                                        left,
+                                        right,
+                                        hint,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericAdd));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
-                                Instruction::Sub { dst: d, lhs, rhs, feedback_index }
-                                | Instruction::SubInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                Instruction::Sub {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                }
+                                | Instruction::SubInt32 {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
                                     let callee_feedback = callee.feedback_vector.read();
                                     let hint = SpecializationHint::from_type_flags(
-                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                        callee_feedback
+                                            .get(*feedback_index as usize)
+                                            .map(|m| &m.type_observations),
                                     );
-                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Sub, left, right, hint);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericSub));
+                                    let guarded = type_guards::emit_specialized_arith(
+                                        builder,
+                                        ArithOp::Sub,
+                                        left,
+                                        right,
+                                        hint,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericSub));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
-                                Instruction::Mul { dst: d, lhs, rhs, feedback_index }
-                                | Instruction::MulInt32 { dst: d, lhs, rhs, feedback_index } => {
+                                Instruction::Mul {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                }
+                                | Instruction::MulInt32 {
+                                    dst: d,
+                                    lhs,
+                                    rhs,
+                                    feedback_index,
+                                } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
                                     let callee_feedback = callee.feedback_vector.read();
                                     let hint = SpecializationHint::from_type_flags(
-                                        callee_feedback.get(*feedback_index as usize).map(|m| &m.type_observations),
+                                        callee_feedback
+                                            .get(*feedback_index as usize)
+                                            .map(|m| &m.type_observations),
                                     );
-                                    let guarded = type_guards::emit_specialized_arith(builder, ArithOp::Mul, left, right, hint);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericMul));
+                                    let guarded = type_guards::emit_specialized_arith(
+                                        builder,
+                                        ArithOp::Mul,
+                                        left,
+                                        right,
+                                        hint,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericMul));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
@@ -1908,20 +2203,36 @@ pub fn translate_function_with_constants(
                                 Instruction::Inc { dst: d, src } => {
                                     let val = read_reg(builder, &callee_reg_slots, *src);
                                     let guarded = type_guards::emit_guarded_i32_inc(builder, val);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericInc));
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericInc));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, val],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, val],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::Dec { dst: d, src } => {
                                     let val = read_reg(builder, &callee_reg_slots, *src);
                                     let guarded = type_guards::emit_guarded_i32_dec(builder, val);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericDec));
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericDec));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, val],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, val],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
@@ -1929,57 +2240,115 @@ pub fn translate_function_with_constants(
                                 Instruction::Lt { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedLessThan, FloatCC::LessThan, left, right);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLt));
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(
+                                        builder,
+                                        IntCC::SignedLessThan,
+                                        FloatCC::LessThan,
+                                        left,
+                                        right,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericLt));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::Le { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedLessThanOrEqual, FloatCC::LessThanOrEqual, left, right);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericLe));
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(
+                                        builder,
+                                        IntCC::SignedLessThanOrEqual,
+                                        FloatCC::LessThanOrEqual,
+                                        left,
+                                        right,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericLe));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::Gt { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedGreaterThan, FloatCC::GreaterThan, left, right);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGt));
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(
+                                        builder,
+                                        IntCC::SignedGreaterThan,
+                                        FloatCC::GreaterThan,
+                                        left,
+                                        right,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericGt));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::Ge { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let guarded = type_guards::emit_guarded_numeric_cmp(builder, IntCC::SignedGreaterThanOrEqual, FloatCC::GreaterThanOrEqual, left, right);
-                                    let generic_ref = helpers.and_then(|h| h.get(HelperKind::GenericGe));
+                                    let guarded = type_guards::emit_guarded_numeric_cmp(
+                                        builder,
+                                        IntCC::SignedGreaterThanOrEqual,
+                                        FloatCC::GreaterThanOrEqual,
+                                        left,
+                                        right,
+                                    );
+                                    let generic_ref =
+                                        helpers.and_then(|h| h.get(HelperKind::GenericGe));
                                     let out = lower_guarded_with_generic_fallback(
-                                        builder, guarded, generic_ref, &[ctx_ptr, left, right],
-                                        ctx_ptr, pc, BailoutReason::HelperReturnedSentinel, &local_slots, &reg_slots,
+                                        builder,
+                                        guarded,
+                                        generic_ref,
+                                        &[ctx_ptr, left, right],
+                                        ctx_ptr,
+                                        pc,
+                                        BailoutReason::HelperReturnedSentinel,
+                                        &local_slots,
+                                        &reg_slots,
                                     );
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::StrictEq { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let out = type_guards::emit_strict_eq(builder, left, right, false);
+                                    let out =
+                                        type_guards::emit_strict_eq(builder, left, right, false);
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::StrictNe { dst: d, lhs, rhs } => {
                                     let left = read_reg(builder, &callee_reg_slots, *lhs);
                                     let right = read_reg(builder, &callee_reg_slots, *rhs);
-                                    let out = type_guards::emit_strict_eq(builder, left, right, true);
+                                    let out =
+                                        type_guards::emit_strict_eq(builder, left, right, true);
                                     write_reg(builder, &callee_reg_slots, *d, out);
                                 }
                                 Instruction::Not { dst: d, src } => {
@@ -1991,19 +2360,28 @@ pub fn translate_function_with_constants(
                                 }
                                 // Jumps within the callee (relative to callee blocks)
                                 Instruction::Jump { offset } => {
-                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                    if let Ok(target) =
+                                        jump_target(ci, offset.offset(), callee_instr_count)
+                                    {
                                         builder.ins().jump(callee_blocks[target], &[]);
                                     } else {
-                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                        let undef_ret = builder
+                                            .ins()
+                                            .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder
+                                            .ins()
+                                            .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                     }
                                     continue;
                                 }
                                 Instruction::JumpIfTrue { cond, offset } => {
                                     let cond_val = read_reg(builder, &callee_reg_slots, *cond);
                                     let truthy = type_guards::emit_is_truthy(builder, cond_val);
-                                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
-                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                    let is_truthy =
+                                        builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                                    if let Ok(target) =
+                                        jump_target(ci, offset.offset(), callee_instr_count)
+                                    {
                                         let fallthrough = ci + 1;
                                         let ft_block = if fallthrough < callee_instr_count {
                                             callee_blocks[fallthrough]
@@ -2011,47 +2389,82 @@ pub fn translate_function_with_constants(
                                             // Past end → return undefined via continuation
                                             let exit_block = builder.create_block();
                                             builder.switch_to_block(exit_block);
-                                            let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                            builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                            let undef_ret = builder
+                                                .ins()
+                                                .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                            builder
+                                                .ins()
+                                                .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                             // Switch back to emit the branch
                                             builder.switch_to_block(callee_blocks[ci]);
                                             exit_block
                                         };
-                                        builder.ins().brif(is_truthy, callee_blocks[target], &[], ft_block, &[]);
+                                        builder.ins().brif(
+                                            is_truthy,
+                                            callee_blocks[target],
+                                            &[],
+                                            ft_block,
+                                            &[],
+                                        );
                                     } else {
-                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                        let undef_ret = builder
+                                            .ins()
+                                            .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder
+                                            .ins()
+                                            .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                     }
                                     continue;
                                 }
                                 Instruction::JumpIfFalse { cond, offset } => {
                                     let cond_val = read_reg(builder, &callee_reg_slots, *cond);
                                     let truthy = type_guards::emit_is_truthy(builder, cond_val);
-                                    let is_truthy = builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
-                                    if let Ok(target) = jump_target(ci, offset.offset(), callee_instr_count) {
+                                    let is_truthy =
+                                        builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0);
+                                    if let Ok(target) =
+                                        jump_target(ci, offset.offset(), callee_instr_count)
+                                    {
                                         let fallthrough = ci + 1;
                                         let ft_block = if fallthrough < callee_instr_count {
                                             callee_blocks[fallthrough]
                                         } else {
                                             let exit_block = builder.create_block();
                                             builder.switch_to_block(exit_block);
-                                            let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                            builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                            let undef_ret = builder
+                                                .ins()
+                                                .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                            builder
+                                                .ins()
+                                                .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                             builder.switch_to_block(callee_blocks[ci]);
                                             exit_block
                                         };
-                                        builder.ins().brif(is_truthy, ft_block, &[], callee_blocks[target], &[]);
+                                        builder.ins().brif(
+                                            is_truthy,
+                                            ft_block,
+                                            &[],
+                                            callee_blocks[target],
+                                            &[],
+                                        );
                                     } else {
-                                        let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                        builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                        let undef_ret = builder
+                                            .ins()
+                                            .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                        builder
+                                            .ins()
+                                            .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                     }
                                     continue;
                                 }
                                 Instruction::Nop => {}
                                 // Unsupported in inlined code → bail out (return undefined)
                                 _ => {
-                                    let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                    builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                    let undef_ret = builder
+                                        .ins()
+                                        .iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                    builder
+                                        .ins()
+                                        .jump(continuation, &[BlockArg::Value(undef_ret)]);
                                     continue;
                                 }
                             }
@@ -2062,8 +2475,11 @@ pub fn translate_function_with_constants(
                                 builder.ins().jump(callee_blocks[next_ci], &[]);
                             } else {
                                 // Past end of callee → implicit return undefined
-                                let undef_ret = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                                builder.ins().jump(continuation, &[BlockArg::Value(undef_ret)]);
+                                let undef_ret =
+                                    builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
+                                builder
+                                    .ins()
+                                    .jump(continuation, &[BlockArg::Value(undef_ret)]);
                             }
                         }
 
@@ -2264,56 +2680,123 @@ pub fn translate_function_with_constants(
             Instruction::GetPropQuickened {
                 dst,
                 obj,
-                name,
-                ic_index,
+                shape_id,
+                offset,
             } => {
                 let full_ref = helpers
                     .and_then(|h| h.get(HelperKind::GetPropConst))
                     .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_slots, *obj);
 
-                let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
-                    if let InlineCacheState::Monomorphic { shape_id, offset } = ic {
-                        Some((*shape_id, *offset))
-                    } else {
-                        None
-                    }
-                });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
 
-                let result = if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
-                    emit_mono_prop_with_fallback(
-                        builder, mono_helper, full_ref,
-                        obj_val, ctx_ptr, shape_id, offset,
-                        name.index(), *ic_index,
-                    )
+                let result = if let Some(mono_helper) = mono_ref {
+                    // The macro expects `key` and `ic_index`. Since we skipped the IC lookup
+                    // we pass dummy values (0) because `emit_mono_prop_with_fallback`
+                    // is an abstraction that requires an `ic_index` to fallback to `GetPropConst`.
+                    // Wait! we need `name` and `ic_idx` to fallback. `GetPropQuickened` doesn't have them anymore.
+                    // For the JIT, if `GetPropQuickened` misses, we emit a bailout!
+                    let bail_block = builder.create_block();
+                    let continue_block = builder.create_block();
+                    let is_object = type_guards::emit_is_object(builder, obj_val);
+                    // Check if object
+                    let shape_check_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(is_object, shape_check_block, &[], bail_block, &[]);
+
+                    builder.switch_to_block(shape_check_block);
+                    // Extract ptr and check shape
+                    let obj_ptr = builder.ins().band_imm(obj_val, !type_guards::PTR_MASK);
+                    let shape_ptr_addr = builder.ins().iadd_imm(obj_ptr, 16); // shape is offset 16
+                    let current_shape =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::new(), shape_ptr_addr, 0);
+                    let expected_shape = builder.ins().iconst(types::I64, *shape_id as i64);
+                    let shape_match =
+                        builder
+                            .ins()
+                            .icmp(IntCC::Equal, current_shape, expected_shape);
+
+                    let load_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(shape_match, load_block, &[], bail_block, &[]);
+
+                    builder.switch_to_block(load_block);
+                    let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24); // properties is offset 24
+                    let props_ptr =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::new(), props_ptr_addr, 0);
+                    let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
+                    let val = builder.ins().load(types::I64, MemFlags::new(), val_addr, 0);
+                    builder.ins().jump(continue_block, &[BlockArg::Value(val)]);
+
+                    builder.switch_to_block(bail_block);
+                    emit_bailout_return(builder);
+
+                    builder.switch_to_block(continue_block);
+                    builder.block_params(continue_block)[0]
                 } else {
-                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
-                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                    emit_helper_call_with_bailout(
-                        builder, full_ref, &[ctx_ptr, obj_val, name_idx, ic_idx],
-                    )
+                    // Fallback bailout
+                    emit_bailout_return(builder);
+                    builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED)
                 };
                 write_reg(builder, &reg_slots, *dst, result);
             }
             Instruction::SetPropQuickened {
                 obj,
-                name,
                 val,
-                ic_index,
+                shape_id,
+                offset,
             } => {
-                let helper_ref = helpers
-                    .and_then(|h| h.get(HelperKind::SetPropConst))
-                    .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_slots, *obj);
-                let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
                 let value = read_reg(builder, &reg_slots, *val);
-                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                emit_helper_call_with_bailout(
-                    builder,
-                    helper_ref,
-                    &[ctx_ptr, obj_val, name_idx, value, ic_idx],
-                );
+
+                let bail_block = builder.create_block();
+                let continue_block = builder.create_block();
+                let is_object = type_guards::emit_is_object(builder, obj_val);
+
+                let shape_check_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_object, shape_check_block, &[], bail_block, &[]);
+
+                builder.switch_to_block(shape_check_block);
+                let obj_ptr = builder.ins().band_imm(obj_val, !type_guards::PTR_MASK);
+                let shape_ptr_addr = builder.ins().iadd_imm(obj_ptr, 16);
+                let current_shape =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), shape_ptr_addr, 0);
+                let expected_shape = builder.ins().iconst(types::I64, *shape_id as i64);
+                let shape_match = builder
+                    .ins()
+                    .icmp(IntCC::Equal, current_shape, expected_shape);
+
+                let store_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(shape_match, store_block, &[], bail_block, &[]);
+
+                builder.switch_to_block(store_block);
+                let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24);
+                let props_ptr = builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), props_ptr_addr, 0);
+                let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
+                builder.ins().store(MemFlags::new(), value, val_addr, 0);
+
+                // Note: Object pointers in memory need to trigger GC write barriers!
+                // Since this engine is embedding first, it handles write barriers in the allocator. We rely on standard conservative GC.
+                builder.ins().jump(continue_block, &[]);
+
+                builder.switch_to_block(bail_block);
+                emit_bailout_return(builder);
+
+                builder.switch_to_block(continue_block);
             }
             // --- LoadThis ---
             Instruction::LoadThis { dst } => {
@@ -3159,15 +3642,12 @@ pub fn translate_function_with_constants(
                 let fallthrough = pc + 1;
                 if fallthrough < instruction_count {
                     let ft_block = resolve_target(pc, fallthrough);
-                    builder
-                        .ins()
-                        .brif(is_done, jump_block, &[], ft_block, &[]);
+                    builder.ins().brif(is_done, jump_block, &[], ft_block, &[]);
                 } else {
                     builder.ins().brif(is_done, jump_block, &[], exit, &[]);
                 }
                 continue;
             }
-            _ => return Err(unsupported(pc, instruction)),
         }
 
         let next_pc = pc + 1;
@@ -3202,13 +3682,9 @@ pub fn translate_function_with_constants(
 
         if let Some(check) = all_int32 {
             // Branch: all int32 → optimized, otherwise → guarded
-            builder.ins().brif(
-                check,
-                vl.opt_blocks[0],
-                &[],
-                blocks[vl.header_pc],
-                &[],
-            );
+            builder
+                .ins()
+                .brif(check, vl.opt_blocks[0], &[], blocks[vl.header_pc], &[]);
         } else {
             // No registers to check (shouldn't happen for qualified loops)
             builder.ins().jump(blocks[vl.header_pc], &[]);
@@ -3293,8 +3769,12 @@ pub fn translate_function_with_constants(
                         }
                     } else {
                         emit_bailout_return_with_state(
-                            builder, ctx_ptr, body_pc,
-                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                            builder,
+                            ctx_ptr,
+                            body_pc,
+                            BailoutReason::TypeGuardFailure,
+                            &local_slots,
+                            &reg_slots,
                         );
                     }
                     builder.switch_to_block(guarded.merge_block);
@@ -3320,8 +3800,12 @@ pub fn translate_function_with_constants(
                         }
                     } else {
                         emit_bailout_return_with_state(
-                            builder, ctx_ptr, body_pc,
-                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                            builder,
+                            ctx_ptr,
+                            body_pc,
+                            BailoutReason::TypeGuardFailure,
+                            &local_slots,
+                            &reg_slots,
                         );
                     }
                     builder.switch_to_block(guarded.merge_block);
@@ -3347,8 +3831,12 @@ pub fn translate_function_with_constants(
                         }
                     } else {
                         emit_bailout_return_with_state(
-                            builder, ctx_ptr, body_pc,
-                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                            builder,
+                            ctx_ptr,
+                            body_pc,
+                            BailoutReason::TypeGuardFailure,
+                            &local_slots,
+                            &reg_slots,
                         );
                     }
                     builder.switch_to_block(guarded.merge_block);
@@ -3372,8 +3860,12 @@ pub fn translate_function_with_constants(
                         }
                     } else {
                         emit_bailout_return_with_state(
-                            builder, ctx_ptr, body_pc,
-                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                            builder,
+                            ctx_ptr,
+                            body_pc,
+                            BailoutReason::TypeGuardFailure,
+                            &local_slots,
+                            &reg_slots,
                         );
                     }
                     builder.switch_to_block(guarded.merge_block);
@@ -3396,8 +3888,12 @@ pub fn translate_function_with_constants(
                         }
                     } else {
                         emit_bailout_return_with_state(
-                            builder, ctx_ptr, body_pc,
-                            BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                            builder,
+                            ctx_ptr,
+                            body_pc,
+                            BailoutReason::TypeGuardFailure,
+                            &local_slots,
+                            &reg_slots,
                         );
                     }
                     builder.switch_to_block(guarded.merge_block);
@@ -3407,14 +3903,17 @@ pub fn translate_function_with_constants(
                 Instruction::Lt { dst, lhs, rhs } => {
                     let left = read_reg(builder, &reg_slots, *lhs);
                     let right = read_reg(builder, &reg_slots, *rhs);
-                    let guarded = type_guards::emit_bare_i32_cmp(
-                        builder, IntCC::SignedLessThan, left, right,
-                    );
+                    let guarded =
+                        type_guards::emit_bare_i32_cmp(builder, IntCC::SignedLessThan, left, right);
                     // slow_block is never reached for bare cmp, but seal it
                     builder.switch_to_block(guarded.slow_block);
                     emit_bailout_return_with_state(
-                        builder, ctx_ptr, body_pc,
-                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        builder,
+                        ctx_ptr,
+                        body_pc,
+                        BailoutReason::TypeGuardFailure,
+                        &local_slots,
+                        &reg_slots,
                     );
                     builder.switch_to_block(guarded.merge_block);
                     write_reg(builder, &reg_slots, *dst, guarded.result);
@@ -3423,12 +3922,19 @@ pub fn translate_function_with_constants(
                     let left = read_reg(builder, &reg_slots, *lhs);
                     let right = read_reg(builder, &reg_slots, *rhs);
                     let guarded = type_guards::emit_bare_i32_cmp(
-                        builder, IntCC::SignedLessThanOrEqual, left, right,
+                        builder,
+                        IntCC::SignedLessThanOrEqual,
+                        left,
+                        right,
                     );
                     builder.switch_to_block(guarded.slow_block);
                     emit_bailout_return_with_state(
-                        builder, ctx_ptr, body_pc,
-                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        builder,
+                        ctx_ptr,
+                        body_pc,
+                        BailoutReason::TypeGuardFailure,
+                        &local_slots,
+                        &reg_slots,
                     );
                     builder.switch_to_block(guarded.merge_block);
                     write_reg(builder, &reg_slots, *dst, guarded.result);
@@ -3437,12 +3943,19 @@ pub fn translate_function_with_constants(
                     let left = read_reg(builder, &reg_slots, *lhs);
                     let right = read_reg(builder, &reg_slots, *rhs);
                     let guarded = type_guards::emit_bare_i32_cmp(
-                        builder, IntCC::SignedGreaterThan, left, right,
+                        builder,
+                        IntCC::SignedGreaterThan,
+                        left,
+                        right,
                     );
                     builder.switch_to_block(guarded.slow_block);
                     emit_bailout_return_with_state(
-                        builder, ctx_ptr, body_pc,
-                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        builder,
+                        ctx_ptr,
+                        body_pc,
+                        BailoutReason::TypeGuardFailure,
+                        &local_slots,
+                        &reg_slots,
                     );
                     builder.switch_to_block(guarded.merge_block);
                     write_reg(builder, &reg_slots, *dst, guarded.result);
@@ -3451,12 +3964,19 @@ pub fn translate_function_with_constants(
                     let left = read_reg(builder, &reg_slots, *lhs);
                     let right = read_reg(builder, &reg_slots, *rhs);
                     let guarded = type_guards::emit_bare_i32_cmp(
-                        builder, IntCC::SignedGreaterThanOrEqual, left, right,
+                        builder,
+                        IntCC::SignedGreaterThanOrEqual,
+                        left,
+                        right,
                     );
                     builder.switch_to_block(guarded.slow_block);
                     emit_bailout_return_with_state(
-                        builder, ctx_ptr, body_pc,
-                        BailoutReason::TypeGuardFailure, &local_slots, &reg_slots,
+                        builder,
+                        ctx_ptr,
+                        body_pc,
+                        BailoutReason::TypeGuardFailure,
+                        &local_slots,
+                        &reg_slots,
                     );
                     builder.switch_to_block(guarded.merge_block);
                     write_reg(builder, &reg_slots, *dst, guarded.result);
@@ -3489,7 +4009,9 @@ pub fn translate_function_with_constants(
                     if target == vl.header_pc {
                         builder.ins().jump(vl.opt_blocks[0], &[]);
                     } else if target >= vl.header_pc && target <= vl.back_edge_pc {
-                        builder.ins().jump(vl.opt_blocks[target - vl.header_pc], &[]);
+                        builder
+                            .ins()
+                            .jump(vl.opt_blocks[target - vl.header_pc], &[]);
                     } else {
                         builder.ins().jump(blocks[target], &[]);
                     }
@@ -3506,14 +4028,17 @@ pub fn translate_function_with_constants(
                         blocks[jump_to]
                     };
                     let fallthrough = body_pc + 1;
-                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc
+                    {
                         vl.opt_blocks[fallthrough - vl.header_pc]
                     } else if fallthrough < instruction_count {
                         blocks[fallthrough]
                     } else {
                         exit
                     };
-                    builder.ins().brif(is_truthy, jump_block, &[], ft_block, &[]);
+                    builder
+                        .ins()
+                        .brif(is_truthy, jump_block, &[], ft_block, &[]);
                     continue;
                 }
                 Instruction::JumpIfFalse { cond, offset } => {
@@ -3527,14 +4052,17 @@ pub fn translate_function_with_constants(
                         blocks[jump_to]
                     };
                     let fallthrough = body_pc + 1;
-                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc
+                    {
                         vl.opt_blocks[fallthrough - vl.header_pc]
                     } else if fallthrough < instruction_count {
                         blocks[fallthrough]
                     } else {
                         exit
                     };
-                    builder.ins().brif(is_truthy, ft_block, &[], jump_block, &[]);
+                    builder
+                        .ins()
+                        .brif(is_truthy, ft_block, &[], jump_block, &[]);
                     continue;
                 }
                 Instruction::JumpIfNullish { src, offset } => {
@@ -3547,14 +4075,17 @@ pub fn translate_function_with_constants(
                         blocks[jump_to]
                     };
                     let fallthrough = body_pc + 1;
-                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc
+                    {
                         vl.opt_blocks[fallthrough - vl.header_pc]
                     } else if fallthrough < instruction_count {
                         blocks[fallthrough]
                     } else {
                         exit
                     };
-                    builder.ins().brif(is_nullish, jump_block, &[], ft_block, &[]);
+                    builder
+                        .ins()
+                        .brif(is_nullish, jump_block, &[], ft_block, &[]);
                     continue;
                 }
                 Instruction::JumpIfNotNullish { src, offset } => {
@@ -3567,14 +4098,17 @@ pub fn translate_function_with_constants(
                         blocks[jump_to]
                     };
                     let fallthrough = body_pc + 1;
-                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc {
+                    let ft_block = if fallthrough >= vl.header_pc && fallthrough <= vl.back_edge_pc
+                    {
                         vl.opt_blocks[fallthrough - vl.header_pc]
                     } else if fallthrough < instruction_count {
                         blocks[fallthrough]
                     } else {
                         exit
                     };
-                    builder.ins().brif(is_nullish, ft_block, &[], jump_block, &[]);
+                    builder
+                        .ins()
+                        .brif(is_nullish, ft_block, &[], jump_block, &[]);
                     continue;
                 }
                 // --- Return (same as guarded) ---

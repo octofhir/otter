@@ -76,9 +76,9 @@ pub fn enqueue_hot_function(
             continue;
         }
         // Check that the callee doesn't use LoadThis (this-binding differs when inlined)
-        let has_load_this = instrs.iter().any(|inst| {
-            matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. })
-        });
+        let has_load_this = instrs
+            .iter()
+            .any(|inst| matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. }));
         if has_load_this {
             continue;
         }

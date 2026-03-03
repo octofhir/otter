@@ -171,41 +171,44 @@ fn json_to_value(
     }
 }
 
+use std::fmt::Write; // Needed for write! on String
+
 /// Escape special characters in JSON strings (using UTF-8 input)
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+fn escape_json_string(s: &str, out: &mut String) {
     for c in s.chars() {
         let code = c as u32;
         match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            '\x08' => result.push_str("\\b"),
-            '\x0C' => result.push_str("\\f"),
-            c if code < 0x20 => result.push_str(&format!("\\u{:04x}", code)),
-            c => result.push(c),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if code < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", code);
+            }
+            c => out.push(c),
         }
     }
-    result
 }
 
 /// Escape JSON string preserving lone surrogates from UTF-16 data
-fn escape_json_string_utf16(units: &[u16]) -> String {
-    let mut result = String::with_capacity(units.len() * 2);
+fn escape_json_string_utf16(units: &[u16], out: &mut String) {
     let mut i = 0;
     while i < units.len() {
         let code = units[i];
         match code {
-            0x22 => result.push_str("\\\""), // "
-            0x5C => result.push_str("\\\\"), // \
-            0x0A => result.push_str("\\n"),  // \n
-            0x0D => result.push_str("\\r"),  // \r
-            0x09 => result.push_str("\\t"),  // \t
-            0x08 => result.push_str("\\b"),  // \b
-            0x0C => result.push_str("\\f"),  // \f
-            c if c < 0x20 => result.push_str(&format!("\\u{:04x}", c)),
+            0x22 => out.push_str("\\\""), // "
+            0x5C => out.push_str("\\\\"), // \
+            0x0A => out.push_str("\\n"),  // \n
+            0x0D => out.push_str("\\r"),  // \r
+            0x09 => out.push_str("\\t"),  // \t
+            0x08 => out.push_str("\\b"),  // \b
+            0x0C => out.push_str("\\f"),  // \f
+            c if c < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c);
+            }
             // High surrogate
             c if (0xD800..=0xDBFF).contains(&c) => {
                 // Check for valid surrogate pair
@@ -215,84 +218,41 @@ fn escape_json_string_utf16(units: &[u16]) -> String {
                     let low = units[i + 1] as u32 - 0xDC00;
                     let cp = 0x10000 + high + low;
                     if let Some(ch) = char::from_u32(cp) {
-                        result.push(ch);
+                        out.push(ch);
                     }
                     i += 1; // Skip the low surrogate
                 } else {
                     // Lone high surrogate - escape it
-                    result.push_str(&format!("\\u{:04x}", c));
+                    let _ = write!(out, "\\u{:04x}", c);
                 }
             }
             // Lone low surrogate - escape it
             c if (0xDC00..=0xDFFF).contains(&c) => {
-                result.push_str(&format!("\\u{:04x}", c));
+                let _ = write!(out, "\\u{:04x}", c);
             }
             c => {
                 // Regular BMP character
                 if let Some(ch) = char::from_u32(c as u32) {
-                    result.push(ch);
+                    out.push(ch);
                 }
             }
         }
         i += 1;
     }
-    result
 }
 
 /// Format a number for JSON output (NaN and Infinity become "null")
-fn format_number(n: f64) -> String {
+fn format_number(n: f64, out: &mut String) {
     if n.is_nan() || n.is_infinite() {
-        return "null".to_string();
+        out.push_str("null");
+    } else {
+        out.push_str(&crate::globals::js_number_to_string(n));
     }
-    // JSON uses JS Number::toString for number serialization
-    crate::globals::js_number_to_string(n)
 }
 
 /// Format a number as a property key (JavaScript ToString semantics)
 fn number_to_property_key(n: f64) -> String {
     crate::globals::js_number_to_string(n)
-}
-
-/// Format an array with optional indentation
-fn format_array(items: &[String], indent: &Option<String>, depth: usize) -> String {
-    match indent {
-        None => format!("[{}]", items.join(",")),
-        Some(ind) => {
-            let inner_indent = ind.repeat(depth + 1);
-            let outer_indent = ind.repeat(depth);
-            let formatted_items: Vec<_> = items
-                .iter()
-                .map(|item| format!("{}{}", inner_indent, item))
-                .collect();
-            format!("[\n{}\n{}]", formatted_items.join(",\n"), outer_indent)
-        }
-    }
-}
-
-/// Format an object with optional indentation, preserving key order
-fn format_object(items: &[(String, String)], indent: &Option<String>, depth: usize) -> String {
-    if items.is_empty() {
-        return "{}".to_string();
-    }
-
-    match indent {
-        None => {
-            let pairs: Vec<_> = items
-                .iter()
-                .map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), v))
-                .collect();
-            format!("{{{}}}", pairs.join(","))
-        }
-        Some(ind) => {
-            let inner_indent = ind.repeat(depth + 1);
-            let outer_indent = ind.repeat(depth);
-            let pairs: Vec<_> = items
-                .iter()
-                .map(|(k, v)| format!("{}\"{}\": {}", inner_indent, escape_json_string(k), v))
-                .collect();
-            format!("{{\n{}\n{}}}", pairs.join(",\n"), outer_indent)
-        }
-    }
 }
 
 /// Call toJSON method on value if it exists
@@ -505,20 +465,23 @@ fn serialize_value_simple(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<bool, VmError> {
     // Depth limit to prevent stack overflow
     if depth > 100 {
-        return Ok(Some("null".to_string()));
+        out.push_str("null");
+        return Ok(true);
     }
 
-    // undefined, functions, symbols return None (omitted)
+    // undefined, functions, symbols return false (omitted)
     if value.is_undefined() || value.is_callable() || value.is_symbol() {
-        return Ok(None);
+        return Ok(false);
     }
 
     // null
     if value.is_null() {
-        return Ok(Some("null".to_string()));
+        out.push_str("null");
+        return Ok(true);
     }
 
     // BigInt should have been handled by toJSON or should throw
@@ -528,37 +491,43 @@ fn serialize_value_simple(
 
     // Boolean
     if let Some(b) = value.as_boolean() {
-        return Ok(Some(if b { "true" } else { "false" }.to_string()));
+        out.push_str(if b { "true" } else { "false" });
+        return Ok(true);
     }
 
     // Number (int32 or f64)
     if let Some(n) = value.as_int32() {
-        return Ok(Some(format!("{}", n)));
+        let _ = write!(out, "{}", n);
+        return Ok(true);
     }
     if let Some(n) = value.as_number() {
-        return Ok(Some(format_number(n)));
+        format_number(n, out);
+        return Ok(true);
     }
 
     // String - use UTF-16 escaping to preserve lone surrogates
     if let Some(s) = value.as_string() {
-        return Ok(Some(format!(
-            "\"{}\"",
-            escape_json_string_utf16(s.as_utf16())
-        )));
+        out.push('"');
+        escape_json_string_utf16(s.as_utf16(), out);
+        out.push('"');
+        return Ok(true);
     }
 
     // Check for array (including proxy arrays)
     if is_array_value(value)? {
-        return serialize_array_simple(value, key, indent, property_list, tracker, depth, ncx);
+        serialize_array_simple(value, key, indent, property_list, tracker, depth, ncx, out)?;
+        return Ok(true);
     }
 
     // Regular object
     if value.as_object().is_some() {
-        return serialize_object_simple(value, key, indent, property_list, tracker, depth, ncx);
+        serialize_object_simple(value, key, indent, property_list, tracker, depth, ncx, out)?;
+        return Ok(true);
     }
 
     // Default to null for unknown types
-    Ok(Some("null".to_string()))
+    out.push_str("null");
+    Ok(true)
 }
 
 /// Serialize an array (simple version, no toJSON/replacer)
@@ -570,7 +539,8 @@ fn serialize_array_simple(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<(), VmError> {
     let obj = value
         .as_array()
         .or_else(|| value.as_object())
@@ -591,16 +561,39 @@ fn serialize_array_simple(
         })
         .unwrap_or(0);
 
-    let mut items = Vec::with_capacity(len);
+    if len == 0 {
+        out.push_str("[]");
+        tracker.exit(ptr);
+        return Ok(());
+    }
+
+    out.push('[');
+    if let Some(ind) = indent {
+        out.push('\n');
+    }
 
     for i in 0..len {
         maybe_check_interrupt(ncx, i)?;
+        if i > 0 {
+            out.push(',');
+            if let Some(ind) = indent {
+                out.push('\n');
+            }
+        }
+        if let Some(ind) = indent {
+            for _ in 0..=depth {
+                out.push_str(ind);
+            }
+        }
+
         let elem = obj
             .get(&PropertyKey::Index(i as u32))
             .unwrap_or(Value::undefined());
         let elem = unwrap_primitive(&elem);
         let elem_key = i.to_string();
-        match serialize_value_simple(
+
+        let initial_len = out.len();
+        let written = serialize_value_simple(
             &elem,
             &elem_key,
             indent,
@@ -608,14 +601,24 @@ fn serialize_array_simple(
             tracker,
             depth + 1,
             ncx,
-        )? {
-            Some(s) => items.push(s),
-            None => items.push("null".to_string()),
+            out,
+        )?;
+        if !written {
+            out.truncate(initial_len);
+            out.push_str("null");
         }
     }
 
+    if let Some(ind) = indent {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str(ind);
+        }
+    }
+    out.push(']');
+
     tracker.exit(ptr);
-    Ok(Some(format_array(&items, indent, depth)))
+    Ok(())
 }
 
 /// Serialize an object (simple version, no toJSON/replacer)
@@ -627,7 +630,8 @@ fn serialize_object_simple(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<(), VmError> {
     let obj = value
         .as_object()
         .ok_or_else(|| VmError::type_error("Expected object"))?;
@@ -671,22 +675,72 @@ fn serialize_object_simple(
             .collect()
     };
 
-    let mut items = Vec::new();
+    if keys.is_empty() {
+        out.push_str("{}");
+        tracker.exit(ptr);
+        return Ok(());
+    }
+
+    out.push('{');
+    let mut first = true;
+    let mut wrote_property = false;
 
     for (i, key) in keys.into_iter().enumerate() {
         maybe_check_interrupt(ncx, i)?;
         if let Some(val) = obj.get(&PropertyKey::string(&key)) {
             let val = unwrap_primitive(&val);
-            if let Some(json_val) =
-                serialize_value_simple(&val, &key, indent, property_list, tracker, depth + 1, ncx)?
-            {
-                items.push((key, json_val));
+
+            let initial_len = out.len();
+            if !first {
+                out.push(',');
+            }
+            if let Some(ind) = indent {
+                out.push('\n');
+                for _ in 0..=depth {
+                    out.push_str(ind);
+                }
+            }
+
+            out.push('"');
+            escape_json_string(&key, out);
+            out.push('"');
+            out.push(':');
+            if indent.is_some() {
+                out.push(' ');
+            }
+
+            let written = serialize_value_simple(
+                &val,
+                &key,
+                indent,
+                property_list,
+                tracker,
+                depth + 1,
+                ncx,
+                out,
+            )?;
+            if written {
+                first = false;
+                wrote_property = true;
+            } else {
+                out.truncate(initial_len);
             }
         }
     }
 
+    if wrote_property && indent.is_some() {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str(indent.as_ref().unwrap());
+        }
+    } else if !wrote_property && out.len() > 1 {
+        // Did not write properties, so we shouldn't have newlines
+        // If we added '{', do nothing more
+    }
+    out.push('}');
+
     tracker.exit(ptr);
-    Ok(Some(format_object(&items, indent, depth)))
+    Ok(())
 }
 
 /// Full stringify with toJSON and replacer support
@@ -699,10 +753,12 @@ fn stringify_with_replacer(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<bool, VmError> {
     // Depth limit
     if depth > 100 {
-        return Ok(Some("null".to_string()));
+        out.push_str("null");
+        return Ok(true);
     }
 
     // Step 1: Get value from holder (properly invoking getters)
@@ -721,7 +777,7 @@ fn stringify_with_replacer(
         // For proxies, invoke the get trap
         crate::proxy_operations::proxy_get(ncx, proxy, &prop_key, key_value, holder.clone())?
     } else {
-        return Ok(None);
+        return Ok(false);
     };
 
     // Step 2: Call toJSON if present
@@ -734,14 +790,15 @@ fn stringify_with_replacer(
     let value = unwrap_primitive_with_calls(&value, ncx)?;
 
     // Step 5: Serialize based on type
-    // undefined, functions, symbols return None (omitted)
+    // undefined, functions, symbols return false (omitted)
     if value.is_undefined() || value.is_callable() || value.is_symbol() {
-        return Ok(None);
+        return Ok(false);
     }
 
     // null
     if value.is_null() {
-        return Ok(Some("null".to_string()));
+        out.push_str("null");
+        return Ok(true);
     }
 
     // BigInt should have been handled by toJSON or should throw
@@ -751,28 +808,31 @@ fn stringify_with_replacer(
 
     // Boolean
     if let Some(b) = value.as_boolean() {
-        return Ok(Some(if b { "true" } else { "false" }.to_string()));
+        out.push_str(if b { "true" } else { "false" });
+        return Ok(true);
     }
 
     // Number (int32 or f64)
     if let Some(n) = value.as_int32() {
-        return Ok(Some(format!("{}", n)));
+        let _ = write!(out, "{}", n);
+        return Ok(true);
     }
     if let Some(n) = value.as_number() {
-        return Ok(Some(format_number(n)));
+        format_number(n, out);
+        return Ok(true);
     }
 
     // String - use UTF-16 escaping to preserve lone surrogates
     if let Some(s) = value.as_string() {
-        return Ok(Some(format!(
-            "\"{}\"",
-            escape_json_string_utf16(s.as_utf16())
-        )));
+        out.push('"');
+        escape_json_string_utf16(s.as_utf16(), out);
+        out.push('"');
+        return Ok(true);
     }
 
     // Check for array (including proxy arrays)
     if is_array_value(&value)? {
-        return stringify_array_with_replacer(
+        stringify_array_with_replacer(
             &value,
             key,
             replacer_fn,
@@ -781,12 +841,14 @@ fn stringify_with_replacer(
             tracker,
             depth,
             ncx,
-        );
+            out,
+        )?;
+        return Ok(true);
     }
 
     // Regular object or proxy
     if value.as_object().is_some() || value.as_proxy().is_some() {
-        return stringify_object_with_replacer(
+        stringify_object_with_replacer(
             &value,
             key,
             replacer_fn,
@@ -795,10 +857,13 @@ fn stringify_with_replacer(
             tracker,
             depth,
             ncx,
-        );
+            out,
+        )?;
+        return Ok(true);
     }
 
-    Ok(Some("null".to_string()))
+    out.push_str("null");
+    Ok(true)
 }
 
 /// Stringify array with replacer support
@@ -811,7 +876,8 @@ fn stringify_array_with_replacer(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<(), VmError> {
     // Get pointer for circular reference checking
     // Works for arrays, objects, and proxies
     let ptr = if let Some(obj) = value.as_array().or_else(|| value.as_object()) {
@@ -846,12 +912,35 @@ fn stringify_array_with_replacer(
     // Convert length to number using ToNumber semantics (may throw)
     let len = value_to_usize(&length_val, ncx)?;
 
-    let mut items = Vec::with_capacity(len);
+    if len == 0 {
+        out.push_str("[]");
+        tracker.exit(ptr);
+        return Ok(());
+    }
+
+    out.push('[');
+    if let Some(ind) = indent {
+        out.push('\n');
+    }
 
     for i in 0..len {
         maybe_check_interrupt(ncx, i)?;
         let key = i.to_string();
-        match stringify_with_replacer(
+
+        if i > 0 {
+            out.push(',');
+            if let Some(ind) = indent {
+                out.push('\n');
+            }
+        }
+        if let Some(ind) = indent {
+            for _ in 0..=depth {
+                out.push_str(ind);
+            }
+        }
+
+        let initial_len = out.len();
+        let written = stringify_with_replacer(
             value,
             &key,
             replacer_fn,
@@ -860,14 +949,25 @@ fn stringify_array_with_replacer(
             tracker,
             depth + 1,
             ncx,
-        )? {
-            Some(s) => items.push(s),
-            None => items.push("null".to_string()),
+            out,
+        )?;
+
+        if !written {
+            out.truncate(initial_len);
+            out.push_str("null");
         }
     }
 
+    if let Some(ind) = indent {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str(ind);
+        }
+    }
+    out.push(']');
+
     tracker.exit(ptr);
-    Ok(Some(format_array(&items, indent, depth)))
+    Ok(())
 }
 
 /// Stringify object with replacer support
@@ -880,7 +980,8 @@ fn stringify_object_with_replacer(
     tracker: &mut CircularTracker,
     depth: usize,
     ncx: &mut NativeContext,
-) -> Result<Option<String>, VmError> {
+    out: &mut String,
+) -> Result<(), VmError> {
     // Get pointer for circular reference checking - works for objects and proxies
     let (ptr, keys) = if let Some(obj) = value.as_object() {
         let ptr = obj.as_ptr() as usize;
@@ -942,11 +1043,39 @@ fn stringify_object_with_replacer(
         return Err(VmError::type_error(msg));
     }
 
-    let mut items = Vec::new();
+    if keys.is_empty() {
+        out.push_str("{}");
+        tracker.exit(ptr);
+        return Ok(());
+    }
+
+    out.push('{');
+    let mut first = true;
+    let mut wrote_property = false;
 
     for (i, key) in keys.into_iter().enumerate() {
         maybe_check_interrupt(ncx, i)?;
-        if let Some(json_val) = stringify_with_replacer(
+        let initial_len = out.len();
+
+        if !first {
+            out.push(',');
+        }
+        if let Some(ind) = indent {
+            out.push('\n');
+            for _ in 0..=depth {
+                out.push_str(ind);
+            }
+        }
+
+        out.push('"');
+        escape_json_string(&key, out);
+        out.push('"');
+        out.push(':');
+        if indent.is_some() {
+            out.push(' ');
+        }
+
+        let written = stringify_with_replacer(
             value,
             &key,
             replacer_fn,
@@ -955,13 +1084,27 @@ fn stringify_object_with_replacer(
             tracker,
             depth + 1,
             ncx,
-        )? {
-            items.push((key, json_val));
+            out,
+        )?;
+
+        if written {
+            first = false;
+            wrote_property = true;
+        } else {
+            out.truncate(initial_len);
         }
     }
 
+    if wrote_property && indent.is_some() {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str(indent.as_ref().unwrap());
+        }
+    }
+    out.push('}');
+
     tracker.exit(ptr);
-    Ok(Some(format_object(&items, indent, depth)))
+    Ok(())
 }
 
 #[dive(name = "parse", length = 2)]
@@ -1079,8 +1222,10 @@ fn json_stringify(
 
     let mut tracker = CircularTracker::new();
 
+    let mut out = String::with_capacity(128);
+
     // Serialize
-    let result = stringify_with_replacer(
+    let written = stringify_with_replacer(
         &wrapper_val,
         "",
         &replacer_fn,
@@ -1089,11 +1234,13 @@ fn json_stringify(
         &mut tracker,
         0,
         ncx,
+        &mut out,
     )?;
 
-    match result {
-        Some(s) => Ok(Value::string(JsString::intern(&s))),
-        None => Ok(Value::undefined()),
+    if written {
+        Ok(Value::string(JsString::intern(&out)))
+    } else {
+        Ok(Value::undefined())
     }
 }
 

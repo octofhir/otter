@@ -1150,17 +1150,17 @@ pub enum Instruction {
     GetPropQuickened {
         dst: Register,
         obj: Register,
-        name: ConstantIndex,
-        ic_index: u16,
+        shape_id: u64,
+        offset: u32,
     },
     /// Quickened SetPropConst: IC is monomorphic (single shape).
     /// Skips proxy checks, goes directly to shape check + offset store.
     /// On shape miss → de-quicken to SetPropConst.
     SetPropQuickened {
         obj: Register,
-        name: ConstantIndex,
         val: Register,
-        ic_index: u16,
+        shape_id: u64,
+        offset: u32,
     },
 
     // ── Superinstructions (fused pairs) ─────────────────────────

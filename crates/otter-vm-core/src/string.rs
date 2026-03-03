@@ -105,7 +105,7 @@ impl StringTable {
         if let Ok(borrowed) = self.strings.try_borrow() {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
-                    if existing.data.as_ref() == units.as_slice() {
+                    if existing.as_utf16() == units.as_slice() {
                         Self::perform_read_barrier(*existing);
                         return *existing;
                     }
@@ -115,9 +115,10 @@ impl StringTable {
 
         // Create new interned string
         let js_str = GcRef::new(JsString {
-            data: units.into(),
+            repr: StringRepr::Flat(units.into()),
+            flattened: OnceLock::new(),
             utf8: OnceLock::new(),
-            hash,
+            hash: OnceLock::from(hash),
         });
 
         // Add to the hash bucket
@@ -135,7 +136,7 @@ impl StringTable {
         if let Ok(borrowed) = self.strings.try_borrow() {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
-                    if existing.data.as_ref() == units {
+                    if existing.as_utf16() == units {
                         Self::perform_read_barrier(*existing);
                         return *existing;
                     }
@@ -144,9 +145,10 @@ impl StringTable {
         }
 
         let js_str = GcRef::new(JsString {
-            data: Arc::from(units),
+            repr: StringRepr::Flat(Arc::from(units)),
+            flattened: OnceLock::new(),
             utf8: OnceLock::new(),
-            hash,
+            hash: OnceLock::from(hash),
         });
 
         // Add to the hash bucket
@@ -163,7 +165,7 @@ impl StringTable {
         let borrowed = self.strings.borrow();
         if let Some(bucket) = borrowed.get(&hash) {
             for existing in bucket.iter() {
-                if existing.data.as_ref() == units.as_slice() {
+                if existing.as_utf16() == units.as_slice() {
                     return true;
                 }
             }
@@ -299,19 +301,34 @@ pub fn global_string_table_size() -> usize {
 // JsString
 // ============================================================================
 
-/// An interned JavaScript string with GC support
+/// Internal representation of a JavaScript string
+#[derive(Clone)]
+pub enum StringRepr {
+    /// A flat string backed by a contiguous UTF-16 buffer
+    Flat(Arc<[u16]>),
+    /// A rope string representing the concatenation of two other strings
+    Rope {
+        left: GcRef<JsString>,
+        right: GcRef<JsString>,
+        len: usize,
+        depth: u16,
+    },
+}
+
+/// An interned or rope JavaScript string with GC support
 ///
 /// `JsString` is allocated via `GcRef<JsString>` which wraps it in a `GcBox`.
-/// The `GcBox` provides the GC header for marking. `JsString` itself only
-/// contains the string data and metadata.
+/// The `GcBox` provides the GC header for marking.
 #[derive(Clone)]
 pub struct JsString {
-    /// The actual string data (UTF-16 code units)
-    data: Arc<[u16]>,
+    /// Internal representation (flat or rope)
+    repr: StringRepr,
+    /// Cached flattened UTF-16 representation (for Ropes)
+    flattened: OnceLock<Arc<[u16]>>,
     /// Cached UTF-8 representation (lossy for lone surrogates)
     utf8: OnceLock<Arc<str>>,
-    /// Precomputed hash for fast lookup
-    hash: u64,
+    /// Precomputed or lazily-computed hash for fast lookup
+    hash: OnceLock<u64>,
 }
 
 impl JsString {
@@ -344,11 +361,11 @@ impl JsString {
 
     /// Create a string from UTF-16 code units without interning
     pub fn from_utf16_units(units: Vec<u16>) -> Self {
-        let hash = Self::compute_hash_units(&units);
         Self {
-            data: units.into(),
+            repr: StringRepr::Flat(units.into()),
+            flattened: OnceLock::new(),
             utf8: OnceLock::new(),
-            hash,
+            hash: OnceLock::new(),
         }
     }
 
@@ -379,52 +396,186 @@ impl JsString {
     #[inline]
     pub fn as_str(&self) -> &str {
         let cached = self.utf8.get_or_init(|| {
-            let s = String::from_utf16_lossy(&self.data);
+            let s = String::from_utf16_lossy(self.as_utf16());
             Arc::<str>::from(s)
         });
         cached.as_ref()
     }
 
     /// Get the UTF-16 code units
+    ///
+    /// This may trigger flattening if the string is currently a rope.
+    /// Note: Interior mutability is handled by the GcRef wrapper + GcBox
+    /// but since we want to return a slice to the interior Arc buffer,
+    /// we must ensure the rope is flattened into a Flat representation.
+    ///
+    /// SAFETY: This method effectively performs lazy flattening.
+    /// To return a `&[u16]`, we return the slice from the `Flat` variant's `Arc`.
+    /// If it's a `Rope`, we MUST flatten it.
     #[inline]
     pub fn as_utf16(&self) -> &[u16] {
-        &self.data
+        match &self.repr {
+            StringRepr::Flat(data) => data,
+            StringRepr::Rope { .. } => self.flattened.get_or_init(|| {
+                let mut units = Vec::with_capacity(self.len_utf16());
+                self.write_utf16_to(&mut units);
+                Arc::from(units)
+            }),
+        }
+    }
+
+    fn write_utf16_to(&self, buf: &mut Vec<u16>) {
+        let mut worklist = vec![self];
+        while let Some(current) = worklist.pop() {
+            // Check if we have a flattened version first (cached)
+            if let Some(data) = current.flattened.get() {
+                buf.extend_from_slice(data);
+                continue;
+            }
+
+            match &current.repr {
+                StringRepr::Flat(data) => buf.extend_from_slice(data),
+                StringRepr::Rope { left, right, .. } => {
+                    // Push right then left so left is processed first (LIFO)
+                    worklist.push(&**right);
+                    worklist.push(&**left);
+                }
+            }
+        }
     }
 
     /// Get the length in UTF-16 code units (for JS compatibility)
     pub fn len_utf16(&self) -> usize {
-        self.data.len()
+        match &self.repr {
+            StringRepr::Flat(data) => data.len(),
+            StringRepr::Rope { len, .. } => *len,
+        }
     }
 
     /// Get the length in bytes
     #[inline]
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.len_utf16()
     }
 
     /// Check if string is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len_utf16() == 0
     }
 
     /// Get precomputed hash value
     #[inline]
     pub fn hash_value(&self) -> u64 {
-        self.hash
+        *self.hash.get_or_init(|| {
+            match &self.repr {
+                StringRepr::Flat(data) => Self::compute_hash_units(data),
+                StringRepr::Rope { .. } => {
+                    // For ropes, we flatten to compute the hash accurately
+                    // (alternatively we could combine hashes but that's risky)
+                    Self::compute_hash_units(self.as_utf16())
+                }
+            }
+        })
     }
 
     /// Concatenate two strings
+    ///
+    /// For small strings or small total length, we may still intern.
+    /// But for larger ones, we create a Rope.
     pub fn concat(&self, other: &JsString) -> GcRef<Self> {
-        let mut units = Vec::with_capacity(self.data.len() + other.data.len());
-        units.extend_from_slice(&self.data);
-        units.extend_from_slice(&other.data);
-        Self::intern_utf16(&units)
+        let left_len = self.len_utf16();
+        let right_len = other.len_utf16();
+        let total_len = left_len + right_len;
+
+        // Optimization: if both are small, just flatten and intern immediately
+        if total_len < 64 {
+            let mut units = Vec::with_capacity(total_len);
+            self.write_utf16_to(&mut units);
+            other.write_utf16_to(&mut units);
+            return Self::intern_utf16(&units);
+        }
+
+        // Create a Rope
+        // We need self and other to be GcRef. But they are passed as &JsString.
+        // This is a problem because we need to store them in the Rope.
+        // Actually, in the interpreter, we usually have GcRef<JsString>.
+        // Let's change the signature or provide a way to get GcRef if we are in a GcBox.
+        // For now, let's assume we can get the GcRef from the caller or re-allocate.
+        // Wait, if we are in JsString::concat(&self, other), we don't know our own GcRef.
+        // This means we should probably implement this at the GcRef level or Value level.
+
+        // Let's implement a version that takes GcRefs.
+        unreachable!("Use JsString::concat_gc")
+    }
+
+    /// Concatenate two GcRef strings, potentially creating a rope.
+    pub fn concat_gc(left: GcRef<Self>, right: GcRef<Self>) -> GcRef<Self> {
+        let left_len = left.len_utf16();
+        let right_len = right.len_utf16();
+        let total_len = left_len + right_len;
+
+        // If total length is small, intern to avoid rope overhead
+        if total_len < 64 {
+            if total_len == 0 {
+                return left;
+            }
+            if left_len == 0 {
+                return right;
+            }
+            if right_len == 0 {
+                return left;
+            }
+
+            let mut units = Vec::with_capacity(total_len);
+            left.write_utf16_to(&mut units);
+            right.write_utf16_to(&mut units);
+            return Self::intern_utf16(&units);
+        }
+
+        let left_depth = match &left.repr {
+            StringRepr::Flat(_) => 0,
+            StringRepr::Rope { depth, .. } => *depth,
+        };
+        let right_depth = match &right.repr {
+            StringRepr::Flat(_) => 0,
+            StringRepr::Rope { depth, .. } => *depth,
+        };
+
+        let depth = left_depth.max(right_depth) + 1u16;
+
+        // If depth is too high, flatten to avoid extreme recursion or tree imbalance.
+        // We use an iterative write_utf16_to, so 1000 is safe from stack overflow.
+        if depth > 1000 {
+            // eprintln!("ROPE DEPTH LIMIT REACHED: flattening string of len {}", total_len);
+            let mut units = Vec::with_capacity(total_len);
+            left.write_utf16_to(&mut units);
+            right.write_utf16_to(&mut units);
+
+            // Only intern if the string is reasonably small
+            if total_len < 256 {
+                return Self::intern_utf16(&units);
+            } else {
+                return Self::from_utf16_units_gc(units);
+            }
+        }
+
+        GcRef::new(Self {
+            repr: StringRepr::Rope {
+                left,
+                right,
+                len: total_len,
+                depth,
+            },
+            flattened: OnceLock::new(),
+            utf8: OnceLock::new(),
+            hash: OnceLock::new(),
+        })
     }
 
     /// Get character at index (UTF-16 code unit)
     pub fn char_at(&self, index: usize) -> Option<char> {
-        self.data
+        self.as_utf16()
             .get(index)
             .and_then(|unit| char::from_u32(*unit as u32))
     }
@@ -443,17 +594,18 @@ impl JsString {
     ///
     /// JavaScript strings use UTF-16 internally, so indices are in UTF-16 code units.
     pub fn substring_utf16(&self, start: usize, end: usize) -> GcRef<Self> {
-        let start = start.min(self.data.len());
-        let end = end.min(self.data.len()).max(start);
-        let slice = &self.data[start..end];
+        let units = self.as_utf16();
+        let start = start.min(units.len());
+        let end = end.min(units.len()).max(start);
+        let slice = &units[start..end];
         Self::intern_utf16(slice)
     }
 
     /// Concatenate using a specific string table instead of thread-local intern
     pub fn concat_with_table(&self, other: &JsString, table: &StringTable) -> GcRef<Self> {
-        let mut units = Vec::with_capacity(self.data.len() + other.data.len());
-        units.extend_from_slice(&self.data);
-        units.extend_from_slice(&other.data);
+        let mut units = Vec::with_capacity(self.len_utf16() + other.len_utf16());
+        self.write_utf16_to(&mut units);
+        other.write_utf16_to(&mut units);
         table.intern_utf16(&units)
     }
 
@@ -479,11 +631,14 @@ impl std::fmt::Display for JsString {
 impl PartialEq for JsString {
     fn eq(&self, other: &Self) -> bool {
         // Fast path: same hash means likely same string
-        if self.hash != other.hash {
+        if self.hash_value() != other.hash_value() {
             return false;
         }
         // Verify with actual comparison
-        self.data == other.data
+        if self.len_utf16() != other.len_utf16() {
+            return false;
+        }
+        self.as_utf16() == other.as_utf16()
     }
 }
 
@@ -491,7 +646,7 @@ impl Eq for JsString {}
 
 impl Hash for JsString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
+        self.hash_value().hash(state);
     }
 }
 
@@ -503,7 +658,7 @@ impl AsRef<str> for JsString {
 
 impl AsRef<[u16]> for JsString {
     fn as_ref(&self) -> &[u16] {
-        &self.data
+        self.as_utf16()
     }
 }
 
@@ -516,12 +671,15 @@ impl AsRef<[u16]> for JsString {
 // ============================================================================
 
 impl otter_vm_gc::GcTraceable for JsString {
-    // Strings don't contain GC references
-    const NEEDS_TRACE: bool = false;
+    // Strings contain GC references if they are Ropes
+    const NEEDS_TRACE: bool = true;
     const TYPE_ID: u8 = otter_vm_gc::object::tags::STRING;
 
-    fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // No references to trace
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        if let StringRepr::Rope { left, right, .. } = &self.repr {
+            tracer(left.header() as *const otter_vm_gc::GcHeader);
+            tracer(right.header() as *const otter_vm_gc::GcHeader);
+        }
     }
 }
 

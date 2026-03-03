@@ -456,7 +456,11 @@ fn run_background_worker(
         let compile_result = compiler
             .as_mut()
             .expect("jit compiler should be initialized")
-            .compile_function_with_inlining(&request.function, &request.constants, &request.module_functions);
+            .compile_function_with_inlining(
+                &request.function,
+                &request.constants,
+                &request.module_functions,
+            );
 
         match compile_result {
             Ok((artifact, deopt_metadata)) => {
@@ -548,9 +552,11 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
         .as_mut()
         .expect("jit compiler should be initialized");
 
-    match compiler
-        .compile_function_with_inlining(&request.function, &request.constants, &request.module_functions)
-    {
+    match compiler.compile_function_with_inlining(
+        &request.function,
+        &request.constants,
+        &request.module_functions,
+    ) {
         Ok((artifact, deopt_metadata)) => {
             let code_ptr = artifact.code_ptr as usize;
             request.function.set_jit_entry_ptr(code_ptr);
@@ -857,6 +863,38 @@ pub fn deopt_metadata_snapshot(module_id: u64, function_index: u32) -> Option<De
         .map(|entry| entry.deopt_metadata.clone())
 }
 
+/// Ensure `function` has a hydrated JIT entry pointer if compiled code exists.
+///
+/// This is primarily used by interpreter OSR paths where we want a cheap
+/// readiness check before building full OSR state snapshots.
+pub fn hydrate_jit_entry_ptr(module_id: u64, function_index: u32, function: &Function) -> bool {
+    if !is_jit_enabled() || function.is_deoptimized() {
+        return false;
+    }
+
+    if function.jit_entry_ptr() != 0 {
+        return true;
+    }
+
+    drain_background_results();
+
+    let ptr = {
+        let state = lock_state();
+        state
+            .compiled_entries
+            .get(&(module_id, function_index))
+            .map(|entry| entry.code_ptr)
+            .unwrap_or(0)
+    };
+
+    if ptr == 0 {
+        return false;
+    }
+
+    function.set_jit_entry_ptr(ptr);
+    true
+}
+
 #[cfg(test)]
 fn clear_runtime_state_for_tests() {
     {
@@ -1044,6 +1082,36 @@ mod tests {
             saw_compiled,
             "expected function to become executable after JIT compilation"
         );
+
+        crate::clear_for_tests();
+        clear_runtime_state_for_tests();
+    }
+
+    #[test]
+    fn hydrate_jit_entry_ptr_sets_pointer_from_compiled_cache() {
+        let _guard = crate::test_lock();
+        crate::clear_for_tests();
+        clear_runtime_state_for_tests();
+
+        let module = build_test_module();
+        let function = module
+            .function(0)
+            .expect("test module should expose function");
+        assert_eq!(function.jit_entry_ptr(), 0);
+
+        {
+            let mut state = lock_state();
+            state.compiled_entries.insert(
+                (module.module_id, 0),
+                CompiledFunctionEntry {
+                    code_ptr: 0x1234,
+                    deopt_metadata: DeoptMetadata::default(),
+                },
+            );
+        }
+
+        assert!(hydrate_jit_entry_ptr(module.module_id, 0, function));
+        assert_eq!(function.jit_entry_ptr(), 0x1234);
 
         crate::clear_for_tests();
         clear_runtime_state_for_tests();

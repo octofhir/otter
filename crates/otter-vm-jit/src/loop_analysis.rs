@@ -239,7 +239,6 @@ fn arith_feedback_info(inst: &Instruction) -> Option<(u16, Vec<u16>)> {
         // Comparisons (Lt, Le, Gt, Ge) don't have feedback_index in bytecode
         // but they are handled by the guarded numeric path, so we don't need
         // to check them for loop versioning — they work on any type
-
         _ => None,
     }
 }

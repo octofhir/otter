@@ -90,8 +90,7 @@ pub struct JitContext {
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
-    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
-    JIT_CTX_OSR_ENTRY_PC_OFFSET,
+    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
 };
 const _: () = {
     assert!(
@@ -118,8 +117,7 @@ const _: () = {
         "JitContext::deopt_locals_count offset changed — update JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET in runtime_helpers.rs"
     );
     assert!(
-        std::mem::offset_of!(JitContext, deopt_regs_ptr) as i32
-            == JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+        std::mem::offset_of!(JitContext, deopt_regs_ptr) as i32 == JIT_CTX_DEOPT_REGS_PTR_OFFSET,
         "JitContext::deopt_regs_ptr offset changed — update JIT_CTX_DEOPT_REGS_PTR_OFFSET in runtime_helpers.rs"
     );
     assert!(
@@ -135,6 +133,8 @@ const _: () = {
 
 /// UTF-16 encoding of "length" for fast constant pool comparison.
 const LENGTH_UTF16: [u16; 6] = [108, 101, 110, 103, 116, 104];
+/// UTF-16 encoding of "toString" for hot CallMethod fast path.
+const TO_STRING_UTF16: [u16; 8] = [116, 111, 83, 116, 114, 105, 110, 103];
 
 /// Check if the constant at `name_idx` in the module constant pool is "length".
 #[allow(unsafe_code)]
@@ -192,11 +192,7 @@ fn extract_js_object_ref(bits: u64) -> Option<&'static JsObject> {
 ///
 /// Signature: `(obj: i64, expected_shape: i64, offset: i64) -> i64`
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_get_prop_mono(
-    obj_raw: i64,
-    expected_shape: i64,
-    offset: i64,
-) -> i64 {
+extern "C" fn otter_rt_get_prop_mono(obj_raw: i64, expected_shape: i64, offset: i64) -> i64 {
     let obj_ref = match extract_js_object_ref(obj_raw as u64) {
         Some(o) => o,
         None => return BAILOUT_SENTINEL,
@@ -313,8 +309,66 @@ extern "C" fn otter_rt_get_prop_const(
         }
     }
 
-    // IC miss — bail out to interpreter
-    BAILOUT_SENTINEL
+    let Some(name_str) = (unsafe { resolve_constant_string(ctx, name_idx) }) else {
+        return BAILOUT_SENTINEL;
+    };
+    let key = PropertyKey::from_js_string(JsString::intern_utf16(name_str));
+
+    // Slow path on IC miss: resolve by shape offset and update IC.
+    if !obj_ref.is_dictionary_mode() {
+        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+            let current_epoch = ctx.proto_epoch;
+            match &mut ic.ic_state {
+                InlineCacheState::Uninitialized => {
+                    ic.ic_state = InlineCacheState::Monomorphic {
+                        shape_id: obj_shape_ptr,
+                        offset: offset as u32,
+                    };
+                    ic.proto_epoch = current_epoch;
+                }
+                InlineCacheState::Monomorphic {
+                    shape_id: old_shape,
+                    offset: old_offset,
+                } => {
+                    if *old_shape != obj_shape_ptr {
+                        let mut entries = [(0u64, 0u32); 4];
+                        entries[0] = (*old_shape, *old_offset);
+                        entries[1] = (obj_shape_ptr, offset as u32);
+                        ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
+                        ic.proto_epoch = current_epoch;
+                    }
+                }
+                InlineCacheState::Polymorphic { count, entries } => {
+                    let mut found = false;
+                    for i in 0..(*count as usize) {
+                        if entries[i].0 == obj_shape_ptr {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        if (*count as usize) < 4 {
+                            entries[*count as usize] = (obj_shape_ptr, offset as u32);
+                            *count += 1;
+                            ic.proto_epoch = current_epoch;
+                        } else {
+                            ic.ic_state = InlineCacheState::Megamorphic;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+                return val.to_jit_bits();
+            }
+        }
+    }
+
+    // Generic object property read fallback.
+    obj_ref
+        .get(&key)
+        .unwrap_or_else(crate::value::Value::undefined)
+        .to_jit_bits()
 }
 
 /// Runtime helper: SetPropConst — IC fast-path property write.
@@ -331,7 +385,7 @@ extern "C" fn otter_rt_get_prop_const(
 extern "C" fn otter_rt_set_prop_const(
     ctx_raw: i64,
     obj_raw: i64,
-    _name_idx: i64,
+    name_idx: i64,
     value_raw: i64,
     ic_idx: i64,
 ) -> i64 {
@@ -412,7 +466,10 @@ extern "C" fn otter_rt_set_prop_const(
     };
 
     if let Some(offset) = cached_offset {
-        if obj_ref.set_by_offset(offset as usize, write_value).is_ok() {
+        if obj_ref
+            .set_by_offset(offset as usize, write_value.clone())
+            .is_ok()
+        {
             ic.record_hit();
             // MRU reordering for polymorphic
             if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
@@ -427,7 +484,71 @@ extern "C" fn otter_rt_set_prop_const(
         }
     }
 
-    BAILOUT_SENTINEL
+    let Some(name_str) = (unsafe { resolve_constant_string(ctx, name_idx) }) else {
+        return BAILOUT_SENTINEL;
+    };
+    let key = PropertyKey::from_js_string(JsString::intern_utf16(name_str));
+
+    // Slow path on IC miss: resolve by shape offset and update IC.
+    if !obj_ref.is_dictionary_mode() {
+        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+            let current_epoch = ctx.proto_epoch;
+            match &mut ic.ic_state {
+                InlineCacheState::Uninitialized => {
+                    ic.ic_state = InlineCacheState::Monomorphic {
+                        shape_id: obj_shape_ptr,
+                        offset: offset as u32,
+                    };
+                    ic.proto_epoch = current_epoch;
+                }
+                InlineCacheState::Monomorphic {
+                    shape_id: old_shape,
+                    offset: old_offset,
+                } => {
+                    if *old_shape != obj_shape_ptr {
+                        let mut entries = [(0u64, 0u32); 4];
+                        entries[0] = (*old_shape, *old_offset);
+                        entries[1] = (obj_shape_ptr, offset as u32);
+                        ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
+                        ic.proto_epoch = current_epoch;
+                    }
+                }
+                InlineCacheState::Polymorphic { count, entries } => {
+                    let mut found = false;
+                    for i in 0..(*count as usize) {
+                        if entries[i].0 == obj_shape_ptr {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        if (*count as usize) < 4 {
+                            entries[*count as usize] = (obj_shape_ptr, offset as u32);
+                            *count += 1;
+                            ic.proto_epoch = current_epoch;
+                        } else {
+                            ic.ic_state = InlineCacheState::Megamorphic;
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if obj_ref
+                .set_by_offset(offset as usize, write_value.clone())
+                .is_ok()
+            {
+                return 0;
+            }
+        }
+    }
+
+    // Generic object property write fallback.
+    if obj_ref.set(key, write_value).is_ok() {
+        0
+    } else {
+        BAILOUT_SENTINEL
+    }
 }
 
 /// Runtime helper: CallFunction — re-entrant function call.
@@ -598,6 +719,48 @@ extern "C" fn otter_rt_new_array(ctx_raw: i64, len_raw: i64) -> i64 {
     }
 
     crate::value::Value::array(arr).to_jit_bits()
+}
+
+/// Runtime helper: LoadConst — materialize a module constant as a JS value.
+///
+/// Signature: `(ctx: i64, const_idx: i64) -> i64`
+///
+/// Supports Number/String/BigInt/Symbol constants directly.
+/// RegExp and TemplateLiteral constants currently deopt to interpreter.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_load_const(ctx_raw: i64, const_idx_raw: i64) -> i64 {
+    if const_idx_raw < 0 {
+        return BAILOUT_SENTINEL;
+    }
+
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    if ctx.constants.is_null() {
+        return BAILOUT_SENTINEL;
+    }
+
+    let constants = unsafe { &*ctx.constants };
+    let Some(constant) = constants.get(const_idx_raw as u32) else {
+        return BAILOUT_SENTINEL;
+    };
+
+    match constant {
+        otter_vm_bytecode::Constant::Number(n) => crate::value::Value::number(*n).to_jit_bits(),
+        otter_vm_bytecode::Constant::String(units) => {
+            crate::value::Value::string(JsString::intern_utf16(units)).to_jit_bits()
+        }
+        otter_vm_bytecode::Constant::BigInt(s) => {
+            crate::value::Value::bigint(s.to_string()).to_jit_bits()
+        }
+        otter_vm_bytecode::Constant::Symbol(id) => {
+            let sym = GcRef::new(crate::value::Symbol {
+                id: *id,
+                description: None,
+            });
+            crate::value::Value::symbol(sym).to_jit_bits()
+        }
+        otter_vm_bytecode::Constant::RegExp { .. }
+        | otter_vm_bytecode::Constant::TemplateLiteral { .. } => BAILOUT_SENTINEL,
+    }
 }
 
 /// Helper: resolve constant index to string name from JitContext's constant pool.
@@ -1358,76 +1521,174 @@ extern "C" fn otter_rt_call_method(
     if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
         return BAILOUT_SENTINEL;
     }
+    if ctx.constants.is_null() || method_name_idx < 0 {
+        return BAILOUT_SENTINEL;
+    }
 
     let receiver = match unsafe { crate::value::Value::from_raw_bits_unchecked(obj_raw as u64) } {
         Some(v) => v,
         None => return BAILOUT_SENTINEL,
     };
-
-    // Try IC fast path to get method
-    let obj_ref = match receiver.as_object() {
-        Some(o) => o,
-        None => return BAILOUT_SENTINEL,
-    };
-
-    if obj_ref.is_dictionary_mode() {
-        return BAILOUT_SENTINEL;
-    }
-
-    let obj_shape_ptr = obj_ref.shape_ptr_raw();
-    let function = unsafe { &*ctx.function_ptr };
-    let feedback = function.feedback_vector.write();
-    let Some(ic) = feedback.get_mut(ic_idx as usize) else {
-        return BAILOUT_SENTINEL;
-    };
-
-    if !ic.proto_epoch_matches(ctx.proto_epoch) {
-        return BAILOUT_SENTINEL;
-    }
-
-    let cached_offset = match &mut ic.ic_state {
-        InlineCacheState::Monomorphic { shape_id, offset } => {
-            if obj_shape_ptr == *shape_id {
-                Some(*offset)
-            } else {
-                None
-            }
-        }
-        InlineCacheState::Polymorphic { count, entries } => {
-            let mut found = None;
-            for i in 0..(*count as usize) {
-                if obj_shape_ptr == entries[i].0 {
-                    found = Some(entries[i].1);
-                    // MRU reordering
-                    if i > 0 {
-                        entries.swap(0, i);
-                    }
-                    break;
-                }
-            }
-            found
-        }
-        _ => None,
-    };
-
-    let method = match cached_offset {
-        Some(offset) => match obj_ref.get_by_offset(offset as usize) {
-            Some(val) => {
-                ic.record_hit();
-                val
-            }
-            None => return BAILOUT_SENTINEL,
-        },
-        None => return BAILOUT_SENTINEL,
-    };
-    // Must drop feedback borrow before calling interpreter
-    drop(feedback);
-
     let argc = argc_raw as usize;
     let args = match unsafe { collect_args(argc, argv_ptr_raw) } {
         Some(a) => a,
         None => return BAILOUT_SENTINEL,
     };
+
+    let constants = unsafe { &*ctx.constants };
+    let method_name_units = match constants.get(method_name_idx as u32) {
+        Some(otter_vm_bytecode::Constant::String(units)) => units,
+        _ => return BAILOUT_SENTINEL,
+    };
+    let method_name = JsString::intern_utf16(method_name_units);
+    let method_key = PropertyKey::from_js_string(method_name.clone());
+
+    // Very hot path in string benchmark: `(i % 10).toString()`.
+    // Skip method lookup/call overhead for no-arg primitive toString.
+    if argc == 0 && method_name_units.as_slice() == TO_STRING_UTF16 {
+        if let Some(n) = receiver.as_number() {
+            let s = crate::globals::js_number_to_string(n);
+            return crate::value::Value::string(JsString::intern(&s)).to_jit_bits();
+        }
+        if let Some(s) = receiver.as_string() {
+            return crate::value::Value::string(s).to_jit_bits();
+        }
+        if let Some(b) = receiver.as_boolean() {
+            let out = if b { "true" } else { "false" };
+            return crate::value::Value::string(JsString::intern(out)).to_jit_bits();
+        }
+    }
+
+    let mut method: Option<crate::value::Value> = None;
+
+    if let Some(obj_ref) = receiver.as_object() {
+        let function = unsafe { &*ctx.function_ptr };
+        let feedback = function.feedback_vector.write();
+
+        if let Some(ic) = feedback.get_mut(ic_idx as usize) {
+            // IC fast path
+            if !obj_ref.is_dictionary_mode() && ic.proto_epoch_matches(ctx.proto_epoch) {
+                let obj_shape_ptr = obj_ref.shape_ptr_raw();
+                let cached_offset = match &mut ic.ic_state {
+                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                        if obj_shape_ptr == *shape_id {
+                            Some(*offset)
+                        } else {
+                            None
+                        }
+                    }
+                    InlineCacheState::Polymorphic { count, entries } => {
+                        let mut found = None;
+                        for i in 0..(*count as usize) {
+                            if obj_shape_ptr == entries[i].0 {
+                                found = Some(entries[i].1);
+                                // MRU reordering
+                                if i > 0 {
+                                    entries.swap(0, i);
+                                }
+                                break;
+                            }
+                        }
+                        found
+                    }
+                    _ => None,
+                };
+                if let Some(offset) = cached_offset {
+                    if let Some(val) = obj_ref.get_by_offset(offset as usize) {
+                        ic.record_hit();
+                        method = Some(val);
+                    }
+                }
+            }
+
+            // Slow path on IC miss: resolve method and update IC.
+            if method.is_none() && !obj_ref.is_dictionary_mode() {
+                if let Some(offset) = obj_ref.shape().get_offset(&method_key) {
+                    let shape_ptr = obj_ref.shape_ptr_raw();
+                    let current_epoch = ctx.proto_epoch;
+                    match &mut ic.ic_state {
+                        InlineCacheState::Uninitialized => {
+                            ic.ic_state = InlineCacheState::Monomorphic {
+                                shape_id: shape_ptr,
+                                offset: offset as u32,
+                            };
+                            ic.proto_epoch = current_epoch;
+                        }
+                        InlineCacheState::Monomorphic {
+                            shape_id: old_shape,
+                            offset: old_offset,
+                        } => {
+                            if *old_shape != shape_ptr {
+                                let mut entries = [(0u64, 0u32); 4];
+                                entries[0] = (*old_shape, *old_offset);
+                                entries[1] = (shape_ptr, offset as u32);
+                                ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
+                                ic.proto_epoch = current_epoch;
+                            }
+                        }
+                        InlineCacheState::Polymorphic { count, entries } => {
+                            let mut found = false;
+                            for i in 0..(*count as usize) {
+                                if entries[i].0 == shape_ptr {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                if (*count as usize) < 4 {
+                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                    *count += 1;
+                                    ic.proto_epoch = current_epoch;
+                                } else {
+                                    ic.ic_state = InlineCacheState::Megamorphic;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    method = obj_ref.get_by_offset(offset as usize);
+                }
+            }
+        }
+        if method.is_none() {
+            method = obj_ref.get(&method_key);
+        }
+        // Must drop feedback borrow before calling interpreter
+        drop(feedback);
+    } else {
+        let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+        method = if receiver.is_string() {
+            let string_obj = vm_ctx.get_global("String").and_then(|v| v.as_object());
+            let string_proto = string_obj.and_then(|ctor| {
+                ctor.get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+            });
+            string_proto
+                .and_then(|proto| proto.get(&method_key))
+                .or_else(|| Some(crate::value::Value::undefined()))
+        } else if receiver.is_number() {
+            let number_obj = vm_ctx.get_global("Number").and_then(|v| v.as_object());
+            let number_proto = number_obj.and_then(|ctor| {
+                ctor.get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+            });
+            number_proto
+                .and_then(|proto| proto.get(&method_key))
+                .or_else(|| Some(crate::value::Value::undefined()))
+        } else if receiver.is_boolean() {
+            let boolean_obj = vm_ctx.get_global("Boolean").and_then(|v| v.as_object());
+            let boolean_proto = boolean_obj.and_then(|ctor| {
+                ctor.get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+            });
+            boolean_proto
+                .and_then(|proto| proto.get(&method_key))
+                .or_else(|| Some(crate::value::Value::undefined()))
+        } else {
+            None
+        };
+    }
+    let method = method.unwrap_or_else(crate::value::Value::undefined);
 
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
@@ -3557,14 +3818,65 @@ fn jit_to_f64(raw: i64) -> Option<f64> {
     }
 }
 
-/// Generic JS `+` for numeric operands.
+/// Generic JS `+` for numeric and string operands.
 /// Signature: `(ctx: i64, lhs: i64, rhs: i64) -> i64`
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_generic_add(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
-    match (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
-        (Some(l), Some(r)) => crate::value::Value::number(l + r).to_jit_bits(),
-        _ => BAILOUT_SENTINEL,
+extern "C" fn otter_rt_generic_add(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> i64 {
+    let bits_l = lhs_raw as u64;
+    let bits_r = rhs_raw as u64;
+
+    // Fast path: both are numbers
+    if let (Some(l), Some(r)) = (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
+        return crate::value::Value::number(l + r).to_jit_bits();
     }
+
+    // String concatenation path
+    // SAFETY: from_raw_bits_unchecked is safe here because we are in a JIT helper scope.
+    // It will reconstruct HeapRef::String if the bits match a string pointer.
+    unsafe {
+        let val_l = crate::value::Value::from_raw_bits_unchecked(bits_l);
+        let val_r = crate::value::Value::from_raw_bits_unchecked(bits_r);
+
+        if let (Some(l), Some(r)) = (val_l, val_r) {
+            if let (Some(s_l), Some(s_r)) = (l.as_string(), r.as_string()) {
+                // String + String
+                return crate::value::Value::string(JsString::concat_gc(s_l, s_r)).to_jit_bits();
+            }
+
+            // Fallback for mixed types (e.g. String + Number)
+            // If one is string, we convert the other to string too.
+            if l.is_string() || r.is_string() {
+                let ctx = &*(ctx_raw as *const JitContext);
+                if !ctx.vm_ctx.is_null() && !ctx.interpreter.is_null() {
+                    let vm_ctx = &mut *ctx.vm_ctx;
+                    let interp = &*ctx.interpreter;
+
+                    let s_l = if let Some(s) = l.as_string() {
+                        s
+                    } else {
+                        match interp.to_string_value(vm_ctx, &l) {
+                            Ok(s) => JsString::intern(&s),
+                            Err(_) => return BAILOUT_SENTINEL,
+                        }
+                    };
+
+                    let s_r = if let Some(s) = r.as_string() {
+                        s
+                    } else {
+                        match interp.to_string_value(vm_ctx, &r) {
+                            Ok(s) => JsString::intern(&s),
+                            Err(_) => return BAILOUT_SENTINEL,
+                        }
+                    };
+
+                    return crate::value::Value::string(JsString::concat_gc(s_l, s_r))
+                        .to_jit_bits();
+                }
+            }
+        }
+    }
+
+    BAILOUT_SENTINEL
 }
 
 /// Generic JS `-` for numeric operands.
@@ -3710,12 +4022,7 @@ fn f64_to_uint32(n: f64) -> u32 {
 /// Signature: `(ctx: i64, lhs: i64, rhs: i64, op_id: i64) -> i64`
 /// op_id: 0=And, 1=Or, 2=Xor, 3=Shl, 4=Shr, 5=Ushr
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_generic_bitop(
-    _ctx_raw: i64,
-    lhs_raw: i64,
-    rhs_raw: i64,
-    op_id: i64,
-) -> i64 {
+extern "C" fn otter_rt_generic_bitop(_ctx_raw: i64, lhs_raw: i64, rhs_raw: i64, op_id: i64) -> i64 {
     let lhs_f = match jit_to_f64(lhs_raw) {
         Some(n) => n,
         None => return BAILOUT_SENTINEL,
@@ -3797,6 +4104,7 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
     let mut helpers = RuntimeHelpers::new();
     // SAFETY: Function signatures match HelperKind conventions.
     unsafe {
+        helpers.set(HelperKind::LoadConst, otter_rt_load_const as *const u8);
         helpers.set(
             HelperKind::GetPropConst,
             otter_rt_get_prop_const as *const u8,
@@ -3955,8 +4263,14 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
         helpers.set(HelperKind::GenericGe, otter_rt_generic_ge as *const u8);
         helpers.set(HelperKind::GenericEq, otter_rt_generic_eq as *const u8);
         helpers.set(HelperKind::GenericNeq, otter_rt_generic_neq as *const u8);
-        helpers.set(HelperKind::GenericBitOp, otter_rt_generic_bitop as *const u8);
-        helpers.set(HelperKind::GenericBitNot, otter_rt_generic_bitnot as *const u8);
+        helpers.set(
+            HelperKind::GenericBitOp,
+            otter_rt_generic_bitop as *const u8,
+        );
+        helpers.set(
+            HelperKind::GenericBitNot,
+            otter_rt_generic_bitnot as *const u8,
+        );
         helpers.set(HelperKind::GenericNot, otter_rt_generic_not as *const u8);
         helpers.set(HelperKind::GetPropMono, otter_rt_get_prop_mono as *const u8);
 

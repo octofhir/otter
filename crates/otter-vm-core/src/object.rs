@@ -752,6 +752,10 @@ pub struct ObjectFlags {
     /// - ToBoolean returns false
     /// - Abstract equality with null/undefined returns true
     pub is_htmldda: bool,
+    /// Fast path: this is the Array.prototype.push native function
+    pub is_array_push: bool,
+    /// Fast path: this is the Array.prototype.pop native function
+    pub is_array_pop: bool,
 }
 
 impl JsObject {
@@ -3202,18 +3206,97 @@ impl JsObject {
         self.elements.borrow().len()
     }
 
-    /// Push element to array
-    pub fn array_push(&self, value: Value) {
-        gc_write_barrier(&value);
-        self.elements.borrow_mut().push(value);
+    /// Fast path for getting an element by index.
+    /// Returns None if the index is out of bounds or it's a hole.
+    pub fn get_index(&self, index: usize) -> Option<Value> {
+        // Fast path for non-mapped arguments: avoid borrow_mut and logic
+        // This covers 99.9% of arrays.
+        let elements = self.elements.borrow();
+        if index < elements.len() {
+            let val = &elements[index];
+            if !val.is_hole() {
+                return Some(val.clone());
+            }
+        }
+        drop(elements);
+
+        // Slow path: check for mapped arguments (aliased parameters)
+        if let Some(cell) = self.get_argument_cell(index) {
+            return Some(cell.get());
+        }
+
+        None
     }
 
-    /// Pop element from array
+    /// Fast path for setting an element by index.
+    /// Handles length updates and sparse-to-dense transitions.
+    pub fn set_index(&self, index: usize, value: Value) -> Result<(), SetPropertyError> {
+        let flags = self.flags.borrow();
+        if flags.frozen {
+            return Err(SetPropertyError::Frozen);
+        }
+        drop(flags);
+
+        let mut elements = self.elements.borrow_mut();
+        if index < elements.len() {
+            gc_write_barrier(&value);
+            elements[index] = value;
+            return Ok(());
+        }
+        drop(elements);
+
+        // For mapped arguments: write through UpvalueCell for aliased parameters
+        if let Some(cell) = self.get_argument_cell(index) {
+            gc_write_barrier(&value);
+            cell.set(value.clone());
+            // Also update elements for when mapping is later removed
+            let mut elements = self.elements.borrow_mut();
+            if index < elements.len() {
+                elements[index] = value;
+            }
+            return Ok(());
+        }
+
+        let mut elements = self.elements.borrow_mut();
+        if index < elements.len() {
+            gc_write_barrier(&value);
+            elements[index] = value;
+            return Ok(());
+        }
+
+        if flags.extensible && !flags.sealed {
+            // Cap dense element storage to avoid OOM on sparse arrays.
+            const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
+            if index < MAX_DENSE_LENGTH {
+                gc_write_barrier(&value);
+                elements.resize(index + 1, Value::hole());
+                elements[index] = value;
+                return Ok(());
+            }
+        }
+
+        drop(elements);
+        drop(flags);
+
+        // Fallback to generic set for large sparse indices
+        self.set(PropertyKey::Index(index as u32), value)
+    }
+
+    pub fn array_push(&self, value: Value) -> usize {
+        gc_write_barrier(&value);
+        let mut elements = self.elements.borrow_mut();
+        elements.push(value);
+        elements.len()
+    }
+
     pub fn array_pop(&self) -> Value {
-        self.elements
-            .borrow_mut()
-            .pop()
-            .unwrap_or_else(Value::undefined)
+        let mut elements = self.elements.borrow_mut();
+        let val = elements.pop().unwrap_or(Value::undefined());
+        if val.is_hole() {
+            Value::undefined()
+        } else {
+            val
+        }
     }
 
     /// Get inline properties storage (for GC tracing)

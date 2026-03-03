@@ -1,0 +1,1578 @@
+warning: unused variable: `full_ref`
+    --> crates/otter-vm-jit/src/translator.rs:2686:21
+     |
+2686 |                 let full_ref = helpers
+     |                     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_full_ref`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mono_helper`
+    --> crates/otter-vm-jit/src/translator.rs:2693:42
+     |
+2693 | ...let Some(mono_helper) = mono_ref {
+     |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mono_helper`
+
+warning: type `HelperRefs` is more private than the item `translate_function_with_constants`
+   --> crates/otter-vm-jit/src/translator.rs:803:1
+    |
+803 | / pub fn translate_function_with_cons...
+804 | |     builder: &mut FunctionBuilder<'_>,
+805 | |     function: &Function,
+806 | |     constants: &[Constant],
+807 | |     helpers: Option<&HelperRefs>,
+808 | |     module_functions: &[(u32, Funct...
+809 | | ) -> Result<(), JitError> {
+    | |_________________________^ function `translate_function_with_constants` is reachable at visibility `pub`
+    |
+note: but type `HelperRefs` is only usable at visibility `pub(crate)`
+   --> crates/otter-vm-jit/src/runtime_helpers.rs:550:1
+    |
+550 | pub(crate) struct HelperRefs {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `assert_send_sync` is never used
+  --> crates/otter-vm-jit/src/compiler.rs:54:8
+   |
+54 |     fn assert_send_sync<T: Send + Sync...
+   |        ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `check` is never used
+  --> crates/otter-vm-jit/src/compiler.rs:55:8
+   |
+55 |     fn check() {
+   |        ^^^^^
+
+warning: method `require` is never used
+   --> crates/otter-vm-jit/src/runtime_helpers.rs:576:12
+    |
+554 | impl HelperRefs {
+    | --------------- method in this implementation
+...
+576 |     pub fn require(
+    |            ^^^^^^^
+
+warning: function `emit_guarded_i32_cmp` is never used
+   --> crates/otter-vm-jit/src/type_guards.rs:312:15
+    |
+312 | pub(crate) fn emit_guarded_i32_cmp(
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `emit_specialized_cmp` is never used
+    --> crates/otter-vm-jit/src/type_guards.rs:1508:15
+     |
+1508 | pub(crate) fn emit_specialized_cmp(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-jit/src/compiler.rs:120:30
+    |
+120 | ...struction { pc: usize, opcode: Str...
+    |                ^^^^^^^^^
+    |
+note: the lint level is defined here
+   --> crates/otter-vm-jit/src/lib.rs:6:9
+    |
+  6 | #![warn(missing_docs)]
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-jit/src/compiler.rs:120:41
+    |
+120 | ...c: usize, opcode: String },
+    |              ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-jit/src/compiler.rs:125:9
+    |
+125 |         pc: usize,
+    |         ^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-jit/src/compiler.rs:126:9
+    |
+126 |         offset: i32,
+    |         ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-jit/src/compiler.rs:127:9
+    |
+127 |         instruction_count: usize,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `otter-vm-jit` (lib) generated 13 warnings (run `cargo fix --lib -p otter-vm-jit` to apply 2 suggestions)
+warning: missing documentation for a method
+   --> crates/otter-vm-gc/src/mark_sweep.rs:186:5
+    |
+186 |     pub fn register_type<T: GcTraceable>(&mut self) {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: the lint level is defined here
+   --> crates/otter-vm-gc/src/lib.rs:16:9
+    |
+ 16 | #![warn(missing_docs)]
+    |         ^^^^^^^^^^^^
+
+warning: `otter-vm-gc` (lib) generated 1 warning
+warning: function `assert_send_sync` is never used
+   --> crates/otter-vm-exec/src/jit_runtime.rs:114:8
+    |
+114 |     fn assert_send_sync<T: Send + S...
+    |        ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `check` is never used
+   --> crates/otter-vm-exec/src/jit_runtime.rs:115:8
+    |
+115 |     fn check() {
+    |        ^^^^^
+
+warning: `otter-vm-exec` (lib) generated 2 warnings
+    Checking otter-vm-core v0.1.0 (/Users/alexanderstreltsov/work/octofhir/otter/crates/otter-vm-core)
+warning: unnecessary parentheses around block return value
+    --> crates/otter-vm-core/src/jit_helpers.rs:3952:5
+     |
+3952 |     (n as i64 as i32)
+     |     ^               ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+3952 -     (n as i64 as i32)
+3952 +     n as i64 as i32
+     |
+
+warning: unnecessary parentheses around block return value
+    --> crates/otter-vm-core/src/jit_helpers.rs:3961:5
+     |
+3961 |     (n as i64 as u32)
+     |     ^               ^
+     |
+help: remove these parentheses
+     |
+3961 -     (n as i64 as u32)
+3961 +     n as i64 as u32
+     |
+
+warning: use of deprecated associated function `chrono::NaiveDateTime::from_timestamp_opt`: use `DateTime::from_timestamp` instead
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:294:40
+    |
+294 |     let naive = chrono::NaiveDateTime::from_timestamp_opt(total_secs, su...
+    |                                        ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `chrono::TimeZone`
+   --> crates/otter-vm-core/src/intrinsics_impl/date.rs:647:9
+    |
+647 |     use chrono::TimeZone;
+    |         ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Datelike`
+ --> crates/otter-vm-core/src/intrinsics_impl/temporal/plain_date_time.rs:9:14
+  |
+9 | use chrono::{Datelike, Timelike};
+  |              ^^^^^^^^
+
+warning: unused import: `Timelike`
+ --> crates/otter-vm-core/src/intrinsics_impl/temporal/plain_date_time.rs:9:24
+  |
+9 | use chrono::{Datelike, Timelike};
+  |                        ^^^^^^^^
+
+warning: variable `num_holes` is assigned to, but never used
+    --> crates/otter-vm-core/src/intrinsics_impl/array.rs:1658:21
+     |
+1658 |                 let mut num_holes: usize = 0;
+     |                     ^^^^^^^^^^^^^
+     |
+     = note: consider using `_num_holes` instead
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `num_holes` is never read
+    --> crates/otter-vm-core/src/intrinsics_impl/array.rs:1664:25
+     |
+1664 |                         num_holes += 1;
+     |                         ^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ind`
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:571:17
+    |
+571 |     if let Some(ind) = indent {
+    |                 ^^^ help: if this is intentional, prefix it with an underscore: `_ind`
+
+warning: unused variable: `ind`
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:579:25
+    |
+579 |             if let Some(ind) = indent {
+    |                         ^^^ help: if this is intentional, prefix it with an underscore: `_ind`
+
+warning: unused variable: `ind`
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:922:17
+    |
+922 |     if let Some(ind) = indent {
+    |                 ^^^ help: if this is intentional, prefix it with an underscore: `_ind`
+
+warning: unused variable: `ind`
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:932:25
+    |
+932 |             if let Some(ind) = indent {
+    |                         ^^^ help: if this is intentional, prefix it with an underscore: `_ind`
+
+warning: unused variable: `arg`
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/duration.rs:672:17
+    |
+672 |             let arg = args.first().cloned().unwrap_or(Value::undefined());
+    |                 ^^^ help: if this is intentional, prefix it with an underscore: `_arg`
+
+warning: unused variable: `field`
+  --> crates/otter-vm-core/src/intrinsics_impl/temporal/duration.rs:70:17
+   |
+70 |         for (i, field) in DURATION_FIELDS.iter().enumerate() {
+   |                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_field`
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:942:22
+    |
+942 |     let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+   --> crates/otter-vm-core/src/jit_helpers.rs:933:1
+    |
+933 | unsafe fn extract_js_object(bits: u64) -> Option<&'static JsObject> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:943:15
+    |
+943 |     let tag = (*header_ptr).tag();
+    |               ^^^^^^^^^^^^^ dereference of raw pointer
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:948:11
+    |
+948 |     Some(&*(raw_ptr as *const JsObject))
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dereference of raw pointer
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:960:24
+    |
+960 |             let bits = *argv.add(i) as u64;
+    |                        ^^^^^^^^^^^^ dereference of raw pointer
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+   --> crates/otter-vm-core/src/jit_helpers.rs:955:1
+    |
+955 | unsafe fn collect_args(argc: usize, argv_ptr: i64) -> Option<Vec<crate::value::Value>> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::add` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:960:25
+    |
+960 |             let bits = *argv.add(i) as u64;
+    |                         ^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `value::Value::from_raw_bits_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/jit_helpers.rs:961:23
+    |
+961 |             let arg = crate::value::Value::from_raw_bits_unchecked(bits)?;
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:459:26
+    |
+459 |         let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+   --> crates/otter-vm-core/src/value.rs:443:5
+    |
+443 |     pub(crate) unsafe fn from_raw_bits_unchecked(bits: u64) -> Option<Self> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:460:19
+    |
+460 |         let tag = (*header_ptr).tag();
+    |                   ^^^^^^^^^^^^^ dereference of raw pointer
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...r = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |        ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+474 | ...RE => HeapRef::Function(gc_ref!(Closure)),
+    |                            ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+474 | ...:CLOSURE => HeapRef::Function(gc_ref!(Closure)),
+    |                                  ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...om_raw(NonNull::new_unchecked(box_ptr));
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+474 | ...unction(gc_ref!(Closure)),
+    |            ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+474 |             gc_tags::CLOSURE => HeapRef::Function(gc_ref!(Closure)),
+    |                                                   ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...tr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |         ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+475 | ...TION => HeapRef::NativeFunction(gc_ref!(NativeFunctionObject)),
+    |                                    ----------------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ... = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+475 | ...UNCTION => HeapRef::NativeFunction(gc_ref!(NativeFunctionObject)),
+    |                                       ----------------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...aw(NonNull::new_unchecked(box_ptr));
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+475 | ...veFunction(gc_ref!(NativeFunctionObject)),
+    |               ----------------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 | ...   crate::gc::GcRef::from_gc(gc)
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+475 | ...c_tags::FUNCTION => HeapRef::NativeFunction(gc_ref!(NativeFunctionObject)),
+    |                                                ----------------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...tr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |         ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+476 | ...CT => HeapRef::Object(gc_ref!(JsObject)),
+    |                          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+476 | ...:OBJECT => HeapRef::Object(gc_ref!(JsObject)),
+    |                               ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...rom_raw(NonNull::new_unchecked(box_ptr));
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+476 | ...bject(gc_ref!(JsObject)),
+    |          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+476 |             gc_tags::OBJECT => HeapRef::Object(gc_ref!(JsObject)),
+    |                                                ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |          ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+477 | ...AY => HeapRef::Array(gc_ref!(JsObject)),
+    |                         ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+477 | ...:ARRAY => HeapRef::Array(gc_ref!(JsObject)),
+    |                             ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...from_raw(NonNull::new_unchecked(box_ptr));
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+477 | ...rray(gc_ref!(JsObject)),
+    |         ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+477 |             gc_tags::ARRAY => HeapRef::Array(gc_ref!(JsObject)),
+    |                                              ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...tr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |         ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+478 | ...NG => HeapRef::String(gc_ref!(JsString)),
+    |                          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+478 | ...:STRING => HeapRef::String(gc_ref!(JsString)),
+    |                               ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...rom_raw(NonNull::new_unchecked(box_ptr));
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+478 | ...tring(gc_ref!(JsString)),
+    |          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+478 |             gc_tags::STRING => HeapRef::String(gc_ref!(JsString)),
+    |                                                ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |          ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+479 | ...XY => HeapRef::Proxy(gc_ref!(JsProxy)),
+    |                         ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+479 | ...:PROXY => HeapRef::Proxy(gc_ref!(JsProxy)),
+    |                             ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...from_raw(NonNull::new_unchecked(box_ptr));
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+479 | ...roxy(gc_ref!(JsProxy)),
+    |         ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+479 |             gc_tags::PROXY => HeapRef::Proxy(gc_ref!(JsProxy)),
+    |                                              ---------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ... = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |       ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+480 | ...E => HeapRef::Promise(gc_ref!(JsPromise)),
+    |                          ------------------ in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+480 | ...:PROMISE => HeapRef::Promise(gc_ref!(JsPromise)),
+    |                                 ------------------ in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...om_raw(NonNull::new_unchecked(box_ptr));
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+480 | ...romise(gc_ref!(JsPromise)),
+    |           ------------------ in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+480 |             gc_tags::PROMISE => HeapRef::Promise(gc_ref!(JsPromise)),
+    |                                                  ------------------ in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ... box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |               ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+481 | ...::GENERATOR => HeapRef::Generator(gc_ref!(JsGenerator)),
+    |                                      -------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+481 | ...:GENERATOR => HeapRef::Generator(gc_ref!(JsGenerator)),
+    |                                     -------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...om_raw(NonNull::new_unchecked(box_ptr));
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+481 | ...:Generator(gc_ref!(JsGenerator)),
+    |               -------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+481 |             gc_tags::GENERATOR => HeapRef::Generator(gc_ref!(JsGenerator)),
+    |                                                      -------------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |          ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+482 | ...BOL => HeapRef::Symbol(gc_ref!(Symbol)),
+    |                           --------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+482 | ...:SYMBOL => HeapRef::Symbol(gc_ref!(Symbol)),
+    |                               --------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...rom_raw(NonNull::new_unchecked(box_ptr));
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+482 | ...ymbol(gc_ref!(Symbol)),
+    |          --------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+482 |             gc_tags::SYMBOL => HeapRef::Symbol(gc_ref!(Symbol)),
+    |                                                --------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::const_ptr::<impl *const T>::sub` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:467:31
+    |
+467 | ...tr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
+    |         ^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+483 | ...XP => HeapRef::RegExp(gc_ref!(JsRegExp)),
+    |                          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::Gc::<T>::from_raw` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:26
+    |
+468 | ...gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+483 | ...:REGEXP => HeapRef::RegExp(gc_ref!(JsRegExp)),
+    |                               ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `std::ptr::NonNull::<T>::new_unchecked` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:468:50
+    |
+468 | ...rom_raw(NonNull::new_unchecked(box_ptr));
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+483 | ...egExp(gc_ref!(JsRegExp)),
+    |          ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning[E0133]: call to unsafe function `gc::GcRef::<T>::from_gc` is unsafe and requires unsafe block
+   --> crates/otter-vm-core/src/value.rs:469:17
+    |
+469 |                 crate::gc::GcRef::from_gc(gc)
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+...
+483 |             gc_tags::REGEXP => HeapRef::RegExp(gc_ref!(JsRegExp)),
+    |                                                ----------------- in this macro invocation
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: this warning originates in the macro `gc_ref` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: methods `default_object_prototype_for_constructor`, `get_prototype_from_constructor`, and `get_prototype_from_constructor_with_default` are never used
+   --> crates/otter-vm-core/src/context.rs:165:19
+    |
+ 42 | impl<'a> NativeContext<'a> {
+    | -------------------------- methods in this implementation
+...
+165 |     pub(crate) fn default_object_prototype_for_constructor(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+173 |     pub(crate) fn get_prototype_from_constructor(&self, ctor: &Value) ->...
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+180 |     pub(crate) fn get_prototype_from_constructor_with_default(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `parse_hex2` is never used
+    --> crates/otter-vm-core/src/globals.rs:1757:4
+     |
+1757 | fn parse_hex2(bytes: &[u8]) -> Option<u16> {
+     |    ^^^^^^^^^^
+
+warning: function `parse_hex4` is never used
+    --> crates/otter-vm-core/src/globals.rs:1766:4
+     |
+1766 | fn parse_hex4(bytes: &[u8]) -> Option<u16> {
+     |    ^^^^^^^^^^
+
+warning: function `hex_digit` is never used
+    --> crates/otter-vm-core/src/globals.rs:1777:4
+     |
+1777 | fn hex_digit(b: u8) -> Option<u8> {
+     |    ^^^^^^^^^
+
+warning: function `to_js_string` is never used
+    --> crates/otter-vm-core/src/globals.rs:2073:4
+     |
+2073 | fn to_js_string(value: &Value) -> GcRef<JsString> {
+     |    ^^^^^^^^^^^^
+
+warning: methods `to_string_utf16_units` and `to_primitive_number` are never used
+     --> crates/otter-vm-core/src/interpreter.rs:10375:8
+      |
+  191 | impl Interpreter {
+      | ---------------- methods in this implementation
+...
+10375 |     fn to_string_utf16_units(&self, ctx: &mut VmContext, value: &Value...
+      |        ^^^^^^^^^^^^^^^^^^^^^
+...
+10488 |     fn to_primitive_number(&self, ctx: &mut VmContext, value: &Value) ...
+      |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `unwrap_primitive` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:394:4
+    |
+394 | fn unwrap_primitive(value: &Value) -> Value {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `serialize_value_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:460:4
+    |
+460 | fn serialize_value_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `serialize_array_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:534:4
+    |
+534 | fn serialize_array_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `serialize_object_simple` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/json.rs:625:4
+    |
+625 | fn serialize_object_simple(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `weak_key_id` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/map_set.rs:116:4
+    |
+116 | fn weak_key_id(value: &Value) -> Option<usize> {
+    |    ^^^^^^^^^^^
+
+warning: function `js_get` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/map_set.rs:156:4
+    |
+156 | fn js_get(
+    |    ^^^^^^
+
+warning: function `descriptor_from_attributes` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/reflect.rs:137:4
+    |
+137 | fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDes...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `obj_set_with_receiver` is never used
+  --> crates/otter-vm-core/src/intrinsics_impl/regexp.rs:90:4
+   |
+90 | fn obj_set_with_receiver(
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `this_string_value` is never used
+  --> crates/otter-vm-core/src/intrinsics_impl/string.rs:23:4
+   |
+23 | fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
+   |    ^^^^^^^^^^^^^^^^^
+
+warning: function `extract_date_like` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:166:15
+    |
+166 | pub(super) fn extract_date_like(obj: &GcRef<JsObject>) -> Result<tempora...
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `iso_date_to_epoch_days` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:310:15
+    |
+310 | pub(super) fn iso_date_to_epoch_days(year: i32, month: i32, day: i32) ->...
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_tz_offset_ns` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:327:15
+    |
+327 | pub(super) fn parse_tz_offset_ns(tz_id: &str) -> Result<i128, VmError> {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_month_code` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:486:15
+    |
+486 | pub(super) fn parse_month_code(s: &str) -> Option<u32> {
+    |               ^^^^^^^^^^^^^^^^
+
+warning: function `extract_iso_date_from_date_like_slots` is never used
+   --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:727:15
+    |
+727 | pub(super) fn extract_iso_date_from_date_like_slots(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `has_standalone_utc_offset` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1055:15
+     |
+1055 | pub(super) fn has_standalone_utc_offset(s: &str) -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `has_utc_offset` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1095:15
+     |
+1095 | pub(super) fn has_utc_offset(s: &str) -> bool {
+     |               ^^^^^^^^^^^^^^
+
+warning: function `parse_timezone_offset_ns` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1320:15
+     |
+1320 | pub(super) fn parse_timezone_offset_ns(tz_id: &str) -> i128 {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_time_fields_from_bag` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1711:15
+     |
+1711 | pub(super) fn read_time_fields_from_bag(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_time_fields_from_bag_with_leap_second` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1769:15
+     |
+1769 | pub(super) fn read_time_fields_from_bag_with_leap_second(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_time_fields_from_bag_value` is never used
+    --> crates/otter-vm-core/src/intrinsics_impl/temporal/common.rs:1834:15
+     |
+1834 | pub(super) fn read_time_fields_from_bag_value(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `get_prototype_storage` is never used
+    --> crates/otter-vm-core/src/object.rs:3235:19
+     |
+ 757 | impl JsObject {
+     | ------------- method in this implementation
+...
+3235 |     pub(crate) fn get_prototype_storage(&self) -> &ObjectCell<Value> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `remove_unicode_keyword` is never used
+   --> crates/otter-vm-core/src/web_api/intl.rs:958:4
+    |
+958 | fn remove_unicode_keyword(locale: &str, keyword: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `WriteablePartCollector` is never constructed
+    --> crates/otter-vm-core/src/web_api/intl.rs:1496:8
+     |
+1496 | struct WriteablePartCollector {
+     |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:26:1
+   |
+26 | pub mod drop_guard;
+   | ^^^^^^^^^^^^^^^^^^
+   |
+note: the lint level is defined here
+  --> crates/otter-vm-core/src/lib.rs:12:9
+   |
+12 | #![warn(missing_docs)]
+   |         ^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:47:1
+   |
+47 | pub mod regexp;
+   | ^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:53:1
+   |
+53 | pub mod symbol_registry;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> crates/otter-vm-core/src/lib.rs:59:1
+   |
+59 | pub mod web_api;
+   | ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:638:5
+    |
+638 |     pub function_index: u32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:639:5
+    |
+639 |     pub function_name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:640:5
+    |
+640 |     pub pc: usize,
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:641:5
+    |
+641 |     pub instruction: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:642:5
+    |
+642 |     pub module_url: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:643:5
+    |
+643 |     pub is_async: bool,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:644:5
+    |
+644 |     pub is_generator: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/context.rs:645:5
+    |
+645 |     pub is_construct: bool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2002:5
+     |
+2002 |     pub fn set_pending_new_target_proto(&mut self, proto: GcRef<JsObject>) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2006:5
+     |
+2006 |     pub fn set_pending_realm_id(&mut self, realm_id: RealmId) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2253:5
+     |
+2253 |     pub fn registers_to_trace(&self) -> &[Value] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2257:5
+     |
+2257 |     pub fn pending_args_to_trace(&self) -> &[Value] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2261:5
+     |
+2261 |     pub fn pending_this_to_trace(&self) -> Option<&Value> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2265:5
+     |
+2265 |     pub fn pending_callee_to_trace(&self) -> Option<&Value> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2269:5
+     |
+2269 |     pub fn pending_home_object_to_trace(&self) -> Option<&GcRef<JsObject>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2273:5
+     |
+2273 |     pub fn pending_upvalues_to_trace(&self) -> &[UpvalueCell] {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> crates/otter-vm-core/src/context.rs:2277:5
+     |
+2277 |     pub fn open_upvalues_to_trace(&self) -> &HashMap<(usize, u16), UpvalueCell> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> crates/otter-vm-core/src/generator.rs:273:1
+    |
+273 | pub struct JsGenerator {
+    | ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/globals.rs:1831:1
+     |
+1831 | pub fn to_number(value: &Value) -> f64 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/globals.rs:2049:1
+     |
+2049 | pub fn to_string(value: &Value) -> String {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/interpreter.rs:750:5
+    |
+750 | /     pub fn execute_with_suspension_and_locals(
+751 | |         &self,
+752 | |         module: Arc<Module>,
+753 | |         ctx: &mut VmContext,
+754 | |         result_promise: GcRef<JsPromise>,
+755 | |         initial_locals: Option<std::collections::HashMap<u16, Value>>,
+756 | |     ) -> VmExecutionResult {
+    | |__________________________^
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+     --> crates/otter-vm-core/src/interpreter.rs:11439:21
+      |
+11439 |                     drop(instructions);
+      |                     ^^^^^------------^
+      |                          |
+      |                          argument has type `&Vec<Instruction>`
+      |
+      = note: `#[warn(dropping_references)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+      |
+11439 -                     drop(instructions);
+11439 +                     let _ = instructions;
+      |
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+     --> crates/otter-vm-core/src/interpreter.rs:11857:17
+      |
+11857 |                 drop(instructions);
+      |                 ^^^^^------------^
+      |                      |
+      |                      argument has type `&Vec<Instruction>`
+      |
+help: use `let _ = ...` to ignore the expression or result
+      |
+11857 -                 drop(instructions);
+11857 +                 let _ = instructions;
+      |
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:256:1
+    |
+256 | / pub fn create_generator_function_constructor(
+257 | |     realm_id: RealmId,
+258 | | ) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
+    | |__________________________________________________________________________________________________^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:262:1
+    |
+262 | / pub fn create_async_function_constructor(
+263 | |     realm_id: RealmId,
+264 | | ) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
+    | |__________________________________________________________________________________________________^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/intrinsics_impl/function.rs:268:1
+    |
+268 | / pub fn create_async_generator_function_constructor(
+269 | |     realm_id: RealmId,
+270 | | ) -> Box<dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync> {
+    | |__________________________________________________________________________________________________^
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+    --> crates/otter-vm-core/src/jit_helpers.rs:1657:9
+     |
+1657 |         drop(feedback);
+     |         ^^^^^--------^
+     |              |
+     |              argument has type `&mut Vec<InstructionMetadata>`
+     |
+help: use `let _ = ...` to ignore the expression or result
+     |
+1657 -         drop(feedback);
+1657 +         let _ = feedback;
+     |
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/memory.rs:300:5
+    |
+300 |     pub fn new(inner: T, size: usize, manager: Arc<MemoryManager>) -> VmResult<Self> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/memory.rs:309:5
+    |
+309 |     pub fn inner(&self) -> &T {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/memory.rs:313:5
+    |
+313 |     pub fn inner_mut(&mut self) -> &mut T {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> crates/otter-vm-core/src/object.rs:828:5
+    |
+828 |     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:22:5
+   |
+22 |     pub id: RealmId,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:23:5
+   |
+23 |     pub intrinsics: Intrinsics,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:24:5
+   |
+24 |     pub function_prototype: GcRef<JsObject>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/otter-vm-core/src/realm.rs:25:5
+   |
+25 |     pub global: GcRef<JsObject>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/realm.rs:35:5
+   |
+35 |     pub fn new() -> Arc<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/regexp.rs:80:5
+   |
+80 |     pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/string.rs:309:9
+    |
+309 |         left: GcRef<JsString>,
+    |         ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/string.rs:310:9
+    |
+310 |         right: GcRef<JsString>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/string.rs:311:9
+    |
+311 |         len: usize,
+    |         ^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/otter-vm-core/src/string.rs:312:9
+    |
+312 |         depth: u8,
+    |         ^^^^^^^^^
+
+error: casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`
+   --> crates/otter-vm-core/src/string.rs:439:41
+    |
+439 | ...ut = unsafe { &mut *(self as *const Self as *mut Self) };
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>
+    = note: even for types with interior mutability, the only legal way to obtain a mutable pointer from a shared reference is through `UnsafeCell::get`
+    = note: `#[deny(invalid_reference_casting)]` on by default
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/symbol_registry.rs:21:5
+   |
+21 |     pub fn new() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:27:5
+   |
+27 |     pub fn get(&self, key: &str) -> Option<GcRef<Symbol>> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:31:5
+   |
+31 |     pub fn insert(&self, key: String, symbol: GcRef<Symbol>) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:35:5
+   |
+35 |     pub fn key_for(&self, symbol: &GcRef<Symbol>) -> Option<String> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> crates/otter-vm-core/src/symbol_registry.rs:45:5
+   |
+45 |     pub fn trace_roots(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/value.rs:545:5
+    |
+545 |     pub fn regex(regex: GcRef<JsRegExp>) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> crates/otter-vm-core/src/web_api/abort_controller.rs:30:1
+   |
+30 | #[js_class(name = "AbortSignal")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the attribute macro `js_class` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/web_api/abort_controller.rs:36:5
+   |
+36 |     pub fn abort(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/web_api/abort_controller.rs:42:5
+   |
+42 | /     pub fn timeout(
+43 | |         _this: &Value,
+44 | |         args: &[Value],
+45 | |         ncx: &mut NativeContext,
+46 | |     ) -> Result<Value, VmError> {
+   | |_______________________________^
+
+warning: missing documentation for an associated function
+  --> crates/otter-vm-core/src/web_api/abort_controller.rs:89:5
+   |
+89 | /     pub fn aborted(
+90 | |         this: &Value,
+91 | |         _args: &[Value],
+92 | |         _ncx: &mut NativeContext,
+93 | |     ) -> Result<Value, VmError> {
+   | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:98:5
+    |
+ 98 | /     pub fn reason(
+ 99 | |         this: &Value,
+100 | |         _args: &[Value],
+101 | |         _ncx: &mut NativeContext,
+102 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:107:5
+    |
+107 | /     pub fn throw_if_aborted(
+108 | |         this: &Value,
+109 | |         _args: &[Value],
+110 | |         _ncx: &mut NativeContext,
+111 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:121:5
+    |
+121 | /     pub fn get_onabort(
+122 | |         this: &Value,
+123 | |         _args: &[Value],
+124 | |         _ncx: &mut NativeContext,
+125 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:130:5
+    |
+130 | /     pub fn set_onabort(
+131 | |         this: &Value,
+132 | |         args: &[Value],
+133 | |         _ncx: &mut NativeContext,
+134 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for a struct
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:167:1
+    |
+167 | #[js_class(name = "AbortController")]
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this warning originates in the attribute macro `js_class` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:173:5
+    |
+173 | /     pub fn constructor(
+174 | |         this: &Value,
+175 | |         _args: &[Value],
+176 | |         ncx: &mut NativeContext,
+177 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:184:5
+    |
+184 | /     pub fn signal(
+185 | |         this: &Value,
+186 | |         _args: &[Value],
+187 | |         _ncx: &mut NativeContext,
+188 | |     ) -> Result<Value, VmError> {
+    | |_______________________________^
+
+warning: missing documentation for an associated function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:193:5
+    |
+193 |     pub fn abort(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:271:1
+    |
+271 | / pub fn init_abort_signal(
+272 | |     signal_ctor: GcRef<JsObject>,
+273 | |     signal_proto: GcRef<JsObject>,
+274 | |     fn_proto: GcRef<JsObject>,
+275 | |     mm: &Arc<crate::memory::MemoryManager>,
+276 | | ) {
+    | |_^
+
+warning: missing documentation for a function
+   --> crates/otter-vm-core/src/web_api/abort_controller.rs:320:1
+    |
+320 | / pub fn init_abort_controller(
+321 | |     controller_ctor: GcRef<JsObject>,
+322 | |     controller_proto: GcRef<JsObject>,
+323 | |     fn_proto: GcRef<JsObject>,
+324 | |     mm: &Arc<crate::memory::MemoryManager>,
+325 | | ) {
+    | |_^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/web_api/intl.rs:3564:1
+     |
+3564 | / pub fn to_locale_lowercase(
+3565 | |     input: &str,
+3566 | |     locales: Option<&Value>,
+3567 | |     ncx: &mut NativeContext<'_>,
+3568 | | ) -> Result<String, VmError> {
+     | |____________________________^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/web_api/intl.rs:3579:1
+     |
+3579 | / pub fn to_locale_uppercase(
+3580 | |     input: &str,
+3581 | |     locales: Option<&Value>,
+3582 | |     ncx: &mut NativeContext<'_>,
+3583 | | ) -> Result<String, VmError> {
+     | |____________________________^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/web_api/intl.rs:3594:1
+     |
+3594 | / pub fn locale_compare(
+3595 | |     left: &str,
+3596 | |     right: &str,
+3597 | |     locales: Option<&Value>,
+3598 | |     options: Option<&Value>,
+3599 | |     ncx: &mut NativeContext<'_>,
+3600 | | ) -> Result<f64, VmError> {
+     | |_________________________^
+
+warning: missing documentation for a function
+    --> crates/otter-vm-core/src/web_api/intl.rs:3688:1
+     |
+3688 | / pub fn install_intl(
+3689 | |     global: GcRef<JsObject>,
+3690 | |     object_proto: GcRef<JsObject>,
+3691 | |     fn_proto: GcRef<JsObject>,
+3692 | |     mm: &Arc<MemoryManager>,
+3693 | | ) {
+     | |_^
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `otter-vm-core` (lib) generated 160 warnings
+error: could not compile `otter-vm-core` (lib) due to 1 previous error; 160 warnings emitted

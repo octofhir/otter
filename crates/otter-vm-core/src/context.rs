@@ -1837,12 +1837,7 @@ impl VmContext {
     /// Overwrites the current frame's locals and registers with the captured
     /// values from JIT deopt, and sets the program counter to `bailout_pc`.
     /// The interpreter then resumes execution from that point.
-    pub fn restore_deopt_state(
-        &mut self,
-        bailout_pc: u32,
-        locals: &[Value],
-        registers: &[Value],
-    ) {
+    pub fn restore_deopt_state(&mut self, bailout_pc: u32, locals: &[Value], registers: &[Value]) {
         if let Some(frame) = self.call_stack.last_mut() {
             frame.pc = bailout_pc as usize;
             // Overwrite locals with deopt-captured values

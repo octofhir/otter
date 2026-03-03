@@ -269,52 +269,60 @@ pub fn init_array_prototype(
 ) {
     let _ = array_iterator_proto;
     // Array.prototype.push
+    let push_fn = Value::native_function_with_proto_named(
+        |this_val, args, _ncx| {
+            let obj = this_val
+                .as_object()
+                .ok_or_else(|| "Array.prototype.push: this is not an object".to_string())?;
+            let mut len = get_len(&obj);
+            for arg in args {
+                let _ = obj.set(PropertyKey::Index(len as u32), arg.clone());
+                len += 1;
+            }
+            set_len(&obj, len);
+            Ok(Value::number(len as f64))
+        },
+        mm.clone(),
+        fn_proto.clone(),
+        "push",
+        1,
+    );
+    if let Some(obj) = push_fn.native_function_object() {
+        obj.flags.borrow_mut().is_array_push = true;
+    }
     arr_proto.define_property(
         PropertyKey::string("push"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-            |this_val, args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "Array.prototype.push: this is not an object".to_string())?;
-                let mut len = get_len(&obj);
-                for arg in args {
-                    let _ = obj.set(PropertyKey::Index(len as u32), arg.clone());
-                    len += 1;
-                }
-                set_len(&obj, len);
-                Ok(Value::number(len as f64))
-            },
-            mm.clone(),
-            fn_proto,
-            "push",
-            1,
-        )),
+        PropertyDescriptor::builtin_method(push_fn),
     );
 
     // Array.prototype.pop
+    let pop_fn = Value::native_function_with_proto_named(
+        |this_val, _args, _ncx| {
+            let obj = this_val
+                .as_object()
+                .ok_or_else(|| "Array.prototype.pop: this is not an object".to_string())?;
+            let len = get_len(&obj);
+            if len == 0 {
+                set_len(&obj, 0);
+                return Ok(Value::undefined());
+            }
+            let idx = PropertyKey::Index((len - 1) as u32);
+            let val = obj.get(&idx).unwrap_or(Value::undefined());
+            obj.delete(&idx);
+            set_len(&obj, len - 1);
+            Ok(val)
+        },
+        mm.clone(),
+        fn_proto.clone(),
+        "pop",
+        0,
+    );
+    if let Some(obj) = pop_fn.native_function_object() {
+        obj.flags.borrow_mut().is_array_pop = true;
+    }
     arr_proto.define_property(
         PropertyKey::string("pop"),
-        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-            |this_val, _args, _ncx| {
-                let obj = this_val
-                    .as_object()
-                    .ok_or_else(|| "Array.prototype.pop: this is not an object".to_string())?;
-                let len = get_len(&obj);
-                if len == 0 {
-                    set_len(&obj, 0);
-                    return Ok(Value::undefined());
-                }
-                let idx = PropertyKey::Index((len - 1) as u32);
-                let val = obj.get(&idx).unwrap_or(Value::undefined());
-                obj.delete(&idx);
-                set_len(&obj, len - 1);
-                Ok(val)
-            },
-            mm.clone(),
-            fn_proto,
-            "pop",
-            0,
-        )),
+        PropertyDescriptor::builtin_method(pop_fn),
     );
 
     // Array.prototype.shift

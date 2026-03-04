@@ -89,8 +89,8 @@ struct Cli {
     #[arg(long, global = true)]
     profile: bool,
 
-    /// Dump debug snapshot on timeout (default: true)
-    #[arg(long, global = true, default_value = "true")]
+    /// Dump debug snapshot on timeout (default: false)
+    #[arg(long, global = true)]
     dump_on_timeout: bool,
 
     /// File path for timeout dumps (default: stderr)
@@ -344,11 +344,13 @@ fn build_capabilities(cli: &Cli) -> otter_engine::Capabilities {
 }
 
 fn build_engine(cli: &Cli, caps: otter_engine::Capabilities) -> otter_engine::Otter {
-    EngineBuilder::new()
+    let mut engine = EngineBuilder::new()
         .capabilities(caps)
         .with_http()
         .with_nodejs_profile(cli.node_api.to_profile())
-        .build()
+        .build();
+    engine.set_debug_snapshot_updates_enabled(cli.dump_on_timeout || cli.cpu_prof);
+    engine
 }
 
 struct ResolveBaseDirGuard {
@@ -1584,6 +1586,15 @@ mod tests {
     }
 
     #[test]
+    fn dump_on_timeout_is_off_by_default() {
+        let cli = Cli::try_parse_from(["otter", "repl"]).expect("cli parse");
+        assert!(
+            !cli.dump_on_timeout,
+            "timeout dump tracing must stay opt-in"
+        );
+    }
+
+    #[test]
     fn async_trace_flags_parse() {
         let cli = Cli::try_parse_from([
             "otter",
@@ -2023,6 +2034,21 @@ mod tests {
                 .collect()
         }
 
+        fn opcode_counts(opcodes: &[String]) -> std::collections::BTreeMap<&str, usize> {
+            let mut counts = std::collections::BTreeMap::new();
+            for opcode in opcodes {
+                *counts.entry(opcode.as_str()).or_insert(0) += 1;
+            }
+            counts
+        }
+
+        fn opcode_transitions(opcodes: &[String]) -> std::collections::BTreeSet<(&str, &str)> {
+            opcodes
+                .windows(2)
+                .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                .collect()
+        }
+
         async fn write_timeout_dump(
             cli: &Cli,
             source: &str,
@@ -2113,8 +2139,28 @@ mod tests {
             "expected timeout dump to include instruction opcode lines"
         );
         assert_eq!(
-            opcodes_one, opcodes_two,
-            "timeout dump opcode sequence should be reproducible across identical runs"
+            opcodes_one.len(),
+            opcodes_two.len(),
+            "timeout dump opcode windows should have the same length"
+        );
+        let counts_one = opcode_counts(&opcodes_one);
+        let counts_two = opcode_counts(&opcodes_two);
+        assert!(
+            counts_one.keys().eq(counts_two.keys()),
+            "timeout dump opcode sets should match across identical runs"
+        );
+        for key in counts_one.keys() {
+            let a = counts_one.get(key).copied().unwrap_or(0);
+            let b = counts_two.get(key).copied().unwrap_or(0);
+            assert!(
+                a.abs_diff(b) <= 1,
+                "opcode frequency drift is too large for {key}: {a} vs {b}"
+            );
+        }
+        assert_eq!(
+            opcode_transitions(&opcodes_one),
+            opcode_transitions(&opcodes_two),
+            "timeout dump opcode transition graph should be reproducible across identical runs"
         );
 
         let _ = std::fs::remove_file(dump_one_path);

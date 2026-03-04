@@ -725,10 +725,8 @@ impl Trace for crate::context::VmContext {
         // Trace global object
         tracer.mark(self.global().as_ref());
 
-        // Trace registers
-        for value in self.registers_to_trace().iter() {
-            tracer.mark_value(value);
-        }
+        // Trace only live register windows for active frames.
+        self.for_each_live_register(|value| tracer.mark_value(value));
 
         // Trace call stack
         for frame in self.call_stack().iter() {

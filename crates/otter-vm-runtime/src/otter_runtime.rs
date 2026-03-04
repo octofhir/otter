@@ -462,6 +462,8 @@ pub struct Otter {
     interrupt_flag: Arc<AtomicBool>,
     /// Debug snapshot for watchdogs
     debug_snapshot: Arc<parking_lot::Mutex<VmContextSnapshot>>,
+    /// Whether execution contexts should periodically refresh debug snapshots.
+    debug_snapshot_updates_enabled: bool,
     /// Trace configuration (if tracing is enabled)
     trace_config: Option<otter_vm_core::TraceConfig>,
     /// Async operation tracer for Chrome Trace-compatible output
@@ -511,6 +513,7 @@ impl Otter {
             capabilities: Capabilities::none(),
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
+            debug_snapshot_updates_enabled: true,
             trace_config: None,
             #[cfg(feature = "profiling")]
             async_tracer: None,
@@ -540,6 +543,17 @@ impl Otter {
     /// Get the debug snapshot handle for watchdogs.
     pub fn debug_snapshot_handle(&self) -> Arc<parking_lot::Mutex<VmContextSnapshot>> {
         Arc::clone(&self.debug_snapshot)
+    }
+
+    /// Enable or disable periodic debug snapshot updates during execution.
+    ///
+    /// When disabled, contexts are created without a snapshot target, avoiding
+    /// per-interval snapshot formatting overhead in hot loops.
+    pub fn set_debug_snapshot_updates_enabled(&mut self, enabled: bool) {
+        self.debug_snapshot_updates_enabled = enabled;
+        if !enabled {
+            *self.debug_snapshot.lock() = VmContextSnapshot::default();
+        }
     }
 
     /// Request interruption of execution
@@ -772,7 +786,11 @@ impl Otter {
         // 3. Create execution context with globals and interrupt flag
         let mut ctx = self.isolate.runtime().create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
-        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        if self.debug_snapshot_updates_enabled {
+            ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        } else {
+            ctx.set_debug_snapshot_target(None);
+        }
 
         // Apply trace configuration if enabled
         if let Some(ref trace_config) = self.trace_config {
@@ -1211,7 +1229,11 @@ impl Otter {
         // Create execution context with interrupt flag
         let mut ctx = self.isolate.runtime().create_context();
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
-        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        if self.debug_snapshot_updates_enabled {
+            ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        } else {
+            ctx.set_debug_snapshot_target(None);
+        }
 
         // Apply trace configuration if enabled
         if let Some(ref trace_config) = self.trace_config {
@@ -2116,7 +2138,11 @@ impl Otter {
     /// Configure a context with runtime hooks, ops, and extension setup JS.
     fn setup_context(&self, ctx: &mut VmContext) -> Result<(), OtterError> {
         ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
-        ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        if self.debug_snapshot_updates_enabled {
+            ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
+        } else {
+            ctx.set_debug_snapshot_target(None);
+        }
         self.configure_eval(ctx);
         Self::configure_js_job_queue(ctx, &self.event_loop);
         Self::configure_next_tick_queue(ctx, &self.event_loop);

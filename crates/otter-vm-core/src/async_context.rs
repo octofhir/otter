@@ -66,7 +66,7 @@ pub struct SavedFrame {
     pub pc: usize,
     /// Local variables snapshot
     pub locals: Vec<Value>,
-    /// Register values for this frame (256 registers max)
+    /// Register values for this frame's live register window
     pub registers: Vec<Value>,
     /// Captured upvalues (heap-allocated cells)
     pub upvalues: Vec<UpvalueCell>,

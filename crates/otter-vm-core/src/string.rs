@@ -98,14 +98,13 @@ impl StringTable {
 
     /// Intern a string in this table.
     pub fn intern(&self, s: &str) -> GcRef<JsString> {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let hash = JsString::compute_hash_units(&units);
+        let hash = JsString::compute_hash_str(s);
 
         // Check if already interned
         if let Ok(borrowed) = self.strings.try_borrow() {
             if let Some(bucket) = borrowed.get(&hash) {
                 for existing in bucket.iter() {
-                    if existing.as_utf16() == units.as_slice() {
+                    if JsString::utf16_equals_str(existing.as_utf16(), s) {
                         Self::perform_read_barrier(*existing);
                         return *existing;
                     }
@@ -114,6 +113,7 @@ impl StringTable {
         }
 
         // Create new interned string
+        let units: Vec<u16> = s.encode_utf16().collect();
         let js_str = GcRef::new(JsString {
             repr: StringRepr::Flat(units.into()),
             flattened: OnceLock::new(),
@@ -160,12 +160,11 @@ impl StringTable {
 
     /// Check if a string is interned in this table.
     pub fn is_interned(&self, s: &str) -> bool {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let hash = JsString::compute_hash_units(&units);
+        let hash = JsString::compute_hash_str(s);
         let borrowed = self.strings.borrow();
         if let Some(bucket) = borrowed.get(&hash) {
             for existing in bucket.iter() {
-                if existing.as_utf16() == units.as_slice() {
+                if JsString::utf16_equals_str(existing.as_utf16(), s) {
                     return true;
                 }
             }
@@ -610,9 +609,36 @@ impl JsString {
     }
 
     fn compute_hash_units(units: &[u16]) -> u64 {
+        Self::compute_hash_utf16_iter(units.iter().copied())
+    }
+
+    fn compute_hash_str(s: &str) -> u64 {
+        Self::compute_hash_utf16_iter(s.encode_utf16())
+    }
+
+    fn compute_hash_utf16_iter<I>(units: I) -> u64
+    where
+        I: Iterator<Item = u16>,
+    {
         let mut hasher = FxHasher::default();
-        units.hash(&mut hasher);
+        let mut len = 0usize;
+        for unit in units {
+            unit.hash(&mut hasher);
+            len += 1;
+        }
+        len.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn utf16_equals_str(units: &[u16], s: &str) -> bool {
+        let mut idx = 0usize;
+        for unit in s.encode_utf16() {
+            if idx >= units.len() || units[idx] != unit {
+                return false;
+            }
+            idx += 1;
+        }
+        idx == units.len()
     }
 }
 
@@ -858,6 +884,20 @@ mod tests {
         table.clear();
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_intern_hash_matches_utf16_path() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let table = StringTable::new();
+        let text = "json_key_😀";
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+
+        let via_str = table.intern(text);
+        let via_utf16 = table.intern_utf16(&utf16);
+
+        assert_eq!(via_str.as_ptr(), via_utf16.as_ptr());
+        assert_eq!(table.len(), 1);
     }
 
     #[test]

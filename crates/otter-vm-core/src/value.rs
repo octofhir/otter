@@ -103,12 +103,12 @@ const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
 const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004; // Array hole sentinel (not user-visible)
 const TAG_NAN: u64 = 0x7FFA_0000_0000_0000; // Canonical NaN (distinct from undefined)
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
+const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
 
 /// A JavaScript value using NaN-boxing for efficient storage
 ///
 /// This type is `Send + Sync` because all heap-allocated data is behind `Arc`.
-#[derive(Clone)]
 pub struct Value {
     bits: u64,
     /// Heap reference to prevent GC while value is alive
@@ -122,6 +122,23 @@ pub struct Value {
 // to a single Isolate, which is `Send` but `!Sync`.
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
+
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        if self.heap_ref.is_none() {
+            return Self {
+                bits: self.bits,
+                heap_ref: None,
+            };
+        }
+
+        Self {
+            bits: self.bits,
+            heap_ref: self.heap_ref.clone(),
+        }
+    }
+}
 
 /// Native function handler type.
 ///
@@ -931,9 +948,9 @@ impl Value {
     }
 
     /// Check if value is an integer
-    #[inline]
+    #[inline(always)]
     pub fn is_int32(&self) -> bool {
-        (self.bits & 0xFFFF_FFFF_0000_0000) == TAG_INT32
+        (self.bits & INT32_TAG_MASK) == TAG_INT32
     }
 
     /// Check if value is NaN
@@ -1493,22 +1510,45 @@ impl std::fmt::Debug for Value {
 }
 
 impl PartialEq for Value {
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
+        let self_bits = self.bits;
+        let other_bits = other.bits;
+
         // NaN != NaN (IEEE 754)
-        if self.bits == TAG_NAN || other.bits == TAG_NAN {
+        if self_bits == TAG_NAN || other_bits == TAG_NAN {
             return false;
         }
 
         // Fast path: same bits
-        if self.bits == other.bits {
+        if self_bits == other_bits {
             return true;
         }
 
-        // Numbers: need special handling for NaN
-        if self.is_number() && other.is_number() {
-            let a = self.as_number().unwrap();
-            let b = other.as_number().unwrap();
-            return a == b; // NaN != NaN is correct
+        // Int32 fast path: different tagged int32 values are never equal.
+        // Avoids falling through to the generic number conversion path.
+        let self_is_int32 = (self_bits & INT32_TAG_MASK) == TAG_INT32;
+        let other_is_int32 = (other_bits & INT32_TAG_MASK) == TAG_INT32;
+        if self_is_int32 && other_is_int32 {
+            return false;
+        }
+
+        // Numbers: int32 and non-boxed f64 values.
+        // TAG_NAN was already handled above, so numeric compare can be direct.
+        let self_is_number = self_is_int32 || (self_bits & QUIET_NAN) != QUIET_NAN;
+        let other_is_number = other_is_int32 || (other_bits & QUIET_NAN) != QUIET_NAN;
+        if self_is_number && other_is_number {
+            let a = if self_is_int32 {
+                (self_bits as u32 as i32) as f64
+            } else {
+                f64::from_bits(self_bits)
+            };
+            let b = if other_is_int32 {
+                (other_bits as u32 as i32) as f64
+            } else {
+                f64::from_bits(other_bits)
+            };
+            return a == b;
         }
 
         // Strings: compare contents

@@ -871,47 +871,6 @@ impl PeepholeOptimizer {
 
     /// Two-instruction window optimizations
     fn optimize_window_2(&self, first: &Instruction, second: &Instruction) -> Option<WindowResult> {
-        // Double negation: Neg then Neg
-        if let (
-            Instruction::Neg {
-                dst: dst1,
-                src: src1,
-            },
-            Instruction::Neg {
-                dst: dst2,
-                src: src2,
-            },
-        ) = (first, second)
-        {
-            if dst1 == src2 {
-                // -(-x) = x
-                return Some(WindowResult::Replace1(Instruction::Move {
-                    dst: *dst2,
-                    src: *src1,
-                }));
-            }
-        }
-
-        // Double Not: !(!x) = x (for booleans)
-        if let (
-            Instruction::Not {
-                dst: dst1,
-                src: src1,
-            },
-            Instruction::Not {
-                dst: dst2,
-                src: src2,
-            },
-        ) = (first, second)
-        {
-            if dst1 == src2 {
-                return Some(WindowResult::Replace1(Instruction::Move {
-                    dst: *dst2,
-                    src: *src1,
-                }));
-            }
-        }
-
         // Load followed by overwriting load to same register
         if self.is_load_to_register(first) && self.is_load_to_register(second) {
             let dst1 = self.get_load_dst(first);
@@ -1087,15 +1046,10 @@ mod tests {
         ];
 
         let changed = optimizer.optimize(&mut instructions);
-        assert!(changed);
-        assert_eq!(instructions.len(), 1);
-        assert!(matches!(
-            instructions[0],
-            Instruction::Move {
-                dst: Register(2),
-                src: Register(0)
-            }
-        ));
+        assert!(!changed);
+        assert_eq!(instructions.len(), 2);
+        assert!(matches!(instructions[0], Instruction::Neg { .. }));
+        assert!(matches!(instructions[1], Instruction::Neg { .. }));
     }
 
     #[test]
@@ -1113,15 +1067,10 @@ mod tests {
         ];
 
         let changed = optimizer.optimize(&mut instructions);
-        assert!(changed);
-        assert_eq!(instructions.len(), 1);
-        assert!(matches!(
-            instructions[0],
-            Instruction::Move {
-                dst: Register(2),
-                src: Register(0)
-            }
-        ));
+        assert!(!changed);
+        assert_eq!(instructions.len(), 2);
+        assert!(matches!(instructions[0], Instruction::Not { .. }));
+        assert!(matches!(instructions[1], Instruction::Not { .. }));
     }
 
     #[test]

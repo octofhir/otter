@@ -741,7 +741,7 @@ impl Interpreter {
 
         // Pop the entry frame that we pushed above.
         // run_loop returns without popping at stack_depth==1.
-        ctx.pop_frame();
+        ctx.pop_frame_discard();
 
         ctx.set_running(false);
         result
@@ -1106,7 +1106,7 @@ impl Interpreter {
                 if ctx.stack_depth() <= prev_stack_depth {
                     break Value::undefined();
                 }
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
                 continue;
             }
 
@@ -1134,7 +1134,7 @@ impl Interpreter {
                         }
                         other => {
                             while ctx.stack_depth() > prev_stack_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             ctx.set_running(was_running);
                             return Err(other);
@@ -1157,10 +1157,10 @@ impl Interpreter {
                                     .ok_or_else(|| VmError::internal("no frame"))?
                                     .return_register;
                                 if ctx.stack_depth() <= prev_stack_depth + 1 {
-                                    ctx.pop_frame();
+                                    ctx.pop_frame_discard();
                                     break osr_value;
                                 }
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                                 if let Some(reg) = return_reg {
                                     ctx.set_register(reg, osr_value);
                                 } else {
@@ -1195,11 +1195,11 @@ impl Interpreter {
                     };
                     // Check if we've returned to the original depth
                     if ctx.stack_depth() <= prev_stack_depth + 1 {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                         break value;
                     }
                     // Handle return from nested call
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     if let Some(reg) = return_reg {
                         ctx.set_register(reg, value);
                     } else {
@@ -1314,7 +1314,7 @@ impl Interpreter {
                     upvalues,
                 } => {
                     // Tail call: pop current frame and push new one
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     let local_count = module
                         .function(func_index)
                         .ok_or_else(|| VmError::internal("function not found"))?
@@ -1345,7 +1345,7 @@ impl Interpreter {
                     {
                         let _ = ctx.take_nearest_try();
                         while ctx.stack_depth() > target_depth {
-                            ctx.pop_frame();
+                            ctx.pop_frame_discard();
                         }
                         if let Some(frame) = ctx.current_frame_mut() {
                             frame.pc = catch_pc;
@@ -1360,7 +1360,7 @@ impl Interpreter {
 
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
 
                     if is_async_frame {
@@ -1412,7 +1412,7 @@ impl Interpreter {
             // Process through try-catch machinery
             if let Some(handler) = ctx.take_nearest_try() {
                 while ctx.stack_depth() > handler.0 {
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                 }
                 if let Some(frame) = ctx.current_frame_mut() {
                     frame.pc = handler.1;
@@ -1442,6 +1442,7 @@ impl Interpreter {
 
             // Periodic interrupt check for responsive timeouts
             if ctx.should_check_interrupt() {
+                ctx.update_debug_snapshot();
                 if ctx.is_interrupted() {
                     ctx.set_running(false);
                     return VmExecutionResult::Error("Execution interrupted".to_string());
@@ -1456,8 +1457,6 @@ impl Interpreter {
                         let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
                     }
                 }
-                // Update debug snapshot
-                ctx.update_debug_snapshot();
             }
 
             let frame = match ctx.current_frame() {
@@ -1485,7 +1484,7 @@ impl Interpreter {
                     ctx.set_running(false);
                     return VmExecutionResult::Complete(Value::undefined());
                 }
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
                 // Invalidate cache since frame changed
                 cached_frame_id = usize::MAX;
                 continue;
@@ -1575,7 +1574,7 @@ impl Interpreter {
                                     .current_frame()
                                     .map(|f| f.return_register)
                                     .unwrap_or(None);
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                                 cached_frame_id = usize::MAX;
                                 if let Some(reg) = return_reg {
                                     ctx.set_register(reg, osr_value);
@@ -1606,7 +1605,7 @@ impl Interpreter {
                             frame.is_async,
                         )
                     };
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
@@ -1627,7 +1626,7 @@ impl Interpreter {
                     if let Some((target_depth, catch_pc)) = ctx.take_nearest_try() {
                         // Pop frames above the handler
                         while ctx.stack_depth() > target_depth {
-                            ctx.pop_frame();
+                            ctx.pop_frame_discard();
                         }
                         // Invalidate cache since frames changed
                         cached_frame_id = usize::MAX;
@@ -1649,7 +1648,7 @@ impl Interpreter {
 
                     if is_async && ctx.stack_depth() > 1 {
                         let return_reg = ctx.current_frame().and_then(|f| f.return_register);
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                         cached_frame_id = usize::MAX;
                         let rejected = self.create_js_promise(ctx, JsPromise::rejected(value));
                         if let Some(reg) = return_reg {
@@ -1833,7 +1832,7 @@ impl Interpreter {
                     upvalues,
                 } => {
                     // Tail call optimization: pop current frame before pushing new one
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
@@ -1950,6 +1949,7 @@ impl Interpreter {
 
             // Periodic interrupt check for responsive timeouts
             if ctx.should_check_interrupt() {
+                ctx.update_debug_snapshot();
                 if ctx.is_interrupted() {
                     return Err(VmError::interrupted());
                 }
@@ -1963,8 +1963,6 @@ impl Interpreter {
                         let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
                     }
                 }
-                // Update debug snapshot
-                ctx.update_debug_snapshot();
             }
 
             let frame = ctx
@@ -1989,7 +1987,7 @@ impl Interpreter {
                 if ctx.stack_depth() == 1 {
                     return Ok(Value::undefined());
                 }
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
                 // Invalidate cache since frame changed
                 cached_frame_id = usize::MAX;
                 continue;
@@ -2078,7 +2076,7 @@ impl Interpreter {
                                     .current_frame()
                                     .ok_or_else(|| VmError::internal("no frame"))?
                                     .return_register;
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                                 cached_frame_id = usize::MAX;
                                 if let Some(reg) = return_reg {
                                     ctx.set_register(reg, osr_value);
@@ -2107,7 +2105,7 @@ impl Interpreter {
                             frame.is_async,
                         )
                     };
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
@@ -2129,7 +2127,7 @@ impl Interpreter {
                     if let Some((target_depth, catch_pc)) = ctx.take_nearest_try() {
                         // Pop frames above the handler
                         while ctx.stack_depth() > target_depth {
-                            ctx.pop_frame();
+                            ctx.pop_frame_discard();
                         }
                         // Invalidate cache since frames changed
                         cached_frame_id = usize::MAX;
@@ -2151,7 +2149,7 @@ impl Interpreter {
                     let return_reg = ctx.current_frame().and_then(|f| f.return_register);
 
                     if is_async && ctx.stack_depth() > 1 {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                         cached_frame_id = usize::MAX;
                         let rejected = self.create_js_promise(ctx, JsPromise::rejected(value));
                         if let Some(reg) = return_reg {
@@ -2328,7 +2326,7 @@ impl Interpreter {
                 } => {
                     // Tail call optimization: pop current frame before pushing new one
                     // This prevents stack growth for recursive tail calls
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
@@ -2493,14 +2491,12 @@ impl Interpreter {
 
             // ==================== Variables ====================
             Instruction::GetLocal { dst, idx } => {
-                let value = ctx.get_local(idx.0)?;
-                ctx.set_register(dst.0, value);
+                ctx.load_local_into_register(dst.0, idx.0);
                 Ok(InstructionResult::Continue)
             }
 
             Instruction::SetLocal { idx, src } => {
-                let value = ctx.get_register(src.0).clone();
-                ctx.set_local(idx.0, value)?;
+                ctx.store_register_into_local(idx.0, src.0);
                 Ok(InstructionResult::Continue)
             }
 
@@ -2846,14 +2842,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
-
                 if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
                     use otter_vm_bytecode::function::ArithmeticType;
                     match ty {
                         ArithmeticType::Int32 => {
-                            if let (Some(l), Some(r)) = (left.as_int32(), right.as_int32()) {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_int32(), right.as_int32())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
                                 if let Some(result) = l.checked_add(r) {
                                     ctx.set_register(dst.0, Value::int32(result));
                                     return Ok(InstructionResult::Continue);
@@ -2861,13 +2859,25 @@ impl Interpreter {
                             }
                         }
                         ArithmeticType::Number => {
-                            if let (Some(l), Some(r)) = (left.as_number(), right.as_number()) {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_number(), right.as_number())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
                                 ctx.set_register(dst.0, Value::number(l + r));
                                 return Ok(InstructionResult::Continue);
                             }
                         }
                         ArithmeticType::String => {
-                            if left.is_string() || right.is_string() {
+                            let uses_string = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                left.is_string() || right.is_string()
+                            };
+                            if uses_string {
+                                let left = ctx.get_register(lhs.0).clone();
+                                let right = ctx.get_register(rhs.0).clone();
                                 let result = self.op_add(ctx, &left, &right)?;
                                 ctx.set_register(dst.0, result);
                                 return Ok(InstructionResult::Continue);
@@ -2877,6 +2887,8 @@ impl Interpreter {
                 }
 
                 // Generic path
+                let left = ctx.get_register(lhs.0).clone();
+                let right = ctx.get_register(rhs.0).clone();
                 let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
                 Self::update_arithmetic_ic(ctx, *feedback_index, &left, &right);
@@ -2889,16 +2901,16 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
-
                 if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
                     use otter_vm_bytecode::function::ArithmeticType;
                     match ty {
                         ArithmeticType::Int32 => {
-                            if let (Some(l), Some(r)) =
-                                (left_value.as_int32(), right_value.as_int32())
-                            {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_int32(), right.as_int32())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
                                 if let Some(result) = l.checked_sub(r) {
                                     ctx.set_register(dst.0, Value::int32(result));
                                     return Ok(InstructionResult::Continue);
@@ -2906,9 +2918,12 @@ impl Interpreter {
                             }
                         }
                         ArithmeticType::Number => {
-                            if let (Some(l), Some(r)) =
-                                (left_value.as_number(), right_value.as_number())
-                            {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_number(), right.as_number())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
                                 ctx.set_register(dst.0, Value::number(l - r));
                                 return Ok(InstructionResult::Continue);
                             }
@@ -2918,6 +2933,8 @@ impl Interpreter {
                 }
 
                 // Generic path (ToNumeric)
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -2995,12 +3012,11 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
-
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
+                        let left_value = ctx.get_register(lhs.0);
+                        let right_value = ctx.get_register(rhs.0);
                         let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left_value);
@@ -3018,7 +3034,12 @@ impl Interpreter {
 
                 // Fast path for int32 multiplication (inline quickening)
                 if use_int32_fast_path {
-                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
+                    let fast_result = {
+                        let left = ctx.get_register(lhs.0);
+                        let right = ctx.get_register(rhs.0);
+                        (left.as_int32(), right.as_int32())
+                    };
+                    if let (Some(l), Some(r)) = fast_result {
                         if let Some(result) = l.checked_mul(r) {
                             ctx.set_register(dst.0, Value::int32(result));
                             return Ok(InstructionResult::Continue);
@@ -3027,6 +3048,8 @@ impl Interpreter {
                 }
 
                 // Generic path (ToNumeric)
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3049,12 +3072,11 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
-
                 // Collect type feedback and check for quickening opportunity
                 let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
                     if let Some(func) = frame.module.function(frame.function_index) {
+                        let left_value = ctx.get_register(lhs.0);
+                        let right_value = ctx.get_register(rhs.0);
                         let feedback = func.feedback_vector.write();
                         if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
                             Self::observe_value_type(&mut meta.type_observations, &left_value);
@@ -3072,7 +3094,12 @@ impl Interpreter {
 
                 // Fast path for int32 division (only if result is exact integer)
                 if use_int32_fast_path {
-                    if let (Some(l), Some(r)) = (left_value.as_int32(), right_value.as_int32()) {
+                    let fast_result = {
+                        let left = ctx.get_register(lhs.0);
+                        let right = ctx.get_register(rhs.0);
+                        (left.as_int32(), right.as_int32())
+                    };
+                    if let (Some(l), Some(r)) = fast_result {
                         if let Some(rem) = l.checked_rem(r)
                             && rem == 0
                             && let Some(quotient) = l.checked_div(r)
@@ -3085,6 +3112,8 @@ impl Interpreter {
                 }
 
                 // Generic path (ToNumeric)
+                let left_value = ctx.get_register(lhs.0).clone();
+                let right_value = ctx.get_register(rhs.0).clone();
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -9104,12 +9133,16 @@ impl Interpreter {
 
         // Mini run-loop that returns when eval frame completes
         loop {
-            if ctx.should_check_interrupt() && ctx.is_interrupted() {
-                // Pop the eval frame before returning error
-                while ctx.stack_depth() > prev_stack_depth {
-                    ctx.pop_frame();
+            if ctx.should_check_interrupt() {
+                ctx.update_debug_snapshot();
+                if ctx.is_interrupted() {
+                    // Pop the eval frame before returning error
+                    while ctx.stack_depth() > prev_stack_depth {
+                        ctx.pop_frame_discard();
+                    }
+                    return Err(VmError::interrupted());
                 }
-                return Err(VmError::interrupted());
+                ctx.update_debug_snapshot();
             }
 
             let frame = ctx
@@ -9126,7 +9159,7 @@ impl Interpreter {
                 if ctx.stack_depth() <= prev_stack_depth {
                     return Ok(Value::undefined());
                 }
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
                 continue;
             }
 
@@ -9162,14 +9195,14 @@ impl Interpreter {
                     if ctx.stack_depth() <= prev_stack_depth + 1 {
                         // Capture exports before popping the entry frame
                         self.capture_module_exports(ctx, &module);
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                         return Ok(value);
                     }
                     let return_reg = ctx
                         .current_frame()
                         .and_then(|f| f.return_register)
                         .unwrap_or(0);
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     ctx.set_register(return_reg, value);
                 }
                 Ok(InstructionResult::Call {
@@ -9209,7 +9242,7 @@ impl Interpreter {
                             // Handler is within eval scope — use it
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9220,7 +9253,7 @@ impl Interpreter {
                     }
                     // No handler in eval scope — unwind and propagate to outer
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(value));
                 }
@@ -9239,7 +9272,7 @@ impl Interpreter {
                         if target_depth > prev_stack_depth {
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9249,7 +9282,7 @@ impl Interpreter {
                         }
                     }
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(error_value));
                 }
@@ -9259,7 +9292,7 @@ impl Interpreter {
                         if target_depth > prev_stack_depth {
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9269,7 +9302,7 @@ impl Interpreter {
                         }
                     }
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(error_val));
                 }
@@ -9279,7 +9312,7 @@ impl Interpreter {
                         if target_depth > prev_stack_depth {
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9289,7 +9322,7 @@ impl Interpreter {
                         }
                     }
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(error_val));
                 }
@@ -9299,7 +9332,7 @@ impl Interpreter {
                         if target_depth > prev_stack_depth {
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9309,7 +9342,7 @@ impl Interpreter {
                         }
                     }
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(error_val));
                 }
@@ -9319,7 +9352,7 @@ impl Interpreter {
                         if target_depth > prev_stack_depth {
                             ctx.take_nearest_try();
                             while ctx.stack_depth() > target_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             if let Some(frame) = ctx.current_frame_mut() {
                                 frame.pc = catch_pc;
@@ -9329,13 +9362,13 @@ impl Interpreter {
                         }
                     }
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(VmError::exception(error_val));
                 }
                 Err(other) => {
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return Err(other);
                 }
@@ -9595,7 +9628,7 @@ impl Interpreter {
                 if ctx.stack_depth() <= prev_stack_depth {
                     break Value::undefined();
                 }
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
                 continue;
             }
 
@@ -9647,11 +9680,11 @@ impl Interpreter {
                     };
                     // Check if we've returned to the original depth
                     if ctx.stack_depth() <= prev_stack_depth + 1 {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                         break value;
                     }
                     // Handle return from nested call
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     if let Some(reg) = return_reg {
                         ctx.set_register(reg, value);
                     } else {
@@ -9766,7 +9799,7 @@ impl Interpreter {
                     upvalues,
                 }) => {
                     // Tail call: pop current frame and push new one
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     let local_count = module
                         .function(func_index)
                         .ok_or_else(|| VmError::internal("function not found"))?
@@ -9793,7 +9826,7 @@ impl Interpreter {
                 Ok(InstructionResult::Throw(error)) => {
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     ctx.set_running(was_running);
                     return Err(VmError::exception(error));
@@ -9801,7 +9834,7 @@ impl Interpreter {
                 Err(e) => {
                     // Pop the frame we pushed and unwind to original depth
                     while ctx.stack_depth() > prev_stack_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     ctx.set_running(was_running);
                     return Err(e);
@@ -11210,13 +11243,12 @@ impl Interpreter {
     }
 
     /// Strict equality comparison (===)
+    #[inline(always)]
     fn strict_equal(&self, left: &Value, right: &Value) -> bool {
-        // Different types are never strictly equal
-        if left.type_of() != right.type_of() {
-            return false;
-        }
-
-        // Use Value's PartialEq
+        // Value::PartialEq already matches strict-equality behavior:
+        // - same-tag primitives compare by bits/number value
+        // - object/function/symbol identity compares by pointer bits
+        // - different kinds fall through to false
         left == right
     }
 
@@ -11846,7 +11878,7 @@ impl Interpreter {
                 if frame_depth > initial_depth {
                     ctx.take_nearest_try(); // Actually pop it
                     while ctx.stack_depth() > frame_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     ctx.set_pc(catch_pc);
                     // Put error in register 0 for catch block (standard convention)
@@ -11869,7 +11901,7 @@ impl Interpreter {
                     internal_handler = true;
                     ctx.take_nearest_try(); // Actually pop it
                     while ctx.stack_depth() > frame_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     ctx.set_pc(catch_pc);
                     // Use pending return value as the exception object so it propagates
@@ -12161,7 +12193,7 @@ impl Interpreter {
                     );
                     generator.suspend_with_frame(frame);
                     // Pop the generator's frame from context
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     return Some(GeneratorResult::Yielded(yielded_value));
                 }
                 // Non-yield bailout: restore deopt state and continue interpreting
@@ -12196,6 +12228,7 @@ impl Interpreter {
         loop {
             // Periodic interrupt check
             if ctx.should_check_interrupt() {
+                ctx.update_debug_snapshot();
                 if ctx.is_interrupted() {
                     generator.complete();
                     return GeneratorResult::Error(VmError::interrupted());
@@ -12238,7 +12271,7 @@ impl Interpreter {
             // Check if we've reached the end
             if frame.pc >= func.instructions.read().len() {
                 // Generator frame has no more instructions - pop it
-                ctx.pop_frame();
+                ctx.pop_frame_discard();
 
                 // Check if we're back to the initial depth (generator is done)
                 if ctx.stack_depth() <= initial_depth {
@@ -12343,7 +12376,7 @@ impl Interpreter {
                                     GeneratorResult::Returned(v) => {
                                         generator.complete();
                                         while ctx.stack_depth() > initial_depth {
-                                            ctx.pop_frame();
+                                            ctx.pop_frame_discard();
                                         }
                                         return GeneratorResult::Returned(v);
                                     }
@@ -12362,7 +12395,7 @@ impl Interpreter {
                                         .current_frame()
                                         .map(|f| f.return_register)
                                         .unwrap_or(None);
-                                    ctx.pop_frame();
+                                    ctx.pop_frame_discard();
                                     if ctx.stack_depth() <= initial_depth {
                                         generator.complete();
                                         return GeneratorResult::Returned(osr_value);
@@ -12418,7 +12451,7 @@ impl Interpreter {
                     }
 
                     // Pop the generator's frame from context
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
 
                     return GeneratorResult::Yielded(value);
                 }
@@ -12429,7 +12462,7 @@ impl Interpreter {
                             ctx.take_nearest_try(); // Actually pop it
                             // Unwind to the handler frame
                             while ctx.stack_depth() > frame_depth {
-                                ctx.pop_frame();
+                                ctx.pop_frame_discard();
                             }
                             ctx.set_pc(catch_pc);
                             ctx.set_exception(error.clone());
@@ -12444,7 +12477,7 @@ impl Interpreter {
                     if let Some(return_value) = generator.take_pending_return() {
                         generator.complete();
                         while ctx.stack_depth() > initial_depth {
-                            ctx.pop_frame();
+                            ctx.pop_frame_discard();
                         }
                         return GeneratorResult::Returned(return_value);
                     }
@@ -12453,7 +12486,7 @@ impl Interpreter {
                     generator.complete();
                     // Pop all frames down to initial_depth
                     while ctx.stack_depth() > initial_depth {
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
                     }
                     return GeneratorResult::Error(VmError::exception(error));
                 }
@@ -12535,7 +12568,7 @@ impl Interpreter {
                     upvalues,
                 } => {
                     // Tail call optimization: pop current frame before pushing new one
-                    ctx.pop_frame();
+                    ctx.pop_frame_discard();
                     cached_frame_id = usize::MAX;
 
                     let callee = match call_module.function(func_index) {
@@ -12617,7 +12650,7 @@ impl Interpreter {
                         }
 
                         // Pop the generator's frame from context
-                        ctx.pop_frame();
+                        ctx.pop_frame_discard();
 
                         return GeneratorResult::Suspended {
                             promise,

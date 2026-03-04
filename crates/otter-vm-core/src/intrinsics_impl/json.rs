@@ -17,7 +17,8 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -110,65 +111,198 @@ impl CircularTracker {
     }
 }
 
-/// Convert serde_json::Value to JavaScript Value
-/// object_proto and array_proto are used to set proper prototypes on created objects
-fn json_to_value(
-    json: &serde_json::Value,
+struct JsonParseState<'a, 'ctx> {
+    mm: &'a Arc<MemoryManager>,
+    object_proto: &'a Value,
+    array_proto: &'a Value,
+    key_cache: &'a mut FxHashMap<String, GcRef<JsString>>,
+    node_count: usize,
+    ncx: &'a mut NativeContext<'ctx>,
+}
+
+impl<'a, 'ctx> JsonParseState<'a, 'ctx> {
+    #[inline]
+    fn before_node(&mut self) -> Result<(), VmError> {
+        self.node_count += 1;
+        maybe_check_interrupt(self.ncx, self.node_count)
+    }
+}
+
+struct JsonValueSeed<'s, 'a, 'ctx> {
+    state: &'s mut JsonParseState<'a, 'ctx>,
+}
+
+struct JsonValueVisitor<'s, 'a, 'ctx> {
+    state: &'s mut JsonParseState<'a, 'ctx>,
+}
+
+impl<'de, 's, 'a, 'ctx> DeserializeSeed<'de> for JsonValueSeed<'s, 'a, 'ctx> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        self.state
+            .before_node()
+            .map_err(|e| de::Error::custom(e.to_string()))?;
+        deserializer.deserialize_any(JsonValueVisitor { state: self.state })
+    }
+}
+
+impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a valid JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::null())
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::boolean(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if let Ok(i) = i32::try_from(v) {
+            Ok(Value::int32(i))
+        } else {
+            Ok(Value::number(v as f64))
+        }
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if let Ok(i) = i32::try_from(v) {
+            Ok(Value::int32(i))
+        } else {
+            Ok(Value::number(v as f64))
+        }
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::number(v))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::string(JsString::intern(v)))
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(v)
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::string(JsString::intern(&v)))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint().unwrap_or(0);
+        let arr = GcRef::new(JsObject::array(hint, self.state.mm.clone()));
+        arr.set_prototype(self.state.array_proto.clone());
+
+        let mut index = 0usize;
+        while let Some(value) = seq.next_element_seed(JsonValueSeed { state: self.state })? {
+            arr.initialize_array_element(index, value);
+            index += 1;
+        }
+
+        Ok(Value::array(arr))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let obj = GcRef::new(JsObject::new(
+            self.state.object_proto.clone(),
+            self.state.mm.clone(),
+        ));
+
+        let mut seen_keys = FxHashSet::default();
+        let mut index = 0usize;
+
+        while let Some(raw_key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            maybe_check_interrupt(self.state.ncx, index)
+                .map_err(|e| de::Error::custom(e.to_string()))?;
+            index += 1;
+
+            let key = if let Some(cached) = self.state.key_cache.get(raw_key.as_ref()) {
+                *cached
+            } else {
+                let new_key = JsString::intern(raw_key.as_ref());
+                self.state.key_cache.insert(raw_key.into_owned(), new_key);
+                new_key
+            };
+
+            let value = map.next_value_seed(JsonValueSeed { state: self.state })?;
+            if seen_keys.insert(key) {
+                obj.define_data_property_for_construction(key, value);
+            } else {
+                obj.set(PropertyKey::String(key), value)
+                    .map_err(|e| de::Error::custom(e.to_string()))?;
+            }
+        }
+
+        Ok(Value::object(obj))
+    }
+}
+
+fn parse_json_to_value_direct(
+    text: &str,
     mm: &Arc<MemoryManager>,
     object_proto: &Value,
     array_proto: &Value,
-    key_cache: &mut FxHashMap<String, PropertyKey>,
-    node_count: &mut usize,
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    *node_count += 1;
-    maybe_check_interrupt(ncx, *node_count)?;
+    let mut key_cache = FxHashMap::default();
+    let mut state = JsonParseState {
+        mm,
+        object_proto,
+        array_proto,
+        key_cache: &mut key_cache,
+        node_count: 0,
+        ncx,
+    };
 
-    match json {
-        serde_json::Value::Null => Ok(Value::null()),
-        serde_json::Value::Bool(b) => Ok(Value::boolean(*b)),
-        serde_json::Value::Number(n) => Ok(Value::number(n.as_f64().unwrap_or(f64::NAN))),
-        serde_json::Value::String(s) => Ok(Value::string(JsString::intern(s))),
-        serde_json::Value::Array(items) => {
-            let arr = GcRef::new(JsObject::array(items.len(), mm.clone()));
-            // Set Array.prototype
-            arr.set_prototype(array_proto.clone());
-            for (i, item) in items.iter().enumerate() {
-                maybe_check_interrupt(ncx, i)?;
-                let _ = arr.set(
-                    PropertyKey::Index(i as u32),
-                    json_to_value(
-                        item,
-                        mm,
-                        object_proto,
-                        array_proto,
-                        key_cache,
-                        node_count,
-                        ncx,
-                    )?,
-                );
-            }
-            Ok(Value::array(arr))
-        }
-        serde_json::Value::Object(map) => {
-            let obj = GcRef::new(JsObject::new(object_proto.clone(), mm.clone()));
-            for (i, (k, v)) in map.iter().enumerate() {
-                maybe_check_interrupt(ncx, i)?;
-                let key = if let Some(cached) = key_cache.get(k.as_str()) {
-                    *cached
-                } else {
-                    let new_key = PropertyKey::string(k);
-                    key_cache.insert(k.clone(), new_key);
-                    new_key
-                };
-                let _ = obj.set(
-                    key,
-                    json_to_value(v, mm, object_proto, array_proto, key_cache, node_count, ncx)?,
-                );
-            }
-            Ok(Value::object(obj))
-        }
-    }
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let value = JsonValueSeed { state: &mut state }
+        .deserialize(&mut deserializer)
+        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {e}")))?;
+
+    deserializer
+        .end()
+        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {e}")))?;
+
+    Ok(value)
 }
 
 use std::fmt::Write; // Needed for write! on String
@@ -255,16 +389,40 @@ fn number_to_property_key(n: f64) -> String {
     crate::globals::js_number_to_string(n)
 }
 
+#[inline]
+fn stringify_callback_key_value(prop_key: PropertyKey, key_text: &str) -> Value {
+    match prop_key {
+        PropertyKey::String(s) => Value::string(s),
+        PropertyKey::Index(_) => Value::string(JsString::intern(key_text)),
+        PropertyKey::Symbol(_) => Value::undefined(),
+    }
+}
+
+#[inline]
+fn stringify_access_key_value_for_proxy(prop_key: PropertyKey, key_text: &str) -> Value {
+    match prop_key {
+        PropertyKey::Index(i) if i <= i32::MAX as u32 => Value::int32(i as i32),
+        PropertyKey::Index(i) => Value::number(i as f64),
+        PropertyKey::String(_) => stringify_callback_key_value(prop_key, key_text),
+        PropertyKey::Symbol(_) => Value::undefined(),
+    }
+}
+
 /// Call toJSON method on value if it exists
 /// Note: Does NOT throw for BigInt - that's handled after the replacer is called
-fn call_to_json(value: &Value, key: &str, ncx: &mut NativeContext) -> Result<Value, VmError> {
+fn call_to_json(
+    value: &Value,
+    key_text: &str,
+    prop_key: PropertyKey,
+    ncx: &mut NativeContext,
+) -> Result<Value, VmError> {
     // Check if value has toJSON method
     if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
         // Use get_property_value to properly invoke getter accessors
         let to_json = get_property_value(&obj, &PropertyKey::string("toJSON"), value, ncx)?;
         if to_json.is_callable() {
-            let key_val = Value::string(JsString::intern(key));
-            return ncx.call_function(&to_json, value.clone(), &[key_val]);
+            let key_value = stringify_callback_key_value(prop_key, key_text);
+            return ncx.call_function(&to_json, value.clone(), &[key_value]);
         }
     }
     // For BigInt, check BigInt.prototype.toJSON (but don't throw if not present)
@@ -284,8 +442,8 @@ fn call_to_json(value: &Value, key: &str, ncx: &mut NativeContext) -> Result<Val
                             ncx,
                         )?;
                         if to_json.is_callable() {
-                            let key_val = Value::string(JsString::intern(key));
-                            return ncx.call_function(&to_json, value.clone(), &[key_val]);
+                            let key_value = stringify_callback_key_value(prop_key, key_text);
+                            return ncx.call_function(&to_json, value.clone(), &[key_value]);
                         }
                     }
                 }
@@ -301,13 +459,14 @@ fn call_to_json(value: &Value, key: &str, ncx: &mut NativeContext) -> Result<Val
 fn call_replacer(
     replacer_fn: &Option<Value>,
     holder: &Value,
-    key: &str,
+    key_text: &str,
+    prop_key: PropertyKey,
     value: Value,
     ncx: &mut NativeContext,
 ) -> Result<Value, VmError> {
     if let Some(replacer) = replacer_fn {
-        let key_val = Value::string(JsString::intern(key));
-        return ncx.call_function(replacer, holder.clone(), &[key_val, value]);
+        let key_value = stringify_callback_key_value(prop_key, key_text);
+        return ncx.call_function(replacer, holder.clone(), &[key_value, value]);
     }
     Ok(value)
 }
@@ -342,6 +501,13 @@ fn get_property_value(
     receiver: &Value,
     ncx: &mut NativeContext,
 ) -> Result<Value, VmError> {
+    // Common fast path: ordinary data properties (own/prototype chain) without accessors.
+    // JsObject::get already handles prototype traversal for data properties.
+    if let Some(value) = obj.get(key) {
+        return Ok(value);
+    }
+
+    // Slow path: accessor descriptors (where JsObject::get intentionally returns None).
     if let Some(desc) = obj.lookup_property_descriptor(key) {
         match desc {
             PropertyDescriptor::Data { value, .. } => Ok(value),
@@ -755,41 +921,60 @@ fn stringify_with_replacer(
     ncx: &mut NativeContext,
     out: &mut String,
 ) -> Result<bool, VmError> {
+    let prop_key = PropertyKey::string(key);
+    stringify_with_replacer_prepared(
+        holder,
+        key,
+        prop_key,
+        replacer_fn,
+        indent,
+        property_list,
+        tracker,
+        depth,
+        ncx,
+        out,
+    )
+}
+
+fn stringify_with_replacer_prepared(
+    holder: &Value,
+    key: &str,
+    prop_key: PropertyKey,
+    replacer_fn: &Option<Value>,
+    indent: &Option<String>,
+    property_list: &Option<Vec<String>>,
+    tracker: &mut CircularTracker,
+    depth: usize,
+    ncx: &mut NativeContext,
+    out: &mut String,
+) -> Result<bool, VmError> {
     // Depth limit
     if depth > 100 {
         out.push_str("null");
         return Ok(true);
     }
 
-    // Step 1: Get value from holder (properly invoking getters)
-    let (prop_key, key_value) = if let Ok(idx) = key.parse::<u32>() {
-        // For numeric keys, pass as number so Reflect.get works correctly with arrays
-        (PropertyKey::Index(idx), Value::int32(idx as i32))
-    } else {
-        (
-            PropertyKey::string(key),
-            Value::string(JsString::intern(key)),
-        )
-    };
+    // Step 2: Get value from holder (properly invoking getters)
     let value = if let Some(obj) = holder.as_object().or_else(|| holder.as_array()) {
         get_property_value(&obj, &prop_key, holder, ncx)?
     } else if let Some(proxy) = holder.as_proxy() {
         // For proxies, invoke the get trap
-        crate::proxy_operations::proxy_get(ncx, proxy, &prop_key, key_value, holder.clone())?
+        let access_key_value = stringify_access_key_value_for_proxy(prop_key, key);
+        crate::proxy_operations::proxy_get(ncx, proxy, &prop_key, access_key_value, holder.clone())?
     } else {
         return Ok(false);
     };
 
-    // Step 2: Call toJSON if present
-    let value = call_to_json(&value, key, ncx)?;
+    // Step 3: Call toJSON if present
+    let value = call_to_json(&value, key, prop_key, ncx)?;
 
-    // Step 3: Call replacer function if present
-    let value = call_replacer(replacer_fn, holder, key, value, ncx)?;
+    // Step 4: Call replacer function if present
+    let value = call_replacer(replacer_fn, holder, key, prop_key, value, ncx)?;
 
-    // Step 4: Unwrap wrapper objects (calls ToString for String wrappers per spec)
+    // Step 5: Unwrap wrapper objects (calls ToString for String wrappers per spec)
     let value = unwrap_primitive_with_calls(&value, ncx)?;
 
-    // Step 5: Serialize based on type
+    // Step 6: Serialize based on type
     // undefined, functions, symbols return false (omitted)
     if value.is_undefined() || value.is_callable() || value.is_symbol() {
         return Ok(false);
@@ -923,9 +1108,11 @@ fn stringify_array_with_replacer(
         out.push('\n');
     }
 
+    let mut index_key_text = String::new();
     for i in 0..len {
         maybe_check_interrupt(ncx, i)?;
-        let key = i.to_string();
+        index_key_text.clear();
+        let _ = std::fmt::Write::write_fmt(&mut index_key_text, format_args!("{i}"));
 
         if i > 0 {
             out.push(',');
@@ -940,17 +1127,32 @@ fn stringify_array_with_replacer(
         }
 
         let initial_len = out.len();
-        let written = stringify_with_replacer(
-            value,
-            &key,
-            replacer_fn,
-            indent,
-            property_list,
-            tracker,
-            depth + 1,
-            ncx,
-            out,
-        )?;
+        let written = if let Ok(index) = u32::try_from(i) {
+            stringify_with_replacer_prepared(
+                value,
+                &index_key_text,
+                PropertyKey::Index(index),
+                replacer_fn,
+                indent,
+                property_list,
+                tracker,
+                depth + 1,
+                ncx,
+                out,
+            )?
+        } else {
+            stringify_with_replacer(
+                value,
+                &index_key_text,
+                replacer_fn,
+                indent,
+                property_list,
+                tracker,
+                depth + 1,
+                ncx,
+                out,
+            )?
+        };
 
         if !written {
             out.truncate(initial_len);
@@ -982,13 +1184,16 @@ fn stringify_object_with_replacer(
     ncx: &mut NativeContext,
     out: &mut String,
 ) -> Result<(), VmError> {
+    enum ObjectStringifyKey {
+        Prepared(PropertyKey),
+        Text(String),
+    }
+
     // Get pointer for circular reference checking - works for objects and proxies
     let (ptr, keys) = if let Some(obj) = value.as_object() {
         let ptr = obj.as_ptr() as usize;
-        // Get keys - include enumerable own properties (both string keys and integer indices)
-        // Per spec, integer indices come first in numeric order, then string keys in insertion order
-        let keys: Vec<String> = if let Some(list) = property_list {
-            list.clone()
+        let keys: Vec<ObjectStringifyKey> = if let Some(list) = property_list {
+            list.iter().cloned().map(ObjectStringifyKey::Text).collect()
         } else {
             obj.own_keys()
                 .into_iter()
@@ -1005,9 +1210,10 @@ fn stringify_object_with_replacer(
                     });
                     if let Some(desc) = desc {
                         if desc.enumerable() {
-                            return match &k {
-                                PropertyKey::String(s) => Some(s.as_str().to_string()),
-                                PropertyKey::Index(i) => Some(i.to_string()),
+                            return match k {
+                                PropertyKey::String(_) | PropertyKey::Index(_) => {
+                                    Some(ObjectStringifyKey::Prepared(k))
+                                }
                                 PropertyKey::Symbol(_) => None, // Symbols are not included in JSON
                             };
                         }
@@ -1020,16 +1226,18 @@ fn stringify_object_with_replacer(
     } else if let Some(proxy) = value.as_proxy() {
         let ptr = proxy.as_ptr() as usize;
         // For proxies, use the property list if available, otherwise use proxy ownKeys trap
-        let keys: Vec<String> = if let Some(list) = property_list {
-            list.clone()
+        let keys: Vec<ObjectStringifyKey> = if let Some(list) = property_list {
+            list.iter().cloned().map(ObjectStringifyKey::Text).collect()
         } else {
             // Get keys from proxy using ownKeys trap
             let proxy_keys = crate::proxy_operations::proxy_own_keys(ncx, proxy)?;
             proxy_keys
                 .into_iter()
                 .filter_map(|k| match k {
-                    PropertyKey::String(s) => Some(s.as_str().to_string()),
-                    PropertyKey::Index(i) => Some(i.to_string()),
+                    PropertyKey::String(s) => {
+                        Some(ObjectStringifyKey::Text(s.as_str().to_string()))
+                    }
+                    PropertyKey::Index(i) => Some(ObjectStringifyKey::Text(i.to_string())),
                     PropertyKey::Symbol(_) => None,
                 })
                 .collect()
@@ -1053,45 +1261,132 @@ fn stringify_object_with_replacer(
     let mut first = true;
     let mut wrote_property = false;
 
-    for (i, key) in keys.into_iter().enumerate() {
+    for (i, key_entry) in keys.into_iter().enumerate() {
         maybe_check_interrupt(ncx, i)?;
         let initial_len = out.len();
 
-        if !first {
-            out.push(',');
-        }
-        if let Some(ind) = indent {
-            out.push('\n');
-            for _ in 0..=depth {
-                out.push_str(ind);
+        match key_entry {
+            ObjectStringifyKey::Prepared(prop_key) => match prop_key {
+                PropertyKey::String(s) => {
+                    let key_text = s.as_str();
+                    if !first {
+                        out.push(',');
+                    }
+                    if let Some(ind) = indent {
+                        out.push('\n');
+                        for _ in 0..=depth {
+                            out.push_str(ind);
+                        }
+                    }
+
+                    out.push('"');
+                    escape_json_string(key_text, out);
+                    out.push('"');
+                    out.push(':');
+                    if indent.is_some() {
+                        out.push(' ');
+                    }
+
+                    let written = stringify_with_replacer_prepared(
+                        value,
+                        key_text,
+                        prop_key,
+                        replacer_fn,
+                        indent,
+                        property_list,
+                        tracker,
+                        depth + 1,
+                        ncx,
+                        out,
+                    )?;
+
+                    if written {
+                        first = false;
+                        wrote_property = true;
+                    } else {
+                        out.truncate(initial_len);
+                    }
+                }
+                PropertyKey::Index(i) => {
+                    let key_text = i.to_string();
+                    if !first {
+                        out.push(',');
+                    }
+                    if let Some(ind) = indent {
+                        out.push('\n');
+                        for _ in 0..=depth {
+                            out.push_str(ind);
+                        }
+                    }
+
+                    out.push('"');
+                    escape_json_string(&key_text, out);
+                    out.push('"');
+                    out.push(':');
+                    if indent.is_some() {
+                        out.push(' ');
+                    }
+
+                    let written = stringify_with_replacer_prepared(
+                        value,
+                        &key_text,
+                        prop_key,
+                        replacer_fn,
+                        indent,
+                        property_list,
+                        tracker,
+                        depth + 1,
+                        ncx,
+                        out,
+                    )?;
+
+                    if written {
+                        first = false;
+                        wrote_property = true;
+                    } else {
+                        out.truncate(initial_len);
+                    }
+                }
+                PropertyKey::Symbol(_) => continue,
+            },
+            ObjectStringifyKey::Text(key) => {
+                if !first {
+                    out.push(',');
+                }
+                if let Some(ind) = indent {
+                    out.push('\n');
+                    for _ in 0..=depth {
+                        out.push_str(ind);
+                    }
+                }
+
+                out.push('"');
+                escape_json_string(&key, out);
+                out.push('"');
+                out.push(':');
+                if indent.is_some() {
+                    out.push(' ');
+                }
+
+                let written = stringify_with_replacer(
+                    value,
+                    &key,
+                    replacer_fn,
+                    indent,
+                    property_list,
+                    tracker,
+                    depth + 1,
+                    ncx,
+                    out,
+                )?;
+
+                if written {
+                    first = false;
+                    wrote_property = true;
+                } else {
+                    out.truncate(initial_len);
+                }
             }
-        }
-
-        out.push('"');
-        escape_json_string(&key, out);
-        out.push('"');
-        out.push(':');
-        if indent.is_some() {
-            out.push(' ');
-        }
-
-        let written = stringify_with_replacer(
-            value,
-            &key,
-            replacer_fn,
-            indent,
-            property_list,
-            tracker,
-            depth + 1,
-            ncx,
-            out,
-        )?;
-
-        if written {
-            first = false;
-            wrote_property = true;
-        } else {
-            out.truncate(initial_len);
         }
     }
 
@@ -1150,9 +1445,6 @@ fn json_parse(
         return Err(VmError::syntax_error("JSON.parse: unexpected input"));
     };
 
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {}", e)))?;
-
     // Get Object.prototype and Array.prototype from global
     let global = ncx.ctx.global();
     let object_proto = global
@@ -1167,17 +1459,7 @@ fn json_parse(
         .unwrap_or_else(Value::null);
 
     let mm = ncx.memory_manager().clone();
-    let mut key_cache = FxHashMap::default();
-    let mut node_count = 0usize;
-    let result = json_to_value(
-        &parsed,
-        &mm,
-        &object_proto,
-        &array_proto,
-        &mut key_cache,
-        &mut node_count,
-        ncx,
-    )?;
+    let result = parse_json_to_value_direct(&text, &mm, &object_proto, &array_proto, ncx)?;
 
     // Apply reviver if provided
     if let Some(reviver) = args.get(1) {

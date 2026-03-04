@@ -1033,8 +1033,9 @@ where
             initialized += 1;
         }
 
-        let args =
-            unsafe { std::slice::from_raw_parts(stack.as_ptr() as *const crate::value::Value, argc) };
+        let args = unsafe {
+            std::slice::from_raw_parts(stack.as_ptr() as *const crate::value::Value, argc)
+        };
         let result = f(args);
         for slot in stack.iter_mut().take(initialized) {
             unsafe { slot.assume_init_drop() };
@@ -1268,8 +1269,7 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
                     _ => None,
                 };
                 if let Some(offset) = cached_offset {
-                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
-                    {
+                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
                         ic.record_hit();
                         return val.to_jit_bits();
                     }
@@ -1676,8 +1676,7 @@ extern "C" fn otter_rt_call_method(
                     _ => None,
                 };
                 if let Some(offset) = cached_offset {
-                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
-                    {
+                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
                         ic.record_hit();
                         method = Some(val);
                     }

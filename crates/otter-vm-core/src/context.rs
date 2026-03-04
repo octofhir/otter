@@ -381,12 +381,16 @@ impl<'a> NativeContext<'a> {
 /// Default maximum native call depth to prevent Rust stack overflow
 pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 100;
 
-/// Maximum number of registers per function
+/// Legacy fallback register window for functions without register metadata.
+/// New compiler output should always provide an exact register_count.
 const MAX_REGISTERS: usize = 65536;
 
 /// Interval for interrupt checking in hot loops (every N instructions)
 /// Increased from 1000 to reduce GC check overhead (GC was taking 43% CPU)
 pub const INTERRUPT_CHECK_INTERVAL: u32 = 10_000;
+
+/// Max number of cached locals buffers for frame reuse.
+const MAX_RECYCLED_LOCALS_BUFFERS: usize = 128;
 
 /// A call stack frame
 #[derive(Debug)]
@@ -401,6 +405,8 @@ pub struct CallFrame {
     pub pc: usize,
     /// Base register index
     pub register_base: usize,
+    /// Number of registers in this frame's window
+    pub register_count: usize,
     /// Local variables
     pub locals: Vec<Value>,
     /// Captured upvalues (heap-allocated cells for shared mutable access)
@@ -417,6 +423,9 @@ pub struct CallFrame {
     pub is_async: bool,
     /// Unique frame ID for tracking open upvalues
     pub frame_id: usize,
+    /// Number of open upvalues owned by this frame.
+    /// Used to keep local access on a fast path for frames without captures.
+    pub open_upvalue_count: usize,
     /// Number of arguments passed to this function
     pub argc: usize,
     /// Home object for methods (used for `super` resolution)
@@ -464,6 +473,8 @@ pub struct VmContext {
     running: bool,
     /// Pending arguments for next call
     pending_args: Vec<Value>,
+    /// Recycled locals buffers to reduce per-call Vec allocations.
+    recycled_locals: Vec<Vec<Value>>,
     /// Pending `this` value for next call
     pending_this: Option<Value>,
     /// Pending upvalues for next call (captured closure cells)
@@ -707,13 +718,14 @@ impl VmContext {
         crate::memory::MemoryManager::set_thread_default(memory_manager.clone());
 
         Self {
-            registers: vec![Value::undefined(); MAX_REGISTERS],
+            registers: Vec::new(),
             call_stack: Vec::with_capacity(64),
             global,
             exception: None,
             try_stack: Vec::new(),
             running: false,
             pending_args: Vec::new(),
+            recycled_locals: Vec::new(),
             pending_this: None,
             pending_upvalues: Vec::new(),
             pending_home_object: None,
@@ -1104,7 +1116,6 @@ impl VmContext {
         self.instruction_count += 1;
         if self.instruction_count >= INTERRUPT_CHECK_INTERVAL {
             self.instruction_count = 0;
-            self.update_debug_snapshot();
             true
         } else {
             false
@@ -1282,7 +1293,9 @@ impl VmContext {
         {
             // SAFETY: Interpreter only reads registers with an active frame and
             // bytecode-generated register indices that are within frame bounds.
-            let base = unsafe { self.call_stack.last().unwrap_unchecked().register_base };
+            let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
+            let base = frame.register_base;
+            debug_assert!((index as usize) < frame.register_count);
             return unsafe { self.registers.get_unchecked(base + index as usize) };
         }
 
@@ -1293,6 +1306,7 @@ impl VmContext {
                 Some(f) => f,
                 None => return &UNDEFINED,
             };
+            debug_assert!((index as usize) < frame.register_count);
             &self.registers[frame.register_base + index as usize]
         }
     }
@@ -1304,7 +1318,9 @@ impl VmContext {
         {
             // SAFETY: Interpreter only writes registers with an active frame and
             // bytecode-generated register indices that are within frame bounds.
-            let base = unsafe { self.call_stack.last().unwrap_unchecked().register_base };
+            let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
+            let base = frame.register_base;
+            debug_assert!((index as usize) < frame.register_count);
             unsafe {
                 *self.registers.get_unchecked_mut(base + index as usize) = value;
             }
@@ -1317,6 +1333,9 @@ impl VmContext {
                 Some(f) => f.register_base,
                 None => return,
             };
+            if let Some(frame) = self.current_frame() {
+                debug_assert!((index as usize) < frame.register_count);
+            }
             self.registers[base + index as usize] = value;
         }
     }
@@ -1328,8 +1347,8 @@ impl VmContext {
             .current_frame()
             .ok_or_else(|| VmError::internal("no call frame"))?;
 
-        // Fast path: most frames do not have captured locals.
-        if self.open_upvalues.is_empty() {
+        // Fast path: this frame has no captured locals.
+        if frame.open_upvalue_count == 0 {
             return frame
                 .locals
                 .get(index as usize)
@@ -1351,23 +1370,68 @@ impl VmContext {
             .ok_or_else(|| VmError::internal(format!("local index {} out of bounds", index)))
     }
 
+    /// Read a local slot for bytecode execution.
+    ///
+    /// Assumes there is an active frame and `index` is bytecode-validated.
+    #[inline]
+    pub(crate) fn read_local_unchecked(&self, index: u16) -> Value {
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: Interpreter only accesses locals with an active frame and
+            // bytecode-validated local indices that are within frame bounds.
+            let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
+            let local_index = index as usize;
+            debug_assert!(local_index < frame.locals.len());
+
+            if frame.open_upvalue_count != 0 {
+                if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index)) {
+                    return cell.get();
+                }
+            }
+
+            // SAFETY: local_index is validated above by bytecode invariants.
+            return unsafe { frame.locals.get_unchecked(local_index).clone() };
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let frame = self
+                .call_stack
+                .last()
+                .expect("read_local_unchecked requires an active call frame");
+            debug_assert!((index as usize) < frame.locals.len());
+
+            if frame.open_upvalue_count != 0 {
+                if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index)) {
+                    return cell.get();
+                }
+            }
+
+            frame.locals[index as usize].clone()
+        }
+    }
+
     /// Set a local variable
     /// If this local has been captured by a closure, also update the shared cell
     #[inline]
     pub fn set_local(&mut self, index: u16, value: Value) -> VmResult<()> {
-        let has_open_upvalues = !self.open_upvalues.is_empty();
+        let (frame_id, has_frame_open_upvalues) = {
+            let frame = self
+                .current_frame()
+                .ok_or_else(|| VmError::internal("no call frame"))?;
+            (frame.frame_id, frame.open_upvalue_count != 0)
+        };
         let frame = self
             .current_frame_mut()
             .ok_or_else(|| VmError::internal("no call frame"))?;
         if (index as usize) < frame.locals.len() {
-            if !has_open_upvalues {
+            if !has_frame_open_upvalues {
                 frame.locals[index as usize] = value;
                 return Ok(());
             }
 
             frame.locals[index as usize] = value.clone();
             // If this local has been captured, update the cell too
-            let frame_id = frame.frame_id;
             if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
                 let _ = cell.set(value);
             }
@@ -1377,6 +1441,165 @@ impl VmContext {
                 "local index {} out of bounds",
                 index
             )))
+        }
+    }
+
+    /// Write a local slot for bytecode execution.
+    ///
+    /// Assumes there is an active frame and `index` is bytecode-validated.
+    #[inline]
+    pub(crate) fn write_local_unchecked(&mut self, index: u16, value: Value) {
+        #[cfg(not(debug_assertions))]
+        {
+            let local_index = index as usize;
+            let frame_id = {
+                // SAFETY: Interpreter only writes locals with an active frame and
+                // bytecode-validated local indices that are within frame bounds.
+                let frame = unsafe { self.call_stack.last_mut().unwrap_unchecked() };
+                debug_assert!(local_index < frame.locals.len());
+
+                if frame.open_upvalue_count == 0 {
+                    // SAFETY: local_index is validated above by bytecode invariants.
+                    unsafe {
+                        *frame.locals.get_unchecked_mut(local_index) = value;
+                    }
+                    return;
+                }
+
+                let frame_id = frame.frame_id;
+                // SAFETY: local_index is validated above by bytecode invariants.
+                unsafe {
+                    *frame.locals.get_unchecked_mut(local_index) = value.clone();
+                }
+                frame_id
+            };
+
+            if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+                let _ = cell.set(value);
+            }
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let (frame_id, value_for_upvalue) = {
+                let frame = self
+                    .call_stack
+                    .last_mut()
+                    .expect("write_local_unchecked requires an active call frame");
+                debug_assert!((index as usize) < frame.locals.len());
+                let has_open_upvalues = frame.open_upvalue_count != 0;
+                let frame_id = frame.frame_id;
+
+                if has_open_upvalues {
+                    frame.locals[index as usize] = value.clone();
+                    (frame_id, Some(value))
+                } else {
+                    frame.locals[index as usize] = value;
+                    (frame_id, None)
+                }
+            };
+
+            if let Some(value_for_upvalue) = value_for_upvalue {
+                if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+                    let _ = cell.set(value_for_upvalue);
+                }
+            }
+        }
+    }
+
+    /// Load a local slot into a register.
+    ///
+    /// Assumes there is an active frame and indices are bytecode-validated.
+    #[inline(always)]
+    pub(crate) fn load_local_into_register(&mut self, dst: u16, local_index: u16) {
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: Interpreter executes with an active frame; register and local
+            // indices are validated by compiler/bytecode invariants.
+            let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
+            let reg_base = frame.register_base;
+            let dst_index = dst as usize;
+            let local_index_usize = local_index as usize;
+
+            debug_assert!(dst_index < frame.register_count);
+            debug_assert!(local_index_usize < frame.locals.len());
+
+            let value = if frame.open_upvalue_count != 0 {
+                if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, local_index)) {
+                    cell.get()
+                } else {
+                    // SAFETY: local_index_usize is validated above.
+                    unsafe { frame.locals.get_unchecked(local_index_usize).clone() }
+                }
+            } else {
+                // SAFETY: local_index_usize is validated above.
+                unsafe { frame.locals.get_unchecked(local_index_usize).clone() }
+            };
+
+            // SAFETY: dst_index is validated above.
+            unsafe {
+                *self.registers.get_unchecked_mut(reg_base + dst_index) = value;
+            }
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let value = self.read_local_unchecked(local_index);
+            self.set_register(dst, value);
+        }
+    }
+
+    /// Store a register value into a local slot.
+    ///
+    /// Assumes there is an active frame and indices are bytecode-validated.
+    #[inline(always)]
+    pub(crate) fn store_register_into_local(&mut self, local_index: u16, src: u16) {
+        #[cfg(not(debug_assertions))]
+        {
+            let local_index_usize = local_index as usize;
+            let src_index = src as usize;
+            let (frame_id, value) = {
+                // SAFETY: Interpreter executes with an active frame; register and local
+                // indices are validated by compiler/bytecode invariants.
+                let frame = unsafe { self.call_stack.last_mut().unwrap_unchecked() };
+                debug_assert!(src_index < frame.register_count);
+                debug_assert!(local_index_usize < frame.locals.len());
+
+                // SAFETY: src_index and local_index_usize are validated above.
+                let value = unsafe {
+                    self.registers
+                        .get_unchecked(frame.register_base + src_index)
+                        .clone()
+                };
+
+                if frame.open_upvalue_count == 0 {
+                    // SAFETY: local_index_usize is validated above.
+                    unsafe {
+                        *frame.locals.get_unchecked_mut(local_index_usize) = value;
+                    }
+                    return;
+                }
+
+                let frame_id = frame.frame_id;
+                // SAFETY: local_index_usize is validated above.
+                unsafe {
+                    *frame.locals.get_unchecked_mut(local_index_usize) = value.clone();
+                }
+                (frame_id, value)
+            };
+
+            if let Some(cell) = self.open_upvalues.get(&(frame_id, local_index)) {
+                let _ = cell.set(value);
+            }
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let value = self.get_register(src).clone();
+            self.write_local_unchecked(local_index, value);
         }
     }
 
@@ -1758,18 +1981,25 @@ impl VmContext {
         let register_base = self
             .call_stack
             .last()
-            .map(|f| f.register_base + MAX_REGISTERS)
+            .map(|f| f.register_base + f.register_count)
             .unwrap_or(0);
 
-        // Ensure we have enough registers
-        let needed = register_base + MAX_REGISTERS;
+        let func = &module.functions[function_index as usize];
+        // Legacy fallback for hand-built bytecode/tests missing register_count.
+        let register_count = if func.register_count == 0 {
+            MAX_REGISTERS
+        } else {
+            func.register_count as usize
+        };
+
+        // Ensure we have enough registers.
+        let needed = register_base + register_count;
         if needed > self.registers.len() {
             self.registers.resize(needed, Value::undefined());
         }
 
         // Consume pending arguments into locals while keeping pending_args capacity.
         let pending_arg_len = self.pending_args.len();
-        let func = &module.functions[function_index as usize];
         let param_count = func.param_count as usize;
         let has_rest = func.flags.has_rest;
 
@@ -1793,7 +2023,7 @@ impl VmContext {
         let total_locals = local_count + extra_args_count;
         let locals = if extra_args_count == 0 {
             // Common case: no spread/extra arguments. Avoid pre-filling and overwriting.
-            let mut locals = Vec::with_capacity(local_count);
+            let mut locals = self.acquire_locals_buffer(local_count);
             for arg in self.pending_args.drain(..).take(local_count) {
                 locals.push(arg);
             }
@@ -1802,7 +2032,8 @@ impl VmContext {
             }
             locals
         } else {
-            let mut locals = vec![Value::undefined(); total_locals];
+            let mut locals = self.acquire_locals_buffer(total_locals);
+            locals.resize(total_locals, Value::undefined());
             for (i, arg) in self.pending_args.drain(..).enumerate() {
                 if i < effective_param_count {
                     // Regular argument (or rest array) -> mapped to parameter local
@@ -1865,6 +2096,7 @@ impl VmContext {
             realm_id: frame_realm_id,
             pc: 0,
             register_base,
+            register_count,
             locals,
             upvalues,
             return_register,
@@ -1873,6 +2105,7 @@ impl VmContext {
             is_construct,
             is_async,
             frame_id,
+            open_upvalue_count: 0,
             argc,
             home_object,
             new_target_proto: self.pending_new_target_proto.take(),
@@ -1902,6 +2135,9 @@ impl VmContext {
             // Overwrite registers with deopt-captured values
             let base = frame.register_base;
             for (i, value) in registers.iter().enumerate() {
+                if i >= frame.register_count {
+                    break;
+                }
                 let idx = base + i;
                 if idx < self.registers.len() {
                     self.registers[idx] = value.clone();
@@ -1925,14 +2161,48 @@ impl VmContext {
         if let Some(frame) = self.call_stack.last() {
             // Clean up open upvalues for this frame
             // (cells are already synced via set_local updates)
-            let frame_id = frame.frame_id;
-            self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
+            if frame.open_upvalue_count != 0 {
+                let frame_id = frame.frame_id;
+                self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
+            }
         }
         let popped = self.call_stack.pop();
         if let Some(frame) = self.call_stack.last() {
             self.switch_realm(frame.realm_id);
         }
         popped
+    }
+
+    /// Pop a call frame when the caller does not need frame contents.
+    ///
+    /// Recycles the frame's locals buffer to reduce per-call heap churn.
+    #[inline]
+    pub fn pop_frame_discard(&mut self) {
+        if let Some(mut frame) = self.pop_frame() {
+            self.recycle_locals_buffer(std::mem::take(&mut frame.locals));
+        }
+    }
+
+    #[inline]
+    fn acquire_locals_buffer(&mut self, min_capacity: usize) -> Vec<Value> {
+        if let Some(mut buf) = self.recycled_locals.pop() {
+            if buf.capacity() < min_capacity {
+                buf.reserve(min_capacity - buf.capacity());
+            }
+            buf.clear();
+            buf
+        } else {
+            Vec::with_capacity(min_capacity)
+        }
+    }
+
+    #[inline]
+    fn recycle_locals_buffer(&mut self, mut buf: Vec<Value>) {
+        if self.recycled_locals.len() >= MAX_RECYCLED_LOCALS_BUFFERS {
+            return;
+        }
+        buf.clear();
+        self.recycled_locals.push(buf);
     }
 
     /// Get current call frame
@@ -2019,11 +2289,19 @@ impl VmContext {
         let Some(frame) = self.current_frame() else {
             return;
         };
-        let start = frame.register_base + start as usize;
-        let end = start + count;
-        debug_assert!(end <= self.registers.len());
+        let frame_start = frame.register_base;
+        let frame_end = frame_start + frame.register_count;
+        let start = frame_start + start as usize;
+        if start >= frame_end {
+            self.pending_args.resize(count, Value::undefined());
+            return;
+        }
+        let take = (frame_end - start).min(count);
         self.pending_args
-            .extend_from_slice(&self.registers[start..end]);
+            .extend_from_slice(&self.registers[start..start + take]);
+        if take < count {
+            self.pending_args.resize(count, Value::undefined());
+        }
     }
 
     /// Borrow pending arguments for the next function call.
@@ -2033,9 +2311,7 @@ impl VmContext {
 
     /// Take pending arguments (transfers ownership)
     pub fn take_pending_args(&mut self) -> Vec<Value> {
-        let mut args = Vec::with_capacity(self.pending_args.len());
-        args.extend(self.pending_args.drain(..));
-        args
+        std::mem::take(&mut self.pending_args)
     }
 
     /// Set pending `this` value for next function call
@@ -2137,6 +2413,10 @@ impl VmContext {
         let value = self.get_local(local_idx)?;
         let cell = UpvalueCell::new(value);
         self.open_upvalues.insert(key, cell.clone());
+        if let Some(frame) = self.current_frame_mut() {
+            debug_assert_eq!(frame.frame_id, frame_id);
+            frame.open_upvalue_count += 1;
+        }
         Ok(cell)
     }
 
@@ -2156,13 +2436,23 @@ impl VmContext {
             let _ = cell.set(value);
         }
         // Remove from open upvalues (the closures keep their own clones of the cell)
-        self.open_upvalues.remove(&key);
+        if self.open_upvalues.remove(&key).is_some() {
+            if let Some(frame) = self.current_frame_mut() {
+                debug_assert_eq!(frame.frame_id, frame_id);
+                frame.open_upvalue_count = frame.open_upvalue_count.saturating_sub(1);
+            }
+        }
         Ok(())
     }
 
     /// Clean up all open upvalues for a frame that's being popped
     pub fn close_all_upvalues_for_frame(&mut self, frame_id: usize) {
         self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
+        if let Some(frame) = self.current_frame_mut() {
+            if frame.frame_id == frame_id {
+                frame.open_upvalue_count = 0;
+            }
+        }
     }
 
     /// Get the `this` value of the current call frame
@@ -2229,9 +2519,9 @@ impl VmContext {
         self.call_stack
             .iter()
             .map(|frame| {
-                // Extract registers for this frame (256 registers per frame)
+                // Extract only this frame's live register window.
                 let reg_start = frame.register_base;
-                let reg_end = (reg_start + MAX_REGISTERS).min(self.registers.len());
+                let reg_end = (reg_start + frame.register_count).min(self.registers.len());
                 let frame_registers = self.registers[reg_start..reg_end].to_vec();
 
                 SavedFrame::new(
@@ -2260,24 +2550,27 @@ impl VmContext {
     pub fn restore_frames(&mut self, saved_frames: Vec<SavedFrame>) -> VmResult<()> {
         // Clear current call stack
         self.call_stack.clear();
+        self.open_upvalues.clear();
 
-        // Ensure we have enough registers for all frames
-        let max_registers_needed = saved_frames.len() * MAX_REGISTERS;
-        if max_registers_needed > self.registers.len() {
+        // Ensure we have enough registers for all restored frame windows.
+        let total_registers_needed: usize = saved_frames.iter().map(|f| f.registers.len()).sum();
+        if total_registers_needed > self.registers.len() {
             self.registers
-                .resize(max_registers_needed, Value::undefined());
+                .resize(total_registers_needed, Value::undefined());
         }
 
         // Restore each frame
-        for (i, saved) in saved_frames.into_iter().enumerate() {
-            let register_base = i * MAX_REGISTERS;
+        let mut next_register_base = 0usize;
+        for saved in saved_frames.into_iter() {
+            let register_base = next_register_base;
+            let register_count = saved.registers.len();
+            let register_end = register_base + register_count;
 
             // Restore registers for this frame
             for (j, reg) in saved.registers.into_iter().enumerate() {
-                if register_base + j < self.registers.len() {
-                    self.registers[register_base + j] = reg;
-                }
+                self.registers[register_base + j] = reg;
             }
+            next_register_base = register_end;
 
             self.call_stack.push(CallFrame {
                 function_index: saved.function_index,
@@ -2285,6 +2578,7 @@ impl VmContext {
                 realm_id: saved.realm_id,
                 pc: saved.pc,
                 register_base,
+                register_count,
                 locals: saved.locals,
                 upvalues: saved.upvalues,
                 return_register: saved.return_register,
@@ -2293,6 +2587,7 @@ impl VmContext {
                 is_construct: saved.is_construct,
                 is_async: saved.is_async,
                 frame_id: saved.frame_id,
+                open_upvalue_count: 0,
                 argc: saved.argc,
                 home_object: None,
                 new_target_proto: None,
@@ -2322,6 +2617,17 @@ impl VmContext {
     /// Get the call stack (for inspection)
     pub fn call_stack(&self) -> &[CallFrame] {
         &self.call_stack
+    }
+
+    #[inline]
+    pub(crate) fn for_each_live_register(&self, mut f: impl FnMut(&Value)) {
+        for frame in &self.call_stack {
+            let start = frame.register_base;
+            let end = (start + frame.register_count).min(self.registers.len());
+            for value in &self.registers[start..end] {
+                f(value);
+            }
+        }
     }
 
     pub fn registers_to_trace(&self) -> &[Value] {
@@ -2435,10 +2741,8 @@ impl VmContext {
         // Check global object
         check_value(&Value::object(self.global));
 
-        // Check registers
-        for value in self.registers.iter() {
-            check_value(value);
-        }
+        // Check registers from active frame windows only.
+        self.for_each_live_register(&mut check_value);
 
         // Check call stack locals
         for frame in self.call_stack.iter() {
@@ -2566,10 +2870,8 @@ impl VmContext {
         // Add global object
         roots.push(self.global.header() as *const _);
 
-        // Add values from registers
-        for value in self.registers.iter() {
-            value.trace(&mut |header| roots.push(header));
-        }
+        // Add values from active frame register windows only.
+        self.for_each_live_register(|value| value.trace(&mut |header| roots.push(header)));
 
         // Add values from call stack
         for frame in self.call_stack.iter() {
@@ -2773,6 +3075,51 @@ mod tests {
         assert_eq!(ctx.get_local(0).unwrap().as_int32(), Some(1));
         assert_eq!(ctx.get_local(1).unwrap().as_int32(), Some(2));
         assert_eq!(ctx.get_local(2).unwrap().as_int32(), Some(3));
+    }
+
+    #[test]
+    fn test_open_upvalue_count_tracks_current_frame() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let mut ctx = runtime.create_context();
+        let module = dummy_module();
+
+        ctx.push_frame(0, module.clone(), 1, None, false, false, 0)
+            .unwrap();
+        ctx.set_local(0, Value::int32(42)).unwrap();
+
+        assert_eq!(ctx.call_stack()[0].open_upvalue_count, 0);
+        assert!(ctx.open_upvalues_to_trace().is_empty());
+
+        let _cell = ctx.get_or_create_open_upvalue(0).unwrap();
+        assert_eq!(ctx.call_stack()[0].open_upvalue_count, 1);
+        assert_eq!(ctx.open_upvalues_to_trace().len(), 1);
+
+        ctx.close_upvalue(0).unwrap();
+        assert_eq!(ctx.call_stack()[0].open_upvalue_count, 0);
+        assert!(ctx.open_upvalues_to_trace().is_empty());
+    }
+
+    #[test]
+    fn test_open_upvalues_in_outer_frame_do_not_mark_inner_frame_hot() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let mut ctx = runtime.create_context();
+        let module = dummy_module();
+
+        ctx.push_frame(0, module.clone(), 1, None, false, false, 0)
+            .unwrap();
+        ctx.set_local(0, Value::int32(10)).unwrap();
+        let _cell = ctx.get_or_create_open_upvalue(0).unwrap();
+
+        assert_eq!(ctx.call_stack()[0].open_upvalue_count, 1);
+        assert_eq!(ctx.open_upvalues_to_trace().len(), 1);
+
+        ctx.push_frame(0, module, 1, None, false, false, 0).unwrap();
+        ctx.set_local(0, Value::int32(99)).unwrap();
+        assert_eq!(
+            ctx.current_frame().expect("inner frame").open_upvalue_count,
+            0
+        );
+        assert_eq!(ctx.get_local(0).unwrap().as_int32(), Some(99));
     }
 
     #[test]

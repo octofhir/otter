@@ -123,10 +123,8 @@ impl PropertyKey {
     pub fn string(s: &str) -> Self {
         // Canonicalize numeric strings to Index for consistent lookup.
         // Only values 0..=MAX_ARRAY_INDEX are valid array indices per spec.
-        if let Ok(n) = s.parse::<u32>() {
-            if n <= Self::MAX_ARRAY_INDEX && n.to_string() == s {
-                return Self::Index(n);
-            }
+        if let Some(n) = Self::parse_canonical_array_index_bytes(s.as_bytes()) {
+            return Self::Index(n);
         }
         let js_str = JsString::intern(s);
         Self::String(js_str)
@@ -135,11 +133,8 @@ impl PropertyKey {
     /// Create from a GcRef<JsString>
     pub fn from_js_string(s: GcRef<JsString>) -> Self {
         // Canonicalize numeric strings to Index for consistent lookup
-        let str_val = s.as_str();
-        if let Ok(n) = str_val.parse::<u32>() {
-            if n <= Self::MAX_ARRAY_INDEX && n.to_string() == str_val {
-                return Self::Index(n);
-            }
+        if let Some(n) = Self::parse_canonical_array_index_utf16(s.as_utf16()) {
+            return Self::Index(n);
         }
         Self::String(s)
     }
@@ -147,6 +142,50 @@ impl PropertyKey {
     /// Create an index property key
     pub fn index(i: u32) -> Self {
         Self::Index(i)
+    }
+
+    #[inline]
+    fn parse_canonical_array_index_bytes(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() || (bytes.len() > 1 && bytes[0] == b'0') {
+            return None;
+        }
+
+        let mut value: u32 = 0;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            value = value.checked_mul(10)?;
+            value = value.checked_add((b - b'0') as u32)?;
+        }
+
+        if value <= Self::MAX_ARRAY_INDEX {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn parse_canonical_array_index_utf16(units: &[u16]) -> Option<u32> {
+        if units.is_empty() || (units.len() > 1 && units[0] == b'0' as u16) {
+            return None;
+        }
+
+        let mut value: u32 = 0;
+        for &unit in units {
+            if !(b'0' as u16..=b'9' as u16).contains(&unit) {
+                return None;
+            }
+            value = value.checked_mul(10)?;
+            value = value.checked_add((unit - b'0' as u16) as u32)?;
+        }
+
+        if value <= Self::MAX_ARRAY_INDEX {
+            Some(value)
+        } else {
+            None
+        }
     }
 
     /// Trace property key for GC
@@ -1970,8 +2009,10 @@ impl JsObject {
                     match key {
                         PropertyKey::Index(i) => integer_keys.push(*i),
                         PropertyKey::String(s) => {
-                            // Check if it's a valid array index string
-                            if let Ok(n) = s.as_str().parse::<u32>() {
+                            // Check canonical array index form only.
+                            if let Some(n) =
+                                PropertyKey::parse_canonical_array_index_utf16(s.as_utf16())
+                            {
                                 integer_keys.push(n);
                             } else {
                                 string_keys.push(key.clone());
@@ -1988,8 +2029,10 @@ impl JsObject {
                     match &key {
                         PropertyKey::Index(i) => integer_keys.push(*i),
                         PropertyKey::String(s) => {
-                            // Check if it's a valid array index string
-                            if let Ok(n) = s.as_str().parse::<u32>() {
+                            // Check canonical array index form only.
+                            if let Some(n) =
+                                PropertyKey::parse_canonical_array_index_utf16(s.as_utf16())
+                            {
                                 integer_keys.push(n);
                             } else {
                                 string_keys.push(key);
@@ -2627,19 +2670,7 @@ impl JsObject {
                     None
                 }
             }
-            PropertyKey::String(s) => {
-                let str = s.as_str();
-                if let Ok(n) = str.parse::<u32>() {
-                    // Must be canonical: no leading zeros, and in range
-                    if n <= 0xFFFF_FFFE && n.to_string() == str {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            PropertyKey::String(s) => PropertyKey::parse_canonical_array_index_utf16(s.as_utf16()),
             PropertyKey::Symbol(_) => None,
         }
     }
@@ -3338,6 +3369,98 @@ impl JsObject {
         self.set(PropertyKey::Index(index as u32), value)
     }
 
+    /// Construction-path write for dense array initialization.
+    ///
+    /// Used by parsers/builders (e.g. JSON.parse) that create fresh arrays and
+    /// fill dense elements in order. This skips generic [[Set]] checks.
+    #[inline]
+    pub(crate) fn initialize_array_element(&self, index: usize, value: Value) {
+        gc_write_barrier(&value);
+        let mut elements = self.elements.borrow_mut();
+        debug_assert!(
+            index < elements.len(),
+            "initialize_array_element expects preallocated dense storage"
+        );
+        if index < elements.len() {
+            elements[index] = value;
+            return;
+        }
+        drop(elements);
+        let _ = self.set_index(index, value);
+    }
+
+    /// Construction-path write for own enumerable data properties.
+    ///
+    /// Used by parsers/builders (e.g. JSON.parse) for fresh ordinary objects to
+    /// avoid generic [[Set]] overhead while preserving normal data-property
+    /// storage in shape/dictionary layouts.
+    ///
+    /// Contract: callers must only append unique keys for this object.
+    /// (serde_json::Map already guarantees unique keys for JSON objects.)
+    #[inline]
+    pub(crate) fn define_data_property_for_construction(&self, key: GcRef<JsString>, value: Value) {
+        gc_write_barrier(&value);
+
+        let key = PropertyKey::String(key);
+
+        // Fast path for construction: append a fresh property without checking
+        // existing slots via shape lookup. This is valid for JSON object maps
+        // where keys are unique after parsing.
+        if self.flags.borrow().is_dictionary {
+            if let Some(map) = self.dictionary_properties.borrow_mut().as_mut() {
+                map.insert(
+                    key,
+                    PropertyEntry {
+                        desc: PropertyDescriptor::data(value),
+                    },
+                );
+            }
+            return;
+        }
+
+        let mut shape_write = self.shape.borrow_mut();
+        let next_shape = shape_write.transition(key.clone());
+        let offset = next_shape
+            .offset
+            .expect("Shape transition should have an offset");
+
+        if offset >= DICTIONARY_THRESHOLD {
+            drop(shape_write);
+            self.transition_to_dictionary();
+            if let Some(map) = self.dictionary_properties.borrow_mut().as_mut() {
+                map.insert(
+                    key,
+                    PropertyEntry {
+                        desc: PropertyDescriptor::data(value),
+                    },
+                );
+            }
+            return;
+        }
+
+        *shape_write = next_shape;
+
+        let entry = PropertyEntry {
+            desc: PropertyDescriptor::data(value),
+        };
+        if offset < INLINE_PROPERTY_COUNT {
+            let mut inline = self.inline_properties.borrow_mut();
+            inline[offset] = Some(entry);
+        } else {
+            let mut overflow = self.overflow_properties.borrow_mut();
+            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
+            if overflow_idx >= overflow.len() {
+                overflow.resize(
+                    overflow_idx + 1,
+                    PropertyEntry {
+                        desc: PropertyDescriptor::Deleted,
+                    },
+                );
+            }
+            overflow[overflow_idx] = entry;
+        }
+    }
+
     pub fn array_push(&self, value: Value) -> usize {
         gc_write_barrier(&value);
         let mut elements = self.elements.borrow_mut();
@@ -3406,6 +3529,58 @@ unsafe impl Sync for JsObject {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_property_key_string_canonical_index_fast_path() {
+        assert_eq!(PropertyKey::string("0"), PropertyKey::Index(0));
+        assert_eq!(
+            PropertyKey::string("4294967294"),
+            PropertyKey::Index(PropertyKey::MAX_ARRAY_INDEX)
+        );
+    }
+
+    #[test]
+    fn test_property_key_string_non_canonical_index() {
+        let _rt = crate::runtime::VmRuntime::new();
+        assert!(matches!(PropertyKey::string("01"), PropertyKey::String(_)));
+        assert!(matches!(PropertyKey::string("-1"), PropertyKey::String(_)));
+        assert!(matches!(
+            PropertyKey::string("4294967295"),
+            PropertyKey::String(_)
+        ));
+    }
+
+    #[test]
+    fn test_property_key_from_js_string_index_fast_path() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let js_idx = JsString::intern("123");
+        let js_non_idx = JsString::intern("00123");
+
+        assert_eq!(PropertyKey::from_js_string(js_idx), PropertyKey::Index(123));
+        assert!(matches!(
+            PropertyKey::from_js_string(js_non_idx),
+            PropertyKey::String(_)
+        ));
+    }
+
+    #[test]
+    fn test_own_keys_uses_canonical_array_indices_only() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let memory_manager = _rt.memory_manager().clone();
+        let obj = JsObject::new(Value::null(), memory_manager);
+
+        let _ = obj.set(PropertyKey::String(JsString::intern("2")), Value::int32(1));
+        let _ = obj.set(PropertyKey::String(JsString::intern("1")), Value::int32(2));
+        let _ = obj.set(PropertyKey::String(JsString::intern("01")), Value::int32(3));
+        let _ = obj.set(PropertyKey::String(JsString::intern("a")), Value::int32(4));
+
+        let keys = obj.own_keys();
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys[0], PropertyKey::Index(1));
+        assert_eq!(keys[1], PropertyKey::Index(2));
+        assert!(matches!(keys[2], PropertyKey::String(s) if s.as_str() == "01"));
+        assert!(matches!(keys[3], PropertyKey::String(s) if s.as_str() == "a"));
+    }
 
     #[test]
     fn test_object_get_set() {

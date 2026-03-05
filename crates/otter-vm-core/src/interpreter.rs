@@ -17,7 +17,7 @@ use crate::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind, PromiseState};
 use crate::realm::RealmId;
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
-use crate::value::{Closure, HeapRef, NativeFn, UpvalueCell, Value};
+use crate::value::{Closure, NativeFn, UpvalueCell, Value};
 
 use num_bigint::BigInt as NumBigInt;
 use num_traits::{One, ToPrimitive, Zero};
@@ -4100,11 +4100,8 @@ impl Interpreter {
                 if let Some(native_fn) = func_value.as_native_function() {
                     // Some native ops need interpreter-level dispatch (call/apply, generator ops).
                     let is_same_native = |candidate: &Value| -> bool {
-                        match (func_value.heap_ref(), candidate.heap_ref()) {
-                            (
-                                Some(HeapRef::NativeFunction(a)),
-                                Some(HeapRef::NativeFunction(b)),
-                            ) => std::ptr::eq(a.as_ptr(), b.as_ptr()),
+                        match (func_value.as_native_fn_obj(), candidate.as_native_fn_obj()) {
+                            (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), b.as_ptr()),
                             _ => false,
                         }
                     };
@@ -7933,8 +7930,6 @@ impl Interpreter {
 
             // ==================== Iteration ====================
             Instruction::GetIterator { dst, src } => {
-                use crate::value::HeapRef;
-
                 let obj = ctx.get_register(src.0).clone();
 
                 // Get Symbol.iterator method
@@ -7957,21 +7952,8 @@ impl Interpreter {
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto.get(&PropertyKey::Symbol(iterator_sym))
                 } else {
-                    match obj.heap_ref() {
-                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                            o.get(&PropertyKey::Symbol(iterator_sym))
-                        }
-                        Some(HeapRef::Function(f)) => {
-                            f.object.get(&PropertyKey::Symbol(iterator_sym))
-                        }
-                        Some(HeapRef::NativeFunction(f)) => {
-                            f.object.get(&PropertyKey::Symbol(iterator_sym))
-                        }
-                        Some(HeapRef::Generator(g)) => {
-                            g.object.get(&PropertyKey::Symbol(iterator_sym))
-                        }
-                        _ => None,
-                    }
+                    obj.as_object()
+                        .and_then(|o| o.get(&PropertyKey::Symbol(iterator_sym)))
                 };
 
                 let iterator_fn =
@@ -8002,8 +7984,6 @@ impl Interpreter {
             }
 
             Instruction::GetAsyncIterator { dst, src } => {
-                use crate::value::HeapRef;
-
                 let obj = ctx.get_register(src.0).clone();
 
                 // 1. Try Symbol.asyncIterator
@@ -8022,21 +8002,8 @@ impl Interpreter {
                         obj.clone(),
                     )?)
                 } else {
-                    match obj.heap_ref() {
-                        Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                            o.get(&PropertyKey::Symbol(async_iterator_sym))
-                        }
-                        Some(HeapRef::Function(f)) => {
-                            f.object.get(&PropertyKey::Symbol(async_iterator_sym))
-                        }
-                        Some(HeapRef::NativeFunction(f)) => {
-                            f.object.get(&PropertyKey::Symbol(async_iterator_sym))
-                        }
-                        Some(HeapRef::Generator(g)) => {
-                            g.object.get(&PropertyKey::Symbol(async_iterator_sym))
-                        }
-                        _ => None,
-                    }
+                    obj.as_object()
+                        .and_then(|o| o.get(&PropertyKey::Symbol(async_iterator_sym)))
                 };
 
                 // 2. Fallback to Symbol.iterator
@@ -8053,21 +8020,9 @@ impl Interpreter {
                             obj.clone(),
                         )?);
                     } else {
-                        iterator_method = match obj.heap_ref() {
-                            Some(HeapRef::Object(o)) | Some(HeapRef::Array(o)) => {
-                                o.get(&PropertyKey::Symbol(iterator_sym))
-                            }
-                            Some(HeapRef::Function(f)) => {
-                                f.object.get(&PropertyKey::Symbol(iterator_sym))
-                            }
-                            Some(HeapRef::NativeFunction(f)) => {
-                                f.object.get(&PropertyKey::Symbol(iterator_sym))
-                            }
-                            Some(HeapRef::Generator(g)) => {
-                                g.object.get(&PropertyKey::Symbol(iterator_sym))
-                            }
-                            _ => None,
-                        };
+                        iterator_method = obj
+                            .as_object()
+                            .and_then(|o| o.get(&PropertyKey::Symbol(iterator_sym)));
                     }
                 }
 
@@ -10142,7 +10097,7 @@ impl Interpreter {
                 }
             }
             "bigint" => {
-                if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+                if let Some(b) = value.as_bigint() {
                     b.value.clone()
                 } else {
                     "0".to_string()
@@ -10662,7 +10617,7 @@ impl Interpreter {
         if let Some(s) = value.as_string() {
             return Ok(s.as_str().to_string());
         }
-        if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+        if let Some(b) = value.as_bigint() {
             return Ok(b.value.clone());
         }
         if value.is_symbol() {
@@ -10883,7 +10838,7 @@ impl Interpreter {
     }
 
     fn bigint_value(&self, value: &Value) -> VmResult<Option<NumBigInt>> {
-        if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+        if let Some(b) = value.as_bigint() {
             let bigint = self.parse_bigint_str(&b.value)?;
             return Ok(Some(bigint));
         }

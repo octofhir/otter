@@ -5,7 +5,7 @@ use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::temporal_value::TemporalValue;
-use crate::value::{HeapRef, Value};
+use crate::value::Value;
 use std::sync::Arc;
 
 use super::common::*;
@@ -119,18 +119,10 @@ pub(super) fn install_instant(
         // Per spec: ToBigInt(epochNanoseconds)
         // Accepts: BigInt, boolean (true→1n, false→0n), string (parse as BigInt)
         // Rejects: undefined→TypeError, null→TypeError, number→TypeError, symbol→TypeError
-        let ns: i128 = if epoch_ns_val.is_bigint() {
-            match epoch_ns_val.heap_ref() {
-                Some(HeapRef::BigInt(b)) => b
-                    .value
-                    .parse::<i128>()
-                    .map_err(|_| VmError::range_error("epoch nanoseconds out of range"))?,
-                _ => {
-                    return Err(VmError::type_error(
-                        "Temporal.Instant requires a BigInt argument",
-                    ));
-                }
-            }
+        let ns: i128 = if let Some(b) = epoch_ns_val.as_bigint() {
+            b.value
+                .parse::<i128>()
+                .map_err(|_| VmError::range_error("epoch nanoseconds out of range"))?
         } else if let Some(b) = epoch_ns_val.as_boolean() {
             if b { 1i128 } else { 0i128 }
         } else if epoch_ns_val.is_string() {

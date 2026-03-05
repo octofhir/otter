@@ -56,27 +56,45 @@ pub(crate) const TAG_NAN: i64 = 0x7FFA_0000_0000_0000_u64 as i64;
 // Primitive type checks
 // ---------------------------------------------------------------------------
 
-/// Mask to extract the inner pointer from a NaN-boxed object value.
+/// Mask to extract the upper 16-bit NaN-box tag.
 pub(crate) const PTR_MASK: i64 = 0xFFFF_0000_0000_0000_u64 as i64;
 
-/// Object tags starting bytes.
-const TAG_OBJECT: i64 = 0xFFF9_0000_0000_0000_u64 as i64;
-const TAG_ARRAY: i64 = 0xFFFA_0000_0000_0000_u64 as i64;
-const TAG_FUNCTION: i64 = 0xFFFB_0000_0000_0000_u64 as i64;
+/// Mask to test for any pointer sub-tag (zeroes bits 48-49, keeps 50-63).
+/// All 4 pointer sub-tags (0x7FFC..0x7FFF) map to 0x7FFC under this mask.
+pub(crate) const PTR_TAG_MASK: i64 = 0xFFFC_0000_0000_0000_u64 as i64;
+
+/// Pointer sub-tags (must match otter-vm-core/src/value.rs)
+const TAG_PTR_OBJECT: i64 = 0x7FFC_0000_0000_0000_u64 as i64; // JsObject (plain or array)
+const TAG_PTR_STRING: i64 = 0x7FFD_0000_0000_0000_u64 as i64; // JsString
+const TAG_PTR_FUNCTION: i64 = 0x7FFE_0000_0000_0000_u64 as i64; // Closure or NativeFunctionObject
+#[allow(dead_code)]
+const TAG_PTR_OTHER: i64 = 0x7FFF_0000_0000_0000_u64 as i64; // Everything else
+
+/// 48-bit payload mask for extracting raw pointer from NaN-boxed value.
+pub(crate) const PAYLOAD_MASK: i64 = 0x0000_FFFF_FFFF_FFFF_u64 as i64;
 
 /// Emit: is this value an Object (or Array, or Function)?
 ///
 /// Returns a Cranelift `i8` value (0 or 1).
+/// Objects have TAG_PTR_OBJECT (0x7FFC), functions have TAG_PTR_FUNCTION (0x7FFE).
+/// Both object and function NaN-box tags indicate "object-like" values.
 pub(crate) fn emit_is_object(builder: &mut FunctionBuilder, val: Value) -> Value {
     let mask = builder.ins().iconst(types::I64, PTR_MASK);
     let tag = builder.ins().band(val, mask);
 
-    let is_obj = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_OBJECT);
-    let is_arr = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_ARRAY);
-    let is_func = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_FUNCTION);
+    let is_obj = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT);
+    let is_func = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_PTR_FUNCTION);
 
-    let obj_or_arr = builder.ins().bor(is_obj, is_arr);
-    builder.ins().bor(obj_or_arr, is_func)
+    builder.ins().bor(is_obj, is_func)
+}
+
+/// Emit: is this value any NaN-boxed pointer (Object, String, Function, or Other)?
+///
+/// Returns a Cranelift `i8` value (0 or 1).
+pub(crate) fn emit_is_pointer(builder: &mut FunctionBuilder, val: Value) -> Value {
+    let mask = builder.ins().iconst(types::I64, PTR_TAG_MASK);
+    let tag = builder.ins().band(val, mask);
+    builder.ins().icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT as i64)
 }
 
 /// Emit: is this value a NaN-boxed int32?

@@ -2118,7 +2118,7 @@ impl Intrinsics {
                 // Per spec: Number(value) uses ToNumeric first, then BigInt→Number if needed
                 if arg.is_bigint() {
                     // BigInt::numberValue — convert BigInt to f64
-                    if let Some(crate::value::HeapRef::BigInt(b)) = arg.heap_ref() {
+                    if let Some(b) = arg.as_bigint() {
                         b.value.parse::<f64>().unwrap_or(f64::NAN)
                     } else {
                         0.0

@@ -389,6 +389,8 @@ pub fn install_weakref_constructors(
     // WeakRef constructor
     let ctor = Value::native_function_with_proto(weakref_constructor, mm.clone(), fn_proto);
     if let Some(ctor_obj) = ctor.native_function_object() {
+        // Remove __non_constructor set by native_function_with_proto — WeakRef IS a constructor
+        let _ = ctor_obj.delete(&pk("__non_constructor"));
         ctor_obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::function_length(Value::int32(1)),
@@ -437,6 +439,8 @@ pub fn install_weakref_constructors(
     // FinalizationRegistry constructor
     let fr_ctor = Value::native_function_with_proto(finreg_constructor, mm.clone(), fn_proto);
     if let Some(ctor_obj) = fr_ctor.native_function_object() {
+        // Remove __non_constructor — FinalizationRegistry IS a constructor
+        let _ = ctor_obj.delete(&pk("__non_constructor"));
         ctor_obj.define_property(
             PropertyKey::string("length"),
             PropertyDescriptor::function_length(Value::int32(1)),

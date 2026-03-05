@@ -351,7 +351,7 @@ impl JsTypedArray {
             return false;
         }
         if self.kind.is_bigint() {
-            if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
+            if let Some(b) = val.as_bigint() {
                 if let Ok(n) = b.value.parse::<i64>() {
                     self.set_bigint(index, n);
                 }

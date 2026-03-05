@@ -608,7 +608,7 @@ fn init_typed_array_iterators(
     fn ta_set_from_value(ta: &JsTypedArray, index: usize, val: &Value) {
         if ta.kind().is_bigint() {
             // Try to get BigInt value
-            if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref() {
+            if let Some(b) = val.as_bigint() {
                 if let Ok(n) = b.value.parse::<i64>() {
                     ta.set_bigint(index, n);
                 }

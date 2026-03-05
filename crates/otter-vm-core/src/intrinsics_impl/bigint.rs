@@ -38,7 +38,7 @@ fn bigint_from_value(ncx: &mut NativeContext<'_>, this_val: &Value) -> Result<Nu
     let prim = bigint_value_from(this_val).ok_or_else(|| {
         VmError::type_error("BigInt.prototype method requires that 'this' be a BigInt")
     })?;
-    if let Some(crate::value::HeapRef::BigInt(b)) = prim.heap_ref() {
+    if let Some(b) = prim.as_bigint() {
         return ncx.parse_bigint_str(&b.value);
     }
     Err(VmError::type_error(
@@ -53,10 +53,8 @@ fn to_bigint(ncx: &mut NativeContext<'_>, value: &Value) -> Result<NumBigInt, Vm
         value.clone()
     };
 
-    if prim.is_bigint() {
-        if let Some(crate::value::HeapRef::BigInt(b)) = prim.heap_ref() {
-            return ncx.parse_bigint_str(&b.value);
-        }
+    if let Some(b) = prim.as_bigint() {
+        return ncx.parse_bigint_str(&b.value);
     }
     if prim.is_symbol() {
         return Err(VmError::type_error(

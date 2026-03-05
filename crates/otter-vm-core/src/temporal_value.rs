@@ -46,7 +46,7 @@ impl std::fmt::Debug for TemporalValue {
 // TemporalValue contains no GC references — all fields are plain Rust types.
 impl otter_vm_gc::GcTraceable for TemporalValue {
     const NEEDS_TRACE: bool = false;
-    const TYPE_ID: u8 = otter_vm_gc::object::tags::NONE;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::TEMPORAL;
 
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // No GC references to trace

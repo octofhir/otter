@@ -389,9 +389,7 @@ fn setup_builtin_constructors(
                         };
 
                         if target_ta.kind().is_bigint() {
-                            let bigint = if let Some(crate::value::HeapRef::BigInt(b)) =
-                                mapped.heap_ref()
-                            {
+                            let bigint = if let Some(b) = mapped.as_bigint() {
                                 b.value.parse::<i64>().map_err(|_| {
                                     VmError::type_error("TypedArray.from: invalid BigInt value")
                                 })?
@@ -404,7 +402,7 @@ fn setup_builtin_constructors(
                                 } else {
                                     mapped.clone()
                                 };
-                                if let Some(crate::value::HeapRef::BigInt(b)) = prim.heap_ref() {
+                                if let Some(b) = prim.as_bigint() {
                                     b.value.parse::<i64>().map_err(|_| {
                                         VmError::type_error("TypedArray.from: invalid BigInt value")
                                     })?
@@ -844,7 +842,7 @@ fn setup_builtin_constructors(
 
                             for (i, val) in values.into_iter().enumerate() {
                                 if kind.is_bigint() {
-                                    if let Some(crate::value::HeapRef::BigInt(b)) = val.heap_ref()
+                                    if let Some(b) = val.as_bigint()
                                         && let Ok(bigint) = b.value.parse::<i64>()
                                     {
                                         let _ = ta.set_bigint(i, bigint);
@@ -1818,7 +1816,7 @@ pub fn to_number(value: &Value) -> f64 {
     if let Some(n) = value.as_number() {
         return n;
     }
-    if let Some(crate::value::HeapRef::BigInt(b)) = value.heap_ref() {
+    if let Some(b) = value.as_bigint() {
         let mut s = b.value.as_str();
         let negative = s.starts_with('-');
         if negative {

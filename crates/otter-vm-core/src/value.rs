@@ -106,37 +106,49 @@ const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
 
-/// A JavaScript value using NaN-boxing for efficient storage
+// Pointer sub-tags (Phase 1.1): encode the 3 hottest heap types in the NaN-box
+// tag bits to avoid GcHeader dereference on type checks.
+//
+// All 4 values (0x7FFC..0x7FFF) are valid quiet NaN encodings.
+// is_pointer:   (bits & 0xFFFC_0000_0000_0000) == 0x7FFC_0000_0000_0000
+// ptr_subtag:   (bits >> 48) & 0x3 → 0=Object, 1=String, 2=Function, 3=Other
+#[allow(dead_code)]
+const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000; // JsObject (plain or array)
+#[allow(dead_code)]
+const TAG_PTR_STRING: u64 = 0x7FFD_0000_0000_0000; // JsString
+#[allow(dead_code)]
+const TAG_PTR_FUNCTION: u64 = 0x7FFE_0000_0000_0000; // Closure or NativeFunctionObject
+#[allow(dead_code)]
+const TAG_PTR_OTHER: u64 = 0x7FFF_0000_0000_0000; // Everything else (read GcHeader for subtype)
+
+/// Mask to test for any pointer sub-tag (bits 50-63 must match 0x7FFC pattern).
+#[allow(dead_code)]
+const TAG_PTR_MASK: u64 = 0xFFFC_0000_0000_0000;
+
+/// A JavaScript value using NaN-boxing for efficient 8-byte storage.
 ///
-/// This type is `Send + Sync` because all heap-allocated data is behind `Arc`.
+/// All type information is encoded in the upper 16 bits of the u64:
+/// - Primitive tags: undefined, null, true, false, NaN, int32, hole
+/// - Pointer sub-tags: TAG_PTR_OBJECT (0x7FFC), TAG_PTR_STRING (0x7FFD),
+///   TAG_PTR_FUNCTION (0x7FFE), TAG_PTR_OTHER (0x7FFF)
+/// - For TAG_PTR_OTHER, the GcHeader::tag() byte discriminates the exact type.
+///
+/// This type is `Copy` — GcRef pointers are stable heap addresses managed by GC.
+#[repr(transparent)]
 pub struct Value {
     bits: u64,
-    /// Heap reference to prevent GC while value is alive
-    /// This is Some only for pointer types (Object, String, etc.)
-    heap_ref: Option<HeapRef>,
 }
 
-// SAFETY: Value contains only u64 bits and HeapRef (Arc-based).
-// Thread confinement is enforced by the Isolate abstraction.
-// Pointer-tagged values (GcRef) are safe because they are confined
-// to a single Isolate, which is `Send` but `!Sync`.
+// SAFETY: Value is just a u64. Thread confinement is enforced by the Isolate.
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
+
+impl Copy for Value {}
 
 impl Clone for Value {
     #[inline(always)]
     fn clone(&self) -> Self {
-        if self.heap_ref.is_none() {
-            return Self {
-                bits: self.bits,
-                heap_ref: None,
-            };
-        }
-
-        Self {
-            bits: self.bits,
-            heap_ref: self.heap_ref.clone(),
-        }
+        *self
     }
 }
 
@@ -156,82 +168,6 @@ pub type NativeFn = Arc<
         + Sync,
 >;
 
-/// Reference to heap-allocated data
-#[derive(Clone)]
-pub enum HeapRef {
-    /// String value (GC-managed)
-    String(GcRef<JsString>),
-    /// Object value (GC-managed)
-    Object(GcRef<JsObject>),
-    /// Array value (stored as Object internally, GC-managed)
-    Array(GcRef<JsObject>),
-    /// Function closure
-    Function(GcRef<Closure>),
-    /// Symbol
-    Symbol(GcRef<Symbol>),
-    /// BigInt
-    BigInt(GcRef<BigInt>),
-    /// Promise
-    Promise(GcRef<JsPromise>),
-    /// Proxy object
-    Proxy(GcRef<JsProxy>),
-    /// Generator object
-    Generator(GcRef<JsGenerator>),
-    /// ArrayBuffer (raw binary data buffer)
-    ArrayBuffer(GcRef<JsArrayBuffer>),
-    /// TypedArray (view over ArrayBuffer)
-    TypedArray(GcRef<JsTypedArray>),
-    /// DataView (arbitrary byte-order access to ArrayBuffer)
-    DataView(GcRef<JsDataView>),
-    /// SharedArrayBuffer (can be shared between workers)
-    SharedArrayBuffer(GcRef<SharedArrayBuffer>),
-    /// Native function (implemented in Rust)
-    NativeFunction(GcRef<NativeFunctionObject>),
-    /// RegExp
-    RegExp(GcRef<JsRegExp>),
-    /// Map internal data
-    MapData(GcRef<MapData>),
-    /// Set internal data
-    SetData(GcRef<SetData>),
-    /// Ephemeron table for WeakMap/WeakSet
-    EphemeronTable(GcRef<otter_vm_gc::EphemeronTable>),
-    /// WeakRef cell (weak reference to a GC object)
-    WeakRef(GcRef<otter_vm_gc::WeakRefCell>),
-    /// FinalizationRegistry data
-    FinalizationRegistry(GcRef<otter_vm_gc::FinalizationRegistryData>),
-    /// Temporal value (PlainDate, PlainTime, Duration, etc.)
-    Temporal(GcRef<TemporalValue>),
-}
-
-impl std::fmt::Debug for HeapRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HeapRef::String(s) => f.debug_tuple("String").field(s).finish(),
-            HeapRef::Object(o) => f.debug_tuple("Object").field(o).finish(),
-            HeapRef::Array(a) => f.debug_tuple("Array").field(a).finish(),
-            HeapRef::Function(c) => f.debug_tuple("Function").field(c).finish(),
-            HeapRef::Symbol(s) => f.debug_tuple("Symbol").field(s).finish(),
-            HeapRef::BigInt(b) => f.debug_tuple("BigInt").field(b).finish(),
-            HeapRef::Promise(p) => f.debug_tuple("Promise").field(p).finish(),
-            HeapRef::Proxy(p) => f.debug_tuple("Proxy").field(p).finish(),
-            HeapRef::Generator(g) => f.debug_tuple("Generator").field(g).finish(),
-            HeapRef::ArrayBuffer(a) => f.debug_tuple("ArrayBuffer").field(a).finish(),
-            HeapRef::TypedArray(t) => f.debug_tuple("TypedArray").field(t).finish(),
-            HeapRef::DataView(d) => f.debug_tuple("DataView").field(d).finish(),
-            HeapRef::SharedArrayBuffer(s) => f.debug_tuple("SharedArrayBuffer").field(s).finish(),
-            HeapRef::NativeFunction(_) => f.debug_tuple("NativeFunction").finish(),
-            HeapRef::RegExp(r) => f.debug_tuple("RegExp").field(r).finish(),
-            HeapRef::MapData(m) => f.debug_tuple("MapData").field(m).finish(),
-            HeapRef::SetData(s) => f.debug_tuple("SetData").field(s).finish(),
-            HeapRef::EphemeronTable(e) => f.debug_tuple("EphemeronTable").field(e).finish(),
-            HeapRef::WeakRef(w) => f.debug_tuple("WeakRef").field(w).finish(),
-            HeapRef::FinalizationRegistry(r) => {
-                f.debug_tuple("FinalizationRegistry").field(r).finish()
-            }
-            HeapRef::Temporal(t) => f.debug_tuple("Temporal").field(t).finish(),
-        }
-    }
-}
 
 /// A JavaScript function closure
 #[derive(Debug)]
@@ -340,7 +276,7 @@ pub struct BigInt {
 
 impl otter_vm_gc::GcTraceable for BigInt {
     const NEEDS_TRACE: bool = false;
-    const TYPE_ID: u8 = otter_vm_gc::object::tags::NONE;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::BIGINT;
     fn trace(&self, _tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
         // BigInt contains only a String, no GC references
     }
@@ -352,7 +288,7 @@ impl Value {
     pub const fn undefined() -> Self {
         Self {
             bits: TAG_UNDEFINED,
-            heap_ref: None,
+
         }
     }
 
@@ -361,7 +297,7 @@ impl Value {
     pub const fn null() -> Self {
         Self {
             bits: TAG_NULL,
-            heap_ref: None,
+
         }
     }
 
@@ -370,7 +306,7 @@ impl Value {
     pub const fn boolean(b: bool) -> Self {
         Self {
             bits: if b { TAG_TRUE } else { TAG_FALSE },
-            heap_ref: None,
+
         }
     }
 
@@ -383,7 +319,7 @@ impl Value {
     pub const fn hole() -> Self {
         Self {
             bits: TAG_HOLE,
-            heap_ref: None,
+
         }
     }
 
@@ -398,7 +334,7 @@ impl Value {
     pub fn int32(n: i32) -> Self {
         Self {
             bits: TAG_INT32 | (n as u32 as u64),
-            heap_ref: None,
+
         }
     }
 
@@ -409,7 +345,7 @@ impl Value {
         if n.is_nan() {
             return Self {
                 bits: TAG_NAN,
-                heap_ref: None,
+    
             };
         }
 
@@ -425,7 +361,7 @@ impl Value {
 
         Self {
             bits: n.to_bits(),
-            heap_ref: None,
+
         }
     }
 
@@ -435,20 +371,20 @@ impl Value {
     /// `heap_ref` to be GC-safe.
     #[inline]
     pub(crate) fn from_jit_bits(bits: u64) -> Option<Self> {
-        if (bits & TAG_MASK) == TAG_POINTER {
+        if (bits & TAG_PTR_MASK) == TAG_PTR_OBJECT {
             return None;
         }
 
         Some(Self {
             bits,
-            heap_ref: None,
+
         })
     }
 
     /// Reconstruct a full Value from raw NaN-boxed bits, including pointer types.
     ///
     /// For pointer-tagged values, reads the GC header tag to determine the type
-    /// and reconstructs the appropriate `HeapRef`. Returns `None` for unsupported
+    /// and validates the pointer. Returns `None` for unsupported
     /// or unrecognized pointer types.
     ///
     /// # Safety
@@ -456,55 +392,20 @@ impl Value {
     /// - The raw pointer in `bits` must point to a live GC object
     /// - No GC must occur while the returned Value is in use
     /// - Intended for JIT runtime helpers during no-GC JIT execution scope
+    /// Reconstruct a Value from raw NaN-boxed bits.
+    ///
+    /// With `#[repr(transparent)]`, Value is just a u64, so this is trivial.
+    /// Validates that pointer-tagged values have non-null payloads.
     #[allow(unsafe_code)]
     pub(crate) unsafe fn from_raw_bits_unchecked(bits: u64) -> Option<Self> {
-        use otter_vm_gc::object::{GcHeader, tags as gc_tags};
-        use std::ptr::NonNull;
-
-        if (bits & TAG_MASK) != TAG_POINTER {
-            return Self::from_jit_bits(bits);
+        if (bits & TAG_PTR_MASK) == TAG_PTR_OBJECT {
+            // Pointer-tagged value — validate non-null payload
+            let raw_ptr = (bits & PAYLOAD_MASK) as *const u8;
+            if raw_ptr.is_null() {
+                return None;
+            }
         }
-
-        let raw_ptr = (bits & PAYLOAD_MASK) as *const u8;
-        if raw_ptr.is_null() {
-            return None;
-        }
-
-        // GcAllocation<T> layout: [GcHeader (8 bytes)] [T value]
-        // raw_ptr points to T, header is 8 bytes before.
-        let header_offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
-        let header_ptr = raw_ptr.sub(header_offset) as *const GcHeader;
-        let tag = (*header_ptr).tag();
-
-        // Reconstruct GcRef<T> from a raw value pointer.
-        // SAFETY: raw_ptr must point to the `value` field of a live GcBox<T>.
-        macro_rules! gc_ref {
-            ($T:ty) => {{
-                let offset = std::mem::offset_of!(crate::gc::GcBox<$T>, value);
-                let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<$T>;
-                let gc = crate::gc::Gc::from_raw(NonNull::new_unchecked(box_ptr));
-                crate::gc::GcRef::from_gc(gc)
-            }};
-        }
-
-        let heap_ref = match tag {
-            gc_tags::CLOSURE => HeapRef::Function(gc_ref!(Closure)),
-            gc_tags::FUNCTION => HeapRef::NativeFunction(gc_ref!(NativeFunctionObject)),
-            gc_tags::OBJECT => HeapRef::Object(gc_ref!(JsObject)),
-            gc_tags::ARRAY => HeapRef::Array(gc_ref!(JsObject)),
-            gc_tags::STRING => HeapRef::String(gc_ref!(JsString)),
-            gc_tags::PROXY => HeapRef::Proxy(gc_ref!(JsProxy)),
-            gc_tags::PROMISE => HeapRef::Promise(gc_ref!(JsPromise)),
-            gc_tags::GENERATOR => HeapRef::Generator(gc_ref!(JsGenerator)),
-            gc_tags::SYMBOL => HeapRef::Symbol(gc_ref!(Symbol)),
-            gc_tags::REGEXP => HeapRef::RegExp(gc_ref!(JsRegExp)),
-            _ => return None,
-        };
-
-        Some(Self {
-            bits,
-            heap_ref: Some(heap_ref),
-        })
+        Some(Self { bits })
     }
 
     /// Return raw NaN-box bits for JIT argument passing.
@@ -518,7 +419,7 @@ impl Value {
     pub const fn nan() -> Self {
         Self {
             bits: TAG_NAN,
-            heap_ref: None,
+
         }
     }
 
@@ -527,8 +428,7 @@ impl Value {
         // Store pointer address in NaN-boxed format
         let ptr = s.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::String(s)),
+            bits: TAG_PTR_STRING | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -536,8 +436,7 @@ impl Value {
     pub fn object(obj: GcRef<JsObject>) -> Self {
         let ptr = obj.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Object(obj)),
+            bits: TAG_PTR_OBJECT | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -545,8 +444,7 @@ impl Value {
     pub fn function(closure: GcRef<Closure>) -> Self {
         let ptr = closure.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Function(closure)),
+            bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -554,16 +452,14 @@ impl Value {
     pub fn promise(promise: GcRef<JsPromise>) -> Self {
         let ptr = promise.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Promise(promise)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
     pub fn regex(regex: GcRef<JsRegExp>) -> Self {
         let ptr = regex.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::RegExp(regex)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -571,8 +467,7 @@ impl Value {
     pub fn proxy(proxy: GcRef<JsProxy>) -> Self {
         let ptr = proxy.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Proxy(proxy)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -580,8 +475,7 @@ impl Value {
     pub fn generator(generator: GcRef<JsGenerator>) -> Self {
         let ptr = generator.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Generator(generator)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -589,8 +483,7 @@ impl Value {
     pub fn array_buffer(ab: GcRef<JsArrayBuffer>) -> Self {
         let ptr = ab.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::ArrayBuffer(ab)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -598,8 +491,7 @@ impl Value {
     pub fn typed_array(ta: GcRef<JsTypedArray>) -> Self {
         let ptr = ta.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::TypedArray(ta)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -607,8 +499,7 @@ impl Value {
     pub fn data_view(dv: GcRef<JsDataView>) -> Self {
         let ptr = dv.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::DataView(dv)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -616,8 +507,7 @@ impl Value {
     pub fn shared_array_buffer(sab: GcRef<SharedArrayBuffer>) -> Self {
         let ptr = sab.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::SharedArrayBuffer(sab)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -625,8 +515,7 @@ impl Value {
     pub fn map_data(data: GcRef<MapData>) -> Self {
         let ptr = data.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::MapData(data)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -634,8 +523,7 @@ impl Value {
     pub fn set_data(data: GcRef<SetData>) -> Self {
         let ptr = data.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::SetData(data)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -643,8 +531,7 @@ impl Value {
     pub fn ephemeron_table(table: GcRef<otter_vm_gc::EphemeronTable>) -> Self {
         let ptr = table.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::EphemeronTable(table)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -652,8 +539,7 @@ impl Value {
     pub fn weak_ref(cell: GcRef<otter_vm_gc::WeakRefCell>) -> Self {
         let ptr = cell.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::WeakRef(cell)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -661,8 +547,7 @@ impl Value {
     pub fn finalization_registry(data: GcRef<otter_vm_gc::FinalizationRegistryData>) -> Self {
         let ptr = data.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::FinalizationRegistry(data)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -671,8 +556,7 @@ impl Value {
         let gc = GcRef::new(tv);
         let ptr = gc.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Temporal(gc)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -680,8 +564,7 @@ impl Value {
     pub fn temporal_ref(gc: GcRef<TemporalValue>) -> Self {
         let ptr = gc.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Temporal(gc)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -689,8 +572,7 @@ impl Value {
     pub fn array(arr: GcRef<JsObject>) -> Self {
         let ptr = arr.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Array(arr)),
+            bits: TAG_PTR_OBJECT | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -699,8 +581,7 @@ impl Value {
         let bi = GcRef::new(BigInt { value });
         let ptr = bi.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::BigInt(bi)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -708,8 +589,7 @@ impl Value {
     pub fn symbol(sym: GcRef<Symbol>) -> Self {
         let ptr = sym.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::Symbol(sym)),
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -730,8 +610,7 @@ impl Value {
         let native = GcRef::new(NativeFunctionObject { func, object });
         let ptr = native.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -747,8 +626,7 @@ impl Value {
         let native = GcRef::new(NativeFunctionObject { func, object });
         let ptr = native.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -781,8 +659,7 @@ impl Value {
         let native = GcRef::new(NativeFunctionObject { func, object });
         let ptr = native.as_ptr() as u64;
         Self {
-            bits: TAG_POINTER | (ptr & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
         }
     }
 
@@ -836,8 +713,7 @@ impl Value {
         }
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
-            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
     }
 
@@ -892,8 +768,7 @@ impl Value {
         }
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
-            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
     }
 
@@ -917,8 +792,7 @@ impl Value {
         }
         let native = GcRef::new(NativeFunctionObject { func, object });
         Self {
-            bits: TAG_POINTER | (native.as_ptr() as u64 & PAYLOAD_MASK),
-            heap_ref: Some(HeapRef::NativeFunction(native)),
+            bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
     }
 
@@ -965,101 +839,118 @@ impl Value {
     }
 
     /// Check if value is a string
-    #[inline]
+    #[inline(always)]
+    #[allow(unsafe_code)]
     pub fn is_string(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::String(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_STRING
     }
 
     /// Check if value has [[IsHTMLDDA]] internal slot (Annex B)
     #[inline]
     pub fn is_htmldda(&self) -> bool {
-        match &self.heap_ref {
-            Some(HeapRef::Object(obj)) => obj.is_htmldda(),
-            Some(HeapRef::NativeFunction(f)) => f.object.is_htmldda(),
-            _ => false,
-        }
+        self.as_object().map_or(false, |o| o.is_htmldda())
     }
 
     /// Check if value is an object (includes functions, arrays, regexps, etc.)
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_object(&self) -> bool {
-        matches!(
-            &self.heap_ref,
-            Some(HeapRef::Object(_))
-                | Some(HeapRef::Array(_))
-                | Some(HeapRef::RegExp(_))
-                | Some(HeapRef::Function(_))
-                | Some(HeapRef::NativeFunction(_))
-                | Some(HeapRef::Promise(_))
-                | Some(HeapRef::Proxy(_))
-                | Some(HeapRef::Generator(_))
-                | Some(HeapRef::ArrayBuffer(_))
-                | Some(HeapRef::TypedArray(_))
-                | Some(HeapRef::DataView(_))
-        )
+        use otter_vm_gc::object::tags as gc_tags;
+        let tag16 = self.bits & TAG_MASK;
+        match tag16 {
+            TAG_PTR_OBJECT | TAG_PTR_FUNCTION => true,
+            TAG_PTR_OTHER => {
+                let t = unsafe { self.gc_header_tag_from_bits() };
+                matches!(
+                    t,
+                    gc_tags::REGEXP
+                        | gc_tags::PROMISE
+                        | gc_tags::PROXY
+                        | gc_tags::GENERATOR
+                        | gc_tags::ARRAY_BUFFER
+                        | gc_tags::TYPED_ARRAY
+                        | gc_tags::DATA_VIEW
+                )
+            }
+            _ => false,
+        }
     }
 
     /// Check if value is a function (includes native functions)
-    #[inline]
+    #[inline(always)]
     pub fn is_function(&self) -> bool {
-        matches!(
-            &self.heap_ref,
-            Some(HeapRef::Function(_)) | Some(HeapRef::NativeFunction(_))
-        )
+        (self.bits & TAG_MASK) == TAG_PTR_FUNCTION
     }
 
     /// Check if value is a promise
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_promise(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Promise(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::PROMISE
     }
 
     /// Check if value is a proxy
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_proxy(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Proxy(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::PROXY
     }
 
     /// Check if value is a generator
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_generator(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Generator(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::GENERATOR
     }
 
     /// Check if value is an ArrayBuffer
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_array_buffer(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::ArrayBuffer(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::ARRAY_BUFFER
     }
 
     /// Check if value is a TypedArray
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_typed_array(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::TypedArray(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::TYPED_ARRAY
     }
 
     /// Check if value is a DataView
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_data_view(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::DataView(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::DATA_VIEW
     }
 
     /// Check if value is a SharedArrayBuffer
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_shared_array_buffer(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::SharedArrayBuffer(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() }
+                == otter_vm_gc::object::tags::SHARED_ARRAY_BUFFER
     }
 
     /// Check if value is a native function
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_native_function(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::NativeFunction(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_FUNCTION
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::FUNCTION
     }
 
     /// Check if value is callable (function, native function, or bound function)
     #[inline]
     pub fn is_callable(&self) -> bool {
-        if self.is_function() || self.is_native_function() {
+        if self.is_function() {
             return true;
         }
         if let Some(proxy) = self.as_proxy() {
@@ -1082,14 +973,18 @@ impl Value {
 
     /// Check if value is a symbol
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_symbol(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::Symbol(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::SYMBOL
     }
 
     /// Check if value is a BigInt
     #[inline]
+    #[allow(unsafe_code)]
     pub fn is_bigint(&self) -> bool {
-        matches!(&self.heap_ref, Some(HeapRef::BigInt(_)))
+        (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::BIGINT
     }
 
     /// Check if this is a NaN-boxed value (vs regular double)
@@ -1131,226 +1026,449 @@ impl Value {
     }
 
     /// Get as string (GC-managed)
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_string(&self) -> Option<GcRef<JsString>> {
-        match &self.heap_ref {
-            Some(HeapRef::String(s)) => Some(*s),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_STRING {
+            Some(unsafe { self.extract_gcref::<JsString>() })
+        } else {
+            None
         }
     }
 
     /// Get as object (GC-managed)
+    ///
+    /// Returns the inner `JsObject` for objects, arrays, functions, generators,
+    /// regexps, array buffers, and typed arrays.
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_object(&self) -> Option<GcRef<JsObject>> {
-        match &self.heap_ref {
-            Some(HeapRef::Object(o)) => Some(*o),
-            Some(HeapRef::Array(a)) => Some(*a),
-            Some(HeapRef::Function(f)) => Some(f.object),
-            Some(HeapRef::NativeFunction(n)) => Some(n.object),
-            Some(HeapRef::Generator(g)) => Some(g.object),
-            Some(HeapRef::RegExp(r)) => Some(r.object),
-            Some(HeapRef::ArrayBuffer(ab)) => Some(ab.object),
-            Some(HeapRef::TypedArray(ta)) => Some(ta.object),
+        let tag16 = self.bits & TAG_MASK;
+        match tag16 {
+            TAG_PTR_OBJECT => {
+                // Plain objects and arrays both store JsObject directly
+                Some(unsafe { self.extract_gcref::<JsObject>() })
+            }
+            TAG_PTR_FUNCTION => {
+                // Closure or NativeFunction — extract inner .object field
+                let gc_tag = unsafe { self.gc_header_tag_from_bits() };
+                if gc_tag == otter_vm_gc::object::tags::CLOSURE {
+                    let closure: GcRef<Closure> = unsafe { self.extract_gcref() };
+                    Some(closure.object)
+                } else {
+                    // FUNCTION tag = NativeFunctionObject
+                    let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
+                    Some(nfo.object)
+                }
+            }
+            TAG_PTR_OTHER => {
+                let gc_tag = unsafe { self.gc_header_tag_from_bits() };
+                match gc_tag {
+                    otter_vm_gc::object::tags::GENERATOR => {
+                        let g: GcRef<JsGenerator> = unsafe { self.extract_gcref() };
+                        Some(g.object)
+                    }
+                    otter_vm_gc::object::tags::REGEXP => {
+                        let r: GcRef<JsRegExp> = unsafe { self.extract_gcref() };
+                        Some(r.object)
+                    }
+                    otter_vm_gc::object::tags::ARRAY_BUFFER => {
+                        let ab: GcRef<JsArrayBuffer> = unsafe { self.extract_gcref() };
+                        Some(ab.object)
+                    }
+                    otter_vm_gc::object::tags::TYPED_ARRAY => {
+                        let ta: GcRef<JsTypedArray> = unsafe { self.extract_gcref() };
+                        Some(ta.object)
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
 
     /// Get as array object (GC-managed)
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_array(&self) -> Option<GcRef<JsObject>> {
-        match &self.heap_ref {
-            Some(HeapRef::Array(a)) => Some(*a),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OBJECT
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::ARRAY
+        {
+            Some(unsafe { self.extract_gcref::<JsObject>() })
+        } else {
+            None
         }
     }
 
     /// Get as function closure
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_function(&self) -> Option<GcRef<Closure>> {
-        match &self.heap_ref {
-            Some(HeapRef::Function(f)) => Some(*f),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_FUNCTION
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::CLOSURE
+        {
+            Some(unsafe { self.extract_gcref::<Closure>() })
+        } else {
+            None
         }
     }
 
     /// Get the inner `JsObject` attached to a function (closure or native).
     /// This is the object that holds properties like `.prototype`, `.name`, `.length`
     /// and carries the `[[Prototype]]` internal slot (should be `Function.prototype`).
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn function_inner_object(&self) -> Option<GcRef<JsObject>> {
-        match &self.heap_ref {
-            Some(HeapRef::Function(f)) => Some(f.object),
-            Some(HeapRef::NativeFunction(n)) => Some(n.object),
-            _ => None,
+        if (self.bits & TAG_MASK) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        let gc_tag = unsafe { self.gc_header_tag_from_bits() };
+        if gc_tag == otter_vm_gc::object::tags::CLOSURE {
+            let closure: GcRef<Closure> = unsafe { self.extract_gcref() };
+            Some(closure.object)
+        } else if gc_tag == otter_vm_gc::object::tags::FUNCTION {
+            let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
+            Some(nfo.object)
+        } else {
+            None
         }
     }
 
     /// Get as native function
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_native_function(&self) -> Option<&NativeFn> {
-        match &self.heap_ref {
-            Some(HeapRef::NativeFunction(f)) => Some(&f.func),
-            _ => None,
+        if self.is_native_function() {
+            let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
+            // SAFETY: GcRef wraps a stable GC-heap pointer. The NativeFunctionObject
+            // is alive as long as this Value's pointer is valid (i.e., it's rooted).
+            // The returned reference lifetime is bounded by the caller's usage of &self.
+            Some(unsafe { &(*nfo.as_ptr()).func })
+        } else {
+            None
         }
     }
 
     /// Get the properties object of a native function, for setting `name`, `length`, etc.
     /// Returns `None` if the value is not a `NativeFunction`.
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn native_function_object(&self) -> Option<GcRef<JsObject>> {
-        match &self.heap_ref {
-            Some(HeapRef::NativeFunction(f)) => Some(f.object),
-            _ => None,
+        if self.is_native_function() {
+            let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
+            Some(nfo.object)
+        } else {
+            None
         }
     }
 
     /// Get as promise
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_promise(&self) -> Option<GcRef<JsPromise>> {
-        match &self.heap_ref {
-            Some(HeapRef::Promise(p)) => Some(*p),
-            _ => None,
+        if self.is_promise() {
+            Some(unsafe { self.extract_gcref::<JsPromise>() })
+        } else {
+            None
         }
     }
 
     /// Get as proxy
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_proxy(&self) -> Option<GcRef<JsProxy>> {
-        match &self.heap_ref {
-            Some(HeapRef::Proxy(p)) => Some(*p),
-            _ => None,
+        if self.is_proxy() {
+            Some(unsafe { self.extract_gcref::<JsProxy>() })
+        } else {
+            None
         }
     }
 
     /// Get as generator
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_generator(&self) -> Option<GcRef<JsGenerator>> {
-        match &self.heap_ref {
-            Some(HeapRef::Generator(g)) => Some(*g),
-            _ => None,
+        if self.is_generator() {
+            Some(unsafe { self.extract_gcref::<JsGenerator>() })
+        } else {
+            None
         }
     }
 
     /// Get as regex
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_regex(&self) -> Option<GcRef<JsRegExp>> {
-        match &self.heap_ref {
-            Some(HeapRef::RegExp(r)) => Some(*r),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::REGEXP
+        {
+            Some(unsafe { self.extract_gcref::<JsRegExp>() })
+        } else {
+            None
         }
     }
 
     /// Get as ArrayBuffer
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_array_buffer(&self) -> Option<GcRef<JsArrayBuffer>> {
-        match &self.heap_ref {
-            Some(HeapRef::ArrayBuffer(ab)) => Some(*ab),
-            _ => None,
+        if self.is_array_buffer() {
+            Some(unsafe { self.extract_gcref::<JsArrayBuffer>() })
+        } else {
+            None
         }
     }
 
     /// Get as TypedArray
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_typed_array(&self) -> Option<GcRef<JsTypedArray>> {
-        match &self.heap_ref {
-            Some(HeapRef::TypedArray(ta)) => Some(*ta),
-            _ => None,
+        if self.is_typed_array() {
+            Some(unsafe { self.extract_gcref::<JsTypedArray>() })
+        } else {
+            None
         }
     }
 
     /// Get as DataView
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_data_view(&self) -> Option<GcRef<JsDataView>> {
-        match &self.heap_ref {
-            Some(HeapRef::DataView(dv)) => Some(*dv),
-            _ => None,
+        if self.is_data_view() {
+            Some(unsafe { self.extract_gcref::<JsDataView>() })
+        } else {
+            None
         }
     }
 
     /// Get as SharedArrayBuffer
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_shared_array_buffer(&self) -> Option<GcRef<SharedArrayBuffer>> {
-        match &self.heap_ref {
-            Some(HeapRef::SharedArrayBuffer(sab)) => Some(*sab),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() }
+                == otter_vm_gc::object::tags::SHARED_ARRAY_BUFFER
+        {
+            Some(unsafe { self.extract_gcref::<SharedArrayBuffer>() })
+        } else {
+            None
         }
     }
 
     /// Get as symbol
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_symbol(&self) -> Option<GcRef<Symbol>> {
-        match &self.heap_ref {
-            Some(HeapRef::Symbol(s)) => Some(*s),
-            _ => None,
+        if self.is_symbol() {
+            Some(unsafe { self.extract_gcref::<Symbol>() })
+        } else {
+            None
         }
     }
 
     /// Get as Map internal data
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_map_data(&self) -> Option<GcRef<MapData>> {
-        match &self.heap_ref {
-            Some(HeapRef::MapData(m)) => Some(*m),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::MAP_DATA
+        {
+            Some(unsafe { self.extract_gcref::<MapData>() })
+        } else {
+            None
         }
     }
 
     /// Get as Set internal data
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_set_data(&self) -> Option<GcRef<SetData>> {
-        match &self.heap_ref {
-            Some(HeapRef::SetData(s)) => Some(*s),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::SET_DATA
+        {
+            Some(unsafe { self.extract_gcref::<SetData>() })
+        } else {
+            None
         }
     }
 
     /// Get as ephemeron table
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_ephemeron_table(&self) -> Option<GcRef<otter_vm_gc::EphemeronTable>> {
-        match &self.heap_ref {
-            Some(HeapRef::EphemeronTable(e)) => Some(*e),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() }
+                == otter_vm_gc::object::tags::EPHEMERON_TABLE
+        {
+            Some(unsafe { self.extract_gcref::<otter_vm_gc::EphemeronTable>() })
+        } else {
+            None
         }
     }
 
     /// Get as WeakRef cell reference
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_weak_ref(&self) -> Option<GcRef<otter_vm_gc::WeakRefCell>> {
-        match &self.heap_ref {
-            Some(HeapRef::WeakRef(w)) => Some(*w),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::WEAK_REF
+        {
+            Some(unsafe { self.extract_gcref::<otter_vm_gc::WeakRefCell>() })
+        } else {
+            None
         }
     }
 
     /// Get as FinalizationRegistry data reference
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_finalization_registry(&self) -> Option<GcRef<otter_vm_gc::FinalizationRegistryData>> {
-        match &self.heap_ref {
-            Some(HeapRef::FinalizationRegistry(r)) => Some(*r),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() }
+                == otter_vm_gc::object::tags::FINALIZATION_REGISTRY
+        {
+            Some(unsafe {
+                self.extract_gcref::<otter_vm_gc::FinalizationRegistryData>()
+            })
+        } else {
+            None
         }
     }
 
     /// Get as Temporal value (PlainDate, PlainTime, Duration, etc.)
+    #[inline]
+    #[allow(unsafe_code)]
     pub fn as_temporal(&self) -> Option<GcRef<TemporalValue>> {
-        match &self.heap_ref {
-            Some(HeapRef::Temporal(t)) => Some(*t),
-            _ => None,
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::TEMPORAL
+        {
+            Some(unsafe { self.extract_gcref::<TemporalValue>() })
+        } else {
+            None
         }
     }
 
-    /// Get the heap reference (for structured clone)
-    #[doc(hidden)]
-    pub fn heap_ref(&self) -> &Option<HeapRef> {
-        &self.heap_ref
+
+    // ========================================================================
+    // Phase 1.1 helpers: pointer sub-tag + GcHeader-based type discrimination
+    // ========================================================================
+
+    /// Check if this value is a NaN-boxed pointer (any heap type).
+    #[inline(always)]
+    #[allow(dead_code)]
+    fn is_pointer_tagged(&self) -> bool {
+        (self.bits & TAG_PTR_MASK) == TAG_PTR_OBJECT
+    }
+
+    /// Get the raw 48-bit pointer from a pointer-tagged value.
+    ///
+    /// Returns the pointer to the T value inside `GcBox<T>` (not the GcBox itself).
+    /// Returns null for non-pointer values.
+    #[inline(always)]
+    fn raw_heap_ptr(&self) -> *const u8 {
+        (self.bits & PAYLOAD_MASK) as *const u8
+    }
+
+    /// Read the `GcHeader::tag()` byte from a pointer-tagged value.
+    ///
+    /// This dereferences the pointer to read the type tag from the GcHeader,
+    /// which is at a fixed negative offset from the value pointer.
+    ///
+    /// # Safety
+    /// Caller must ensure this value is pointer-tagged and points to a live GcBox.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    unsafe fn gc_header_tag_from_bits(&self) -> u8 {
+        let raw_ptr = self.raw_heap_ptr();
+        debug_assert!(!raw_ptr.is_null());
+        let header_offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
+        let header_ptr = raw_ptr.sub(header_offset) as *const otter_vm_gc::GcHeader;
+        (*header_ptr).tag()
+    }
+
+    /// Extract a `GcRef<T>` from NaN-boxed pointer bits.
+    ///
+    /// # Safety
+    /// Caller must ensure this Value is a pointer of the correct type T.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    unsafe fn extract_gcref<T>(&self) -> GcRef<T> {
+        let raw_ptr = self.raw_heap_ptr();
+        debug_assert!(!raw_ptr.is_null());
+        let offset = std::mem::offset_of!(crate::gc::GcBox<T>, value);
+        let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<T>;
+        GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(box_ptr)))
+    }
+
+    // ========================================================================
+    // Missing typed accessors (replacing direct heap_ref() matches)
+    // ========================================================================
+
+    /// Get as BigInt (GC-managed)
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn as_bigint(&self) -> Option<GcRef<BigInt>> {
+        if self.is_bigint() {
+            Some(unsafe { self.extract_gcref::<BigInt>() })
+        } else {
+            None
+        }
+    }
+
+    /// Get as native function object (GC-managed NativeFunctionObject)
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn as_native_fn_obj(&self) -> Option<GcRef<NativeFunctionObject>> {
+        if self.is_native_function() {
+            Some(unsafe { self.extract_gcref::<NativeFunctionObject>() })
+        } else {
+            None
+        }
+    }
+
+    /// Get as closure (GC-managed Closure).
+    /// Note: `as_function()` returns the same thing; this is an alias for clarity.
+    pub fn as_closure(&self) -> Option<GcRef<Closure>> {
+        self.as_function()
+    }
+
+    /// Get as map internal data (GC-managed)
+    pub fn as_map_data_raw(&self) -> Option<GcRef<MapData>> {
+        self.as_map_data()
+    }
+
+    /// Get as set internal data (GC-managed)
+    pub fn as_set_data_raw(&self) -> Option<GcRef<SetData>> {
+        self.as_set_data()
+    }
+
+    /// Get the NaN-boxed bits (for identity-based hashing/comparison).
+    /// For pointer values, the lower 48 bits are the address — unique per object.
+    #[inline(always)]
+    pub fn to_bits_raw(&self) -> u64 {
+        self.bits
     }
 
     /// Get the GC header pointer for this value (if it's a GC-managed type)
     ///
     /// Returns the pointer to the GcHeader if this value contains a GC-managed
     /// object (String or Object), otherwise returns None.
+    #[allow(unsafe_code)]
     pub fn gc_header(&self) -> Option<*const otter_vm_gc::GcHeader> {
-        match &self.heap_ref {
-            Some(HeapRef::String(s)) => Some(s.header() as *const _),
-            Some(HeapRef::Object(o)) => Some(o.header() as *const _),
-            Some(HeapRef::Array(a)) => Some(a.header() as *const _),
-            Some(HeapRef::Function(f)) => Some(f.object.header() as *const _),
-            Some(HeapRef::NativeFunction(n)) => Some(n.object.header() as *const _),
-            Some(HeapRef::RegExp(r)) => Some(r.object.header() as *const _),
-            Some(HeapRef::Generator(g)) => Some(g.object.header() as *const _),
-            Some(HeapRef::Symbol(s)) => Some(s.header() as *const _),
-            Some(HeapRef::BigInt(b)) => Some(b.header() as *const _),
-            Some(HeapRef::Promise(p)) => Some(p.header() as *const _),
-            Some(HeapRef::Proxy(p)) => Some(p.header() as *const _),
-            Some(HeapRef::ArrayBuffer(a)) => Some(a.header() as *const _),
-            Some(HeapRef::TypedArray(t)) => Some(t.header() as *const _),
-            Some(HeapRef::DataView(d)) => Some(d.header() as *const _),
-            Some(HeapRef::SharedArrayBuffer(s)) => Some(s.header() as *const _),
-            Some(HeapRef::MapData(m)) => Some(m.header() as *const _),
-            Some(HeapRef::SetData(s)) => Some(s.header() as *const _),
-            Some(HeapRef::EphemeronTable(e)) => Some(e.header() as *const _),
-            Some(HeapRef::WeakRef(w)) => Some(w.header() as *const _),
-            Some(HeapRef::FinalizationRegistry(r)) => Some(r.header() as *const _),
-            Some(HeapRef::Temporal(t)) => Some(t.header() as *const _),
-            None => None,
+        let tag16 = self.bits & TAG_MASK;
+        match tag16 {
+            TAG_PTR_OBJECT | TAG_PTR_STRING | TAG_PTR_FUNCTION | TAG_PTR_OTHER => {
+                let raw_ptr = self.raw_heap_ptr();
+                if raw_ptr.is_null() {
+                    return None;
+                }
+                unsafe {
+                    let offset =
+                        std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
+                    Some(raw_ptr.sub(offset) as *const otter_vm_gc::GcHeader)
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1365,18 +1483,15 @@ impl Value {
                 !n.is_nan() && n != 0.0
             }
             _ => {
-                if let Some(HeapRef::BigInt(b)) = &self.heap_ref {
+                if let Some(b) = self.as_bigint() {
                     return b.value != "0";
                 }
                 // Strings: empty string is false
                 if let Some(s) = self.as_string() {
                     !s.is_empty()
-                } else if let Some(HeapRef::Object(obj)) = &self.heap_ref {
-                    // [[IsHTMLDDA]] objects: ToBoolean returns false (Annex B)
-                    !obj.is_htmldda()
-                } else if let Some(HeapRef::NativeFunction(f)) = &self.heap_ref {
-                    // [[IsHTMLDDA]] NativeFunction: ToBoolean returns false (Annex B)
-                    !f.object.is_htmldda()
+                } else if self.is_htmldda() {
+                    // [[IsHTMLDDA]] objects/native functions: ToBoolean returns false (Annex B)
+                    false
                 } else {
                     // Objects, functions are always truthy
                     true
@@ -1395,55 +1510,44 @@ impl Value {
             TAG_TRUE | TAG_FALSE => "boolean",
             TAG_NAN => "number", // NaN is a number
             _ if self.is_int32() || !self.is_nan_boxed() => "number",
-            _ => match &self.heap_ref {
-                Some(HeapRef::String(_)) => "string",
-                Some(HeapRef::Function(_)) => "function",
-                Some(HeapRef::NativeFunction(f)) => {
-                    // [[IsHTMLDDA]] NativeFunction: typeof returns "undefined" (Annex B)
-                    if f.object.is_htmldda() {
+            _ => {
+                if self.is_string() {
+                    "string"
+                } else if self.is_symbol() {
+                    "symbol"
+                } else if self.is_bigint() {
+                    "bigint"
+                } else if self.is_function() {
+                    if self.is_htmldda() {
                         "undefined"
                     } else {
                         "function"
                     }
-                }
-                Some(HeapRef::Symbol(_)) => "symbol",
-                Some(HeapRef::BigInt(_)) => "bigint",
-                Some(HeapRef::RegExp(_)) => "object",
-                Some(HeapRef::Object(obj)) => {
-                    // [[IsHTMLDDA]] objects: typeof returns "undefined" (Annex B)
-                    if obj.is_htmldda() {
-                        "undefined"
-                    // Check if it's a bound function (has __boundFunction__ property)
-                    } else if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
-                        "function"
-                    } else {
-                        "object"
-                    }
-                }
-                Some(
-                    HeapRef::Array(_)
-                    | HeapRef::Promise(_)
-                    | HeapRef::Generator(_)
-                    | HeapRef::ArrayBuffer(_)
-                    | HeapRef::TypedArray(_)
-                    | HeapRef::DataView(_)
-                    | HeapRef::SharedArrayBuffer(_)
-                    | HeapRef::MapData(_)
-                    | HeapRef::SetData(_)
-                    | HeapRef::EphemeronTable(_)
-                    | HeapRef::WeakRef(_)
-                    | HeapRef::FinalizationRegistry(_)
-                    | HeapRef::Temporal(_),
-                ) => "object",
-                Some(HeapRef::Proxy(_)) => {
+                } else if self.is_proxy() {
                     if self.is_callable() {
                         "function"
                     } else {
                         "object"
                     }
+                } else if self.is_object() {
+                    // as_object covers plain objects, arrays, generators, regexp, etc.
+                    // Check [[IsHTMLDDA]] and bound functions on plain objects
+                    if let Some(obj) = self.as_object() {
+                        if obj.is_htmldda() {
+                            "undefined"
+                        } else if obj.get(&PropertyKey::string("__boundFunction__")).is_some() {
+                            "function"
+                        } else {
+                            "object"
+                        }
+                    } else {
+                        "object"
+                    }
+                } else {
+                    // All remaining pointer types (MapData, SetData, EphemeronTable, etc.)
+                    "object"
                 }
-                None => "undefined", // Should not happen
-            },
+            }
         }
     }
 }
@@ -1464,46 +1568,45 @@ impl std::fmt::Debug for Value {
             TAG_FALSE => write!(f, "false"),
             _ if self.is_int32() => write!(f, "{}", self.as_int32().unwrap()),
             _ if !self.is_nan_boxed() => write!(f, "{}", f64::from_bits(self.bits)),
-            _ => match &self.heap_ref {
-                Some(HeapRef::String(s)) => write!(f, "\"{}\"", s.as_str()),
-                Some(HeapRef::Object(_)) => write!(f, "[object Object]"),
-                Some(HeapRef::Array(_)) => write!(f, "[object Array]"),
-                Some(HeapRef::Function(_)) => write!(f, "[Function]"),
-                Some(HeapRef::NativeFunction(_)) => write!(f, "[NativeFunction]"),
-                Some(HeapRef::Promise(_)) => write!(f, "[object Promise]"),
-                Some(HeapRef::Proxy(_)) => write!(f, "[object Proxy]"),
-                Some(HeapRef::RegExp(r)) => write!(f, "/{}/{}", r.pattern, r.flags),
-                Some(HeapRef::Generator(_)) => write!(f, "[object Generator]"),
-                Some(HeapRef::Symbol(s)) => {
-                    if let Some(desc) = &s.description {
+            _ => {
+                if let Some(s) = self.as_string() {
+                    write!(f, "\"{}\"", s.as_str())
+                } else if let Some(b) = self.as_bigint() {
+                    write!(f, "{}n", b.value)
+                } else if let Some(sym) = self.as_symbol() {
+                    if let Some(desc) = &sym.description {
                         write!(f, "Symbol({})", desc)
                     } else {
                         write!(f, "Symbol()")
                     }
-                }
-                Some(HeapRef::BigInt(b)) => write!(f, "{}n", b.value),
-                Some(HeapRef::ArrayBuffer(ab)) => {
+                } else if let Some(r) = self.as_regex() {
+                    write!(f, "/{}/{}", r.pattern, r.flags)
+                } else if let Some(ab) = self.as_array_buffer() {
                     write!(f, "ArrayBuffer({})", ab.byte_length())
-                }
-                Some(HeapRef::TypedArray(ta)) => {
+                } else if let Some(ta) = self.as_typed_array() {
                     write!(f, "{}({})", ta.kind().name(), ta.length())
-                }
-                Some(HeapRef::DataView(dv)) => {
+                } else if let Some(dv) = self.as_data_view() {
                     write!(f, "DataView({})", dv.byte_length())
-                }
-                Some(HeapRef::SharedArrayBuffer(sab)) => {
+                } else if let Some(sab) = self.as_shared_array_buffer() {
                     write!(f, "SharedArrayBuffer({})", sab.byte_length())
+                } else if self.as_array().is_some() {
+                    write!(f, "[object Array]")
+                } else if self.as_function().is_some() {
+                    write!(f, "[Function]")
+                } else if self.is_native_function() {
+                    write!(f, "[NativeFunction]")
+                } else if self.is_promise() {
+                    write!(f, "[object Promise]")
+                } else if self.is_proxy() {
+                    write!(f, "[object Proxy]")
+                } else if self.is_generator() {
+                    write!(f, "[object Generator]")
+                } else if self.as_object().is_some() {
+                    write!(f, "[object Object]")
+                } else {
+                    write!(f, "<heap:{:#x}>", self.bits)
                 }
-                Some(HeapRef::MapData(m)) => write!(f, "[MapData {:?}]", m),
-                Some(HeapRef::SetData(s)) => write!(f, "[SetData {:?}]", s),
-                Some(HeapRef::EphemeronTable(e)) => write!(f, "[EphemeronTable {:?}]", e),
-                Some(HeapRef::WeakRef(w)) => write!(f, "[WeakRef {:?}]", w),
-                Some(HeapRef::FinalizationRegistry(r)) => {
-                    write!(f, "[FinalizationRegistry {:?}]", r)
-                }
-                Some(HeapRef::Temporal(t)) => write!(f, "[Temporal {:?}]", t),
-                None => write!(f, "<unknown>"),
-            },
+            }
         }
     }
 }
@@ -1556,9 +1659,7 @@ impl PartialEq for Value {
         }
 
         // BigInt equality
-        if let (Some(HeapRef::BigInt(a)), Some(HeapRef::BigInt(b))) =
-            (self.heap_ref(), other.heap_ref())
-        {
+        if let (Some(a), Some(b)) = (self.as_bigint(), other.as_bigint()) {
             return a.value == b.value;
         }
 
@@ -1675,7 +1776,11 @@ mod tests {
 
     #[test]
     fn test_from_jit_bits_rejects_pointer_tag() {
-        assert!(Value::from_jit_bits(0x7FFC_0000_0000_0001).is_none());
+        // All 4 pointer sub-tags should be rejected
+        assert!(Value::from_jit_bits(0x7FFC_0000_0000_0001).is_none()); // Object
+        assert!(Value::from_jit_bits(0x7FFD_0000_0000_0001).is_none()); // String
+        assert!(Value::from_jit_bits(0x7FFE_0000_0000_0001).is_none()); // Function
+        assert!(Value::from_jit_bits(0x7FFF_0000_0000_0001).is_none()); // Other
 
         let boxed_int = Value::int32(7).bits;
         let restored = Value::from_jit_bits(boxed_int).expect("int32 bits should be accepted");
@@ -1688,75 +1793,95 @@ mod tests {
 // ============================================================================
 
 impl Value {
-    /// Trace GC references in this value
+    /// Trace GC references in this value.
+    ///
+    /// Uses sub-tag + GcHeader tag for type discrimination, then traces
+    /// the appropriate GC roots for each type.
+    #[allow(unsafe_code)]
     pub fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        if let Some(heap_ref) = &self.heap_ref {
-            match heap_ref {
-                HeapRef::String(s) => {
-                    tracer(s.header() as *const _);
+        let tag16 = self.bits & TAG_MASK;
+        match tag16 {
+            TAG_PTR_STRING => {
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
                 }
-                HeapRef::Object(o) | HeapRef::Array(o) => {
-                    tracer(o.header() as *const _);
+            }
+            TAG_PTR_OBJECT => {
+                // Plain objects and arrays — trace the JsObject header
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
                 }
-                HeapRef::Function(f) => {
-                    tracer(f.header() as *const _);
+            }
+            TAG_PTR_FUNCTION => {
+                // Closure or NativeFunction — trace the wrapper's header (not the inner object)
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
                 }
-                HeapRef::NativeFunction(n) => {
-                    tracer(n.header() as *const _);
+            }
+            TAG_PTR_OTHER => {
+                let gc_tag = unsafe { self.gc_header_tag_from_bits() };
+                use otter_vm_gc::object::tags as gc_tags;
+                match gc_tag {
+                    gc_tags::PROMISE => {
+                        // Promise needs special trace_roots for reaction chains
+                        if let Some(p) = self.as_promise() {
+                            p.trace_roots(tracer);
+                        }
+                    }
+                    gc_tags::TYPED_ARRAY => {
+                        // TypedArray: trace both the object and its buffer
+                        if let Some(ta) = self.as_typed_array() {
+                            tracer(ta.object.header() as *const _);
+                            tracer(ta.buffer().object.header() as *const _);
+                        }
+                    }
+                    gc_tags::DATA_VIEW => {
+                        // DataView: trace the buffer
+                        if let Some(dv) = self.as_data_view() {
+                            tracer(dv.buffer().object.header() as *const _);
+                        }
+                    }
+                    gc_tags::REGEXP => {
+                        // RegExp: trace inner object
+                        if let Some(r) = self.as_regex() {
+                            tracer(r.object.header() as *const _);
+                        }
+                    }
+                    gc_tags::ARRAY_BUFFER => {
+                        // ArrayBuffer: trace inner object
+                        if let Some(ab) = self.as_array_buffer() {
+                            tracer(ab.object.header() as *const _);
+                        }
+                    }
+                    gc_tags::MAP_DATA => {
+                        // MapData: trace all key/value pairs
+                        if let Some(m) = self.as_map_data() {
+                            otter_vm_gc::GcTraceable::trace(&*m, tracer);
+                        }
+                    }
+                    gc_tags::SET_DATA => {
+                        // SetData: trace all entries
+                        if let Some(s) = self.as_set_data() {
+                            otter_vm_gc::GcTraceable::trace(&*s, tracer);
+                        }
+                    }
+                    gc_tags::FINALIZATION_REGISTRY => {
+                        // FinalizationRegistry: trace callback + held values
+                        if let Some(r) = self.as_finalization_registry() {
+                            otter_vm_gc::GcTraceable::trace(&*r, tracer);
+                        }
+                    }
+                    _ => {
+                        // Symbol, BigInt, Generator, Proxy, SharedArrayBuffer,
+                        // EphemeronTable, WeakRef, Temporal — trace just the header
+                        if let Some(hdr) = self.gc_header() {
+                            tracer(hdr);
+                        }
+                    }
                 }
-                HeapRef::RegExp(r) => {
-                    tracer(r.object.header() as *const _);
-                }
-                HeapRef::Generator(g) => {
-                    tracer(g.header() as *const _);
-                }
-                HeapRef::ArrayBuffer(ab) => {
-                    tracer(ab.object.header() as *const _);
-                }
-                HeapRef::TypedArray(ta) => {
-                    tracer(ta.object.header() as *const _);
-                    tracer(ta.buffer().object.header() as *const _);
-                }
-                HeapRef::DataView(dv) => {
-                    tracer(dv.buffer().object.header() as *const _);
-                }
-                HeapRef::Promise(p) => {
-                    p.trace_roots(tracer);
-                }
-                HeapRef::Proxy(p) => {
-                    tracer(p.header() as *const _);
-                }
-                HeapRef::Symbol(s) => {
-                    tracer(s.header() as *const _);
-                }
-                HeapRef::BigInt(b) => {
-                    tracer(b.header() as *const _);
-                }
-                HeapRef::SharedArrayBuffer(sab) => {
-                    tracer(sab.header() as *const _);
-                }
-                HeapRef::MapData(m) => {
-                    otter_vm_gc::GcTraceable::trace(&**m, tracer);
-                }
-                HeapRef::SetData(s) => {
-                    otter_vm_gc::GcTraceable::trace(&**s, tracer);
-                }
-                HeapRef::EphemeronTable(e) => {
-                    tracer(e.header() as *const _);
-                }
-                HeapRef::WeakRef(w) => {
-                    // WeakRef itself is traced (keeps the cell alive),
-                    // but WeakRefCell::trace() is a no-op (doesn't trace target)
-                    tracer(w.header() as *const _);
-                }
-                HeapRef::FinalizationRegistry(r) => {
-                    // Trace the FinalizationRegistryData (traces callback + held values)
-                    otter_vm_gc::GcTraceable::trace(&**r, tracer);
-                }
-                HeapRef::Temporal(t) => {
-                    // TemporalValue has no inner GC refs, but we still need to keep the allocation alive
-                    tracer(t.header() as *const _);
-                }
+            }
+            _ => {
+                // Not a pointer type (int32, f64, bool, null, undefined) — nothing to trace
             }
         }
     }

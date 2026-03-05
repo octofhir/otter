@@ -13,7 +13,7 @@ use crate::gc::GcRef;
 use crate::intrinsics_impl::helpers::MapKey;
 use crate::map_data::{MapData, SetData};
 use crate::object::{JsObject, PropertyKey};
-use crate::value::{HeapRef, Value};
+use crate::value::Value;
 use crate::{JsDataView, JsTypedArray};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -82,77 +82,63 @@ impl StructuredCloner {
             return Ok(Value::number(n));
         }
 
-        // Handle heap-allocated types
-        match value.heap_ref() {
-            Some(HeapRef::String(s)) => {
-                // Strings are immutable, can share the GcRef (it's Copy)
-                Ok(Value::string(*s))
+        // Handle heap-allocated types via typed accessors.
+        // Order matters: check specific types before as_object() which returns
+        // inner objects for functions, generators, etc.
+        if let Some(s) = value.as_string() {
+            Ok(Value::string(s))
+        } else if value.is_function() {
+            Err(StructuredCloneError::NotCloneable("function"))
+        } else if value.is_symbol() {
+            Err(StructuredCloneError::NotCloneable("symbol"))
+        } else if let Some(bi) = value.as_bigint() {
+            Ok(Value::bigint(bi.value.clone()))
+        } else if value.is_promise() {
+            Err(StructuredCloneError::NotCloneable("promise"))
+        } else if value.is_proxy() {
+            Err(StructuredCloneError::NotCloneable("proxy"))
+        } else if value.is_generator() {
+            Err(StructuredCloneError::NotCloneable("generator"))
+        } else if let Some(sab) = value.as_shared_array_buffer() {
+            Ok(Value::shared_array_buffer(sab))
+        } else if let Some(r) = value.as_regex() {
+            let new_regex = GcRef::new(crate::regexp::JsRegExp::new(
+                r.pattern.clone(),
+                r.flags.clone(),
+                None,
+            ));
+            Ok(Value::regex(new_regex))
+        } else if let Some(ab) = value.as_array_buffer() {
+            let len = ab.byte_length();
+            if let Some(new_ab) = ab.slice(0, len) {
+                Ok(Value::array_buffer(GcRef::new(new_ab)))
+            } else {
+                Err(StructuredCloneError::DataCloneError(
+                    "ArrayBuffer is detached",
+                ))
             }
-
-            Some(HeapRef::SharedArrayBuffer(sab)) => {
-                // SharedArrayBuffer: share the same underlying buffer (not cloned!)
-                Ok(Value::shared_array_buffer(*sab))
-            }
-
-            Some(HeapRef::Object(obj)) => self.clone_object(*obj),
-
-            Some(HeapRef::Array(arr)) => self.clone_array(*arr),
-
-            Some(HeapRef::Function(_)) => Err(StructuredCloneError::NotCloneable("function")),
-
-            Some(HeapRef::NativeFunction(_)) => Err(StructuredCloneError::NotCloneable("function")),
-
-            Some(HeapRef::Symbol(_)) => Err(StructuredCloneError::NotCloneable("symbol")),
-
-            Some(HeapRef::BigInt(bi)) => {
-                // Clone BigInt
-                Ok(Value::bigint(bi.value.clone()))
-            }
-
-            Some(HeapRef::Promise(_)) => Err(StructuredCloneError::NotCloneable("promise")),
-
-            Some(HeapRef::Proxy(_)) => Err(StructuredCloneError::NotCloneable("proxy")),
-
-            Some(HeapRef::RegExp(r)) => {
-                // Clone RegExp
-                // New object with same pattern/flags
-                // NOTE: This does not restrictively clone all properties yet, just the basic regex part.
-                // Improving strict spec compliance later if needed.
-                let new_regex = GcRef::new(crate::regexp::JsRegExp::new(
-                    r.pattern.clone(),
-                    r.flags.clone(),
-                    None,
-                ));
-                Ok(Value::regex(new_regex))
-            }
-
-            Some(HeapRef::Generator(_)) => Err(StructuredCloneError::NotCloneable("generator")),
-            Some(HeapRef::ArrayBuffer(ab)) => {
-                let len = ab.byte_length();
-                // Slice creates a copy
-                if let Some(new_ab) = ab.slice(0, len) {
-                    Ok(Value::array_buffer(GcRef::new(new_ab)))
-                } else {
-                    Err(StructuredCloneError::DataCloneError(
-                        "ArrayBuffer is detached",
-                    ))
-                }
-            }
-            Some(HeapRef::TypedArray(ta)) => self.clone_typed_array(*ta),
-            Some(HeapRef::DataView(dv)) => self.clone_data_view(*dv),
-
-            Some(HeapRef::MapData(md)) => self.clone_map_data(*md),
-            Some(HeapRef::SetData(sd)) => self.clone_set_data(*sd),
-            Some(HeapRef::EphemeronTable(_)) => {
-                Err(StructuredCloneError::NotCloneable("EphemeronTable"))
-            }
-            Some(HeapRef::WeakRef(_)) => Err(StructuredCloneError::NotCloneable("WeakRef")),
-            Some(HeapRef::FinalizationRegistry(_)) => {
-                Err(StructuredCloneError::NotCloneable("FinalizationRegistry"))
-            }
-            Some(HeapRef::Temporal(_)) => Err(StructuredCloneError::NotCloneable("Temporal")),
-
-            None => Ok(Value::undefined()),
+        } else if let Some(ta) = value.as_typed_array() {
+            self.clone_typed_array(ta)
+        } else if let Some(dv) = value.as_data_view() {
+            self.clone_data_view(dv)
+        } else if let Some(md) = value.as_map_data() {
+            self.clone_map_data(md)
+        } else if let Some(sd) = value.as_set_data() {
+            self.clone_set_data(sd)
+        } else if value.as_ephemeron_table().is_some() {
+            Err(StructuredCloneError::NotCloneable("EphemeronTable"))
+        } else if value.as_weak_ref().is_some() {
+            Err(StructuredCloneError::NotCloneable("WeakRef"))
+        } else if value.as_finalization_registry().is_some() {
+            Err(StructuredCloneError::NotCloneable("FinalizationRegistry"))
+        } else if value.as_temporal().is_some() {
+            Err(StructuredCloneError::NotCloneable("Temporal"))
+        } else if let Some(arr) = value.as_array() {
+            self.clone_array(arr)
+        } else if let Some(obj) = value.as_object() {
+            self.clone_object(obj)
+        } else {
+            Ok(Value::undefined())
         }
     }
 

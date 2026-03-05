@@ -27,11 +27,7 @@ pub fn strict_equal(a: &Value, b: &Value) -> bool {
         sym1.id == sym2.id
     } else if let (Some(o1), Some(o2)) = (a.as_object(), b.as_object()) {
         o1.as_ptr() == o2.as_ptr()
-    } else if let (
-        Some(crate::value::HeapRef::BigInt(ba)),
-        Some(crate::value::HeapRef::BigInt(bb)),
-    ) = (a.heap_ref(), b.heap_ref())
-    {
+    } else if let (Some(ba), Some(bb)) = (a.as_bigint(), b.as_bigint()) {
         ba.value == bb.value
     } else {
         false
@@ -139,43 +135,13 @@ impl Hash for MapKey {
         } else if let Some(sym) = v.as_symbol() {
             HASH_TAG_SYMBOL.hash(state);
             sym.id.hash(state);
+        } else if let Some(b) = v.as_bigint() {
+            HASH_TAG_BIGINT.hash(state);
+            b.value.hash(state);
         } else {
-            // For heap-allocated reference types, use the HeapRef discriminant + pointer
-            match v.heap_ref() {
-                Some(crate::value::HeapRef::Object(obj)) => {
-                    HASH_TAG_OBJECT.hash(state);
-                    (obj.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::Array(arr)) => {
-                    HASH_TAG_ARRAY.hash(state);
-                    (arr.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::Function(f)) => {
-                    HASH_TAG_FUNCTION.hash(state);
-                    (f.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::NativeFunction(nf)) => {
-                    HASH_TAG_NATIVE_FN.hash(state);
-                    (nf.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::Proxy(p)) => {
-                    HASH_TAG_PROXY.hash(state);
-                    (p.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::Promise(p)) => {
-                    HASH_TAG_PROMISE.hash(state);
-                    (p.as_ptr() as usize).hash(state);
-                }
-                Some(crate::value::HeapRef::BigInt(b)) => {
-                    HASH_TAG_BIGINT.hash(state);
-                    b.value.hash(state);
-                }
-                _ => {
-                    // Generator, ArrayBuffer, TypedArray, DataView, etc.
-                    // Hash by type tag + a constant (identity not meaningful for maps)
-                    255u8.hash(state);
-                }
-            }
+            // For heap-allocated reference types, hash by pointer identity via raw bits.
+            // The lower 48 bits are the unique pointer for any NaN-boxed heap type.
+            v.to_bits_raw().hash(state);
         }
     }
 }

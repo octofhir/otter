@@ -355,7 +355,7 @@ fn format_value(value: &Value) -> String {
             "Symbol()".to_string()
         }
     } else if value.is_bigint() {
-        if let Some(otter_vm_core::value::HeapRef::BigInt(b)) = value.heap_ref() {
+        if let Some(b) = value.as_bigint() {
             format!("{}n", b.value)
         } else {
             "BigInt".to_string()

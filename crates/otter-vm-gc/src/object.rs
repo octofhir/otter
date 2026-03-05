@@ -220,6 +220,12 @@ pub mod tags {
     pub const SET_DATA: u8 = 21;
     /// EphemeronTable object
     pub const EPHEMERON_TABLE: u8 = 22;
+    /// BigInt object
+    pub const BIGINT: u8 = 23;
+    /// SharedArrayBuffer object
+    pub const SHARED_ARRAY_BUFFER: u8 = 24;
+    /// Temporal value (PlainDate, PlainTime, Duration, etc.)
+    pub const TEMPORAL: u8 = 25;
 }
 
 #[cfg(test)]

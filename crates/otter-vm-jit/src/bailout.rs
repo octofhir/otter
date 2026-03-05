@@ -24,12 +24,10 @@
 
 /// Sentinel value returned by JIT code to signal a bailout.
 ///
-/// Uses `0x7FFC_0000_0000_0000` which is in the NaN space but unused by
-/// any JS type tag in the NaN-boxing scheme:
-///
-/// - `0x7FF8_0000` = quiet NaN prefix (undefined, null, true, false, int32)
-/// - `0x7FFA_0000` = canonical NaN
-/// - `0x7FFC_0000` = **bailout sentinel** (unused by any JS type)
+/// Uses `0x7FFC_0000_0000_0000` which is TAG_PTR_OBJECT with a null payload.
+/// Valid pointer values always have non-null payloads (heap addresses are never 0),
+/// so this is distinguishable from any real Value. JIT callers check for this
+/// sentinel before calling `from_raw_bits_unchecked()`.
 pub const BAILOUT_SENTINEL: i64 = 0x7FFC_0000_0000_0000_u64 as i64;
 
 /// Number of bailouts before a function is deoptimized (JIT code invalidated).

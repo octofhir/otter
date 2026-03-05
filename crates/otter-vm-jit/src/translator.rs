@@ -1058,28 +1058,6 @@ pub fn translate_function_with_constants(
     }
 
     // --- Loop analysis (needed before block creation for leader computation) ---
-    eprintln!(
-        "[JIT] function={} regs={} locals={} instr_count={} feedback_count={}",
-        function.display_name(),
-        reg_count,
-        local_count,
-        instruction_count,
-        feedback_snapshot.len(),
-    );
-    for (i, tf) in feedback_snapshot.iter().enumerate() {
-        eprintln!(
-            "[JIT]   feedback[{}]: int32={} number={} string={} object={} fn={} undef={} null={} bool={}",
-            i,
-            tf.seen_int32,
-            tf.seen_number,
-            tf.seen_string,
-            tf.seen_object,
-            tf.seen_function,
-            tf.seen_undefined,
-            tf.seen_null,
-            tf.seen_boolean
-        );
-    }
     let versioned_loops = loop_analysis::detect_loops(&instructions_ref, &feedback_snapshot);
     let osr_loop_headers_vec: Vec<usize> =
         versioned_loops.iter().map(|info| info.header_pc).collect();
@@ -1132,10 +1110,6 @@ pub fn translate_function_with_constants(
         std::collections::HashMap::new();
 
     for info in &versioned_loops {
-        eprintln!(
-            "[JIT] loop header={} back_edge={} qualifies={} check_regs={:?}",
-            info.header_pc, info.back_edge_pc, info.qualifies, info.check_registers,
-        );
         if !info.qualifies {
             continue;
         }
@@ -2968,6 +2942,7 @@ pub fn translate_function_with_constants(
                 obj,
                 shape_id,
                 offset,
+                ..
             } => {
                 let obj_val = read_reg(builder, &reg_vars, *obj);
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
@@ -3012,6 +2987,7 @@ pub fn translate_function_with_constants(
                 val,
                 shape_id,
                 offset,
+                ..
             } => {
                 let obj_val = read_reg(builder, &reg_vars, *obj);
                 let value = read_reg(builder, &reg_vars, *val);
@@ -3031,7 +3007,7 @@ pub fn translate_function_with_constants(
                 let current_shape =
                     builder
                         .ins()
-                        .load(types::I64, MemFlags::new(), shape_ptr_addr, 0);
+                        .load(types::I64, MemFlags::trusted(), shape_ptr_addr, 0);
                 let expected_shape = builder.ins().iconst(types::I64, *shape_id as i64);
                 let shape_match = builder
                     .ins()
@@ -3046,9 +3022,9 @@ pub fn translate_function_with_constants(
                 let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24);
                 let props_ptr = builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), props_ptr_addr, 0);
+                    .load(types::I64, MemFlags::trusted(), props_ptr_addr, 0);
                 let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
-                builder.ins().store(MemFlags::new(), value, val_addr, 0);
+                builder.ins().store(MemFlags::trusted(), value, val_addr, 0);
 
                 // Note: Object pointers in memory need to trigger GC write barriers!
                 // Since this engine is embedding first, it handles write barriers in the allocator. We rely on standard conservative GC.

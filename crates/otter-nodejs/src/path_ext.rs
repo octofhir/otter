@@ -235,7 +235,7 @@ fn path_parse(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
 
     let root = if p_str.starts_with('/') { "/" } else { "" };
 
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(
         PropertyKey::string("root"),
         Value::string(JsString::new_gc(root)),

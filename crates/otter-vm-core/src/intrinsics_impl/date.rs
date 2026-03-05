@@ -2375,7 +2375,7 @@ pub fn init_date_prototype(
 
             let proto = instant_proto.map(Value::object).unwrap_or_else(Value::null);
 
-            let instant = GcRef::new(JsObject::new(proto, mm));
+            let instant = GcRef::new(JsObject::new(proto));
             let _ = instant.set(
                 PropertyKey::string("epochNanoseconds"),
                 Value::bigint(ns_str),

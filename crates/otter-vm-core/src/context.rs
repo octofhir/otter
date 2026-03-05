@@ -4,7 +4,9 @@
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::async_context::SavedFrame;
@@ -85,7 +87,8 @@ impl<'a> NativeContext<'a> {
     ) -> crate::error::VmResult<crate::value::Value> {
         let mut current_func = func.clone();
         let mut current_this = this_value;
-        let mut current_args: Vec<crate::value::Value> = args.to_vec();
+        let mut current_args: std::borrow::Cow<'_, [crate::value::Value]> =
+            std::borrow::Cow::Borrowed(args);
 
         // Unwrap bound functions (stored as objects)
         while let Some(obj) = current_func.as_object() {
@@ -117,8 +120,8 @@ impl<'a> NativeContext<'a> {
                                     .unwrap_or_else(crate::value::Value::undefined),
                             );
                         }
-                        new_args.extend(current_args);
-                        current_args = new_args;
+                        new_args.extend(current_args.iter().cloned());
+                        current_args = std::borrow::Cow::Owned(new_args);
                     }
                 }
                 current_func = bound_fn;
@@ -492,7 +495,7 @@ pub struct VmContext {
     /// Open upvalues: maps (frame_id, local_idx) to the cell.
     /// When a closure captures a local, we create/reuse a cell here.
     /// Multiple closures in the same frame share the same cell.
-    open_upvalues: HashMap<(usize, u16), UpvalueCell>,
+    open_upvalues: FxHashMap<(usize, u16), UpvalueCell>,
     /// Next frame ID counter (monotonically increasing)
     next_frame_id: usize,
     /// Interrupt flag for timeout/cancellation support
@@ -583,6 +586,9 @@ pub struct VmContext {
     /// Cached proto epoch value, refreshed once per run_loop iteration.
     /// Avoids repeated atomic loads in IC hot paths.
     pub(crate) cached_proto_epoch: u64,
+    /// Cached String.prototype for fast string method dispatch.
+    /// Lazily populated on first use, avoids get_global("String") per string op.
+    string_prototype_cache: Option<GcRef<JsObject>>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -733,7 +739,7 @@ impl VmContext {
             pending_new_target_proto: None,
             pending_callee_value: None,
             pending_realm_id: None,
-            open_upvalues: HashMap::new(),
+            open_upvalues: FxHashMap::default(),
             next_frame_id: 0,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             max_stack_depth,
@@ -769,6 +775,7 @@ impl VmContext {
             template_cache: HashMap::new(),
             regexp_cache: HashMap::new(),
             cached_proto_epoch: crate::object::get_proto_epoch(),
+            string_prototype_cache: None,
         }
     }
 
@@ -1937,6 +1944,22 @@ impl VmContext {
         self.js_job_queue.is_some()
     }
 
+    /// Get cached String.prototype (lazily resolved from global "String")
+    pub(crate) fn string_prototype(&mut self) -> Option<GcRef<JsObject>> {
+        if let Some(cached) = self.string_prototype_cache {
+            return Some(cached);
+        }
+        let proto = self
+            .get_global("String")
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object());
+        if let Some(p) = proto {
+            self.string_prototype_cache = Some(p);
+        }
+        proto
+    }
+
     /// Get global variable
     pub fn get_global(&self, name: &str) -> Option<Value> {
         use crate::object::PropertyKey;
@@ -2052,7 +2075,8 @@ impl VmContext {
             locals
         };
 
-        if std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok() {
+        static TRACE_ASSERT_ARGS: OnceLock<bool> = OnceLock::new();
+        if *TRACE_ASSERT_ARGS.get_or_init(|| std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok()) {
             if let Some(func) = module.functions.get(function_index as usize) {
                 if func.name.as_deref() == Some("assert") {
                     let arg_types: Vec<_> = locals
@@ -2654,7 +2678,7 @@ impl VmContext {
         &self.pending_upvalues
     }
 
-    pub fn open_upvalues_to_trace(&self) -> &HashMap<(usize, u16), UpvalueCell> {
+    pub fn open_upvalues_to_trace(&self) -> &FxHashMap<(usize, u16), UpvalueCell> {
         &self.open_upvalues
     }
 
@@ -2964,6 +2988,9 @@ impl VmContext {
         if let Some(agp) = self.async_generator_prototype_intrinsic {
             roots.push(agp.header() as *const _);
         }
+        if let Some(sp) = self.string_prototype_cache {
+            roots.push(sp.header() as *const _);
+        }
 
         // Add all realm roots (globals, function prototypes, intrinsics, symbols).
         if let Some(registry) = &self.realm_registry {
@@ -3126,7 +3153,7 @@ mod tests {
     fn test_stack_overflow() {
         let runtime = crate::runtime::VmRuntime::new();
         let memory_manager = runtime.memory_manager().clone();
-        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null()));
         // Use a small max_stack_depth for testing
         let test_max_depth = 100;
         let mut ctx = VmContext::with_config(
@@ -3152,7 +3179,7 @@ mod tests {
     fn test_native_call_depth() {
         let runtime = crate::runtime::VmRuntime::new();
         let memory_manager = runtime.memory_manager().clone();
-        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let global = GcRef::new(JsObject::new(Value::null()));
         let ctx = VmContext::with_config(global, DEFAULT_MAX_STACK_DEPTH, 3, memory_manager);
 
         // Should be able to enter 3 native calls

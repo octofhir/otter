@@ -19,7 +19,7 @@ fn native_from_decl_with_function_proto(
 ) -> Value {
     // Preserve historical function object shape from native_function_with_proto:
     // [[Prototype]] = %Function.prototype%, name="", length=0.
-    let object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let object = GcRef::new(JsObject::new(Value::object(fn_proto)));
     object.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::int32(0)),
@@ -294,8 +294,6 @@ pub fn create_aggregate_error_constructor() -> Box<
     Box::new(|this, args, ncx| {
         if let Some(obj) = this.as_object() {
             let errors_arg = args.first().cloned().unwrap_or(Value::undefined());
-            let mm = obj.memory_manager().clone();
-
             // Step 3: message (BEFORE errors per spec)
             if let Some(msg) = args.get(1) {
                 if !msg.is_undefined() {
@@ -328,7 +326,7 @@ pub fn create_aggregate_error_constructor() -> Box<
             }
 
             // Step 5: IterableToList(errors)
-            let errors_array = iterable_to_list(ncx, &errors_arg, &mm)?;
+            let errors_array = iterable_to_list(ncx, &errors_arg)?;
 
             // Step 6: Define .errors property
             obj.define_property(
@@ -349,7 +347,6 @@ pub fn create_aggregate_error_constructor() -> Box<
 fn iterable_to_list(
     ncx: &mut NativeContext<'_>,
     iterable: &Value,
-    mm: &Arc<MemoryManager>,
 ) -> Result<Value, VmError> {
     use crate::object::get_value_full;
 
@@ -391,7 +388,7 @@ fn iterable_to_list(
         return Err(VmError::type_error("iterator.next is not a function"));
     }
 
-    let result_arr = GcRef::new(JsObject::array(0, mm.clone()));
+    let result_arr = GcRef::new(JsObject::array(0));
     // Root the result array across call_function GC points
     ncx.ctx.push_root_slot(Value::array(result_arr));
     let mut idx = 0u32;

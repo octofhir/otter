@@ -337,7 +337,7 @@ fn dispatch_message(engine: &mut crate::otter_runtime::Otter, handler: &Value, d
     let mm = runtime.memory_manager().clone();
 
     // Create event-like object: { data: value }
-    let event = GcRef::new(JsObject::new(Value::null(), mm));
+    let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(PropertyKey::string("data"), data);
 
     // Call handler(event)

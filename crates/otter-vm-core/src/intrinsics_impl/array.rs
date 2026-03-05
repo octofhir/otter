@@ -129,7 +129,7 @@ fn array_create(length: usize, ncx: &mut NativeContext<'_>) -> Result<GcRef<JsOb
 }
 
 fn create_default_array(length: usize, ncx: &mut NativeContext<'_>) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(length, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(length));
     // Set Array.prototype so methods like .map(), .filter() work on the result
     if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
         if let Some(array_obj) = array_ctor
@@ -246,8 +246,7 @@ pub(crate) fn make_array_iterator(
     let array_iter_proto = intrinsics.array_iterator_prototype;
     // Create iterator with %ArrayIteratorPrototype% as prototype (has next() on it)
     let iter = GcRef::new(JsObject::new(
-        Value::object(array_iter_proto),
-        ncx.memory_manager().clone(),
+        Value::object(array_iter_proto)
     ));
     // Store the array reference, current index, and kind
     let _ = iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
@@ -1878,7 +1877,7 @@ pub fn init_array_prototype(
                     VmError::type_error("Array.prototype.toReversed: this is not an object")
                 })?;
                 let len = get_len(&obj);
-                let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(len));
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1959,7 +1958,7 @@ pub fn init_array_prototype(
                     }
                 }
 
-                let result = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(len));
                 for (i, val) in elements.into_iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), val);
                 }
@@ -2001,7 +2000,7 @@ pub fn init_array_prototype(
                 };
 
                 let new_len = (len as usize) - delete_count + insert_count;
-                let result = GcRef::new(JsObject::array(new_len, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(new_len));
                 let mut r: u32 = 0;
 
                 // Copy elements before start
@@ -2060,7 +2059,7 @@ pub fn init_array_prototype(
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
                 let result =
-                    GcRef::new(JsObject::array(len as usize, ncx.memory_manager().clone()));
+                    GcRef::new(JsObject::array(len as usize));
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -2084,7 +2083,7 @@ pub fn init_array_prototype(
     // §23.1.3.40 Array.prototype[@@unscopables]
     {
         let unscopables_sym = crate::intrinsics::well_known::unscopables_symbol();
-        let unscopables_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let unscopables_obj = GcRef::new(JsObject::new(Value::null()));
         for method_name in &[
             "at",
             "copyWithin",
@@ -2325,7 +2324,7 @@ pub fn install_array_statics(
         PropertyKey::string("of"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |_this, args, ncx| {
-                let result = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(args.len()));
                 for (i, arg) in args.iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), arg.clone());
                 }

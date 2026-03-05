@@ -118,7 +118,6 @@ impl<'a> RegistrationContext<'a> {
     pub fn new_object(&self) -> GcRef<JsObject> {
         GcRef::new(JsObject::new(
             Value::object(self.obj_proto()),
-            self.mm.clone(),
         ))
     }
 
@@ -185,7 +184,7 @@ fn make_module_fn(
     name: &str,
     length: u32,
 ) -> Value {
-    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
 
     fn_obj.define_property(
         PropertyKey::string("length"),

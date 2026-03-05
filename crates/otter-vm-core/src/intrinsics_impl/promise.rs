@@ -123,7 +123,7 @@ fn create_js_promise_wrapper_with_mm(
         .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
         .unwrap_or_else(Value::null);
 
-    let obj = GcRef::new(JsObject::new(proto_val, mm.clone()));
+    let obj = GcRef::new(JsObject::new(proto_val));
 
     // Set _internal to the raw promise
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -418,8 +418,7 @@ fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, messa
         .and_then(|v| v.as_object());
 
     let obj = GcRef::new(JsObject::new(
-        proto.map(Value::object).unwrap_or_else(Value::null),
-        ncx.memory_manager().clone(),
+        proto.map(Value::object).unwrap_or_else(Value::null)
     ));
 
     let _ = obj.set(
@@ -528,7 +527,7 @@ pub fn install_promise_statics(
 
                 // Empty array resolves immediately with []
                 if items.is_empty() {
-                    let arr = GcRef::new(JsObject::array(0, mm));
+                    let arr = GcRef::new(JsObject::array(0));
                     JsPromise::resolve_with_js_jobs(
                         result_promise,
                         Value::array(arr),
@@ -556,7 +555,6 @@ pub fn install_promise_statics(
                     let remaining = remaining.clone();
                     let results = results.clone();
                     let rejected = rejected.clone();
-                    let mm_inner = mm.clone();
                     let enqueue_fulfill = enqueue.clone();
                     let enqueue_reject = enqueue.clone();
 
@@ -579,7 +577,7 @@ pub fn install_promise_statics(
                             locked[index] = Some(value);
                         }
                         if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            let arr = GcRef::new(JsObject::array(count, mm_inner.clone()));
+                            let arr = GcRef::new(JsObject::array(count));
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
@@ -681,7 +679,7 @@ pub fn install_promise_statics(
 
                 // Empty array resolves immediately with []
                 if items.is_empty() {
-                    let arr = GcRef::new(JsObject::array(0, mm));
+                    let arr = GcRef::new(JsObject::array(0));
                     JsPromise::resolve_with_js_jobs(
                         result_promise,
                         Value::array(arr),
@@ -710,8 +708,6 @@ pub fn install_promise_statics(
                     let remaining2 = remaining.clone();
                     let results = results.clone();
                     let results2 = results.clone();
-                    let mm_t = mm.clone();
-                    let mm_c = mm.clone();
                     let enqueue_fulfill = enqueue.clone();
                     let enqueue_reject = enqueue.clone();
 
@@ -724,7 +720,7 @@ pub fn install_promise_statics(
                     };
 
                     source_promise.then(move |value| {
-                        let obj = GcRef::new(JsObject::new(Value::null(), mm_t.clone()));
+                        let obj = GcRef::new(JsObject::new(Value::null()));
                         let _ = obj.set(
                             "status".into(),
                             Value::string(JsString::intern("fulfilled")),
@@ -734,7 +730,7 @@ pub fn install_promise_statics(
                             locked[index] = Some(Value::object(obj));
                         }
                         if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            let arr = GcRef::new(JsObject::array(count, mm_t.clone()));
+                            let arr = GcRef::new(JsObject::array(count));
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
@@ -750,7 +746,7 @@ pub fn install_promise_statics(
                         }
                     });
                     source_promise.catch(move |error| {
-                        let obj = GcRef::new(JsObject::new(Value::null(), mm_c.clone()));
+                        let obj = GcRef::new(JsObject::new(Value::null()));
                         let _ =
                             obj.set("status".into(), Value::string(JsString::intern("rejected")));
                         let _ = obj.set("reason".into(), error);
@@ -758,7 +754,7 @@ pub fn install_promise_statics(
                             locked[index] = Some(Value::object(obj));
                         }
                         if remaining2.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            let arr = GcRef::new(JsObject::array(count, mm_c.clone()));
+                            let arr = GcRef::new(JsObject::array(count));
                             if let Ok(locked) = results2.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
@@ -783,6 +779,7 @@ pub fn install_promise_statics(
     );
 
     // Promise.any(iterable) — §27.2.4.3
+    let mm_any = mm.clone();
     ctor.define_property(
         PropertyKey::string("any"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
@@ -794,8 +791,7 @@ pub fn install_promise_statics(
                 // Empty array rejects with AggregateError
                 if items.is_empty() {
                     let agg = GcRef::new(JsObject::new(
-                        Value::object(aggregate_error_proto),
-                        mm.clone(),
+                        Value::object(aggregate_error_proto)
                     ));
                     let _ = agg.set(
                         PropertyKey::string("message"),
@@ -805,7 +801,7 @@ pub fn install_promise_statics(
                         PropertyKey::string("name"),
                         Value::string(JsString::intern("AggregateError")),
                     );
-                    let empty_arr = GcRef::new(JsObject::array(0, mm.clone()));
+                    let empty_arr = GcRef::new(JsObject::array(0));
                     let _ = agg.set(PropertyKey::string("errors"), Value::array(empty_arr));
                     JsPromise::reject_with_js_jobs(
                         result_promise,
@@ -836,7 +832,7 @@ pub fn install_promise_statics(
                     let fulfilled2 = fulfilled.clone();
                     let remaining = remaining.clone();
                     let errors = errors.clone();
-                    let mm_err = mm.clone();
+                    let mm_err = mm_any.clone();
                     let agg_proto = aggregate_error_proto;
                     let enqueue_fulfill = enqueue.clone();
                     let enqueue_reject = enqueue.clone();
@@ -871,12 +867,12 @@ pub fn install_promise_statics(
                             } else {
                                 vec![]
                             };
-                            let arr = GcRef::new(JsObject::array(errs.len(), mm_err.clone()));
+                            let arr = GcRef::new(JsObject::array(errs.len()));
                             for (i, e) in errs.iter().enumerate() {
                                 let _ = arr.set(PropertyKey::Index(i as u32), e.clone());
                             }
                             let agg =
-                                GcRef::new(JsObject::new(Value::object(agg_proto), mm_err.clone()));
+                                GcRef::new(JsObject::new(Value::object(agg_proto)));
                             let _ = agg.set(
                                 PropertyKey::string("name"),
                                 Value::string(JsString::intern("AggregateError")),
@@ -910,7 +906,7 @@ pub fn install_promise_statics(
             PropertyDescriptor::builtin_method(Value::native_function_with_proto(
                 move |_this, _args, ncx| {
                     let promise = JsPromise::new();
-                    let result = GcRef::new(JsObject::new(Value::null(), mm_wr.clone()));
+                    let result = GcRef::new(JsObject::new(Value::null()));
 
                     // Get job queue for resolver/rejecter functions
                     let queue = ncx.js_job_queue();

@@ -1,6 +1,8 @@
 //! Baseline JIT compiler wrapper around Cranelift.
 
 use cranelift_codegen::ir::{AbiParam, UserFuncName, types};
+use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::settings::Configurable;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, ModuleError, default_libcall_names};
@@ -141,13 +143,33 @@ pub struct JitCompiler {
     context: cranelift_codegen::Context,
     next_function_id: u64,
     helper_func_ids: Option<HelperFuncIds>,
+    /// Host calling convention (SystemV on Linux, AppleAarch64 on macOS ARM64, etc.)
+    host_call_conv: CallConv,
+}
+
+/// Build a `JITBuilder` with host-native ISA and `opt_level=speed`.
+fn make_optimized_jit_builder() -> Result<(JITBuilder, CallConv), JitError> {
+    let mut flag_builder = cranelift_codegen::settings::builder();
+    // Enable optimizations: DCE, instruction combining, register allocation.
+    // Note: egraph-based rewrites are enabled by default in Cranelift 0.129
+    // when opt_level >= speed.
+    flag_builder
+        .set("opt_level", "speed")
+        .expect("valid cranelift setting");
+    let flags = cranelift_codegen::settings::Flags::new(flag_builder);
+    let isa = cranelift_native::builder()
+        .map_err(|e| JitError::Builder(format!("cranelift-native ISA: {e}")))?
+        .finish(flags)
+        .map_err(|e| JitError::Builder(format!("cranelift ISA finish: {e}")))?;
+    let call_conv = isa.default_call_conv();
+    let builder = JITBuilder::with_isa(isa, default_libcall_names());
+    Ok((builder, call_conv))
 }
 
 impl JitCompiler {
     /// Create a new baseline JIT compiler instance (no runtime helpers).
     pub fn new() -> Result<Self, JitError> {
-        let builder = JITBuilder::new(default_libcall_names())
-            .map_err(|e| JitError::Builder(e.to_string()))?;
+        let (builder, call_conv) = make_optimized_jit_builder()?;
         let module = JITModule::new(builder);
         Ok(Self {
             module,
@@ -155,6 +177,7 @@ impl JitCompiler {
             context: cranelift_codegen::Context::new(),
             next_function_id: 0,
             helper_func_ids: None,
+            host_call_conv: call_conv,
         })
     }
 
@@ -163,18 +186,23 @@ impl JitCompiler {
     /// Runtime helpers enable compilation of property access, function calls,
     /// and other complex operations that require VM context.
     pub fn new_with_helpers(helpers: RuntimeHelpers) -> Result<Self, JitError> {
-        let mut builder = JITBuilder::new(default_libcall_names())
-            .map_err(|e| JitError::Builder(e.to_string()))?;
+        let (mut builder, call_conv) = make_optimized_jit_builder()?;
         helpers.register_symbols(&mut builder);
         let mut module = JITModule::new(builder);
-        let helper_func_ids = HelperFuncIds::declare(&helpers, &mut module)?;
+        let helper_func_ids = HelperFuncIds::declare_with_call_conv(&helpers, &mut module, call_conv)?;
         Ok(Self {
             module,
             function_builder_ctx: FunctionBuilderContext::new(),
             context: cranelift_codegen::Context::new(),
             next_function_id: 0,
             helper_func_ids: Some(helper_func_ids),
+            host_call_conv: call_conv,
         })
+    }
+
+    /// Host-native calling convention for this compiler.
+    pub fn host_call_conv(&self) -> CallConv {
+        self.host_call_conv
     }
 
     /// Whether runtime helpers are available for compilation.

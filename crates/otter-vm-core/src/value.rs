@@ -714,7 +714,7 @@ impl Value {
     }
 
     /// Create native function value
-    pub fn native_function<F>(f: F, memory_manager: Arc<crate::memory::MemoryManager>) -> Self
+    pub fn native_function<F>(f: F, _memory_manager: Arc<crate::memory::MemoryManager>) -> Self
     where
         F: Fn(
                 &Value,
@@ -726,7 +726,7 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let native = GcRef::new(NativeFunctionObject { func, object });
         let ptr = native.as_ptr() as u64;
         Self {
@@ -741,9 +741,9 @@ impl Value {
     /// (e.g., from `#[dive]` macro-generated `_native_fn()` getters).
     pub fn native_function_from_arc(
         func: NativeFn,
-        memory_manager: Arc<crate::memory::MemoryManager>,
+        _memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let native = GcRef::new(NativeFunctionObject { func, object });
         let ptr = native.as_ptr() as u64;
         Self {
@@ -760,9 +760,9 @@ impl Value {
         name: &str,
         func: NativeFn,
         length: u32,
-        memory_manager: Arc<crate::memory::MemoryManager>,
+        _memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
-        let object = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let object = GcRef::new(JsObject::new(Value::null()));
         object.define_property(
             crate::object::PropertyKey::string("length"),
             crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),
@@ -793,7 +793,7 @@ impl Value {
     /// constructor when `Function.prototype` is already available.
     pub fn native_function_with_proto<F>(
         f: F,
-        memory_manager: Arc<crate::memory::MemoryManager>,
+        _memory_manager: Arc<crate::memory::MemoryManager>,
         prototype: GcRef<JsObject>,
     ) -> Self
     where
@@ -807,7 +807,7 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = GcRef::new(JsObject::new(Value::object(prototype), memory_manager));
+        let object = GcRef::new(JsObject::new(Value::object(prototype)));
         // Per ES2023 §10.2.8, built-in function objects have `length` and `name`
         // properties: { writable: false, enumerable: false, configurable: true }.
         object.define_property(
@@ -847,7 +847,7 @@ impl Value {
     /// `__non_constructor` per ES2023 §10.2.8 / §17.
     pub fn native_function_with_proto_named<F>(
         f: F,
-        memory_manager: Arc<crate::memory::MemoryManager>,
+        _memory_manager: Arc<crate::memory::MemoryManager>,
         prototype: GcRef<JsObject>,
         name: &str,
         length: u32,
@@ -865,7 +865,6 @@ impl Value {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(
             Value::object(prototype.clone()),
-            memory_manager,
         ));
         object.define_property(
             crate::object::PropertyKey::string("length"),

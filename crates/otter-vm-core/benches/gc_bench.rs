@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// Create a test VM context
 fn create_test_context() -> (VmContext, Arc<MemoryManager>) {
     let mm = Arc::new(MemoryManager::new(100_000_000)); // 100MB
-    let global = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let global = GcRef::new(JsObject::new(Value::null()));
     let ctx = VmContext::new(global, mm.clone());
     (ctx, mm)
 }
@@ -43,7 +43,7 @@ fn gc_pause_benchmark(c: &mut Criterion) {
                         // Keep some alive, let others become garbage
                         let mut live_objects = Vec::with_capacity(n / 2);
                         for i in 0..n {
-                            let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                            let obj = GcRef::new(JsObject::new(Value::null()));
                             obj.set(PropertyKey::string("value"), Value::int32(i as i32));
                             if i % 2 == 0 {
                                 live_objects.push(obj);
@@ -77,7 +77,7 @@ fn allocation_throughput_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let (_, mm) = create_test_context();
             for i in 0..1000 {
-                let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let obj = GcRef::new(JsObject::new(Value::null()));
                 obj.set(PropertyKey::string("x"), Value::int32(i));
                 black_box(&obj);
             }
@@ -88,7 +88,7 @@ fn allocation_throughput_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let (_, mm) = create_test_context();
             for i in 0..1000 {
-                let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let obj = GcRef::new(JsObject::new(Value::null()));
                 // Add multiple properties
                 obj.set(PropertyKey::string("a"), Value::int32(i));
                 obj.set(PropertyKey::string("b"), Value::int32(i * 2));
@@ -114,8 +114,8 @@ fn gc_circular_refs_benchmark(c: &mut Criterion) {
 
                 // Create 100 circular reference pairs
                 for _ in 0..100 {
-                    let a = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                    let b = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let a = GcRef::new(JsObject::new(Value::null()));
+                    let b = GcRef::new(JsObject::new(Value::null()));
                     a.set(PropertyKey::string("ref"), Value::object(b));
                     b.set(PropertyKey::string("ref"), Value::object(a));
                     // Drop both - creates garbage cycle
@@ -139,7 +139,7 @@ fn gc_circular_refs_benchmark(c: &mut Criterion) {
 
                 // Create 100 self-referencing objects
                 for _ in 0..100 {
-                    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let obj = GcRef::new(JsObject::new(Value::null()));
                     obj.set(PropertyKey::string("self"), Value::object(obj));
                 }
 
@@ -168,10 +168,10 @@ fn gc_mark_benchmark(c: &mut Criterion) {
                 let (ctx, mm) = create_test_context();
 
                 // Create a chain of 100 objects
-                let root = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let root = GcRef::new(JsObject::new(Value::null()));
                 let mut current = root;
                 for depth in 0..100 {
-                    let next = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let next = GcRef::new(JsObject::new(Value::null()));
                     current.set(PropertyKey::string("next"), Value::object(next));
                     current.set(PropertyKey::string("depth"), Value::int32(depth));
                     current = next;
@@ -201,7 +201,7 @@ fn gc_mark_benchmark(c: &mut Criterion) {
 
                 // Create a tree with fanout 10 and depth 3 (1 + 10 + 100 + 1000 = 1111 objects)
                 fn create_tree(mm: &Arc<MemoryManager>, depth: i32) -> GcRef<JsObject> {
-                    let node = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let node = GcRef::new(JsObject::new(Value::null()));
                     node.set(PropertyKey::string("depth"), Value::int32(depth));
 
                     if depth > 0 {
@@ -249,22 +249,22 @@ fn gc_realistic_workload_benchmark(c: &mut Criterion) {
                 // Long-lived objects
                 let mut long_lived = Vec::new();
                 for i in 0..50 {
-                    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let obj = GcRef::new(JsObject::new(Value::null()));
                     obj.set(PropertyKey::string("id"), Value::int32(i));
                     long_lived.push(obj);
                 }
 
                 // Short-lived garbage
                 for i in 0..200 {
-                    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let obj = GcRef::new(JsObject::new(Value::null()));
                     obj.set(PropertyKey::string("temp"), Value::int32(i));
                     // Immediately becomes garbage
                 }
 
                 // Some circular references
                 for _ in 0..20 {
-                    let a = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-                    let b = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                    let a = GcRef::new(JsObject::new(Value::null()));
+                    let b = GcRef::new(JsObject::new(Value::null()));
                     a.set(PropertyKey::string("peer"), Value::object(b));
                     b.set(PropertyKey::string("peer"), Value::object(a));
                 }
@@ -293,7 +293,7 @@ fn gc_reclamation_benchmark(c: &mut Criterion) {
 
             // Allocate and immediately drop 5000 objects
             for i in 0..5000 {
-                let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let obj = GcRef::new(JsObject::new(Value::null()));
                 obj.set(PropertyKey::string("data"), Value::int32(i));
             }
 

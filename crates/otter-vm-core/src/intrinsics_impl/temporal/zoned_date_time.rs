@@ -252,8 +252,8 @@ pub(super) fn install_zoned_date_time(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
@@ -1691,7 +1691,6 @@ pub(super) fn install_zoned_date_time(
             let zdt = extract_zoned_date_time(&obj)?;
             let result = GcRef::new(JsObject::new(
                 Value::undefined(),
-                ncx.ctx.memory_manager().clone(),
             ));
             result.define_property(
                 PropertyKey::string("calendar"),

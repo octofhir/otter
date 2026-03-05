@@ -584,8 +584,8 @@ fn init_typed_array_iterators(
         let byte_len = length
             .checked_mul(kind.element_size())
             .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(proto, mm));
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
+        let object = GcRef::new(JsObject::new(proto));
         JsTypedArray::new(object, buffer, kind, 0, length).map_err(|e| VmError::type_error(e))
     }
 

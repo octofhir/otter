@@ -270,9 +270,7 @@ impl Util {
     ) -> Result<Value, VmError> {
         // Stub: return empty array
         Ok(Value::object(GcRef::new(JsObject::array(
-            0,
-            ncx.memory_manager().clone(),
-        ))))
+            0))))
     }
 }
 
@@ -491,7 +489,6 @@ pub fn make_fn(
 ) -> Value {
     let fn_obj = GcRef::new(JsObject::new(
         Value::object(ctx.fn_proto()),
-        ctx.mm().clone(),
     ));
     fn_obj.define_property(
         PropertyKey::string("length"),

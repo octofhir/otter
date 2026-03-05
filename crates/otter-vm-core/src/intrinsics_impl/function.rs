@@ -148,12 +148,12 @@ fn function_bind(
         .map(Value::object)
         .unwrap_or_else(Value::null);
 
-    let bound = GcRef::new(JsObject::new(fn_proto, ncx.memory_manager().clone()));
+    let bound = GcRef::new(JsObject::new(fn_proto));
     let _ = bound.set(PropertyKey::string("__boundFunction__"), this_val.clone());
     let _ = bound.set(PropertyKey::string("__boundThis__"), this_arg);
 
     if args.len() > 1 {
-        let arr = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+        let arr = GcRef::new(JsObject::new(Value::null()));
         for (i, arg) in args[1..].iter().enumerate() {
             let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
         }

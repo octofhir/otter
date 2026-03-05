@@ -182,12 +182,12 @@ fn build_tracked_mock_fn(
     fn_proto: &GcRef<JsObject>,
 ) -> Value {
     // Shared arrays for call tracking
-    let calls_arr = GcRef::new(JsObject::array(0, mm.clone()));
-    let contexts_arr = GcRef::new(JsObject::array(0, mm.clone()));
-    let results_arr = GcRef::new(JsObject::array(0, mm.clone()));
+    let calls_arr = GcRef::new(JsObject::array(0));
+    let contexts_arr = GcRef::new(JsObject::array(0));
+    let results_arr = GcRef::new(JsObject::array(0));
 
     // Build the .mock object
-    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
     let _ = mock_obj.set(
         PropertyKey::string("calls"),
         Value::object(calls_arr.clone()),
@@ -220,13 +220,13 @@ fn build_tracked_mock_fn(
 
     // mock.resetCalls()
     let mock_obj_for_reset = mock_obj.clone();
-    let mm_for_reset = mm.clone();
+    let _mm_for_reset = mm.clone();
     let reset_fn = Value::native_function(
         move |_this, _args, _ncx| {
             // Replace arrays with fresh empty ones
-            let new_calls = GcRef::new(JsObject::array(0, mm_for_reset.clone()));
-            let new_contexts = GcRef::new(JsObject::array(0, mm_for_reset.clone()));
-            let new_results = GcRef::new(JsObject::array(0, mm_for_reset.clone()));
+            let new_calls = GcRef::new(JsObject::array(0));
+            let new_contexts = GcRef::new(JsObject::array(0));
+            let new_results = GcRef::new(JsObject::array(0));
             let _ = mock_obj_for_reset.set(PropertyKey::string("calls"), Value::object(new_calls));
             let _ = mock_obj_for_reset
                 .set(PropertyKey::string("contexts"), Value::object(new_contexts));
@@ -248,7 +248,7 @@ fn build_tracked_mock_fn(
         dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync,
     > = Arc::new(move |this, args, ncx| {
         // Record the call arguments as an array
-        let args_arr = GcRef::new(JsObject::array(0, mm_clone.clone()));
+        let args_arr = GcRef::new(JsObject::array(0));
         for arg in args {
             args_arr.array_push(arg.clone());
         }
@@ -265,7 +265,7 @@ fn build_tracked_mock_fn(
         };
 
         // Record the result
-        let result_obj = GcRef::new(JsObject::new(Value::null(), mm_clone.clone()));
+        let result_obj = GcRef::new(JsObject::new(Value::null()));
         match &result {
             Ok(val) => {
                 let _ = result_obj.set(
@@ -292,7 +292,7 @@ fn build_tracked_mock_fn(
     });
 
     // Create the function object and attach .mock
-    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
     fn_obj.define_property(
         PropertyKey::string("name"),
         PropertyDescriptor::function_length(Value::string(JsString::intern("mockFn"))),
@@ -311,7 +311,7 @@ fn build_mock_stub(ctx: &RegistrationContext) -> Value {
     let mm = ctx.mm().clone();
     let obj_proto = ctx.obj_proto();
     let fn_proto = ctx.fn_proto();
-    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
 
     // mock.fn() → returns a tracked mock function
     let mm2 = mm.clone();
@@ -602,7 +602,7 @@ fn test_impl(
                                     .and_then(|v| v.as_object())
                             })
                             .unwrap_or_else(|| {
-                                GcRef::new(JsObject::new(Value::null(), mm.clone()))
+                                GcRef::new(JsObject::new(Value::null()))
                             }),
                     )
                 };
@@ -623,7 +623,7 @@ fn test_impl(
                                     .and_then(|v| v.as_object())
                             })
                             .unwrap_or_else(|| {
-                                GcRef::new(JsObject::new(Value::null(), mm.clone()))
+                                GcRef::new(JsObject::new(Value::null()))
                             }),
                     )
                 };
@@ -694,7 +694,7 @@ fn build_test_context_from_ncx(
             c.get(&PropertyKey::string("prototype"))
                 .and_then(|v| v.as_object())
         })
-        .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null(), mm.clone())));
+        .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
 
     let fn_proto = global
         .get(&PropertyKey::string("Function"))
@@ -703,12 +703,12 @@ fn build_test_context_from_ncx(
             c.get(&PropertyKey::string("prototype"))
                 .and_then(|v| v.as_object())
         })
-        .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null(), mm.clone())));
+        .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
 
-    let obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
 
     // --- State cell: shared mutable state between t methods and runner ---
-    let state = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let state = GcRef::new(JsObject::new(Value::null()));
     let _ = state.set(PropertyKey::string("__skip"), Value::boolean(false));
     let _ = state.set(PropertyKey::string("__todo"), Value::boolean(false));
     // -1 means "no plan set"
@@ -740,7 +740,7 @@ fn build_test_context_from_ncx(
     >,
                           fname: &str,
                           length: u32| {
-        let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+        let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
         fn_obj.define_property(
             PropertyKey::string("name"),
             PropertyDescriptor::function_length(Value::string(JsString::intern(fname))),
@@ -811,12 +811,12 @@ fn build_test_context_from_ncx(
     );
 
     // t.signal
-    let signal = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let signal = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
     let _ = signal.set(PropertyKey::string("aborted"), Value::boolean(false));
     let _ = obj.set(PropertyKey::string("signal"), Value::object(signal));
 
     // t.mock — MockTracker with tracked mock.fn() (Feature 3)
-    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
+    let mock_obj = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
     let mm_for_mock = mm.clone();
     let obj_proto_for_mock = obj_proto.clone();
     let fn_proto_for_mock = fn_proto.clone();
@@ -859,7 +859,7 @@ fn build_test_context_from_ncx(
     let _ = obj.set(PropertyKey::string("mock"), Value::object(mock_obj));
 
     // t.assert — assertion methods with counting (Feature 2)
-    let assert_obj = GcRef::new(JsObject::new(Value::object(obj_proto), mm.clone()));
+    let assert_obj = GcRef::new(JsObject::new(Value::object(obj_proto)));
 
     // Helper: build assertion function that increments counter
     let build_assert_fn = |state_ref: GcRef<JsObject>,
@@ -1121,7 +1121,7 @@ fn is_thenable(val: &Value) -> bool {
 /// Wrap a JsPromise into a JsObject with Promise.prototype for `.then`/`.catch`/`.finally`.
 /// (Same pattern as events_ext::wrap_promise)
 fn wrap_promise(ncx: &NativeContext, internal: GcRef<JsPromise>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
     if let Some(promise_ctor) = ncx
@@ -1287,7 +1287,7 @@ fn execute_lifecycle_hook(
                 let mm = ncx.memory_manager().clone();
 
                 // Create a result holder to capture async errors
-                let error_holder = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let error_holder = GcRef::new(JsObject::new(Value::null()));
                 let _ = error_holder.set(PropertyKey::string("error"), Value::undefined());
                 let _ = error_holder.set(PropertyKey::string("settled"), Value::boolean(false));
 
@@ -1627,12 +1627,10 @@ fn build_tests_stream_instance(
     emitter_proto: GcRef<JsObject>,
 ) -> Result<GcRef<JsObject>, VmError> {
     let stream = GcRef::new(JsObject::new(
-        Value::object(emitter_proto),
-        ncx.memory_manager().clone(),
-    ));
+        Value::object(emitter_proto)));
 
     // Initialize EventEmitter storage (listeners map)
-    let listeners_map = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let listeners_map = GcRef::new(JsObject::new(Value::null()));
     let _ = stream.set(
         PropertyKey::string("__ee_listeners"),
         Value::object(listeners_map),
@@ -1643,7 +1641,7 @@ fn build_tests_stream_instance(
     );
 
     // Initialize event queue for async iteration (future feature)
-    let event_queue = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+    let event_queue = GcRef::new(JsObject::array(0));
     let _ = stream.set(
         PropertyKey::string("__event_queue"),
         Value::object(event_queue),
@@ -1930,13 +1928,13 @@ fn build_test_event_data(
     duration_ms: f64,
     ncx: &NativeContext,
 ) -> Value {
-    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern(event_type)),
     );
 
-    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let data = GcRef::new(JsObject::new(Value::null()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -1964,13 +1962,13 @@ fn emit_test_diagnostic_event(
     test: &TestEntry,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:diagnostic")),
     );
 
-    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let data = GcRef::new(JsObject::new(Value::null()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2023,13 +2021,13 @@ fn emit_test_skip_event(
     duration_ms: f64,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:skip")),
     );
 
-    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let data = GcRef::new(JsObject::new(Value::null()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2104,13 +2102,13 @@ fn emit_test_fail_event(
     failure_type: &str,
     ncx: &mut NativeContext,
 ) -> Result<(), VmError> {
-    let event = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern("test:fail")),
     );
 
-    let data = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let data = GcRef::new(JsObject::new(Value::null()));
     let _ = data.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&test.name)),
@@ -2156,7 +2154,7 @@ fn emit_test_fail_event(
     );
 
     // Feature 4: details with failure type
-    let details = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let details = GcRef::new(JsObject::new(Value::null()));
     let _ = details.set(
         PropertyKey::string("type"),
         Value::string(JsString::intern(failure_type)),
@@ -2222,7 +2220,7 @@ fn handle_async_test_result(
     let stream_clone = stream.clone();
 
     // Create a timeout flag (shared between timeout and promise handlers)
-    let timed_out = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let timed_out = GcRef::new(JsObject::new(Value::null()));
     let _ = timed_out.set(PropertyKey::string("value"), Value::boolean(false));
 
     // Setup timeout

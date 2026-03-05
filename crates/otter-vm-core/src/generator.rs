@@ -615,7 +615,7 @@ mod tests {
         let module = Arc::new(Module::builder("test").build());
         let _rt = crate::runtime::VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let generator = JsGenerator::new(
             0,
             module,
@@ -638,7 +638,7 @@ mod tests {
         let module = Arc::new(Module::builder("test").build());
         let _rt = crate::runtime::VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),
@@ -685,7 +685,7 @@ mod tests {
         let module = Arc::new(Module::builder("test").build());
         let _rt = crate::runtime::VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),
@@ -776,7 +776,7 @@ mod tests {
         let module = Arc::new(Module::builder("test").build());
         let _rt = crate::runtime::VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let generator = JsGenerator::new(
             0,
             Arc::clone(&module),

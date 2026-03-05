@@ -509,20 +509,22 @@ impl AllocationRegistry {
     /// This is built once per GC cycle for O(1) lookup during mark phase,
     /// replacing the O(n) linear search from the old Vec<AllocationEntry>.
 
-    /// Mark phase: trace from roots and mark all reachable objects
+    /// Mark phase: trace from roots and mark all reachable objects.
+    ///
+    /// Uses tri-color mark bits (White/Gray/Black) on GcHeader instead of a
+    /// separate HashSet for visited tracking.  All headers start White after
+    /// the prepare phase, so `mark != White` means already enqueued.
     fn mark(&self, roots: &[*const GcHeader]) {
         let mut worklist: VecDeque<*const GcHeader> = VecDeque::new();
-        let mut visited: HashSet<usize> = HashSet::new();
 
         // Add all roots to the worklist (mark as gray)
         for &root in roots {
             if !root.is_null() {
-                let addr = root as usize;
-                if visited.insert(addr) {
-                    unsafe {
+                unsafe {
+                    if (*root).mark() == MarkColor::White {
                         (*root).set_mark(MarkColor::Gray);
+                        worklist.push_back(root);
                     }
-                    worklist.push_back(root);
                 }
             }
         }
@@ -542,12 +544,11 @@ impl AllocationRegistry {
                 if let Some(trace_fn) = self.trace_table[tag as usize] {
                     // Trace the object's references, passing the start of the allocation
                     trace_fn(ptr as *const u8, &mut |child_header| {
-                        if !child_header.is_null() {
-                            let child_addr = child_header as usize;
-                            if visited.insert(child_addr) {
-                                (*child_header).set_mark(MarkColor::Gray);
-                                worklist.push_back(child_header);
-                            }
+                        if !child_header.is_null()
+                            && (*child_header).mark() == MarkColor::White
+                        {
+                            (*child_header).set_mark(MarkColor::Gray);
+                            worklist.push_back(child_header);
                         }
                     });
                 }
@@ -567,21 +568,16 @@ impl AllocationRegistry {
             reclaimed += dir.sweep();
         }
 
-        // Sweep large objects
+        // Sweep large objects: partition into live/dead with single drain
         {
             let mut large_objects = self.large_objects.borrow_mut();
-            let mut live = Vec::with_capacity(large_objects.len());
-            let mut dead = Vec::new();
+            let (live, dead): (Vec<_>, Vec<_>) =
+                large_objects.drain(..).partition(|entry| unsafe {
+                    (*entry.header).mark() != MarkColor::White
+                });
 
-            for entry in large_objects.drain(..) {
-                unsafe {
-                    if (*entry.header).mark() == MarkColor::White {
-                        reclaimed += entry.size;
-                        dead.push(entry);
-                    } else {
-                        live.push(entry);
-                    }
-                }
+            for entry in &dead {
+                reclaimed += entry.size;
             }
 
             *large_objects = live;

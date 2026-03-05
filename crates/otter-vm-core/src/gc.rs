@@ -600,9 +600,7 @@ impl Trace for crate::object::JsObject {
         tracer.mark_value(&proto_val);
 
         // Trace argument mapping (UpvalueCells hold Values that must be traced)
-        for cell in self.argument_mapping_cells() {
-            cell.trace(tracer);
-        }
+        self.trace_argument_mapping(tracer);
     }
 }
 
@@ -998,7 +996,7 @@ mod tests {
 
         {
             let scope = HandleScope::new(&mut ctx);
-            let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let obj = GcRef::new(JsObject::new(Value::null()));
             let _handle = scope.root_value(Value::object(obj.clone()));
 
             // Verify the object is rooted
@@ -1018,7 +1016,7 @@ mod tests {
     fn test_gc_ref_basic() {
         let _rt = VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Set a property
         obj.set("foo".into(), Value::int32(123));
@@ -1031,7 +1029,7 @@ mod tests {
     fn test_gc_ref_clone() {
         let _rt = VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj1 = GcRef::new(JsObject::new(Value::null()));
         obj1.set("value".into(), Value::int32(99));
 
         // Clone the reference
@@ -1049,8 +1047,8 @@ mod tests {
     fn test_gc_ref_equality() {
         let _rt = VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let obj2 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj1 = GcRef::new(JsObject::new(Value::null()));
+        let obj2 = GcRef::new(JsObject::new(Value::null()));
 
         // Different objects should not be equal
         assert_ne!(obj1.as_ptr(), obj2.as_ptr());
@@ -1064,7 +1062,7 @@ mod tests {
     fn test_gc_ref_pointer_identity() {
         let _rt = VmRuntime::new();
         let mm = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Clone and verify pointer identity
         let clone1 = obj.clone();
@@ -1156,7 +1154,7 @@ mod tests {
         let (mut ctx, mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         obj.set("important".into(), Value::int32(999));
 
         let handle = scope.root_value(Value::object(obj.clone()));

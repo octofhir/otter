@@ -122,7 +122,6 @@ impl StructuredCloner {
                     r.pattern.clone(),
                     r.flags.clone(),
                     None,
-                    self.memory_manager.clone(),
                 ));
                 Ok(Value::regex(new_regex))
             }
@@ -213,7 +212,7 @@ impl StructuredCloner {
         }
 
         // Generic object: clone all own properties
-        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let new_value = Value::object(new_obj);
         self.memory.insert(ptr, new_value.clone());
 
@@ -234,7 +233,7 @@ impl StructuredCloner {
         ptr: usize,
         timestamp: Value,
     ) -> Result<Value, StructuredCloneError> {
-        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__timestamp__"), timestamp);
         let new_value = Value::object(new_obj);
         self.memory.insert(ptr, new_value.clone());
@@ -249,7 +248,7 @@ impl StructuredCloner {
         source_data: GcRef<MapData>,
     ) -> Result<Value, StructuredCloneError> {
         let new_data = GcRef::new(MapData::new());
-        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__is_map__"), Value::boolean(true));
         let _ = new_obj.set(
             PropertyKey::string("__map_data__"),
@@ -277,7 +276,7 @@ impl StructuredCloner {
         source_data: GcRef<SetData>,
     ) -> Result<Value, StructuredCloneError> {
         let new_data = GcRef::new(SetData::new());
-        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__is_set__"), Value::boolean(true));
         let _ = new_obj.set(
             PropertyKey::string("__set_data__"),
@@ -302,7 +301,7 @@ impl StructuredCloner {
         obj: GcRef<JsObject>,
         ptr: usize,
     ) -> Result<Value, StructuredCloneError> {
-        let new_obj = GcRef::new(JsObject::new(obj.prototype(), self.memory_manager.clone()));
+        let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let new_value = Value::object(new_obj);
         self.memory.insert(ptr, new_value.clone());
@@ -386,7 +385,7 @@ impl StructuredCloner {
 
         // Create new array
         let len = arr.array_length();
-        let new_arr = GcRef::new(JsObject::array(len, self.memory_manager.clone()));
+        let new_arr = GcRef::new(JsObject::array(len));
         let new_value = Value::array(new_arr);
 
         // Register before cloning elements
@@ -431,7 +430,6 @@ impl StructuredCloner {
 
         let new_obj = GcRef::new(JsObject::new(
             ta.object.prototype(),
-            self.memory_manager.clone(),
         ));
         let new_ta = JsTypedArray::new(
             new_obj,
@@ -527,7 +525,7 @@ mod tests {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
-        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("x"), Value::int32(1));
         let _ = obj.set(PropertyKey::string("y"), Value::int32(2));
 
@@ -582,7 +580,7 @@ mod tests {
             upvalues: vec![],
             is_async: false,
             is_generator: false,
-            object: GcRef::new(JsObject::new(Value::null(), memory_manager.clone())),
+            object: GcRef::new(JsObject::new(Value::null())),
             home_object: None,
         }));
 
@@ -599,8 +597,8 @@ mod tests {
         let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
 
-        let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));
-        let object = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let buffer = GcRef::new(JsArrayBuffer::new(8, None));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let ta = JsTypedArray::new(object, buffer, TypedArrayKind::Int16, 2, 2).unwrap();
         let ta = GcRef::new(ta);
         assert!(ta.set(0, 10.0));
@@ -626,7 +624,7 @@ mod tests {
         let memory_manager = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(memory_manager.clone());
 
-        let buffer = GcRef::new(JsArrayBuffer::new(8, None, memory_manager.clone()));
+        let buffer = GcRef::new(JsArrayBuffer::new(8, None));
         let dv = JsDataView::new(buffer, 1, Some(4)).unwrap();
         let dv = GcRef::new(dv);
         dv.set_uint8(0, 11).unwrap();
@@ -652,7 +650,7 @@ mod tests {
         let mut cloner = StructuredCloner::new(mm.clone());
 
         // Simulate a Date object: JsObject with __timestamp__
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let timestamp = 1700000000000.0_f64; // 2023-11-14T22:13:20Z
         let _ = obj.set(
             PropertyKey::string("__timestamp__"),
@@ -683,7 +681,7 @@ mod tests {
         let mut cloner = StructuredCloner::new(mm.clone());
 
         // Invalid Date has NaN timestamp
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__timestamp__"), Value::nan());
 
         let val = Value::object(obj);
@@ -712,7 +710,7 @@ mod tests {
             Value::int32(2),
         );
 
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__is_map__"), Value::boolean(true));
         let _ = obj.set(PropertyKey::string("__map_data__"), Value::map_data(data));
 
@@ -761,7 +759,7 @@ mod tests {
         data.add(MapKey(Value::int32(20)));
         data.add(MapKey(Value::int32(30)));
 
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__is_set__"), Value::boolean(true));
         let _ = obj.set(PropertyKey::string("__set_data__"), Value::set_data(data));
 
@@ -790,7 +788,7 @@ mod tests {
         let mm = _rt.memory_manager().clone();
         let mut cloner = StructuredCloner::new(mm.clone());
 
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let _ = obj.set(
             PropertyKey::string("name"),
@@ -834,7 +832,7 @@ mod tests {
         let mut cloner = StructuredCloner::new(mm.clone());
 
         // Inner cause error
-        let cause_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let cause_obj = GcRef::new(JsObject::new(Value::null()));
         let _ = cause_obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let _ = cause_obj.set(
             PropertyKey::string("name"),
@@ -846,7 +844,7 @@ mod tests {
         );
 
         // Outer error with cause
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let _ = obj.set(
             PropertyKey::string("name"),
@@ -880,7 +878,7 @@ mod tests {
         let mut cloner = StructuredCloner::new(mm.clone());
 
         // Map with object values that should be deeply cloned
-        let inner_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let inner_obj = GcRef::new(JsObject::new(Value::null()));
         let _ = inner_obj.set(PropertyKey::string("x"), Value::int32(42));
 
         let data = GcRef::new(MapData::new());
@@ -889,7 +887,7 @@ mod tests {
             Value::object(inner_obj),
         );
 
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set(PropertyKey::string("__is_map__"), Value::boolean(true));
         let _ = obj.set(PropertyKey::string("__map_data__"), Value::map_data(data));
 

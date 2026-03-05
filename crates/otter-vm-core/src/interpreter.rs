@@ -257,6 +257,25 @@ impl Interpreter {
         }
     }
 
+    /// Check if a function is eligible for JIT compilation.
+    #[inline]
+    fn can_jit(
+        func: &otter_vm_bytecode::Function,
+        is_construct: bool,
+        is_async: bool,
+        argc: u8,
+    ) -> bool {
+        otter_vm_exec::is_jit_enabled()
+            && func.is_hot_function()
+            && !func.is_deoptimized()
+            && !is_construct
+            && !is_async
+            && !func.flags.has_rest
+            && !func.flags.uses_arguments
+            && !func.flags.uses_eval
+            && argc <= func.param_count
+    }
+
     /// Attempt to quicken a property access instruction based on IC state.
     #[inline]
     fn try_quicken_property_access(
@@ -270,8 +289,8 @@ impl Interpreter {
             Instruction::GetPropConst {
                 dst,
                 obj,
-                name: _,
-                ic_index: _,
+                name,
+                ic_index,
             } => {
                 func.quicken_instruction(
                     pc,
@@ -280,14 +299,16 @@ impl Interpreter {
                         obj: *obj,
                         shape_id,
                         offset,
+                        name: *name,
+                        ic_index: *ic_index,
                     },
                 );
             }
             Instruction::SetPropConst {
                 obj,
-                name: _,
+                name,
                 val,
-                ic_index: _,
+                ic_index,
             } => {
                 func.quicken_instruction(
                     pc,
@@ -296,6 +317,8 @@ impl Interpreter {
                         val: *val,
                         shape_id,
                         offset,
+                        name: *name,
+                        ic_index: *ic_index,
                     },
                 );
             }
@@ -771,7 +794,7 @@ impl Interpreter {
         // Get entry function
         let entry_func = match module.entry_function() {
             Some(f) => f,
-            None => return VmExecutionResult::Error("no entry function".to_string()),
+            None => return VmExecutionResult::Error(VmError::internal("no entry function")),
         };
         self.precompile_module_jit_candidates(&module);
 
@@ -801,7 +824,7 @@ impl Interpreter {
             entry_func.is_async(),
             0,
         ) {
-            return VmExecutionResult::Error(e.to_string());
+            return VmExecutionResult::Error(e);
         }
 
         // Populate initial locals if provided (import bindings)
@@ -822,7 +845,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(panic_message(&panic_payload))
+                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
                 }
             }
         }
@@ -840,7 +863,7 @@ impl Interpreter {
     ) -> VmExecutionResult {
         // Restore the call stack from saved frames
         if let Err(e) = ctx.restore_frames(async_ctx.frames) {
-            return VmExecutionResult::Error(e.to_string());
+            return VmExecutionResult::Error(e);
         }
 
         // Set the resolved value in the resume register
@@ -856,7 +879,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(panic_message(&panic_payload))
+                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
                 }
             }
         }
@@ -874,7 +897,7 @@ impl Interpreter {
     ) -> VmExecutionResult {
         // Restore the call stack from saved frames
         if let Err(e) = ctx.restore_frames(async_ctx.frames) {
-            return VmExecutionResult::Error(e.to_string());
+            return VmExecutionResult::Error(e);
         }
 
         ctx.set_running(async_ctx.was_running);
@@ -892,7 +915,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(panic_message(&panic_payload))
+                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
                 }
             }
         }
@@ -952,8 +975,7 @@ impl Interpreter {
                     }
                 });
             let gen_obj = GcRef::new(JsObject::new(
-                proto.map(Value::object).unwrap_or_else(Value::null),
-                ctx.memory_manager().clone(),
+                proto.map(Value::object).unwrap_or_else(Value::null)
             ));
             let generator = JsGenerator::new(
                 closure.function_index,
@@ -988,15 +1010,12 @@ impl Interpreter {
             otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
         }
 
-        let can_try_jit = otter_vm_exec::is_jit_enabled()
-            && func_info.is_hot_function()
-            && !func_info.is_deoptimized()
-            && !closure.is_async
-            && !closure.is_generator
-            && !func_info.flags.has_rest
-            && !func_info.flags.uses_arguments
-            && !func_info.flags.uses_eval
-            && args.len() <= usize::from(func_info.param_count);
+        let can_try_jit = Self::can_jit(
+            func_info,
+            false, // not construct
+            closure.is_async || closure.is_generator,
+            args.len() as u8,
+        );
         if can_try_jit {
             ctx.set_pending_this(this_value.clone());
             if let Some(ref home_obj) = closure.home_object {
@@ -1046,8 +1065,7 @@ impl Interpreter {
                 Vec::new()
             };
             let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
-                rest_args.len(),
-                ctx.memory_manager().clone(),
+                rest_args.len()
             ));
             if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
                 if let Some(array_proto) = array_obj
@@ -1234,15 +1252,7 @@ impl Interpreter {
                         }
                     }
                     {
-                        let can_try_jit = otter_vm_exec::is_jit_enabled()
-                            && func.is_hot_function()
-                            && !func.is_deoptimized()
-                            && !is_construct
-                            && !is_async
-                            && !func.flags.has_rest
-                            && !func.flags.uses_arguments
-                            && !func.flags.uses_eval
-                            && argc <= func.param_count;
+                        let can_try_jit = Self::can_jit(func, is_construct, is_async, argc);
                         if can_try_jit {
                             let jit_interp: *const Self = self;
                             let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
@@ -1407,6 +1417,14 @@ impl Interpreter {
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
 
+        // Hoist trace config: trace_state doesn't change mid-execution
+        let tracing_enabled = ctx.trace_state.is_some();
+        let trace_capture_timing = ctx
+            .trace_state
+            .as_ref()
+            .map(|s| s.config.capture_timing)
+            .unwrap_or(false);
+
         // Check for pending throw (injected by resume_async_throw)
         if let Some(throw_value) = ctx.take_pending_throw() {
             // Process through try-catch machinery
@@ -1422,17 +1440,7 @@ impl Interpreter {
             } else {
                 // No try-catch — uncaught exception
                 ctx.set_running(false);
-                // Format the error for display
-                let msg = if let Some(s) = throw_value.as_string() {
-                    s.as_str().to_string()
-                } else if let Some(obj) = throw_value.as_object() {
-                    obj.get(&crate::object::PropertyKey::string("message"))
-                        .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                        .unwrap_or_else(|| format!("{:?}", throw_value))
-                } else {
-                    format!("{:?}", throw_value)
-                };
-                return VmExecutionResult::Error(format!("Uncaught exception: {}", msg));
+                return VmExecutionResult::Error(VmError::exception(throw_value));
             }
         }
 
@@ -1445,7 +1453,7 @@ impl Interpreter {
                 ctx.update_debug_snapshot();
                 if ctx.is_interrupted() {
                     ctx.set_running(false);
-                    return VmExecutionResult::Error("Execution interrupted".to_string());
+                    return VmExecutionResult::Error(VmError::Interrupted);
                 }
                 // Check for GC trigger at safepoint
                 ctx.maybe_collect_garbage();
@@ -1461,7 +1469,7 @@ impl Interpreter {
 
             let frame = match ctx.current_frame() {
                 Some(f) => f,
-                None => return VmExecutionResult::Error("no frame".to_string()),
+                None => return VmExecutionResult::Error(VmError::internal("no frame")),
             };
 
             // Only clone Arc when frame changes (avoids atomic ops on hot path)
@@ -1474,7 +1482,7 @@ impl Interpreter {
             let module_ref = cached_module.as_ref().unwrap();
             let func = match module_ref.function(frame.function_index) {
                 Some(f) => f,
-                None => return VmExecutionResult::Error("function not found".to_string()),
+                None => return VmExecutionResult::Error(VmError::internal("function not found")),
             };
 
             // Check if we've reached the end of the function
@@ -1495,8 +1503,8 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
-            // Capture trace data while frame is borrowed (record after execution)
-            let trace_data = if ctx.trace_state.is_some() {
+            // Capture trace data (hoisted booleans avoid per-instruction Option probes)
+            let trace_data = if tracing_enabled {
                 Some((
                     frame.pc,
                     frame.function_index,
@@ -1506,11 +1514,6 @@ impl Interpreter {
             } else {
                 None
             };
-            let trace_capture_timing = ctx
-                .trace_state
-                .as_ref()
-                .map(|state| state.config.capture_timing)
-                .unwrap_or(false);
             let trace_start_time = if trace_capture_timing {
                 Some(std::time::Instant::now())
             } else {
@@ -1537,7 +1540,7 @@ impl Interpreter {
                     VmError::URIError(message) => {
                         InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
                     }
-                    other => return VmExecutionResult::Error(other.to_string()),
+                    other => return VmExecutionResult::Error(other),
                 },
             };
 
@@ -1596,7 +1599,7 @@ impl Interpreter {
                     let (return_reg, is_construct, construct_this, is_async) = {
                         let frame = match ctx.current_frame() {
                             Some(f) => f,
-                            None => return VmExecutionResult::Error("no frame".to_string()),
+                            None => return VmExecutionResult::Error(VmError::internal("no frame")),
                         };
                         (
                             frame.return_register,
@@ -1634,7 +1637,7 @@ impl Interpreter {
                         // Jump to catch block in the handler frame
                         let frame = match ctx.current_frame_mut() {
                             Some(f) => f,
-                            None => return VmExecutionResult::Error("no frame".to_string()),
+                            None => return VmExecutionResult::Error(VmError::internal("no frame")),
                         };
                         frame.pc = catch_pc;
 
@@ -1659,10 +1662,7 @@ impl Interpreter {
 
                     // No handler: return as error
                     ctx.set_running(false);
-                    return VmExecutionResult::Error(format!(
-                        "Uncaught exception: {}",
-                        self.to_string(&value)
-                    ));
+                    return VmExecutionResult::Error(VmError::exception(value));
                 }
                 InstructionResult::Call {
                     func_index,
@@ -1678,11 +1678,11 @@ impl Interpreter {
                     let callee = match call_module.function(func_index) {
                         Some(f) => f,
                         None => {
-                            return VmExecutionResult::Error(format!(
+                            return VmExecutionResult::Error(VmError::internal(format!(
                                 "callee not found (func_index={}, function_count={})",
                                 func_index,
                                 call_module.function_count()
-                            ));
+                            )));
                         }
                     };
 
@@ -1704,15 +1704,7 @@ impl Interpreter {
                         }
                     }
                     {
-                        let can_try_jit = otter_vm_exec::is_jit_enabled()
-                            && callee.is_hot_function()
-                            && !callee.is_deoptimized()
-                            && !is_construct
-                            && !is_async
-                            && !callee.flags.has_rest
-                            && !callee.flags.uses_arguments
-                            && !callee.flags.uses_eval
-                            && argc <= callee.param_count;
+                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
                         if can_try_jit {
                             let jit_interp: *const Self = self;
                             let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
@@ -1748,7 +1740,7 @@ impl Interpreter {
                                         is_async,
                                         argc as usize,
                                     ) {
-                                        return VmExecutionResult::Error(e.to_string());
+                                        return VmExecutionResult::Error(e);
                                     }
                                     ctx.restore_deopt_state(bailout_pc, &locals, &registers);
                                     continue;
@@ -1787,8 +1779,7 @@ impl Interpreter {
 
                         // Create rest array
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
@@ -1820,7 +1811,7 @@ impl Interpreter {
                         is_async,
                         argc as usize,
                     ) {
-                        return VmExecutionResult::Error(e.to_string());
+                        return VmExecutionResult::Error(e);
                     }
                 }
                 InstructionResult::TailCall {
@@ -1839,11 +1830,11 @@ impl Interpreter {
                     let callee = match call_module.function(func_index) {
                         Some(f) => f,
                         None => {
-                            return VmExecutionResult::Error(format!(
+                            return VmExecutionResult::Error(VmError::internal(format!(
                                 "callee not found (func_index={}, function_count={})",
                                 func_index,
                                 call_module.function_count()
-                            ));
+                            )));
                         }
                     };
 
@@ -1860,8 +1851,7 @@ impl Interpreter {
                             Vec::new()
                         };
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -1888,7 +1878,7 @@ impl Interpreter {
                         is_async,
                         argc as usize,
                     ) {
-                        return VmExecutionResult::Error(e.to_string());
+                        return VmExecutionResult::Error(e);
                     }
                 }
                 InstructionResult::Suspend {
@@ -1907,10 +1897,7 @@ impl Interpreter {
                         PromiseState::Rejected(error) => {
                             // Promise rejected, propagate as error
                             ctx.set_running(false);
-                            return VmExecutionResult::Error(format!(
-                                "Promise rejected: {:?}",
-                                error
-                            ));
+                            return VmExecutionResult::Error(VmError::exception(error));
                         }
                         PromiseState::Pending | PromiseState::PendingThenable(_) => {
                             // Promise is pending - suspend execution
@@ -1927,7 +1914,7 @@ impl Interpreter {
                 InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
                     let result =
-                        GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                        GcRef::new(JsObject::new(Value::null()));
                     let _ = result.set(PropertyKey::string("value"), value);
                     let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -1942,6 +1929,14 @@ impl Interpreter {
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
+
+        // Hoist trace config: trace_state doesn't change mid-execution
+        let tracing_enabled = ctx.trace_state.is_some();
+        let trace_capture_timing = ctx
+            .trace_state
+            .as_ref()
+            .map(|s| s.config.capture_timing)
+            .unwrap_or(false);
 
         loop {
             // Refresh cached proto epoch once per iteration (avoids atomic load per IC access)
@@ -1998,8 +1993,8 @@ impl Interpreter {
             // Record instruction execution for profiling
             ctx.record_instruction();
 
-            // Capture trace data while frame is borrowed (record after execution)
-            let trace_data = if ctx.trace_state.is_some() {
+            // Capture trace data (hoisted booleans avoid per-instruction Option probes)
+            let trace_data = if tracing_enabled {
                 Some((
                     frame.pc,
                     frame.function_index,
@@ -2009,11 +2004,6 @@ impl Interpreter {
             } else {
                 None
             };
-            let trace_capture_timing = ctx
-                .trace_state
-                .as_ref()
-                .map(|state| state.config.capture_timing)
-                .unwrap_or(false);
             let trace_start_time = if trace_capture_timing {
                 Some(std::time::Instant::now())
             } else {
@@ -2202,15 +2192,7 @@ impl Interpreter {
                         }
                     }
                     {
-                        let can_try_jit = otter_vm_exec::is_jit_enabled()
-                            && callee.is_hot_function()
-                            && !callee.is_deoptimized()
-                            && !is_construct
-                            && !is_async
-                            && !callee.flags.has_rest
-                            && !callee.flags.uses_arguments
-                            && !callee.flags.uses_eval
-                            && argc <= callee.param_count;
+                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
                         if can_try_jit {
                             let jit_interp: *const Self = self;
                             let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
@@ -2283,8 +2265,7 @@ impl Interpreter {
 
                         // Create rest array
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
@@ -2351,8 +2332,7 @@ impl Interpreter {
                             Vec::new()
                         };
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -2410,7 +2390,7 @@ impl Interpreter {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
                     let result =
-                        GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                        GcRef::new(JsObject::new(Value::null()));
                     let _ = result.set(PropertyKey::string("value"), value);
                     let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -2554,7 +2534,7 @@ impl Interpreter {
                                 offset,
                             } = &ic.ic_state
                             {
-                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
+                                if global_obj.shape_ptr_raw() == *shape_addr
                                 {
                                     global_obj.get_by_offset(*offset as usize)
                                 } else {
@@ -2589,7 +2569,7 @@ impl Interpreter {
                     let global_obj = ctx.global().clone();
                     if !global_obj.is_dictionary_mode() {
                         let key = Self::utf16_key(name_str);
-                        if let Some(offset) = global_obj.shape().get_offset(&key) {
+                        if let Some(offset) = global_obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
@@ -2684,7 +2664,7 @@ impl Interpreter {
                                 offset,
                             } = &ic.ic_state
                             {
-                                if std::sync::Arc::as_ptr(&global_obj.shape()) as u64 == *shape_addr
+                                if global_obj.shape_ptr_raw() == *shape_addr
                                 {
                                     if global_obj
                                         .set_by_offset(*offset as usize, val_val.clone())
@@ -2712,7 +2692,7 @@ impl Interpreter {
                         let property_exists = if global_obj.is_dictionary_mode() {
                             global_obj.has_own(&key)
                         } else {
-                            global_obj.shape().get_offset(&key).is_some()
+                            global_obj.shape_get_offset(&key).is_some()
                         };
                         if !property_exists {
                             return Err(VmError::ReferenceError(format!(
@@ -2730,7 +2710,7 @@ impl Interpreter {
                     let global_obj = ctx.global().clone();
                     if !global_obj.is_dictionary_mode() {
                         let key = Self::utf16_key(name_str);
-                        if let Some(offset) = global_obj.shape().get_offset(&key) {
+                        if let Some(offset) = global_obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
@@ -3012,40 +2992,43 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                // Collect type feedback and check for quickening opportunity
-                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
-                        let left_value = ctx.get_register(lhs.0);
-                        let right_value = ctx.get_register(rhs.0);
-                        let feedback = func.feedback_vector.write();
-                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, &left_value);
-                            Self::observe_value_type(&mut meta.type_observations, &right_value);
-                            meta.type_observations.is_int32_only()
-                        } else {
-                            false
+                // Check-first: if IC already knows this is int32, skip feedback write
+                if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
+                    use otter_vm_bytecode::function::ArithmeticType;
+                    match ty {
+                        ArithmeticType::Int32 => {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_int32(), right.as_int32())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
+                                if let Some(result) = l.checked_mul(r) {
+                                    ctx.set_register(dst.0, Value::int32(result));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Fast path for int32 multiplication (inline quickening)
-                if use_int32_fast_path {
-                    let fast_result = {
-                        let left = ctx.get_register(lhs.0);
-                        let right = ctx.get_register(rhs.0);
-                        (left.as_int32(), right.as_int32())
-                    };
-                    if let (Some(l), Some(r)) = fast_result {
-                        if let Some(result) = l.checked_mul(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            return Ok(InstructionResult::Continue);
+                        ArithmeticType::Number => {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_number(), right.as_number())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
+                                ctx.set_register(dst.0, Value::number(l * r));
+                                return Ok(InstructionResult::Continue);
+                            }
                         }
+                        _ => {}
                     }
                 }
+
+                // Slow path: observe types and update feedback
+                Self::update_arithmetic_ic(ctx, *feedback_index,
+                    &ctx.get_register(lhs.0).clone(),
+                    &ctx.get_register(rhs.0).clone(),
+                );
 
                 // Generic path (ToNumeric)
                 let left_value = ctx.get_register(lhs.0).clone();
@@ -3072,44 +3055,46 @@ impl Interpreter {
                 rhs,
                 feedback_index,
             } => {
-                // Collect type feedback and check for quickening opportunity
-                let use_int32_fast_path = if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
-                        let left_value = ctx.get_register(lhs.0);
-                        let right_value = ctx.get_register(rhs.0);
-                        let feedback = func.feedback_vector.write();
-                        if let Some(meta) = feedback.get_mut(*feedback_index as usize) {
-                            Self::observe_value_type(&mut meta.type_observations, &left_value);
-                            Self::observe_value_type(&mut meta.type_observations, &right_value);
-                            meta.type_observations.is_int32_only()
-                        } else {
-                            false
+                // Check-first: if IC already knows this is int32/number, skip feedback write
+                if let Some(ty) = Self::get_arithmetic_fast_path(ctx, *feedback_index) {
+                    use otter_vm_bytecode::function::ArithmeticType;
+                    match ty {
+                        ArithmeticType::Int32 => {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_int32(), right.as_int32())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
+                                if let Some(rem) = l.checked_rem(r)
+                                    && rem == 0
+                                    && let Some(quotient) = l.checked_div(r)
+                                {
+                                    ctx.set_register(dst.0, Value::int32(quotient));
+                                    return Ok(InstructionResult::Continue);
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Fast path for int32 division (only if result is exact integer)
-                if use_int32_fast_path {
-                    let fast_result = {
-                        let left = ctx.get_register(lhs.0);
-                        let right = ctx.get_register(rhs.0);
-                        (left.as_int32(), right.as_int32())
-                    };
-                    if let (Some(l), Some(r)) = fast_result {
-                        if let Some(rem) = l.checked_rem(r)
-                            && rem == 0
-                            && let Some(quotient) = l.checked_div(r)
-                        {
-                            // Result is an exact integer and doesn't overflow i32.
-                            ctx.set_register(dst.0, Value::int32(quotient));
-                            return Ok(InstructionResult::Continue);
+                        ArithmeticType::Number => {
+                            let fast_result = {
+                                let left = ctx.get_register(lhs.0);
+                                let right = ctx.get_register(rhs.0);
+                                (left.as_number(), right.as_number())
+                            };
+                            if let (Some(l), Some(r)) = fast_result {
+                                ctx.set_register(dst.0, Value::number(l / r));
+                                return Ok(InstructionResult::Continue);
+                            }
                         }
+                        _ => {}
                     }
                 }
+
+                // Slow path: observe types and update feedback
+                Self::update_arithmetic_ic(ctx, *feedback_index,
+                    &ctx.get_register(lhs.0).clone(),
+                    &ctx.get_register(rhs.0).clone(),
+                );
 
                 // Generic path (ToNumeric)
                 let left_value = ctx.get_register(lhs.0).clone();
@@ -3451,7 +3436,7 @@ impl Interpreter {
                     let feedback = func.feedback_vector.write();
                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                         use otter_vm_bytecode::function::InlineCacheState;
-                        let obj_shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+                        let obj_shape_ptr = right_obj.shape_ptr_raw();
 
                         if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                             match &mut ic.ic_state {
@@ -3486,7 +3471,7 @@ impl Interpreter {
                     let proto = right_obj.get(&proto_key).unwrap_or_else(Value::undefined);
 
                     // Update IC
-                    if let Some(offset) = right_obj.shape().get_offset(&proto_key) {
+                    if let Some(offset) = right_obj.shape_get_offset(&proto_key) {
                         let frame = ctx
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
@@ -3501,7 +3486,7 @@ impl Interpreter {
                             if right_obj.is_dictionary_mode() {
                                 ic.ic_state = InlineCacheState::Megamorphic;
                             } else {
-                                let shape_ptr = std::sync::Arc::as_ptr(&right_obj.shape()) as u64;
+                                let shape_ptr = right_obj.shape_ptr_raw();
                                 let current_epoch = ctx.cached_proto_epoch;
 
                                 match &mut ic.ic_state {
@@ -3700,7 +3685,7 @@ impl Interpreter {
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
                 let func_obj =
-                    GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                    GcRef::new(JsObject::new(Value::null()));
 
                 // Get Object.prototype so function's .prototype object has correct chain
                 let obj_proto = ctx
@@ -3714,8 +3699,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let proto = GcRef::new(JsObject::new(
-                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
 
                 // Set [[Prototype]] to Function.prototype so methods like
@@ -3807,7 +3791,7 @@ impl Interpreter {
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
                 let func_obj =
-                    GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                    GcRef::new(JsObject::new(Value::null()));
 
                 // Get Object.prototype for function's .prototype object
                 let obj_proto = ctx
@@ -3821,8 +3805,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let _proto = GcRef::new(JsObject::new(
-                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
 
                 // Set [[Prototype]] to Function.prototype
@@ -3896,8 +3879,7 @@ impl Interpreter {
                 let func_obj = GcRef::new(JsObject::new(
                     gen_func_proto
                         .map(Value::object)
-                        .unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                        .unwrap_or_else(Value::null)
                 ));
                 func_obj.define_property(
                     PropertyKey::string("__realm_id__"),
@@ -3931,8 +3913,7 @@ impl Interpreter {
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
                 let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
 
                 let closure = GcRef::new(Closure {
@@ -3991,8 +3972,7 @@ impl Interpreter {
                 let func_obj = GcRef::new(JsObject::new(
                     async_gen_func_proto
                         .map(Value::object)
-                        .unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                        .unwrap_or_else(Value::null)
                 ));
                 func_obj.define_property(
                     PropertyKey::string("__realm_id__"),
@@ -4026,8 +4006,7 @@ impl Interpreter {
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
                 let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
 
                 let closure = GcRef::new(Closure {
@@ -4362,8 +4341,7 @@ impl Interpreter {
                         ctor_proto
                             .clone()
                             .map(Value::object)
-                            .unwrap_or_else(Value::null),
-                        ctx.memory_manager().clone(),
+                            .unwrap_or_else(Value::null)
                     ));
                     let new_obj_value = Value::object(new_obj.clone());
 
@@ -4459,8 +4437,7 @@ impl Interpreter {
                             ctor_proto
                                 .clone()
                                 .map(Value::object)
-                                .unwrap_or_else(Value::null),
-                            ctx.memory_manager().clone(),
+                                .unwrap_or_else(Value::null)
                         ));
                         let new_obj_value = Value::object(new_obj.clone());
 
@@ -4531,7 +4508,7 @@ impl Interpreter {
                             offset,
                         } = &ic.ic_state
                         {
-                            if std::sync::Arc::as_ptr(&obj_ref.shape()) as u64 == *shape_addr {
+                            if obj_ref.shape_ptr_raw() == *shape_addr {
                                 obj_ref.get_by_offset(*offset as usize)
                             } else {
                                 None
@@ -4605,7 +4582,7 @@ impl Interpreter {
                     let key = Self::utf16_key(method_name);
 
                     if !obj_ref.is_dictionary_mode() {
-                        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+                        if let Some(offset) = obj_ref.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
@@ -4616,7 +4593,7 @@ impl Interpreter {
                             let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                                let shape_ptr = obj_ref.shape_ptr_raw();
                                 let current_epoch = ctx.cached_proto_epoch;
 
                                 match &mut ic.ic_state {
@@ -4667,13 +4644,8 @@ impl Interpreter {
 
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
-                    let string_obj = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
-                    let proto = string_obj
-                        .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object())
+                    let proto = ctx
+                        .string_prototype()
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto
                         .get(&Self::utf16_key(method_name))
@@ -4756,7 +4728,7 @@ impl Interpreter {
 
                         // Create iterator result object { value, done }
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(PropertyKey::string("value"), result_value);
                         let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -4894,7 +4866,7 @@ impl Interpreter {
                 // Update IC if method was found on the object itself
                 if let Some(obj_ref) = receiver.as_object() {
                     let key = Self::utf16_key(method_name);
-                    if let Some(offset) = obj_ref.shape().get_offset(&key) {
+                    if let Some(offset) = obj_ref.shape_get_offset(&key) {
                         let frame = ctx
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
@@ -4910,7 +4882,7 @@ impl Interpreter {
                             ) {
                                 ic.ic_state =
                                     otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: std::sync::Arc::as_ptr(&obj_ref.shape()) as u64,
+                                        shape_id: obj_ref.shape_ptr_raw(),
                                         offset: offset as u32,
                                     };
                             }
@@ -5061,8 +5033,7 @@ impl Interpreter {
                             self.default_object_prototype_for_constructor(ctx, &func_value)
                         });
                     let new_obj = GcRef::new(JsObject::new(
-                        ctor_proto.map(Value::object).unwrap_or_else(Value::null),
-                        ctx.memory_manager().clone(),
+                        ctor_proto.map(Value::object).unwrap_or_else(Value::null)
                     ));
                     let new_obj_value = Value::object(new_obj);
 
@@ -5092,8 +5063,7 @@ impl Interpreter {
                     .and_then(|v| v.as_object())
                     .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                 let new_obj = GcRef::new(JsObject::new(
-                    ctor_proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    ctor_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
                 let new_obj_value = Value::object(new_obj);
 
@@ -5256,8 +5226,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let obj = GcRef::new(JsObject::new(
-                    proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
                 ctx.set_register(dst.0, Value::object(obj));
                 Ok(InstructionResult::Continue)
@@ -5284,7 +5253,7 @@ impl Interpreter {
                     .and_then(|v| v.as_object());
 
                 // Use array_like (not array) so Array.isArray(arguments) returns false
-                let args_obj = GcRef::new(JsObject::array_like(argc, mm.clone()));
+                let args_obj = GcRef::new(JsObject::array_like(argc));
                 if let Some(proto) = obj_proto {
                     args_obj.set_prototype(Value::object(proto));
                 }
@@ -5542,16 +5511,11 @@ impl Interpreter {
                         return Ok(InstructionResult::Continue);
                     }
 
-                    if let Some(string_obj) = ctx.get_global("String").and_then(|v| v.as_object()) {
-                        if let Some(proto) = string_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let key = Self::utf16_key(name_str);
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
+                    if let Some(proto) = ctx.string_prototype() {
+                        let key = Self::utf16_key(name_str);
+                        let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                        ctx.set_register(dst.0, value);
+                        return Ok(InstructionResult::Continue);
                     }
                 }
 
@@ -5575,7 +5539,7 @@ impl Interpreter {
                         let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                            let obj_shape_ptr = obj_ref.shape_ptr_raw();
 
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
@@ -5644,7 +5608,7 @@ impl Interpreter {
                             // Slow path: full lookup and IC update
                             // Skip IC for dictionary mode objects
                             if !obj_ref.is_dictionary_mode() {
-                                if let Some(offset) = obj_ref.shape().get_offset(&key) {
+                                if let Some(offset) = obj_ref.shape_get_offset(&key) {
                                     let frame = ctx
                                         .current_frame()
                                         .ok_or_else(|| VmError::internal("no frame"))?;
@@ -5656,7 +5620,7 @@ impl Interpreter {
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr =
-                                            std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                                            obj_ref.shape_ptr_raw();
                                         let current_epoch = ctx.cached_proto_epoch;
 
                                         match &mut ic.ic_state {
@@ -5844,7 +5808,7 @@ impl Interpreter {
                         let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                            let obj_shape_ptr = obj.shape_ptr_raw();
 
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
@@ -5957,7 +5921,7 @@ impl Interpreter {
                             // Skip IC for dictionary mode objects
                             if !obj.is_dictionary_mode() {
                                 if let Some(offset) =
-                                    obj.shape().get_offset(&Self::utf16_key(name_str))
+                                    obj.shape_get_offset(&Self::utf16_key(name_str))
                                 {
                                     let frame = ctx
                                         .current_frame()
@@ -5969,7 +5933,7 @@ impl Interpreter {
                                     let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                        let shape_ptr = obj.shape_ptr_raw();
                                         let current_epoch = ctx.cached_proto_epoch;
 
                                         match &mut ic.ic_state {
@@ -6203,15 +6167,10 @@ impl Interpreter {
                         _ => {}
                     }
 
-                    if let Some(string_obj) = ctx.get_global("String").and_then(|v| v.as_object()) {
-                        if let Some(proto) = string_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
+                    if let Some(proto) = ctx.string_prototype() {
+                        let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                        ctx.set_register(dst.0, value);
+                        return Ok(InstructionResult::Continue);
                     }
                 }
 
@@ -6530,7 +6489,7 @@ impl Interpreter {
 
             // ==================== Arrays ====================
             Instruction::NewArray { dst, len } => {
-                let arr = GcRef::new(JsObject::array(*len as usize, ctx.memory_manager().clone()));
+                let arr = GcRef::new(JsObject::array(*len as usize));
                 // Attach `Array.prototype` if present so arrays are iterable and have methods.
                 if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                     && let Some(array_proto) = array_obj
@@ -6596,7 +6555,7 @@ impl Interpreter {
                             let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
-                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let obj_shape_ptr = obj.shape_ptr_raw();
 
                                 if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                     match &mut ic.ic_state {
@@ -6631,7 +6590,7 @@ impl Interpreter {
 
                         // Slow path with IC update (skip for dictionary mode)
                         if !obj.is_dictionary_mode() {
-                            if let Some(offset) = obj.shape().get_offset(&key) {
+                            if let Some(offset) = obj.shape_get_offset(&key) {
                                 let frame = ctx
                                     .current_frame()
                                     .ok_or_else(|| VmError::internal("no frame"))?;
@@ -6642,7 +6601,7 @@ impl Interpreter {
                                 let feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                    let shape_ptr = obj.shape_ptr_raw();
                                     let current_epoch = ctx.cached_proto_epoch;
 
                                     match &mut ic.ic_state {
@@ -6761,7 +6720,7 @@ impl Interpreter {
                             let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
-                                let obj_shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let obj_shape_ptr = obj.shape_ptr_raw();
 
                                 if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                     match &mut ic.ic_state {
@@ -6824,7 +6783,7 @@ impl Interpreter {
 
                         // Slow path with IC update (skip for dictionary mode)
                         if !obj.is_dictionary_mode() {
-                            if let Some(offset) = obj.shape().get_offset(&key) {
+                            if let Some(offset) = obj.shape_get_offset(&key) {
                                 let frame = ctx
                                     .current_frame()
                                     .ok_or_else(|| VmError::internal("no frame"))?;
@@ -6835,7 +6794,7 @@ impl Interpreter {
                                 let feedback = func.feedback_vector.write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                    let shape_ptr = obj.shape_ptr_raw();
                                     let current_epoch = ctx.cached_proto_epoch;
 
                                     match &mut ic.ic_state {
@@ -6962,7 +6921,7 @@ impl Interpreter {
                             offset,
                         } = &ic.ic_state
                         {
-                            if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                            if obj.shape_ptr_raw() == *shape_addr {
                                 obj.get_by_offset(*offset as usize)
                             } else {
                                 None
@@ -7097,7 +7056,7 @@ impl Interpreter {
 
                         // Create iterator result object { value, done }
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(PropertyKey::string("value"), result_value);
                         let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -7109,13 +7068,8 @@ impl Interpreter {
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
-                    let string_obj = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
-                    let proto = string_obj
-                        .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object())
+                    let proto = ctx
+                        .string_prototype()
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_number() {
@@ -7180,7 +7134,7 @@ impl Interpreter {
                 // Update IC if method was found on the object itself
                 if let Some(obj) = receiver.as_object() {
                     if !obj.is_dictionary_mode() {
-                        if let Some(offset) = obj.shape().get_offset(&key) {
+                        if let Some(offset) = obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
@@ -7191,7 +7145,7 @@ impl Interpreter {
                             let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let shape_ptr = obj.shape_ptr_raw();
                                 let current_epoch = ctx.cached_proto_epoch;
 
                                 match &mut ic.ic_state {
@@ -7287,7 +7241,7 @@ impl Interpreter {
                             offset,
                         } = &ic.ic_state
                         {
-                            if std::sync::Arc::as_ptr(&obj.shape()) as u64 == *shape_addr {
+                            if obj.shape_ptr_raw() == *shape_addr {
                                 obj.get_by_offset(*offset as usize)
                             } else {
                                 None
@@ -7338,13 +7292,8 @@ impl Interpreter {
                 let method_value = if let Some(obj_ref) = receiver.as_object() {
                     obj_ref.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_string() {
-                    let string_obj = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
-                    let proto = string_obj
-                        .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object())
+                    let proto = ctx
+                        .string_prototype()
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto.get(&key).unwrap_or_else(Value::undefined)
                 } else if receiver.is_number() {
@@ -7409,7 +7358,7 @@ impl Interpreter {
                 // Update IC if method was found on the object itself
                 if let Some(obj) = receiver.as_object() {
                     if !obj.is_dictionary_mode() {
-                        if let Some(offset) = obj.shape().get_offset(&key) {
+                        if let Some(offset) = obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
@@ -7420,7 +7369,7 @@ impl Interpreter {
                             let feedback = func.feedback_vector.write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = std::sync::Arc::as_ptr(&obj.shape()) as u64;
+                                let shape_ptr = obj.shape_ptr_raw();
                                 let current_epoch = ctx.cached_proto_epoch;
 
                                 match &mut ic.ic_state {
@@ -7828,12 +7777,14 @@ impl Interpreter {
                 obj,
                 shape_id,
                 offset,
+                name,
+                ic_index,
             } => {
                 let object = ctx.get_register(obj.0);
 
                 // Fast path: direct shape verify and load
                 if let Some(obj_ref) = object.as_object() {
-                    let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                    let obj_shape_ptr = obj_ref.shape_ptr_raw();
                     if obj_shape_ptr == *shape_id {
                         if let Some(val) = obj_ref.get_by_offset(*offset as usize) {
                             ctx.set_register(dst.0, val);
@@ -7842,14 +7793,28 @@ impl Interpreter {
                     }
                 }
 
-                // De-quicken: Shape missed, revert to full interpreter dynamic lookup.
-                // We don't have enough metadata inside `Instruction::GetPropQuickened` anymore to neatly fallback to
-                // `Instruction::GetPropConst`. Since `GetPropQuickened` only holds `shape_id` and `offset`,
-                // a miss fundamentally breaks the instruction pipeline. However, quickening should only occur
-                // on fully stabilized ICs over `QUICKENING_WARMUP` hits, meaning a polymorphic de-opt is rare.
-                return Err(VmError::internal(
-                    "De-optimization from GetPropQuickened not currently supported.",
-                ));
+                // Shape miss: de-quicken back to GetPropConst and execute the generic path.
+                if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::GetPropConst {
+                                dst: *dst,
+                                obj: *obj,
+                                name: *name,
+                                ic_index: *ic_index,
+                            },
+                        );
+                    }
+                }
+                // Fall through to generic GetPropConst execution.
+                let fallback = Instruction::GetPropConst {
+                    dst: *dst,
+                    obj: *obj,
+                    name: *name,
+                    ic_index: *ic_index,
+                };
+                return self.execute_instruction(&fallback, module, ctx);
             }
 
             // Superinstruction: fused GetLocal + GetPropConst
@@ -7874,7 +7839,7 @@ impl Interpreter {
                         let feedback = func.feedback_vector.write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                            let obj_shape_ptr = obj_ref.shape_ptr_raw();
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
                                     InlineCacheState::Monomorphic { shape_id, offset } => {
@@ -7927,13 +7892,15 @@ impl Interpreter {
                 val,
                 shape_id,
                 offset,
+                name,
+                ic_index,
             } => {
                 let object = ctx.get_register(obj.0).clone();
                 let value = ctx.get_register(val.0).clone();
 
                 // Fast path: direct shape verify and store
                 if let Some(obj_ref) = object.as_object() {
-                    let obj_shape_ptr = std::sync::Arc::as_ptr(&obj_ref.shape()) as u64;
+                    let obj_shape_ptr = obj_ref.shape_ptr_raw();
                     if obj_shape_ptr == *shape_id {
                         if obj_ref.set_by_offset(*offset as usize, value).is_ok() {
                             return Ok(InstructionResult::Continue);
@@ -7941,10 +7908,27 @@ impl Interpreter {
                     }
                 }
 
-                // De-quicken: Shape missed, revert is not supported (same as GetPropQuickened).
-                return Err(VmError::internal(
-                    "De-optimization from SetPropQuickened not currently supported.",
-                ));
+                // Shape miss: de-quicken back to SetPropConst and execute the generic path.
+                if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = frame.module.function(frame.function_index) {
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::SetPropConst {
+                                obj: *obj,
+                                name: *name,
+                                val: *val,
+                                ic_index: *ic_index,
+                            },
+                        );
+                    }
+                }
+                let fallback = Instruction::SetPropConst {
+                    obj: *obj,
+                    name: *name,
+                    val: *val,
+                    ic_index: *ic_index,
+                };
+                return self.execute_instruction(&fallback, module, ctx);
             }
 
             // ==================== Iteration ====================
@@ -7968,13 +7952,8 @@ impl Interpreter {
                     )?)
                 } else if obj.is_string() {
                     // String primitives: look up Symbol.iterator on String.prototype
-                    let string_obj = ctx
-                        .get_global("String")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| VmError::type_error("String is not defined"))?;
-                    let proto = string_obj
-                        .get(&PropertyKey::string("prototype"))
-                        .and_then(|v| v.as_object())
+                    let proto = ctx
+                        .string_prototype()
                         .ok_or_else(|| VmError::type_error("String.prototype is not defined"))?;
                     proto.get(&PropertyKey::Symbol(iterator_sym))
                 } else {
@@ -8250,7 +8229,7 @@ impl Interpreter {
                     // Step 5.f: if IsConstructor(superclass) is false, throw TypeError
                     if super_value.is_null() {
                         // extends null: create prototype with null __proto__
-                        let derived_proto = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                        let derived_proto = GcRef::new(JsObject::new(Value::null()));
 
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(ctor_obj) = ctor_value.as_object() {
@@ -8317,8 +8296,7 @@ impl Interpreter {
 
                         // Create derived prototype: Object.create(super.prototype)
                         let derived_proto = GcRef::new(JsObject::new(
-                            super_proto.map(Value::object).unwrap_or_else(Value::null),
-                            mm.clone(),
+                            super_proto.map(Value::object).unwrap_or_else(Value::null)
                         ));
 
                         // Set ctor.prototype = derived_proto
@@ -8440,8 +8418,7 @@ impl Interpreter {
                     // Base case: super constructor is a native built-in (Array, RegExp, etc.)
                     // Create object with correct prototype, then call as constructor.
                     let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone()),
-                        mm.clone(),
+                        Value::object(new_target_proto.clone())
                     ));
                     let new_obj_value = Value::object(new_obj);
 
@@ -8466,7 +8443,7 @@ impl Interpreter {
                 } else {
                     // Base case: super constructor is a regular (non-derived) closure.
                     let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
+                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
 
                     let result =
@@ -8560,8 +8537,7 @@ impl Interpreter {
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Native built-in constructor (Array, RegExp, etc.)
                     let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone()),
-                        mm.clone(),
+                        Value::object(new_target_proto.clone())
                     ));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function_construct(
@@ -8582,7 +8558,7 @@ impl Interpreter {
                     this_obj
                 } else {
                     let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
+                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
                     let result =
                         self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
@@ -8682,8 +8658,7 @@ impl Interpreter {
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
                     let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone()),
-                        mm.clone(),
+                        Value::object(new_target_proto.clone())
                     ));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function_construct(
@@ -8702,7 +8677,7 @@ impl Interpreter {
                     }
                 } else {
                     let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto), mm.clone()));
+                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function(
                         ctx,
@@ -9015,7 +8990,6 @@ impl Interpreter {
                     pattern.to_string(),
                     flags.to_string(),
                     proto,
-                    ctx.memory_manager().clone(),
                 ));
                 Ok(Value::regex(js_regex))
             }
@@ -9086,7 +9060,7 @@ impl Interpreter {
         ctx: &mut VmContext,
         values: &[Value],
     ) -> VmResult<GcRef<JsObject>> {
-        let arr = GcRef::new(JsObject::array(values.len(), ctx.memory_manager().clone()));
+        let arr = GcRef::new(JsObject::array(values.len()));
         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
             && let Some(array_proto) = array_obj
                 .get(&PropertyKey::string("prototype"))
@@ -9517,8 +9491,7 @@ impl Interpreter {
                 .and_then(|v| v.as_object())
                 .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
             let new_obj = GcRef::new(JsObject::new(
-                ctor_proto.map(Value::object).unwrap_or_else(Value::null),
-                ctx.memory_manager().clone(),
+                ctor_proto.map(Value::object).unwrap_or_else(Value::null)
             ));
             let new_obj_value = Value::object(new_obj);
 
@@ -9567,8 +9540,7 @@ impl Interpreter {
                 Vec::new()
             };
             let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
-                rest_args.len(),
-                ctx.memory_manager().clone(),
+                rest_args.len()
             ));
             if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
                 if let Some(array_proto) = array_obj
@@ -9719,15 +9691,7 @@ impl Interpreter {
                         }
                     }
                     {
-                        let can_try_jit = otter_vm_exec::is_jit_enabled()
-                            && func.is_hot_function()
-                            && !func.is_deoptimized()
-                            && !is_construct
-                            && !is_async
-                            && !func.flags.has_rest
-                            && !func.flags.uses_arguments
-                            && !func.flags.uses_eval
-                            && argc <= func.param_count;
+                        let can_try_jit = Self::can_jit(func, is_construct, is_async, argc);
                         if can_try_jit {
                             let jit_interp: *const Self = self;
                             let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
@@ -9994,8 +9958,7 @@ impl Interpreter {
 
                 // Create the generator's internal object
                 let gen_obj = GcRef::new(JsObject::new(
-                    proto.map(Value::object).unwrap_or_else(Value::null),
-                    ctx.memory_manager().clone(),
+                    proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
 
                 let generator = JsGenerator::new(
@@ -10798,7 +10761,7 @@ impl Interpreter {
     /// Create a JavaScript Promise object from an internal promise
     /// This creates an object with _internal field and copies methods from Promise.prototype
     fn create_js_promise(&self, ctx: &VmContext, internal: GcRef<JsPromise>) -> Value {
-        let obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Set _internal to the raw promise
         let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
@@ -10884,8 +10847,7 @@ impl Interpreter {
             .and_then(|v| v.as_object());
 
         let obj = GcRef::new(JsObject::new(
-            proto.map(Value::object).unwrap_or_else(Value::null),
-            ctx.memory_manager().clone(),
+            proto.map(Value::object).unwrap_or_else(Value::null)
         ));
         let _ = obj.set(
             PropertyKey::string("name"),
@@ -11363,7 +11325,7 @@ impl Interpreter {
                 module: module.clone(),
                 function_index: init_idx,
                 upvalues: captured,
-                object: GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone())),
+                object: GcRef::new(JsObject::new(Value::null())),
                 is_async: false,
                 is_generator: false,
                 home_object: None,
@@ -11420,10 +11382,10 @@ impl Interpreter {
         let frames: Vec<_> = ctx.call_stack().iter().rev().skip(1).take(10).collect();
 
         // Create array to hold stack frame objects
-        let frames_array = GcRef::new(JsObject::array(frames.len(), ctx.memory_manager().clone()));
+        let frames_array = GcRef::new(JsObject::array(frames.len()));
 
         for (i, frame) in frames.iter().enumerate() {
-            let frame_obj = GcRef::new(JsObject::new(Value::null(), ctx.memory_manager().clone()));
+            let frame_obj = GcRef::new(JsObject::new(Value::null()));
 
             // Get function name
             if let Some(func_def) = frame.module.functions.get(frame.function_index as usize) {
@@ -11519,7 +11481,7 @@ fn make_iterator_result_object(
     value: Value,
     done: bool,
 ) -> Value {
-    let iter_result = GcRef::new(JsObject::new(Value::null(), memory_manager));
+    let iter_result = GcRef::new(JsObject::new(Value::null()));
     let _ = iter_result.set(PropertyKey::string("value"), value);
     let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(done));
     Value::object(iter_result)
@@ -12225,6 +12187,14 @@ impl Interpreter {
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
 
+        // Hoist trace config: trace_state doesn't change mid-execution
+        let tracing_enabled = ctx.trace_state.is_some();
+        let trace_capture_timing = ctx
+            .trace_state
+            .as_ref()
+            .map(|s| s.config.capture_timing)
+            .unwrap_or(false);
+
         loop {
             // Periodic interrupt check
             if ctx.should_check_interrupt() {
@@ -12291,8 +12261,8 @@ impl Interpreter {
             let instruction = &func.instructions.read()[frame.pc];
             ctx.record_instruction();
 
-            // Capture trace data while frame is borrowed (record after execution)
-            let trace_data = if ctx.trace_state.is_some() {
+            // Capture trace data (hoisted booleans avoid per-instruction Option probes)
+            let trace_data = if tracing_enabled {
                 Some((
                     frame.pc,
                     frame.function_index,
@@ -12302,11 +12272,6 @@ impl Interpreter {
             } else {
                 None
             };
-            let trace_capture_timing = ctx
-                .trace_state
-                .as_ref()
-                .map(|state| state.config.capture_timing)
-                .unwrap_or(false);
             let trace_start_time = if trace_capture_timing {
                 Some(std::time::Instant::now())
             } else {
@@ -12526,8 +12491,7 @@ impl Interpreter {
                         };
 
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -12595,8 +12559,7 @@ impl Interpreter {
                             Vec::new()
                         };
                         let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len(),
-                            ctx.memory_manager().clone(),
+                            rest_args.len()
                         ));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -14178,8 +14141,8 @@ mod tests {
         let initial_epoch = get_proto_epoch();
 
         // Create objects and set prototype
-        let obj1 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let obj2 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let obj1 = GcRef::new(JsObject::new(Value::null()));
+        let obj2 = GcRef::new(JsObject::new(Value::null()));
 
         // Set prototype should bump epoch
         obj1.set_prototype(Value::object(obj2.clone()));
@@ -14191,7 +14154,7 @@ mod tests {
         );
 
         // Another set_prototype should bump again
-        let obj3 = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let obj3 = GcRef::new(JsObject::new(Value::null()));
         obj2.set_prototype(Value::object(obj3));
 
         let after_second = get_proto_epoch();
@@ -14444,7 +14407,7 @@ mod tests {
 
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Initially not in dictionary mode
         assert!(
@@ -14489,7 +14452,7 @@ mod tests {
 
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Add a few properties
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
@@ -14521,7 +14484,7 @@ mod tests {
 
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Add a property
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
@@ -14557,7 +14520,7 @@ mod tests {
 
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Add and delete a property to trigger dictionary mode
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));

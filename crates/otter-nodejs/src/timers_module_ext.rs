@@ -306,7 +306,7 @@ fn timers_promises_set_interval(
         }
     }
 
-    let iterator = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let iterator = GcRef::new(JsObject::new(Value::null()));
 
     let state_for_next = Arc::clone(&state);
     let tick_value_for_next = tick_value.clone();
@@ -469,7 +469,7 @@ fn signal_is_aborted_value(signal: &Value) -> bool {
 }
 
 fn iteration_result(mm: &Arc<MemoryManager>, value: Value, done: bool) -> Value {
-    let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set(PropertyKey::string("value"), value);
     let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
     Value::object(result)
@@ -558,7 +558,7 @@ fn rejected_promise(ncx: &mut NativeContext, reason: Value) -> Result<Value, VmE
 }
 
 fn wrap_internal_promise(ncx: &NativeContext, internal: GcRef<JsPromise>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
     if let Some(promise_ctor) = ncx

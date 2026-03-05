@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 fn create_test_context() -> VmContext {
     let memory_manager = Arc::new(MemoryManager::test());
-    let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+    let global = GcRef::new(JsObject::new(Value::null()));
     VmContext::new(global, memory_manager)
 }
 

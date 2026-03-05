@@ -454,7 +454,7 @@ impl Intrinsics {
     /// by `VmRuntime` before this call.
     pub fn allocate(mm: &Arc<MemoryManager>, fn_proto: GcRef<JsObject>) -> Self {
         // Helper to allocate an empty object with no prototype
-        let alloc = || GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let alloc = || GcRef::new(JsObject::new(Value::null()));
 
         // Create well-known symbols
         let make_symbol = |id: u64, desc: &str| -> Value {
@@ -871,7 +871,7 @@ impl Intrinsics {
                     .and_then(|v| v.as_object())
                     .map(Value::object)
                     .unwrap_or(Value::null());
-                let result = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(proto));
                 let _ = result.set(PropertyKey::string("value"), value);
                 let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
                 Value::object(result)
@@ -988,7 +988,7 @@ impl Intrinsics {
                     .and_then(|v| v.as_object())
                     .map(Value::object)
                     .unwrap_or(Value::null());
-                let result = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(proto));
                 let _ = result.set(PropertyKey::string("value"), value);
                 let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
                 Value::object(result)
@@ -1089,7 +1089,7 @@ impl Intrinsics {
                             "key" => Value::number(idx as f64),
                             "entry" => {
                                 let entry =
-                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                    GcRef::new(JsObject::array(2));
                                 let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
                                 let elem_val = get_element(&arr_val, idx, ncx)?;
                                 let _ = entry.set(PropertyKey::Index(1), elem_val);
@@ -1313,7 +1313,6 @@ impl Intrinsics {
                         let new_ab = GcRef::new(JsArrayBuffer::new(
                             new_len,
                             None,
-                            ncx.memory_manager().clone(),
                         ));
                         if new_len > 0 {
                             ab.with_data(|src| {
@@ -1717,7 +1716,7 @@ impl Intrinsics {
             .and_then(|v| v.as_int32())
             .map(|id| id as u32)
             .unwrap_or(0);
-        let alloc_ctor = || GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+        let alloc_ctor = || GcRef::new(JsObject::new(Value::object(fn_proto)));
 
         // Helper: install a constructor+prototype pair on the global
         let install = |name: &str,
@@ -2192,7 +2191,7 @@ impl Intrinsics {
                 + Sync,
         > = Box::new(move |_this, args, ncx| {
             let make_array = |len: usize| -> GcRef<JsObject> {
-                let arr = GcRef::new(JsObject::array(len, ncx.memory_manager().clone()));
+                let arr = GcRef::new(JsObject::array(len));
                 arr.set_prototype(Value::object(array_proto));
                 arr
             };
@@ -2459,7 +2458,7 @@ impl Intrinsics {
 
                 // Get prototype from `this` (set by Construct handler)
                 let proto = this.as_object().map(|o| o.prototype());
-                let ab = GcRef::new(JsArrayBuffer::new(len, None, ncx.memory_manager().clone()));
+                let ab = GcRef::new(JsArrayBuffer::new(len, None));
                 // Set the correct prototype on the ArrayBuffer's internal object
                 if let Some(p) = proto {
                     ab.object.set_prototype(p);

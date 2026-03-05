@@ -44,7 +44,7 @@ fn proxy_revocable(
 
     let revocable = JsProxy::revocable(target.clone(), handler.clone());
 
-    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set("proxy".into(), Value::proxy(revocable.proxy));
 
     let revoke_fn = revocable.revoke.clone();

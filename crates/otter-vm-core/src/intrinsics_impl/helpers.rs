@@ -228,7 +228,7 @@ pub fn define_species_getter(
     mm: &Arc<MemoryManager>,
 ) {
     let (_species_name, species_native, _species_len) = species_getter_decl();
-    let getter_object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let getter_object = GcRef::new(JsObject::new(Value::object(fn_proto)));
     getter_object.define_property(
         PropertyKey::string("name"),
         PropertyDescriptor::function_length(Value::string(JsString::intern(

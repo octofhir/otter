@@ -149,8 +149,7 @@ fn create_signal_object(
         .ok_or_else(|| VmError::internal("Realm intrinsics not found"))?;
 
     let signal = JsObject::new(
-        Value::object(intrinsics.abort_signal_prototype),
-        ncx.memory_manager().clone(),
+        Value::object(intrinsics.abort_signal_prototype)
     );
     let signal_val = Value::object(GcRef::new(signal));
 
@@ -235,7 +234,7 @@ fn abort_signal(signal: &Value, reason: Value, ncx: &mut NativeContext) -> Resul
 
     let onabort = get_property(signal, ONABORT_KEY)?.unwrap_or(Value::undefined());
     if onabort.is_callable() {
-        let event = JsObject::new(Value::null(), ncx.memory_manager().clone());
+        let event = JsObject::new(Value::null());
         let event_val = Value::object(GcRef::new(event));
         set_property(&event_val, "type", Value::string(JsString::intern("abort")))?;
         set_property(&event_val, "target", signal.clone())?;

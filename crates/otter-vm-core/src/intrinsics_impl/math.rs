@@ -689,7 +689,7 @@ pub fn install_math_namespace(
     mm: &Arc<MemoryManager>,
     object_prototype: GcRef<JsObject>,
 ) {
-    let math_obj = GcRef::new(JsObject::new(Value::object(object_prototype), mm.clone()));
+    let math_obj = GcRef::new(JsObject::new(Value::object(object_prototype)));
 
     // Math Constants (ES2026 §21.3.1)
     let const_attrs = PropertyAttributes::permanent();

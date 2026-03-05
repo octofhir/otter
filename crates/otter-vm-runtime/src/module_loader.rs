@@ -151,7 +151,7 @@ impl ModuleNamespace {
 
 /// Convert a [`ModuleNamespace`] into a plain JS object whose properties mirror the exports.
 pub fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), mm));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     for (key, value) in namespace.entries() {
         let _ = obj.set(PropertyKey::string(&key), value);
     }
@@ -1785,7 +1785,7 @@ mod tests {
         loader.load(&module_url, ModuleType::CommonJS).unwrap();
 
         let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
-        let exports_obj = GcRef::new(JsObject::new(Value::null(), mm));
+        let exports_obj = GcRef::new(JsObject::new(Value::null()));
         exports_obj
             .set(PropertyKey::string("named"), Value::int32(7))
             .unwrap();
@@ -1817,7 +1817,7 @@ mod tests {
         loader.load(&shared_url, ModuleType::CommonJS).unwrap();
 
         let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
-        let exports_obj = GcRef::new(JsObject::new(Value::null(), Arc::clone(&mm)));
+        let exports_obj = GcRef::new(JsObject::new(Value::null()));
         exports_obj
             .set(PropertyKey::string("value"), Value::int32(1))
             .unwrap();

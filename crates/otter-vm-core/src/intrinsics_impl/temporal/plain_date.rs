@@ -755,7 +755,6 @@ pub(super) fn install_plain_date_prototype(
             let pd = extract_plain_date(&obj)?;
             let result = GcRef::new(JsObject::new(
                 Value::undefined(),
-                ncx.ctx.memory_manager().clone(),
             ));
             result.define_property(
                 PropertyKey::string("calendar"),

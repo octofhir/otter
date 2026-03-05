@@ -98,7 +98,7 @@ impl ChildProcessStub {
     ) -> Result<Value, VmError> {
         // Return a minimal result object: { status: 0, stdout: '', stderr: '', signal: null }
         let mm = ncx.memory_manager().clone();
-        let result = GcRef::new(JsObject::new(Value::null(), mm));
+        let result = GcRef::new(JsObject::new(Value::null()));
         let _ = result.set(PropertyKey::string("status"), Value::int32(0));
         let _ = result.set(
             PropertyKey::string("stdout"),

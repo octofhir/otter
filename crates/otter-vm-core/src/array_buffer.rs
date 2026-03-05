@@ -43,10 +43,9 @@ impl JsArrayBuffer {
     pub fn new(
         byte_length: usize,
         prototype: Option<GcRef<JsObject>>,
-        memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
-        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
+        let object = GcRef::new(JsObject::new(proto_value));
         Self {
             object,
             data: RefCell::new(Some(vec![0; byte_length])),
@@ -59,10 +58,9 @@ impl JsArrayBuffer {
         byte_length: usize,
         max_byte_length: usize,
         prototype: Option<GcRef<JsObject>>,
-        memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
-        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
+        let object = GcRef::new(JsObject::new(proto_value));
         Self {
             object,
             data: RefCell::new(Some(vec![0; byte_length])),
@@ -101,8 +99,8 @@ impl JsArrayBuffer {
         let data = self.data.borrow_mut().take()?;
         // Create new object with same memory manager but fresh object identity/proto
         // Note: Callers might need to set correct proto if not default
-        let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+
+        let object = GcRef::new(JsObject::new(Value::null()));
         Some(JsArrayBuffer {
             object,
             data: RefCell::new(Some(data)),
@@ -118,8 +116,8 @@ impl JsArrayBuffer {
         let copy_len = old_data.len().min(new_length);
         new_data[..copy_len].copy_from_slice(&old_data[..copy_len]);
 
-        let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+
+        let object = GcRef::new(JsObject::new(Value::null()));
 
         Some(JsArrayBuffer {
             object,
@@ -153,8 +151,8 @@ impl JsArrayBuffer {
             new_data.copy_from_slice(&data[actual_start..actual_end]);
         }
 
-        let mm = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+
+        let object = GcRef::new(JsObject::new(Value::null()));
 
         Some(JsArrayBuffer {
             object,
@@ -238,7 +236,7 @@ mod tests {
     #[test]
     fn test_create_array_buffer() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(16, None, mm);
+        let ab = JsArrayBuffer::new(16, None);
         assert_eq!(ab.byte_length(), 16);
         assert!(!ab.is_detached());
         assert!(!ab.is_resizable());
@@ -247,7 +245,7 @@ mod tests {
     #[test]
     fn test_create_resizable() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new_resizable(8, 16, None, mm);
+        let ab = JsArrayBuffer::new_resizable(8, 16, None);
         assert_eq!(ab.byte_length(), 8);
         assert_eq!(ab.max_byte_length(), Some(16));
         assert!(ab.is_resizable());
@@ -256,7 +254,7 @@ mod tests {
     #[test]
     fn test_get_set() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(4, None, mm);
+        let ab = JsArrayBuffer::new(4, None);
         assert!(ab.set(0, 42));
         assert_eq!(ab.get(0), Some(42));
         assert_eq!(ab.get(4), None); // Out of bounds
@@ -265,7 +263,7 @@ mod tests {
     #[test]
     fn test_detach() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(8, None, mm);
+        let ab = JsArrayBuffer::new(8, None);
         assert!(!ab.is_detached());
         ab.detach();
         assert!(ab.is_detached());
@@ -275,7 +273,7 @@ mod tests {
     #[test]
     fn test_transfer() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(8, None, mm);
+        let ab = JsArrayBuffer::new(8, None);
         ab.set(0, 42);
         let new_ab = ab.transfer().unwrap();
         assert!(ab.is_detached());
@@ -286,7 +284,7 @@ mod tests {
     #[test]
     fn test_slice() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(16, None, mm);
+        let ab = JsArrayBuffer::new(16, None);
         ab.set(4, 1);
         ab.set(5, 2);
         ab.set(6, 3);
@@ -303,7 +301,7 @@ mod tests {
     #[test]
     fn test_resize() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new_resizable(8, 16, None, mm);
+        let ab = JsArrayBuffer::new_resizable(8, 16, None);
         ab.set(0, 42);
 
         assert!(ab.resize(12).is_ok());
@@ -316,7 +314,7 @@ mod tests {
     #[test]
     fn test_read_write_bytes() {
         let (mm, _rt) = make_test_env();
-        let ab = JsArrayBuffer::new(8, None, mm);
+        let ab = JsArrayBuffer::new(8, None);
         let src = [1, 2, 3, 4];
         assert!(ab.write_bytes(2, &src));
 

@@ -894,7 +894,7 @@ fn normalize_locale_for_ops(locale: Option<String>) -> String {
 }
 
 fn create_array(ncx: &mut NativeContext<'_>, length: usize) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(length, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(length));
     if let Some(array_ctor) = ncx.ctx.get_global("Array").and_then(|v| v.as_object())
         && let Some(proto) = array_ctor.get(&PropertyKey::string("prototype"))
     {
@@ -907,9 +907,9 @@ fn create_plain_object(ncx: &mut NativeContext<'_>) -> GcRef<JsObject> {
     if let Some(object_ctor) = ncx.ctx.get_global("Object").and_then(|v| v.as_object())
         && let Some(proto) = object_ctor.get(&PropertyKey::string("prototype"))
     {
-        return GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+        return GcRef::new(JsObject::new(proto));
     }
-    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()))
+    GcRef::new(JsObject::new(Value::null()))
 }
 
 fn locale_from_receiver(
@@ -2858,7 +2858,7 @@ fn install_basic_intl_constructor(
     object_proto: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
 ) -> Value {
-    let proto_obj = GcRef::new(JsObject::new(Value::object(object_proto), mm.clone()));
+    let proto_obj = GcRef::new(JsObject::new(Value::object(object_proto)));
     for (name, _length, value) in prototype_methods {
         proto_obj.define_property(
             PropertyKey::string(*name),
@@ -2866,7 +2866,7 @@ fn install_basic_intl_constructor(
         );
     }
 
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
     install_common_constructor_bits(&ctor_obj, ctor_name, ctor_len, proto_obj);
 
     let ctor = Value::native_function_with_proto_and_object(
@@ -2884,8 +2884,7 @@ fn install_basic_intl_constructor(
                     })?
                 } else {
                     GcRef::new(JsObject::new(
-                        Value::object(proto_obj),
-                        ncx.memory_manager().clone(),
+                        Value::object(proto_obj)
                     ))
                 };
                 target.define_property(
@@ -3691,7 +3690,7 @@ pub fn install_intl(
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let intl = GcRef::new(JsObject::new(Value::object(object_proto), mm.clone()));
+    let intl = GcRef::new(JsObject::new(Value::object(object_proto)));
     let to_string_tag_symbol = global
         .get(&PropertyKey::string("Symbol"))
         .and_then(|v| v.as_object())

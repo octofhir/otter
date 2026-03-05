@@ -127,7 +127,7 @@ pub enum VmExecutionResult {
     /// Execution suspended waiting for a Promise
     Suspended(AsyncContext),
     /// Execution failed with an error
-    Error(String),
+    Error(crate::VmError),
 }
 
 impl VmExecutionResult {

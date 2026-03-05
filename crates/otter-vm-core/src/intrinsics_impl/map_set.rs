@@ -362,7 +362,7 @@ fn make_map_iterator(
 ) -> Result<Value, VmError> {
     let (_obj, data) = require_map(this_val, "entries")?;
 
-    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto)));
     // Store MapData reference for live iteration
     let _ = iter.set(pk("__map_data_ref__"), Value::map_data(data));
     let _ = iter.set(pk("__iter_index__"), Value::number(0.0));
@@ -398,7 +398,7 @@ fn make_map_iterator(
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         // Park index at end
@@ -411,14 +411,14 @@ fn make_map_iterator(
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         match kind.as_str() {
                             "key" => {
                                 let _ = result.set(pk("value"), key);
                             }
                             "entry" => {
                                 let entry =
-                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                    GcRef::new(JsObject::array(2));
                                 let _ = entry.set(PropertyKey::Index(0), key);
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
@@ -786,7 +786,7 @@ fn make_set_iterator(
 ) -> Result<Value, VmError> {
     let (_obj, data) = require_set(this_val, "values")?;
 
-    let iter = GcRef::new(JsObject::new(Value::object(iter_proto), mm.clone()));
+    let iter = GcRef::new(JsObject::new(Value::object(iter_proto)));
     let _ = iter.set(pk("__set_data_ref__"), Value::set_data(data));
     let _ = iter.set(pk("__iter_index__"), Value::number(0.0));
     let _ = iter.set(pk("__iter_kind__"), Value::string(JsString::intern(kind)));
@@ -820,7 +820,7 @@ fn make_set_iterator(
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
@@ -832,11 +832,11 @@ fn make_set_iterator(
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
                         let result =
-                            GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         match kind.as_str() {
                             "entry" => {
                                 let entry =
-                                    GcRef::new(JsObject::array(2, ncx.memory_manager().clone()));
+                                    GcRef::new(JsObject::array(2));
                                 let _ = entry.set(PropertyKey::Index(0), value.clone());
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
@@ -1103,7 +1103,7 @@ pub fn init_set_prototype(
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null()));
                 init_set_slots(&result);
                 let result_data = get_set_data(&result).unwrap();
 
@@ -1142,7 +1142,7 @@ pub fn init_set_prototype(
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null()));
                 init_set_slots(&result);
                 let result_data = get_set_data(&result).unwrap();
 
@@ -1180,7 +1180,7 @@ pub fn init_set_prototype(
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null()));
                 init_set_slots(&result);
                 let result_data = get_set_data(&result).unwrap();
 
@@ -1220,7 +1220,7 @@ pub fn init_set_prototype(
                 let other_data = get_set_data(&other_obj)
                     .ok_or_else(|| VmError::type_error("Set object missing internal data"))?;
 
-                let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::new(Value::null()));
                 init_set_slots(&result);
                 let result_data = get_set_data(&result).unwrap();
 
@@ -2004,7 +2004,7 @@ pub fn install_map_statics(
 
                 // Create a new Map
                 let mm = ncx.ctx.memory_manager().clone();
-                let map_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let map_obj = GcRef::new(JsObject::new(Value::null()));
                 // Root map_obj across call_function GC points
                 ncx.ctx.push_root_slot(Value::object(map_obj));
                 // Set Map prototype
@@ -2044,7 +2044,7 @@ pub fn install_map_statics(
                         }
                     } else {
                         // Create new array with this value
-                        let arr = JsObject::array(4, mm.clone());
+                        let arr = JsObject::array(4);
                         // Set Array prototype
                         if let Some(array_proto) = ncx
                             .ctx

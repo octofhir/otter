@@ -2438,6 +2438,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "temporal_rs",
  "thiserror 2.0.17",
  "unicode-normalization",
@@ -2470,6 +2471,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
+ "cranelift-native",
  "otter-vm-bytecode",
  "thiserror 2.0.17",
 ]

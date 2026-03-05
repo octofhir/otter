@@ -413,7 +413,7 @@ fn build_exec_result(
         out.push(val);
     }
 
-    let arr = JsObject::array(out.len(), mm.clone());
+    let arr = JsObject::array(out.len());
     if let Some(array_proto) = get_array_proto(ncx) {
         arr.set_prototype(Value::object(array_proto));
     }
@@ -432,7 +432,7 @@ fn build_exec_result(
     // Named capture groups
     let has_named = regex.capture_group_names.iter().any(|n| n.is_some());
     if has_named {
-        let groups = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let groups = GcRef::new(JsObject::new(Value::null()));
         let mut order: Vec<String> = Vec::new();
         let mut seen_name = std::collections::HashSet::<String>::new();
         let mut values = std::collections::HashMap::<String, Value>::new();
@@ -462,14 +462,14 @@ fn build_exec_result(
 
     // Match indices (d flag / hasIndices)
     if has_indices {
-        let indices_arr = JsObject::array(num_groups + 1, mm.clone());
+        let indices_arr = JsObject::array(num_groups + 1);
         if let Some(array_proto) = get_array_proto(ncx) {
             indices_arr.set_prototype(Value::object(array_proto.clone()));
         }
         for idx in 0..=num_groups {
             let index_pair = match mat.group(idx) {
                 Some(range) => {
-                    let pair = JsObject::array(2, mm.clone());
+                    let pair = JsObject::array(2);
                     if let Some(ap) = get_array_proto(ncx) {
                         pair.set_prototype(Value::object(ap));
                     }
@@ -482,7 +482,7 @@ fn build_exec_result(
             let _ = indices_arr.set(PropertyKey::Index(idx as u32), index_pair);
         }
         if has_named {
-            let groups_indices = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let groups_indices = GcRef::new(JsObject::new(Value::null()));
             let mut order: Vec<String> = Vec::new();
             let mut seen_name = std::collections::HashSet::<String>::new();
             let mut values = std::collections::HashMap::<String, Value>::new();
@@ -494,7 +494,7 @@ fn build_exec_result(
                     values.insert(name.clone(), Value::undefined());
                 }
                 if let Some(range) = mat.group(idx + 1) {
-                    let pair = JsObject::array(2, mm.clone());
+                    let pair = JsObject::array(2);
                     if let Some(ap) = get_array_proto(ncx) {
                         pair.set_prototype(Value::object(ap));
                     }
@@ -1073,8 +1073,7 @@ fn create_regexp_string_iterator(
 ) -> Result<Value, VmError> {
     // Create the iterator object with %IteratorPrototype% as [[Prototype]]
     let iter = GcRef::new(JsObject::new(
-        Value::object(iterator_prototype.clone()),
-        mm.clone(),
+        Value::object(iterator_prototype.clone())
     ));
 
     // Store internal slots as properties
@@ -1215,7 +1214,7 @@ fn make_iter_result(
     done: bool,
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let result = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set(PropertyKey::string("value"), value);
     let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
     Ok(Value::object(result))
@@ -1512,7 +1511,7 @@ pub fn init_regexp_prototype(
                 return Ok(Value::null());
             }
 
-            let arr = JsObject::array(results.len(), ncx.memory_manager().clone());
+            let arr = JsObject::array(results.len());
             if let Some(array_proto) = get_array_proto(ncx) {
                 arr.set_prototype(Value::object(array_proto));
             }
@@ -1563,7 +1562,6 @@ pub fn init_regexp_prototype(
                     regex.pattern.clone(),
                     flags.clone(),
                     proto_obj,
-                    ncx.memory_manager().clone(),
                 ));
                 let val = Value::regex(new_regex.clone());
                 let obj = new_regex.object.clone();
@@ -1739,8 +1737,7 @@ pub fn init_regexp_prototype(
                         } else if let Some(s) = named_captures_val.as_string() {
                             // String → String exotic object wrapper
                             let obj = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx.memory_manager().clone(),
+                                Value::null()
                             ));
                             let _ = obj.set(
                                 PropertyKey::string("length"),
@@ -1756,8 +1753,7 @@ pub fn init_regexp_prototype(
                         } else {
                             // Other primitives (number, boolean) → wrapper objects
                             let obj = GcRef::new(JsObject::new(
-                                Value::null(),
-                                ncx.memory_manager().clone(),
+                                Value::null()
                             ));
                             Some(obj)
                         }
@@ -1891,7 +1887,6 @@ pub fn init_regexp_prototype(
                     regex.pattern.clone(),
                     new_flags,
                     proto_obj,
-                    ncx.memory_manager().clone(),
                 ));
                 let val = Value::regex(new_regex.clone());
                 let obj = new_regex.object.clone();
@@ -1921,7 +1916,7 @@ pub fn init_regexp_prototype(
             let mut parts: Vec<Value> = Vec::new();
 
             if limit == 0 {
-                let arr = JsObject::array(0, ncx.memory_manager().clone());
+                let arr = JsObject::array(0);
                 if let Some(array_proto) = get_array_proto(ncx) {
                     arr.set_prototype(Value::object(array_proto));
                 }
@@ -1935,7 +1930,7 @@ pub fn init_regexp_prototype(
                 if result.is_null() {
                     parts.push(Value::string(JsString::intern(&input_str)));
                 }
-                let arr = JsObject::array(parts.len(), ncx.memory_manager().clone());
+                let arr = JsObject::array(parts.len());
                 if let Some(array_proto) = get_array_proto(ncx) {
                     arr.set_prototype(Value::object(array_proto));
                 }
@@ -2007,7 +2002,7 @@ pub fn init_regexp_prototype(
                 parts.push(Value::string(seg));
             }
 
-            let arr = JsObject::array(parts.len(), ncx.memory_manager().clone());
+            let arr = JsObject::array(parts.len());
             if let Some(array_proto) = get_array_proto(ncx) {
                 arr.set_prototype(Value::object(array_proto));
             }
@@ -2343,7 +2338,6 @@ pub fn create_regexp_constructor(
             pattern_str,
             flags_str,
             Some(proto),
-            ncx.memory_manager().clone(),
         ));
         Ok(Value::regex(regex))
     })

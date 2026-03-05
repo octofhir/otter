@@ -50,7 +50,7 @@ fn get_listeners_map(this: &Value, ncx: &NativeContext) -> Result<GcRef<JsObject
     }
 
     // Create fresh listeners map
-    let map = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let map = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(key, Value::object(map));
     Ok(map)
 }
@@ -66,14 +66,14 @@ fn get_or_create_listener_array(
             return arr;
         }
     }
-    let arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(0));
     let _ = map.set(event.clone(), Value::object(arr));
     arr
 }
 
 /// Create a listener entry object: `{ fn: callback, once: bool }`
 fn make_listener_entry(callback: Value, once: bool, ncx: &NativeContext) -> GcRef<JsObject> {
-    let entry = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let entry = GcRef::new(JsObject::new(Value::null()));
     let _ = entry.set(PropertyKey::string("fn"), callback);
     let _ = entry.set(PropertyKey::string("once"), Value::boolean(once));
     entry
@@ -207,7 +207,7 @@ impl EventEmitter {
             // Remove ALL listeners: replace map with empty object
             if let Some(obj) = this.as_object() {
                 let new_map =
-                    GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                    GcRef::new(JsObject::new(Value::null()));
                 let _ = obj.set(PropertyKey::string(LISTENERS_KEY), Value::object(new_map));
             }
         } else {
@@ -293,7 +293,7 @@ impl EventEmitter {
             if let Some(current_arr_val) = map.get(&event) {
                 if let Some(current_arr) = current_arr_val.as_object() {
                     let current_len = current_arr.array_length();
-                    let new_arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                    let new_arr = GcRef::new(JsObject::array(0));
                     for i in 0..current_len {
                         if !remove_indices.contains(&i) {
                             if let Some(v) = current_arr.get(&PropertyKey::Index(i as u32)) {
@@ -318,7 +318,7 @@ impl EventEmitter {
         let event = event_key(args)?;
         let map = get_listeners_map(this, ncx)?;
 
-        let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+        let result = GcRef::new(JsObject::array(0));
 
         if let Some(arr_val) = map.get(&event) {
             if let Some(arr) = arr_val.as_object() {
@@ -378,7 +378,7 @@ impl EventEmitter {
         ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         let map = get_listeners_map(this, ncx)?;
-        let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+        let result = GcRef::new(JsObject::array(0));
 
         for key in map.own_keys() {
             // Only include events that have at least one listener
@@ -486,7 +486,7 @@ impl EventEmitter {
             }
             // Clear and rebuild
             // Set length to 0 by overwriting
-            let new_arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+            let new_arr = GcRef::new(JsObject::array(0));
             new_arr.array_push(Value::object(entry));
             for v in existing {
                 new_arr.array_push(v);
@@ -544,7 +544,7 @@ impl EventEmitter {
 
                 if let Some(idx) = found_idx {
                     // Rebuild array without the removed element
-                    let new_arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+                    let new_arr = GcRef::new(JsObject::array(0));
                     for i in 0..len {
                         if i != idx {
                             if let Some(v) = arr.get(&PropertyKey::Index(i as u32)) {
@@ -661,7 +661,7 @@ fn events_once(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result
     let resolve_promise = promise_ref;
     let resolve_fn = Value::native_function(
         move |_this, call_args, ncx| {
-            let result = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+            let result = GcRef::new(JsObject::array(0));
             for arg in call_args {
                 result.array_push(arg.clone());
             }
@@ -711,7 +711,7 @@ fn events_once(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result
 
 /// Wrap a JsPromise into a JsObject with Promise.prototype for `.then`/`.catch`/`.finally`.
 fn wrap_promise(ncx: &NativeContext, internal: GcRef<JsPromise>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
     if let Some(promise_ctor) = ncx
@@ -820,7 +820,7 @@ fn build_event_emitter_class(ctx: &RegistrationContext) -> Value {
             // The interpreter already created `this` with EventEmitter.prototype.
             // We just initialize the internal state on it.
             if let Some(obj) = this.as_object() {
-                let map = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+                let map = GcRef::new(JsObject::new(Value::null()));
                 let _ = obj.set(PropertyKey::string(LISTENERS_KEY), Value::object(map));
                 let _ = obj.set(
                     PropertyKey::string(MAX_LISTENERS_KEY),

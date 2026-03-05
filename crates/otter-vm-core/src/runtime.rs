@@ -113,7 +113,7 @@ impl VmRuntime {
         // Per ES2023 §10.3.1, every built-in function object must have this
         // as its [[Prototype]]. By creating it up-front, all native functions
         // can receive it at construction time
-        let function_prototype = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let function_prototype = GcRef::new(JsObject::new(Value::null()));
         function_prototype.mark_as_intrinsic();
         // Realm id for the default realm.
         function_prototype.define_property(
@@ -129,8 +129,7 @@ impl VmRuntime {
         intrinsics.init_core(&memory_manager);
 
         let global = GcRef::new(JsObject::new(
-            Value::object(intrinsics.object_prototype),
-            memory_manager.clone(),
+            Value::object(intrinsics.object_prototype)
         ));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
@@ -195,7 +194,7 @@ impl VmRuntime {
         let realm_id = self.realm_registry.allocate_id();
         let mm = self.memory_manager.clone();
 
-        let function_prototype = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let function_prototype = GcRef::new(JsObject::new(Value::null()));
         function_prototype.mark_as_intrinsic();
         function_prototype.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
@@ -207,8 +206,7 @@ impl VmRuntime {
         intrinsics.init_core(&mm);
 
         let global = GcRef::new(JsObject::new(
-            Value::object(intrinsics.object_prototype),
-            mm.clone(),
+            Value::object(intrinsics.object_prototype)
         ));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),

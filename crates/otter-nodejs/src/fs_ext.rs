@@ -495,7 +495,7 @@ fn data_to_bytes(value: &Value) -> Result<Vec<u8>, VmError> {
 }
 
 fn build_dirent_object(entry: &FsDirEntry, mm: &Arc<MemoryManager>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(&entry.name)),
@@ -594,7 +594,7 @@ fn create_array(
     array_proto: Option<GcRef<JsObject>>,
     len: usize,
 ) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(len, mm.clone()));
+    let arr = GcRef::new(JsObject::array(len));
     if let Some(proto) = array_proto {
         arr.set_prototype(Value::object(proto));
     }
@@ -633,7 +633,7 @@ fn decode_bytes(
 }
 
 fn wrap_internal_promise(ncx: &NativeContext, internal: GcRef<JsPromise>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
     if let Some(promise_ctor) = ncx
@@ -710,7 +710,7 @@ fn extract_file_handle_id(this: &Value, op: &str) -> Result<u64, VmError> {
 
 fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
     let mm = ncx.memory_manager().clone();
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(
         PropertyKey::string("__otterFileHandleId"),
         Value::number(handle_id as f64),
@@ -790,9 +790,7 @@ fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
                     };
 
                     let out = GcRef::new(JsObject::new(
-                        Value::null(),
-                        callback_ncx.memory_manager().clone(),
-                    ));
+                        Value::null()));
                     let _ = out.set(
                         PropertyKey::string("bytesRead"),
                         Value::number(bytes.len() as f64),
@@ -851,9 +849,7 @@ fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
                     };
 
                     let out = GcRef::new(JsObject::new(
-                        Value::null(),
-                        callback_ncx.memory_manager().clone(),
-                    ));
+                        Value::null()));
                     let _ = out.set(
                         PropertyKey::string("bytesWritten"),
                         Value::number(written as f64),
@@ -1038,7 +1034,7 @@ fn extract_dir_handle_id(this: &Value, op: &str) -> Result<u64, VmError> {
 
 fn create_dir_object(ncx: &mut NativeContext, handle_id: u64, path: String) -> Value {
     let mm = ncx.memory_manager().clone();
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     let _ = obj.set(
         PropertyKey::string("__otterDirHandleId"),
         Value::number(handle_id as f64),
@@ -1130,9 +1126,7 @@ fn create_dir_object(ncx: &mut NativeContext, handle_id: u64, path: String) -> V
                     };
 
                     let out = GcRef::new(JsObject::new(
-                        Value::null(),
-                        callback_ncx.memory_manager().clone(),
-                    ));
+                        Value::null()));
                     let done = entry.is_none();
                     let _ = out.set(PropertyKey::string("done"), Value::boolean(done));
                     let value = match entry {
@@ -1208,7 +1202,7 @@ fn construct_error_object(ncx: &mut NativeContext, ctor_name: &str, message: &st
         return value;
     }
 
-    let fallback = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let fallback = GcRef::new(JsObject::new(Value::null()));
     let _ = fallback.set(
         PropertyKey::string("name"),
         Value::string(JsString::new_gc(ctor_name)),
@@ -1304,7 +1298,7 @@ fn settled_promise_from_outcome(
 
 /// Build a Node.js-like Stats object from normalized metadata.
 fn build_stat_object_from_core(metadata: &FsMetadata, mm: &Arc<MemoryManager>) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
 
     let _ = obj.set(
         PropertyKey::string("size"),

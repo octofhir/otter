@@ -19,7 +19,6 @@ use crate::value::Value;
 use otter_macros::dive;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Native JSON hot-loop interrupt check cadence (power-of-two for bitmask checks).
@@ -37,7 +36,7 @@ fn maybe_check_interrupt(ncx: &mut NativeContext<'_>, index: usize) -> Result<()
 /// Also maintains a path for generating helpful error messages.
 struct CircularTracker {
     /// Maps object pointer to index in path
-    visited: HashMap<usize, usize>,
+    visited: FxHashMap<usize, usize>,
     /// Path from root: (property_key, object_ptr, is_array)
     path: Vec<(String, usize, bool)>,
 }
@@ -45,7 +44,7 @@ struct CircularTracker {
 impl CircularTracker {
     fn new() -> Self {
         Self {
-            visited: HashMap::new(),
+            visited: FxHashMap::default(),
             path: Vec::new(),
         }
     }
@@ -226,7 +225,7 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
         A: SeqAccess<'de>,
     {
         let hint = seq.size_hint().unwrap_or(0);
-        let arr = GcRef::new(JsObject::array(hint, self.state.mm.clone()));
+        let arr = GcRef::new(JsObject::array(hint));
         arr.set_prototype(self.state.array_proto.clone());
 
         let mut index = 0usize;
@@ -244,7 +243,6 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
     {
         let obj = GcRef::new(JsObject::new(
             self.state.object_proto.clone(),
-            self.state.mm.clone(),
         ));
 
         let mut seen_keys = FxHashSet::default();
@@ -718,14 +716,17 @@ fn serialize_array_simple(
         return Err(VmError::type_error(msg));
     }
 
-    let len = obj
-        .get(&PropertyKey::string("length"))
-        .and_then(|v| {
-            v.as_int32()
-                .map(|i| i as usize)
-                .or_else(|| v.as_number().map(|n| n as usize))
-        })
-        .unwrap_or(0);
+    let len = if obj.is_array() {
+        obj.array_length()
+    } else {
+        obj.get(&PropertyKey::string("length"))
+            .and_then(|v| {
+                v.as_int32()
+                    .map(|i| i as usize)
+                    .or_else(|| v.as_number().map(|n| n as usize))
+            })
+            .unwrap_or(0)
+    };
 
     if len == 0 {
         out.push_str("[]");
@@ -752,13 +753,21 @@ fn serialize_array_simple(
             }
         }
 
-        let elem = obj
-            .get(&PropertyKey::Index(i as u32))
-            .unwrap_or(Value::undefined());
+        // Use direct elements access for arrays to avoid full property lookup
+        let elem = {
+            let elements = obj.elements.borrow();
+            if i < elements.len() {
+                let v = &elements[i];
+                if !v.is_hole() { v.clone() } else { Value::undefined() }
+            } else {
+                Value::undefined()
+            }
+        };
         let elem = unwrap_primitive(&elem);
-        let elem_key = i.to_string();
 
         let initial_len = out.len();
+        // Use index string only if needed (circular reference error). Avoids i.to_string() alloc.
+        let elem_key = i.to_string();
         let written = serialize_value_simple(
             &elem,
             &elem_key,
@@ -808,18 +817,103 @@ fn serialize_object_simple(
         return Err(VmError::type_error(msg));
     }
 
-    // Get keys - either from property_list (replacer array) or from object
-    // Include enumerable own properties (both string keys and integer indices)
-    // Per spec, integer indices come first in numeric order, then string keys in insertion order
+    // Fast path for shape-based objects (non-dictionary): iterate shape keys + offsets
+    // in one pass, avoiding separate own_keys + get_own_property_descriptor + get lookups.
+    if property_list.is_none() && !obj.is_dictionary_mode() {
+        let shape_keys = obj.own_keys(); // shape keys in insertion order
+        if shape_keys.is_empty() {
+            out.push_str("{}");
+            tracker.exit(ptr);
+            return Ok(());
+        }
+
+        out.push('{');
+        let mut first = true;
+
+        for (i, prop_key) in shape_keys.iter().enumerate() {
+            maybe_check_interrupt(ncx, i)?;
+            // Skip symbols
+            if matches!(prop_key, PropertyKey::Symbol(_)) {
+                continue;
+            }
+            // Get offset from shape and read value + descriptor in one lookup
+            let offset = obj.shape_get_offset(prop_key);
+            let val = if let Some(off) = offset {
+                match obj.get_property_entry_by_offset(off) {
+                    Some(desc) => {
+                        if !desc.enumerable() {
+                            continue;
+                        }
+                        desc.value().cloned().unwrap_or(Value::undefined())
+                    }
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            let val = unwrap_primitive(&val);
+
+            // Get key string
+            let key_str: std::borrow::Cow<str> = match prop_key {
+                PropertyKey::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                PropertyKey::Index(idx) => std::borrow::Cow::Owned(idx.to_string()),
+                PropertyKey::Symbol(_) => unreachable!(),
+            };
+
+            let initial_len = out.len();
+            if !first {
+                out.push(',');
+            }
+            if let Some(ind) = indent {
+                out.push('\n');
+                for _ in 0..=depth {
+                    out.push_str(ind);
+                }
+            }
+
+            out.push('"');
+            escape_json_string(&key_str, out);
+            out.push('"');
+            out.push(':');
+            if indent.is_some() {
+                out.push(' ');
+            }
+
+            let written = serialize_value_simple(
+                &val,
+                &key_str,
+                indent,
+                property_list,
+                tracker,
+                depth + 1,
+                ncx,
+                out,
+            )?;
+            if written {
+                first = false;
+            } else {
+                out.truncate(initial_len);
+            }
+        }
+
+        if let Some(ind) = indent {
+            out.push('\n');
+            for _ in 0..depth {
+                out.push_str(ind);
+            }
+        }
+        out.push('}');
+        tracker.exit(ptr);
+        return Ok(());
+    }
+
+    // Slow path: dictionary mode or with property_list replacer
     let keys: Vec<String> = if let Some(list) = property_list {
         list.clone()
     } else {
         obj.own_keys()
             .into_iter()
             .filter_map(|k| {
-                // Check if property is enumerable
-                // Note: own_keys() may return Index(i) for properties stored as String("i")
-                // so we need to check both forms
                 let desc = obj.get_own_property_descriptor(&k).or_else(|| {
                     if let PropertyKey::Index(i) = &k {
                         obj.get_own_property_descriptor(&PropertyKey::string(&i.to_string()))
@@ -832,7 +926,7 @@ fn serialize_object_simple(
                         return match &k {
                             PropertyKey::String(s) => Some(s.as_str().to_string()),
                             PropertyKey::Index(i) => Some(i.to_string()),
-                            PropertyKey::Symbol(_) => None, // Symbols are not included in JSON
+                            PropertyKey::Symbol(_) => None,
                         };
                     }
                 }
@@ -1490,34 +1584,45 @@ fn json_stringify(
     // Parse space argument
     let space_str = parse_space(args.get(2), ncx)?;
 
-    // Create wrapper object to hold the value
-    // Per spec, wrapper should have Object.prototype as its prototype
-    let global = ncx.ctx.global();
-    let object_proto = global
-        .get(&PropertyKey::string("Object"))
-        .and_then(|o| o.as_object())
-        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-        .unwrap_or_else(Value::null);
-    let wrapper = GcRef::new(JsObject::new(object_proto, ncx.memory_manager().clone()));
-    let _ = wrapper.set(PropertyKey::string(""), val.clone());
-    let wrapper_val = Value::object(wrapper);
-
     let mut tracker = CircularTracker::new();
-
     let mut out = String::with_capacity(128);
 
-    // Serialize
-    let written = stringify_with_replacer(
-        &wrapper_val,
-        "",
-        &replacer_fn,
-        &space_str,
-        &property_list,
-        &mut tracker,
-        0,
-        ncx,
-        &mut out,
-    )?;
+    // Fast path: no replacer, no toJSON on top-level → skip wrapper object allocation
+    let written = if replacer_fn.is_none() {
+        serialize_value_simple(
+            &val,
+            "",
+            &space_str,
+            &property_list,
+            &mut tracker,
+            0,
+            ncx,
+            &mut out,
+        )?
+    } else {
+        // Slow path: create wrapper object for replacer spec compliance
+        let global = ncx.ctx.global();
+        let object_proto = global
+            .get(&PropertyKey::string("Object"))
+            .and_then(|o| o.as_object())
+            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+            .unwrap_or_else(Value::null);
+        let wrapper = GcRef::new(JsObject::new(object_proto));
+        let _ = wrapper.set(PropertyKey::string(""), val.clone());
+        let wrapper_val = Value::object(wrapper);
+
+        stringify_with_replacer(
+            &wrapper_val,
+            "",
+            &replacer_fn,
+            &space_str,
+            &property_list,
+            &mut tracker,
+            0,
+            ncx,
+            &mut out,
+        )?
+    };
 
     if written {
         Ok(Value::string(JsString::intern(&out)))
@@ -1532,7 +1637,7 @@ pub fn install_json_namespace(
     mm: &Arc<MemoryManager>,
     function_prototype: GcRef<JsObject>,
 ) {
-    let json_obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let json_obj = GcRef::new(JsObject::new(Value::null()));
 
     // JSON.parse(text, reviver?) — §25.5.1
     let (parse_name, parse_native, parse_length) = json_parse_decl();
@@ -1713,7 +1818,7 @@ fn parse_replacer(
         let len = get_replacer_length(r, ncx)?;
 
         let mut list = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
 
         for i in 0..len {
             maybe_check_interrupt(ncx, i)?;
@@ -1850,7 +1955,7 @@ fn apply_reviver(
     mm: &Arc<MemoryManager>,
 ) -> Result<Value, VmError> {
     // Create root holder
-    let root = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let root = GcRef::new(JsObject::new(Value::null()));
     let _ = root.set(PropertyKey::string(""), value.clone());
     let root_val = Value::object(root);
 

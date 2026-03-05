@@ -42,8 +42,8 @@ fn test_circular_reference_two_objects() {
 
     // Create circular references in a block so locals go out of scope
     {
-        let obj_a = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let obj_b = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj_a = GcRef::new(JsObject::new(Value::null()));
+        let obj_b = GcRef::new(JsObject::new(Value::null()));
 
         // Set up circular references: a.b = b, b.a = a
         obj_a.set(PropertyKey::string("b"), Value::object(obj_b));
@@ -78,9 +78,9 @@ fn test_circular_reference_chain() {
     let (ctx, mm, _rt) = create_test_context();
 
     {
-        let obj_a = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let obj_b = GcRef::new(JsObject::new(Value::null(), mm.clone()));
-        let obj_c = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj_a = GcRef::new(JsObject::new(Value::null()));
+        let obj_b = GcRef::new(JsObject::new(Value::null()));
+        let obj_c = GcRef::new(JsObject::new(Value::null()));
 
         obj_a.set(PropertyKey::string("next"), Value::object(obj_b));
         obj_b.set(PropertyKey::string("next"), Value::object(obj_c));
@@ -99,7 +99,7 @@ fn test_self_referencing_object() {
     let (ctx, mm, _rt) = create_test_context();
 
     {
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         obj.set(PropertyKey::string("self"), Value::object(obj));
     }
 
@@ -121,7 +121,7 @@ fn test_gc_stress_many_objects() {
     const NUM_OBJECTS: usize = 10_000;
 
     for i in 0..NUM_OBJECTS {
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         obj.set(PropertyKey::string("value"), Value::int32(i as i32));
     }
 
@@ -141,7 +141,7 @@ fn test_gc_stress_with_properties() {
     let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
 
         for j in 0..10 {
             let key = PropertyKey::string(&format!("prop{}", j));
@@ -161,11 +161,11 @@ fn test_gc_stress_nested_objects() {
     let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..100 {
-        let root = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let root = GcRef::new(JsObject::new(Value::null()));
         let mut current = root;
 
         for depth in 0..10 {
-            let child = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let child = GcRef::new(JsObject::new(Value::null()));
             child.set(PropertyKey::string("depth"), Value::int32(depth));
             current.set(PropertyKey::string("child"), Value::object(child));
             current = child;
@@ -189,7 +189,7 @@ fn test_gc_retains_rooted_objects() {
 
     let scope = HandleScope::new(&mut ctx);
 
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     obj.set(PropertyKey::string("important"), Value::int32(42));
 
     assert_eq!(
@@ -201,7 +201,7 @@ fn test_gc_retains_rooted_objects() {
     let handle = scope.root_value(Value::object(obj));
 
     for _ in 0..100 {
-        let _garbage = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _garbage = GcRef::new(JsObject::new(Value::null()));
     }
 
     scope.context().collect_garbage();
@@ -227,14 +227,14 @@ fn test_gc_retains_objects_reachable_from_roots() {
     let scope = HandleScope::new(&mut ctx);
 
     // Create a chain: obj1 -> obj2 -> obj3
-    let obj3 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj3 = GcRef::new(JsObject::new(Value::null()));
     obj3.set(PropertyKey::string("value"), Value::int32(3));
 
-    let obj2 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj2 = GcRef::new(JsObject::new(Value::null()));
     obj2.set(PropertyKey::string("next"), Value::object(obj3));
     obj2.set(PropertyKey::string("value"), Value::int32(2));
 
-    let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj1 = GcRef::new(JsObject::new(Value::null()));
     obj1.set(PropertyKey::string("next"), Value::object(obj2));
     obj1.set(PropertyKey::string("value"), Value::int32(1));
 
@@ -254,7 +254,7 @@ fn test_gc_retains_objects_reachable_from_roots() {
     let handle = scope.root_value(Value::object(obj1));
 
     for _ in 0..50 {
-        let _garbage = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _garbage = GcRef::new(JsObject::new(Value::null()));
     }
 
     scope.context().collect_garbage();
@@ -298,13 +298,13 @@ fn test_gc_nested_handle_scopes() {
     let (mut ctx, mm, _rt) = create_test_context();
 
     let scope1 = HandleScope::new(&mut ctx);
-    let obj1 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj1 = GcRef::new(JsObject::new(Value::null()));
     obj1.set(PropertyKey::string("level"), Value::int32(1));
     let h1 = scope1.root_value(Value::object(obj1));
 
     {
         let scope2 = HandleScope::new(scope1.context_mut());
-        let obj2 = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj2 = GcRef::new(JsObject::new(Value::null()));
         obj2.set(PropertyKey::string("level"), Value::int32(2));
         let h2 = scope2.root_value(Value::object(obj2));
 
@@ -338,7 +338,7 @@ fn test_gc_stats_tracking() {
     let initial_stats = ctx.gc_stats();
 
     for _ in 0..100 {
-        let _obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _obj = GcRef::new(JsObject::new(Value::null()));
     }
 
     ctx.collect_garbage();
@@ -350,7 +350,7 @@ fn test_gc_stats_tracking() {
     );
 
     for _ in 0..100 {
-        let _obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _obj = GcRef::new(JsObject::new(Value::null()));
     }
 
     ctx.collect_garbage();
@@ -369,7 +369,7 @@ fn test_gc_pause_time_recorded() {
     let (ctx, mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
-        let _obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let _obj = GcRef::new(JsObject::new(Value::null()));
     }
 
     ctx.collect_garbage();
@@ -395,7 +395,7 @@ fn test_gc_threshold_trigger() {
     let initial_collection_count = ctx.gc_stats().collection_count;
 
     for _ in 0..100 {
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         obj.set(PropertyKey::string("data"), Value::int32(12345));
     }
 
@@ -416,7 +416,7 @@ fn test_heap_size_reporting() {
 
     let mut objects = Vec::new();
     for _ in 0..100 {
-        let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let obj = GcRef::new(JsObject::new(Value::null()));
         objects.push(obj);
     }
 

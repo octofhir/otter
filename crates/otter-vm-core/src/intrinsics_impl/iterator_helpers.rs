@@ -82,7 +82,7 @@ fn create_iter_result(value: Value, done: bool, ncx: &mut NativeContext<'_>) -> 
         .and_then(|v| v.as_object())
         .map(Value::object)
         .unwrap_or(Value::null());
-    let result = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+    let result = GcRef::new(JsObject::new(proto));
     let _ = result.set(pk("value"), value);
     let _ = result.set(pk("done"), Value::boolean(done));
     Value::object(result)
@@ -173,7 +173,7 @@ fn make_iterator_helper(
     mm: Arc<MemoryManager>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Value {
-    let helper = GcRef::new(JsObject::new(Value::object(iter_helper_proto), mm));
+    let helper = GcRef::new(JsObject::new(Value::object(iter_helper_proto)));
     let _ = helper.set(pk(UNDERLYING_ITER), underlying.clone());
     let _ = helper.set(pk(UNDERLYING_NEXT), next_method);
     let _ = helper.set(pk(HELPER_KIND), Value::string(JsString::intern(kind)));
@@ -489,7 +489,7 @@ fn iterator_to_array(
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let (iter, next) = get_iterator_direct(this_val, ncx)?;
-    let arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(0));
     let mut idx = 0u32;
     loop {
         let (value, done) = iter_step(&iter, &next, ncx)?;
@@ -848,8 +848,7 @@ fn wrap_for_valid_iterator(
 ) -> Result<Value, VmError> {
     let next_method = get_iterator_next(iter, ncx)?;
     let wrapper = GcRef::new(JsObject::new(
-        Value::object(wrap_proto),
-        ncx.memory_manager().clone(),
+        Value::object(wrap_proto)
     ));
     let _ = wrapper.set(pk(UNDERLYING_ITER), iter.clone());
     let _ = wrapper.set(pk(UNDERLYING_NEXT), next_method);

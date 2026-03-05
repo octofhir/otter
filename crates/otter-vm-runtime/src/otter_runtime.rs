@@ -970,8 +970,8 @@ impl Otter {
                     signal = Some(s);
                     pending_async_ctx = Some(async_ctx);
                 }
-                VmExecutionResult::Error(msg) => {
-                    return Err(OtterError::Runtime(msg));
+                VmExecutionResult::Error(err) => {
+                    return Err(OtterError::Runtime(err.to_string()));
                 }
             }
         }
@@ -1039,13 +1039,13 @@ impl Otter {
                             signal = Some(new_signal);
                             pending_async_ctx = Some(new_ctx);
                         }
-                        VmExecutionResult::Error(msg) => {
+                        VmExecutionResult::Error(err) => {
                             if self.interrupt_flag.load(Ordering::Relaxed) {
                                 return Err(OtterError::Runtime(
                                     "Execution interrupted (timeout)".into(),
                                 ));
                             }
-                            return Err(OtterError::Runtime(msg));
+                            return Err(OtterError::Runtime(err.to_string()));
                         }
                     }
                 }
@@ -1493,16 +1493,16 @@ impl Otter {
             PropertyKey::string("__otter_eval"),
             Value::native_function_with_proto(
                 move |_this: &Value, args: &[Value], _mm| {
-                    let mm_result = mm_eval_closure.clone();
+                    let _mm_result = mm_eval_closure.clone();
                     let result_ok = |value: Value| {
-                        let obj = JsObject::new(Value::null(), mm_result.clone());
+                        let obj = JsObject::new(Value::null());
                         let _ = obj.set(PropertyKey::string("ok"), Value::boolean(true));
                         let _ = obj.set(PropertyKey::string("value"), value);
                         Value::object(GcRef::new(obj))
                     };
 
                     let result_err = |error_type: &str, message: &str| {
-                        let obj = JsObject::new(Value::null(), mm_result.clone());
+                        let obj = JsObject::new(Value::null());
                         let _ = obj.set(PropertyKey::string("ok"), Value::boolean(false));
                         let _ = obj.set(
                             PropertyKey::string("errorType"),
@@ -1634,7 +1634,7 @@ impl Otter {
                         );
 
                         let realm_obj =
-                            GcRef::new(JsObject::new(Value::null(), mm_realm_for_create.clone()));
+                            GcRef::new(JsObject::new(Value::null()));
                         let _ = realm_obj
                             .set(PropertyKey::string("global"), Value::object(realm_global));
                         let _ = realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
@@ -1649,7 +1649,6 @@ impl Otter {
         // Create console object from __console_* ops
         let console_obj = GcRef::new(JsObject::new(
             Value::null(),
-            self.isolate.runtime().memory_manager().clone(),
         ));
 
         // Helper to wire console methods from global __console_* functions
@@ -1924,7 +1923,7 @@ impl Otter {
         let env_store_keys = Arc::clone(&env_store);
         let caps_keys = caps.clone();
         let mm_keys = mm_env.clone();
-        let mm_keys_closure = mm_keys.clone();
+        let _mm_keys_closure = mm_keys.clone();
         let _ = global.set(
             PropertyKey::string("__env_keys"),
             Value::native_function_with_proto(
@@ -1934,7 +1933,7 @@ impl Otter {
                         .into_iter()
                         .filter(|key| caps_keys.can_env(key))
                         .collect();
-                    let arr = JsObject::array(keys.len(), mm_keys_closure.clone());
+                    let arr = JsObject::array(keys.len());
                     for (i, key) in keys.into_iter().enumerate() {
                         let _ = arr.set(
                             PropertyKey::Index(i as u32),
@@ -3119,7 +3118,7 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
         }
         serde_json::Value::String(s) => Value::string(otter_vm_core::string::JsString::intern(s)),
         serde_json::Value::Array(arr) => {
-            let js_arr = JsObject::array(arr.len(), mm.clone());
+            let js_arr = JsObject::array(arr.len());
             for (i, elem) in arr.iter().enumerate() {
                 let _ = js_arr.set(
                     PropertyKey::Index(i as u32),
@@ -3129,7 +3128,7 @@ fn json_to_value(json: &serde_json::Value, mm: Arc<otter_vm_core::MemoryManager>
             Value::object(GcRef::new(js_arr))
         }
         serde_json::Value::Object(obj) => {
-            let js_obj = JsObject::new(Value::null(), mm.clone());
+            let js_obj = JsObject::new(Value::null());
             for (key, val) in obj {
                 let _ = js_obj.set(PropertyKey::string(key), json_to_value(val, mm.clone()));
             }
@@ -3146,7 +3145,7 @@ fn make_error_value(ctx: &VmContext, name: &str, message: &str) -> Value {
         .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
         .unwrap_or_else(Value::null);
 
-    let obj = GcRef::new(JsObject::new(proto, ctx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(proto));
     let _ = obj.set(
         PropertyKey::string("name"),
         Value::string(JsString::intern(name)),

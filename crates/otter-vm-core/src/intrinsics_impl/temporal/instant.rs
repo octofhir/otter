@@ -72,8 +72,8 @@ pub(super) fn install_instant(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),

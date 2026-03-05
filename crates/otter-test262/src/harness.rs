@@ -263,10 +263,11 @@ pub fn create_harness_extension() -> Extension {
 #[deprecated(note = "Use create_harness_extension_with_state() with the extension system instead")]
 pub fn setup_harness(ctx: &mut VmContext) {
     let global = ctx.global();
-    let mm = Arc::clone(global.memory_manager());
+    let mm = otter_vm_core::memory::MemoryManager::current()
+        .expect("MemoryManager must be set before setup_harness");
 
     // Create $262 object
-    let obj_262 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&mm)));
+    let obj_262 = GcRef::new(JsObject::new(Value::null()));
 
     // $262.global - Reference to the global object
     let _ = obj_262.set(PropertyKey::string("global"), Value::object(global));

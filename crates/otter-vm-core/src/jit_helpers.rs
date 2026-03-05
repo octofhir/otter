@@ -316,7 +316,7 @@ extern "C" fn otter_rt_get_prop_const(
 
     // Slow path on IC miss: resolve by shape offset and update IC.
     if !obj_ref.is_dictionary_mode() {
-        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+        if let Some(offset) = obj_ref.shape_get_offset(&key) {
             let current_epoch = ctx.proto_epoch;
             match &mut ic.ic_state {
                 InlineCacheState::Uninitialized => {
@@ -491,7 +491,7 @@ extern "C" fn otter_rt_set_prop_const(
 
     // Slow path on IC miss: resolve by shape offset and update IC.
     if !obj_ref.is_dictionary_mode() {
-        if let Some(offset) = obj_ref.shape().get_offset(&key) {
+        if let Some(offset) = obj_ref.shape_get_offset(&key) {
             let current_epoch = ctx.proto_epoch;
             match &mut ic.ic_state {
                 InlineCacheState::Uninitialized => {
@@ -699,8 +699,7 @@ extern "C" fn otter_rt_new_object(ctx_raw: i64) -> i64 {
     let obj = crate::gc::GcRef::new(JsObject::new(
         proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
     crate::value::Value::object(obj).to_jit_bits()
 }
@@ -722,7 +721,7 @@ extern "C" fn otter_rt_new_array(ctx_raw: i64, len_raw: i64) -> i64 {
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
     let len = len_raw as usize;
 
-    let arr = crate::gc::GcRef::new(JsObject::array(len, vm_ctx.memory_manager().clone()));
+    let arr = crate::gc::GcRef::new(JsObject::array(len));
 
     // Fast path: realm intrinsics; fallback to global lookup.
     let realm_id = vm_ctx
@@ -1330,7 +1329,7 @@ extern "C" fn otter_rt_set_elem(
                     elements.push(write_val);
                     // Update length property
                     let length_key = PropertyKey::string("length");
-                    if let Some(len_offset) = obj_ref.shape().get_offset(&length_key) {
+                    if let Some(len_offset) = obj_ref.shape_get_offset(&length_key) {
                         let _ = obj_ref.set_by_offset(
                             len_offset,
                             crate::value::Value::number((idx + 1) as f64),
@@ -1685,7 +1684,7 @@ extern "C" fn otter_rt_call_method(
 
             // Slow path on IC miss: resolve method and update IC.
             if method.is_none() && !obj_ref.is_dictionary_mode() {
-                if let Some(offset) = obj_ref.shape().get_offset(&method_key) {
+                if let Some(offset) = obj_ref.shape_get_offset(&method_key) {
                     let shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
                     let current_epoch = ctx.proto_epoch;
                     match &mut ic.ic_state {
@@ -2998,8 +2997,7 @@ extern "C" fn otter_rt_define_class(
     let derived_proto = GcRef::new(JsObject::new(
         super_proto_obj
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
 
     // Set ctor.prototype = derived_proto
@@ -3494,8 +3492,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
         // Native built-in constructor
         let mm = vm_ctx.memory_manager().clone();
         let new_obj = GcRef::new(JsObject::new(
-            crate::value::Value::object(new_target_proto.clone()),
-            mm,
+            crate::value::Value::object(new_target_proto.clone())
         ));
         let new_obj_value = crate::value::Value::object(new_obj);
         match interpreter.call_function_construct(
@@ -3520,8 +3517,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
     } else {
         let mm = vm_ctx.memory_manager().clone();
         let new_obj = GcRef::new(JsObject::new(
-            crate::value::Value::object(new_target_proto),
-            mm,
+            crate::value::Value::object(new_target_proto)
         ));
         let new_obj_value = crate::value::Value::object(new_obj);
         match interpreter.call_function(vm_ctx, &super_ctor_val, new_obj_value.clone(), &args) {
@@ -3589,8 +3585,7 @@ extern "C" fn otter_rt_async_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     };
 
     let func_obj = GcRef::new(JsObject::new(
-        crate::value::Value::null(),
-        vm_ctx.memory_manager().clone(),
+        crate::value::Value::null()
     ));
 
     // Set [[Prototype]] to Function.prototype
@@ -3690,8 +3685,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     let func_obj = GcRef::new(JsObject::new(
         gen_func_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
     func_obj.define_property(
         PropertyKey::string("__realm_id__"),
@@ -3727,8 +3721,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     let proto = GcRef::new(JsObject::new(
         gen_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
 
     let closure = GcRef::new(crate::value::Closure {
@@ -3813,8 +3806,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
     let func_obj = GcRef::new(JsObject::new(
         async_gen_func_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
     func_obj.define_property(
         PropertyKey::string("__realm_id__"),
@@ -3850,8 +3842,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
     let proto = GcRef::new(JsObject::new(
         gen_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null),
-        vm_ctx.memory_manager().clone(),
+            .unwrap_or_else(crate::value::Value::null)
     ));
 
     let closure = GcRef::new(crate::value::Closure {

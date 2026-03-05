@@ -72,7 +72,7 @@ impl OtterExtension for NodeProcessExtension {
         START_INSTANT.get_or_init(Instant::now);
 
         let mm = ctx.mm().clone();
-        let process_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let process_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
 
         // Set global.global = global (Node.js compatibility)
         let global = ctx.global();
@@ -92,7 +92,7 @@ impl OtterExtension for NodeProcessExtension {
         );
 
         // process.versions
-        let versions_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let versions_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
         let _ = versions_obj.set(
             PropertyKey::string("node"),
             Value::string(JsString::intern("0.1.0")),
@@ -125,7 +125,7 @@ impl OtterExtension for NodeProcessExtension {
         let _ = process_obj.set(PropertyKey::string("argv"), Value::object(argv_arr));
 
         // process.execArgv (empty array for now)
-        let exec_argv = GcRef::new(JsObject::array(0, mm.clone()));
+        let exec_argv = GcRef::new(JsObject::array(0));
         exec_argv.set_prototype(Value::object(ctx.intrinsics().array_prototype));
         let _ = process_obj.set(PropertyKey::string("execArgv"), Value::object(exec_argv));
 
@@ -137,14 +137,14 @@ impl OtterExtension for NodeProcessExtension {
         let _ = process_obj.set(PropertyKey::string("exitCode"), Value::int32(0));
 
         // process.config — needed by common/index.js (hasCrypto check)
-        let config_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
-        let config_vars = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let config_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
+        let config_vars = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
         let _ = config_obj.set(PropertyKey::string("variables"), Value::object(config_vars));
         let _ = config_obj.set(PropertyKey::string("target_defaults"), Value::null());
         let _ = process_obj.set(PropertyKey::string("config"), Value::object(config_obj));
 
         // process.features — needed by common/index.js
-        let features_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto()), mm.clone()));
+        let features_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
         let _ = features_obj.set(PropertyKey::string("inspector"), Value::boolean(false));
         let _ = features_obj.set(PropertyKey::string("debug"), Value::boolean(false));
         let _ = features_obj.set(PropertyKey::string("tls"), Value::boolean(false));
@@ -242,7 +242,7 @@ fn build_argv_array(
     array_prototype: GcRef<JsObject>,
     args: &[String],
 ) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(0, mm.clone()));
+    let arr = GcRef::new(JsObject::array(0));
     arr.set_prototype(Value::object(array_prototype));
     for arg in args {
         arr.array_push(Value::string(JsString::new_gc(arg)));
@@ -253,11 +253,9 @@ fn build_argv_array(
 fn build_env_proxy(ctx: &RegistrationContext) -> GcRef<JsProxy> {
     let target_obj = GcRef::new(JsObject::new(
         Value::object(ctx.obj_proto()),
-        ctx.mm().clone(),
     ));
     let handler_obj = GcRef::new(JsObject::new(
         Value::object(ctx.obj_proto()),
-        ctx.mm().clone(),
     ));
     register_env_proxy_traps(ctx, &handler_obj);
     JsProxy::new(Value::object(target_obj), Value::object(handler_obj))
@@ -412,7 +410,7 @@ fn env_bridge_get(ncx: &mut NativeContext, key: &Value) -> Result<Value, VmError
 }
 
 fn descriptor_to_object_value(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
-    let out = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let out = GcRef::new(JsObject::new(Value::null()));
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
@@ -570,7 +568,7 @@ fn env_proxy_own_keys(args: &[Value], ncx: &mut NativeContext) -> Result<Value, 
         }
     }
 
-    let out = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+    let out = GcRef::new(JsObject::array(0));
     for key in &merged {
         out.array_push(property_key_to_value_pub(key));
     }
@@ -596,7 +594,7 @@ fn env_proxy_get_own_property_descriptor(
         let prop_val = Value::string(prop_str);
         if env_bridge_has(ncx, &prop_val)? {
             let value = env_bridge_get(ncx, &prop_val)?;
-            let desc = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+            let desc = GcRef::new(JsObject::new(Value::null()));
             let _ = desc.set(PropertyKey::string("value"), value);
             let _ = desc.set(PropertyKey::string("writable"), Value::boolean(true));
             let _ = desc.set(PropertyKey::string("enumerable"), Value::boolean(true));
@@ -685,14 +683,14 @@ fn process_hrtime(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmEr
             let diff_secs = diff / 1_000_000_000;
             let diff_nanos = diff % 1_000_000_000;
 
-            let arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+            let arr = GcRef::new(JsObject::array(0));
             arr.array_push(Value::number(diff_secs as f64));
             arr.array_push(Value::number(diff_nanos as f64));
             return Ok(Value::object(arr));
         }
     }
 
-    let arr = GcRef::new(JsObject::array(0, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(0));
     arr.array_push(Value::number(now.as_secs() as f64));
     arr.array_push(Value::number(now.subsec_nanos() as f64));
     Ok(Value::object(arr))
@@ -720,7 +718,7 @@ fn process_uptime(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 #[dive(name = "memoryUsage", length = 0)]
 fn process_memory_usage(ncx: &mut NativeContext) -> Result<Value, VmError> {
     let mm = ncx.memory_manager();
-    let obj = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
     // Best-effort: return stub values; heapUsed could track mm.allocated() later
     let _ = obj.set(PropertyKey::string("rss"), Value::int32(0));
     let _ = obj.set(PropertyKey::string("heapTotal"), Value::int32(0));
@@ -733,7 +731,7 @@ fn process_memory_usage(ncx: &mut NativeContext) -> Result<Value, VmError> {
 #[dive(name = "cpuUsage", length = 1)]
 fn process_cpu_usage(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     // Stub: return { user: 0, system: 0 } or delta from previous value
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
 
     let (prev_user, prev_system) = if let Some(prev) = args.first().and_then(|v| v.as_object()) {
         let u = prev

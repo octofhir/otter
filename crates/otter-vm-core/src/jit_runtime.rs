@@ -126,10 +126,26 @@ pub(crate) fn try_execute_jit(
     };
 
     // Allocate deopt state buffers for precise resume / OSR input.
+    // Use stack-local arrays for small functions (≤32 slots) to avoid heap alloc.
+    const INLINE_DEOPT_SLOTS: usize = 32;
     let local_count = function.local_count as usize;
     let reg_count = function.register_count as usize;
-    let mut deopt_locals = vec![0_i64; local_count];
-    let mut deopt_regs = vec![0_i64; reg_count];
+    let mut inline_locals = [0_i64; INLINE_DEOPT_SLOTS];
+    let mut inline_regs = [0_i64; INLINE_DEOPT_SLOTS];
+    let mut heap_locals: Vec<i64>;
+    let mut heap_regs: Vec<i64>;
+    let deopt_locals: &mut [i64] = if local_count <= INLINE_DEOPT_SLOTS {
+        &mut inline_locals[..local_count]
+    } else {
+        heap_locals = vec![0_i64; local_count];
+        &mut heap_locals
+    };
+    let deopt_regs: &mut [i64] = if reg_count <= INLINE_DEOPT_SLOTS {
+        &mut inline_regs[..reg_count]
+    } else {
+        heap_regs = vec![0_i64; reg_count];
+        &mut heap_regs
+    };
 
     // For OSR entry, pre-fill deopt buffers with the interpreter's frame state.
     // The JIT prologue will load these instead of reading from argv.
@@ -228,7 +244,7 @@ pub(crate) fn try_execute_jit(
         )
     };
 
-    let result = map_exec_result(exec_result, &deopt_locals, &deopt_regs);
+    let result = map_exec_result(exec_result, deopt_locals, deopt_regs);
     if matches!(result, JitCallResult::NotCompiled)
         && function.is_hot_function()
         && !function.is_deoptimized()

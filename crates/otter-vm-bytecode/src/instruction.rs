@@ -1152,6 +1152,10 @@ pub enum Instruction {
         obj: Register,
         shape_id: u64,
         offset: u32,
+        /// Original property name index for fallback on shape miss.
+        name: ConstantIndex,
+        /// Original IC index for fallback on shape miss.
+        ic_index: u16,
     },
     /// Quickened SetPropConst: IC is monomorphic (single shape).
     /// Skips proxy checks, goes directly to shape check + offset store.
@@ -1161,6 +1165,10 @@ pub enum Instruction {
         val: Register,
         shape_id: u64,
         offset: u32,
+        /// Original property name index for fallback on shape miss.
+        name: ConstantIndex,
+        /// Original IC index for fallback on shape miss.
+        ic_index: u16,
     },
 
     // ── Superinstructions (fused pairs) ─────────────────────────

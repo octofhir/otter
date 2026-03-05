@@ -19,6 +19,7 @@
 
 use crate::gc::GcRef;
 use rustc_hash::{FxHashMap, FxHasher};
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
@@ -48,7 +49,7 @@ thread_local! {
 /// thread, `THREAD_STRING_TABLE` points to it so `JsString::intern()` can
 /// find the correct table without explicit parameters.
 pub struct StringTable {
-    strings: RefCell<FxHashMap<u64, Vec<GcRef<JsString>>>>,
+    strings: RefCell<FxHashMap<u64, SmallVec<[GcRef<JsString>; 1]>>>,
 }
 
 // SAFETY: StringTable is only accessed from the single VM thread.
@@ -112,10 +113,9 @@ impl StringTable {
             }
         }
 
-        // Create new interned string
-        let units: Vec<u16> = s.encode_utf16().collect();
+        // Create new interned string (single alloc via Arc::from_iter)
         let js_str = GcRef::new(JsString {
-            repr: StringRepr::Flat(units.into()),
+            repr: StringRepr::Flat(Arc::from_iter(s.encode_utf16())),
             flattened: OnceLock::new(),
             utf8: OnceLock::new(),
             hash: OnceLock::from(hash),
@@ -123,7 +123,7 @@ impl StringTable {
 
         // Add to the hash bucket
         if let Ok(mut borrowed) = self.strings.try_borrow_mut() {
-            borrowed.entry(hash).or_insert_with(Vec::new).push(js_str);
+            borrowed.entry(hash).or_default().push(js_str);
         }
         js_str
     }
@@ -153,7 +153,7 @@ impl StringTable {
 
         // Add to the hash bucket
         if let Ok(mut borrowed) = self.strings.try_borrow_mut() {
-            borrowed.entry(hash).or_insert_with(Vec::new).push(js_str);
+            borrowed.entry(hash).or_default().push(js_str);
         }
         js_str
     }
@@ -237,21 +237,13 @@ impl StringTable {
     /// **Only use this when the weak-ref eviction path (`prune_dead_entries`)
     /// is not in effect.** The two approaches are mutually exclusive.
     pub fn trace_all(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // Collect headers first so we don't hold a RefCell borrow while invoking
-        // the tracer callback (which may re-enter string interning).
-        let headers: Vec<*const otter_vm_gc::GcHeader> = {
-            let borrowed = self.strings.borrow();
-            let mut out = Vec::new();
-            for bucket in borrowed.values() {
-                for js_str in bucket.iter() {
-                    out.push(js_str.header() as *const _);
-                }
+        // GC mark phase does not allocate or intern strings, so holding the
+        // borrow for the duration is safe (no re-entrance into string table).
+        let borrowed = self.strings.borrow();
+        for bucket in borrowed.values() {
+            for js_str in bucket.iter() {
+                tracer(js_str.header() as *const _);
             }
-            out
-        };
-
-        for header in headers {
-            tracer(header);
         }
     }
 }

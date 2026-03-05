@@ -138,16 +138,14 @@ impl JsTypedArray {
         kind: TypedArrayKind,
         length: usize,
         prototype: Option<GcRef<JsObject>>,
-        memory_manager: Arc<MemoryManager>,
     ) -> Self {
         let byte_length = length * kind.element_size();
         let buffer = GcRef::new(JsArrayBuffer::new(
             byte_length,
             None,
-            memory_manager.clone(),
         ));
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
-        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
+        let object = GcRef::new(JsObject::new(proto_value));
         Self {
             object,
             buffer,
@@ -393,8 +391,7 @@ impl JsTypedArray {
 
         // Create new object with same prototype as original
         let prototype = self.object.prototype();
-        let memory_manager = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(prototype, memory_manager));
+        let object = GcRef::new(JsObject::new(prototype));
 
         Ok(JsTypedArray {
             object,
@@ -429,13 +426,11 @@ impl JsTypedArray {
         let elem_size = self.kind.element_size();
         let new_byte_length = new_length * elem_size;
 
-        // Get prototype and memory_manager from existing buffer
+        // Get prototype from existing buffer
         let prototype = self.buffer.object.prototype().as_object();
-        let memory_manager = self.buffer.object.memory_manager().clone();
         let new_buffer = GcRef::new(JsArrayBuffer::new(
             new_byte_length,
             prototype,
-            memory_manager,
         ));
 
         // Copy data
@@ -446,8 +441,7 @@ impl JsTypedArray {
 
         // Create new object with same prototype as original
         let object_prototype = self.object.prototype();
-        let object_memory_manager = self.object.memory_manager().clone();
-        let object = GcRef::new(JsObject::new(object_prototype, object_memory_manager));
+        let object = GcRef::new(JsObject::new(object_prototype));
 
         Ok(JsTypedArray {
             object,
@@ -578,8 +572,8 @@ mod tests {
     #[test]
     fn test_create_int32_array() {
         let (mm, _rt) = make_test_env();
-        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
         assert_eq!(arr.length(), 4);
         assert_eq!(arr.byte_length(), 16);
@@ -589,7 +583,7 @@ mod tests {
     #[test]
     fn test_with_length() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Float64, 10, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Float64, 10, None);
         assert_eq!(arr.length(), 10);
         assert_eq!(arr.byte_length(), 80);
     }
@@ -597,7 +591,7 @@ mod tests {
     #[test]
     fn test_get_set_int32() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 4, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 4, None);
         arr.set(0, 42.0);
         arr.set(1, -100.0);
         arr.set(2, 0.0);
@@ -612,7 +606,7 @@ mod tests {
     #[test]
     fn test_uint8_clamped() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Uint8Clamped, 4, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Uint8Clamped, 4, None);
         arr.set(0, 300.0); // Should clamp to 255
         arr.set(1, -50.0); // Should clamp to 0
         arr.set(2, 127.5); // Should round to 128
@@ -625,7 +619,7 @@ mod tests {
     #[test]
     fn test_subarray() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None);
         for i in 0..10 {
             arr.set(i, i as f64);
         }
@@ -644,7 +638,7 @@ mod tests {
     #[test]
     fn test_slice() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None);
         for i in 0..10 {
             arr.set(i, i as f64);
         }
@@ -661,7 +655,7 @@ mod tests {
     #[test]
     fn test_fill() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None);
         arr.fill(42.0, None, None);
 
         for i in 0..5 {
@@ -672,7 +666,7 @@ mod tests {
     #[test]
     fn test_reverse() {
         let (mm, _rt) = make_test_env();
-        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None, mm);
+        let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None);
         for i in 0..5 {
             arr.set(i, i as f64);
         }
@@ -689,8 +683,8 @@ mod tests {
     #[test]
     fn test_detached_buffer() {
         let (mm, _rt) = make_test_env();
-        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
 
         arr.set(0, 42.0);
@@ -707,8 +701,8 @@ mod tests {
     #[test]
     fn test_alignment_error() {
         let (mm, _rt) = make_test_env();
-        let buf = GcRef::new(JsArrayBuffer::new(16, None, mm.clone()));
-        let object = GcRef::new(JsObject::new(Value::null(), mm));
+        let buf = GcRef::new(JsArrayBuffer::new(16, None));
+        let object = GcRef::new(JsObject::new(Value::null()));
         let result = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 1, 3);
         assert!(result.is_err());
     }

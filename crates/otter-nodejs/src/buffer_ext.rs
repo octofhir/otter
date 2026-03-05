@@ -129,7 +129,7 @@ fn create_buffer_from_bytes(bytes: &[u8], ncx: &NativeContext) -> Value {
         .and_then(|ctor| ctor.get(&PropertyKey::string("prototype")))
         .and_then(|v| v.as_object());
 
-    let ta = JsTypedArray::with_length(TypedArrayKind::Uint8, bytes.len(), buffer_proto, mm);
+    let ta = JsTypedArray::with_length(TypedArrayKind::Uint8, bytes.len(), buffer_proto);
 
     for (i, &b) in bytes.iter().enumerate() {
         ta.set(i, b as f64);
@@ -708,13 +708,13 @@ impl Buffer {
             .ok_or_else(|| VmError::type_error("Buffer.prototype.toJSON: not a Buffer"))?;
 
         let mm = ncx.memory_manager().clone();
-        let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+        let result = GcRef::new(JsObject::new(Value::null()));
         let _ = result.set(
             PropertyKey::string("type"),
             Value::string(JsString::intern("Buffer")),
         );
 
-        let data_arr = GcRef::new(JsObject::array(0, mm));
+        let data_arr = GcRef::new(JsObject::array(0));
         for &b in &bytes {
             data_arr.array_push(Value::number(b as f64));
         }
@@ -854,9 +854,9 @@ fn build_buffer_class(ctx: &RegistrationContext) -> Value {
     let fn_proto = ctx.fn_proto();
 
     // Create Buffer.prototype with Uint8Array.prototype as its [[Prototype]]
-    let buffer_proto = GcRef::new(JsObject::new(Value::object(uint8_proto), mm.clone()));
+    let buffer_proto = GcRef::new(JsObject::new(Value::object(uint8_proto)));
     // Create Buffer constructor with Function.prototype as its [[Prototype]]
-    let buffer_ctor = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let buffer_ctor = GcRef::new(JsObject::new(Value::object(fn_proto)));
 
     let mut builder = BuiltInBuilder::new(mm, fn_proto, buffer_ctor, buffer_proto, "Buffer")
         .constructor_fn(

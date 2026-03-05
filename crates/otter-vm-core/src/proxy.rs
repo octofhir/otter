@@ -162,8 +162,8 @@ mod tests {
     fn test_proxy_creation() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(Value::null()));
+        let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
 
         assert!(!proxy.is_revoked());
@@ -175,8 +175,8 @@ mod tests {
     fn test_proxy_revoke() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(Value::null()));
+        let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
 
         assert!(!proxy.is_revoked());
@@ -190,8 +190,8 @@ mod tests {
     fn test_revocable_proxy() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(Value::null()));
+        let handler = GcRef::new(JsObject::new(Value::null()));
         let RevocableProxy { proxy, revoke } =
             JsProxy::revocable(Value::object(target), Value::object(handler));
 
@@ -204,8 +204,8 @@ mod tests {
     fn test_get_trap_missing() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let target = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let handler = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
+        let target = GcRef::new(JsObject::new(Value::null()));
+        let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
 
         assert!(proxy.get_trap("get").is_none());

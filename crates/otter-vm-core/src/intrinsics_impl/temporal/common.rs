@@ -280,7 +280,7 @@ pub(super) fn construct_duration_object(
     proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) -> GcRef<JsObject> {
-    let obj = GcRef::new(JsObject::new(Value::object(proto.clone()), mm.clone()));
+    let obj = GcRef::new(JsObject::new(Value::object(proto.clone())));
     store_temporal_inner(&obj, TemporalValue::Duration(*dur));
     obj
 }

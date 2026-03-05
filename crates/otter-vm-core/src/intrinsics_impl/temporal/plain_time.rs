@@ -16,8 +16,8 @@ pub(super) fn install_plain_time(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone()), mm.clone()));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone()), mm.clone()));
+    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
@@ -555,7 +555,6 @@ pub(super) fn install_plain_time(
                 .as_object()
                 .ok_or_else(|| VmError::type_error("getISOFields called on non-object"))?;
             let pt = extract_plain_time(&obj)?;
-            let mm = obj.memory_manager();
             let obj_proto_val = obj.prototype();
             // Get Object.prototype (grandparent of PlainTime prototype)
             let base_proto = if let Some(proto) = obj_proto_val.as_object() {
@@ -563,7 +562,7 @@ pub(super) fn install_plain_time(
             } else {
                 Value::null()
             };
-            let result = GcRef::new(JsObject::new(base_proto, mm.clone()));
+            let result = GcRef::new(JsObject::new(base_proto));
             result.define_property(
                 PropertyKey::string("isoHour"),
                 PropertyDescriptor::builtin_data(Value::int32(pt.hour() as i32)),
@@ -645,8 +644,7 @@ pub(super) fn install_plain_time(
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let pt = extract_plain_time(&obj)?;
                     let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone()),
-                        from_mm.clone(),
+                        Value::object(from_proto.clone())
                     ));
                     store_temporal_inner(
                         &result,
@@ -661,8 +659,7 @@ pub(super) fn install_plain_time(
                     let pdt = extract_plain_date_time(&obj)?;
                     let pt = temporal_rs::PlainTime::from(pdt);
                     let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone()),
-                        from_mm.clone(),
+                        Value::object(from_proto.clone())
                     ));
                     store_temporal_inner(
                         &result,
@@ -677,8 +674,7 @@ pub(super) fn install_plain_time(
                     let zdt = extract_zoned_date_time(&obj)?;
                     let pt = zdt.to_plain_time();
                     let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone()),
-                        from_mm.clone(),
+                        Value::object(from_proto.clone())
                     ));
                     store_temporal_inner(
                         &result,
@@ -729,8 +725,7 @@ pub(super) fn install_plain_time(
                 let pt = temporal_rs::PlainTime::from_partial(partial, Some(overflow))
                     .map_err(temporal_err)?;
                 let result = GcRef::new(JsObject::new(
-                    Value::object(from_proto.clone()),
-                    from_mm.clone(),
+                    Value::object(from_proto.clone())
                 ));
                 store_temporal_inner(&result, crate::temporal_value::TemporalValue::PlainTime(pt));
                 return Ok(Value::object(result));

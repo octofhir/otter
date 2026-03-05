@@ -40,10 +40,9 @@ impl JsRegExp {
         pattern: String,
         flags: String,
         proto: Option<GcRef<JsObject>>,
-        memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
-        let object = GcRef::new(JsObject::new(proto_value, memory_manager));
+        let object = GcRef::new(JsObject::new(proto_value));
         object.define_property(
             PropertyKey::string("lastIndex"),
             PropertyDescriptor::data_with_attrs(
@@ -75,10 +74,6 @@ impl JsRegExp {
             fallback_literal_utf16,
             native_regex,
         }
-    }
-
-    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
-        self.object.memory_manager()
     }
 
     /// Execute the regex on a string

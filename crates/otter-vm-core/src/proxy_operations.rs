@@ -12,7 +12,7 @@ use crate::string::JsString;
 use crate::value::Value;
 
 fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(args.len(), ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(args.len()));
     if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
         if let Some(array_obj) = array_ctor.as_object() {
             if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -1004,7 +1004,7 @@ fn validate_define_property_invariants(
 
 /// Convert a PropertyDescriptor to a descriptor object Value
 fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
-    let obj = GcRef::new(JsObject::new(Value::null(), ncx.memory_manager().clone()));
+    let obj = GcRef::new(JsObject::new(Value::null()));
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {

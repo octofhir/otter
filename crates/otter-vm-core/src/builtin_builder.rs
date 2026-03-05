@@ -128,8 +128,8 @@ impl BuiltInBuilder {
         obj_proto: GcRef<JsObject>,
         name: &str,
     ) -> Self {
-        let prototype = GcRef::new(JsObject::new(Value::object(obj_proto), mm.clone()));
-        let constructor = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+        let prototype = GcRef::new(JsObject::new(Value::object(obj_proto)));
+        let constructor = GcRef::new(JsObject::new(Value::object(fn_proto)));
         Self {
             mm,
             fn_proto,
@@ -472,7 +472,7 @@ fn make_native_fn(
     name: &str,
     length: u32,
 ) -> Value {
-    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
 
     fn_obj.define_property(
         PropertyKey::string("length"),

@@ -202,7 +202,7 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
         .unwrap_or(Value::null());
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(obj_proto));
             let _ = desc_obj.set("value".into(), value);
             let _ = desc_obj.set("writable".into(), Value::boolean(attributes.writable));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -217,7 +217,7 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
             set,
             attributes,
         } => {
-            let desc_obj = GcRef::new(JsObject::new(obj_proto, ncx.memory_manager().clone()));
+            let desc_obj = GcRef::new(JsObject::new(obj_proto));
             let _ = desc_obj.set("get".into(), get.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("set".into(), set.unwrap_or(Value::undefined()));
             let _ = desc_obj.set("enumerable".into(), Value::boolean(attributes.enumerable));
@@ -412,7 +412,7 @@ fn reflect_own_keys(
         obj.own_keys()
     };
 
-    let result = GcRef::new(JsObject::array(keys.len(), ncx.memory_manager().clone()));
+    let result = GcRef::new(JsObject::array(keys.len()));
     for (i, key) in keys.into_iter().enumerate() {
         let key_val = crate::proxy_operations::property_key_to_value_pub(&key);
         let _ = result.set(PropertyKey::Index(i as u32), key_val);
@@ -722,7 +722,7 @@ fn reflect_construct(
         let default_proto = default_proto_for_construct(ncx, target, &new_target);
         default_proto.map(Value::object).unwrap_or_else(Value::null)
     };
-    let new_obj = GcRef::new(JsObject::new(proto, ncx.memory_manager().clone()));
+    let new_obj = GcRef::new(JsObject::new(proto));
     let this_val = Value::object(new_obj);
 
     let result = ncx.call_function_construct(target, this_val.clone(), &args_array)?;
@@ -740,7 +740,7 @@ pub fn install_reflect_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager
         .and_then(|v| v.as_object())
         .and_then(|o| o.get(&PropertyKey::string("prototype")))
         .unwrap_or(Value::null());
-    let reflect_obj = GcRef::new(JsObject::new(obj_proto, mm.clone()));
+    let reflect_obj = GcRef::new(JsObject::new(obj_proto));
 
     let methods: &[(&str, crate::value::NativeFn, u32)] = &[
         reflect_get_decl(),

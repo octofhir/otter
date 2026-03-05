@@ -432,9 +432,8 @@ impl HelperKind {
         1
     }
 
-    /// Build the Cranelift IR signature for this helper.
-    pub fn make_signature(self) -> ir::Signature {
-        let call_conv = cranelift_codegen::isa::CallConv::SystemV;
+    /// Build the Cranelift IR signature for this helper using the given calling convention.
+    pub fn make_signature_with_call_conv(self, call_conv: cranelift_codegen::isa::CallConv) -> ir::Signature {
         let mut sig = ir::Signature::new(call_conv);
         for _ in 0..self.param_count() {
             sig.params.push(AbiParam::new(types::I64));
@@ -443,6 +442,11 @@ impl HelperKind {
             sig.returns.push(AbiParam::new(types::I64));
         }
         sig
+    }
+
+    /// Build the Cranelift IR signature for this helper (SystemV fallback).
+    pub fn make_signature(self) -> ir::Signature {
+        self.make_signature_with_call_conv(cranelift_codegen::isa::CallConv::SystemV)
     }
 }
 
@@ -521,11 +525,20 @@ pub(crate) struct HelperFuncIds {
 impl HelperFuncIds {
     /// Declare all available helpers as imported functions on the module.
     pub fn declare<M: Module>(helpers: &RuntimeHelpers, module: &mut M) -> Result<Self, JitError> {
+        Self::declare_with_call_conv(helpers, module, cranelift_codegen::isa::CallConv::SystemV)
+    }
+
+    /// Declare all available helpers with a specific calling convention.
+    pub fn declare_with_call_conv<M: Module>(
+        helpers: &RuntimeHelpers,
+        module: &mut M,
+        call_conv: cranelift_codegen::isa::CallConv,
+    ) -> Result<Self, JitError> {
         let mut ids = [None; HELPER_COUNT];
         for (i, ptr) in helpers.ptrs.iter().enumerate() {
             if ptr.is_some() {
                 let kind = unsafe { std::mem::transmute::<u8, HelperKind>(i as u8) };
-                let sig = kind.make_signature();
+                let sig = kind.make_signature_with_call_conv(call_conv);
                 let func_id = module.declare_function(kind.symbol_name(), Linkage::Import, &sig)?;
                 ids[i] = Some(func_id);
             }

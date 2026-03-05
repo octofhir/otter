@@ -757,8 +757,6 @@ pub struct JsObject {
     pub elements: ObjectCell<Vec<Value>>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
     pub flags: ObjectCell<ObjectFlags>,
-    /// Memory manager for accounting
-    memory_manager: Arc<crate::memory::MemoryManager>,
     /// Parameter mapping for mapped arguments objects (sloppy mode).
     /// None for all non-arguments objects (8 bytes overhead).
     argument_mapping: ObjectCell<Option<Box<ArgumentMapping>>>,
@@ -800,10 +798,11 @@ pub struct ObjectFlags {
 }
 
 impl JsObject {
-    /// Create a new empty object (prototype can be object, proxy, or null)
-    pub fn new(prototype: Value, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
-        // Note: allocation tracking is handled by GcRef::new() which calls mm.alloc().
-        // Do NOT call mm.alloc() here to avoid double-counting.
+    /// Create a new empty object (prototype can be object, proxy, or null).
+    ///
+    /// Memory accounting is handled by `GcRef::new()` which calls
+    /// `MemoryManager::current()` (thread-local) — no per-object Arc needed.
+    pub fn new(prototype: Value) -> Self {
         Self {
             shape: ObjectCell::new(Shape::root()),
             inline_properties: ObjectCell::new([None, None, None, None]),
@@ -815,7 +814,6 @@ impl JsObject {
                 extensible: true,
                 ..Default::default()
             }),
-            memory_manager,
             argument_mapping: ObjectCell::new(None),
         }
     }
@@ -864,7 +862,7 @@ impl JsObject {
         self.argument_mapping.borrow().is_some()
     }
 
-    /// Get argument mapping for GC tracing
+    /// Get argument mapping for GC tracing (allocates)
     pub fn argument_mapping_cells(&self) -> Vec<UpvalueCell> {
         let mapping = self.argument_mapping.borrow();
         match mapping.as_ref() {
@@ -873,13 +871,20 @@ impl JsObject {
         }
     }
 
-    pub fn memory_manager(&self) -> &Arc<crate::memory::MemoryManager> {
-        &self.memory_manager
+    /// Trace argument mapping cells without allocating
+    pub fn trace_argument_mapping(&self, tracer: &mut dyn crate::gc::Tracer) {
+        use crate::gc::Trace;
+        let mapping = self.argument_mapping.borrow();
+        if let Some(m) = mapping.as_ref() {
+            for cell in m.cells.iter().flatten() {
+                cell.trace(tracer);
+            }
+        }
     }
 
     /// Create a new array
-    pub fn array(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
-        let obj = Self::new(Value::null(), memory_manager);
+    pub fn array(length: usize) -> Self {
+        let obj = Self::new(Value::null());
         // Cap dense element pre-allocation to avoid OOM on large sparse arrays.
         const MAX_DENSE_PREALLOC: usize = 1 << 24; // 16M elements
         let mut flags = obj.flags.borrow_mut();
@@ -903,8 +908,8 @@ impl JsObject {
     /// This creates an object with indexed storage like an array,
     /// but is_array=false so Array.isArray() returns false.
     /// Per ES2026 §10.4.4, arguments objects are ordinary objects, not arrays.
-    pub fn array_like(length: usize, memory_manager: Arc<crate::memory::MemoryManager>) -> Self {
-        let obj = Self::new(Value::null(), memory_manager);
+    pub fn array_like(length: usize) -> Self {
+        let obj = Self::new(Value::null());
         const MAX_DENSE_PREALLOC: usize = 1 << 24;
         if length <= MAX_DENSE_PREALLOC {
             obj.elements.borrow_mut().resize(length, Value::undefined());
@@ -1061,9 +1066,24 @@ impl JsObject {
         inline_count + overflow.len()
     }
 
-    /// Get current shape
+    /// Get current shape (clones Arc — atomic refcount bump).
+    /// Prefer `with_shape()` or `shape_get_offset()` on hot paths.
     pub fn shape(&self) -> Arc<Shape> {
         self.shape.borrow().clone()
+    }
+
+    /// Access the shape by reference, without Arc clone.
+    #[inline]
+    pub fn with_shape<R>(&self, f: impl FnOnce(&Shape) -> R) -> R {
+        let borrow = self.shape.borrow();
+        f(&borrow)
+    }
+
+    /// Look up a property offset in the shape without Arc clone.
+    #[inline]
+    pub fn shape_get_offset(&self, key: &PropertyKey) -> Option<usize> {
+        let borrow = self.shape.borrow();
+        borrow.get_offset(key)
     }
 
     /// Get the raw pointer value of the current shape (for IC comparison).
@@ -3567,7 +3587,7 @@ mod tests {
     fn test_own_keys_uses_canonical_array_indices_only() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
 
         let _ = obj.set(PropertyKey::String(JsString::intern("2")), Value::int32(1));
         let _ = obj.set(PropertyKey::String(JsString::intern("1")), Value::int32(2));
@@ -3586,7 +3606,7 @@ mod tests {
     fn test_object_get_set() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
 
         obj.set(PropertyKey::string("foo"), Value::int32(42));
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
@@ -3596,7 +3616,7 @@ mod tests {
     fn test_object_has() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.has(&PropertyKey::string("foo")));
@@ -3607,7 +3627,7 @@ mod tests {
     fn test_array() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let arr = JsObject::array(3, memory_manager);
+        let arr = JsObject::array(3);
         assert!(arr.is_array());
         assert_eq!(arr.array_length(), 3);
 
@@ -3624,7 +3644,7 @@ mod tests {
     fn test_array_holes() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let arr = JsObject::array(3, memory_manager);
+        let arr = JsObject::array(3);
         arr.set(PropertyKey::Index(0), Value::int32(10));
         arr.set(PropertyKey::Index(1), Value::int32(20));
         arr.set(PropertyKey::Index(2), Value::int32(30));
@@ -3653,7 +3673,7 @@ mod tests {
     fn test_array_prefill_holes() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let arr = JsObject::array(5, memory_manager);
+        let arr = JsObject::array(5);
         // new Array(5) should create holes, not present elements
         assert!(!arr.has_own(&PropertyKey::Index(0)));
         assert!(!arr.has_own(&PropertyKey::Index(4)));
@@ -3664,7 +3684,7 @@ mod tests {
     fn test_array_length_truncate() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let arr = JsObject::array(0, memory_manager);
+        let arr = JsObject::array(0);
         arr.set(PropertyKey::Index(0), Value::int32(1));
         arr.set(PropertyKey::Index(1), Value::int32(2));
         arr.set(PropertyKey::Index(2), Value::int32(3));
@@ -3689,7 +3709,7 @@ mod tests {
     fn test_array_length_set_via_property() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let arr = JsObject::array(0, memory_manager);
+        let arr = JsObject::array(0);
         arr.set(PropertyKey::Index(0), Value::int32(10));
         arr.set(PropertyKey::Index(1), Value::int32(20));
         arr.set(PropertyKey::Index(2), Value::int32(30));
@@ -3711,7 +3731,7 @@ mod tests {
     fn test_object_freeze() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
         obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_frozen());
@@ -3746,7 +3766,7 @@ mod tests {
     fn test_object_seal() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(!obj.is_sealed());
@@ -3782,7 +3802,7 @@ mod tests {
     fn test_object_prevent_extensions() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj = JsObject::new(Value::null(), memory_manager);
+        let obj = JsObject::new(Value::null());
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
         assert!(obj.is_extensible());
@@ -3817,7 +3837,7 @@ mod tests {
         // Build a prototype chain of depth 100
         let mut proto_val = Value::null();
         for i in 0..100 {
-            let obj = GcRef::new(JsObject::new(proto_val, Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto_val));
             obj.set(
                 PropertyKey::string(&format!("prop{}", i)),
                 Value::int32(i as i32),
@@ -3825,7 +3845,7 @@ mod tests {
             proto_val = Value::object(obj);
         }
 
-        let child = JsObject::new(proto_val, memory_manager);
+        let child = JsObject::new(proto_val);
 
         // Should be able to access properties at depth 100
         assert_eq!(
@@ -3846,14 +3866,14 @@ mod tests {
         // Build a prototype chain that exceeds the limit (100)
         let mut proto_val = Value::null();
         for i in 0..110 {
-            let obj = GcRef::new(JsObject::new(proto_val, Arc::clone(&memory_manager)));
+            let obj = GcRef::new(JsObject::new(proto_val));
             if i == 0 {
                 obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
             }
             proto_val = Value::object(obj);
         }
 
-        let child = JsObject::new(proto_val, memory_manager);
+        let child = JsObject::new(proto_val);
 
         // Property at depth > 100 should not be found (returns None gracefully)
         assert_eq!(child.get(&PropertyKey::string("deep_prop")), None);
@@ -3864,14 +3884,12 @@ mod tests {
     fn test_prototype_cycle_prevention() {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
-        let obj1 = GcRef::new(JsObject::new(Value::null(), Arc::clone(&memory_manager)));
+        let obj1 = GcRef::new(JsObject::new(Value::null()));
         let obj2 = GcRef::new(JsObject::new(
             Value::object(obj1),
-            Arc::clone(&memory_manager),
         ));
         let obj3 = GcRef::new(JsObject::new(
             Value::object(obj2),
-            Arc::clone(&memory_manager),
         ));
 
         // Attempting to create a cycle should fail
@@ -3882,7 +3900,7 @@ mod tests {
         assert!(obj1.set_prototype(Value::null()));
 
         // Setting to an unrelated object should work
-        let unrelated = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let unrelated = GcRef::new(JsObject::new(Value::null()));
         assert!(obj1.set_prototype(Value::object(unrelated)));
     }
 }

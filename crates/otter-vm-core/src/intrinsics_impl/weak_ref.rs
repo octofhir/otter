@@ -106,7 +106,7 @@ fn weakref_constructor(
         .map(Value::object)
         .unwrap_or(Value::null());
 
-    let obj = GcRef::new(JsObject::new(weak_ref_proto, mm));
+    let obj = GcRef::new(JsObject::new(weak_ref_proto));
     let _ = obj.set(pk(WEAKREF_MARKER), Value::boolean(true));
     let _ = obj.set(pk(WEAKREF_CELL), Value::weak_ref(cell));
 
@@ -173,14 +173,14 @@ fn finreg_constructor(
         .map(Value::object)
         .unwrap_or(Value::null());
 
-    let obj = GcRef::new(JsObject::new(finreg_proto, mm.clone()));
+    let obj = GcRef::new(JsObject::new(finreg_proto));
     let _ = obj.set(pk(FINREG_MARKER), Value::boolean(true));
     let _ = obj.set(pk(FINREG_DATA), Value::finalization_registry(data));
     let _ = obj.set(pk(FINREG_CALLBACK), callback);
 
     // Create arrays for held values and tokens (indexed by entry_index)
-    let held_arr = GcRef::new(JsObject::array(0, mm.clone()));
-    let token_arr = GcRef::new(JsObject::array(0, mm));
+    let held_arr = GcRef::new(JsObject::array(0));
+    let token_arr = GcRef::new(JsObject::array(0));
     let _ = obj.set(pk(FINREG_HELD_VALUES), Value::array(held_arr));
     let _ = obj.set(pk(FINREG_TOKENS), Value::array(token_arr));
 

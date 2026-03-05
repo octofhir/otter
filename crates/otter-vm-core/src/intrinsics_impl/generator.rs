@@ -34,13 +34,13 @@ fn sync_generator_result_to_value(
 ) -> std::result::Result<Value, VmError> {
     match gen_result {
         GeneratorResult::Yielded(v) => {
-            let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let result = GcRef::new(JsObject::new(Value::null()));
             let _ = result.set(PropertyKey::string("value"), v);
             let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
             Ok(Value::object(result))
         }
         GeneratorResult::Returned(v) => {
-            let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+            let result = GcRef::new(JsObject::new(Value::null()));
             let _ = result.set(PropertyKey::string("value"), v);
             let _ = result.set(PropertyKey::string("done"), Value::boolean(true));
             Ok(Value::object(result))
@@ -63,7 +63,7 @@ fn async_generator_result_to_promise(
 
     match gen_result {
         GeneratorResult::Yielded(v) => {
-            let iter_result = GcRef::new(JsObject::new(Value::null(), mm));
+            let iter_result = GcRef::new(JsObject::new(Value::null()));
             let _ = iter_result.set(PropertyKey::string("value"), v);
             let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
             let js_queue = js_queue.clone();
@@ -78,7 +78,7 @@ fn async_generator_result_to_promise(
             );
         }
         GeneratorResult::Returned(v) => {
-            let iter_result = GcRef::new(JsObject::new(Value::null(), mm));
+            let iter_result = GcRef::new(JsObject::new(Value::null()));
             let _ = iter_result.set(PropertyKey::string("value"), v);
             let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(true));
             let js_queue = js_queue.clone();
@@ -112,7 +112,7 @@ fn async_generator_result_to_promise(
             let result_promise = promise.clone();
             let js_queue = js_queue.clone();
             awaited_promise.then(move |resolved_value| {
-                let iter_result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let iter_result = GcRef::new(JsObject::new(Value::null()));
                 let _ = iter_result.set(PropertyKey::string("value"), resolved_value);
                 let _ = iter_result.set(PropertyKey::string("done"), Value::boolean(false));
                 let js_queue = js_queue.clone();
@@ -139,7 +139,7 @@ fn native_from_decl_with_function_proto(
 ) -> Value {
     // Preserve historical function object shape from native_function_with_proto:
     // [[Prototype]] = %Function.prototype%, name="", length=0.
-    let object = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let object = GcRef::new(JsObject::new(Value::object(fn_proto)));
     object.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::int32(0)),

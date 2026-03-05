@@ -55,8 +55,7 @@ pub(crate) fn to_object_for_builtin(
     let proto =
         get_builtin_proto(&global, proto_name).or_else(|| get_builtin_proto(&global, "Object"));
     let obj = GcRef::new(JsObject::new(
-        proto.map(Value::object).unwrap_or_else(Value::null),
-        mm,
+        proto.map(Value::object).unwrap_or_else(Value::null)
     ));
     let _ = obj.set(PropertyKey::string(slot_key), slot_value);
     Ok(obj)
@@ -389,8 +388,7 @@ pub fn init_object_constructor(
                                 .map(Value::object)
                                 .unwrap_or(Value::null());
                             let desc_obj = GcRef::new(JsObject::new(
-                                obj_proto,
-                                ncx_inner.memory_manager().clone(),
+                                obj_proto
                             ));
                             match &desc {
                                 PropertyDescriptor::Data { value, attributes } => {
@@ -452,7 +450,7 @@ pub fn init_object_constructor(
                         .map(Value::object)
                         .unwrap_or(Value::null());
                     let desc_obj =
-                        GcRef::new(JsObject::new(obj_proto, ncx_inner.memory_manager().clone()));
+                        GcRef::new(JsObject::new(obj_proto));
                     match &desc {
                         PropertyDescriptor::Data { value, attributes } => {
                             let _ = desc_obj.set(PropertyKey::string("value"), value.clone());
@@ -557,7 +555,7 @@ pub fn init_object_constructor(
                         _ => {}
                     }
                 }
-                let result = GcRef::new(JsObject::array(names.len(), ncx.memory_manager().clone()));
+                let result = GcRef::new(JsObject::array(names.len()));
                 if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -632,7 +630,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result =
-                    GcRef::new(JsObject::array(values.len(), ncx.memory_manager().clone()));
+                    GcRef::new(JsObject::array(values.len()));
                 if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
                         if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
@@ -711,7 +709,7 @@ pub fn init_object_constructor(
                             _ => continue,
                         };
                         let entry =
-                            GcRef::new(JsObject::array(2, ncx_inner.memory_manager().clone()));
+                            GcRef::new(JsObject::array(2));
                         if let Some(array_ctor) =
                             ncx_inner.global().get(&PropertyKey::string("Array"))
                         {
@@ -731,8 +729,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result = GcRef::new(JsObject::array(
-                    entries.len(),
-                    ncx_inner.memory_manager().clone(),
+                    entries.len()
                 ));
                 if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
@@ -1242,7 +1239,7 @@ pub fn init_object_constructor(
                 };
 
                 let new_obj =
-                    GcRef::new(JsObject::new(prototype, ncx_inner.memory_manager().clone()));
+                    GcRef::new(JsObject::new(prototype));
 
                 // Handle optional properties object (second argument)
                 if let Some(props_val) = args.get(1) {
@@ -1336,7 +1333,7 @@ pub fn init_object_constructor(
                 } else if let Some(obj) = arg.as_object() {
                     obj.own_keys()
                 } else {
-                    let arr = GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                    let arr = GcRef::new(JsObject::array(0));
                     if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))
                     {
                         if let Some(array_obj) = array_ctor.as_object() {
@@ -1368,8 +1365,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result = GcRef::new(JsObject::array(
-                    names.len(),
-                    ncx_inner.memory_manager().clone(),
+                    names.len()
                 ));
                 if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
@@ -1411,7 +1407,7 @@ pub fn init_object_constructor(
                     obj.own_keys()
                 } else {
                     // Primitives (string, number, boolean, symbol) have no own symbol properties
-                    let arr = GcRef::new(JsObject::array(0, ncx_inner.memory_manager().clone()));
+                    let arr = GcRef::new(JsObject::array(0));
                     if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))
                     {
                         if let Some(array_obj) = array_ctor.as_object() {
@@ -1433,8 +1429,7 @@ pub fn init_object_constructor(
                     }
                 }
                 let result = GcRef::new(JsObject::array(
-                    symbols.len(),
-                    ncx_inner.memory_manager().clone(),
+                    symbols.len()
                 ));
                 if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
@@ -1464,8 +1459,7 @@ pub fn init_object_constructor(
                     Some(o) => o,
                     None => {
                         return Ok(Value::object(GcRef::new(JsObject::new(
-                            Value::null(),
-                            ncx_inner.memory_manager().clone(),
+                            Value::null()
                         ))));
                     }
                 };
@@ -1473,14 +1467,12 @@ pub fn init_object_constructor(
                     .map(Value::object)
                     .unwrap_or(Value::null());
                 let result = GcRef::new(JsObject::new(
-                    obj_proto.clone(),
-                    ncx_inner.memory_manager().clone(),
+                    obj_proto.clone()
                 ));
                 for key in obj.own_keys() {
                     if let Some(desc) = obj.get_own_property_descriptor(&key) {
                         let desc_obj = GcRef::new(JsObject::new(
-                            obj_proto.clone(),
-                            ncx_inner.memory_manager().clone(),
+                            obj_proto.clone()
                         ));
                         match &desc {
                             PropertyDescriptor::Data { value, attributes } => {
@@ -1640,8 +1632,7 @@ pub fn init_object_constructor(
                     .as_object()
                     .ok_or_else(|| "Object.fromEntries argument must be iterable".to_string())?;
                 let result = GcRef::new(JsObject::new(
-                    Value::null(),
-                    ncx_inner.memory_manager().clone(),
+                    Value::null()
                 ));
 
                 // Support array-like iterables (check length property)
@@ -1693,7 +1684,7 @@ pub fn init_object_constructor(
                 }
 
                 let mm = ncx.ctx.memory_manager().clone();
-                let result = GcRef::new(JsObject::new(Value::null(), mm.clone()));
+                let result = GcRef::new(JsObject::new(Value::null()));
                 // Root result across call_function GC points
                 ncx.ctx.push_root_slot(Value::object(result));
 
@@ -1785,7 +1776,7 @@ pub fn init_object_constructor(
                                 );
                             }
                         } else {
-                            let arr = JsObject::array(4, mm.clone());
+                            let arr = JsObject::array(4);
                             if let Some(array_proto) = ncx
                                 .ctx
                                 .get_global("Array")
@@ -1837,8 +1828,7 @@ pub fn create_object_constructor() -> Box<
             if arg.is_null() || arg.is_undefined() {
                 let obj_proto = get_proto("Object");
                 let obj = GcRef::new(JsObject::new(
-                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
-                    mm,
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null)
                 ));
                 return Ok(Value::object(obj));
             }
@@ -1861,8 +1851,7 @@ pub fn create_object_constructor() -> Box<
 
             let proto = get_proto(proto_name).or_else(|| get_proto("Object"));
             let obj = GcRef::new(JsObject::new(
-                proto.map(Value::object).unwrap_or_else(Value::null),
-                mm,
+                proto.map(Value::object).unwrap_or_else(Value::null)
             ));
             let _ = obj.set(PropertyKey::string(slot_key), slot_value);
             return Ok(Value::object(obj));
@@ -1898,8 +1887,7 @@ pub fn create_object_rest_helper(fn_proto: GcRef<JsObject>, mm: &Arc<MemoryManag
 
             let proto = get_builtin_proto(&ncx.global(), "Object");
             let result = GcRef::new(JsObject::new(
-                proto.map(Value::object).unwrap_or_else(Value::null),
-                ncx.memory_manager().clone(),
+                proto.map(Value::object).unwrap_or_else(Value::null)
             ));
 
             for key in source_obj.own_keys() {

@@ -950,7 +950,7 @@ pub(super) fn install_plain_date_time_prototype(
                 .get(&PropertyKey::string("prototype"))
                 .unwrap_or(Value::undefined());
 
-            let result_obj = GcRef::new(JsObject::new(pdt_proto, ncx.ctx.memory_manager().clone()));
+            let result_obj = GcRef::new(JsObject::new(pdt_proto));
             store_temporal_inner(&result_obj, TemporalValue::PlainDateTime(pdt));
             Ok(Value::object(result_obj))
         },

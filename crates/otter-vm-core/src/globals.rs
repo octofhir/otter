@@ -35,7 +35,7 @@ fn define_global_fn<F>(
         + Sync
         + 'static,
 {
-    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto), mm.clone()));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
     fn_obj.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::number(length as f64)),
@@ -72,7 +72,8 @@ pub fn setup_global_object(
     fn_proto: GcRef<JsObject>,
     intrinsics_opt: Option<&crate::intrinsics::Intrinsics>,
 ) {
-    let mm = global.memory_manager().clone();
+    let mm = crate::memory::MemoryManager::current()
+        .expect("MemoryManager must be set before setup_global_object");
 
     // globalThis - self-referencing, per spec: {writable: true, enumerable: false, configurable: false}
     global.define_property(
@@ -188,7 +189,8 @@ fn setup_builtin_constructors(
     fn_proto: GcRef<JsObject>,
     intrinsics_opt: Option<&crate::intrinsics::Intrinsics>,
 ) {
-    let mm = global.memory_manager().clone();
+    let mm = crate::memory::MemoryManager::current()
+        .expect("MemoryManager must be set before setup_builtin_constructors");
     let tag_builtin = |ctor: &Value, name: &str| {
         if let Some(obj) = ctor.as_object() {
             obj.define_property(
@@ -513,10 +515,10 @@ fn setup_builtin_constructors(
                 "BigUint64Array" => intrinsics.biguint64_array_prototype,
                 "AbortController" => intrinsics.abort_controller_prototype,
                 "AbortSignal" => intrinsics.abort_signal_prototype,
-                _ => GcRef::new(JsObject::new(Value::null(), mm.clone())),
+                _ => GcRef::new(JsObject::new(Value::null())),
             }
         } else {
-            GcRef::new(JsObject::new(Value::null(), mm.clone()))
+            GcRef::new(JsObject::new(Value::null()))
         };
 
         // Create constructor based on type — all get fn_proto as [[Prototype]]
@@ -610,7 +612,6 @@ fn setup_builtin_constructors(
                     let ab = GcRef::new(JsArrayBuffer::new(
                         len,
                         Some(fn_proto),
-                        ncx.memory_manager().clone(),
                     ));
                     Ok(Value::array_buffer(ab))
                 },
@@ -676,10 +677,9 @@ fn setup_builtin_constructors(
                     if args.is_empty() {
                         // new TypedArray() - create empty with length 0
                         let buffer =
-                            GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                            GcRef::new(JsArrayBuffer::new(0, None));
                         let object = GcRef::new(JsObject::new(
-                            Value::object(proto_clone),
-                            ncx.memory_manager().clone(),
+                            Value::object(proto_clone)
                         ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                             .map_err(|e| VmError::type_error(e))?;
@@ -702,8 +702,7 @@ fn setup_builtin_constructors(
                         };
 
                         let object = GcRef::new(JsObject::new(
-                            Value::object(proto_clone),
-                            ncx.memory_manager().clone(),
+                            Value::object(proto_clone)
                         ));
                         let ta =
                             JsTypedArray::new(object, buffer.clone(), kind, byte_offset, length)
@@ -720,11 +719,9 @@ fn setup_builtin_constructors(
                         let buffer = GcRef::new(JsArrayBuffer::new(
                             byte_len,
                             None,
-                            ncx.memory_manager().clone(),
                         ));
                         let object = GcRef::new(JsObject::new(
-                            Value::object(proto_clone),
-                            ncx.memory_manager().clone(),
+                            Value::object(proto_clone)
                         ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
@@ -754,11 +751,9 @@ fn setup_builtin_constructors(
                         let buffer = GcRef::new(JsArrayBuffer::new(
                             byte_len,
                             None,
-                            ncx.memory_manager().clone(),
                         ));
                         let object = GcRef::new(JsObject::new(
-                            Value::object(proto_clone),
-                            ncx.memory_manager().clone(),
+                            Value::object(proto_clone)
                         ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
@@ -776,11 +771,9 @@ fn setup_builtin_constructors(
                         let buffer = GcRef::new(JsArrayBuffer::new(
                             byte_len,
                             None,
-                            ncx.memory_manager().clone(),
                         ));
                         let object = GcRef::new(JsObject::new(
-                            Value::object(proto_clone),
-                            ncx.memory_manager().clone(),
+                            Value::object(proto_clone)
                         ));
                         let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                             .map_err(|e| VmError::type_error(e))?;
@@ -842,11 +835,9 @@ fn setup_builtin_constructors(
                             let buffer = GcRef::new(JsArrayBuffer::new(
                                 byte_len,
                                 None,
-                                ncx.memory_manager().clone(),
                             ));
                             let object = GcRef::new(JsObject::new(
-                                Value::object(proto_clone),
-                                ncx.memory_manager().clone(),
+                                Value::object(proto_clone)
                             ));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
@@ -874,11 +865,9 @@ fn setup_builtin_constructors(
                                 let buffer = GcRef::new(JsArrayBuffer::new(
                                     length * kind.element_size(),
                                     None,
-                                    ncx.memory_manager().clone(),
                                 ));
                                 let object = GcRef::new(JsObject::new(
-                                    Value::object(proto_clone),
-                                    ncx.memory_manager().clone(),
+                                    Value::object(proto_clone)
                                 ));
                                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                     .map_err(|e| VmError::type_error(e))?;
@@ -901,10 +890,9 @@ fn setup_builtin_constructors(
 
                     // Default: treat as length 0
                     let buffer =
-                        GcRef::new(JsArrayBuffer::new(0, None, ncx.memory_manager().clone()));
+                        GcRef::new(JsArrayBuffer::new(0, None));
                     let object = GcRef::new(JsObject::new(
-                        Value::object(proto_clone),
-                        ncx.memory_manager().clone(),
+                        Value::object(proto_clone)
                     ));
                     let ta = JsTypedArray::new(object, buffer, kind, 0, 0)
                         .map_err(|e| VmError::type_error(e))?;
@@ -928,7 +916,7 @@ fn setup_builtin_constructors(
                     // and arguments are present, we might want to set properties.
                     // For Error types, setting 'message' is crucial.
                     if let Some(msg) = args.get(0) {
-                        let obj = JsObject::new(Value::null(), ncx.memory_manager().clone());
+                        let obj = JsObject::new(Value::null());
                         let _ = obj.set(PropertyKey::string("message"), msg.clone());
                         return Ok(Value::object(GcRef::new(obj)));
                     }
@@ -1111,11 +1099,9 @@ fn setup_builtin_constructors(
                             let buffer = GcRef::new(JsArrayBuffer::new(
                                 length * kind.element_size(),
                                 None,
-                                ncx.memory_manager().clone(),
                             ));
                             let object = GcRef::new(JsObject::new(
-                                Value::object(proto_of),
-                                ncx.memory_manager().clone(),
+                                Value::object(proto_of)
                             ));
                             let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                                 .map_err(|e| VmError::type_error(e))?;
@@ -2099,8 +2085,8 @@ mod tests {
     fn test_global_this_setup() {
         let runtime = crate::runtime::VmRuntime::new();
         let memory_manager = runtime.memory_manager().clone();
-        let global = GcRef::new(JsObject::new(Value::null(), memory_manager.clone()));
-        let fn_proto = GcRef::new(JsObject::new(Value::null(), memory_manager));
+        let global = GcRef::new(JsObject::new(Value::null()));
+        let fn_proto = GcRef::new(JsObject::new(Value::null()));
         setup_global_object(global, fn_proto, None);
 
         // globalThis should reference the global object itself

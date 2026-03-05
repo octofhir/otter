@@ -169,7 +169,7 @@ fn es_trim_end(s: &str) -> &str {
 
 /// Create an array with proper Array.prototype
 fn create_array(ncx: &mut NativeContext, length: usize) -> GcRef<JsObject> {
-    let arr = GcRef::new(JsObject::array(length, ncx.memory_manager().clone()));
+    let arr = GcRef::new(JsObject::array(length));
     // Set Array.prototype as prototype
     if let Some(array_ctor) = ncx.ctx.get_global("Array").and_then(|v| v.as_object()) {
         if let Some(proto) = array_ctor.get(&PropertyKey::string("prototype")) {
@@ -320,7 +320,7 @@ fn make_string_iterator(
     let string = require_object_coercible_to_string(this_val, ncx)?;
 
     // Create iterator object with %StringIteratorPrototype% as prototype
-    let iter = GcRef::new(JsObject::new(Value::object(string_iter_proto), mm));
+    let iter = GcRef::new(JsObject::new(Value::object(string_iter_proto)));
 
     // Store the string reference and current index
     let _ = iter.set(PropertyKey::string("__string_ref__"), Value::string(string));

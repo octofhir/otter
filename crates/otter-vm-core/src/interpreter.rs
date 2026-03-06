@@ -11864,7 +11864,7 @@ impl Interpreter {
         ctx.set_pending_upvalues(frame.upvalues.clone());
         ctx.set_pending_this(frame.this_value.clone());
 
-        // Set up the locals as pending args (they'll be copied to locals)
+        // Set up the locals as pending args (they'll be copied into the register window)
         ctx.set_pending_args(frame.locals.clone());
 
         // Get function info
@@ -11886,12 +11886,12 @@ impl Interpreter {
         // Restore PC (push_frame sets it to 0, we need to set it to the saved value)
         ctx.set_pc(frame.pc);
 
-        // Restore registers
+        // Restore registers (scratch registers, after locals in the window)
         for (i, reg_value) in frame.registers.iter().enumerate() {
             ctx.set_register(i as u16, reg_value.clone());
         }
 
-        // Restore locals
+        // Restore locals (overwrite what push_frame set from pending_args)
         for (i, local_value) in frame.locals.iter().enumerate() {
             ctx.set_local(i as u16, local_value.clone())?;
         }
@@ -11934,11 +11934,21 @@ impl Interpreter {
             })
             .collect();
 
+        // Extract locals from the register window
+        let local_count = current_frame.local_count;
+        let mut locals = Vec::with_capacity(local_count);
+        for i in 0..local_count {
+            locals.push(
+                ctx.get_local(i as u16)
+                    .unwrap_or_else(|_| Value::undefined()),
+            );
+        }
+
         Ok(GeneratorFrame::new(
             current_frame.pc,
             current_frame.function_index,
             Arc::clone(&current_frame.module),
-            current_frame.locals.clone(),
+            locals,
             registers,
             current_frame.upvalues.clone(),
             try_stack,

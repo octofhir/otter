@@ -678,20 +678,17 @@ impl Trace for crate::generator::JsGenerator {
     }
 }
 
-// Implement Trace for UpvalueCell
+// Implement Trace for UpvalueCell — delegates to GC-managed UpvalueData
 impl Trace for crate::value::UpvalueCell {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        tracer.mark_value(&self.get());
+        tracer.mark_header(self.header() as *const _);
     }
 }
 
 // Implement Trace for CallFrame
 impl Trace for crate::context::CallFrame {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        // Trace locals
-        for value in &self.locals {
-            tracer.mark_value(value);
-        }
+        // Note: locals are in the shared register array (traced separately by VmContext)
 
         // Trace captured upvalues
         for cell in &self.upvalues {
@@ -778,9 +775,7 @@ impl Trace for crate::context::VmContext {
 // Implement Trace for SavedFrame
 impl Trace for crate::async_context::SavedFrame {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        for val in &self.locals {
-            tracer.mark_value(val);
-        }
+        // Registers vec contains the full window (locals + scratch regs)
         for val in &self.registers {
             tracer.mark_value(val);
         }

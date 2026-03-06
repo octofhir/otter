@@ -39,10 +39,62 @@ use crate::shared_buffer::SharedArrayBuffer;
 use crate::string::JsString;
 use crate::temporal_value::TemporalValue;
 use crate::typed_array::JsTypedArray;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::sync::Arc;
 
-/// Heap-allocated cell for mutable upvalues (closures)
+/// GC-managed interior of an upvalue cell.
+///
+/// Holds a single mutable `Value` via `Cell` (safe because the VM is
+/// single-threaded within an Isolate).  The GC traces through this to
+/// keep the captured value alive.
+pub struct UpvalueData {
+    value: Cell<Value>,
+}
+
+// SAFETY: UpvalueData is only accessed from the single VM thread.
+// Thread confinement is enforced by the Isolate abstraction.
+// Cell<Value> is Send (Value is Send) but !Sync; the unsafe Sync impl
+// is required so that GcRef<UpvalueData> satisfies Send+Sync bounds.
+unsafe impl Sync for UpvalueData {}
+
+impl UpvalueData {
+    /// Create a new upvalue data cell.
+    #[inline]
+    pub fn new(value: Value) -> Self {
+        Self {
+            value: Cell::new(value),
+        }
+    }
+
+    /// Read the current value (Copy, no locking).
+    #[inline]
+    pub fn get(&self) -> Value {
+        self.value.get()
+    }
+
+    /// Write a new value (no locking).
+    #[inline]
+    pub fn set(&self, value: Value) {
+        self.value.set(value);
+    }
+}
+
+impl otter_vm_gc::GcTraceable for UpvalueData {
+    const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::UPVALUE;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        self.value.get().trace(tracer);
+    }
+}
+
+impl std::fmt::Debug for UpvalueData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UpvalueData({:?})", self.value.get())
+    }
+}
+
+/// A reference to a GC-managed upvalue cell.
 ///
 /// When a closure captures a local variable that may be mutated,
 /// we store it in an UpvalueCell. Multiple closures can share
@@ -54,38 +106,34 @@ use std::sync::Arc;
 ///     return () => ++count;  // Increments shared count
 /// }
 /// ```
-#[derive(Clone)]
-pub struct UpvalueCell(Arc<RefCell<Value>>);
-
-// SAFETY: UpvalueCell is only accessed from the single VM thread.
-// Thread confinement is enforced by the Isolate abstraction: each Isolate
-// is `Send` but `!Sync`. UpvalueCell is never shared between threads.
-// Arc<RefCell<Value>> allows shared ownership within a single-threaded isolate
-// (closures sharing upvalue cells). The `Sync` impl enables containing types
-// to be `Send` per Rust's auto-trait rules.
-unsafe impl Send for UpvalueCell {}
-unsafe impl Sync for UpvalueCell {}
+///
+/// `UpvalueCell` is `Copy` (8 bytes — just a GcRef pointer).
+/// The actual mutable value lives in the GC-managed `UpvalueData`.
+#[derive(Clone, Copy, Debug)]
+pub struct UpvalueCell(pub(crate) GcRef<UpvalueData>);
 
 impl UpvalueCell {
-    /// Create a new upvalue cell with the given value
+    /// Create a new upvalue cell with the given value (GC-allocated).
     pub fn new(value: Value) -> Self {
-        Self(Arc::new(RefCell::new(value)))
+        Self(GcRef::new(UpvalueData::new(value)))
     }
 
-    /// Get the current value from the cell
+    /// Get the current value from the cell.
+    #[inline]
     pub fn get(&self) -> Value {
-        self.0.borrow().clone()
+        self.0.get()
     }
 
-    /// Set a new value in the cell
+    /// Set a new value in the cell.
+    #[inline]
     pub fn set(&self, value: Value) {
-        *self.0.borrow_mut() = value;
+        self.0.set(value);
     }
-}
 
-impl std::fmt::Debug for UpvalueCell {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UpvalueCell({:?})", *self.0.borrow())
+    /// Get the GC header (for tracing).
+    #[inline]
+    pub fn header(&self) -> &otter_vm_gc::GcHeader {
+        self.0.header()
     }
 }
 
@@ -201,10 +249,9 @@ impl otter_vm_gc::GcTraceable for Closure {
             tracer(home.header() as *const _);
         }
 
-        // Each UpvalueCell contains Arc<RefCell<Value>>, trace the Value inside
+        // Trace each GC-managed upvalue cell
         for upvalue in &self.upvalues {
-            let value = upvalue.get(); // Locks and clones the Value
-            value.trace(tracer);
+            tracer(upvalue.header() as *const _);
         }
     }
 }

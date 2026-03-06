@@ -2778,6 +2778,10 @@ impl Compiler {
         self.codegen.enter_scope();
         let mut lexical_blocked = HashSet::new();
 
+        // Collect `let` binding names from init for per-iteration scoping (ES2015 §14.7.4.2).
+        // `const` bindings don't need per-iteration treatment (spec: perIterationLets is empty for const).
+        let mut per_iteration_let_names: Vec<String> = Vec::new();
+
         // Compile init
         if let Some(init) = &for_stmt.init {
             match init {
@@ -2786,6 +2790,13 @@ impl Compiler {
                         for declarator in &decl.declarations {
                             Self::collect_binding_names(&declarator.id, &mut lexical_blocked);
                         }
+                    }
+                    if decl.kind == VariableDeclarationKind::Let {
+                        let mut names = HashSet::new();
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut names);
+                        }
+                        per_iteration_let_names = names.into_iter().collect();
                     }
                     self.compile_variable_declaration(decl)?;
                 }
@@ -2825,14 +2836,43 @@ impl Compiler {
             this.compile_statement(&for_stmt.body)
         })?;
 
+        // ES2015 §14.7.4.2 CreatePerIterationEnvironment:
+        // Close upvalues for `let` bindings so each iteration gets a fresh cell.
+        // `continue` jumps here (before update) to ensure upvalues are closed.
+        let close_upvalues_start = self.codegen.current_index();
+        if !per_iteration_let_names.is_empty() {
+            // Resolve names to local indices and emit CloseUpvalue for each.
+            // If the binding wasn't captured, CloseUpvalue is a runtime no-op.
+            for name in &per_iteration_let_names {
+                if let Some(crate::scope::ResolvedBinding::Local(idx)) =
+                    self.codegen.current.scopes.resolve(name)
+                {
+                    self.codegen.emit(Instruction::CloseUpvalue {
+                        local_idx: otter_vm_bytecode::LocalIndex(idx),
+                    });
+                }
+            }
+        }
+
         // Compile update
         let update_start = self.codegen.current_index();
+        // continue target = close_upvalues_start (before update), so continue
+        // also closes per-iteration upvalues before running the update expression.
+        let effective_continue_target = if !per_iteration_let_names.is_empty() {
+            close_upvalues_start
+        } else {
+            update_start
+        };
         if let Some(update) = &for_stmt.update {
             if let Some(loop_ctl) = self.loop_stack.last_mut() {
-                loop_ctl.continue_target = Some(update_start);
+                loop_ctl.continue_target = Some(effective_continue_target);
             }
             let reg = self.compile_expression(update)?;
             self.codegen.free_reg(reg);
+        } else if !per_iteration_let_names.is_empty() {
+            if let Some(loop_ctl) = self.loop_stack.last_mut() {
+                loop_ctl.continue_target = Some(effective_continue_target);
+            }
         }
 
         // Jump back to start

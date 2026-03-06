@@ -114,10 +114,9 @@ impl GeneratorFrame {
             value.trace(tracer);
         }
 
-        // Trace upvalue values (each UpvalueCell contains Arc<RefCell<Value>>)
+        // Trace GC-managed upvalue cells
         for upvalue in &self.upvalues {
-            let value = upvalue.get(); // Locks and clones the Value
-            value.trace(tracer);
+            tracer(upvalue.header() as *const _);
         }
 
         // Trace this value

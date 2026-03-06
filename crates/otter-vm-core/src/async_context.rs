@@ -64,9 +64,9 @@ pub struct SavedFrame {
     pub realm_id: crate::realm::RealmId,
     /// Program counter (instruction index)
     pub pc: usize,
-    /// Local variables snapshot
-    pub locals: Vec<Value>,
-    /// Register values for this frame's live register window
+    /// Number of local variable slots at the start of the register window
+    pub local_count: usize,
+    /// Register values for this frame's full register window (locals + scratch regs)
     pub registers: Vec<Value>,
     /// Captured upvalues (heap-allocated cells)
     pub upvalues: Vec<UpvalueCell>,
@@ -91,7 +91,7 @@ impl SavedFrame {
         module: Arc<Module>,
         realm_id: crate::realm::RealmId,
         pc: usize,
-        locals: Vec<Value>,
+        local_count: usize,
         registers: Vec<Value>,
         upvalues: Vec<UpvalueCell>,
         return_register: Option<u16>,
@@ -106,7 +106,7 @@ impl SavedFrame {
             module,
             realm_id,
             pc,
-            locals,
+            local_count,
             registers,
             upvalues,
             return_register,

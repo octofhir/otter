@@ -226,6 +226,8 @@ pub mod tags {
     pub const SHARED_ARRAY_BUFFER: u8 = 24;
     /// Temporal value (PlainDate, PlainTime, Duration, etc.)
     pub const TEMPORAL: u8 = 25;
+    /// Upvalue cell (closure-captured mutable variable)
+    pub const UPVALUE: u8 = 26;
 }
 
 #[cfg(test)]

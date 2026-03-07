@@ -789,8 +789,7 @@ fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
                         }
                     };
 
-                    let out = GcRef::new(JsObject::new(
-                        Value::null()));
+                    let out = GcRef::new(JsObject::new(Value::null()));
                     let _ = out.set(
                         PropertyKey::string("bytesRead"),
                         Value::number(bytes.len() as f64),
@@ -848,8 +847,7 @@ fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
                         }
                     };
 
-                    let out = GcRef::new(JsObject::new(
-                        Value::null()));
+                    let out = GcRef::new(JsObject::new(Value::null()));
                     let _ = out.set(
                         PropertyKey::string("bytesWritten"),
                         Value::number(written as f64),
@@ -1125,8 +1123,7 @@ fn create_dir_object(ncx: &mut NativeContext, handle_id: u64, path: String) -> V
                         _ => return Err(VmError::type_error("Dir.next: invalid fs op result")),
                     };
 
-                    let out = GcRef::new(JsObject::new(
-                        Value::null()));
+                    let out = GcRef::new(JsObject::new(Value::null()));
                     let done = entry.is_none();
                     let _ = out.set(PropertyKey::string("done"), Value::boolean(done));
                     let value = match entry {

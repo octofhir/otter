@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -26,6 +27,30 @@ use crate::promise::JsPromise;
 use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
+
+pub struct GeneratorIntrinsic;
+
+impl IntrinsicObject for GeneratorIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+
+        init_generator_prototype(
+            intrinsics.generator_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::iterator_symbol(),
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+        init_async_generator_prototype(
+            intrinsics.async_generator_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::async_iterator_symbol(),
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+    }
+}
 
 /// Helper: convert a GeneratorResult into an iterator result object for sync generators.
 fn sync_generator_result_to_value(

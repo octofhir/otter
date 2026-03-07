@@ -643,9 +643,7 @@ pub(super) fn install_plain_time(
                     // Read overflow option for observable side effects, then discard
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let pt = extract_plain_time(&obj)?;
-                    let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone())
-                    ));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -658,9 +656,7 @@ pub(super) fn install_plain_time(
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let pdt = extract_plain_date_time(&obj)?;
                     let pt = temporal_rs::PlainTime::from(pdt);
-                    let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone())
-                    ));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -673,9 +669,7 @@ pub(super) fn install_plain_time(
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let zdt = extract_zoned_date_time(&obj)?;
                     let pt = zdt.to_plain_time();
-                    let result = GcRef::new(JsObject::new(
-                        Value::object(from_proto.clone())
-                    ));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -724,9 +718,7 @@ pub(super) fn install_plain_time(
                     .with_nanosecond(ns.map(|n| n as u16));
                 let pt = temporal_rs::PlainTime::from_partial(partial, Some(overflow))
                     .map_err(temporal_err)?;
-                let result = GcRef::new(JsObject::new(
-                    Value::object(from_proto.clone())
-                ));
+                let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
                 store_temporal_inner(&result, crate::temporal_value::TemporalValue::PlainTime(pt));
                 return Ok(Value::object(result));
             }

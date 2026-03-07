@@ -1,31 +1,15 @@
-//! Reflect namespace initialization
+//! `Reflect` namespace object (ES2024 §28.1)
 //!
-//! Creates the Reflect global namespace object with 13 static methods (ES2015+ complete):
-//! - Reflect.get, set, has, deleteProperty
-//! - Reflect.ownKeys, getOwnPropertyDescriptor, defineProperty
-//! - Reflect.getPrototypeOf, setPrototypeOf
-//! - Reflect.isExtensible, preventExtensions
-//! - Reflect.apply, construct
+//! The `Reflect` object provides methods for interceptable JavaScript operations.
+//! It is not a constructor and has no `[[Call]]` or `[[Construct]]`.
 //!
-//! All Reflect methods are implemented natively in Rust inline,
-//! similar to Math namespace.
-//!
-//! ## Implementation Notes
-//!
-//! - `Reflect.apply` and `Reflect.construct` work with both native functions and closures
-//!   via `NativeContext::call_function()`
-//!
-//! ## ES2015+ Compliance
-//!
-//! **Methods**: All methods have property attributes:
-//! - `writable: true` (allow polyfills/testing overrides)
-//! - `enumerable: false` (keep namespace clean)
-//! - `configurable: true` (allow runtime modifications)
+//! Spec: <https://tc39.es/ecma262/#sec-reflect-object>
+//! MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect>
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject, NamespaceBuilder};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
@@ -265,6 +249,7 @@ fn value_to_array_args(args_list: &Value) -> Result<Vec<Value>, VmError> {
     }
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.get>
 #[dive(name = "get", length = 2)]
 fn reflect_get(
     _this: &Value,
@@ -311,6 +296,7 @@ fn reflect_get(
     }
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.set>
 #[dive(name = "set", length = 3)]
 fn reflect_set(
     _this: &Value,
@@ -345,6 +331,7 @@ fn reflect_set(
     Ok(Value::boolean(true))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.has>
 #[dive(name = "has", length = 2)]
 fn reflect_has(
     _this: &Value,
@@ -369,6 +356,7 @@ fn reflect_has(
     Ok(Value::boolean(obj.has(&key)))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.deleteproperty>
 #[dive(name = "deleteProperty", length = 2)]
 fn reflect_delete_property(
     _this: &Value,
@@ -395,6 +383,7 @@ fn reflect_delete_property(
     Ok(Value::boolean(deleted))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.ownkeys>
 #[dive(name = "ownKeys", length = 1)]
 fn reflect_own_keys(
     _this: &Value,
@@ -421,6 +410,7 @@ fn reflect_own_keys(
     Ok(Value::array(result))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor>
 #[dive(name = "getOwnPropertyDescriptor", length = 2)]
 fn reflect_get_own_property_descriptor(
     _this: &Value,
@@ -467,6 +457,7 @@ fn reflect_get_own_property_descriptor(
     }
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.defineproperty>
 #[dive(name = "defineProperty", length = 3)]
 fn reflect_define_property(
     _this: &Value,
@@ -538,6 +529,7 @@ fn reflect_define_property(
     Ok(Value::boolean(ok))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
 #[dive(name = "getPrototypeOf", length = 1)]
 fn reflect_get_prototype_of(
     _this: &Value,
@@ -561,6 +553,7 @@ fn reflect_get_prototype_of(
     Ok(proto_val)
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
 #[dive(name = "setPrototypeOf", length = 2)]
 fn reflect_set_prototype_of(
     _this: &Value,
@@ -600,6 +593,7 @@ fn reflect_set_prototype_of(
     Ok(Value::boolean(success))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.isextensible>
 #[dive(name = "isExtensible", length = 1)]
 fn reflect_is_extensible(
     _this: &Value,
@@ -619,6 +613,7 @@ fn reflect_is_extensible(
     Ok(Value::boolean(obj.is_extensible()))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.preventextensions>
 #[dive(name = "preventExtensions", length = 1)]
 fn reflect_prevent_extensions(
     _this: &Value,
@@ -639,6 +634,7 @@ fn reflect_prevent_extensions(
     Ok(Value::boolean(true))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.apply>
 #[dive(name = "apply", length = 3)]
 fn reflect_apply(
     _this: &Value,
@@ -668,6 +664,7 @@ fn reflect_apply(
     ncx.call_function(target, this_arg, &args_array)
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-reflect.construct>
 #[dive(name = "construct", length = 2)]
 fn reflect_construct(
     _this: &Value,
@@ -734,44 +731,31 @@ fn reflect_construct(
 }
 
 /// Create and install Reflect namespace on global object
-pub fn install_reflect_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManager>) {
-    let obj_proto = global
-        .get(&PropertyKey::string("Object"))
-        .and_then(|v| v.as_object())
-        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-        .unwrap_or(Value::null());
-    let reflect_obj = GcRef::new(JsObject::new(obj_proto));
+/// `Reflect` namespace object.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-reflect-object>
+/// MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect>
+pub struct ReflectNamespace;
 
-    let methods: &[(&str, crate::value::NativeFn, u32)] = &[
-        reflect_get_decl(),
-        reflect_set_decl(),
-        reflect_has_decl(),
-        reflect_delete_property_decl(),
-        reflect_own_keys_decl(),
-        reflect_get_own_property_descriptor_decl(),
-        reflect_define_property_decl(),
-        reflect_get_prototype_of_decl(),
-        reflect_set_prototype_of_decl(),
-        reflect_is_extensible_decl(),
-        reflect_prevent_extensions_decl(),
-        reflect_apply_decl(),
-        reflect_construct_decl(),
-    ];
+impl IntrinsicObject for ReflectNamespace {
+    fn init(ctx: &IntrinsicContext) {
+        let reflect_obj = ctx.alloc_object(ctx.obj_proto());
 
-    for (name, native_fn, length) in methods {
-        let func = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
-        reflect_obj.define_property(
-            PropertyKey::string(name),
-            PropertyDescriptor::data_with_attrs(
-                func,
-                PropertyAttributes {
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                },
-            ),
-        );
+        NamespaceBuilder::new(ctx.mm(), ctx.fn_proto(), reflect_obj)
+            .method_decl(reflect_apply_decl())
+            .method_decl(reflect_construct_decl())
+            .method_decl(reflect_define_property_decl())
+            .method_decl(reflect_delete_property_decl())
+            .method_decl(reflect_get_decl())
+            .method_decl(reflect_get_own_property_descriptor_decl())
+            .method_decl(reflect_get_prototype_of_decl())
+            .method_decl(reflect_has_decl())
+            .method_decl(reflect_is_extensible_decl())
+            .method_decl(reflect_own_keys_decl())
+            .method_decl(reflect_prevent_extensions_decl())
+            .method_decl(reflect_set_decl())
+            .method_decl(reflect_set_prototype_of_decl())
+            .string_tag("Reflect")
+            .install_on(&ctx.global(), "Reflect");
     }
-
-    let _ = global.set(PropertyKey::string("Reflect"), Value::object(reflect_obj));
 }

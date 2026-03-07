@@ -1,24 +1,142 @@
 //! Builder pattern for creating spec-correct builtin constructors and prototypes.
 //!
-//! ## Usage
+//! Spec: <https://tc39.es/ecma262/#sec-ecmascript-standard-built-in-objects>
+//!
+//! ## Trait-based registration (Boa-inspired)
+//!
+//! Each built-in type implements [`IntrinsicObject`] (and optionally [`BuiltInConstructor`])
+//! to self-initialize using the shared [`IntrinsicContext`]:
 //!
 //! ```ignore
-//! let (ctor, proto) = BuiltInBuilder::new(mm, fn_proto, obj_proto, "Array")
-//!     .method("push", array_push_fn, 1)
-//!     .method("pop", array_pop_fn, 0)
-//!     .static_method("isArray", array_is_array_fn, 1)
-//!     .static_method("from", array_from_fn, 1)
-//!     .build();
+//! pub struct MathNamespace;
+//!
+//! impl IntrinsicObject for MathNamespace {
+//!     fn init(ctx: &IntrinsicContext) {
+//!         NamespaceBuilder::new(ctx.mm(), ctx.fn_proto(), ctx.alloc_object(ctx.obj_proto()))
+//!             .method_decl(math_abs_decl())
+//!             .string_tag("Math")
+//!             .install_on(&ctx.global(), "Math");
+//!     }
+//! }
+//! ```
+//!
+//! ## Builder usage
+//!
+//! ```ignore
+//! // Constructor + prototype (Array, Map, etc.)
+//! BuiltInBuilder::new(ctx.mm(), ctx.fn_proto(), ctor_obj, proto_obj, "Array")
+//!     .constructor_fn(array_constructor, 1)
+//!     .method_decl(array_push_decl())
+//!     .static_method_decl(array_is_array_decl())
+//!     .build_and_install(&ctx.global());
+//!
+//! // Namespace (Math, JSON, Reflect)
+//! NamespaceBuilder::new(ctx.mm(), ctx.fn_proto(), obj)
+//!     .method_decl(json_parse_decl())
+//!     .string_tag("JSON")
+//!     .install_on(&ctx.global(), "JSON");
 //! ```
 
 use std::sync::Arc;
 
 use crate::error::VmError;
 use crate::gc::GcRef;
+use crate::intrinsics::Intrinsics;
 use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::{NativeFn, Value};
+
+// ============================================================================
+// Traits
+// ============================================================================
+
+/// Shared context passed to [`IntrinsicObject::init`] implementations.
+///
+/// Provides access to the memory manager, intrinsics table, and global object
+/// without requiring individual `install_*` functions to take ad-hoc parameter lists.
+pub struct IntrinsicContext {
+    mm: Arc<MemoryManager>,
+    global: Option<GcRef<JsObject>>,
+    intrinsics: Intrinsics,
+}
+
+impl IntrinsicContext {
+    /// Create a new context for intrinsic initialization.
+    pub fn new(mm: Arc<MemoryManager>, global: GcRef<JsObject>, intrinsics: Intrinsics) -> Self {
+        Self {
+            mm,
+            global: Some(global),
+            intrinsics,
+        }
+    }
+
+    /// Create a context for stage-3 intrinsic initialization before the global
+    /// object is fully wired.
+    pub fn for_init_core(mm: Arc<MemoryManager>, intrinsics: Intrinsics) -> Self {
+        Self {
+            mm,
+            global: None,
+            intrinsics,
+        }
+    }
+
+    /// Memory manager.
+    pub fn mm(&self) -> Arc<MemoryManager> {
+        self.mm.clone()
+    }
+
+    /// The global object.
+    pub fn global(&self) -> GcRef<JsObject> {
+        self.global
+            .expect("IntrinsicContext::global() is only available during global installation")
+    }
+
+    /// The global object, if stage-4 installation is in progress.
+    pub fn global_opt(&self) -> Option<GcRef<JsObject>> {
+        self.global
+    }
+
+    /// The full intrinsics table.
+    pub fn intrinsics(&self) -> &Intrinsics {
+        &self.intrinsics
+    }
+
+    /// `%Function.prototype%` — `[[Prototype]]` for native function objects.
+    pub fn fn_proto(&self) -> GcRef<JsObject> {
+        self.intrinsics.function_prototype
+    }
+
+    /// `%Object.prototype%` — `[[Prototype]]` for most prototype objects.
+    pub fn obj_proto(&self) -> GcRef<JsObject> {
+        self.intrinsics.object_prototype
+    }
+
+    /// Allocate a fresh empty object with the given prototype.
+    pub fn alloc_object(&self, proto: GcRef<JsObject>) -> GcRef<JsObject> {
+        GcRef::new(JsObject::new(Value::object(proto)))
+    }
+
+    /// Allocate a fresh constructor object whose `[[Prototype]]` is `%Function.prototype%`.
+    pub fn alloc_constructor(&self) -> GcRef<JsObject> {
+        GcRef::new(JsObject::new(Value::object(self.fn_proto())))
+    }
+}
+
+/// Trait for intrinsic objects that can self-initialize.
+///
+/// Each built-in module (Math, JSON, Array, etc.) implements this trait.
+/// The `init` method receives an [`IntrinsicContext`] providing access to
+/// pre-allocated intrinsic objects, the memory manager, and the global object.
+///
+/// This replaces the old `install_*_namespace(global, mm, ...)` function pattern.
+pub trait IntrinsicObject {
+    /// Initialize this intrinsic's properties on pre-allocated objects.
+    ///
+    /// Implementations should use [`BuiltInBuilder`] or [`NamespaceBuilder`]
+    /// to set up methods, properties, and prototype chains.
+    fn init(ctx: &IntrinsicContext);
+}
 
 /// A deferred property definition to be applied during `build()`.
 enum DeferredProperty {
@@ -199,6 +317,11 @@ impl BuiltInBuilder {
         self
     }
 
+    /// Add a method from a `#[dive]` decl tuple `(name, func, length)`.
+    pub fn method_decl(self, decl: (&str, NativeFn, u32)) -> Self {
+        self.method_native(decl.0, decl.1, decl.2)
+    }
+
     /// Add a static method to the constructor.
     pub fn static_method<F>(mut self, name: &str, f: F, length: u32) -> Self
     where
@@ -227,6 +350,11 @@ impl BuiltInBuilder {
             length,
         });
         self
+    }
+
+    /// Add a static method from a `#[dive]` decl tuple `(name, func, length)`.
+    pub fn static_method_decl(self, decl: (&str, NativeFn, u32)) -> Self {
+        self.static_method_native(decl.0, decl.1, decl.2)
     }
 
     /// Add a data property to the prototype with explicit attributes.
@@ -294,6 +422,23 @@ impl BuiltInBuilder {
             symbol,
             name: name.to_string(),
             func: Arc::new(f),
+            length,
+        });
+        self
+    }
+
+    /// Add a symbol-keyed method using a pre-built `NativeFn` Arc.
+    pub fn symbol_method_native(
+        mut self,
+        symbol: Value,
+        name: &str,
+        func: NativeFn,
+        length: u32,
+    ) -> Self {
+        self.properties.push(DeferredProperty::SymbolMethod {
+            symbol,
+            name: name.to_string(),
+            func,
             length,
         });
         self
@@ -461,6 +606,31 @@ impl BuiltInBuilder {
 
         ctor_value
     }
+
+    /// Build and install the constructor on the global object.
+    ///
+    /// The constructor is set as `{ writable: true, enumerable: false, configurable: true }`
+    /// per ES2024 §19, and tagged with `__builtin_tag__` for realm-aware prototype resolution.
+    pub fn build_and_install(self, global: &GcRef<JsObject>) {
+        let name = self.name.clone();
+        let ctor_value = self.build();
+
+        // Tag constructor for realm-aware GetPrototypeFromConstructor
+        if let Some(obj) = ctor_value.as_object() {
+            obj.define_property(
+                PropertyKey::string("__builtin_tag__"),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern(&name)),
+                    PropertyAttributes::permanent(),
+                ),
+            );
+        }
+
+        global.define_property(
+            PropertyKey::string(&name),
+            PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::builtin_method()),
+        );
+    }
 }
 
 /// Create a native function value with correct `length` and `name` properties,
@@ -490,6 +660,16 @@ fn make_native_fn(
 /// Builder for creating namespace objects (like `Math`, `JSON`, `Reflect`).
 ///
 /// Namespace objects are NOT constructors — they are plain objects with methods.
+///
+/// ## Example
+///
+/// ```ignore
+/// NamespaceBuilder::new(mm, fn_proto, obj)
+///     .method("parse", json_parse, 2)
+///     .method("stringify", json_stringify, 3)
+///     .string_tag("JSON")
+///     .install_on(&global, "JSON");
+/// ```
 pub struct NamespaceBuilder {
     mm: Arc<MemoryManager>,
     fn_proto: GcRef<JsObject>,
@@ -528,11 +708,48 @@ impl NamespaceBuilder {
         self
     }
 
+    /// Add a method using a pre-built `NativeFn` Arc (from `#[dive]` decl tuples).
+    pub fn method_native(mut self, name: &str, func: NativeFn, length: u32) -> Self {
+        self.properties.push(DeferredProperty::Method {
+            name: name.to_string(),
+            func,
+            length,
+        });
+        self
+    }
+
+    /// Add a method from a `#[dive]` decl tuple `(name, func, length)`.
+    pub fn method_decl(self, decl: (&str, NativeFn, u32)) -> Self {
+        self.method_native(decl.0, decl.1, decl.2)
+    }
+
     /// Add a data property to the namespace object.
     pub fn property(mut self, key: PropertyKey, value: Value, attrs: PropertyAttributes) -> Self {
         self.properties
             .push(DeferredProperty::Property { key, value, attrs });
         self
+    }
+
+    /// Add a constant numeric property (writable: false, enumerable: false, configurable: false).
+    pub fn constant(self, name: &str, value: f64) -> Self {
+        self.property(
+            PropertyKey::string(name),
+            Value::number(value),
+            PropertyAttributes::permanent(),
+        )
+    }
+
+    /// Set `@@toStringTag` (non-writable, non-enumerable, configurable).
+    pub fn string_tag(self, tag: &str) -> Self {
+        self.property(
+            PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
+            Value::string(JsString::intern(tag)),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        )
     }
 
     /// Build the namespace object, returning it as a `Value`.
@@ -560,5 +777,24 @@ impl NamespaceBuilder {
             }
         }
         Value::object(object)
+    }
+
+    /// Build and install the namespace on the global object.
+    ///
+    /// The namespace is set as `{ writable: true, enumerable: false, configurable: true }`
+    /// per ES2024 §19.
+    pub fn install_on(self, global: &GcRef<JsObject>, name: &str) {
+        let value = self.build();
+        global.define_property(
+            PropertyKey::string(name),
+            PropertyDescriptor::data_with_attrs(
+                value,
+                PropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
     }
 }

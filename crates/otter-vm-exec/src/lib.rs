@@ -8,6 +8,7 @@
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
+mod entry_stub;
 mod jit_queue;
 mod jit_runtime;
 

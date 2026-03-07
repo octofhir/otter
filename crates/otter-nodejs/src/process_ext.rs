@@ -251,12 +251,8 @@ fn build_argv_array(
 }
 
 fn build_env_proxy(ctx: &RegistrationContext) -> GcRef<JsProxy> {
-    let target_obj = GcRef::new(JsObject::new(
-        Value::object(ctx.obj_proto()),
-    ));
-    let handler_obj = GcRef::new(JsObject::new(
-        Value::object(ctx.obj_proto()),
-    ));
+    let target_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
+    let handler_obj = GcRef::new(JsObject::new(Value::object(ctx.obj_proto())));
     register_env_proxy_traps(ctx, &handler_obj);
     JsProxy::new(Value::object(target_obj), Value::object(handler_obj))
 }

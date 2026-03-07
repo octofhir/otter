@@ -116,9 +116,7 @@ impl<'a> RegistrationContext<'a> {
 
     /// Create a fresh plain object for use as a module namespace.
     pub fn new_object(&self) -> GcRef<JsObject> {
-        GcRef::new(JsObject::new(
-            Value::object(self.obj_proto()),
-        ))
+        GcRef::new(JsObject::new(Value::object(self.obj_proto())))
     }
 
     /// Create a `ModuleNamespaceBuilder` for building module exports.

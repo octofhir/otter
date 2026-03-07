@@ -40,10 +40,7 @@ impl otter_vm_gc::GcTraceable for JsArrayBuffer {
 
 impl JsArrayBuffer {
     /// Create a new ArrayBuffer with the specified byte length
-    pub fn new(
-        byte_length: usize,
-        prototype: Option<GcRef<JsObject>>,
-    ) -> Self {
+    pub fn new(byte_length: usize, prototype: Option<GcRef<JsObject>>) -> Self {
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value));
         Self {
@@ -116,7 +113,6 @@ impl JsArrayBuffer {
         let copy_len = old_data.len().min(new_length);
         new_data[..copy_len].copy_from_slice(&old_data[..copy_len]);
 
-
         let object = GcRef::new(JsObject::new(Value::null()));
 
         Some(JsArrayBuffer {
@@ -150,7 +146,6 @@ impl JsArrayBuffer {
         if slice_len > 0 {
             new_data.copy_from_slice(&data[actual_start..actual_end]);
         }
-
 
         let object = GcRef::new(JsObject::new(Value::null()));
 

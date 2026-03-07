@@ -17,6 +17,7 @@ use otter_vm_bytecode::{Constant, Function};
 
 use crate::JitError;
 use crate::bailout::{BAILOUT_SENTINEL, BailoutReason};
+use crate::compiler::{DeoptResumeSite, build_deopt_metadata};
 use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
@@ -120,6 +121,7 @@ fn resolve_inline_candidates<'a>(
             Instruction::Call { func, .. } => {
                 if let Some(&func_idx) = reg_func.get(&func.0) {
                     if let Some(&callee) = func_by_index.get(&func_idx) {
+                        // Verify all callee instructions are JIT-translatable.
                         // Verify all callee instructions are JIT-translatable
                         let callee_instrs = callee.instructions.read();
                         let all_translatable = callee_instrs
@@ -657,6 +659,7 @@ fn emit_record_bailout_with_state(
     reason: BailoutReason,
     local_vars: &[Variable],
     reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
 ) {
     let is_null = {
         let zero = builder.ins().iconst(types::I64, 0);
@@ -685,6 +688,7 @@ fn emit_record_bailout_with_state(
     );
 
     // Dump locals to deopt buffer
+    let live_locals = deopt_site.map(|site| site.live_locals.as_slice());
     if !local_vars.is_empty() {
         let locals_ptr = builder.ins().load(
             types::I64,
@@ -702,17 +706,29 @@ fn emit_record_bailout_with_state(
             .ins()
             .brif(locals_null, after_locals_block, &[], dump_locals_block, &[]);
         builder.switch_to_block(dump_locals_block);
-        for (i, &var) in local_vars.iter().enumerate() {
-            let val = builder.use_var(var);
-            builder
-                .ins()
-                .store(MemFlags::trusted(), val, locals_ptr, (i * 8) as i32);
+        if let Some(indices) = live_locals {
+            for &index in indices {
+                if let Some(&var) = local_vars.get(index as usize) {
+                    let val = builder.use_var(var);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), val, locals_ptr, i32::from(index) * 8);
+                }
+            }
+        } else {
+            for (i, &var) in local_vars.iter().enumerate() {
+                let val = builder.use_var(var);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), val, locals_ptr, (i * 8) as i32);
+            }
         }
         builder.ins().jump(after_locals_block, &[]);
         builder.switch_to_block(after_locals_block);
     }
 
     // Dump registers to deopt buffer
+    let live_registers = deopt_site.map(|site| site.live_registers.as_slice());
     if !reg_vars.is_empty() {
         let regs_ptr = builder.ins().load(
             types::I64,
@@ -730,11 +746,22 @@ fn emit_record_bailout_with_state(
             .ins()
             .brif(regs_null, after_regs_block, &[], dump_regs_block, &[]);
         builder.switch_to_block(dump_regs_block);
-        for (i, &var) in reg_vars.iter().enumerate() {
-            let val = builder.use_var(var);
-            builder
-                .ins()
-                .store(MemFlags::trusted(), val, regs_ptr, (i * 8) as i32);
+        if let Some(indices) = live_registers {
+            for &index in indices {
+                if let Some(&var) = reg_vars.get(index as usize) {
+                    let val = builder.use_var(var);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), val, regs_ptr, i32::from(index) * 8);
+                }
+            }
+        } else {
+            for (i, &var) in reg_vars.iter().enumerate() {
+                let val = builder.use_var(var);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), val, regs_ptr, (i * 8) as i32);
+            }
         }
         builder.ins().jump(after_regs_block, &[]);
         builder.switch_to_block(after_regs_block);
@@ -751,8 +778,11 @@ fn emit_bailout_return_with_state(
     reason: BailoutReason,
     local_vars: &[Variable],
     reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
 ) {
-    emit_record_bailout_with_state(builder, ctx_ptr, pc, reason, local_vars, reg_vars);
+    emit_record_bailout_with_state(
+        builder, ctx_ptr, pc, reason, local_vars, reg_vars, deopt_site,
+    );
     emit_bailout_return(builder);
 }
 
@@ -806,6 +836,7 @@ fn lower_guarded_with_generic_fallback(
     reason: BailoutReason,
     local_vars: &[Variable],
     reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
 ) -> Value {
     builder.switch_to_block(guarded.slow_block);
     if let Some(helper_ref) = generic_ref {
@@ -819,7 +850,9 @@ fn lower_guarded_with_generic_fallback(
             .ins()
             .brif(is_bailout, bail_block, &[], ok_block, &[]);
         builder.switch_to_block(bail_block);
-        emit_bailout_return_with_state(builder, ctx_ptr, pc, reason, local_vars, reg_vars);
+        emit_bailout_return_with_state(
+            builder, ctx_ptr, pc, reason, local_vars, reg_vars, deopt_site,
+        );
         builder.switch_to_block(ok_block);
         builder
             .ins()
@@ -832,6 +865,7 @@ fn lower_guarded_with_generic_fallback(
             BailoutReason::TypeGuardFailure,
             local_vars,
             reg_vars,
+            deopt_site,
         );
     }
     builder.switch_to_block(guarded.merge_block);
@@ -850,9 +884,12 @@ fn lower_guarded_with_bailout(
     reason: BailoutReason,
     local_vars: &[Variable],
     reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
 ) -> Value {
     builder.switch_to_block(guarded.slow_block);
-    emit_bailout_return_with_state(builder, ctx_ptr, pc, reason, local_vars, reg_vars);
+    emit_bailout_return_with_state(
+        builder, ctx_ptr, pc, reason, local_vars, reg_vars, deopt_site,
+    );
     builder.switch_to_block(guarded.merge_block);
     guarded.result
 }
@@ -1035,13 +1072,17 @@ pub fn translate_function_with_constants(
 
     // Snapshot type feedback for speculative optimization.
     // Read the feedback vector once at compile time (not during IR emission).
-    let (feedback_snapshot, ic_snapshot): (Vec<_>, Vec<_>) = {
+    let (feedback_snapshot, ic_snapshot, call_target_snapshot): (Vec<_>, Vec<_>, Vec<_>) = {
         let fv = function.feedback_vector.read();
         (
             fv.iter().map(|m| m.type_observations).collect(),
             fv.iter().map(|m| m.ic_state).collect(),
+            fv.iter()
+                .map(|m| (m.call_target_func_index, m.call_target_module_id))
+                .collect(),
         )
     };
+    let deopt_metadata = build_deopt_metadata(function);
     let get_hint = |feedback_index: u16| -> SpecializationHint {
         SpecializationHint::from_type_flags(feedback_snapshot.get(feedback_index as usize))
     };
@@ -1270,6 +1311,7 @@ pub fn translate_function_with_constants(
 
     for pc in 0..instruction_count {
         let instruction = &instructions_ref[pc];
+        let deopt_site = deopt_metadata.site(pc as u32);
         if leaders[pc] {
             builder.switch_to_block(blocks[pc]);
         }
@@ -1281,6 +1323,7 @@ pub fn translate_function_with_constants(
                 BailoutReason::HelperReturnedSentinel,
                 &local_vars,
                 &reg_vars,
+                deopt_site,
             );
         };
         let emit_helper_call_with_bailout = |builder: &mut FunctionBuilder<'_>,
@@ -1304,6 +1347,7 @@ pub fn translate_function_with_constants(
                 BailoutReason::HelperReturnedSentinel,
                 &local_vars,
                 &reg_vars,
+                deopt_site,
             );
             builder.switch_to_block(continue_block);
             result
@@ -1399,6 +1443,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::HelperReturnedSentinel,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 } else {
                     lower_guarded_with_bailout(
@@ -1409,6 +1454,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::TypeGuardFailure,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 };
                 write_reg(builder, &reg_vars, *dst, out);
@@ -1446,6 +1492,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::HelperReturnedSentinel,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 } else {
                     lower_guarded_with_bailout(
@@ -1456,6 +1503,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::TypeGuardFailure,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 };
                 write_reg(builder, &reg_vars, *dst, out);
@@ -1493,6 +1541,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::HelperReturnedSentinel,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 } else {
                     lower_guarded_with_bailout(
@@ -1503,6 +1552,7 @@ pub fn translate_function_with_constants(
                         BailoutReason::TypeGuardFailure,
                         &local_vars,
                         &reg_vars,
+                        deopt_site,
                     )
                 };
                 write_reg(builder, &reg_vars, *dst, out);
@@ -1532,6 +1582,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1549,6 +1600,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1565,6 +1617,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1581,6 +1634,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1596,6 +1650,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1612,6 +1667,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1628,6 +1684,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1643,6 +1700,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1657,6 +1715,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1671,6 +1730,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1685,6 +1745,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1701,6 +1762,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1717,6 +1779,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1733,6 +1796,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1749,6 +1813,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1765,6 +1830,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1781,6 +1847,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1795,6 +1862,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1819,6 +1887,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::HelperReturnedSentinel,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1843,6 +1912,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::HelperReturnedSentinel,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1876,6 +1946,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1897,6 +1968,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1918,6 +1990,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -1939,6 +2012,7 @@ pub fn translate_function_with_constants(
                     BailoutReason::TypeGuardFailure,
                     &local_vars,
                     &reg_vars,
+                    deopt_site,
                 );
                 write_reg(builder, &reg_vars, *dst, out);
             }
@@ -2155,7 +2229,12 @@ pub fn translate_function_with_constants(
                 builder.switch_to_block(continue_block);
                 // SetPropConst doesn't write to a dst register
             }
-            Instruction::Call { dst, func, argc } => {
+            Instruction::Call {
+                dst,
+                func,
+                argc,
+                ic_index,
+            } => {
                 // Check if this call site has a statically resolved inline candidate
                 if let Some(candidate) = inline_sites.get(&pc) {
                     let callee = candidate.callee;
@@ -2351,6 +2430,7 @@ pub fn translate_function_with_constants(
                                                 BailoutReason::HelperReturnedSentinel,
                                                 &local_vars,
                                                 &reg_vars,
+                                                deopt_site,
                                             )
                                         } else {
                                             lower_guarded_with_bailout(
@@ -2361,6 +2441,7 @@ pub fn translate_function_with_constants(
                                                 BailoutReason::TypeGuardFailure,
                                                 &local_vars,
                                                 &reg_vars,
+                                                deopt_site,
                                             )
                                         };
                                     write_reg(builder, &callee_reg_vars, *d, out);
@@ -2410,6 +2491,7 @@ pub fn translate_function_with_constants(
                                             BailoutReason::HelperReturnedSentinel,
                                             &local_vars,
                                             &reg_vars,
+                                            deopt_site,
                                         )
                                     } else {
                                         lower_guarded_with_bailout(
@@ -2420,6 +2502,7 @@ pub fn translate_function_with_constants(
                                             BailoutReason::TypeGuardFailure,
                                             &local_vars,
                                             &reg_vars,
+                                            deopt_site,
                                         )
                                     };
                                     write_reg(builder, &callee_reg_vars, *d, out);
@@ -2469,6 +2552,7 @@ pub fn translate_function_with_constants(
                                             BailoutReason::HelperReturnedSentinel,
                                             &local_vars,
                                             &reg_vars,
+                                            deopt_site,
                                         )
                                     } else {
                                         lower_guarded_with_bailout(
@@ -2479,6 +2563,7 @@ pub fn translate_function_with_constants(
                                             BailoutReason::TypeGuardFailure,
                                             &local_vars,
                                             &reg_vars,
+                                            deopt_site,
                                         )
                                     };
                                     write_reg(builder, &callee_reg_vars, *d, out);
@@ -2495,6 +2580,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2509,6 +2595,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2531,6 +2618,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2552,6 +2640,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2573,6 +2662,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2594,6 +2684,7 @@ pub fn translate_function_with_constants(
                                         BailoutReason::TypeGuardFailure,
                                         &local_vars,
                                         &reg_vars,
+                                        deopt_site,
                                     );
                                     write_reg(builder, &callee_reg_vars, *d, out);
                                 }
@@ -2749,10 +2840,22 @@ pub fn translate_function_with_constants(
                         write_reg(builder, &reg_vars, *dst, inline_result);
                     }
                 } else {
-                    // No inline candidate → use runtime helper as before
-                    let helper_ref = helpers
-                        .and_then(|h| h.get(HelperKind::CallFunction))
-                        .ok_or_else(|| unsupported(pc, instruction))?;
+                    // No inline candidate → use runtime helper.
+                    // Check call target feedback for monomorphic dispatch.
+                    let mono_func_index: Option<u32> = if *ic_index > 0 {
+                        call_target_snapshot.get(*ic_index as usize).and_then(
+                            |(func_idx_plus1, _mod_id)| {
+                                if *func_idx_plus1 == 0 || *func_idx_plus1 == u32::MAX {
+                                    None // uninit or megamorphic
+                                } else {
+                                    Some(*func_idx_plus1)
+                                }
+                            },
+                        )
+                    } else {
+                        None
+                    };
+
                     let callee_val = read_reg(builder, &reg_vars, *func);
                     let argc_val = builder.ins().iconst(types::I64, *argc as i64);
 
@@ -2772,10 +2875,28 @@ pub fn translate_function_with_constants(
                         builder.ins().iconst(types::I64, 0) // null pointer
                     };
 
-                    let call = builder
-                        .ins()
-                        .call(helper_ref, &[ctx_ptr, callee_val, argc_val, argv_ptr]);
-                    let result = builder.inst_results(call)[0];
+                    let (call, result) = if let Some(expected_idx) = mono_func_index {
+                        // Monomorphic: use CallMono with expected function_index hint
+                        let helper_ref = helpers
+                            .and_then(|h| h.get(HelperKind::CallMono))
+                            .or_else(|| helpers.and_then(|h| h.get(HelperKind::CallFunction)));
+                        let helper_ref = helper_ref.ok_or_else(|| unsupported(pc, instruction))?;
+                        let expected = builder.ins().iconst(types::I64, expected_idx as i64);
+                        let call = builder.ins().call(
+                            helper_ref,
+                            &[ctx_ptr, callee_val, argc_val, argv_ptr, expected],
+                        );
+                        (call, builder.inst_results(call)[0])
+                    } else {
+                        // Polymorphic/unknown: regular CallFunction
+                        let helper_ref = helpers
+                            .and_then(|h| h.get(HelperKind::CallFunction))
+                            .ok_or_else(|| unsupported(pc, instruction))?;
+                        let call = builder
+                            .ins()
+                            .call(helper_ref, &[ctx_ptr, callee_val, argc_val, argv_ptr]);
+                        (call, builder.inst_results(call)[0])
+                    };
 
                     // If helper returns BAILOUT_SENTINEL, bail out the whole function
                     let bail_block = builder.create_block();
@@ -3020,9 +3141,10 @@ pub fn translate_function_with_constants(
 
                 builder.switch_to_block(store_block);
                 let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24);
-                let props_ptr = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), props_ptr_addr, 0);
+                let props_ptr =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), props_ptr_addr, 0);
                 let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
                 builder.ins().store(MemFlags::trusted(), value, val_addr, 0);
 

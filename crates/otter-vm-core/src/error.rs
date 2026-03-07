@@ -1,5 +1,6 @@
 //! VM error types
 
+use crate::object::PropertyKey;
 use crate::value::Value;
 use thiserror::Error;
 
@@ -119,17 +120,45 @@ impl VmError {
 
     /// Create an exception from a thrown JS value
     pub fn exception(value: Value) -> Self {
-        let message = if let Some(s) = value.as_string() {
-            s.as_str().to_string()
-        } else {
-            format!("{:?}", value)
-        };
+        let message = format_thrown_value_message(&value);
         Self::Exception(Box::new(ThrownValue {
             message,
             value,
             stack: Vec::new(),
         }))
     }
+}
+
+fn format_thrown_value_message(value: &Value) -> String {
+    if let Some(s) = value.as_string() {
+        return s.as_str().to_string();
+    }
+
+    if let Some(obj) = value.as_object().or_else(|| value.as_array()) {
+        let is_error_object = obj
+            .get(&PropertyKey::string("__is_error__"))
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false);
+        if is_error_object {
+            let name = obj
+                .get(&PropertyKey::string("name"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "Error".to_string());
+            let message = obj
+                .get(&PropertyKey::string("message"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default();
+
+            if message.is_empty() {
+                return name;
+            }
+            return format!("{name}: {message}");
+        }
+    }
+
+    format!("{:?}", value)
 }
 
 // Automatic conversion from String to VmError for backwards compatibility
@@ -148,3 +177,36 @@ impl From<&str> for VmError {
 
 /// Result type for VM operations
 pub type VmResult<T> = std::result::Result<T, VmError>;
+
+#[cfg(test)]
+mod tests {
+    use super::format_thrown_value_message;
+    use crate::gc::GcRef;
+    use crate::object::JsObject;
+    use crate::runtime::VmRuntime;
+    use crate::value::Value;
+
+    #[test]
+    fn thrown_error_object_uses_name_and_message() {
+        let runtime = VmRuntime::new();
+        let _ctx = runtime.create_context();
+        let obj = GcRef::new(JsObject::new(Value::null()));
+        let _ = obj.set(
+            crate::object::PropertyKey::string("__is_error__"),
+            Value::boolean(true),
+        );
+        let _ = obj.set(
+            crate::object::PropertyKey::string("name"),
+            Value::string(crate::string::JsString::intern("SyntaxError")),
+        );
+        let _ = obj.set(
+            crate::object::PropertyKey::string("message"),
+            Value::string(crate::string::JsString::intern("Execution interrupted")),
+        );
+
+        assert_eq!(
+            format_thrown_value_message(&Value::object(obj)),
+            "SyntaxError: Execution interrupted"
+        );
+    }
+}

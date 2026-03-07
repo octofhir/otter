@@ -16,6 +16,7 @@ use std::sync::Arc;
 use unicode_normalization::char::canonical_combining_class;
 use writeable::{Part, PartsWrite};
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject, NamespaceBuilder};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -2848,7 +2849,7 @@ fn install_common_constructor_bits(
     );
 }
 
-fn install_basic_intl_constructor(
+fn define_basic_intl_constructor(
     intl: &GcRef<JsObject>,
     ctor_name: &str,
     brand_key: &'static str,
@@ -2883,9 +2884,7 @@ fn install_basic_intl_constructor(
                         VmError::type_error("Intl constructor requires object receiver")
                     })?
                 } else {
-                    GcRef::new(JsObject::new(
-                        Value::object(proto_obj)
-                    ))
+                    GcRef::new(JsObject::new(Value::object(proto_obj)))
                 };
                 target.define_property(
                     PropertyKey::string(brand_key),
@@ -3684,18 +3683,64 @@ fn strip_diacritics(input: &str) -> String {
         .collect()
 }
 
-pub fn install_intl(
-    global: GcRef<JsObject>,
-    object_proto: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
-    let intl = GcRef::new(JsObject::new(Value::object(object_proto)));
-    let to_string_tag_symbol = global
-        .get(&PropertyKey::string("Symbol"))
-        .and_then(|v| v.as_object())
-        .and_then(|obj| obj.get(&PropertyKey::string("toStringTag")))
-        .and_then(|v| v.as_symbol());
+fn init_intl_namespace(ctx: &IntrinsicContext) {
+    let Some(global) = ctx.global_opt() else {
+        return;
+    };
+
+    let mm = ctx.mm();
+    let fn_proto = ctx.fn_proto();
+    let object_proto = ctx.obj_proto();
+    let intl = ctx.alloc_object(object_proto);
+    let intl_builder = NamespaceBuilder::new(mm.clone(), fn_proto.clone(), intl)
+        .method(
+            "getCanonicalLocales",
+            |_this, args, ncx| {
+                let locales = canonicalize_locale_list(args.first(), ncx)?;
+                let arr = create_array(ncx, locales.len());
+                for (i, locale) in locales.iter().enumerate() {
+                    let _ = arr.set(
+                        PropertyKey::Index(i as u32),
+                        Value::string(JsString::intern(locale)),
+                    );
+                }
+                Ok(Value::array(arr))
+            },
+            1,
+        )
+        .method(
+            "supportedValuesOf",
+            |_this, args, ncx| {
+                let key = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
+                let mut values: Vec<&str> = match key.as_str() {
+                    "calendar" => SUPPORTED_CALENDARS.to_vec(),
+                    "collation" => SUPPORTED_COLLATIONS.to_vec(),
+                    "currency" => SUPPORTED_CURRENCIES.to_vec(),
+                    "numberingSystem" => SUPPORTED_NUMBERING_SYSTEMS.to_vec(),
+                    "timeZone" => SUPPORTED_TIME_ZONES.to_vec(),
+                    "unit" => SUPPORTED_UNITS.to_vec(),
+                    _ => {
+                        return Err(VmError::range_error(
+                            "Invalid key for Intl.supportedValuesOf",
+                        ));
+                    }
+                };
+                values.sort_unstable();
+                values.dedup();
+                let arr = create_array(ncx, values.len());
+                for (i, value) in values.iter().enumerate() {
+                    let _ = arr.set(
+                        PropertyKey::Index(i as u32),
+                        Value::string(JsString::intern(value)),
+                    );
+                }
+                Ok(Value::array(arr))
+            },
+            1,
+        )
+        .string_tag("Intl");
+
+    let to_string_tag_symbol = ctx.intrinsics().symbol_to_string_tag.as_symbol();
     let set_proto_to_string_tag = |ctor: &Value, tag: &str| {
         if let Some(proto) = ctor
             .as_object()
@@ -3717,65 +3762,6 @@ pub fn install_intl(
             }
         }
     };
-
-    let get_canonical_locales = Value::native_function_with_proto_named(
-        |_this, args, ncx| {
-            let locales = canonicalize_locale_list(args.first(), ncx)?;
-            let arr = create_array(ncx, locales.len());
-            for (i, locale) in locales.iter().enumerate() {
-                let _ = arr.set(
-                    PropertyKey::Index(i as u32),
-                    Value::string(JsString::intern(locale)),
-                );
-            }
-            Ok(Value::array(arr))
-        },
-        mm.clone(),
-        fn_proto.clone(),
-        "getCanonicalLocales",
-        1,
-    );
-    intl.define_property(
-        PropertyKey::string("getCanonicalLocales"),
-        PropertyDescriptor::builtin_method(get_canonical_locales),
-    );
-
-    let supported_values_of = Value::native_function_with_proto_named(
-        |_this, args, ncx| {
-            let key = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
-            let mut values: Vec<&str> = match key.as_str() {
-                "calendar" => SUPPORTED_CALENDARS.to_vec(),
-                "collation" => SUPPORTED_COLLATIONS.to_vec(),
-                "currency" => SUPPORTED_CURRENCIES.to_vec(),
-                "numberingSystem" => SUPPORTED_NUMBERING_SYSTEMS.to_vec(),
-                "timeZone" => SUPPORTED_TIME_ZONES.to_vec(),
-                "unit" => SUPPORTED_UNITS.to_vec(),
-                _ => {
-                    return Err(VmError::range_error(
-                        "Invalid key for Intl.supportedValuesOf",
-                    ));
-                }
-            };
-            values.sort_unstable();
-            values.dedup();
-            let arr = create_array(ncx, values.len());
-            for (i, value) in values.iter().enumerate() {
-                let _ = arr.set(
-                    PropertyKey::Index(i as u32),
-                    Value::string(JsString::intern(value)),
-                );
-            }
-            Ok(Value::array(arr))
-        },
-        mm.clone(),
-        fn_proto.clone(),
-        "supportedValuesOf",
-        1,
-    );
-    intl.define_property(
-        PropertyKey::string("supportedValuesOf"),
-        PropertyDescriptor::builtin_method(supported_values_of),
-    );
 
     let collator_compare_getter = Value::native_function_with_proto_named(
         |this_val, _args, ncx| {
@@ -3888,13 +3874,13 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    let collator_ctor = install_basic_intl_constructor(
+    let collator_ctor = define_basic_intl_constructor(
         &intl,
         "Collator",
         INTL_COLLATOR_BRAND_KEY,
         0,
         &[("resolvedOptions", 0, collator_resolved_options)],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -3934,7 +3920,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    let datetime_ctor = install_basic_intl_constructor(
+    let datetime_ctor = define_basic_intl_constructor(
         &intl,
         "DateTimeFormat",
         INTL_DATETIMEFORMAT_BRAND_KEY,
@@ -3943,7 +3929,7 @@ pub fn install_intl(
             ("format", 1, datetime_format),
             ("resolvedOptions", 0, datetime_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4121,7 +4107,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    let number_ctor = install_basic_intl_constructor(
+    let number_ctor = define_basic_intl_constructor(
         &intl,
         "NumberFormat",
         INTL_NUMBERFORMAT_BRAND_KEY,
@@ -4133,7 +4119,7 @@ pub fn install_intl(
             ("formatRangeToParts", 2, number_format_range_to_parts),
             ("resolvedOptions", 0, number_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4226,7 +4212,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "PluralRules",
         INTL_PLURALRULES_BRAND_KEY,
@@ -4236,7 +4222,7 @@ pub fn install_intl(
             ("selectRange", 2, plural_select_range),
             ("resolvedOptions", 0, plural_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4301,7 +4287,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "RelativeTimeFormat",
         INTL_RELATIVETIMEFORMAT_BRAND_KEY,
@@ -4311,7 +4297,7 @@ pub fn install_intl(
             ("formatToParts", 2, rtf_format_to_parts),
             ("resolvedOptions", 0, rtf_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4386,7 +4372,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "ListFormat",
         INTL_LISTFORMAT_BRAND_KEY,
@@ -4396,7 +4382,7 @@ pub fn install_intl(
             ("formatToParts", 1, list_format_to_parts),
             ("resolvedOptions", 0, list_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4425,7 +4411,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "DisplayNames",
         INTL_DISPLAYNAMES_BRAND_KEY,
@@ -4434,7 +4420,7 @@ pub fn install_intl(
             ("of", 1, display_names_of),
             ("resolvedOptions", 0, display_names_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4479,7 +4465,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "Segmenter",
         INTL_SEGMENTER_BRAND_KEY,
@@ -4488,7 +4474,7 @@ pub fn install_intl(
             ("segment", 1, segmenter_segment),
             ("resolvedOptions", 0, segmenter_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4539,7 +4525,7 @@ pub fn install_intl(
         "resolvedOptions",
         0,
     );
-    install_basic_intl_constructor(
+    define_basic_intl_constructor(
         &intl,
         "DurationFormat",
         INTL_DURATIONFORMAT_BRAND_KEY,
@@ -4549,7 +4535,7 @@ pub fn install_intl(
             ("formatToParts", 1, duration_format_to_parts),
             ("resolvedOptions", 0, duration_resolved_options),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto.clone(),
     );
@@ -4665,7 +4651,7 @@ pub fn install_intl(
         "get numberingSystem",
         0,
     );
-    let locale_ctor = install_basic_intl_constructor(
+    let locale_ctor = define_basic_intl_constructor(
         &intl,
         "Locale",
         INTL_LOCALE_BRAND_KEY,
@@ -4675,7 +4661,7 @@ pub fn install_intl(
             ("maximize", 0, locale_maximize),
             ("minimize", 0, locale_minimize),
         ],
-        mm,
+        &mm,
         object_proto,
         fn_proto,
     );
@@ -4710,44 +4696,14 @@ pub fn install_intl(
         );
     }
 
-    if let Some(symbol_ctor) = global
-        .get(&PropertyKey::string("Symbol"))
-        .and_then(|v| v.as_object())
-        && let Some(to_string_tag) = symbol_ctor
-            .get(&PropertyKey::string("toStringTag"))
-            .and_then(|v| v.as_symbol())
-    {
-        intl.define_property(
-            PropertyKey::Symbol(to_string_tag),
-            PropertyDescriptor::data_with_attrs(
-                Value::string(JsString::intern("Intl")),
-                PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            ),
-        );
-    } else {
-        intl.define_property(
-            PropertyKey::string("@@toStringTag"),
-            PropertyDescriptor::data_with_attrs(
-                Value::string(JsString::intern("Intl")),
-                PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            ),
-        );
-    }
-
-    global.define_property(
-        PropertyKey::string("Intl"),
-        PropertyDescriptor::data_with_attrs(
-            Value::object(intl),
-            PropertyAttributes::builtin_method(),
-        ),
-    );
+    intl_builder.install_on(&global, "Intl");
     let _ = global.set(PropertyKey::string("__Intl_Collator"), collator_ctor);
+}
+
+pub struct IntlNamespace;
+
+impl IntrinsicObject for IntlNamespace {
+    fn init(ctx: &IntrinsicContext) {
+        init_intl_namespace(ctx);
+    }
 }

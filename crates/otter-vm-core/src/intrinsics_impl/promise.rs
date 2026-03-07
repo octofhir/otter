@@ -26,6 +26,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::JsJobQueueTrait;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -34,6 +35,36 @@ use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind};
 use crate::string::JsString;
 use crate::value::Value;
+
+pub struct PromiseIntrinsic;
+
+impl IntrinsicObject for PromiseIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_promise_prototype(ctx.intrinsics().promise_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().promise_prototype,
+                "Promise",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_promise_constructor(), 1)
+            .build_and_install(&global);
+            install_promise_statics(
+                ctor,
+                ctx.fn_proto(),
+                &mm,
+                ctx.intrinsics().aggregate_error_prototype,
+            );
+            crate::intrinsics_impl::helpers::define_species_getter(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 // ============================================================================
 // Helpers
@@ -418,7 +449,7 @@ fn create_error_value(ncx: &crate::context::NativeContext<'_>, name: &str, messa
         .and_then(|v| v.as_object());
 
     let obj = GcRef::new(JsObject::new(
-        proto.map(Value::object).unwrap_or_else(Value::null)
+        proto.map(Value::object).unwrap_or_else(Value::null),
     ));
 
     let _ = obj.set(
@@ -790,9 +821,7 @@ pub fn install_promise_statics(
 
                 // Empty array rejects with AggregateError
                 if items.is_empty() {
-                    let agg = GcRef::new(JsObject::new(
-                        Value::object(aggregate_error_proto)
-                    ));
+                    let agg = GcRef::new(JsObject::new(Value::object(aggregate_error_proto)));
                     let _ = agg.set(
                         PropertyKey::string("message"),
                         Value::string(JsString::intern("All promises were rejected")),
@@ -871,8 +900,7 @@ pub fn install_promise_statics(
                             for (i, e) in errs.iter().enumerate() {
                                 let _ = arr.set(PropertyKey::Index(i as u32), e.clone());
                             }
-                            let agg =
-                                GcRef::new(JsObject::new(Value::object(agg_proto)));
+                            let agg = GcRef::new(JsObject::new(Value::object(agg_proto)));
                             let _ = agg.set(
                                 PropertyKey::string("name"),
                                 Value::string(JsString::intern("AggregateError")),

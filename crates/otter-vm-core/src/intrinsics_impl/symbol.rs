@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -17,6 +18,55 @@ use crate::value::{Symbol, Value};
 use otter_macros::dive;
 
 static NEXT_SYMBOL_ID: AtomicU64 = AtomicU64::new(well_known::UNSCOPABLES + 1);
+
+pub struct SymbolIntrinsic;
+
+impl IntrinsicObject for SymbolIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_symbol_prototype(ctx.intrinsics().symbol_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().symbol_prototype,
+                "Symbol",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_symbol_constructor(), 0)
+            .build_and_install(&global);
+            install_symbol_statics(ctor, ctx.fn_proto(), &mm);
+
+            let sym_attrs = crate::object::PropertyAttributes::permanent();
+            let install_sym = |name: &str, sym_val: &Value| {
+                ctor.define_property(
+                    PropertyKey::string(name),
+                    PropertyDescriptor::data_with_attrs(sym_val.clone(), sym_attrs),
+                );
+            };
+            let intrinsics = ctx.intrinsics();
+            install_sym("iterator", &intrinsics.symbol_iterator);
+            install_sym("asyncIterator", &intrinsics.symbol_async_iterator);
+            install_sym("toStringTag", &intrinsics.symbol_to_string_tag);
+            install_sym("hasInstance", &intrinsics.symbol_has_instance);
+            install_sym("toPrimitive", &intrinsics.symbol_to_primitive);
+            install_sym(
+                "isConcatSpreadable",
+                &intrinsics.symbol_is_concat_spreadable,
+            );
+            install_sym("match", &intrinsics.symbol_match);
+            install_sym("matchAll", &intrinsics.symbol_match_all);
+            install_sym("replace", &intrinsics.symbol_replace);
+            install_sym("search", &intrinsics.symbol_search);
+            install_sym("split", &intrinsics.symbol_split);
+            install_sym("species", &intrinsics.symbol_species);
+            install_sym("unscopables", &intrinsics.symbol_unscopables);
+        }
+    }
+}
 
 fn next_symbol_id() -> u64 {
     NEXT_SYMBOL_ID.fetch_add(1, Ordering::Relaxed)

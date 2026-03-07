@@ -334,6 +334,7 @@ mod tests {
                 dst: Register(0),
                 func: Register(1),
                 argc: 0,
+                ic_index: 0,
             },
             Instruction::Jump {
                 offset: JumpOffset(-2),

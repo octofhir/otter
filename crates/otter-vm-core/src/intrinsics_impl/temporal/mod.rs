@@ -8,6 +8,7 @@
 //! - Temporal.ZonedDateTime
 //! - Temporal.Duration
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -60,7 +61,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
 
     // Create main Temporal namespace object
     let temporal_obj = GcRef::new(JsObject::new(
-        object_proto_val.map(Value::object).unwrap_or(Value::null())
+        object_proto_val.map(Value::object).unwrap_or(Value::null()),
     ));
 
     // Tag it
@@ -76,10 +77,8 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
         ),
     );
 
-    let fn_proto =
-        fn_proto_val.unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
-    let obj_proto =
-        object_proto_val.unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
+    let fn_proto = fn_proto_val.unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
+    let obj_proto = object_proto_val.unwrap_or_else(|| GcRef::new(JsObject::new(Value::null())));
 
     // ====================================================================
     // Temporal.Now (namespace object, not a constructor)
@@ -1106,4 +1105,15 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
             PropertyAttributes::builtin_method(),
         ),
     );
+}
+
+pub struct TemporalNamespace;
+
+impl IntrinsicObject for TemporalNamespace {
+    fn init(ctx: &IntrinsicContext) {
+        if let Some(global) = ctx.global_opt() {
+            let mm = ctx.mm();
+            install_temporal_namespace(global, &mm);
+        }
+    }
 }

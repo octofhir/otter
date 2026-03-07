@@ -544,9 +544,7 @@ impl AllocationRegistry {
                 if let Some(trace_fn) = self.trace_table[tag as usize] {
                     // Trace the object's references, passing the start of the allocation
                     trace_fn(ptr as *const u8, &mut |child_header| {
-                        if !child_header.is_null()
-                            && (*child_header).mark() == MarkColor::White
-                        {
+                        if !child_header.is_null() && (*child_header).mark() == MarkColor::White {
                             (*child_header).set_mark(MarkColor::Gray);
                             worklist.push_back(child_header);
                         }
@@ -571,10 +569,9 @@ impl AllocationRegistry {
         // Sweep large objects: partition into live/dead with single drain
         {
             let mut large_objects = self.large_objects.borrow_mut();
-            let (live, dead): (Vec<_>, Vec<_>) =
-                large_objects.drain(..).partition(|entry| unsafe {
-                    (*entry.header).mark() != MarkColor::White
-                });
+            let (live, dead): (Vec<_>, Vec<_>) = large_objects
+                .drain(..)
+                .partition(|entry| unsafe { (*entry.header).mark() != MarkColor::White });
 
             for entry in &dead {
                 reclaimed += entry.size;

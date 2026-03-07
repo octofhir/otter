@@ -1633,8 +1633,7 @@ impl Otter {
                             fn_proto_realm,
                         );
 
-                        let realm_obj =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let realm_obj = GcRef::new(JsObject::new(Value::null()));
                         let _ = realm_obj
                             .set(PropertyKey::string("global"), Value::object(realm_global));
                         let _ = realm_obj.set(PropertyKey::string("evalScript"), eval_fn);
@@ -1647,9 +1646,7 @@ impl Otter {
         );
 
         // Create console object from __console_* ops
-        let console_obj = GcRef::new(JsObject::new(
-            Value::null(),
-        ));
+        let console_obj = GcRef::new(JsObject::new(Value::null()));
 
         // Helper to wire console methods from global __console_* functions
         let wire_console = |method_name: &str, global_name: &str| {

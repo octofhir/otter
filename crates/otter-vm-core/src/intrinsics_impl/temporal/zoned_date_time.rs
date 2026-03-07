@@ -1689,9 +1689,7 @@ pub(super) fn install_zoned_date_time(
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
             let zdt = extract_zoned_date_time(&obj)?;
-            let result = GcRef::new(JsObject::new(
-                Value::undefined(),
-            ));
+            let result = GcRef::new(JsObject::new(Value::undefined()));
             result.define_property(
                 PropertyKey::string("calendar"),
                 PropertyDescriptor::data(Value::string(JsString::intern(

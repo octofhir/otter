@@ -3885,12 +3885,8 @@ mod tests {
         let _rt = crate::runtime::VmRuntime::new();
         let memory_manager = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null()));
-        let obj2 = GcRef::new(JsObject::new(
-            Value::object(obj1),
-        ));
-        let obj3 = GcRef::new(JsObject::new(
-            Value::object(obj2),
-        ));
+        let obj2 = GcRef::new(JsObject::new(Value::object(obj1)));
+        let obj3 = GcRef::new(JsObject::new(Value::object(obj2)));
 
         // Attempting to create a cycle should fail
         // obj1 -> obj2 -> obj3 -> obj1 would be a cycle

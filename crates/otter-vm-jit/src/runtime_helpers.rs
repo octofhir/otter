@@ -209,10 +209,12 @@ pub enum HelperKind {
     ForInNext = 82,
     /// `(obj, expected_shape, offset) -> value` — monomorphic property read (no ctx)
     GetPropMono = 83,
+    /// `(ctx, callee, argc, argv_ptr, expected_func_ptr) -> value` — monomorphic call
+    CallMono = 84,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 84;
+pub const HELPER_COUNT: usize = 85;
 
 /// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
 /// Used by IteratorNext to return both value and done flag.
@@ -336,6 +338,7 @@ impl HelperKind {
             Self::GetAsyncIterator => "otter_rt_get_async_iterator",
             Self::ForInNext => "otter_rt_for_in_next",
             Self::GetPropMono => "otter_rt_get_prop_mono",
+            Self::CallMono => "otter_rt_call_mono",
         }
     }
 
@@ -422,7 +425,8 @@ impl HelperKind {
             | Self::CallWithReceiver
             | Self::CallSpread
             | Self::ConstructSpread
-            | Self::CallMethodComputedSpread => 5,
+            | Self::CallMethodComputedSpread
+            | Self::CallMono => 5,
             Self::CallMethod | Self::CallMethodComputed => 6,
         }
     }
@@ -433,7 +437,10 @@ impl HelperKind {
     }
 
     /// Build the Cranelift IR signature for this helper using the given calling convention.
-    pub fn make_signature_with_call_conv(self, call_conv: cranelift_codegen::isa::CallConv) -> ir::Signature {
+    pub fn make_signature_with_call_conv(
+        self,
+        call_conv: cranelift_codegen::isa::CallConv,
+    ) -> ir::Signature {
         let mut sig = ir::Signature::new(call_conv);
         for _ in 0..self.param_count() {
             sig.params.push(AbiParam::new(types::I64));

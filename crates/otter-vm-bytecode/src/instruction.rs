@@ -878,6 +878,8 @@ pub enum Instruction {
         dst: Register,
         func: Register,
         argc: u8,
+        /// Index into the feedback vector for call target IC
+        ic_index: u16,
     },
     CallMethod {
         dst: Register,

@@ -94,7 +94,9 @@ pub(crate) fn emit_is_object(builder: &mut FunctionBuilder, val: Value) -> Value
 pub(crate) fn emit_is_pointer(builder: &mut FunctionBuilder, val: Value) -> Value {
     let mask = builder.ins().iconst(types::I64, PTR_TAG_MASK);
     let tag = builder.ins().band(val, mask);
-    builder.ins().icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT as i64)
+    builder
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT as i64)
 }
 
 /// Emit: is this value a NaN-boxed int32?

@@ -12,6 +12,7 @@
 //!         └── %WrapForValidIteratorPrototype% (next, return)
 //! ```
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -26,6 +27,45 @@ use std::sync::Arc;
 // ============================================================================
 const UNDERLYING_ITER: &str = "__underlying_iter__";
 const UNDERLYING_NEXT: &str = "__underlying_next__";
+
+pub struct IteratorIntrinsic;
+
+impl IntrinsicObject for IteratorIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+
+        if let Some(sym) = intrinsics.symbol_iterator.as_symbol() {
+            intrinsics.iterator_prototype.define_property(
+                PropertyKey::Symbol(sym),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |this_val, _args, _ncx| std::result::Result::Ok(this_val.clone()),
+                    mm.clone(),
+                    ctx.fn_proto(),
+                )),
+            );
+        }
+
+        populate_iterator_prototypes(
+            intrinsics.iterator_prototype,
+            intrinsics.iterator_helper_prototype,
+            intrinsics.wrap_for_valid_iterator_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            build_iterator_constructor(
+                intrinsics.iterator_prototype,
+                intrinsics.wrap_for_valid_iterator_prototype,
+                ctx.fn_proto(),
+                &mm,
+            )
+            .build_and_install(&global);
+        }
+    }
+}
 const CALLBACK: &str = "__callback__";
 const HELPER_KIND: &str = "__helper_kind__";
 const REMAINING: &str = "__remaining__";
@@ -847,9 +887,7 @@ fn wrap_for_valid_iterator(
     wrap_proto: GcRef<JsObject>,
 ) -> Result<Value, VmError> {
     let next_method = get_iterator_next(iter, ncx)?;
-    let wrapper = GcRef::new(JsObject::new(
-        Value::object(wrap_proto)
-    ));
+    let wrapper = GcRef::new(JsObject::new(Value::object(wrap_proto)));
     let _ = wrapper.set(pk(UNDERLYING_ITER), iter.clone());
     let _ = wrapper.set(pk(UNDERLYING_NEXT), next_method);
     Ok(Value::object(wrapper))
@@ -895,21 +933,12 @@ fn wrap_return(
     Ok(create_iter_result(Value::undefined(), true, ncx))
 }
 
-// ============================================================================
-// Public initialization functions
-// ============================================================================
-
-/// Initialize Iterator.prototype methods: lazy helpers + terminal methods.
-/// Also sets up %IteratorHelperPrototype% and %WrapForValidIteratorPrototype%.
-///
-/// Called from `Intrinsics::initialize_prototypes()`.
-pub fn init_iterator_prototype(
+fn populate_iterator_prototypes(
     iterator_prototype: GcRef<JsObject>,
     iterator_helper_prototype: GcRef<JsObject>,
     wrap_for_valid_iterator_prototype: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-    symbol_iterator: GcRef<crate::value::Symbol>,
     symbol_to_string_tag: GcRef<crate::value::Symbol>,
 ) {
     // ---- %IteratorHelperPrototype% setup ----
@@ -1122,85 +1151,27 @@ pub fn init_iterator_prototype(
         )),
     );
 
-    // ---- [Symbol.iterator]() { return this; } is already set by intrinsics.rs ----
-    // We don't override it here.
-
-    // ---- Iterator.prototype.constructor = Iterator ----
-    // This is set when the Iterator constructor is installed on the global object.
-    let _ = symbol_iterator; // Used by caller for wiring
+    // `[Symbol.iterator]` and `prototype.constructor` are wired separately.
 }
 
-/// Install the global `Iterator` constructor with `Iterator.from()` static method.
-pub fn install_iterator_constructor(
-    global: GcRef<JsObject>,
+fn build_iterator_constructor(
     iterator_prototype: GcRef<JsObject>,
     wrap_for_valid_iterator_prototype: GcRef<JsObject>,
     fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
-) {
-    // Create Iterator constructor function
-    let ctor = Value::native_function_with_proto(iterator_constructor, mm.clone(), fn_proto);
-    if let Some(ctor_obj) = ctor.native_function_object() {
-        ctor_obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::function_length(Value::int32(0)),
-        );
-        ctor_obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::function_length(Value::string(JsString::intern("Iterator"))),
-        );
-
-        // Iterator.prototype
-        ctor_obj.define_property(
-            PropertyKey::string("prototype"),
-            PropertyDescriptor::Data {
-                value: Value::object(iterator_prototype),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                },
-            },
-        );
-
-        // Iterator.from()
-        let wfvip = wrap_for_valid_iterator_prototype;
-        let mm_from = mm.clone();
-        ctor_obj.define_property(
-            PropertyKey::string("from"),
-            PropertyDescriptor::builtin_method(make_builtin(
-                "from",
-                1,
-                move |this, args, ncx| iterator_from(this, args, ncx, wfvip),
-                mm_from,
-                fn_proto,
-            )),
-        );
-    }
-
-    // Iterator.prototype.constructor = Iterator
-    iterator_prototype.define_property(
-        PropertyKey::string("constructor"),
-        PropertyDescriptor::Data {
-            value: ctor.clone(),
-            attributes: PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-
-    // Install on global object
-    global.define_property(
-        PropertyKey::string("Iterator"),
-        PropertyDescriptor::Data {
-            value: ctor,
-            attributes: PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
+) -> BuiltInBuilder {
+    let wfvip = wrap_for_valid_iterator_prototype;
+    BuiltInBuilder::new(
+        mm.clone(),
+        fn_proto,
+        GcRef::new(JsObject::new(Value::object(fn_proto))),
+        iterator_prototype,
+        "Iterator",
+    )
+    .constructor_fn(iterator_constructor, 0)
+    .static_method(
+        "from",
+        move |this, args, ncx| iterator_from(this, args, ncx, wfvip),
+        1,
+    )
 }

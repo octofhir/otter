@@ -2,14 +2,216 @@
 //!
 //! All String object methods for ES2026 standard.
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
+
+pub struct StringIntrinsic;
+
+impl IntrinsicObject for StringIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+        init_string_iterator_prototype(
+            intrinsics.string_iterator_prototype,
+            intrinsics.iterator_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+        init_string_prototype(
+            intrinsics.string_prototype,
+            ctx.fn_proto(),
+            &mm,
+            intrinsics.string_iterator_prototype,
+            crate::intrinsics::well_known::iterator_symbol(),
+        );
+        let _ = intrinsics.string_prototype.set(
+            PropertyKey::string("__primitiveValue__"),
+            Value::string(JsString::intern("")),
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                intrinsics.string_prototype,
+                "String",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(
+                |this, args, ncx| {
+                    let s = if let Some(arg) = args.first() {
+                        let symbol_to_string = |sym: &crate::value::Symbol| {
+                            if let Some(desc) = sym.description.as_deref() {
+                                format!("Symbol({})", desc)
+                            } else {
+                                "Symbol()".to_string()
+                            }
+                        };
+
+                        if let Some(sym) = arg.as_symbol() {
+                            if !ncx.is_construct() {
+                                symbol_to_string(&sym)
+                            } else {
+                                ncx.to_string_value(arg)?
+                            }
+                        } else if arg.is_object() {
+                            let prim =
+                                ncx.to_primitive(arg, crate::interpreter::PreferredType::String)?;
+                            if let Some(sym) = prim.as_symbol() {
+                                symbol_to_string(&sym)
+                            } else {
+                                ncx.to_string_value(&prim)?
+                            }
+                        } else {
+                            ncx.to_string_value(arg)?
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let str_val = Value::string(JsString::intern(&s));
+                    if let Some(obj) = this.as_object() {
+                        let _ = obj.set(PropertyKey::string("__primitiveValue__"), str_val.clone());
+                        obj.setup_string_exotic(&s);
+                    }
+                    Ok(str_val)
+                },
+                1,
+            )
+            .static_method(
+                "fromCharCode",
+                |_this, args, ncx| {
+                    let mut result = String::new();
+                    for arg in args {
+                        let n = ncx.to_number_value(arg)?;
+                        let code = if n.is_nan() || n.is_infinite() {
+                            0u16
+                        } else {
+                            (n.trunc() as i64 as u32 & 0xFFFF) as u16
+                        };
+                        let s = String::from_utf16_lossy(&[code]);
+                        result.push_str(&s);
+                    }
+                    Ok(Value::string(JsString::intern(&result)))
+                },
+                1,
+            )
+            .static_method(
+                "fromCodePoint",
+                |_this, args, ncx| {
+                    let mut result = String::new();
+                    for arg in args {
+                        let n = ncx.to_number_value(arg)?;
+                        if n != n.trunc() || n < 0.0 || n > 0x10FFFF as f64 || n.is_infinite() {
+                            return Err(VmError::range_error(&format!("Invalid code point {}", n)));
+                        }
+                        let code = n as u32;
+                        if let Some(ch) = char::from_u32(code) {
+                            result.push(ch);
+                        } else {
+                            return Err(VmError::range_error(&format!(
+                                "Invalid code point {}",
+                                code
+                            )));
+                        }
+                    }
+                    Ok(Value::string(JsString::intern(&result)))
+                },
+                1,
+            )
+            .static_method(
+                "raw",
+                |_this, args, ncx| {
+                    fn get_prop(
+                        obj: &GcRef<JsObject>,
+                        obj_val: &Value,
+                        key: &PropertyKey,
+                        ncx: &mut crate::context::NativeContext<'_>,
+                    ) -> Result<Value, VmError> {
+                        if let Some(desc) = obj.lookup_property_descriptor(key) {
+                            match desc {
+                                PropertyDescriptor::Data { value, .. } => Ok(value),
+                                PropertyDescriptor::Accessor { get, .. } => {
+                                    if let Some(getter) = get
+                                        && !getter.is_undefined()
+                                    {
+                                        return ncx.call_function(&getter, obj_val.clone(), &[]);
+                                    }
+                                    Ok(Value::undefined())
+                                }
+                                PropertyDescriptor::Deleted => Ok(Value::undefined()),
+                            }
+                        } else {
+                            if let PropertyKey::Index(i) = key {
+                                let elements = obj.elements.borrow();
+                                if (*i as usize) < elements.len() {
+                                    return Ok(elements[*i as usize].clone());
+                                }
+                            }
+                            Ok(Value::undefined())
+                        }
+                    }
+
+                    let template_val = args.first().cloned().unwrap_or(Value::undefined());
+                    if template_val.is_undefined() || template_val.is_null() {
+                        return Err(VmError::type_error(
+                            "Cannot convert undefined or null to object",
+                        ));
+                    }
+                    let template = template_val.as_object().ok_or_else(|| {
+                        VmError::type_error("String.raw requires a template object")
+                    })?;
+                    let raw_val =
+                        get_prop(&template, &template_val, &PropertyKey::string("raw"), ncx)?;
+                    if raw_val.is_undefined() || raw_val.is_null() {
+                        return Err(VmError::type_error(
+                            "Cannot convert undefined or null to object",
+                        ));
+                    }
+                    let raw_obj = raw_val
+                        .as_object()
+                        .ok_or_else(|| VmError::type_error("raw must be an object"))?;
+                    let len_val =
+                        get_prop(&raw_obj, &raw_val, &PropertyKey::string("length"), ncx)?;
+                    let len_num = ncx.to_number_value(&len_val)?;
+                    let len = if len_num.is_nan() || len_num < 0.0 {
+                        0usize
+                    } else {
+                        len_num.min(9007199254740991.0) as usize
+                    };
+                    if len == 0 {
+                        return Ok(Value::string(JsString::intern("")));
+                    }
+                    let mut result = String::new();
+                    for i in 0..len {
+                        if i > 0
+                            && let Some(sub) = args.get(i)
+                        {
+                            let sub_str = ncx.to_string_value(sub)?;
+                            result.push_str(&sub_str);
+                        }
+                        let segment =
+                            get_prop(&raw_obj, &raw_val, &PropertyKey::Index(i as u32), ncx)?;
+                        let seg_str = ncx.to_string_value(&segment)?;
+                        result.push_str(&seg_str);
+                    }
+                    Ok(Value::string(JsString::intern(&result)))
+                },
+                1,
+            )
+            .build_and_install(&global);
+        }
+    }
+}
 
 /// thisStringValue(value) per ES2023 §22.1.3
 ///
@@ -327,6 +529,109 @@ fn make_string_iterator(
     let _ = iter.set(PropertyKey::string("__string_index__"), Value::number(0.0));
 
     Ok(Value::object(iter))
+}
+
+pub fn init_string_iterator_prototype(
+    string_iterator_proto: GcRef<JsObject>,
+    iterator_prototype: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
+) {
+    string_iterator_proto.set_prototype(Value::object(iterator_prototype));
+
+    fn create_string_iter_result(
+        value: Value,
+        done: bool,
+        ncx: &mut crate::context::NativeContext<'_>,
+    ) -> Value {
+        let proto = ncx
+            .global()
+            .get(&PropertyKey::string("Object"))
+            .and_then(|o| o.as_object().or_else(|| o.native_function_object()))
+            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
+            .map(Value::object)
+            .unwrap_or(Value::null());
+        let result = GcRef::new(JsObject::new(proto));
+        let _ = result.set(PropertyKey::string("value"), value);
+        let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
+        Value::object(result)
+    }
+
+    string_iterator_proto.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+            |this_val, _args, ncx| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+
+                if !iter_obj.has_own(&PropertyKey::string("__string_ref__")) {
+                    return Err(VmError::type_error(
+                        "StringIterator.prototype.next requires that 'this' be a String Iterator object",
+                    ));
+                }
+
+                if iter_obj
+                    .get(&PropertyKey::string("__iter_done__"))
+                    .and_then(|v| v.as_boolean())
+                    .unwrap_or(false)
+                {
+                    return Ok(create_string_iter_result(Value::undefined(), true, ncx));
+                }
+
+                let string = iter_obj
+                    .get(&PropertyKey::string("__string_ref__"))
+                    .and_then(|v| v.as_string())
+                    .ok_or_else(|| VmError::type_error("iterator: missing string ref"))?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__string_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+
+                let units = string.as_utf16();
+                let len = units.len();
+
+                if idx >= len {
+                    let _ = iter_obj.set(PropertyKey::string("__iter_done__"), Value::boolean(true));
+                    return Ok(create_string_iter_result(Value::undefined(), true, ncx));
+                }
+
+                let first = units[idx];
+                let (char_string, next_idx) = if is_high_surrogate(first)
+                    && idx + 1 < len
+                    && is_low_surrogate(units[idx + 1])
+                {
+                    (JsString::intern_utf16(&[first, units[idx + 1]]), idx + 2)
+                } else {
+                    (JsString::intern_utf16(&[first]), idx + 1)
+                };
+
+                let _ = iter_obj.set(
+                    PropertyKey::string("__string_index__"),
+                    Value::number(next_idx as f64),
+                );
+
+                Ok(create_string_iter_result(Value::string(char_string), false, ncx))
+            },
+            mm.clone(),
+            fn_proto,
+            "next",
+            0,
+        )),
+    );
+    string_iterator_proto.define_property(
+        PropertyKey::Symbol(symbol_to_string_tag),
+        PropertyDescriptor::Data {
+            value: Value::string(JsString::intern("String Iterator")),
+            attributes: PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        },
+    );
 }
 
 /// Helper to define a builtin method with correct name and length on a prototype

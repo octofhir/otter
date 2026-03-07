@@ -2,6 +2,7 @@
 //!
 //! All Error object methods for ES2026 standard, including stack trace support.
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -11,6 +12,96 @@ use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
 use std::sync::Arc;
+
+pub struct ErrorIntrinsic;
+
+impl IntrinsicObject for ErrorIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+        init_error_prototypes(
+            intrinsics.error_prototype,
+            intrinsics.type_error_prototype,
+            intrinsics.range_error_prototype,
+            intrinsics.reference_error_prototype,
+            intrinsics.syntax_error_prototype,
+            intrinsics.uri_error_prototype,
+            intrinsics.eval_error_prototype,
+            intrinsics.aggregate_error_prototype,
+            ctx.fn_proto(),
+            &mm,
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let error_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                error_ctor,
+                intrinsics.error_prototype,
+                "Error",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_error_constructor("Error"), 1)
+            .build_and_install(&global);
+
+            for (name, proto, ctor, len) in [
+                (
+                    "TypeError",
+                    intrinsics.type_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "RangeError",
+                    intrinsics.range_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "ReferenceError",
+                    intrinsics.reference_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "SyntaxError",
+                    intrinsics.syntax_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "URIError",
+                    intrinsics.uri_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "EvalError",
+                    intrinsics.eval_error_prototype,
+                    ctx.alloc_constructor(),
+                    1,
+                ),
+                (
+                    "AggregateError",
+                    intrinsics.aggregate_error_prototype,
+                    ctx.alloc_constructor(),
+                    2,
+                ),
+            ] {
+                ctor.set_prototype(Value::object(error_ctor));
+                let builder = BuiltInBuilder::new(mm.clone(), ctx.fn_proto(), ctor, proto, name)
+                    .inherits(intrinsics.error_prototype);
+                let builder = if name == "AggregateError" {
+                    builder.constructor_fn(create_aggregate_error_constructor(), len)
+                } else {
+                    builder.constructor_fn(create_error_constructor(name), len)
+                };
+                builder.build_and_install(&global);
+            }
+        }
+    }
+}
 
 fn native_from_decl_with_function_proto(
     native_fn: crate::value::NativeFn,
@@ -344,10 +435,7 @@ pub fn create_aggregate_error_constructor() -> Box<
 /// Implements IterableToList (§7.4.7) — iterate an iterable and collect values into an array.
 ///
 /// Uses `get_value_full` to properly invoke accessor getters on iterator protocol objects.
-fn iterable_to_list(
-    ncx: &mut NativeContext<'_>,
-    iterable: &Value,
-) -> Result<Value, VmError> {
+fn iterable_to_list(ncx: &mut NativeContext<'_>, iterable: &Value) -> Result<Value, VmError> {
     use crate::object::get_value_full;
 
     // GetMethod(obj, @@iterator) — §7.3.10

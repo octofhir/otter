@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -17,6 +18,28 @@ use crate::proxy::JsProxy;
 use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
+
+pub struct ProxyIntrinsic;
+
+impl IntrinsicObject for ProxyIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        if let Some(global) = ctx.global_opt() {
+            let mm = ctx.mm();
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.alloc_object(ctx.obj_proto()),
+                "Proxy",
+            )
+            .constructor_fn(proxy_constructor, 2)
+            .build_and_install(&global);
+            let _ = ctor.delete(&PropertyKey::string("prototype"));
+            init_proxy_constructor(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 fn is_object_like(value: &Value) -> bool {
     value.as_object().is_some() || value.as_proxy().is_some()

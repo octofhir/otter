@@ -8,15 +8,87 @@
 //!   slice, concat, reverse, at, fill, splice, flat, forEach, map, filter,
 //!   reduce, reduceRight, find, findIndex, every, some, sort, entries, keys, values, copyWithin
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use crate::memory::MemoryManager;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
+
+pub struct ArrayIntrinsic;
+
+impl IntrinsicObject for ArrayIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+        init_array_iterator_prototype(
+            intrinsics.array_iterator_prototype,
+            intrinsics.iterator_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+        intrinsics.array_prototype.mark_as_array();
+        init_array_prototype(
+            intrinsics.array_prototype,
+            ctx.fn_proto(),
+            &mm,
+            intrinsics.array_iterator_prototype,
+            crate::intrinsics::well_known::iterator_symbol(),
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let array_proto = intrinsics.array_prototype;
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(mm.clone(), ctx.fn_proto(), ctor, array_proto, "Array")
+                .inherits(ctx.obj_proto())
+                .constructor_fn(
+                    move |_this, args, _ncx| {
+                        let make_array = |len: usize| -> GcRef<JsObject> {
+                            let arr = GcRef::new(JsObject::array(len));
+                            arr.set_prototype(Value::object(array_proto));
+                            arr
+                        };
+
+                        if args.is_empty() {
+                            return Ok(Value::array(make_array(0)));
+                        }
+                        if args.len() == 1 {
+                            if let Some(n) = args[0].as_number() {
+                                let len = n as u32;
+                                if (len as f64) != n || n < 0.0 {
+                                    return Err(VmError::range_error("Invalid array length"));
+                                }
+                                return Ok(Value::array(make_array(len as usize)));
+                            }
+                            if let Some(n) = args[0].as_int32() {
+                                if n < 0 {
+                                    return Err(VmError::range_error("Invalid array length"));
+                                }
+                                return Ok(Value::array(make_array(n as usize)));
+                            }
+                            let arr = make_array(1);
+                            let _ = arr.set(PropertyKey::index(0), args[0].clone());
+                            return Ok(Value::array(arr));
+                        }
+                        let arr = make_array(args.len());
+                        for (i, arg) in args.iter().enumerate() {
+                            let _ = arr.set(PropertyKey::index(i as u32), arg.clone());
+                        }
+                        Ok(Value::array(arr))
+                    },
+                    1,
+                )
+                .build_and_install(&global);
+            install_array_statics(ctor, ctx.fn_proto(), &mm);
+            crate::intrinsics_impl::helpers::define_species_getter(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 /// Helper: get array length from an object (fast path, no coercion).
 fn get_len(obj: &GcRef<JsObject>) -> usize {
@@ -245,9 +317,7 @@ pub(crate) fn make_array_iterator(
         .ok_or_else(|| VmError::type_error("Array iterator prototype is not defined"))?;
     let array_iter_proto = intrinsics.array_iterator_prototype;
     // Create iterator with %ArrayIteratorPrototype% as prototype (has next() on it)
-    let iter = GcRef::new(JsObject::new(
-        Value::object(array_iter_proto)
-    ));
+    let iter = GcRef::new(JsObject::new(Value::object(array_iter_proto)));
     // Store the array reference, current index, and kind
     let _ = iter.set(PropertyKey::string("__array_ref__"), this_val.clone());
     let _ = iter.set(PropertyKey::string("__array_index__"), Value::number(0.0));
@@ -256,6 +326,146 @@ pub(crate) fn make_array_iterator(
         Value::string(JsString::intern(kind)),
     );
     Ok(Value::object(iter))
+}
+
+pub fn init_array_iterator_prototype(
+    array_iterator_prototype: GcRef<JsObject>,
+    iterator_prototype: GcRef<JsObject>,
+    fn_proto: GcRef<JsObject>,
+    mm: &Arc<MemoryManager>,
+    symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
+) {
+    array_iterator_prototype.set_prototype(Value::object(iterator_prototype));
+
+    fn create_iter_result(
+        value: Value,
+        done: bool,
+        ncx: &mut crate::context::NativeContext<'_>,
+    ) -> Value {
+        let proto = ncx
+            .global()
+            .get(&PropertyKey::string("Object"))
+            .and_then(|o| o.as_object().or_else(|| o.native_function_object()))
+            .and_then(|o| o.get(&PropertyKey::string("prototype")))
+            .and_then(|v| v.as_object())
+            .map(Value::object)
+            .unwrap_or(Value::null());
+        let result = GcRef::new(JsObject::new(proto));
+        let _ = result.set(PropertyKey::string("value"), value);
+        let _ = result.set(PropertyKey::string("done"), Value::boolean(done));
+        Value::object(result)
+    }
+
+    array_iterator_prototype.define_property(
+        PropertyKey::string("next"),
+        PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+            |this_val, _args, ncx| {
+                let iter_obj = this_val
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("not an iterator object"))?;
+
+                if iter_obj
+                    .get(&PropertyKey::string("__iter_done__"))
+                    .map(|v| v.to_boolean())
+                    .unwrap_or(false)
+                {
+                    return Ok(create_iter_result(Value::undefined(), true, ncx));
+                }
+
+                let arr_val = iter_obj
+                    .get(&PropertyKey::string("__array_ref__"))
+                    .ok_or_else(|| VmError::type_error("iterator: missing array ref"))?;
+                let idx = iter_obj
+                    .get(&PropertyKey::string("__array_index__"))
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+
+                let len = if let Some(ta) = arr_val.as_typed_array() {
+                    ta.length()
+                } else {
+                    let key = PropertyKey::string("length");
+                    let len_val = if let Some(proxy) = arr_val.as_proxy() {
+                        let key_value = Value::string(JsString::intern("length"));
+                        crate::proxy_operations::proxy_get(
+                            ncx,
+                            proxy,
+                            &key,
+                            key_value,
+                            arr_val.clone(),
+                        )?
+                    } else if let Some(arr_obj) = arr_val.as_object() {
+                        arr_obj.get(&key).unwrap_or(Value::undefined())
+                    } else {
+                        return Err(VmError::type_error("iterator: missing array ref"));
+                    };
+                    len_val.as_number().unwrap_or(0.0).max(0.0) as usize
+                };
+
+                let kind = iter_obj
+                    .get(&PropertyKey::string("__iter_kind__"))
+                    .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
+                    .unwrap_or_else(|| "value".to_string());
+
+                if idx >= len {
+                    let _ =
+                        iter_obj.set(PropertyKey::string("__iter_done__"), Value::boolean(true));
+                    return Ok(create_iter_result(Value::undefined(), true, ncx));
+                }
+
+                let _ = iter_obj.set(
+                    PropertyKey::string("__array_index__"),
+                    Value::number((idx + 1) as f64),
+                );
+
+                let get_element = |arr: &Value,
+                                   i: usize,
+                                   ncx: &mut crate::context::NativeContext<'_>|
+                 -> Result<Value, VmError> {
+                    if let Some(ta) = arr.as_typed_array() {
+                        Ok(ta.get(i).map(Value::number).unwrap_or(Value::undefined()))
+                    } else if let Some(proxy) = arr.as_proxy() {
+                        let key = PropertyKey::Index(i as u32);
+                        let key_value = Value::number(i as f64);
+                        crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, arr.clone())
+                    } else if let Some(arr_obj) = arr.as_object() {
+                        Ok(arr_obj
+                            .get(&PropertyKey::Index(i as u32))
+                            .unwrap_or(Value::undefined()))
+                    } else {
+                        Ok(Value::undefined())
+                    }
+                };
+
+                let value = match kind.as_str() {
+                    "key" => Value::number(idx as f64),
+                    "entry" => {
+                        let entry = GcRef::new(JsObject::array(2));
+                        let _ = entry.set(PropertyKey::Index(0), Value::number(idx as f64));
+                        let elem_val = get_element(&arr_val, idx, ncx)?;
+                        let _ = entry.set(PropertyKey::Index(1), elem_val);
+                        Value::array(entry)
+                    }
+                    _ => get_element(&arr_val, idx, ncx)?,
+                };
+                Ok(create_iter_result(value, false, ncx))
+            },
+            mm.clone(),
+            fn_proto,
+            "next",
+            0,
+        )),
+    );
+    array_iterator_prototype.define_property(
+        PropertyKey::Symbol(symbol_to_string_tag),
+        PropertyDescriptor::Data {
+            value: Value::string(JsString::intern("Array Iterator")),
+            attributes: PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        },
+    );
 }
 
 /// Wire all Array.prototype methods to the prototype object
@@ -2058,8 +2268,7 @@ pub fn init_array_prototype(
                     ));
                 }
                 let value = args.get(1).cloned().unwrap_or(Value::undefined());
-                let result =
-                    GcRef::new(JsObject::array(len as usize));
+                let result = GcRef::new(JsObject::array(len as usize));
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;

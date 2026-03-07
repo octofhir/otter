@@ -66,6 +66,8 @@ impl Default for CompletionType {
 /// Complete saved execution context for generator suspension
 ///
 /// This captures all state needed to resume a generator from where it was suspended.
+/// The `window` field stores the full register window (locals + scratch registers)
+/// as a single contiguous Vec, matching the layout in the shared register array.
 #[derive(Debug, Clone)]
 pub struct GeneratorFrame {
     /// Program counter (instruction offset)
@@ -74,10 +76,10 @@ pub struct GeneratorFrame {
     pub function_index: u32,
     /// The module this function belongs to
     pub module: Arc<Module>,
-    /// Local variables
-    pub locals: Vec<Value>,
-    /// Register values
-    pub registers: Vec<Value>,
+    /// Number of local variable slots at the start of the window
+    pub local_count: usize,
+    /// Full register window (locals + scratch registers)
+    pub window: Vec<Value>,
     /// Captured upvalues (closure variables)
     pub upvalues: Vec<UpvalueCell>,
     /// Try/catch handler stack
@@ -104,13 +106,8 @@ impl GeneratorFrame {
     /// Trace all GC-managed values in this frame
     /// CRITICAL: This must trace ALL Value fields to prevent GC from collecting live objects
     pub(crate) fn trace_frame(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // Trace all local variables
-        for value in &self.locals {
-            value.trace(tracer);
-        }
-
-        // Trace all register values
-        for value in &self.registers {
+        // Trace full register window (locals + scratch registers)
+        for value in &self.window {
             value.trace(tracer);
         }
 
@@ -141,13 +138,13 @@ impl GeneratorFrame {
 }
 
 impl GeneratorFrame {
-    /// Create a new generator frame with all execution state
+    /// Create a new generator frame with full register window (locals + scratch).
     pub fn new(
         pc: usize,
         function_index: u32,
         module: Arc<Module>,
-        locals: Vec<Value>,
-        registers: Vec<Value>,
+        local_count: usize,
+        window: Vec<Value>,
         upvalues: Vec<UpvalueCell>,
         try_stack: Vec<TryEntry>,
         this_value: Value,
@@ -159,8 +156,8 @@ impl GeneratorFrame {
             pc,
             function_index,
             module,
-            locals,
-            registers,
+            local_count,
+            window,
             upvalues,
             try_stack,
             this_value,
@@ -174,13 +171,13 @@ impl GeneratorFrame {
         }
     }
 
-    /// Create a new generator frame with yield destination register
+    /// Create a new generator frame with yield destination register.
     pub fn with_yield_dst(
         pc: usize,
         function_index: u32,
         module: Arc<Module>,
-        locals: Vec<Value>,
-        registers: Vec<Value>,
+        local_count: usize,
+        window: Vec<Value>,
         upvalues: Vec<UpvalueCell>,
         try_stack: Vec<TryEntry>,
         this_value: Value,
@@ -193,8 +190,8 @@ impl GeneratorFrame {
             pc,
             function_index,
             module,
-            locals,
-            registers,
+            local_count,
+            window,
             upvalues,
             try_stack,
             this_value,
@@ -207,36 +204,6 @@ impl GeneratorFrame {
             yield_dst: Some(yield_dst),
         }
     }
-
-    /// Create an initial frame for a generator that hasn't started yet
-    pub fn initial(
-        function_index: u32,
-        module: Arc<Module>,
-        locals: Vec<Value>,
-        upvalues: Vec<UpvalueCell>,
-        this_value: Value,
-        is_construct: bool,
-        frame_id: usize,
-        argc: usize,
-    ) -> Self {
-        Self {
-            pc: 0,
-            function_index,
-            module,
-            locals,
-            registers: Vec::new(),
-            upvalues,
-            try_stack: Vec::new(),
-            this_value,
-            is_construct,
-            frame_id,
-            argc,
-            received_value: None,
-            pending_throw: None,
-            completion_type: CompletionType::Normal,
-            yield_dst: None,
-        }
-    }
 }
 
 impl Default for GeneratorFrame {
@@ -245,8 +212,8 @@ impl Default for GeneratorFrame {
             pc: 0,
             function_index: 0,
             module: Arc::new(Module::builder("").build()),
-            locals: Vec::new(),
-            registers: Vec::new(),
+            local_count: 0,
+            window: Vec::new(),
             upvalues: Vec::new(),
             try_stack: Vec::new(),
             this_value: Value::undefined(),
@@ -659,8 +626,8 @@ mod tests {
             10, // pc
             0,  // function_index
             module,
-            vec![],             // locals
-            vec![],             // registers
+            0,                  // local_count
+            vec![],             // window
             vec![],             // upvalues
             vec![],             // try_stack
             Value::undefined(), // this_value
@@ -704,7 +671,7 @@ mod tests {
             0,
             0,
             module,
-            vec![],
+            0,
             vec![],
             vec![],
             vec![],
@@ -747,8 +714,8 @@ mod tests {
             42,
             1,
             Arc::clone(&module),
-            vec![Value::int32(1), Value::int32(2)],
-            vec![Value::int32(10)],
+            2,                                                        // local_count
+            vec![Value::int32(1), Value::int32(2), Value::int32(10)], // window: 2 locals + 1 register
             vec![],
             vec![TryEntry {
                 catch_pc: 100,
@@ -762,8 +729,8 @@ mod tests {
 
         assert_eq!(frame.pc, 42);
         assert_eq!(frame.function_index, 1);
-        assert_eq!(frame.locals.len(), 2);
-        assert_eq!(frame.registers.len(), 1);
+        assert_eq!(frame.local_count, 2);
+        assert_eq!(frame.window.len(), 3); // 2 locals + 1 register
         assert_eq!(frame.try_stack.len(), 1);
         assert_eq!(frame.try_stack[0].catch_pc, 100);
         assert_eq!(frame.this_value.as_int32(), Some(999));
@@ -793,7 +760,7 @@ mod tests {
             0,
             0,
             module,
-            vec![],
+            0,
             vec![],
             vec![],
             vec![],

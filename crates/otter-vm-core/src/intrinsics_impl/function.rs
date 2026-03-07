@@ -20,6 +20,7 @@
 //! - bind §20.2.3.2
 //! - toString §20.2.3.5
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -30,6 +31,97 @@ use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
 use std::sync::Arc;
+
+pub struct FunctionIntrinsic;
+
+impl IntrinsicObject for FunctionIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_function_prototype(ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let realm_id = ctx
+                .fn_proto()
+                .get(&PropertyKey::string("__realm_id__"))
+                .and_then(|v| v.as_int32())
+                .map(|id| id as RealmId)
+                .unwrap_or(0);
+
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctx.intrinsics().function_constructor,
+                ctx.intrinsics().function_prototype,
+                "Function",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_function_constructor(realm_id), 1)
+            .build_and_install(&global);
+
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctx.alloc_constructor(),
+                ctx.intrinsics().generator_function_prototype,
+                "GeneratorFunction",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_generator_function_constructor(realm_id), 1)
+            .build_and_install(&global);
+
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctx.alloc_constructor(),
+                ctx.intrinsics().async_function_prototype,
+                "AsyncFunction",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_async_function_constructor(realm_id), 1)
+            .build_and_install(&global);
+
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctx.alloc_constructor(),
+                ctx.intrinsics().async_generator_function_prototype,
+                "AsyncGeneratorFunction",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_async_generator_function_constructor(realm_id), 1)
+            .build_and_install(&global);
+
+            global.define_property(
+                PropertyKey::string("GeneratorFunctionPrototype"),
+                crate::object::PropertyDescriptor::data_with_attrs(
+                    Value::object(ctx.intrinsics().generator_function_prototype),
+                    crate::object::PropertyAttributes::permanent(),
+                ),
+            );
+            global.define_property(
+                PropertyKey::string("AsyncFunctionPrototype"),
+                crate::object::PropertyDescriptor::data_with_attrs(
+                    Value::object(ctx.intrinsics().async_function_prototype),
+                    crate::object::PropertyAttributes::permanent(),
+                ),
+            );
+            global.define_property(
+                PropertyKey::string("AsyncGeneratorFunctionPrototype"),
+                crate::object::PropertyDescriptor::data_with_attrs(
+                    Value::object(ctx.intrinsics().async_generator_function_prototype),
+                    crate::object::PropertyAttributes::permanent(),
+                ),
+            );
+
+            if let Some(call_fn) = ctx.fn_proto().get(&PropertyKey::string("call")) {
+                let _ = global.set(PropertyKey::string("__Function_call"), call_fn);
+            }
+            if let Some(apply_fn) = ctx.fn_proto().get(&PropertyKey::string("apply")) {
+                let _ = global.set(PropertyKey::string("__Function_apply"), apply_fn);
+            }
+        }
+    }
+}
 
 #[dive(name = "toString", length = 0)]
 fn function_to_string(

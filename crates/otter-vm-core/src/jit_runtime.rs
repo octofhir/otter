@@ -6,6 +6,7 @@ use otter_vm_jit::runtime_helpers::RuntimeHelpers;
 use otter_vm_jit::{BAILOUT_SENTINEL, BailoutReason};
 
 use crate::jit_helpers::{self, JitContext};
+use crate::jit_stubs::call_jit_entry;
 use crate::value::Value;
 
 static RUNTIME_HELPERS: OnceLock<RuntimeHelpers> = OnceLock::new();
@@ -29,15 +30,24 @@ pub(crate) struct OsrState {
 ///
 /// Unlike `otter_vm_exec::JitExecResult`, this carries VM-level `Value` types
 /// and deopt frame state needed for precise interpreter resume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DeoptValueSlot {
+    pub index: u16,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JitResumeState {
+    pub bailout_pc: u32,
+    pub locals: Vec<DeoptValueSlot>,
+    pub registers: Vec<DeoptValueSlot>,
+}
+
 pub(crate) enum JitCallResult {
     /// JIT code ran successfully.
     Ok(Value),
     /// JIT code bailed out with captured frame state — resume at deopt PC.
-    BailoutResume {
-        bailout_pc: u32,
-        locals: Vec<Value>,
-        registers: Vec<Value>,
-    },
+    BailoutResume(JitResumeState),
     /// JIT code bailed out — restart function from PC 0.
     BailoutRestart,
     /// No JIT code available for this function.
@@ -46,8 +56,36 @@ pub(crate) enum JitCallResult {
     NeedsRecompilation,
 }
 
+fn decode_raw_deopt_value(bits: i64) -> Value {
+    unsafe { Value::from_raw_bits_unchecked(bits as u64).unwrap_or_else(Value::undefined) }
+}
+
+fn decode_dense_slots(raw: &[i64]) -> Vec<DeoptValueSlot> {
+    raw.iter()
+        .enumerate()
+        .map(|(index, &bits)| DeoptValueSlot {
+            index: index as u16,
+            value: decode_raw_deopt_value(bits),
+        })
+        .collect()
+}
+
+fn decode_sparse_slots(raw: &[i64], live_indices: &[u16]) -> Vec<DeoptValueSlot> {
+    live_indices
+        .iter()
+        .filter_map(|&index| {
+            raw.get(index as usize).map(|&bits| DeoptValueSlot {
+                index,
+                value: decode_raw_deopt_value(bits),
+            })
+        })
+        .collect()
+}
+
 fn map_exec_result(
     exec_result: otter_vm_exec::JitExecResult,
+    module_id: u64,
+    function_index: u32,
     deopt_locals: &[i64],
     deopt_regs: &[i64],
 ) -> JitCallResult {
@@ -62,28 +100,31 @@ fn map_exec_result(
         otter_vm_exec::JitExecResult::Bailout(snapshot) => {
             if snapshot.resume_mode == otter_vm_exec::DeoptResumeMode::ResumeAtPc {
                 if let Some(pc) = snapshot.bailout_pc {
-                    // SAFETY: We are in the JIT execution scope — no GC has occurred
-                    // between the JIT writing these bits and us reading them. The raw
-                    // pointers in pointer-tagged values still point to live GC objects.
-                    let locals: Vec<Value> = deopt_locals
-                        .iter()
-                        .map(|&bits| unsafe {
-                            Value::from_raw_bits_unchecked(bits as u64)
-                                .unwrap_or_else(Value::undefined)
-                        })
-                        .collect();
-                    let registers: Vec<Value> = deopt_regs
-                        .iter()
-                        .map(|&bits| unsafe {
-                            Value::from_raw_bits_unchecked(bits as u64)
-                                .unwrap_or_else(Value::undefined)
-                        })
-                        .collect();
-                    return JitCallResult::BailoutResume {
+                    let (locals, registers) = if let Some(metadata) =
+                        otter_vm_exec::deopt_metadata_snapshot(module_id, function_index)
+                    {
+                        if let Some(site) = metadata.site(pc) {
+                            (
+                                decode_sparse_slots(deopt_locals, &site.live_locals),
+                                decode_sparse_slots(deopt_regs, &site.live_registers),
+                            )
+                        } else {
+                            (
+                                decode_dense_slots(deopt_locals),
+                                decode_dense_slots(deopt_regs),
+                            )
+                        }
+                    } else {
+                        (
+                            decode_dense_slots(deopt_locals),
+                            decode_dense_slots(deopt_regs),
+                        )
+                    };
+                    return JitCallResult::BailoutResume(JitResumeState {
                         bailout_pc: pc,
                         locals,
                         registers,
-                    };
+                    });
                 }
             }
             JitCallResult::BailoutRestart
@@ -244,7 +285,13 @@ pub(crate) fn try_execute_jit(
         )
     };
 
-    let result = map_exec_result(exec_result, deopt_locals, deopt_regs);
+    let result = map_exec_result(
+        exec_result,
+        module_id,
+        function_index,
+        deopt_locals,
+        deopt_regs,
+    );
     if matches!(result, JitCallResult::NotCompiled)
         && function.is_hot_function()
         && !function.is_deoptimized()
@@ -307,11 +354,8 @@ pub(crate) fn try_execute_jit_from_raw_args(
     // This avoids per-call JIT runtime mutex/drain overhead on call-heavy code.
     let ptr = function.jit_entry_ptr();
     if ptr != 0 {
-        // SAFETY: `ptr` is a JIT entry pointer produced by the compiler with
-        // signature `extern "C" fn(*mut u8, *const i64, u32) -> i64`.
-        let code: extern "C" fn(*mut u8, *const i64, u32) -> i64 =
-            unsafe { std::mem::transmute(ptr) };
-        let result = code(ctx_ptr, args_ptr, argc);
+        let outcome = unsafe { call_jit_entry(ctx_ptr.cast::<JitContext>(), args_ptr, argc, ptr) };
+        let result = outcome.result;
         if result != BAILOUT_SENTINEL {
             return Value::from_jit_bits(result as u64)
                 .map(JitCallResult::Ok)
@@ -323,7 +367,7 @@ pub(crate) fn try_execute_jit_from_raw_args(
             action,
             BailoutAction::Recompile | BailoutAction::PermanentDeopt
         ) {
-            otter_vm_exec::invalidate_jit_code(module_id, function_index);
+            otter_vm_exec::invalidate_jit_code(module_id, function_index, function);
         }
         return match action {
             BailoutAction::Recompile => JitCallResult::NeedsRecompilation,
@@ -342,5 +386,5 @@ pub(crate) fn try_execute_jit_from_raw_args(
         ctx_ptr,
     );
 
-    map_exec_result(exec_result, &[], &[])
+    map_exec_result(exec_result, module_id, function_index, &[], &[])
 }

@@ -5,6 +5,7 @@
 //! - Symbol methods: [Symbol.match], [Symbol.matchAll], [Symbol.replace], [Symbol.search], [Symbol.split]
 //! - Accessor getters: flags, source, dotAll, global, hasIndices, ignoreCase, multiline, sticky, unicode, unicodeSets
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -17,6 +18,54 @@ use crate::regexp::{JsRegExp, compile_pattern_for_regress, compute_literal_utf16
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
+
+pub struct RegExpIntrinsic;
+
+impl IntrinsicObject for RegExpIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_regexp_prototype(
+            ctx.intrinsics().regexp_prototype,
+            ctx.fn_proto(),
+            &mm,
+            ctx.intrinsics().iterator_prototype,
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.intrinsics().regexp_constructor;
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().regexp_prototype,
+                "RegExp",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(
+                create_regexp_constructor(ctx.intrinsics().regexp_prototype),
+                2,
+            )
+            .build_and_install(&global);
+            init_regexp_constructor(ctor, ctx.fn_proto(), mm.clone());
+            crate::intrinsics_impl::helpers::define_species_getter(ctor, ctx.fn_proto(), &mm);
+            ctor.define_property(
+                PropertyKey::string("escape"),
+                PropertyDescriptor::builtin_method(Value::native_function_with_proto(
+                    |_this, args, _ncx| {
+                        let s = args.first().and_then(|v| v.as_string()).ok_or_else(|| {
+                            VmError::type_error("RegExp.escape requires a string argument")
+                        })?;
+                        Ok(Value::string(JsString::intern(&regress::escape(
+                            s.as_str(),
+                        ))))
+                    },
+                    mm,
+                    ctx.fn_proto(),
+                )),
+            );
+        }
+    }
+}
 
 // ============================================================================
 // Helpers
@@ -1072,9 +1121,7 @@ fn create_regexp_string_iterator(
     fn_proto: &GcRef<JsObject>,
 ) -> Result<Value, VmError> {
     // Create the iterator object with %IteratorPrototype% as [[Prototype]]
-    let iter = GcRef::new(JsObject::new(
-        Value::object(iterator_prototype.clone())
-    ));
+    let iter = GcRef::new(JsObject::new(Value::object(iterator_prototype.clone())));
 
     // Store internal slots as properties
     let _ = iter.set(PropertyKey::string("__regexp_matcher__"), matcher);
@@ -1736,9 +1783,7 @@ pub fn init_regexp_prototype(
                             Some(obj)
                         } else if let Some(s) = named_captures_val.as_string() {
                             // String → String exotic object wrapper
-                            let obj = GcRef::new(JsObject::new(
-                                Value::null()
-                            ));
+                            let obj = GcRef::new(JsObject::new(Value::null()));
                             let _ = obj.set(
                                 PropertyKey::string("length"),
                                 Value::number(s.as_str().len() as f64),
@@ -1752,9 +1797,7 @@ pub fn init_regexp_prototype(
                             Some(obj)
                         } else {
                             // Other primitives (number, boolean) → wrapper objects
-                            let obj = GcRef::new(JsObject::new(
-                                Value::null()
-                            ));
+                            let obj = GcRef::new(JsObject::new(Value::null()));
                             Some(obj)
                         }
                     } else {
@@ -1883,11 +1926,8 @@ pub fn init_regexp_prototype(
                 // Default: create copy regex with new flags
                 let proto = regex.object.prototype();
                 let proto_obj = proto.as_object();
-                let new_regex = GcRef::new(JsRegExp::new(
-                    regex.pattern.clone(),
-                    new_flags,
-                    proto_obj,
-                ));
+                let new_regex =
+                    GcRef::new(JsRegExp::new(regex.pattern.clone(), new_flags, proto_obj));
                 let val = Value::regex(new_regex.clone());
                 let obj = new_regex.object.clone();
                 (val, obj)
@@ -2334,11 +2374,7 @@ pub fn create_regexp_constructor(
             regexp_proto.clone()
         };
 
-        let regex = GcRef::new(JsRegExp::new(
-            pattern_str,
-            flags_str,
-            Some(proto),
-        ));
+        let regex = GcRef::new(JsRegExp::new(pattern_str, flags_str, Some(proto)));
         Ok(Value::regex(regex))
     })
 }

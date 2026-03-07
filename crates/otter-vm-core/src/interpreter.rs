@@ -587,12 +587,8 @@ impl Interpreter {
                 otter_vm_exec::record_osr_success();
                 BackEdgeOsrOutcome::Returned(value)
             }
-            crate::jit_runtime::JitCallResult::BailoutResume {
-                bailout_pc,
-                locals,
-                registers,
-            } => {
-                ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                crate::jit_resume::resume_in_place(ctx, &state);
                 BackEdgeOsrOutcome::ContinueAtDeoptPc
             }
             crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -861,20 +857,23 @@ impl Interpreter {
         async_ctx: AsyncContext,
         resolved_value: Value,
     ) -> VmExecutionResult {
-        // Restore the call stack from saved frames
-        if let Err(e) = ctx.restore_frames(async_ctx.frames) {
+        // Restore the call stack + registers from saved state (zero-copy move)
+        let result_promise = async_ctx.result_promise;
+        let resume_register = async_ctx.resume_register;
+        let was_running = async_ctx.was_running;
+        if let Err(e) = ctx.restore_frames(async_ctx.frames, async_ctx.registers) {
             return VmExecutionResult::Error(e);
         }
 
         // Set the resolved value in the resume register
-        ctx.set_register(async_ctx.resume_register, resolved_value);
-        ctx.set_running(async_ctx.was_running);
+        ctx.set_register(resume_register, resolved_value);
+        ctx.set_running(was_running);
 
         // Continue execution with panic protection
         {
             use std::panic::{AssertUnwindSafe, catch_unwind};
             match catch_unwind(AssertUnwindSafe(|| {
-                self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+                self.run_loop_with_suspension(ctx, result_promise)
             })) {
                 Ok(result) => result,
                 Err(panic_payload) => {
@@ -895,12 +894,14 @@ impl Interpreter {
         async_ctx: AsyncContext,
         rejection_value: Value,
     ) -> VmExecutionResult {
-        // Restore the call stack from saved frames
-        if let Err(e) = ctx.restore_frames(async_ctx.frames) {
+        // Restore the call stack + registers from saved state (zero-copy move)
+        let result_promise = async_ctx.result_promise;
+        let was_running = async_ctx.was_running;
+        if let Err(e) = ctx.restore_frames(async_ctx.frames, async_ctx.registers) {
             return VmExecutionResult::Error(e);
         }
 
-        ctx.set_running(async_ctx.was_running);
+        ctx.set_running(was_running);
 
         // Set the pending throw value — the run loop will handle it
         // through try-catch or propagate it as an uncaught exception
@@ -910,7 +911,7 @@ impl Interpreter {
         {
             use std::panic::{AssertUnwindSafe, catch_unwind};
             match catch_unwind(AssertUnwindSafe(|| {
-                self.run_loop_with_suspension(ctx, async_ctx.result_promise)
+                self.run_loop_with_suspension(ctx, result_promise)
             })) {
                 Ok(result) => result,
                 Err(panic_payload) => {
@@ -975,7 +976,7 @@ impl Interpreter {
                     }
                 });
             let gen_obj = GcRef::new(JsObject::new(
-                proto.map(Value::object).unwrap_or_else(Value::null)
+                proto.map(Value::object).unwrap_or_else(Value::null),
             ));
             let generator = JsGenerator::new(
                 closure.function_index,
@@ -1049,7 +1050,7 @@ impl Interpreter {
                         crate::jit_runtime::runtime_helpers(),
                     );
                 }
-                crate::jit_runtime::JitCallResult::BailoutResume { .. }
+                crate::jit_runtime::JitCallResult::BailoutResume(_)
                 | crate::jit_runtime::JitCallResult::BailoutRestart
                 | crate::jit_runtime::JitCallResult::NotCompiled => {}
             }
@@ -1064,9 +1065,7 @@ impl Interpreter {
             } else {
                 Vec::new()
             };
-            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
-                rest_args.len()
-            ));
+            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(rest_args.len()));
             if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
                 if let Some(array_proto) = array_obj
                     .get(&crate::object::PropertyKey::string("prototype"))
@@ -1272,11 +1271,7 @@ impl Interpreter {
                                     ctx.set_register(return_reg, value);
                                     continue;
                                 }
-                                crate::jit_runtime::JitCallResult::BailoutResume {
-                                    bailout_pc,
-                                    locals,
-                                    registers,
-                                } => {
+                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
                                     let local_count = func.local_count;
                                     ctx.set_pending_upvalues(upvalues);
                                     ctx.push_frame(
@@ -1288,7 +1283,7 @@ impl Interpreter {
                                         is_async,
                                         argc as usize,
                                     )?;
-                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    crate::jit_resume::resume_in_place(ctx, &state);
                                     continue;
                                 }
                                 crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -1390,20 +1385,24 @@ impl Interpreter {
         Ok(result)
     }
 
-    /// Capture the current VM state as an AsyncContext for suspension
+    /// Capture the current VM state as an AsyncContext for suspension.
+    /// Moves registers + call stack out of VmContext (zero-copy).
     fn capture_async_context(
         &self,
-        ctx: &VmContext,
+        ctx: &mut VmContext,
         resume_register: u16,
         awaited_promise: GcRef<JsPromise>,
         result_promise: GcRef<JsPromise>,
     ) -> AsyncContext {
+        let was_running = ctx.is_running();
+        let (frames, registers) = ctx.take_frames();
         AsyncContext::new(
-            ctx.save_frames(),
+            frames,
+            registers,
             result_promise,
             awaited_promise,
             resume_register,
-            ctx.is_running(),
+            was_running,
         )
     }
 
@@ -1724,11 +1723,7 @@ impl Interpreter {
                                     ctx.set_register(return_reg, value);
                                     continue;
                                 }
-                                crate::jit_runtime::JitCallResult::BailoutResume {
-                                    bailout_pc,
-                                    locals,
-                                    registers,
-                                } => {
+                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
                                     let local_count = callee.local_count;
                                     ctx.set_pending_upvalues(upvalues);
                                     if let Err(e) = ctx.push_frame(
@@ -1742,7 +1737,7 @@ impl Interpreter {
                                     ) {
                                         return VmExecutionResult::Error(e);
                                     }
-                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    crate::jit_resume::resume_in_place(ctx, &state);
                                     continue;
                                 }
                                 crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -1778,9 +1773,7 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -1850,9 +1843,7 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -1913,8 +1904,7 @@ impl Interpreter {
                 }
                 InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
-                    let result =
-                        GcRef::new(JsObject::new(Value::null()));
+                    let result = GcRef::new(JsObject::new(Value::null()));
                     let _ = result.set(PropertyKey::string("value"), value);
                     let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -1926,24 +1916,20 @@ impl Interpreter {
 
     /// Main execution loop
     fn run_loop(&self, ctx: &mut VmContext) -> VmResult<Value> {
+        // If tracing is enabled, use the traced variant to keep the hot path clean
+        if ctx.trace_state.is_some() {
+            return self.run_loop_traced(ctx);
+        }
+
         // Cache module Arc - only refresh when frame changes
         let mut cached_module: Option<Arc<Module>> = None;
         let mut cached_frame_id: usize = usize::MAX;
 
-        // Hoist trace config: trace_state doesn't change mid-execution
-        let tracing_enabled = ctx.trace_state.is_some();
-        let trace_capture_timing = ctx
-            .trace_state
-            .as_ref()
-            .map(|s| s.config.capture_timing)
-            .unwrap_or(false);
-
         loop {
-            // Refresh cached proto epoch once per iteration (avoids atomic load per IC access)
-            ctx.cached_proto_epoch = get_proto_epoch();
-
-            // Periodic interrupt check for responsive timeouts
+            // Periodic interrupt check (batched every INTERRUPT_CHECK_INTERVAL instructions)
             if ctx.should_check_interrupt() {
+                // Refresh proto epoch only at interrupt boundaries (not every instruction)
+                ctx.cached_proto_epoch = get_proto_epoch();
                 ctx.update_debug_snapshot();
                 if ctx.is_interrupted() {
                     return Err(VmError::interrupted());
@@ -1960,9 +1946,11 @@ impl Interpreter {
                 }
             }
 
-            let frame = ctx
-                .current_frame()
-                .ok_or_else(|| VmError::internal("no frame"))?;
+            // SAFETY: call_stack is never empty during execution (checked at entry)
+            let frame = match ctx.call_stack.last() {
+                Some(f) => f,
+                None => return Err(VmError::internal("no frame")),
+            };
 
             // Only clone Arc when frame changes (avoids atomic ops on hot path)
             if frame.frame_id != cached_frame_id {
@@ -1972,12 +1960,17 @@ impl Interpreter {
 
             // Get reference to cached module (avoids clone on hot path for func lookup)
             let module_ref = cached_module.as_ref().unwrap();
-            let func = module_ref
-                .function(frame.function_index)
-                .ok_or_else(|| VmError::internal("function not found"))?;
+            let func = match module_ref.function(frame.function_index) {
+                Some(f) => f,
+                None => return Err(VmError::internal("function not found")),
+            };
+
+            // Cache instructions reference once (avoid double .read() call)
+            let instructions = func.instructions.read();
 
             // Check if we've reached the end of the function
-            if frame.pc >= func.instructions.read().len() {
+            let pc = frame.pc;
+            if pc >= instructions.len() {
                 // Implicit return undefined
                 if ctx.stack_depth() == 1 {
                     return Ok(Value::undefined());
@@ -1988,27 +1981,10 @@ impl Interpreter {
                 continue;
             }
 
-            let instruction = &func.instructions.read()[frame.pc];
+            let instruction = &instructions[pc];
 
             // Record instruction execution for profiling
             ctx.record_instruction();
-
-            // Capture trace data (hoisted booleans avoid per-instruction Option probes)
-            let trace_data = if tracing_enabled {
-                Some((
-                    frame.pc,
-                    frame.function_index,
-                    Arc::clone(&frame.module),
-                    instruction.clone(),
-                ))
-            } else {
-                None
-            };
-            let trace_start_time = if trace_capture_timing {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
 
             // Execute the instruction
             let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
@@ -2034,24 +2010,12 @@ impl Interpreter {
                 },
             };
 
-            // Record trace entry now that ctx is free (after execution, before state update)
-            if let Some((pc, function_index, module, instruction)) = trace_data {
-                let modified_registers = trace_modified_registers(&instruction, ctx);
-                let execution_time_ns = trace_start_time
-                    .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-                ctx.record_trace_entry(
-                    &instruction,
-                    pc,
-                    function_index,
-                    &module,
-                    modified_registers,
-                    execution_time_ns,
-                );
-            }
-
             match instruction_result {
                 InstructionResult::Continue => {
-                    ctx.advance_pc();
+                    // Direct PC increment — avoid current_frame_mut() indirection
+                    if let Some(f) = ctx.call_stack.last_mut() {
+                        f.pc += 1;
+                    }
                 }
                 InstructionResult::Jump(offset) => {
                     if offset < 0 {
@@ -2212,11 +2176,7 @@ impl Interpreter {
                                     ctx.set_register(return_reg, value);
                                     continue;
                                 }
-                                crate::jit_runtime::JitCallResult::BailoutResume {
-                                    bailout_pc,
-                                    locals,
-                                    registers,
-                                } => {
+                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
                                     let local_count = callee.local_count;
                                     ctx.set_pending_upvalues(upvalues);
                                     ctx.push_frame(
@@ -2228,7 +2188,7 @@ impl Interpreter {
                                         is_async,
                                         argc as usize,
                                     )?;
-                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    crate::jit_resume::resume_in_place(ctx, &state);
                                     continue;
                                 }
                                 crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -2264,9 +2224,7 @@ impl Interpreter {
                         };
 
                         // Create rest array
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
@@ -2331,9 +2289,7 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -2389,8 +2345,402 @@ impl Interpreter {
                 InstructionResult::Yield { value, .. } => {
                     // Generator yielded a value
                     // Create an iterator result object { value, done: false }
-                    let result =
-                        GcRef::new(JsObject::new(Value::null()));
+                    let result = GcRef::new(JsObject::new(Value::null()));
+                    let _ = result.set(PropertyKey::string("value"), value);
+                    let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
+                    ctx.advance_pc();
+                    return Ok(Value::object(result));
+                }
+            }
+        }
+    }
+
+    /// Traced variant of run_loop — only used when ctx.trace_state is Some.
+    /// Separated to keep the hot path (run_loop) free of tracing overhead.
+    fn run_loop_traced(&self, ctx: &mut VmContext) -> VmResult<Value> {
+        let mut cached_module: Option<Arc<Module>> = None;
+        let mut cached_frame_id: usize = usize::MAX;
+
+        let trace_capture_timing = ctx
+            .trace_state
+            .as_ref()
+            .map(|s| s.config.capture_timing)
+            .unwrap_or(false);
+
+        loop {
+            ctx.cached_proto_epoch = get_proto_epoch();
+
+            if ctx.should_check_interrupt() {
+                ctx.update_debug_snapshot();
+                if ctx.is_interrupted() {
+                    return Err(VmError::interrupted());
+                }
+                ctx.maybe_collect_garbage();
+                if crate::weak_gc::has_pending_cleanups() {
+                    let cleanups = crate::weak_gc::drain_pending_cleanups();
+                    for (callback, held_value) in cleanups {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        let _ = ncx.call_function(&callback, Value::undefined(), &[held_value]);
+                    }
+                }
+            }
+
+            let frame = match ctx.call_stack.last() {
+                Some(f) => f,
+                None => return Err(VmError::internal("no frame")),
+            };
+
+            if frame.frame_id != cached_frame_id {
+                cached_module = Some(Arc::clone(&frame.module));
+                cached_frame_id = frame.frame_id;
+            }
+
+            let module_ref = cached_module.as_ref().unwrap();
+            let func = match module_ref.function(frame.function_index) {
+                Some(f) => f,
+                None => return Err(VmError::internal("function not found")),
+            };
+
+            let instructions = func.instructions.read();
+            let pc = frame.pc;
+            if pc >= instructions.len() {
+                if ctx.stack_depth() == 1 {
+                    return Ok(Value::undefined());
+                }
+                ctx.pop_frame_discard();
+                cached_frame_id = usize::MAX;
+                continue;
+            }
+
+            let instruction = &instructions[pc];
+            ctx.record_instruction();
+
+            // Capture trace data
+            let trace_data = Some((
+                frame.pc,
+                frame.function_index,
+                Arc::clone(&frame.module),
+                instruction.clone(),
+            ));
+            let trace_start_time = if trace_capture_timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            let instruction_result = match self.execute_instruction(instruction, module_ref, ctx) {
+                Ok(result) => result,
+                Err(err) => match err {
+                    VmError::Exception(thrown) => InstructionResult::Throw(thrown.value),
+                    VmError::TypeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "TypeError", &message))
+                    }
+                    VmError::RangeError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "RangeError", &message))
+                    }
+                    VmError::ReferenceError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "ReferenceError", &message))
+                    }
+                    VmError::SyntaxError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "SyntaxError", &message))
+                    }
+                    VmError::URIError(message) => {
+                        InstructionResult::Throw(self.make_error(ctx, "URIError", &message))
+                    }
+                    other => return Err(other),
+                },
+            };
+
+            // Record trace entry
+            if let Some((pc, function_index, module, instruction)) = trace_data {
+                let modified_registers = trace_modified_registers(&instruction, ctx);
+                let execution_time_ns = trace_start_time
+                    .map(|start| start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                ctx.record_trace_entry(
+                    &instruction,
+                    pc,
+                    function_index,
+                    &module,
+                    modified_registers,
+                    execution_time_ns,
+                );
+            }
+
+            match instruction_result {
+                InstructionResult::Continue => {
+                    if let Some(f) = ctx.call_stack.last_mut() {
+                        f.pc += 1;
+                    }
+                }
+                InstructionResult::Jump(offset) => {
+                    if offset < 0 {
+                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
+                            + offset as i64) as usize;
+                        match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                            BackEdgeOsrOutcome::Returned(osr_value) => {
+                                if ctx.stack_depth() == 1 {
+                                    return Ok(osr_value);
+                                }
+                                let return_reg = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?
+                                    .return_register;
+                                ctx.pop_frame_discard();
+                                cached_frame_id = usize::MAX;
+                                if let Some(reg) = return_reg {
+                                    ctx.set_register(reg, osr_value);
+                                }
+                                continue;
+                            }
+                            BackEdgeOsrOutcome::ContinueAtDeoptPc => continue,
+                            BackEdgeOsrOutcome::ContinueWithJump => {}
+                        }
+                    }
+                    ctx.jump(offset);
+                }
+                InstructionResult::Return(value) => {
+                    if ctx.stack_depth() == 1 {
+                        return Ok(value);
+                    }
+                    let (return_reg, is_construct, construct_this, is_async) = {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        (
+                            frame.return_register,
+                            frame.is_construct,
+                            frame.this_value.clone(),
+                            frame.is_async,
+                        )
+                    };
+                    ctx.pop_frame_discard();
+                    cached_frame_id = usize::MAX;
+                    if let Some(reg) = return_reg {
+                        let value = if is_construct && !value.is_object() {
+                            construct_this
+                        } else if is_async {
+                            self.create_js_promise(ctx, JsPromise::resolved(value))
+                        } else {
+                            value
+                        };
+                        ctx.set_register(reg, value);
+                    }
+                }
+                InstructionResult::Throw(value) => {
+                    if let Some((target_depth, catch_pc)) = ctx.take_nearest_try() {
+                        while ctx.stack_depth() > target_depth {
+                            ctx.pop_frame_discard();
+                        }
+                        cached_frame_id = usize::MAX;
+                        let frame = ctx
+                            .current_frame_mut()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        frame.pc = catch_pc;
+                        ctx.set_exception(value);
+                        continue;
+                    }
+                    let is_async = ctx.current_frame().map(|f| f.is_async).unwrap_or(false);
+                    let return_reg = ctx.current_frame().and_then(|f| f.return_register);
+                    if is_async && ctx.stack_depth() > 1 {
+                        ctx.pop_frame_discard();
+                        cached_frame_id = usize::MAX;
+                        let rejected = self.create_js_promise(ctx, JsPromise::rejected(value));
+                        if let Some(reg) = return_reg {
+                            ctx.set_register(reg, rejected);
+                        }
+                        continue;
+                    }
+                    return Err(VmError::Exception(Box::new(crate::error::ThrownValue {
+                        message: self.to_string(&value),
+                        value: value.clone(),
+                        stack: Vec::new(),
+                    })));
+                }
+                InstructionResult::Call {
+                    func_index,
+                    module: call_module,
+                    argc,
+                    return_reg,
+                    is_construct,
+                    is_async,
+                    upvalues,
+                } => {
+                    ctx.advance_pc();
+                    let callee = call_module.function(func_index).ok_or_else(|| {
+                        VmError::internal(format!(
+                            "callee not found (func_index={}, function_count={})",
+                            func_index,
+                            call_module.function_count()
+                        ))
+                    })?;
+                    let became_hot =
+                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                    if became_hot && otter_vm_exec::is_jit_enabled() {
+                        otter_vm_exec::enqueue_hot_function(&call_module, func_index, callee);
+                        otter_vm_exec::compile_one_pending_request(
+                            crate::jit_runtime::runtime_helpers(),
+                        );
+                    }
+                    {
+                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
+                        if can_try_jit {
+                            let jit_interp: *const Self = self;
+                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                            match crate::jit_runtime::try_execute_jit(
+                                call_module.module_id,
+                                func_index,
+                                callee,
+                                ctx.pending_args(),
+                                ctx.cached_proto_epoch,
+                                jit_interp,
+                                jit_ctx_ptr,
+                                &call_module.constants as *const _,
+                                &upvalues,
+                                None,
+                            ) {
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    ctx.set_register(return_reg, value);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                    let local_count = callee.local_count;
+                                    ctx.set_pending_upvalues(upvalues);
+                                    ctx.push_frame(
+                                        func_index,
+                                        call_module,
+                                        local_count,
+                                        Some(return_reg),
+                                        is_construct,
+                                        is_async,
+                                        argc as usize,
+                                    )?;
+                                    crate::jit_resume::resume_in_place(ctx, &state);
+                                    continue;
+                                }
+                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                    otter_vm_exec::enqueue_hot_function(
+                                        &call_module,
+                                        func_index,
+                                        callee,
+                                    );
+                                    otter_vm_exec::compile_one_pending_request(
+                                        crate::jit_runtime::runtime_helpers(),
+                                    );
+                                }
+                                crate::jit_runtime::JitCallResult::BailoutRestart
+                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
+                            }
+                        }
+                    }
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object())
+                        {
+                            rest_arr.set_prototype(Value::object(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+                    ctx.set_pending_upvalues(upvalues);
+                    ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        is_construct,
+                        is_async,
+                        argc as usize,
+                    )?;
+                }
+                InstructionResult::TailCall {
+                    func_index,
+                    module: call_module,
+                    argc,
+                    return_reg,
+                    is_async,
+                    upvalues,
+                } => {
+                    ctx.pop_frame_discard();
+                    cached_frame_id = usize::MAX;
+                    let callee = call_module.function(func_index).ok_or_else(|| {
+                        VmError::internal(format!(
+                            "callee not found (func_index={}, function_count={})",
+                            func_index,
+                            call_module.function_count()
+                        ))
+                    })?;
+                    let local_count = callee.local_count;
+                    let has_rest = callee.flags.has_rest;
+                    let param_count = callee.param_count as usize;
+                    if has_rest {
+                        let mut args = ctx.take_pending_args();
+                        let rest_args: Vec<Value> = if args.len() > param_count {
+                            args.drain(param_count..).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
+                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                            && let Some(array_proto) = array_obj
+                                .get(&PropertyKey::string("prototype"))
+                                .and_then(|v| v.as_object())
+                        {
+                            rest_arr.set_prototype(Value::object(array_proto));
+                        }
+                        for (i, arg) in rest_args.into_iter().enumerate() {
+                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
+                        }
+                        args.push(Value::object(rest_arr));
+                        ctx.set_pending_args(args);
+                    }
+                    ctx.set_pending_upvalues(upvalues);
+                    ctx.push_frame(
+                        func_index,
+                        call_module,
+                        local_count,
+                        Some(return_reg),
+                        false,
+                        is_async,
+                        argc as usize,
+                    )?;
+                }
+                InstructionResult::Suspend {
+                    promise,
+                    resume_reg,
+                } => {
+                    ctx.advance_pc();
+                    match promise.state() {
+                        PromiseState::Fulfilled(value) => {
+                            ctx.set_register(resume_reg, value);
+                        }
+                        PromiseState::Rejected(error) => {
+                            return Err(VmError::type_error(format!(
+                                "Promise rejected: {:?}",
+                                error
+                            )));
+                        }
+                        PromiseState::Pending | PromiseState::PendingThenable(_) => {
+                            return Ok(Value::promise(promise));
+                        }
+                    }
+                }
+                InstructionResult::Yield { value, .. } => {
+                    let result = GcRef::new(JsObject::new(Value::null()));
                     let _ = result.set(PropertyKey::string("value"), value);
                     let _ = result.set(PropertyKey::string("done"), Value::boolean(false));
                     ctx.advance_pc();
@@ -2534,8 +2884,7 @@ impl Interpreter {
                                 offset,
                             } = &ic.ic_state
                             {
-                                if global_obj.shape_ptr_raw() == *shape_addr
-                                {
+                                if global_obj.shape_ptr_raw() == *shape_addr {
                                     global_obj.get_by_offset(*offset as usize)
                                 } else {
                                     None
@@ -2664,8 +3013,7 @@ impl Interpreter {
                                 offset,
                             } = &ic.ic_state
                             {
-                                if global_obj.shape_ptr_raw() == *shape_addr
-                                {
+                                if global_obj.shape_ptr_raw() == *shape_addr {
                                     if global_obj
                                         .set_by_offset(*offset as usize, val_val.clone())
                                         .is_ok()
@@ -3025,7 +3373,9 @@ impl Interpreter {
                 }
 
                 // Slow path: observe types and update feedback
-                Self::update_arithmetic_ic(ctx, *feedback_index,
+                Self::update_arithmetic_ic(
+                    ctx,
+                    *feedback_index,
                     &ctx.get_register(lhs.0).clone(),
                     &ctx.get_register(rhs.0).clone(),
                 );
@@ -3091,7 +3441,9 @@ impl Interpreter {
                 }
 
                 // Slow path: observe types and update feedback
-                Self::update_arithmetic_ic(ctx, *feedback_index,
+                Self::update_arithmetic_ic(
+                    ctx,
+                    *feedback_index,
                     &ctx.get_register(lhs.0).clone(),
                     &ctx.get_register(rhs.0).clone(),
                 );
@@ -3684,8 +4036,7 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj =
-                    GcRef::new(JsObject::new(Value::null()));
+                let func_obj = GcRef::new(JsObject::new(Value::null()));
 
                 // Get Object.prototype so function's .prototype object has correct chain
                 let obj_proto = ctx
@@ -3699,7 +4050,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let proto = GcRef::new(JsObject::new(
-                    obj_proto.map(Value::object).unwrap_or_else(Value::null)
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
 
                 // Set [[Prototype]] to Function.prototype so methods like
@@ -3790,8 +4141,7 @@ impl Interpreter {
                 // Capture upvalues from parent frame
                 let captured_upvalues = self.capture_upvalues(ctx, &func_def.upvalues)?;
 
-                let func_obj =
-                    GcRef::new(JsObject::new(Value::null()));
+                let func_obj = GcRef::new(JsObject::new(Value::null()));
 
                 // Get Object.prototype for function's .prototype object
                 let obj_proto = ctx
@@ -3805,7 +4155,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let _proto = GcRef::new(JsObject::new(
-                    obj_proto.map(Value::object).unwrap_or_else(Value::null)
+                    obj_proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
 
                 // Set [[Prototype]] to Function.prototype
@@ -3879,7 +4229,7 @@ impl Interpreter {
                 let func_obj = GcRef::new(JsObject::new(
                     gen_func_proto
                         .map(Value::object)
-                        .unwrap_or_else(Value::null)
+                        .unwrap_or_else(Value::null),
                 ));
                 func_obj.define_property(
                     PropertyKey::string("__realm_id__"),
@@ -3913,7 +4263,7 @@ impl Interpreter {
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
                 let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null)
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
 
                 let closure = GcRef::new(Closure {
@@ -3972,7 +4322,7 @@ impl Interpreter {
                 let func_obj = GcRef::new(JsObject::new(
                     async_gen_func_proto
                         .map(Value::object)
-                        .unwrap_or_else(Value::null)
+                        .unwrap_or_else(Value::null),
                 ));
                 func_obj.define_property(
                     PropertyKey::string("__realm_id__"),
@@ -4006,7 +4356,7 @@ impl Interpreter {
                     .get_global("GeneratorPrototype")
                     .and_then(|v| v.as_object());
                 let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null)
+                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
 
                 let closure = GcRef::new(Closure {
@@ -4047,13 +4397,40 @@ impl Interpreter {
                 Ok(InstructionResult::Continue)
             }
 
-            Instruction::Call { dst, func, argc } => {
+            Instruction::Call {
+                dst,
+                func,
+                argc,
+                ic_index,
+            } => {
                 let func_value = ctx.get_register(func.0).clone();
 
                 // Fast path: direct closure call (non-generator) avoids generic call dispatch.
                 if let Some(closure) = func_value.as_function()
                     && !closure.is_generator
                 {
+                    // Record call target for JIT monomorphic call IC
+                    if *ic_index > 0 {
+                        if let Some(frame) = ctx.current_frame() {
+                            if let Some(func) = frame.module.function(frame.function_index) {
+                                if let Some(md) =
+                                    func.feedback_vector.write().get_mut(*ic_index as usize)
+                                {
+                                    let func_idx = closure.function_index;
+                                    let mod_id = closure.module.module_id;
+                                    if md.call_target_func_index == 0 {
+                                        md.call_target_func_index = func_idx.wrapping_add(1);
+                                        md.call_target_module_id = mod_id;
+                                    } else if md.call_target_func_index != func_idx.wrapping_add(1)
+                                        || md.call_target_module_id != mod_id
+                                    {
+                                        md.call_target_func_index = u32::MAX;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     ctx.set_pending_args_from_register_range(func.0 + 1, *argc as u16);
                     let realm_id = self.realm_id_for_function(ctx, &func_value);
                     ctx.set_pending_realm_id(realm_id);
@@ -4338,7 +4715,7 @@ impl Interpreter {
                         ctor_proto
                             .clone()
                             .map(Value::object)
-                            .unwrap_or_else(Value::null)
+                            .unwrap_or_else(Value::null),
                     ));
                     let new_obj_value = Value::object(new_obj.clone());
 
@@ -4434,7 +4811,7 @@ impl Interpreter {
                             ctor_proto
                                 .clone()
                                 .map(Value::object)
-                                .unwrap_or_else(Value::null)
+                                .unwrap_or_else(Value::null),
                         ));
                         let new_obj_value = Value::object(new_obj.clone());
 
@@ -4724,8 +5101,7 @@ impl Interpreter {
                         };
 
                         // Create iterator result object { value, done }
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(PropertyKey::string("value"), result_value);
                         let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -5030,7 +5406,7 @@ impl Interpreter {
                             self.default_object_prototype_for_constructor(ctx, &func_value)
                         });
                     let new_obj = GcRef::new(JsObject::new(
-                        ctor_proto.map(Value::object).unwrap_or_else(Value::null)
+                        ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                     ));
                     let new_obj_value = Value::object(new_obj);
 
@@ -5060,7 +5436,7 @@ impl Interpreter {
                     .and_then(|v| v.as_object())
                     .or_else(|| self.default_object_prototype_for_constructor(ctx, &func_value));
                 let new_obj = GcRef::new(JsObject::new(
-                    ctor_proto.map(Value::object).unwrap_or_else(Value::null)
+                    ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
                 let new_obj_value = Value::object(new_obj);
 
@@ -5223,7 +5599,7 @@ impl Interpreter {
                     .and_then(|proto_val| proto_val.as_object());
 
                 let obj = GcRef::new(JsObject::new(
-                    proto.map(Value::object).unwrap_or_else(Value::null)
+                    proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
                 ctx.set_register(dst.0, Value::object(obj));
                 Ok(InstructionResult::Continue)
@@ -5616,8 +5992,7 @@ impl Interpreter {
                                     let feedback = func.feedback_vector.write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr =
-                                            obj_ref.shape_ptr_raw();
+                                        let shape_ptr = obj_ref.shape_ptr_raw();
                                         let current_epoch = ctx.cached_proto_epoch;
 
                                         match &mut ic.ic_state {
@@ -7052,8 +7427,7 @@ impl Interpreter {
                         };
 
                         // Create iterator result object { value, done }
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(PropertyKey::string("value"), result_value);
                         let _ = result.set(PropertyKey::string("done"), Value::boolean(is_done));
                         ctx.set_register(dst.0, Value::object(result));
@@ -8251,7 +8625,7 @@ impl Interpreter {
 
                         // Create derived prototype: Object.create(super.prototype)
                         let derived_proto = GcRef::new(JsObject::new(
-                            super_proto.map(Value::object).unwrap_or_else(Value::null)
+                            super_proto.map(Value::object).unwrap_or_else(Value::null),
                         ));
 
                         // Set ctor.prototype = derived_proto
@@ -8372,9 +8746,8 @@ impl Interpreter {
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Base case: super constructor is a native built-in (Array, RegExp, etc.)
                     // Create object with correct prototype, then call as constructor.
-                    let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone())
-                    ));
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
                     let new_obj_value = Value::object(new_obj);
 
                     let result = self.call_function_construct(
@@ -8397,8 +8770,7 @@ impl Interpreter {
                     this_obj
                 } else {
                     // Base case: super constructor is a regular (non-derived) closure.
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
 
                     let result =
@@ -8491,9 +8863,8 @@ impl Interpreter {
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Native built-in constructor (Array, RegExp, etc.)
-                    let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone())
-                    ));
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function_construct(
                         ctx,
@@ -8512,8 +8883,7 @@ impl Interpreter {
                     };
                     this_obj
                 } else {
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
                     let result =
                         self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
@@ -8612,9 +8982,8 @@ impl Interpreter {
                         Value::undefined()
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
-                    let new_obj = GcRef::new(JsObject::new(
-                        Value::object(new_target_proto.clone())
-                    ));
+                    let new_obj =
+                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function_construct(
                         ctx,
@@ -8631,8 +9000,7 @@ impl Interpreter {
                         new_obj_value
                     }
                 } else {
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto)));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function(
                         ctx,
@@ -8941,11 +9309,8 @@ impl Interpreter {
                     None
                 };
 
-                let js_regex = GcRef::new(JsRegExp::new(
-                    pattern.to_string(),
-                    flags.to_string(),
-                    proto,
-                ));
+                let js_regex =
+                    GcRef::new(JsRegExp::new(pattern.to_string(), flags.to_string(), proto));
                 Ok(Value::regex(js_regex))
             }
             Constant::TemplateLiteral {
@@ -9446,7 +9811,7 @@ impl Interpreter {
                 .and_then(|v| v.as_object())
                 .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
             let new_obj = GcRef::new(JsObject::new(
-                ctor_proto.map(Value::object).unwrap_or_else(Value::null)
+                ctor_proto.map(Value::object).unwrap_or_else(Value::null),
             ));
             let new_obj_value = Value::object(new_obj);
 
@@ -9494,9 +9859,7 @@ impl Interpreter {
             } else {
                 Vec::new()
             };
-            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(
-                rest_args.len()
-            ));
+            let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(rest_args.len()));
             if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
                 if let Some(array_proto) = array_obj
                     .get(&crate::object::PropertyKey::string("prototype"))
@@ -9666,11 +10029,7 @@ impl Interpreter {
                                     ctx.set_register(return_reg, value);
                                     continue;
                                 }
-                                crate::jit_runtime::JitCallResult::BailoutResume {
-                                    bailout_pc,
-                                    locals,
-                                    registers,
-                                } => {
+                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
                                     let local_count = func.local_count;
                                     ctx.set_pending_upvalues(upvalues);
                                     ctx.push_frame(
@@ -9682,7 +10041,7 @@ impl Interpreter {
                                         is_async,
                                         argc as usize,
                                     )?;
-                                    ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                                    crate::jit_resume::resume_in_place(ctx, &state);
                                     continue;
                                 }
                                 crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -9913,7 +10272,7 @@ impl Interpreter {
 
                 // Create the generator's internal object
                 let gen_obj = GcRef::new(JsObject::new(
-                    proto.map(Value::object).unwrap_or_else(Value::null)
+                    proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
 
                 let generator = JsGenerator::new(
@@ -10802,7 +11161,7 @@ impl Interpreter {
             .and_then(|v| v.as_object());
 
         let obj = GcRef::new(JsObject::new(
-            proto.map(Value::object).unwrap_or_else(Value::null)
+            proto.map(Value::object).unwrap_or_else(Value::null),
         ));
         let _ = obj.set(
             PropertyKey::string("name"),
@@ -11659,44 +12018,27 @@ impl Interpreter {
                     generator.complete();
                     return GeneratorResult::Returned(value);
                 }
-                crate::jit_runtime::JitCallResult::BailoutResume {
-                    bailout_pc,
-                    locals,
-                    registers,
-                } => {
-                    let instructions = func.instructions.read();
-                    if let Some(otter_vm_bytecode::Instruction::Yield { dst, src }) =
-                        instructions.get(bailout_pc as usize)
-                    {
-                        // Yield-bailout: build a GeneratorFrame from deopt state
-                        let yielded_value = registers
-                            .get(src.0 as usize)
-                            .cloned()
-                            .unwrap_or_else(Value::undefined);
-                        let try_stack = Self::reconstruct_try_stack(
-                            func,
-                            bailout_pc as usize,
-                            ctx.stack_depth() + 1,
-                        );
-                        let frame = crate::generator::GeneratorFrame::with_yield_dst(
-                            bailout_pc as usize + 1, // past the Yield instruction
-                            generator.function_index,
-                            Arc::clone(&generator.module),
-                            locals,
-                            registers,
-                            upvalues,
-                            try_stack,
-                            this_value,
-                            generator.is_construct(),
-                            0, // frame_id placeholder
-                            argc,
-                            dst.0,
-                        );
-                        generator.suspend_with_frame(frame);
-                        return GeneratorResult::Yielded(yielded_value);
+                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                    let try_stack = Self::reconstruct_try_stack(
+                        func,
+                        state.bailout_pc as usize,
+                        ctx.stack_depth() + 1,
+                    );
+                    if let Some(resume) = crate::jit_resume::try_materialize_generator_yield(
+                        ctx,
+                        &state,
+                        func,
+                        generator.function_index,
+                        Arc::clone(&generator.module),
+                        upvalues,
+                        try_stack,
+                        this_value.clone(),
+                        generator.is_construct(),
+                        argc,
+                    ) {
+                        generator.suspend_with_frame(resume.frame);
+                        return GeneratorResult::Yielded(resume.yielded_value);
                     }
-                    // Non-yield bailout: fall through to interpreter
-                    drop(instructions);
                 }
                 crate::jit_runtime::JitCallResult::NeedsRecompilation => {
                     otter_vm_exec::enqueue_hot_function(
@@ -11860,12 +12202,9 @@ impl Interpreter {
 
     /// Restore a generator frame to the context
     fn restore_generator_frame(&self, ctx: &mut VmContext, frame: &GeneratorFrame) -> VmResult<()> {
-        // Push a new frame with the saved state
+        // Push a new frame with the saved state (no pending_args — we overwrite the window directly)
         ctx.set_pending_upvalues(frame.upvalues.clone());
         ctx.set_pending_this(frame.this_value.clone());
-
-        // Set up the locals as pending args (they'll be copied into the register window)
-        ctx.set_pending_args(frame.locals.clone());
 
         // Get function info
         let func = frame
@@ -11886,15 +12225,8 @@ impl Interpreter {
         // Restore PC (push_frame sets it to 0, we need to set it to the saved value)
         ctx.set_pc(frame.pc);
 
-        // Restore registers (scratch registers, after locals in the window)
-        for (i, reg_value) in frame.registers.iter().enumerate() {
-            ctx.set_register(i as u16, reg_value.clone());
-        }
-
-        // Restore locals (overwrite what push_frame set from pending_args)
-        for (i, local_value) in frame.locals.iter().enumerate() {
-            ctx.set_local(i as u16, local_value.clone())?;
-        }
+        // Restore full register window (locals + scratch) in one pass
+        ctx.restore_window(&frame.window);
 
         // Restore try stack
         for try_entry in &frame.try_stack {
@@ -11914,16 +12246,6 @@ impl Interpreter {
             .current_frame()
             .ok_or_else(|| VmError::internal("No current frame"))?;
 
-        // Collect registers (we need the function's register count)
-        let func = module
-            .function(current_frame.function_index)
-            .ok_or_else(|| VmError::internal("Function not found"))?;
-
-        let mut registers = Vec::with_capacity(func.register_count as usize);
-        for i in 0..func.register_count {
-            registers.push(ctx.get_register(i).clone());
-        }
-
         // Collect try stack entries for this frame
         let try_handlers = ctx.get_try_handlers_for_current_frame();
         let try_stack: Vec<crate::generator::TryEntry> = try_handlers
@@ -11934,22 +12256,16 @@ impl Interpreter {
             })
             .collect();
 
-        // Extract locals from the register window
+        // Snapshot the full register window (locals + scratch) in one allocation
+        let window = ctx.snapshot_window();
         let local_count = current_frame.local_count;
-        let mut locals = Vec::with_capacity(local_count);
-        for i in 0..local_count {
-            locals.push(
-                ctx.get_local(i as u16)
-                    .unwrap_or_else(|_| Value::undefined()),
-            );
-        }
 
         Ok(GeneratorFrame::new(
             current_frame.pc,
             current_frame.function_index,
             Arc::clone(&current_frame.module),
-            locals,
-            registers,
+            local_count,
+            window,
             current_frame.upvalues.clone(),
             try_stack,
             current_frame.this_value.clone(),
@@ -12088,44 +12404,26 @@ impl Interpreter {
                 otter_vm_exec::record_osr_success();
                 Some(GeneratorResult::Returned(value))
             }
-            crate::jit_runtime::JitCallResult::BailoutResume {
-                bailout_pc,
-                locals,
-                registers,
-            } => {
-                let instructions = func.instructions.read();
-                if let Some(otter_vm_bytecode::Instruction::Yield { dst, src }) =
-                    instructions.get(bailout_pc as usize)
-                {
-                    // Yield-bailout: build GeneratorFrame from deopt state
-                    let yielded_value = registers
-                        .get(src.0 as usize)
-                        .cloned()
-                        .unwrap_or_else(Value::undefined);
-                    let try_stack =
-                        Self::reconstruct_try_stack(func, bailout_pc as usize, initial_depth + 1);
-                    let frame = crate::generator::GeneratorFrame::with_yield_dst(
-                        bailout_pc as usize + 1,
-                        func_index,
-                        Arc::clone(module),
-                        locals,
-                        registers,
-                        upvalues,
-                        try_stack,
-                        this_value,
-                        generator.is_construct(),
-                        0,
-                        argc,
-                        dst.0,
-                    );
-                    generator.suspend_with_frame(frame);
-                    // Pop the generator's frame from context
+            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                let try_stack =
+                    Self::reconstruct_try_stack(func, state.bailout_pc as usize, initial_depth + 1);
+                if let Some(resume) = crate::jit_resume::try_materialize_generator_yield(
+                    ctx,
+                    &state,
+                    func,
+                    func_index,
+                    Arc::clone(module),
+                    upvalues,
+                    try_stack,
+                    this_value.clone(),
+                    generator.is_construct(),
+                    argc,
+                ) {
+                    generator.suspend_with_frame(resume.frame);
                     ctx.pop_frame_discard();
-                    return Some(GeneratorResult::Yielded(yielded_value));
+                    return Some(GeneratorResult::Yielded(resume.yielded_value));
                 }
-                // Non-yield bailout: restore deopt state and continue interpreting
-                drop(instructions);
-                ctx.restore_deopt_state(bailout_pc, &locals, &registers);
+                crate::jit_resume::resume_in_place(ctx, &state);
                 None
             }
             crate::jit_runtime::JitCallResult::NeedsRecompilation => {
@@ -12455,9 +12753,7 @@ impl Interpreter {
                             Vec::new()
                         };
 
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -12523,9 +12819,7 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let rest_arr = GcRef::new(JsObject::array(
-                            rest_args.len()
-                        ));
+                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -13148,6 +13442,7 @@ mod tests {
                 dst: Register(2),
                 func: Register(0),
                 argc: 1,
+                ic_index: 0,
             })
             .instruction(Instruction::Return { src: Register(2) })
             .build();
@@ -13210,6 +13505,7 @@ mod tests {
                 dst: Register(3),
                 func: Register(0),
                 argc: 2,
+                ic_index: 0,
             })
             .instruction(Instruction::Return { src: Register(3) })
             .build();
@@ -13268,6 +13564,7 @@ mod tests {
                 dst: Register(2),
                 func: Register(0),
                 argc: 1,
+                ic_index: 0,
             })
             .instruction(Instruction::Return { src: Register(2) })
             .build();
@@ -13296,6 +13593,7 @@ mod tests {
                 dst: Register(3),
                 func: Register(1),
                 argc: 1,
+                ic_index: 0,
             })
             // Multiply by 2
             .instruction(Instruction::LoadInt32 {
@@ -14666,6 +14964,7 @@ mod tests {
                 dst: Register(3),
                 func: Register(0),
                 argc: 0,
+                ic_index: 0,
             })
             .instruction(Instruction::LoadInt32 {
                 dst: Register(4),

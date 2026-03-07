@@ -122,15 +122,13 @@ impl VmRuntime {
         );
 
         // Stage 1: Allocate all intrinsic objects (empty, no properties yet)
-        let intrinsics = Intrinsics::allocate(&memory_manager, function_prototype);
+        let intrinsics = Intrinsics::allocate(function_prototype);
         // Stage 2: Wire prototype chains (Object.prototype -> null, etc.)
         intrinsics.wire_prototype_chains();
         // Stage 3: Initialize core intrinsic properties (toString, valueOf, etc.)
         intrinsics.init_core(&memory_manager);
 
-        let global = GcRef::new(JsObject::new(
-            Value::object(intrinsics.object_prototype)
-        ));
+        let global = GcRef::new(JsObject::new(Value::object(intrinsics.object_prototype)));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
             crate::object::PropertyDescriptor::builtin_data(Value::int32(default_realm_id as i32)),
@@ -201,13 +199,11 @@ impl VmRuntime {
             crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id as i32)),
         );
 
-        let intrinsics = Intrinsics::allocate(&mm, function_prototype);
+        let intrinsics = Intrinsics::allocate(function_prototype);
         intrinsics.wire_prototype_chains();
         intrinsics.init_core(&mm);
 
-        let global = GcRef::new(JsObject::new(
-            Value::object(intrinsics.object_prototype)
-        ));
+        let global = GcRef::new(JsObject::new(Value::object(intrinsics.object_prototype)));
         global.define_property(
             crate::object::PropertyKey::string("__realm_id__"),
             crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id as i32)),

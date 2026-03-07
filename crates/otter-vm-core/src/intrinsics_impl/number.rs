@@ -9,6 +9,7 @@
 //! ## Prototype methods:
 //! - `valueOf()`, `toString()`, `toFixed()`, `toPrecision()`, `toExponential()`, `toLocaleString()`
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -18,6 +19,53 @@ use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
 use std::sync::Arc;
+
+pub struct NumberIntrinsic;
+
+impl IntrinsicObject for NumberIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_number_prototype(ctx.intrinsics().number_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().number_prototype,
+                "Number",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(
+                |this, args, ncx| {
+                    let n = if let Some(arg) = args.first() {
+                        if arg.is_bigint() {
+                            if let Some(b) = arg.as_bigint() {
+                                b.value.parse::<f64>().unwrap_or(f64::NAN)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            ncx.to_number_value(arg)?
+                        }
+                    } else {
+                        0.0
+                    };
+                    if let Some(obj) = this.as_object() {
+                        let _ = obj.set(PropertyKey::string("__value__"), Value::number(n));
+                        Ok(this.clone())
+                    } else {
+                        Ok(Value::number(n))
+                    }
+                },
+                1,
+            )
+            .build_and_install(&global);
+            install_number_statics(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 fn number_this_value(this_val: &Value, method: &str) -> Result<f64, VmError> {
     if let Some(num) = this_val.as_number() {

@@ -9,6 +9,7 @@
 //! - WeakMap: constructor + 4 prototype methods + Symbol.toStringTag
 //! - WeakSet: constructor + 3 prototype methods + Symbol.toStringTag
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::intrinsics_impl::helpers::MapKey;
@@ -18,6 +19,92 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
+
+pub struct MapSetIntrinsic;
+
+impl IntrinsicObject for MapSetIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        let intrinsics = ctx.intrinsics();
+        init_map_prototype(
+            intrinsics.map_prototype,
+            ctx.fn_proto(),
+            &mm,
+            intrinsics.iterator_prototype,
+            crate::intrinsics::well_known::iterator_symbol(),
+        );
+        init_set_prototype(
+            intrinsics.set_prototype,
+            ctx.fn_proto(),
+            &mm,
+            intrinsics.iterator_prototype,
+            crate::intrinsics::well_known::iterator_symbol(),
+        );
+        init_weak_map_prototype(intrinsics.weak_map_prototype, ctx.fn_proto(), &mm);
+        init_weak_set_prototype(intrinsics.weak_set_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let map_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                map_ctor,
+                intrinsics.map_prototype,
+                "Map",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_map_constructor(), 0)
+            .build_and_install(&global);
+            crate::intrinsics_impl::helpers::define_species_getter(map_ctor, ctx.fn_proto(), &mm);
+            install_map_statics(map_ctor, ctx.fn_proto(), &mm);
+
+            let set_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                set_ctor,
+                intrinsics.set_prototype,
+                "Set",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_set_constructor(), 0)
+            .build_and_install(&global);
+            crate::intrinsics_impl::helpers::define_species_getter(set_ctor, ctx.fn_proto(), &mm);
+
+            let weak_map_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                weak_map_ctor,
+                intrinsics.weak_map_prototype,
+                "WeakMap",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_weak_map_constructor(), 0)
+            .build_and_install(&global);
+            weak_map_ctor.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::number(0.0)),
+            );
+
+            let weak_set_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                weak_set_ctor,
+                intrinsics.weak_set_prototype,
+                "WeakSet",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_weak_set_constructor(), 0)
+            .build_and_install(&global);
+            weak_set_ctor.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::number(0.0)),
+            );
+        }
+    }
+}
 
 // ============================================================================
 // Internal slot keys
@@ -397,8 +484,7 @@ fn make_map_iterator(
                 loop {
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         // Park index at end
@@ -410,15 +496,13 @@ fn make_map_iterator(
                         idx += 1;
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         match kind.as_str() {
                             "key" => {
                                 let _ = result.set(pk("value"), key);
                             }
                             "entry" => {
-                                let entry =
-                                    GcRef::new(JsObject::array(2));
+                                let entry = GcRef::new(JsObject::array(2));
                                 let _ = entry.set(PropertyKey::Index(0), key);
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
@@ -819,8 +903,7 @@ fn make_set_iterator(
                 loop {
                     let entries_len = data.entries_len();
                     if idx >= entries_len {
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         let _ = result.set(pk("value"), Value::undefined());
                         let _ = result.set(pk("done"), Value::boolean(true));
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
@@ -831,12 +914,10 @@ fn make_set_iterator(
                         idx += 1;
                         let _ = iter_obj.set(pk("__iter_index__"), Value::number(idx as f64));
 
-                        let result =
-                            GcRef::new(JsObject::new(Value::null()));
+                        let result = GcRef::new(JsObject::new(Value::null()));
                         match kind.as_str() {
                             "entry" => {
-                                let entry =
-                                    GcRef::new(JsObject::array(2));
+                                let entry = GcRef::new(JsObject::array(2));
                                 let _ = entry.set(PropertyKey::Index(0), value.clone());
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));

@@ -36,11 +36,7 @@ impl otter_vm_gc::GcTraceable for JsRegExp {
 
 impl JsRegExp {
     /// Create a new JsRegExp
-    pub fn new(
-        pattern: String,
-        flags: String,
-        proto: Option<GcRef<JsObject>>,
-    ) -> Self {
+    pub fn new(pattern: String, flags: String, proto: Option<GcRef<JsObject>>) -> Self {
         let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value));
         object.define_property(

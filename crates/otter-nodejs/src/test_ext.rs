@@ -601,9 +601,7 @@ fn test_impl(
                                 c.get(&PropertyKey::string("prototype"))
                                     .and_then(|v| v.as_object())
                             })
-                            .unwrap_or_else(|| {
-                                GcRef::new(JsObject::new(Value::null()))
-                            }),
+                            .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null()))),
                     )
                 };
                 let reject_fn = {
@@ -622,9 +620,7 @@ fn test_impl(
                                 c.get(&PropertyKey::string("prototype"))
                                     .and_then(|v| v.as_object())
                             })
-                            .unwrap_or_else(|| {
-                                GcRef::new(JsObject::new(Value::null()))
-                            }),
+                            .unwrap_or_else(|| GcRef::new(JsObject::new(Value::null()))),
                     )
                 };
 
@@ -1626,8 +1622,7 @@ fn build_tests_stream_instance(
     ncx: &NativeContext,
     emitter_proto: GcRef<JsObject>,
 ) -> Result<GcRef<JsObject>, VmError> {
-    let stream = GcRef::new(JsObject::new(
-        Value::object(emitter_proto)));
+    let stream = GcRef::new(JsObject::new(Value::object(emitter_proto)));
 
     // Initialize EventEmitter storage (listeners map)
     let listeners_map = GcRef::new(JsObject::new(Value::null()));

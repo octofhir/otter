@@ -8,8 +8,12 @@ use otter_vm_bytecode::function::HOT_FUNCTION_THRESHOLD;
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET, RuntimeHelpers,
 };
-use otter_vm_jit::{BAILOUT_SENTINEL, BailoutReason, DEOPT_THRESHOLD, DeoptMetadata, JitCompiler};
+use otter_vm_jit::{
+    BAILOUT_SENTINEL, BailoutReason, DEOPT_THRESHOLD, DeoptMetadata, JitCompileArtifact,
+    JitCompiler,
+};
 
+use crate::entry_stub::call_jit_entry;
 use crate::jit_queue::{self, JitCompileRequest};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -139,9 +143,9 @@ struct BailoutSiteCounter {
     opcode: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CompiledFunctionEntry {
-    code_ptr: usize,
+    artifact: JitCompileArtifact,
     deopt_metadata: DeoptMetadata,
 }
 
@@ -189,7 +193,7 @@ enum BackgroundCompileResult {
     Compiled {
         module_id: u64,
         function_index: u32,
-        code_ptr: usize,
+        artifact: JitCompileArtifact,
         deopt_metadata: DeoptMetadata,
     },
     Error {
@@ -221,6 +225,7 @@ fn parse_env_u32(var_name: &str) -> Option<u32> {
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_bailout_telemetry(ctx_ptr: *mut u8) -> BailoutTelemetry {
     if ctx_ptr.is_null() {
         return BailoutTelemetry::default();
@@ -467,7 +472,7 @@ fn run_background_worker(
                 let _ = result_tx.send(BackgroundCompileResult::Compiled {
                     module_id,
                     function_index,
-                    code_ptr: artifact.code_ptr as usize,
+                    artifact,
                     deopt_metadata,
                 });
             }
@@ -499,14 +504,14 @@ fn drain_background_results() {
             Ok(BackgroundCompileResult::Compiled {
                 module_id,
                 function_index,
-                code_ptr,
+                artifact,
                 deopt_metadata,
             }) => {
                 let mut state = lock_state();
                 state.compiled_entries.insert(
                     (module_id, function_index),
                     CompiledFunctionEntry {
-                        code_ptr,
+                        artifact,
                         deopt_metadata,
                     },
                 );
@@ -563,7 +568,7 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
             state.compiled_entries.insert(
                 (request.module_id, request.function_index),
                 CompiledFunctionEntry {
-                    code_ptr,
+                    artifact,
                     deopt_metadata,
                 },
             );
@@ -634,7 +639,7 @@ pub fn try_execute_jit_raw(
             state
                 .compiled_entries
                 .get(&(module_id, function_index))
-                .map(|entry| entry.code_ptr)
+                .map(|entry| entry.artifact.code_ptr as usize)
                 .unwrap_or(0)
         };
         if ptr != 0 {
@@ -649,15 +654,16 @@ pub fn try_execute_jit_raw(
         return JitExecResult::NotCompiled;
     }
 
-    // SAFETY: ptr is produced by JitCompiler with signature
-    // `(*mut u8, *const i64, u32) -> i64`.
-    let func: extern "C" fn(*mut u8, *const i64, u32) -> i64 = unsafe { std::mem::transmute(ptr) };
-    let result = func(ctx_ptr, args_ptr, argc);
+    let outcome = unsafe { call_jit_entry(ptr, ctx_ptr, args_ptr, argc) };
+    let result = outcome.result;
 
     if result == BAILOUT_SENTINEL {
         use otter_vm_bytecode::function::BailoutAction;
 
-        let telemetry = decode_bailout_telemetry(ctx_ptr);
+        let telemetry = BailoutTelemetry {
+            reason: outcome.bailout_reason,
+            pc: outcome.bailout_pc,
+        };
         let action = function.record_bailout(jit_deopt_threshold());
 
         let mut state = lock_state();
@@ -732,7 +738,8 @@ pub fn try_execute_jit_raw(
 }
 
 /// Invalidate cached compiled code pointer for a function.
-pub fn invalidate_jit_code(module_id: u64, function_index: u32) {
+pub fn invalidate_jit_code(module_id: u64, function_index: u32, function: &Function) {
+    function.clear_jit_entry_ptr();
     let mut state = runtime_state()
         .lock()
         .expect("jit runtime mutex should not be poisoned");
@@ -883,7 +890,7 @@ pub fn hydrate_jit_entry_ptr(module_id: u64, function_index: u32, function: &Fun
         state
             .compiled_entries
             .get(&(module_id, function_index))
-            .map(|entry| entry.code_ptr)
+            .map(|entry| entry.artifact.code_ptr as usize)
             .unwrap_or(0)
     };
 
@@ -1104,7 +1111,7 @@ mod tests {
             state.compiled_entries.insert(
                 (module.module_id, 0),
                 CompiledFunctionEntry {
-                    code_ptr: 0x1234,
+                    artifact: JitCompileArtifact::from_raw_ptr(0x1234 as *const u8),
                     deopt_metadata: DeoptMetadata::default(),
                 },
             );
@@ -1112,6 +1119,40 @@ mod tests {
 
         assert!(hydrate_jit_entry_ptr(module.module_id, 0, function));
         assert_eq!(function.jit_entry_ptr(), 0x1234);
+
+        crate::clear_for_tests();
+        clear_runtime_state_for_tests();
+    }
+
+    #[test]
+    fn invalidate_jit_code_clears_hydrated_function_pointer() {
+        let _guard = crate::test_lock();
+        crate::clear_for_tests();
+        clear_runtime_state_for_tests();
+
+        let module = build_test_module();
+        let function = module
+            .function(0)
+            .expect("test module should expose function");
+
+        {
+            let mut state = lock_state();
+            state.compiled_entries.insert(
+                (module.module_id, 0),
+                CompiledFunctionEntry {
+                    artifact: JitCompileArtifact::from_raw_ptr(0x5678 as *const u8),
+                    deopt_metadata: DeoptMetadata::default(),
+                },
+            );
+        }
+
+        assert!(hydrate_jit_entry_ptr(module.module_id, 0, function));
+        assert_eq!(function.jit_entry_ptr(), 0x5678);
+
+        invalidate_jit_code(module.module_id, 0, function);
+
+        assert_eq!(function.jit_entry_ptr(), 0);
+        assert!(!hydrate_jit_entry_ptr(module.module_id, 0, function));
 
         crate::clear_for_tests();
         clear_runtime_state_for_tests();

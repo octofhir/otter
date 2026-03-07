@@ -627,10 +627,7 @@ impl Trace for crate::value::Closure {
 // Implement Trace for GeneratorFrame
 impl Trace for crate::generator::GeneratorFrame {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        for val in &self.locals {
-            tracer.mark_value(val);
-        }
-        for val in &self.registers {
+        for val in &self.window {
             tracer.mark_value(val);
         }
         for cell in &self.upvalues {
@@ -772,13 +769,9 @@ impl Trace for crate::context::VmContext {
     }
 }
 
-// Implement Trace for SavedFrame
+// Implement Trace for SavedFrame (registers are in AsyncContext::registers, not here)
 impl Trace for crate::async_context::SavedFrame {
     fn trace(&self, tracer: &mut dyn Tracer) {
-        // Registers vec contains the full window (locals + scratch regs)
-        for val in &self.registers {
-            tracer.mark_value(val);
-        }
         for cell in &self.upvalues {
             cell.trace(tracer);
         }
@@ -789,6 +782,10 @@ impl Trace for crate::async_context::SavedFrame {
 // Implement Trace for AsyncContext
 impl Trace for crate::async_context::AsyncContext {
     fn trace(&self, tracer: &mut dyn Tracer) {
+        // Trace flat register array (covers all frames' locals + scratch regs)
+        for val in &self.registers {
+            tracer.mark_value(val);
+        }
         for frame in &self.frames {
             frame.trace(tracer);
         }

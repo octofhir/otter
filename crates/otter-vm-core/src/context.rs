@@ -3,8 +3,8 @@
 //! The context holds per-execution state: registers, call stack, locals.
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
 use rustc_hash::FxHashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -397,7 +397,6 @@ const INITIAL_REGISTER_POOL: usize = 4096;
 /// Increased from 1000 to reduce GC check overhead (GC was taking 43% CPU)
 pub const INTERRUPT_CHECK_INTERVAL: u32 = 10_000;
 
-
 /// A call stack frame
 #[derive(Debug)]
 pub struct CallFrame {
@@ -469,7 +468,7 @@ pub struct VmContext {
     /// Virtual registers
     registers: Vec<Value>,
     /// Call stack
-    call_stack: Vec<CallFrame>,
+    pub(crate) call_stack: Vec<CallFrame>,
     /// Global object
     global: GcRef<JsObject>,
     /// Exception state
@@ -480,6 +479,9 @@ pub struct VmContext {
     running: bool,
     /// Pending arguments for next call
     pending_args: Vec<Value>,
+    /// Fast path: args are still in caller's register window.
+    /// (absolute_start_index, count) — avoids copying into pending_args Vec.
+    pending_args_register_source: Option<(usize, usize)>,
     /// Pending `this` value for next call
     pending_this: Option<Value>,
     /// Pending upvalues for next call (captured closure cells)
@@ -733,6 +735,7 @@ impl VmContext {
             try_stack: Vec::new(),
             running: false,
             pending_args: Vec::new(),
+            pending_args_register_source: None,
             pending_this: None,
             pending_upvalues: Vec::new(),
             pending_home_object: None,
@@ -1434,6 +1437,28 @@ impl VmContext {
         }
     }
 
+    /// Snapshot the current frame's full register window (locals + scratch).
+    /// Returns a new Vec with the window contents.
+    #[inline]
+    pub fn snapshot_window(&self) -> Vec<Value> {
+        let frame = self.call_stack.last().expect("snapshot_window: no frame");
+        let start = frame.register_base;
+        let end = (start + frame.register_count).min(self.registers.len());
+        self.registers[start..end].to_vec()
+    }
+
+    /// Restore the current frame's full register window from a saved snapshot.
+    /// Copies `window` contents directly into the register array at the current
+    /// frame's register_base.
+    #[inline]
+    pub fn restore_window(&mut self, window: &[Value]) {
+        let frame = self.call_stack.last().expect("restore_window: no frame");
+        let start = frame.register_base;
+        let end = (start + window.len()).min(self.registers.len());
+        let copy_len = end - start;
+        self.registers[start..end].copy_from_slice(&window[..copy_len]);
+    }
+
     /// Write a local slot for bytecode execution.
     /// Locals live at `registers[register_base + index]`.
     #[inline]
@@ -1967,7 +1992,6 @@ impl VmContext {
         }
 
         // Consume pending arguments directly into local slots in the register window.
-        let pending_arg_len = self.pending_args.len();
         let param_count = func.param_count as usize;
         let has_rest = func.flags.has_rest;
         let effective_param_count = if has_rest {
@@ -1976,44 +2000,83 @@ impl VmContext {
             param_count
         };
 
-        let extra_args_count = if pending_arg_len > effective_param_count {
-            pending_arg_len - effective_param_count
-        } else {
-            0
-        };
+        if let Some((src_start, src_count)) = self.pending_args_register_source.take() {
+            // Fast path: args are still in the caller's register window.
+            // Copy directly register-to-register (no Vec intermediary).
+            let extra_args_count = if src_count > effective_param_count {
+                src_count - effective_param_count
+            } else {
+                0
+            };
 
-        if extra_args_count == 0 {
-            // Common case: no extra arguments. Write args directly into locals window.
-            for (i, arg) in self.pending_args.drain(..).enumerate() {
-                if i < local_count {
-                    self.registers[register_base + i] = arg;
+            if extra_args_count == 0 {
+                let copy_count = src_count.min(local_count);
+                for i in 0..copy_count {
+                    self.registers[register_base + i] = self.registers[src_start + i];
+                }
+            } else {
+                let total_locals = local_count + extra_args_count;
+                let new_window = total_locals + scratch_regs;
+                let new_needed = register_base + new_window;
+                if new_needed > self.registers.len() {
+                    self.registers.resize(new_needed, Value::undefined());
+                }
+                for slot in
+                    &mut self.registers[register_base + local_count..register_base + total_locals]
+                {
+                    *slot = Value::undefined();
+                }
+                for i in 0..src_count {
+                    if i < effective_param_count {
+                        if i < total_locals {
+                            self.registers[register_base + i] = self.registers[src_start + i];
+                        }
+                    } else {
+                        let target_idx = local_count + (i - effective_param_count);
+                        if target_idx < total_locals {
+                            self.registers[register_base + target_idx] =
+                                self.registers[src_start + i];
+                        }
+                    }
                 }
             }
         } else {
-            // Extra arguments: regular args go to param slots,
-            // extras go after all declared locals.
-            // Grow window if needed for extra args.
-            let total_locals = local_count + extra_args_count;
-            let new_window = total_locals + scratch_regs;
-            let new_needed = register_base + new_window;
-            if new_needed > self.registers.len() {
-                self.registers.resize(new_needed, Value::undefined());
-            }
-            // Initialize extra local slots
-            for slot in
-                &mut self.registers[register_base + local_count..register_base + total_locals]
-            {
-                *slot = Value::undefined();
-            }
-            for (i, arg) in self.pending_args.drain(..).enumerate() {
-                if i < effective_param_count {
-                    if i < total_locals {
+            // Slow path: args are in the pending_args Vec.
+            let pending_arg_len = self.pending_args.len();
+            let extra_args_count = if pending_arg_len > effective_param_count {
+                pending_arg_len - effective_param_count
+            } else {
+                0
+            };
+
+            if extra_args_count == 0 {
+                for (i, arg) in self.pending_args.drain(..).enumerate() {
+                    if i < local_count {
                         self.registers[register_base + i] = arg;
                     }
-                } else {
-                    let target_idx = local_count + (i - effective_param_count);
-                    if target_idx < total_locals {
-                        self.registers[register_base + target_idx] = arg;
+                }
+            } else {
+                let total_locals = local_count + extra_args_count;
+                let new_window = total_locals + scratch_regs;
+                let new_needed = register_base + new_window;
+                if new_needed > self.registers.len() {
+                    self.registers.resize(new_needed, Value::undefined());
+                }
+                for slot in
+                    &mut self.registers[register_base + local_count..register_base + total_locals]
+                {
+                    *slot = Value::undefined();
+                }
+                for (i, arg) in self.pending_args.drain(..).enumerate() {
+                    if i < effective_param_count {
+                        if i < total_locals {
+                            self.registers[register_base + i] = arg;
+                        }
+                    } else {
+                        let target_idx = local_count + (i - effective_param_count);
+                        if target_idx < total_locals {
+                            self.registers[register_base + target_idx] = arg;
+                        }
                     }
                 }
             }
@@ -2091,29 +2154,35 @@ impl VmContext {
     /// Overwrites the current frame's locals and registers with the captured
     /// values from JIT deopt, and sets the program counter to `bailout_pc`.
     /// The interpreter then resumes execution from that point.
-    pub fn restore_deopt_state(&mut self, bailout_pc: u32, locals: &[Value], registers: &[Value]) {
+    pub(crate) fn restore_deopt_state(
+        &mut self,
+        bailout_pc: u32,
+        locals: &[crate::jit_runtime::DeoptValueSlot],
+        registers: &[crate::jit_runtime::DeoptValueSlot],
+    ) {
         if let Some(frame) = self.call_stack.last_mut() {
             frame.pc = bailout_pc as usize;
             let base = frame.register_base;
             // Overwrite locals (at base + 0..local_count)
-            for (i, value) in locals.iter().enumerate() {
-                if i >= frame.local_count {
+            for slot in locals {
+                let local_index = slot.index as usize;
+                if local_index >= frame.local_count {
                     break;
                 }
-                let idx = base + i;
+                let idx = base + local_index;
                 if idx < self.registers.len() {
-                    self.registers[idx] = *value;
+                    self.registers[idx] = slot.value;
                 }
             }
             // Overwrite scratch registers (at base + local_count..)
             let reg_offset = base + frame.local_count;
-            for (i, value) in registers.iter().enumerate() {
-                let idx = reg_offset + i;
+            for slot in registers {
+                let idx = reg_offset + slot.index as usize;
                 if idx >= base + frame.register_count {
                     break;
                 }
                 if idx < self.registers.len() {
-                    self.registers[idx] = *value;
+                    self.registers[idx] = slot.value;
                 }
             }
         }
@@ -2230,45 +2299,70 @@ impl VmContext {
 
     /// Set pending arguments for next function call
     pub fn set_pending_args(&mut self, args: Vec<Value>) {
+        self.pending_args_register_source = None;
         self.pending_args = args;
     }
 
     /// Fill pending arguments from a contiguous register range.
     ///
-    /// Reuses existing pending args allocation to avoid per-call Vec churn.
+    /// Fast path: stores the source register range instead of copying into
+    /// the pending_args Vec. The actual copy happens in `push_frame` directly
+    /// from source to destination registers (register-to-register, no Vec).
     pub fn set_pending_args_from_register_range(&mut self, start: u16, count: u16) {
-        self.pending_args.clear();
-        let count = count as usize;
-        if count == 0 {
+        let count_usize = count as usize;
+        if count_usize == 0 {
+            self.pending_args.clear();
+            self.pending_args_register_source = None;
             return;
         }
         let Some(frame) = self.current_frame() else {
+            self.pending_args.clear();
+            self.pending_args_register_source = None;
             return;
         };
         let frame_start = frame.register_base;
         let frame_end = frame_start + frame.register_count;
         // Register indices are relative to the scratch area (after locals).
-        let start = frame_start + frame.local_count + start as usize;
-        if start >= frame_end {
-            self.pending_args.resize(count, Value::undefined());
+        let abs_start = frame_start + frame.local_count + start as usize;
+
+        // Fast path: all args are within bounds — just record the source range.
+        if abs_start + count_usize <= frame_end && abs_start + count_usize <= self.registers.len() {
+            self.pending_args_register_source = Some((abs_start, count_usize));
             return;
         }
-        let take = (frame_end - start).min(count);
+
+        // Slow path: some args are out of bounds, materialize into Vec.
+        self.pending_args_register_source = None;
+        self.pending_args.clear();
+        if abs_start >= frame_end {
+            self.pending_args.resize(count_usize, Value::undefined());
+            return;
+        }
+        let take = (frame_end - abs_start).min(count_usize);
         self.pending_args
-            .extend_from_slice(&self.registers[start..start + take]);
-        if take < count {
-            self.pending_args.resize(count, Value::undefined());
+            .extend_from_slice(&self.registers[abs_start..abs_start + take]);
+        if take < count_usize {
+            self.pending_args.resize(count_usize, Value::undefined());
         }
     }
 
     /// Borrow pending arguments for the next function call.
     pub fn pending_args(&self) -> &[Value] {
-        &self.pending_args
+        if let Some((start, count)) = self.pending_args_register_source {
+            &self.registers[start..start + count]
+        } else {
+            &self.pending_args
+        }
     }
 
-    /// Take pending arguments (transfers ownership)
+    /// Take pending arguments (transfers ownership).
+    /// Materializes the Vec if args are still in registers.
     pub fn take_pending_args(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.pending_args)
+        if let Some((start, count)) = self.pending_args_register_source.take() {
+            self.registers[start..start + count].to_vec()
+        } else {
+            std::mem::take(&mut self.pending_args)
+        }
     }
 
     /// Set pending `this` value for next function call
@@ -2468,75 +2562,62 @@ impl VmContext {
 
     // ==================== Async Context Save/Restore ====================
 
-    /// Save all call frames as SavedFrames for async suspension
+    /// Move all call frames + registers out of VmContext for async suspension.
     ///
-    /// This captures the complete call stack state so we can restore it later.
-    /// Includes both locals and registers for each frame.
-    pub fn save_frames(&self) -> Vec<SavedFrame> {
-        self.call_stack
-            .iter()
-            .map(|frame| {
-                // Extract this frame's full register window (locals + scratch regs).
-                let reg_start = frame.register_base;
-                let reg_end = (reg_start + frame.register_count).min(self.registers.len());
-                let frame_registers = self.registers[reg_start..reg_end].to_vec();
-
-                SavedFrame::new(
-                    frame.function_index,
-                    Arc::clone(&frame.module),
-                    frame.realm_id,
-                    frame.pc,
-                    frame.local_count,
-                    frame_registers,
-                    frame.upvalues.clone(),
-                    frame.return_register,
-                    frame.this_value.clone(),
-                    frame.is_construct,
-                    frame.is_async,
-                    frame.frame_id,
-                    frame.argc,
-                )
+    /// This is zero-copy: the register Vec and call stack are moved, not cloned.
+    /// The VmContext is left with empty stacks (ready for microtask execution).
+    /// Returns (saved_frames, flat_registers).
+    pub fn take_frames(&mut self) -> (Vec<SavedFrame>, Vec<Value>) {
+        let registers = std::mem::take(&mut self.registers);
+        let frames = self
+            .call_stack
+            .drain(..)
+            .map(|frame| SavedFrame {
+                function_index: frame.function_index,
+                module: frame.module,
+                realm_id: frame.realm_id,
+                pc: frame.pc,
+                local_count: frame.local_count,
+                register_base: frame.register_base,
+                register_count: frame.register_count,
+                upvalues: frame.upvalues,
+                return_register: frame.return_register,
+                this_value: frame.this_value,
+                is_construct: frame.is_construct,
+                is_async: frame.is_async,
+                frame_id: frame.frame_id,
+                argc: frame.argc,
             })
-            .collect()
+            .collect();
+        self.open_upvalues.clear();
+        (frames, registers)
     }
 
-    /// Restore call frames from SavedFrames after async resumption
+    /// Restore call frames + registers from an AsyncContext after async resumption.
     ///
-    /// This replaces the current call stack with the saved state.
-    /// Restores both locals and registers for each frame.
-    pub fn restore_frames(&mut self, saved_frames: Vec<SavedFrame>) -> VmResult<()> {
+    /// This is zero-copy: the register Vec is moved back into VmContext.
+    pub fn restore_frames(
+        &mut self,
+        saved_frames: Vec<SavedFrame>,
+        registers: Vec<Value>,
+    ) -> VmResult<()> {
         // Clear current call stack
         self.call_stack.clear();
         self.open_upvalues.clear();
 
-        // Ensure we have enough registers for all restored frame windows.
-        let total_registers_needed: usize = saved_frames.iter().map(|f| f.registers.len()).sum();
-        if total_registers_needed > self.registers.len() {
-            self.registers
-                .resize(total_registers_needed, Value::undefined());
-        }
+        // Move registers back in (zero-copy)
+        self.registers = registers;
 
-        // Restore each frame
-        let mut next_register_base = 0usize;
+        // Rebuild call stack from saved frame metadata
         for saved in saved_frames.into_iter() {
-            let register_base = next_register_base;
-            let register_count = saved.registers.len();
-            let register_end = register_base + register_count;
-
-            // Restore full register window (locals + scratch regs)
-            for (j, reg) in saved.registers.into_iter().enumerate() {
-                self.registers[register_base + j] = reg;
-            }
-            next_register_base = register_end;
-
             self.call_stack.push(CallFrame {
                 function_index: saved.function_index,
                 module: saved.module,
                 realm_id: saved.realm_id,
                 pc: saved.pc,
-                register_base,
+                register_base: saved.register_base,
                 local_count: saved.local_count,
-                register_count,
+                register_count: saved.register_count,
                 upvalues: saved.upvalues,
                 return_register: saved.return_register,
                 source_location: None,
@@ -2592,7 +2673,11 @@ impl VmContext {
     }
 
     pub fn pending_args_to_trace(&self) -> &[Value] {
-        &self.pending_args
+        if let Some((start, count)) = self.pending_args_register_source {
+            &self.registers[start..start + count]
+        } else {
+            &self.pending_args
+        }
     }
 
     pub fn pending_this_to_trace(&self) -> Option<&Value> {
@@ -2966,6 +3051,7 @@ impl SharedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit_runtime::DeoptValueSlot;
     use otter_vm_bytecode::{Constant, ConstantPool, Function, Instruction, Module, Register};
     use parking_lot::Mutex;
 
@@ -3138,6 +3224,50 @@ mod tests {
 
         ctx.jump(-3);
         assert_eq!(ctx.pc(), 3);
+    }
+
+    #[test]
+    fn test_restore_deopt_state_overwrites_only_live_slots() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let mut ctx = runtime.create_context();
+
+        let mut builder = Module::builder("deopt.js");
+        let func = Function::builder()
+            .name("deopt_sparse")
+            .local_count(2)
+            .register_count(4)
+            .instruction(Instruction::Return { src: Register(0) })
+            .build();
+        builder.add_function(func);
+        let module = Arc::new(builder.build());
+
+        ctx.push_frame(0, module, 2, None, false, false, 0).unwrap();
+        ctx.set_local(0, Value::int32(10)).unwrap();
+        ctx.set_local(1, Value::int32(20)).unwrap();
+        ctx.set_register(0, Value::int32(30));
+        ctx.set_register(1, Value::int32(40));
+        ctx.set_register(2, Value::int32(50));
+        ctx.set_register(3, Value::int32(60));
+
+        ctx.restore_deopt_state(
+            7,
+            &[DeoptValueSlot {
+                index: 1,
+                value: Value::int32(200),
+            }],
+            &[DeoptValueSlot {
+                index: 2,
+                value: Value::int32(500),
+            }],
+        );
+
+        assert_eq!(ctx.pc(), 7);
+        assert_eq!(ctx.get_local(0).unwrap().as_int32(), Some(10));
+        assert_eq!(ctx.get_local(1).unwrap().as_int32(), Some(200));
+        assert_eq!(ctx.get_register(0).as_int32(), Some(30));
+        assert_eq!(ctx.get_register(1).as_int32(), Some(40));
+        assert_eq!(ctx.get_register(2).as_int32(), Some(500));
+        assert_eq!(ctx.get_register(3).as_int32(), Some(60));
     }
 
     #[test]

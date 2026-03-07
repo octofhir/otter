@@ -1,20 +1,18 @@
-//! Math namespace initialization
+//! `Math` namespace object (ES2024 §21.3)
 //!
-//! Creates the Math global namespace object with:
-//! - 8 Math constants (E, LN10, LN2, LOG10E, LOG2E, PI, SQRT1_2, SQRT2)
-//! - 36+ Math static methods (ES2026)
+//! The `Math` object is a single ordinary object with no `[[Construct]]` or `[[Call]]`.
+//! It provides mathematical constants and functions.
 //!
-//! All methods are `#[dive]` functions with automatic type conversion.
+//! Spec: <https://tc39.es/ecma262/#sec-math-object>
+//! MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Math>
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject, NamespaceBuilder};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
-use crate::memory::MemoryManager;
-use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
-use crate::string::JsString;
+use crate::object::{JsObject, PropertyKey};
 use crate::value::Value;
 use otter_macros::dive;
-use std::sync::Arc;
 
 // ============================================================================
 // Helper
@@ -56,21 +54,25 @@ fn to_uint32(n: f64) -> u32 {
 // Single-argument f64 → f64 methods
 // ============================================================================
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.abs>
 #[dive(name = "abs")]
 fn math_abs(x: f64) -> f64 {
     x.abs()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.ceil>
 #[dive(name = "ceil")]
 fn math_ceil(x: f64) -> f64 {
     x.ceil()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.floor>
 #[dive(name = "floor")]
 fn math_floor(x: f64) -> f64 {
     x.floor()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.round>
 #[dive(name = "round", length = 1)]
 fn math_round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
@@ -87,106 +89,127 @@ fn math_round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError
     Ok(Value::number(result))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.trunc>
 #[dive(name = "trunc")]
 fn math_trunc(x: f64) -> f64 {
     x.trunc()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.sqrt>
 #[dive(name = "sqrt")]
 fn math_sqrt(x: f64) -> f64 {
     x.sqrt()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.cbrt>
 #[dive(name = "cbrt")]
 fn math_cbrt(x: f64) -> f64 {
     x.cbrt()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.exp>
 #[dive(name = "exp")]
 fn math_exp(x: f64) -> f64 {
     x.exp()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.expm1>
 #[dive(name = "expm1")]
 fn math_expm1(x: f64) -> f64 {
     x.exp_m1()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.log>
 #[dive(name = "log")]
 fn math_log(x: f64) -> f64 {
     x.ln()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.log1p>
 #[dive(name = "log1p")]
 fn math_log1p(x: f64) -> f64 {
     x.ln_1p()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.log2>
 #[dive(name = "log2")]
 fn math_log2(x: f64) -> f64 {
     x.log2()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.log10>
 #[dive(name = "log10")]
 fn math_log10(x: f64) -> f64 {
     x.log10()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.sin>
 #[dive(name = "sin")]
 fn math_sin(x: f64) -> f64 {
     x.sin()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.cos>
 #[dive(name = "cos")]
 fn math_cos(x: f64) -> f64 {
     x.cos()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.tan>
 #[dive(name = "tan")]
 fn math_tan(x: f64) -> f64 {
     x.tan()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.asin>
 #[dive(name = "asin")]
 fn math_asin(x: f64) -> f64 {
     x.asin()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.acos>
 #[dive(name = "acos")]
 fn math_acos(x: f64) -> f64 {
     x.acos()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.atan>
 #[dive(name = "atan")]
 fn math_atan(x: f64) -> f64 {
     x.atan()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.sinh>
 #[dive(name = "sinh")]
 fn math_sinh(x: f64) -> f64 {
     x.sinh()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.cosh>
 #[dive(name = "cosh")]
 fn math_cosh(x: f64) -> f64 {
     x.cosh()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.tanh>
 #[dive(name = "tanh")]
 fn math_tanh(x: f64) -> f64 {
     x.tanh()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.asinh>
 #[dive(name = "asinh")]
 fn math_asinh(x: f64) -> f64 {
     x.asinh()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.acosh>
 #[dive(name = "acosh")]
 fn math_acosh(x: f64) -> f64 {
     x.acosh()
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.atanh>
 #[dive(name = "atanh")]
 fn math_atanh(x: f64) -> f64 {
     x.atanh()
@@ -196,6 +219,7 @@ fn math_atanh(x: f64) -> f64 {
 // Two-argument methods
 // ============================================================================
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.pow>
 #[dive(name = "pow", length = 2)]
 fn math_pow(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let base = to_number(args.get(0).unwrap_or(&Value::undefined()));
@@ -291,11 +315,13 @@ fn is_odd_integer(n: f64) -> bool {
     (n as i64) % 2 != 0
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.atan2>
 #[dive(name = "atan2")]
 fn math_atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.imul>
 #[dive(name = "imul", length = 2)]
 fn math_imul(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let a = to_int32(to_number(args.get(0).unwrap_or(&Value::undefined())));
@@ -307,6 +333,7 @@ fn math_imul(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError>
 // Special single-argument methods (non-trivial conversion)
 // ============================================================================
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.sign>
 #[dive(name = "sign", length = 1)]
 fn math_sign(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
@@ -322,6 +349,7 @@ fn math_sign(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError>
     Ok(Value::number(result))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.clz32>
 #[dive(name = "clz32", length = 1)]
 fn math_clz32(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
@@ -329,12 +357,14 @@ fn math_clz32(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError
     Ok(Value::number(val.leading_zeros() as f64))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.fround>
 #[dive(name = "fround", length = 1)]
 fn math_fround(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
     Ok(Value::number((x as f32) as f64))
 }
 
+/// Spec: <https://tc39.es/proposal-float16array/#sec-math.f16round>
 #[dive(name = "f16round", length = 1)]
 fn math_f16round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
@@ -346,6 +376,7 @@ fn math_f16round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmEr
 // Varargs methods
 // ============================================================================
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.max>
 #[dive(name = "max", length = 2)]
 fn math_max(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     if args.is_empty() {
@@ -369,6 +400,7 @@ fn math_max(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     Ok(Value::number(max))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.min>
 #[dive(name = "min", length = 2)]
 fn math_min(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     if args.is_empty() {
@@ -392,6 +424,7 @@ fn math_min(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     Ok(Value::number(min))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.hypot>
 #[dive(name = "hypot", length = 2)]
 fn math_hypot(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     if args.is_empty() {
@@ -424,6 +457,7 @@ fn math_hypot(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
     Ok(Value::number(sum.sqrt()))
 }
 
+/// Spec: <https://tc39.es/ecma262/#sec-math.random>
 #[dive(name = "random", length = 0)]
 fn math_random(_args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     use std::collections::hash_map::RandomState;
@@ -440,6 +474,7 @@ fn math_random(_args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmErr
     Ok(Value::number(rand))
 }
 
+/// Spec: <https://tc39.es/proposal-math-sum/#sec-math.sumprecise>
 #[dive(name = "sumPrecise", length = 1)]
 fn math_sum_precise(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     let undefined = Value::undefined();
@@ -683,125 +718,65 @@ fn shewchuk_sum(values: &[f64]) -> f64 {
 // Install
 // ============================================================================
 
-/// Create and install Math namespace on global object.
-pub fn install_math_namespace(
-    global: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-    object_prototype: GcRef<JsObject>,
-) {
-    let math_obj = GcRef::new(JsObject::new(Value::object(object_prototype)));
+/// `Math` namespace object.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-math-object>
+/// MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Math>
+pub struct MathNamespace;
 
-    // Math Constants (ES2026 §21.3.1)
-    let const_attrs = PropertyAttributes::permanent();
-    math_obj.define_property(
-        PropertyKey::string("E"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::E), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("LN10"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LN_10), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("LN2"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LN_2), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("LOG10E"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LOG10_E), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("LOG2E"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::LOG2_E), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("PI"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::PI), const_attrs),
-    );
-    math_obj.define_property(
-        PropertyKey::string("SQRT1_2"),
-        PropertyDescriptor::data_with_attrs(
-            Value::number(std::f64::consts::FRAC_1_SQRT_2),
-            const_attrs,
-        ),
-    );
-    math_obj.define_property(
-        PropertyKey::string("SQRT2"),
-        PropertyDescriptor::data_with_attrs(Value::number(std::f64::consts::SQRT_2), const_attrs),
-    );
+impl IntrinsicObject for MathNamespace {
+    fn init(ctx: &IntrinsicContext) {
+        let math_obj = ctx.alloc_object(ctx.obj_proto());
 
-    // Math Methods (ES2026 §21.3.2)
-    // Wire all #[dive] functions via their cached NativeFn arcs
-    let methods: &[(&str, crate::value::NativeFn, u32)] = &[
-        math_abs_decl(),
-        math_ceil_decl(),
-        math_floor_decl(),
-        math_round_decl(),
-        math_trunc_decl(),
-        math_sign_decl(),
-        math_max_decl(),
-        math_min_decl(),
-        math_sqrt_decl(),
-        math_cbrt_decl(),
-        math_pow_decl(),
-        math_hypot_decl(),
-        math_exp_decl(),
-        math_expm1_decl(),
-        math_log_decl(),
-        math_log1p_decl(),
-        math_log2_decl(),
-        math_log10_decl(),
-        math_sin_decl(),
-        math_cos_decl(),
-        math_tan_decl(),
-        math_asin_decl(),
-        math_acos_decl(),
-        math_atan_decl(),
-        math_atan2_decl(),
-        math_sinh_decl(),
-        math_cosh_decl(),
-        math_tanh_decl(),
-        math_asinh_decl(),
-        math_acosh_decl(),
-        math_atanh_decl(),
-        math_clz32_decl(),
-        math_imul_decl(),
-        math_fround_decl(),
-        math_f16round_decl(),
-        math_random_decl(),
-        math_sum_precise_decl(),
-    ];
-
-    for (name, native_fn, length) in methods {
-        let fn_val = Value::native_function_from_decl(name, native_fn.clone(), *length, mm.clone());
-        math_obj.define_property(
-            PropertyKey::string(name),
-            PropertyDescriptor::builtin_method(fn_val),
-        );
+        NamespaceBuilder::new(ctx.mm(), ctx.fn_proto(), math_obj)
+            // §21.3.1 Value Properties
+            .constant("E", std::f64::consts::E)
+            .constant("LN10", std::f64::consts::LN_10)
+            .constant("LN2", std::f64::consts::LN_2)
+            .constant("LOG10E", std::f64::consts::LOG10_E)
+            .constant("LOG2E", std::f64::consts::LOG2_E)
+            .constant("PI", std::f64::consts::PI)
+            .constant("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2)
+            .constant("SQRT2", std::f64::consts::SQRT_2)
+            // §21.3.2 Function Properties
+            .method_decl(math_abs_decl())
+            .method_decl(math_acos_decl())
+            .method_decl(math_acosh_decl())
+            .method_decl(math_asin_decl())
+            .method_decl(math_asinh_decl())
+            .method_decl(math_atan_decl())
+            .method_decl(math_atan2_decl())
+            .method_decl(math_atanh_decl())
+            .method_decl(math_cbrt_decl())
+            .method_decl(math_ceil_decl())
+            .method_decl(math_clz32_decl())
+            .method_decl(math_cos_decl())
+            .method_decl(math_cosh_decl())
+            .method_decl(math_exp_decl())
+            .method_decl(math_expm1_decl())
+            .method_decl(math_f16round_decl())
+            .method_decl(math_floor_decl())
+            .method_decl(math_fround_decl())
+            .method_decl(math_hypot_decl())
+            .method_decl(math_imul_decl())
+            .method_decl(math_log_decl())
+            .method_decl(math_log1p_decl())
+            .method_decl(math_log2_decl())
+            .method_decl(math_log10_decl())
+            .method_decl(math_max_decl())
+            .method_decl(math_min_decl())
+            .method_decl(math_pow_decl())
+            .method_decl(math_random_decl())
+            .method_decl(math_round_decl())
+            .method_decl(math_sign_decl())
+            .method_decl(math_sin_decl())
+            .method_decl(math_sinh_decl())
+            .method_decl(math_sqrt_decl())
+            .method_decl(math_sum_precise_decl())
+            .method_decl(math_tan_decl())
+            .method_decl(math_tanh_decl())
+            .method_decl(math_trunc_decl())
+            .string_tag("Math")
+            .install_on(&ctx.global(), "Math");
     }
-
-    // @@toStringTag = "Math" (non-writable, non-enumerable, configurable)
-    math_obj.define_property(
-        PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
-        PropertyDescriptor::data_with_attrs(
-            Value::string(JsString::intern("Math")),
-            PropertyAttributes {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-            },
-        ),
-    );
-
-    // Math is non-enumerable, writable, configurable on global
-    global.define_property(
-        PropertyKey::string("Math"),
-        PropertyDescriptor::data_with_attrs(
-            Value::object(math_obj),
-            PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        ),
-    );
 }

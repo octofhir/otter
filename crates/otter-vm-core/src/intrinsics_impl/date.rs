@@ -3,6 +3,7 @@
 //! All Date object methods for ES2026 standard.
 //! Date objects store timestamp in `__timestamp__` property (milliseconds since epoch).
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -13,6 +14,36 @@ use crate::string::JsString;
 use crate::value::Value;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use std::sync::Arc;
+
+pub struct DateIntrinsic;
+
+impl IntrinsicObject for DateIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_date_prototype(
+            ctx.intrinsics().date_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+            crate::intrinsics::well_known::to_primitive_symbol(),
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().date_prototype,
+                "Date",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_date_constructor(), 7)
+            .build_and_install(&global);
+            install_date_statics(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 /// Helper to extract timestamp from Date object
 /// Returns Ok(f64) where f64 is the timestamp (can be NaN)

@@ -269,8 +269,7 @@ impl Util {
         ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         // Stub: return empty array
-        Ok(Value::object(GcRef::new(JsObject::array(
-            0))))
+        Ok(Value::object(GcRef::new(JsObject::array(0))))
     }
 }
 
@@ -487,9 +486,7 @@ pub fn make_fn(
     f: Arc<dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync>,
     length: u32,
 ) -> Value {
-    let fn_obj = GcRef::new(JsObject::new(
-        Value::object(ctx.fn_proto()),
-    ));
+    let fn_obj = GcRef::new(JsObject::new(Value::object(ctx.fn_proto())));
     fn_obj.define_property(
         PropertyKey::string("length"),
         PropertyDescriptor::function_length(Value::number(length as f64)),

@@ -206,8 +206,7 @@ impl EventEmitter {
         if args.is_empty() || args[0].is_undefined() {
             // Remove ALL listeners: replace map with empty object
             if let Some(obj) = this.as_object() {
-                let new_map =
-                    GcRef::new(JsObject::new(Value::null()));
+                let new_map = GcRef::new(JsObject::new(Value::null()));
                 let _ = obj.set(PropertyKey::string(LISTENERS_KEY), Value::object(new_map));
             }
         } else {

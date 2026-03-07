@@ -414,9 +414,7 @@ impl StructuredCloner {
                 ))?;
         let new_buffer = GcRef::new(new_buffer);
 
-        let new_obj = GcRef::new(JsObject::new(
-            ta.object.prototype(),
-        ));
+        let new_obj = GcRef::new(JsObject::new(ta.object.prototype()));
         let new_ta = JsTypedArray::new(
             new_obj,
             new_buffer,

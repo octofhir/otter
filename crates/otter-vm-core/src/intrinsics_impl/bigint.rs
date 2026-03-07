@@ -7,6 +7,7 @@ use num_bigint::Sign;
 use num_traits::{FromPrimitive, One, Zero};
 use otter_macros::dive;
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -16,6 +17,30 @@ use crate::memory::MemoryManager;
 use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
+
+pub struct BigIntIntrinsic;
+
+impl IntrinsicObject for BigIntIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_bigint_prototype(ctx.intrinsics().bigint_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            let ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctor,
+                ctx.intrinsics().bigint_prototype,
+                "BigInt",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_bigint_constructor(), 1)
+            .build_and_install(&global);
+            install_bigint_statics(ctor, ctx.fn_proto(), &mm);
+        }
+    }
+}
 
 fn bigint_value_from(this_val: &Value) -> Option<Value> {
     if this_val.is_bigint() {

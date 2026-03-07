@@ -2423,10 +2423,13 @@ impl Compiler {
                     });
 
                     let rest_reg = self.codegen.alloc_reg();
+                    let call_ic = self.codegen.alloc_ic();
+                    let call_ic = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::Call {
                         dst: rest_reg,
                         func: frame,
                         argc: 2,
+                        ic_index: call_ic,
                     });
 
                     self.codegen.free_reg(func_reg);
@@ -3275,10 +3278,13 @@ impl Compiler {
                         src: excluded_array,
                     });
 
+                    let call_ic = self.codegen.alloc_ic();
+                    let call_ic = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::Call {
                         dst: rest_reg,
                         func: frame,
                         argc: 2,
+                        ic_index: call_ic,
                     });
 
                     self.codegen.free_reg(func_reg);
@@ -3758,10 +3764,13 @@ impl Compiler {
                         src: excluded_array,
                     });
 
+                    let call_ic = self.codegen.alloc_ic();
+                    let call_ic = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::Call {
                         dst: rest_reg,
                         func: frame,
                         argc: 2,
+                        ic_index: call_ic,
                     });
 
                     self.codegen.free_reg(func_reg);
@@ -5448,10 +5457,12 @@ impl Compiler {
         });
 
         let dst = self.codegen.alloc_reg();
+        let call_ic = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::Call {
             dst,
             func: frame,
             argc: 2,
+            ic_index: call_ic,
         });
 
         self.codegen.free_reg(helper);
@@ -5546,10 +5557,12 @@ impl Compiler {
         }
 
         let dst = self.codegen.alloc_reg();
+        let call_ic = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::Call {
             dst,
             func: frame,
             argc,
+            ic_index: call_ic,
         });
 
         self.codegen.free_reg(func);
@@ -5659,10 +5672,12 @@ impl Compiler {
             });
         }
 
+        let call_ic = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::Call {
             dst,
             func: frame,
             argc,
+            ic_index: call_ic,
         });
 
         for tmp in arg_tmps {
@@ -6297,10 +6312,12 @@ impl Compiler {
         }
 
         let dst = self.codegen.alloc_reg();
+        let call_ic = self.codegen.alloc_ic();
         self.codegen.emit(Instruction::Call {
             dst,
             func: frame,
             argc,
+            ic_index: call_ic,
         });
 
         self.codegen.free_reg(func);
@@ -7802,10 +7819,12 @@ impl Compiler {
             }
 
             let dst = self.codegen.alloc_reg();
+            let call_ic = self.codegen.alloc_ic();
             self.codegen.emit(Instruction::Call {
                 dst,
                 func: frame,
                 argc,
+                ic_index: call_ic,
             });
 
             self.codegen.free_reg(func);
@@ -9250,10 +9269,13 @@ impl Compiler {
                     self.codegen.emit(Instruction::Move { dst: arg2, src });
 
                     let call_dst = self.codegen.alloc_reg();
+                    let call_ic = self.codegen.alloc_ic();
+                    let call_ic = self.codegen.alloc_ic();
                     self.codegen.emit(Instruction::Call {
                         dst: call_dst,
                         func: frame,
                         argc: 2,
+                        ic_index: call_ic,
                     });
 
                     self.codegen.free_reg(call_dst);

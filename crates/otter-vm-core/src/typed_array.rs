@@ -140,10 +140,7 @@ impl JsTypedArray {
         prototype: Option<GcRef<JsObject>>,
     ) -> Self {
         let byte_length = length * kind.element_size();
-        let buffer = GcRef::new(JsArrayBuffer::new(
-            byte_length,
-            None,
-        ));
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_length, None));
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value));
         Self {
@@ -428,10 +425,7 @@ impl JsTypedArray {
 
         // Get prototype from existing buffer
         let prototype = self.buffer.object.prototype().as_object();
-        let new_buffer = GcRef::new(JsArrayBuffer::new(
-            new_byte_length,
-            prototype,
-        ));
+        let new_buffer = GcRef::new(JsArrayBuffer::new(new_byte_length, prototype));
 
         // Copy data
         let src_offset = self.byte_offset + start * elem_size;

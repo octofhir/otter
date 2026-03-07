@@ -216,7 +216,6 @@ pub type NativeFn = Arc<
         + Sync,
 >;
 
-
 /// A JavaScript function closure
 #[derive(Debug)]
 pub struct Closure {
@@ -335,17 +334,13 @@ impl Value {
     pub const fn undefined() -> Self {
         Self {
             bits: TAG_UNDEFINED,
-
         }
     }
 
     /// Create null value
     #[inline]
     pub const fn null() -> Self {
-        Self {
-            bits: TAG_NULL,
-
-        }
+        Self { bits: TAG_NULL }
     }
 
     /// Create boolean value
@@ -353,7 +348,6 @@ impl Value {
     pub const fn boolean(b: bool) -> Self {
         Self {
             bits: if b { TAG_TRUE } else { TAG_FALSE },
-
         }
     }
 
@@ -364,10 +358,7 @@ impl Value {
     /// `undefined`, and `has_own()` / `in` treats them as absent.
     #[inline]
     pub const fn hole() -> Self {
-        Self {
-            bits: TAG_HOLE,
-
-        }
+        Self { bits: TAG_HOLE }
     }
 
     /// Check if value is an array hole sentinel
@@ -381,7 +372,6 @@ impl Value {
     pub fn int32(n: i32) -> Self {
         Self {
             bits: TAG_INT32 | (n as u32 as u64),
-
         }
     }
 
@@ -390,10 +380,7 @@ impl Value {
     pub fn number(n: f64) -> Self {
         // Handle NaN specially to avoid collision with undefined
         if n.is_nan() {
-            return Self {
-                bits: TAG_NAN,
-    
-            };
+            return Self { bits: TAG_NAN };
         }
 
         // Check if it fits in i32 for optimization, but preserve -0.0
@@ -406,10 +393,7 @@ impl Value {
             return Self::int32(n as i32);
         }
 
-        Self {
-            bits: n.to_bits(),
-
-        }
+        Self { bits: n.to_bits() }
     }
 
     /// Construct a value from raw JIT bits when they are known to be non-pointer.
@@ -422,10 +406,7 @@ impl Value {
             return None;
         }
 
-        Some(Self {
-            bits,
-
-        })
+        Some(Self { bits })
     }
 
     /// Reconstruct a full Value from raw NaN-boxed bits, including pointer types.
@@ -464,10 +445,7 @@ impl Value {
     /// Create NaN value explicitly
     #[inline]
     pub const fn nan() -> Self {
-        Self {
-            bits: TAG_NAN,
-
-        }
+        Self { bits: TAG_NAN }
     }
 
     /// Create string value (GC-managed)
@@ -786,9 +764,7 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = GcRef::new(JsObject::new(
-            Value::object(prototype.clone()),
-        ));
+        let object = GcRef::new(JsObject::new(Value::object(prototype.clone())));
         object.define_property(
             crate::object::PropertyKey::string("length"),
             crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),
@@ -1374,9 +1350,7 @@ impl Value {
             && unsafe { self.gc_header_tag_from_bits() }
                 == otter_vm_gc::object::tags::FINALIZATION_REGISTRY
         {
-            Some(unsafe {
-                self.extract_gcref::<otter_vm_gc::FinalizationRegistryData>()
-            })
+            Some(unsafe { self.extract_gcref::<otter_vm_gc::FinalizationRegistryData>() })
         } else {
             None
         }
@@ -1394,7 +1368,6 @@ impl Value {
             None
         }
     }
-
 
     // ========================================================================
     // Phase 1.1 helpers: pointer sub-tag + GcHeader-based type discrimination
@@ -1444,7 +1417,9 @@ impl Value {
         debug_assert!(!raw_ptr.is_null());
         let offset = std::mem::offset_of!(crate::gc::GcBox<T>, value);
         let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<T>;
-        GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(box_ptr)))
+        GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
+            box_ptr,
+        )))
     }
 
     // ========================================================================
@@ -1510,8 +1485,7 @@ impl Value {
                     return None;
                 }
                 unsafe {
-                    let offset =
-                        std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
+                    let offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
                     Some(raw_ptr.sub(offset) as *const otter_vm_gc::GcHeader)
                 }
             }

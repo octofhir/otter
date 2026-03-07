@@ -9,6 +9,7 @@
 //! - `FinalizationRegistry.prototype.register(target, heldValue, [unregisterToken])` — register target
 //! - `FinalizationRegistry.prototype.unregister(token)` — remove registrations for token
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -18,6 +19,54 @@ use crate::string::JsString;
 use crate::value::Value;
 use crate::weak_gc;
 use std::sync::Arc;
+
+pub struct WeakRefIntrinsic;
+
+impl IntrinsicObject for WeakRefIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_weak_ref_prototype(
+            ctx.intrinsics().weak_ref_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+        init_finalization_registry_prototype(
+            ctx.intrinsics().finalization_registry_prototype,
+            ctx.fn_proto(),
+            &mm,
+            crate::intrinsics::well_known::to_string_tag_symbol(),
+        );
+
+        if let Some(global) = ctx.global_opt() {
+            let weak_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                weak_ctor,
+                ctx.intrinsics().weak_ref_prototype,
+                "WeakRef",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(weakref_constructor, 1)
+            .build_and_install(&global);
+            let _ = weak_ctor.delete(&pk("__non_constructor"));
+
+            let finreg_ctor = ctx.alloc_constructor();
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                finreg_ctor,
+                ctx.intrinsics().finalization_registry_prototype,
+                "FinalizationRegistry",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(finreg_constructor, 1)
+            .build_and_install(&global);
+            let _ = finreg_ctor.delete(&pk("__non_constructor"));
+        }
+    }
+}
 
 // ============================================================================
 // Internal slot keys
@@ -371,117 +420,6 @@ pub fn init_finalization_registry_prototype(
             value: Value::string(JsString::intern("FinalizationRegistry")),
             attributes: PropertyAttributes {
                 writable: false,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-}
-
-/// Install WeakRef and FinalizationRegistry as global constructors.
-pub fn install_weakref_constructors(
-    global: GcRef<JsObject>,
-    weak_ref_prototype: GcRef<JsObject>,
-    finreg_prototype: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-) {
-    // WeakRef constructor
-    let ctor = Value::native_function_with_proto(weakref_constructor, mm.clone(), fn_proto);
-    if let Some(ctor_obj) = ctor.native_function_object() {
-        // Remove __non_constructor set by native_function_with_proto — WeakRef IS a constructor
-        let _ = ctor_obj.delete(&pk("__non_constructor"));
-        ctor_obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::function_length(Value::int32(1)),
-        );
-        ctor_obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::function_length(Value::string(JsString::intern("WeakRef"))),
-        );
-        ctor_obj.define_property(
-            PropertyKey::string("prototype"),
-            PropertyDescriptor::Data {
-                value: Value::object(weak_ref_prototype),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                },
-            },
-        );
-    }
-
-    weak_ref_prototype.define_property(
-        PropertyKey::string("constructor"),
-        PropertyDescriptor::Data {
-            value: ctor.clone(),
-            attributes: PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-
-    global.define_property(
-        PropertyKey::string("WeakRef"),
-        PropertyDescriptor::Data {
-            value: ctor,
-            attributes: PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-
-    // FinalizationRegistry constructor
-    let fr_ctor = Value::native_function_with_proto(finreg_constructor, mm.clone(), fn_proto);
-    if let Some(ctor_obj) = fr_ctor.native_function_object() {
-        // Remove __non_constructor — FinalizationRegistry IS a constructor
-        let _ = ctor_obj.delete(&pk("__non_constructor"));
-        ctor_obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::function_length(Value::int32(1)),
-        );
-        ctor_obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::function_length(Value::string(JsString::intern(
-                "FinalizationRegistry",
-            ))),
-        );
-        ctor_obj.define_property(
-            PropertyKey::string("prototype"),
-            PropertyDescriptor::Data {
-                value: Value::object(finreg_prototype),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                },
-            },
-        );
-    }
-
-    finreg_prototype.define_property(
-        PropertyKey::string("constructor"),
-        PropertyDescriptor::Data {
-            value: fr_ctor.clone(),
-            attributes: PropertyAttributes {
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-
-    global.define_property(
-        PropertyKey::string("FinalizationRegistry"),
-        PropertyDescriptor::Data {
-            value: fr_ctor,
-            attributes: PropertyAttributes {
-                writable: true,
                 enumerable: false,
                 configurable: true,
             },

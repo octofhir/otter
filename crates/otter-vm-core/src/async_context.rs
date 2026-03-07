@@ -16,10 +16,16 @@ use crate::value::{UpvalueCell, Value};
 ///
 /// When an async function awaits a pending Promise, we capture the entire
 /// call stack state so we can resume execution later.
+///
+/// The registers are stored as a flat Vec moved from VmContext (zero-copy).
+/// Each SavedFrame stores its register_base/register_count as offsets into
+/// this flat array.
 #[derive(Debug)]
 pub struct AsyncContext {
     /// Saved call stack frames (from bottom to top)
     pub frames: Vec<SavedFrame>,
+    /// Flat register array moved from VmContext (locals + scratch for all frames)
+    pub registers: Vec<Value>,
     /// The result promise for this async function
     /// This is what the caller awaits on
     pub result_promise: GcRef<JsPromise>,
@@ -35,6 +41,7 @@ impl AsyncContext {
     /// Create a new async context
     pub fn new(
         frames: Vec<SavedFrame>,
+        registers: Vec<Value>,
         result_promise: GcRef<JsPromise>,
         awaited_promise: GcRef<JsPromise>,
         resume_register: u16,
@@ -42,6 +49,7 @@ impl AsyncContext {
     ) -> Self {
         Self {
             frames,
+            registers,
             result_promise,
             awaited_promise,
             resume_register,
@@ -53,7 +61,8 @@ impl AsyncContext {
 /// A saved call frame for later restoration
 ///
 /// This is a snapshot of a `CallFrame` that can be used to restore
-/// the VM state after async suspension.
+/// the VM state after async suspension. Register data lives in the
+/// flat `AsyncContext::registers` array; this struct stores offsets.
 #[derive(Debug, Clone)]
 pub struct SavedFrame {
     /// Function index in the module
@@ -66,8 +75,10 @@ pub struct SavedFrame {
     pub pc: usize,
     /// Number of local variable slots at the start of the register window
     pub local_count: usize,
-    /// Register values for this frame's full register window (locals + scratch regs)
-    pub registers: Vec<Value>,
+    /// Base index in the flat register array
+    pub register_base: usize,
+    /// Total window size (local_count + scratch registers)
+    pub register_count: usize,
     /// Captured upvalues (heap-allocated cells)
     pub upvalues: Vec<UpvalueCell>,
     /// Return register (where to put the result)
@@ -82,41 +93,6 @@ pub struct SavedFrame {
     pub frame_id: usize,
     /// Number of arguments passed to this function
     pub argc: usize,
-}
-
-impl SavedFrame {
-    /// Create a new saved frame from the given parameters
-    pub fn new(
-        function_index: u32,
-        module: Arc<Module>,
-        realm_id: crate::realm::RealmId,
-        pc: usize,
-        local_count: usize,
-        registers: Vec<Value>,
-        upvalues: Vec<UpvalueCell>,
-        return_register: Option<u16>,
-        this_value: Value,
-        is_construct: bool,
-        is_async: bool,
-        frame_id: usize,
-        argc: usize,
-    ) -> Self {
-        Self {
-            function_index,
-            module,
-            realm_id,
-            pc,
-            local_count,
-            registers,
-            upvalues,
-            return_register,
-            this_value,
-            is_construct,
-            is_async,
-            frame_id,
-            argc,
-        }
-    }
 }
 
 /// Result of VM execution that can indicate suspension

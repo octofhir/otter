@@ -19,6 +19,10 @@ use otter_vm_jit::runtime_helpers::{
 };
 
 use crate::gc::GcRef;
+use crate::jit_stubs::{
+    JitCallReentryState, call_with_reentry_state, otter_rt_call_mono_stub,
+    otter_rt_get_prop_mono_stub,
+};
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::UpvalueCell;
@@ -27,6 +31,7 @@ use crate::value::UpvalueCell;
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
+const TAG_PTR_FUNCTION: u64 = 0x7FFE_0000_0000_0000;
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 
 /// Opaque context passed as the first argument to every JIT-compiled function.
@@ -192,7 +197,11 @@ fn extract_js_object_ref(bits: u64) -> Option<&'static JsObject> {
 ///
 /// Signature: `(obj: i64, expected_shape: i64, offset: i64) -> i64`
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_get_prop_mono(obj_raw: i64, expected_shape: i64, offset: i64) -> i64 {
+pub(crate) extern "C" fn otter_rt_get_prop_mono_impl(
+    obj_raw: i64,
+    expected_shape: i64,
+    offset: i64,
+) -> i64 {
     let obj_ref = match extract_js_object_ref(obj_raw as u64) {
         Some(o) => o,
         None => return BAILOUT_SENTINEL,
@@ -571,84 +580,126 @@ extern "C" fn otter_rt_call_function(
     argc_raw: i64,
     argv_ptr_raw: i64,
 ) -> i64 {
-    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
-
-    // Need interpreter and vm_ctx for re-entrant calls
-    if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
-        return BAILOUT_SENTINEL;
-    }
-
-    // Reconstruct the callee Value from raw bits.
-    // SAFETY: We're in a no-GC JIT scope, pointer is valid.
-    let callee = match unsafe { crate::value::Value::from_raw_bits_unchecked(callee_raw as u64) } {
-        Some(v) => v,
-        None => return BAILOUT_SENTINEL,
-    };
-
-    // Check that the callee is actually callable
-    if !callee.is_function()
-        && !callee.is_native_function()
-        && callee.as_object().is_none()
-        && callee.as_proxy().is_none()
-    {
-        return BAILOUT_SENTINEL;
-    }
-
+    let callee_bits = callee_raw as u64;
     let argc = argc_raw as usize;
 
-    // SAFETY: interpreter and vm_ctx are valid pointers set by try_execute_jit.
-    // The interpreter is paused (not executing instructions), and we have
-    // exclusive access during this synchronous JIT helper call.
-    let interpreter = unsafe { &*ctx.interpreter };
-    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    // Fast path: callee is a Closure with TAG_PTR_FUNCTION + CLOSURE gc tag.
+    // Inline the checks to avoid the overhead of Value reconstruction + as_function().
+    if (callee_bits & TAG_MASK) == TAG_PTR_FUNCTION {
+        let gc_tag = unsafe {
+            let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+            let offset = std::mem::offset_of!(crate::gc::GcBox<crate::value::Closure>, value);
+            let header = &*(raw_ptr.sub(offset) as *const GcHeader);
+            header.tag()
+        };
+        if gc_tag == gc_tags::CLOSURE {
+            let closure: GcRef<crate::value::Closure> = unsafe {
+                let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+                let offset = std::mem::offset_of!(crate::gc::GcBox<crate::value::Closure>, value);
+                let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<crate::value::Closure>;
+                GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
+                    box_ptr,
+                )))
+            };
+            if !closure.is_generator && !closure.is_async {
+                if let Some(func_info) = closure.module.function(closure.function_index) {
+                    if !func_info.flags.has_rest {
+                        // Ultra-fast path: callee has JIT code — call directly via
+                        // rewritten JitContext, avoiding a full new JitContext allocation.
+                        let jit_ptr = func_info.jit_entry_ptr();
+                        if jit_ptr != 0 {
+                            let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                            let this_raw = if func_info.flags.is_strict {
+                                crate::value::Value::undefined().to_jit_bits()
+                            } else {
+                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                            };
+                            let reentry = JitCallReentryState::new(
+                                func_info as *const Function,
+                                &closure.module.constants as *const _,
+                                if closure.upvalues.is_empty() {
+                                    std::ptr::null()
+                                } else {
+                                    closure.upvalues.as_ptr()
+                                },
+                                closure.upvalues.len() as u32,
+                                this_raw,
+                                callee_raw,
+                                crate::value::Value::null().to_jit_bits(),
+                            );
 
-    // Fast path: direct JIT-to-JIT call for JS closures with compiled code.
-    // Avoids the full interpreter.call_function() re-entry overhead when the
-    // callee already has JIT code available.
-    if let Some(closure) = callee.as_function() {
-        if !closure.is_generator && !closure.is_async {
-            if let Some(func_info) = closure.module.function(closure.function_index) {
-                if !func_info.flags.has_rest {
-                    let args_ptr = if argc == 0 {
-                        std::ptr::null()
-                    } else {
-                        argv_ptr_raw as *const i64
-                    };
-                    if argc > 0 && args_ptr.is_null() {
-                        return BAILOUT_SENTINEL;
-                    }
-                    let this_raw = if func_info.flags.is_strict {
-                        crate::value::Value::undefined().to_jit_bits()
-                    } else {
-                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                    };
-                    match crate::jit_runtime::try_execute_jit_from_raw_args(
-                        closure.module.module_id,
-                        closure.function_index,
-                        func_info,
-                        argc as u32,
-                        args_ptr,
-                        this_raw,
-                        callee.to_jit_bits(),
-                        crate::value::Value::null().to_jit_bits(),
-                        vm_ctx.cached_proto_epoch,
-                        ctx.interpreter,
-                        ctx.vm_ctx,
-                        &closure.module.constants as *const _,
-                        &closure.upvalues,
-                    ) {
-                        crate::jit_runtime::JitCallResult::Ok(value) => {
-                            return value.to_jit_bits();
+                            let args_ptr = if argc == 0 {
+                                std::ptr::null()
+                            } else {
+                                argv_ptr_raw as *const i64
+                            };
+                            let result = unsafe {
+                                call_with_reentry_state(
+                                    ctx_raw as *mut JitContext,
+                                    args_ptr,
+                                    argc as u32,
+                                    jit_ptr,
+                                    &reentry,
+                                )
+                            };
+
+                            if result != BAILOUT_SENTINEL {
+                                return result;
+                            }
+                            // JIT bailout → fall through to interpreter
+                        } else {
+                            // No JIT code yet — try full JIT path (may compile)
+                            let args_ptr = if argc == 0 {
+                                std::ptr::null()
+                            } else {
+                                argv_ptr_raw as *const i64
+                            };
+                            let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                            let this_raw = if func_info.flags.is_strict {
+                                crate::value::Value::undefined().to_jit_bits()
+                            } else {
+                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                            };
+                            match crate::jit_runtime::try_execute_jit_from_raw_args(
+                                closure.module.module_id,
+                                closure.function_index,
+                                func_info,
+                                argc as u32,
+                                args_ptr,
+                                this_raw,
+                                callee_raw,
+                                crate::value::Value::null().to_jit_bits(),
+                                vm_ctx.cached_proto_epoch,
+                                ctx.interpreter,
+                                ctx.vm_ctx,
+                                &closure.module.constants as *const _,
+                                &closure.upvalues,
+                            ) {
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    return value.to_jit_bits();
+                                }
+                                _ => {}
+                            }
                         }
-                        // Bailout or not compiled: fall through to interpreter
-                        _ => {}
                     }
                 }
             }
         }
     }
 
-    // Slow path: full interpreter re-entry
+    // Slow path: non-closure callee or JIT not available — full interpreter re-entry
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
+        return BAILOUT_SENTINEL;
+    }
+    let callee = match unsafe { crate::value::Value::from_raw_bits_unchecked(callee_bits) } {
+        Some(v) => v,
+        None => return BAILOUT_SENTINEL,
+    };
+    let interpreter = unsafe { &*ctx.interpreter };
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
     match unsafe {
         with_collected_args(argc, argv_ptr_raw, |args| {
             interpreter.call_function(vm_ctx, &callee, crate::value::Value::undefined(), args)
@@ -657,6 +708,138 @@ extern "C" fn otter_rt_call_function(
         Some(Ok(result)) => result.to_jit_bits(),
         _ => BAILOUT_SENTINEL,
     }
+}
+
+/// Runtime helper: monomorphic call — like `otter_rt_call_function` but with
+/// expected `function_index` passed from JIT feedback. When the callee matches
+/// the expected function_index, skips is_generator/is_async/has_rest checks
+/// (we know they were false at profiling time).
+///
+/// Signature: `(ctx: i64, callee: i64, argc: i64, argv_ptr: i64, expected_func_index: i64) -> i64`
+///
+/// `expected_func_index` encodes `(function_index + 1)` so 0 = no hint.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_call_mono_impl(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+    expected_func_index_raw: i64,
+) -> i64 {
+    let callee_bits = callee_raw as u64;
+    let argc = argc_raw as usize;
+    let expected_func_index = expected_func_index_raw as u32;
+
+    // Fast path: callee is a Closure with TAG_PTR_FUNCTION + CLOSURE gc tag.
+    if (callee_bits & TAG_MASK) == TAG_PTR_FUNCTION {
+        let gc_tag = unsafe {
+            let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+            let offset = std::mem::offset_of!(crate::gc::GcBox<crate::value::Closure>, value);
+            let header = &*(raw_ptr.sub(offset) as *const GcHeader);
+            header.tag()
+        };
+        if gc_tag == gc_tags::CLOSURE {
+            let closure: GcRef<crate::value::Closure> = unsafe {
+                let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+                let offset = std::mem::offset_of!(crate::gc::GcBox<crate::value::Closure>, value);
+                let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<crate::value::Closure>;
+                GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
+                    box_ptr,
+                )))
+            };
+
+            // Monomorphic guard: if function_index matches expected, skip
+            // is_generator/is_async checks (they were false at profiling time).
+            let mono_hit = expected_func_index != 0
+                && closure.function_index.wrapping_add(1) == expected_func_index;
+
+            if mono_hit || (!closure.is_generator && !closure.is_async) {
+                if let Some(func_info) = closure.module.function(closure.function_index) {
+                    if mono_hit || !func_info.flags.has_rest {
+                        let jit_ptr = func_info.jit_entry_ptr();
+                        if jit_ptr != 0 {
+                            let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                            let this_raw = if func_info.flags.is_strict {
+                                crate::value::Value::undefined().to_jit_bits()
+                            } else {
+                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                            };
+                            let reentry = JitCallReentryState::new(
+                                func_info as *const Function,
+                                &closure.module.constants as *const _,
+                                if closure.upvalues.is_empty() {
+                                    std::ptr::null()
+                                } else {
+                                    closure.upvalues.as_ptr()
+                                },
+                                closure.upvalues.len() as u32,
+                                this_raw,
+                                callee_raw,
+                                crate::value::Value::null().to_jit_bits(),
+                            );
+
+                            let args_ptr = if argc == 0 {
+                                std::ptr::null()
+                            } else {
+                                argv_ptr_raw as *const i64
+                            };
+                            let result = unsafe {
+                                call_with_reentry_state(
+                                    ctx_raw as *mut JitContext,
+                                    args_ptr,
+                                    argc as u32,
+                                    jit_ptr,
+                                    &reentry,
+                                )
+                            };
+
+                            if result != BAILOUT_SENTINEL {
+                                return result;
+                            }
+                        } else {
+                            // No JIT code yet — try full JIT path
+                            let args_ptr = if argc == 0 {
+                                std::ptr::null()
+                            } else {
+                                argv_ptr_raw as *const i64
+                            };
+                            let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                            let this_raw = if func_info.flags.is_strict {
+                                crate::value::Value::undefined().to_jit_bits()
+                            } else {
+                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                            };
+                            match crate::jit_runtime::try_execute_jit_from_raw_args(
+                                closure.module.module_id,
+                                closure.function_index,
+                                func_info,
+                                argc as u32,
+                                args_ptr,
+                                this_raw,
+                                callee_raw,
+                                crate::value::Value::null().to_jit_bits(),
+                                vm_ctx.cached_proto_epoch,
+                                ctx.interpreter,
+                                ctx.vm_ctx,
+                                &closure.module.constants as *const _,
+                                &closure.upvalues,
+                            ) {
+                                crate::jit_runtime::JitCallResult::Ok(value) => {
+                                    return value.to_jit_bits();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Slow path: fall through to regular call
+    otter_rt_call_function(ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
 }
 
 /// Runtime helper: NewObject — create a new empty object with Object.prototype.
@@ -699,7 +882,7 @@ extern "C" fn otter_rt_new_object(ctx_raw: i64) -> i64 {
     let obj = crate::gc::GcRef::new(JsObject::new(
         proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
     crate::value::Value::object(obj).to_jit_bits()
 }
@@ -2997,7 +3180,7 @@ extern "C" fn otter_rt_define_class(
     let derived_proto = GcRef::new(JsObject::new(
         super_proto_obj
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
 
     // Set ctor.prototype = derived_proto
@@ -3491,9 +3674,9 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
     } else if super_ctor_val.as_native_function().is_some() {
         // Native built-in constructor
         let mm = vm_ctx.memory_manager().clone();
-        let new_obj = GcRef::new(JsObject::new(
-            crate::value::Value::object(new_target_proto.clone())
-        ));
+        let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(
+            new_target_proto.clone(),
+        )));
         let new_obj_value = crate::value::Value::object(new_obj);
         match interpreter.call_function_construct(
             vm_ctx,
@@ -3516,9 +3699,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
         }
     } else {
         let mm = vm_ctx.memory_manager().clone();
-        let new_obj = GcRef::new(JsObject::new(
-            crate::value::Value::object(new_target_proto)
-        ));
+        let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(new_target_proto)));
         let new_obj_value = crate::value::Value::object(new_obj);
         match interpreter.call_function(vm_ctx, &super_ctor_val, new_obj_value.clone(), &args) {
             Ok(result) => {
@@ -3584,9 +3765,7 @@ extern "C" fn otter_rt_async_closure(ctx_raw: i64, func_idx: i64) -> i64 {
         Err(_) => return BAILOUT_SENTINEL,
     };
 
-    let func_obj = GcRef::new(JsObject::new(
-        crate::value::Value::null()
-    ));
+    let func_obj = GcRef::new(JsObject::new(crate::value::Value::null()));
 
     // Set [[Prototype]] to Function.prototype
     if let Some(fn_proto) = vm_ctx.function_prototype() {
@@ -3685,7 +3864,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     let func_obj = GcRef::new(JsObject::new(
         gen_func_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
     func_obj.define_property(
         PropertyKey::string("__realm_id__"),
@@ -3721,7 +3900,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     let proto = GcRef::new(JsObject::new(
         gen_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
 
     let closure = GcRef::new(crate::value::Closure {
@@ -3806,7 +3985,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
     let func_obj = GcRef::new(JsObject::new(
         async_gen_func_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
     func_obj.define_property(
         PropertyKey::string("__realm_id__"),
@@ -3842,7 +4021,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
     let proto = GcRef::new(JsObject::new(
         gen_proto
             .map(crate::value::Value::object)
-            .unwrap_or_else(crate::value::Value::null)
+            .unwrap_or_else(crate::value::Value::null),
     ));
 
     let closure = GcRef::new(crate::value::Closure {
@@ -4238,6 +4417,7 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
             HelperKind::CallFunction,
             otter_rt_call_function as *const u8,
         );
+        helpers.set(HelperKind::CallMono, otter_rt_call_mono_stub as *const u8);
         helpers.set(HelperKind::NewObject, otter_rt_new_object as *const u8);
         helpers.set(HelperKind::NewArray, otter_rt_new_array as *const u8);
         helpers.set(HelperKind::GetGlobal, otter_rt_get_global as *const u8);
@@ -4393,7 +4573,10 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
             otter_rt_generic_bitnot as *const u8,
         );
         helpers.set(HelperKind::GenericNot, otter_rt_generic_not as *const u8);
-        helpers.set(HelperKind::GetPropMono, otter_rt_get_prop_mono as *const u8);
+        helpers.set(
+            HelperKind::GetPropMono,
+            otter_rt_get_prop_mono_stub as *const u8,
+        );
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
         let stub = otter_rt_bailout_stub as *const u8;

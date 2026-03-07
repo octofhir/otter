@@ -6,6 +6,7 @@
 //! - Boolean.prototype.valueOf() - returns primitive value
 //! - Boolean.prototype.toString() - returns "true" or "false"
 
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -15,6 +16,28 @@ use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
 use std::sync::Arc;
+
+pub struct BooleanIntrinsic;
+
+impl IntrinsicObject for BooleanIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        let mm = ctx.mm();
+        init_boolean_prototype(ctx.intrinsics().boolean_prototype, ctx.fn_proto(), &mm);
+
+        if let Some(global) = ctx.global_opt() {
+            BuiltInBuilder::new(
+                mm.clone(),
+                ctx.fn_proto(),
+                ctx.alloc_constructor(),
+                ctx.intrinsics().boolean_prototype,
+                "Boolean",
+            )
+            .inherits(ctx.obj_proto())
+            .constructor_fn(create_boolean_constructor(), 1)
+            .build_and_install(&global);
+        }
+    }
+}
 
 /// Convert a value to boolean (ToBoolean abstract operation ES2026 §7.1.2)
 fn to_boolean(val: &Value) -> bool {

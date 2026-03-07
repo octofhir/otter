@@ -753,9 +753,7 @@ pub(super) fn install_plain_date_prototype(
                 .as_object()
                 .ok_or_else(|| VmError::type_error("getISOFields called on non-object"))?;
             let pd = extract_plain_date(&obj)?;
-            let result = GcRef::new(JsObject::new(
-                Value::undefined(),
-            ));
+            let result = GcRef::new(JsObject::new(Value::undefined()));
             result.define_property(
                 PropertyKey::string("calendar"),
                 PropertyDescriptor::data(Value::string(JsString::intern("iso8601"))),

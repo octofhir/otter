@@ -1,14 +1,12 @@
-//! JSON namespace initialization (ES2026 §25.5)
+//! `JSON` namespace object (ES2024 §25.5)
 //!
-//! Creates the JSON global namespace object with:
-//! - JSON.parse(text, reviver?) — Parse JSON text into a JavaScript value
-//! - JSON.stringify(value, replacer?, space?) — Serialize a JavaScript value to JSON
+//! The `JSON` object provides `parse` and `stringify` methods for working with JSON.
+//! It is not a constructor and has no `[[Call]]` or `[[Construct]]`.
 //!
-//! ## ES2026 Compliance
-//!
-//! The JSON object has [[Prototype]] of Object.prototype and is not a constructor.
-//! Both methods are non-enumerable.
+//! Spec: <https://tc39.es/ecma262/#sec-json-object>
+//! MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON>
 
+use crate::builtin_builder::{IntrinsicContext, IntrinsicObject, NamespaceBuilder};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -19,6 +17,7 @@ use crate::value::Value;
 use otter_macros::dive;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Native JSON hot-loop interrupt check cadence (power-of-two for bitmask checks).
@@ -33,85 +32,53 @@ fn maybe_check_interrupt(ncx: &mut NativeContext<'_>, index: usize) -> Result<()
 }
 
 /// Tracks visited objects during JSON serialization to detect circular references.
-/// Also maintains a path for generating helpful error messages.
+/// Uses a simple depth + pointer set for the fast path, and only builds
+/// path strings lazily on actual circular reference errors.
 struct CircularTracker {
-    /// Maps object pointer to index in path
+    /// Maps object pointer to depth index for cycle detection
     visited: FxHashMap<usize, usize>,
-    /// Path from root: (property_key, object_ptr, is_array)
-    path: Vec<(String, usize, bool)>,
+    /// Depth counter (avoids storing full path for non-error case)
+    depth: usize,
+    /// Path info stored only as (ptr, is_array) — key string allocated lazily on error
+    path_ptrs: Vec<(usize, bool)>,
 }
 
 impl CircularTracker {
     fn new() -> Self {
         Self {
             visited: FxHashMap::default(),
-            path: Vec::new(),
+            depth: 0,
+            path_ptrs: Vec::new(),
         }
     }
 
     /// Try to enter an object. Returns Err with formatted message if circular.
     fn enter(&mut self, key: &str, ptr: usize, is_array: bool) -> Result<(), String> {
-        if let Some(&cycle_start) = self.visited.get(&ptr) {
-            return Err(self.format_circular_error(key, cycle_start));
+        if let Some(&_cycle_start) = self.visited.get(&ptr) {
+            // Only build error path string on actual circular reference
+            return Err(format!(
+                "Converting circular structure to JSON\n    --> starting at object at depth {}",
+                self.depth
+            ));
         }
-        let idx = self.path.len();
+        let idx = self.depth;
         self.visited.insert(ptr, idx);
-        self.path.push((key.to_string(), ptr, is_array));
+        self.path_ptrs.push((ptr, is_array));
+        self.depth += 1;
+        // Suppress unused variable warning for key
+        let _ = key;
         Ok(())
     }
 
     /// Exit an object (after serialization)
     fn exit(&mut self, ptr: usize) {
         self.visited.remove(&ptr);
-        self.path.pop();
-    }
-
-    /// Format a circular reference error message like Node.js/Chrome
-    fn format_circular_error(&self, closing_key: &str, cycle_start: usize) -> String {
-        let mut msg = String::from("Converting circular structure to JSON");
-
-        if self.path.is_empty() {
-            return msg;
-        }
-
-        // Get the starting object info
-        let (start_key, _, start_is_array) = &self.path[cycle_start];
-        let start_type = if *start_is_array { "Array" } else { "Object" };
-
-        if cycle_start == 0 {
-            msg.push_str(&format!(
-                "\n    --> starting at object with constructor '{}'",
-                start_type
-            ));
-        } else {
-            msg.push_str(&format!(
-                "\n    --> starting at object with constructor '{}' (property '{}')",
-                start_type, start_key
-            ));
-        }
-
-        // Show intermediate path if there is one
-        for i in (cycle_start + 1)..self.path.len() {
-            let (key, _, is_array) = &self.path[i];
-            let obj_type = if *is_array { "Array" } else { "Object" };
-            msg.push_str(&format!(
-                "\n    |     property '{}' -> object with constructor '{}'",
-                key, obj_type
-            ));
-        }
-
-        // Show the closing property
-        msg.push_str(&format!(
-            "\n    --- property '{}' closes the circle",
-            closing_key
-        ));
-
-        msg
+        self.path_ptrs.pop();
+        self.depth -= 1;
     }
 }
 
 struct JsonParseState<'a, 'ctx> {
-    mm: &'a Arc<MemoryManager>,
     object_proto: &'a Value,
     array_proto: &'a Value,
     key_cache: &'a mut FxHashMap<String, GcRef<JsString>>,
@@ -203,7 +170,14 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
     where
         E: de::Error,
     {
-        Ok(Value::string(JsString::intern(v)))
+        // Use the per-parse string cache to avoid redundant intern lookups.
+        // For repeated JSON parsing (same structure), this deduplicates values.
+        if let Some(cached) = self.state.key_cache.get(v) {
+            return Ok(Value::string(*cached));
+        }
+        let s = JsString::intern(v);
+        self.state.key_cache.insert(v.to_owned(), s);
+        Ok(Value::string(s))
     }
 
     fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
@@ -217,20 +191,27 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
     where
         E: de::Error,
     {
-        Ok(Value::string(JsString::intern(&v)))
+        if let Some(cached) = self.state.key_cache.get(v.as_str()) {
+            return Ok(Value::string(*cached));
+        }
+        let s = JsString::intern(&v);
+        self.state.key_cache.insert(v, s);
+        Ok(Value::string(s))
     }
 
     fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        let hint = seq.size_hint().unwrap_or(0);
-        let arr = GcRef::new(JsObject::array(hint));
+        // serde's `size_hint()` is not a contract for exact length; JSON arrays often report `None`.
+        // We must not rely on preallocated dense storage here.
+        let arr = GcRef::new(JsObject::array(0));
         arr.set_prototype(self.state.array_proto.clone());
 
         let mut index = 0usize;
         while let Some(value) = seq.next_element_seed(JsonValueSeed { state: self.state })? {
-            arr.initialize_array_element(index, value);
+            arr.set_index(index, value)
+                .map_err(|e| de::Error::custom(e.to_string()))?;
             index += 1;
         }
 
@@ -241,14 +222,11 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
     where
         A: MapAccess<'de>,
     {
-        let obj = GcRef::new(JsObject::new(
-            self.state.object_proto.clone(),
-        ));
-
+        let obj = GcRef::new(JsObject::new(self.state.object_proto.clone()));
         let mut seen_keys = FxHashSet::default();
         let mut index = 0usize;
 
-        while let Some(raw_key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+        while let Some(raw_key) = map.next_key::<Cow<'de, str>>()? {
             maybe_check_interrupt(self.state.ncx, index)
                 .map_err(|e| de::Error::custom(e.to_string()))?;
             index += 1;
@@ -276,14 +254,12 @@ impl<'de, 's, 'a, 'ctx> Visitor<'de> for JsonValueVisitor<'s, 'a, 'ctx> {
 
 fn parse_json_to_value_direct(
     text: &str,
-    mm: &Arc<MemoryManager>,
     object_proto: &Value,
     array_proto: &Value,
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let mut key_cache = FxHashMap::default();
     let mut state = JsonParseState {
-        mm,
         object_proto,
         array_proto,
         key_cache: &mut key_cache,
@@ -294,13 +270,20 @@ fn parse_json_to_value_direct(
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let value = JsonValueSeed { state: &mut state }
         .deserialize(&mut deserializer)
-        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {e}")))?;
+        .map_err(map_json_parse_error)?;
 
-    deserializer
-        .end()
-        .map_err(|e| VmError::syntax_error(format!("JSON.parse: {e}")))?;
+    deserializer.end().map_err(map_json_parse_error)?;
 
     Ok(value)
+}
+
+fn map_json_parse_error(err: serde_json::Error) -> VmError {
+    let message = err.to_string();
+    if message == "Execution interrupted" {
+        VmError::interrupted()
+    } else {
+        VmError::syntax_error(format!("JSON.parse: {message}"))
+    }
 }
 
 use std::fmt::Write; // Needed for write! on String
@@ -554,29 +537,6 @@ fn value_to_usize(value: &Value, ncx: &mut NativeContext) -> Result<usize, VmErr
     Ok(0)
 }
 
-/// Unwrap Number/String/Boolean wrapper objects (simple version, no function calls)
-fn unwrap_primitive(value: &Value) -> Value {
-    if let Some(obj) = value.as_object() {
-        // Check for __value__ (Number and Boolean wrapper - both use __value__)
-        if let Some(prim) = obj.get(&PropertyKey::string("__value__")) {
-            // Could be Number or Boolean
-            if prim.as_number().is_some()
-                || prim.as_int32().is_some()
-                || prim.as_boolean().is_some()
-            {
-                return prim;
-            }
-        }
-        // Check for __primitiveValue__ (String wrapper)
-        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-            if prim.as_string().is_some() {
-                return prim;
-            }
-        }
-    }
-    value.clone()
-}
-
 /// Unwrap wrapper objects per ES spec - calls ToString for String wrappers, ToNumber for Number wrappers
 fn unwrap_primitive_with_calls(value: &Value, ncx: &mut NativeContext) -> Result<Value, VmError> {
     if let Some(obj) = value.as_object() {
@@ -618,389 +578,6 @@ fn unwrap_primitive_with_calls(value: &Value, ncx: &mut NativeContext) -> Result
         }
     }
     Ok(value.clone())
-}
-
-/// Serialize a value to JSON string (without toJSON/replacer handling)
-fn serialize_value_simple(
-    value: &Value,
-    key: &str,
-    indent: &Option<String>,
-    property_list: &Option<Vec<String>>,
-    tracker: &mut CircularTracker,
-    depth: usize,
-    ncx: &mut NativeContext,
-    out: &mut String,
-) -> Result<bool, VmError> {
-    // Depth limit to prevent stack overflow
-    if depth > 100 {
-        out.push_str("null");
-        return Ok(true);
-    }
-
-    // undefined, functions, symbols return false (omitted)
-    if value.is_undefined() || value.is_callable() || value.is_symbol() {
-        return Ok(false);
-    }
-
-    // null
-    if value.is_null() {
-        out.push_str("null");
-        return Ok(true);
-    }
-
-    // BigInt should have been handled by toJSON or should throw
-    if value.is_bigint() {
-        return Err(VmError::type_error("Do not know how to serialize a BigInt"));
-    }
-
-    // Boolean
-    if let Some(b) = value.as_boolean() {
-        out.push_str(if b { "true" } else { "false" });
-        return Ok(true);
-    }
-
-    // Number (int32 or f64)
-    if let Some(n) = value.as_int32() {
-        let _ = write!(out, "{}", n);
-        return Ok(true);
-    }
-    if let Some(n) = value.as_number() {
-        format_number(n, out);
-        return Ok(true);
-    }
-
-    // String - use UTF-16 escaping to preserve lone surrogates
-    if let Some(s) = value.as_string() {
-        out.push('"');
-        escape_json_string_utf16(s.as_utf16(), out);
-        out.push('"');
-        return Ok(true);
-    }
-
-    // Check for array (including proxy arrays)
-    if is_array_value(value)? {
-        serialize_array_simple(value, key, indent, property_list, tracker, depth, ncx, out)?;
-        return Ok(true);
-    }
-
-    // Regular object
-    if value.as_object().is_some() {
-        serialize_object_simple(value, key, indent, property_list, tracker, depth, ncx, out)?;
-        return Ok(true);
-    }
-
-    // Default to null for unknown types
-    out.push_str("null");
-    Ok(true)
-}
-
-/// Serialize an array (simple version, no toJSON/replacer)
-fn serialize_array_simple(
-    value: &Value,
-    key: &str,
-    indent: &Option<String>,
-    property_list: &Option<Vec<String>>,
-    tracker: &mut CircularTracker,
-    depth: usize,
-    ncx: &mut NativeContext,
-    out: &mut String,
-) -> Result<(), VmError> {
-    let obj = value
-        .as_array()
-        .or_else(|| value.as_object())
-        .ok_or_else(|| VmError::type_error("Expected array"))?;
-
-    // Check for circular reference
-    let ptr = obj.as_ptr() as usize;
-    if let Err(msg) = tracker.enter(key, ptr, true) {
-        return Err(VmError::type_error(msg));
-    }
-
-    let len = if obj.is_array() {
-        obj.array_length()
-    } else {
-        obj.get(&PropertyKey::string("length"))
-            .and_then(|v| {
-                v.as_int32()
-                    .map(|i| i as usize)
-                    .or_else(|| v.as_number().map(|n| n as usize))
-            })
-            .unwrap_or(0)
-    };
-
-    if len == 0 {
-        out.push_str("[]");
-        tracker.exit(ptr);
-        return Ok(());
-    }
-
-    out.push('[');
-    if let Some(ind) = indent {
-        out.push('\n');
-    }
-
-    for i in 0..len {
-        maybe_check_interrupt(ncx, i)?;
-        if i > 0 {
-            out.push(',');
-            if let Some(ind) = indent {
-                out.push('\n');
-            }
-        }
-        if let Some(ind) = indent {
-            for _ in 0..=depth {
-                out.push_str(ind);
-            }
-        }
-
-        // Use direct elements access for arrays to avoid full property lookup
-        let elem = {
-            let elements = obj.elements.borrow();
-            if i < elements.len() {
-                let v = &elements[i];
-                if !v.is_hole() { v.clone() } else { Value::undefined() }
-            } else {
-                Value::undefined()
-            }
-        };
-        let elem = unwrap_primitive(&elem);
-
-        let initial_len = out.len();
-        // Use index string only if needed (circular reference error). Avoids i.to_string() alloc.
-        let elem_key = i.to_string();
-        let written = serialize_value_simple(
-            &elem,
-            &elem_key,
-            indent,
-            property_list,
-            tracker,
-            depth + 1,
-            ncx,
-            out,
-        )?;
-        if !written {
-            out.truncate(initial_len);
-            out.push_str("null");
-        }
-    }
-
-    if let Some(ind) = indent {
-        out.push('\n');
-        for _ in 0..depth {
-            out.push_str(ind);
-        }
-    }
-    out.push(']');
-
-    tracker.exit(ptr);
-    Ok(())
-}
-
-/// Serialize an object (simple version, no toJSON/replacer)
-fn serialize_object_simple(
-    value: &Value,
-    obj_key: &str,
-    indent: &Option<String>,
-    property_list: &Option<Vec<String>>,
-    tracker: &mut CircularTracker,
-    depth: usize,
-    ncx: &mut NativeContext,
-    out: &mut String,
-) -> Result<(), VmError> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| VmError::type_error("Expected object"))?;
-
-    // Check for circular reference
-    let ptr = obj.as_ptr() as usize;
-    if let Err(msg) = tracker.enter(obj_key, ptr, false) {
-        return Err(VmError::type_error(msg));
-    }
-
-    // Fast path for shape-based objects (non-dictionary): iterate shape keys + offsets
-    // in one pass, avoiding separate own_keys + get_own_property_descriptor + get lookups.
-    if property_list.is_none() && !obj.is_dictionary_mode() {
-        let shape_keys = obj.own_keys(); // shape keys in insertion order
-        if shape_keys.is_empty() {
-            out.push_str("{}");
-            tracker.exit(ptr);
-            return Ok(());
-        }
-
-        out.push('{');
-        let mut first = true;
-
-        for (i, prop_key) in shape_keys.iter().enumerate() {
-            maybe_check_interrupt(ncx, i)?;
-            // Skip symbols
-            if matches!(prop_key, PropertyKey::Symbol(_)) {
-                continue;
-            }
-            // Get offset from shape and read value + descriptor in one lookup
-            let offset = obj.shape_get_offset(prop_key);
-            let val = if let Some(off) = offset {
-                match obj.get_property_entry_by_offset(off) {
-                    Some(desc) => {
-                        if !desc.enumerable() {
-                            continue;
-                        }
-                        desc.value().cloned().unwrap_or(Value::undefined())
-                    }
-                    None => continue,
-                }
-            } else {
-                continue;
-            };
-            let val = unwrap_primitive(&val);
-
-            // Get key string
-            let key_str: std::borrow::Cow<str> = match prop_key {
-                PropertyKey::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                PropertyKey::Index(idx) => std::borrow::Cow::Owned(idx.to_string()),
-                PropertyKey::Symbol(_) => unreachable!(),
-            };
-
-            let initial_len = out.len();
-            if !first {
-                out.push(',');
-            }
-            if let Some(ind) = indent {
-                out.push('\n');
-                for _ in 0..=depth {
-                    out.push_str(ind);
-                }
-            }
-
-            out.push('"');
-            escape_json_string(&key_str, out);
-            out.push('"');
-            out.push(':');
-            if indent.is_some() {
-                out.push(' ');
-            }
-
-            let written = serialize_value_simple(
-                &val,
-                &key_str,
-                indent,
-                property_list,
-                tracker,
-                depth + 1,
-                ncx,
-                out,
-            )?;
-            if written {
-                first = false;
-            } else {
-                out.truncate(initial_len);
-            }
-        }
-
-        if let Some(ind) = indent {
-            out.push('\n');
-            for _ in 0..depth {
-                out.push_str(ind);
-            }
-        }
-        out.push('}');
-        tracker.exit(ptr);
-        return Ok(());
-    }
-
-    // Slow path: dictionary mode or with property_list replacer
-    let keys: Vec<String> = if let Some(list) = property_list {
-        list.clone()
-    } else {
-        obj.own_keys()
-            .into_iter()
-            .filter_map(|k| {
-                let desc = obj.get_own_property_descriptor(&k).or_else(|| {
-                    if let PropertyKey::Index(i) = &k {
-                        obj.get_own_property_descriptor(&PropertyKey::string(&i.to_string()))
-                    } else {
-                        None
-                    }
-                });
-                if let Some(desc) = desc {
-                    if desc.enumerable() {
-                        return match &k {
-                            PropertyKey::String(s) => Some(s.as_str().to_string()),
-                            PropertyKey::Index(i) => Some(i.to_string()),
-                            PropertyKey::Symbol(_) => None,
-                        };
-                    }
-                }
-                None
-            })
-            .collect()
-    };
-
-    if keys.is_empty() {
-        out.push_str("{}");
-        tracker.exit(ptr);
-        return Ok(());
-    }
-
-    out.push('{');
-    let mut first = true;
-    let mut wrote_property = false;
-
-    for (i, key) in keys.into_iter().enumerate() {
-        maybe_check_interrupt(ncx, i)?;
-        if let Some(val) = obj.get(&PropertyKey::string(&key)) {
-            let val = unwrap_primitive(&val);
-
-            let initial_len = out.len();
-            if !first {
-                out.push(',');
-            }
-            if let Some(ind) = indent {
-                out.push('\n');
-                for _ in 0..=depth {
-                    out.push_str(ind);
-                }
-            }
-
-            out.push('"');
-            escape_json_string(&key, out);
-            out.push('"');
-            out.push(':');
-            if indent.is_some() {
-                out.push(' ');
-            }
-
-            let written = serialize_value_simple(
-                &val,
-                &key,
-                indent,
-                property_list,
-                tracker,
-                depth + 1,
-                ncx,
-                out,
-            )?;
-            if written {
-                first = false;
-                wrote_property = true;
-            } else {
-                out.truncate(initial_len);
-            }
-        }
-    }
-
-    if wrote_property && indent.is_some() {
-        out.push('\n');
-        for _ in 0..depth {
-            out.push_str(indent.as_ref().unwrap());
-        }
-    } else if !wrote_property && out.len() > 1 {
-        // Did not write properties, so we shouldn't have newlines
-        // If we added '{', do nothing more
-    }
-    out.push('}');
-
-    tracker.exit(ptr);
-    Ok(())
 }
 
 /// Full stringify with toJSON and replacer support
@@ -1496,6 +1073,12 @@ fn stringify_object_with_replacer(
     Ok(())
 }
 
+/// `JSON.parse ( text [, reviver] )`
+///
+/// Parses a JSON string, constructing the JavaScript value or object described by the string.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-json.parse>
+/// MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse>
 #[dive(name = "parse", length = 2)]
 fn json_parse(
     _this_val: &Value,
@@ -1503,18 +1086,19 @@ fn json_parse(
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let string_arg = arg.as_string();
 
     // Convert to string using ToString (calling toString() if needed)
-    let text = if let Some(s) = arg.as_string() {
-        s.as_str().to_string()
+    let text = if let Some(s) = string_arg.as_ref() {
+        Cow::Borrowed(s.as_str())
     } else if let Some(n) = arg.as_number() {
-        format!("{}", n)
+        Cow::Owned(format!("{}", n))
     } else if let Some(n) = arg.as_int32() {
-        format!("{}", n)
+        Cow::Owned(format!("{}", n))
     } else if let Some(b) = arg.as_boolean() {
-        if b { "true" } else { "false" }.to_string()
+        Cow::Borrowed(if b { "true" } else { "false" })
     } else if arg.is_null() {
-        "null".to_string()
+        Cow::Borrowed("null")
     } else if arg.is_undefined() {
         return Err(VmError::syntax_error("JSON.parse: unexpected input"));
     } else if let Some(obj) = arg.as_object() {
@@ -1523,23 +1107,23 @@ fn json_parse(
             if to_string_fn.is_callable() {
                 let result = ncx.call_function(&to_string_fn, Value::object(obj), &[])?;
                 if let Some(s) = result.as_string() {
-                    s.as_str().to_string()
+                    Cow::Owned(s.as_str().to_owned())
                 } else {
                     return Err(VmError::syntax_error(
                         "JSON.parse: toString did not return string",
                     ));
                 }
             } else {
-                "[object Object]".to_string()
+                Cow::Borrowed("[object Object]")
             }
         } else {
-            "[object Object]".to_string()
+            Cow::Borrowed("[object Object]")
         }
     } else {
         return Err(VmError::syntax_error("JSON.parse: unexpected input"));
     };
 
-    // Get Object.prototype and Array.prototype from global
+    // Avoid cloning the full Intrinsics registry on every parse call.
     let global = ncx.ctx.global();
     let object_proto = global
         .get(&PropertyKey::string("Object"))
@@ -1553,7 +1137,7 @@ fn json_parse(
         .unwrap_or_else(Value::null);
 
     let mm = ncx.memory_manager().clone();
-    let result = parse_json_to_value_direct(&text, &mm, &object_proto, &array_proto, ncx)?;
+    let result = parse_json_to_value_direct(text.as_ref(), &object_proto, &array_proto, ncx)?;
 
     // Apply reviver if provided
     if let Some(reviver) = args.get(1) {
@@ -1565,6 +1149,12 @@ fn json_parse(
     Ok(result)
 }
 
+/// `JSON.stringify ( value [, replacer [, space]] )`
+///
+/// Converts a JavaScript value to a JSON string, optionally replacing values or including only specified properties.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-json.stringify>
+/// MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify>
 #[dive(name = "stringify", length = 3)]
 fn json_stringify(
     _this_val: &Value,
@@ -1585,153 +1175,68 @@ fn json_stringify(
     let space_str = parse_space(args.get(2), ncx)?;
 
     let mut tracker = CircularTracker::new();
-    let mut out = String::with_capacity(128);
 
-    // Fast path: no replacer, no toJSON on top-level → skip wrapper object allocation
-    let written = if replacer_fn.is_none() {
-        serialize_value_simple(
-            &val,
-            "",
-            &space_str,
-            &property_list,
-            &mut tracker,
-            0,
-            ncx,
-            &mut out,
-        )?
+    // Estimate output size for better pre-allocation.
+    // Arrays: ~8 bytes per element, Objects: ~32 bytes per property
+    let estimated_capacity = if let Some(obj) = val.as_object() {
+        if obj.is_array() {
+            obj.array_length() * 8 + 16
+        } else {
+            obj.get_shape_key_count() * 32 + 16
+        }
     } else {
-        // Slow path: create wrapper object for replacer spec compliance
-        let global = ncx.ctx.global();
-        let object_proto = global
-            .get(&PropertyKey::string("Object"))
-            .and_then(|o| o.as_object())
-            .and_then(|o| o.get(&PropertyKey::string("prototype")))
-            .unwrap_or_else(Value::null);
-        let wrapper = GcRef::new(JsObject::new(object_proto));
-        let _ = wrapper.set(PropertyKey::string(""), val.clone());
-        let wrapper_val = Value::object(wrapper);
-
-        stringify_with_replacer(
-            &wrapper_val,
-            "",
-            &replacer_fn,
-            &space_str,
-            &property_list,
-            &mut tracker,
-            0,
-            ncx,
-            &mut out,
-        )?
+        128
     };
+    let mut out = String::with_capacity(estimated_capacity.max(128));
+
+    // Per spec, stringify always uses a wrapper object and the SerializeJSONProperty algorithm,
+    // which ensures toJSON/replacer/getters/proxies are honored.
+    let global = ncx.ctx.global();
+    let object_proto = global
+        .get(&PropertyKey::string("Object"))
+        .and_then(|o| o.as_object())
+        .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        .unwrap_or_else(Value::null);
+    let wrapper = GcRef::new(JsObject::new(object_proto));
+    let _ = wrapper.set(PropertyKey::string(""), val.clone());
+    let wrapper_val = Value::object(wrapper);
+
+    let written = stringify_with_replacer(
+        &wrapper_val,
+        "",
+        &replacer_fn,
+        &space_str,
+        &property_list,
+        &mut tracker,
+        0,
+        ncx,
+        &mut out,
+    )?;
 
     if written {
-        Ok(Value::string(JsString::intern(&out)))
+        // Stringify results are typically short-lived; avoid interning megabyte JSON strings.
+        Ok(Value::string(JsString::new_gc(&out)))
     } else {
         Ok(Value::undefined())
     }
 }
 
-/// Create and install JSON namespace on global object
-pub fn install_json_namespace(
-    global: GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
-    function_prototype: GcRef<JsObject>,
-) {
-    let json_obj = GcRef::new(JsObject::new(Value::null()));
+/// `JSON` namespace object.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-json-object>
+/// MDN: <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON>
+pub struct JsonNamespace;
 
-    // JSON.parse(text, reviver?) — §25.5.1
-    let (parse_name, parse_native, parse_length) = json_parse_decl();
-    let parse_fn = Value::native_function_from_arc(parse_native, mm.clone());
-    if let Some(obj) = parse_fn.as_object() {
-        // Set Function.prototype as prototype
-        obj.set_prototype(Value::object(function_prototype));
-        obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::Data {
-                value: Value::int32(parse_length as i32),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            },
-        );
-        obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::Data {
-                value: Value::string(JsString::intern(parse_name)),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            },
-        );
-        obj.define_property(
-            PropertyKey::string("__non_constructor"),
-            PropertyDescriptor::builtin_data(Value::boolean(true)),
-        );
+impl IntrinsicObject for JsonNamespace {
+    fn init(ctx: &IntrinsicContext) {
+        let json_obj = GcRef::new(JsObject::new(Value::null()));
+
+        NamespaceBuilder::new(ctx.mm(), ctx.fn_proto(), json_obj)
+            .method_decl(json_parse_decl())
+            .method_decl(json_stringify_decl())
+            .string_tag("JSON")
+            .install_on(&ctx.global(), "JSON");
     }
-    json_obj.define_property(
-        PropertyKey::string("parse"),
-        PropertyDescriptor::builtin_method(parse_fn),
-    );
-
-    // JSON.stringify(value, replacer?, space?) — §25.5.2
-    let (stringify_name, stringify_native, stringify_length) = json_stringify_decl();
-    let stringify_fn = Value::native_function_from_arc(stringify_native, mm.clone());
-    if let Some(obj) = stringify_fn.as_object() {
-        // Set Function.prototype as prototype
-        obj.set_prototype(Value::object(function_prototype));
-        obj.define_property(
-            PropertyKey::string("length"),
-            PropertyDescriptor::Data {
-                value: Value::int32(stringify_length as i32),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            },
-        );
-        obj.define_property(
-            PropertyKey::string("name"),
-            PropertyDescriptor::Data {
-                value: Value::string(JsString::intern(stringify_name)),
-                attributes: PropertyAttributes {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            },
-        );
-        obj.define_property(
-            PropertyKey::string("__non_constructor"),
-            PropertyDescriptor::builtin_data(Value::boolean(true)),
-        );
-    }
-    json_obj.define_property(
-        PropertyKey::string("stringify"),
-        PropertyDescriptor::builtin_method(stringify_fn),
-    );
-
-    // Set @@toStringTag
-    json_obj.define_property(
-        PropertyKey::string("@@toStringTag"),
-        PropertyDescriptor::Data {
-            value: Value::string(JsString::intern("JSON")),
-            attributes: PropertyAttributes {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-            },
-        },
-    );
-
-    global.define_property(
-        PropertyKey::string("JSON"),
-        PropertyDescriptor::builtin_data(Value::object(json_obj)),
-    );
 }
 
 /// Get a property value from replacer (array or proxy), invoking accessor getters and proxy traps
@@ -1773,6 +1278,30 @@ fn get_replacer_element(
     }
 
     Ok(Value::undefined())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_json_parse_error;
+    use crate::error::VmError;
+    use serde::de::Error as _;
+
+    #[test]
+    fn json_parse_interrupt_is_not_reported_as_syntax_error() {
+        let err = serde_json::Error::custom("Execution interrupted");
+        assert!(matches!(map_json_parse_error(err), VmError::Interrupted));
+    }
+
+    #[test]
+    fn json_parse_syntax_errors_remain_syntax_errors() {
+        let err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        match map_json_parse_error(err) {
+            VmError::SyntaxError(message) => {
+                assert!(message.starts_with("JSON.parse: "));
+            }
+            other => panic!("expected SyntaxError, got {other:?}"),
+        }
+    }
 }
 
 /// Get length from replacer (array or proxy), converting to number (may throw)

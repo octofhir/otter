@@ -3,9 +3,7 @@
 //! Provides the global `AbortController` and `AbortSignal` classes.
 //! State is stored in internal properties on the JS objects.
 
-use std::sync::Arc;
-
-use crate::builtin_builder::BuiltInBuilder;
+use crate::builtin_builder::{BuiltInBuilder, IntrinsicContext, IntrinsicObject};
 use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
@@ -148,9 +146,7 @@ fn create_signal_object(
         .realm_intrinsics(realm_id)
         .ok_or_else(|| VmError::internal("Realm intrinsics not found"))?;
 
-    let signal = JsObject::new(
-        Value::object(intrinsics.abort_signal_prototype)
-    );
+    let signal = JsObject::new(Value::object(intrinsics.abort_signal_prototype));
     let signal_val = Value::object(GcRef::new(signal));
 
     set_property(&signal_val, ABORTED_KEY, Value::boolean(aborted))?;
@@ -263,21 +259,12 @@ fn create_timeout_reason(ncx: &mut NativeContext) -> Value {
     Value::string(JsString::intern("TimeoutError: signal timed out"))
 }
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
-
-pub fn init_abort_signal(
-    signal_ctor: GcRef<JsObject>,
-    signal_proto: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
-    mm: &Arc<crate::memory::MemoryManager>,
-) {
+fn abort_signal_builder(ctx: &IntrinsicContext) -> BuiltInBuilder {
     let mut builder = BuiltInBuilder::new(
-        mm.clone(),
-        fn_proto,
-        signal_ctor,
-        signal_proto,
+        ctx.mm(),
+        ctx.fn_proto(),
+        ctx.intrinsics().abort_signal_constructor,
+        ctx.intrinsics().abort_signal_prototype,
         "AbortSignal",
     )
     .constructor_fn(
@@ -313,20 +300,15 @@ pub fn init_abort_signal(
         builder = builder.static_method_native(name, func, length);
     }
 
-    builder.build();
+    builder
 }
 
-pub fn init_abort_controller(
-    controller_ctor: GcRef<JsObject>,
-    controller_proto: GcRef<JsObject>,
-    fn_proto: GcRef<JsObject>,
-    mm: &Arc<crate::memory::MemoryManager>,
-) {
+fn abort_controller_builder(ctx: &IntrinsicContext) -> BuiltInBuilder {
     let mut builder = BuiltInBuilder::new(
-        mm.clone(),
-        fn_proto,
-        controller_ctor,
-        controller_proto,
+        ctx.mm(),
+        ctx.fn_proto(),
+        ctx.intrinsics().abort_controller_constructor,
+        ctx.intrinsics().abort_controller_prototype,
         "AbortController",
     )
     .constructor_fn(AbortController::constructor, 0);
@@ -339,5 +321,19 @@ pub fn init_abort_controller(
     let (_, signal_get, _) = AbortController::signal_decl();
     builder = builder.accessor("signal", Some(signal_get), None);
 
-    builder.build();
+    builder
+}
+
+pub struct AbortIntrinsic;
+
+impl IntrinsicObject for AbortIntrinsic {
+    fn init(ctx: &IntrinsicContext) {
+        if let Some(global) = ctx.global_opt() {
+            abort_controller_builder(ctx).build_and_install(&global);
+            abort_signal_builder(ctx).build_and_install(&global);
+        } else {
+            abort_controller_builder(ctx).build();
+            abort_signal_builder(ctx).build();
+        }
+    }
 }

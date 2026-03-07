@@ -258,6 +258,11 @@ pub struct InstructionMetadata {
     /// When prototype chains change, the global proto_epoch is bumped.
     /// IC entries are invalidated when their cached proto_epoch doesn't match.
     pub proto_epoch: u64,
+    /// Call target IC: cached function_index for monomorphic call sites.
+    /// 0 = uninitialized, u32::MAX = megamorphic (seen multiple targets).
+    pub call_target_func_index: u32,
+    /// Call target IC: module_id of the cached callee.
+    pub call_target_module_id: u64,
 }
 
 impl InstructionMetadata {

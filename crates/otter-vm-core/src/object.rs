@@ -9,6 +9,7 @@
 //! locality and reduces indirection for common cases where objects have few
 //! properties.
 
+use crate::memory::MemoryManager;
 use crate::object_cell::ObjectCell;
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
 
 /// Number of properties stored inline in the object
 /// Properties beyond this count overflow to a Vec.
-pub const INLINE_PROPERTY_COUNT: usize = 4;
+pub const INLINE_PROPERTY_COUNT: usize = 8;
 
 /// Threshold for transitioning to dictionary mode.
 /// Objects with more than this many properties, or objects that have had
@@ -740,6 +741,453 @@ pub struct ArgumentMapping {
 /// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
 /// for faster access. Additional properties overflow to the `properties` Vec.
 /// Both inline and overflow use `PropertyEntry` to support accessor properties.
+
+/// The internal storage kind for indexed properties (elements).
+/// Used to optimize array storage and operations for common types (SMI and Doubles).
+#[derive(Clone, Debug)]
+pub enum ElementsKind {
+    /// Dense storage for Small Integers (32-bit signed)
+    Smi(Vec<i32>),
+    /// Dense storage for 64-bit IEEE-754 numbers
+    Double(Vec<f64>),
+    /// General storage for any Value (including holes)
+    Object(Vec<Value>),
+}
+
+impl ElementsKind {
+    /// Create a new empty Object elements store
+    pub fn new() -> Self {
+        ElementsKind::Object(Vec::new())
+    }
+
+    /// Return the length of the elements vector
+    pub fn len(&self) -> usize {
+        match self {
+            ElementsKind::Smi(v) => v.len(),
+            ElementsKind::Double(v) => v.len(),
+            ElementsKind::Object(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear the elements
+    pub fn clear(&mut self) {
+        match self {
+            ElementsKind::Smi(v) => v.clear(),
+            ElementsKind::Double(v) => v.clear(),
+            ElementsKind::Object(v) => v.clear(),
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<Value> {
+        match self {
+            ElementsKind::Smi(v) => v.get(index).map(|&x| Value::int32(x)),
+            ElementsKind::Double(v) => v.get(index).map(|&x| Value::number(x)),
+            ElementsKind::Object(v) => v.get(index).cloned(),
+        }
+    }
+
+    pub fn set(&mut self, index: usize, value: Value) {
+        if index >= self.len() {
+            // Should not happen if correctly resized, but fallback to object transition to be safe
+            self.transition_to_object();
+            if let ElementsKind::Object(v) = self {
+                if index >= v.len() {
+                    v.resize(index + 1, Value::hole());
+                }
+                v[index] = value;
+            }
+            return;
+        }
+
+        match self {
+            ElementsKind::Smi(v) => {
+                if value.is_int32() {
+                    v[index] = value.as_int32().unwrap();
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2[index] = value;
+                    }
+                }
+            }
+            ElementsKind::Double(v) => {
+                if value.is_number() {
+                    v[index] = value.as_number().unwrap();
+                } else if value.is_int32() {
+                    v[index] = value.as_int32().unwrap() as f64;
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2[index] = value;
+                    }
+                }
+            }
+            ElementsKind::Object(v) => {
+                v[index] = value;
+            }
+        }
+    }
+
+    pub fn push(&mut self, value: Value) {
+        match self {
+            ElementsKind::Smi(v) => {
+                if value.is_int32() {
+                    v.push(value.as_int32().unwrap());
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.push(value);
+                    }
+                }
+            }
+            ElementsKind::Double(v) => {
+                if value.is_number() {
+                    v.push(value.as_number().unwrap());
+                } else if value.is_int32() {
+                    v.push(value.as_int32().unwrap() as f64);
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.push(value);
+                    }
+                }
+            }
+            ElementsKind::Object(v) => {
+                v.push(value);
+            }
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<Value> {
+        match self {
+            ElementsKind::Smi(v) => v.pop().map(Value::int32),
+            ElementsKind::Double(v) => v.pop().map(Value::number),
+            ElementsKind::Object(v) => v.pop(),
+        }
+    }
+
+    pub fn resize(&mut self, new_len: usize, filler: Value) {
+        if new_len > self.len() && (!filler.is_int32() && !filler.is_number()) {
+            self.transition_to_object();
+        }
+
+        match self {
+            ElementsKind::Smi(v) => {
+                if filler.is_int32() {
+                    v.resize(new_len, filler.as_int32().unwrap());
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.resize(new_len, filler);
+                    }
+                }
+            }
+            ElementsKind::Double(v) => {
+                if filler.is_number() {
+                    v.resize(new_len, filler.as_number().unwrap());
+                } else if filler.is_int32() {
+                    v.resize(new_len, filler.as_int32().unwrap() as f64);
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.resize(new_len, filler);
+                    }
+                }
+            }
+            ElementsKind::Object(v) => {
+                v.resize(new_len, filler);
+            }
+        }
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        match self {
+            ElementsKind::Smi(v) => v.truncate(len),
+            ElementsKind::Double(v) => v.truncate(len),
+            ElementsKind::Object(v) => v.truncate(len),
+        }
+    }
+
+    pub fn shift(&mut self) -> Option<Value> {
+        match self {
+            ElementsKind::Smi(v) => {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(Value::int32(v.remove(0)))
+                }
+            }
+            ElementsKind::Double(v) => {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(Value::number(v.remove(0)))
+                }
+            }
+            ElementsKind::Object(v) => {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            }
+        }
+    }
+
+    pub fn unshift(&mut self, value: Value) {
+        match self {
+            ElementsKind::Smi(v) => {
+                if value.is_int32() {
+                    v.insert(0, value.as_int32().unwrap());
+                } else if value.is_number() {
+                    let mut d: Vec<f64> = v.iter().map(|&x| x as f64).collect();
+                    d.insert(0, value.as_number().unwrap());
+                    *self = ElementsKind::Double(d);
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.insert(0, value);
+                    }
+                }
+            }
+            ElementsKind::Double(v) => {
+                if value.is_number() {
+                    v.insert(0, value.as_number().unwrap());
+                } else if value.is_int32() {
+                    v.insert(0, value.as_int32().unwrap() as f64);
+                } else {
+                    self.transition_to_object();
+                    if let ElementsKind::Object(v2) = self {
+                        v2.insert(0, value);
+                    }
+                }
+            }
+            ElementsKind::Object(v) => {
+                v.insert(0, value);
+            }
+        }
+    }
+
+    pub fn drain<R>(&mut self, range: R) -> Vec<Value>
+    where
+        R: std::ops::RangeBounds<usize> + Clone,
+    {
+        match self {
+            ElementsKind::Smi(v) => v.drain(range).map(Value::int32).collect(),
+            ElementsKind::Double(v) => v.drain(range).map(Value::number).collect(),
+            ElementsKind::Object(v) => v.drain(range).collect(),
+        }
+    }
+
+    pub fn iter(&self) -> Box<dyn Iterator<Item = Value> + '_> {
+        match self {
+            ElementsKind::Smi(v) => Box::new(v.iter().map(|&x| Value::int32(x))),
+            ElementsKind::Double(v) => Box::new(v.iter().map(|&x| Value::number(x))),
+            ElementsKind::Object(v) => {
+                Box::new(v.iter().cloned()) as Box<dyn Iterator<Item = Value> + '_>
+            }
+        }
+    }
+
+    pub fn unwrap_object(&self) -> &Vec<Value> {
+        match self {
+            ElementsKind::Object(v) => v,
+            _ => panic!("Expected Object elements kind"),
+        }
+    }
+
+    fn transition_to_object(&mut self) {
+        let new_vec = match self {
+            ElementsKind::Smi(v) => v.iter().map(|&x| Value::int32(x)).collect(),
+            ElementsKind::Double(v) => v.iter().map(|&x| Value::number(x)).collect(),
+            ElementsKind::Object(_) => return,
+        };
+        *self = ElementsKind::Object(new_vec);
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> ElementsKind {
+        match self {
+            ElementsKind::Smi(v) => {
+                let s = start.min(v.len());
+                let e = end.min(v.len()).max(s);
+                ElementsKind::Smi(v[s..e].to_vec())
+            }
+            ElementsKind::Double(v) => {
+                let s = start.min(v.len());
+                let e = end.min(v.len()).max(s);
+                ElementsKind::Double(v[s..e].to_vec())
+            }
+            ElementsKind::Object(v) => {
+                let s = start.min(v.len());
+                let e = end.min(v.len()).max(s);
+                ElementsKind::Object(v[s..e].to_vec())
+            }
+        }
+    }
+
+    pub fn reverse(&mut self) {
+        match self {
+            ElementsKind::Smi(v) => v.reverse(),
+            ElementsKind::Double(v) => v.reverse(),
+            ElementsKind::Object(v) => v.reverse(),
+        }
+    }
+
+    pub fn append_all(&mut self, other: &ElementsKind) {
+        match (self, other) {
+            (ElementsKind::Smi(v1), ElementsKind::Smi(v2)) => v1.extend_from_slice(v2),
+            (ElementsKind::Double(v1), ElementsKind::Double(v2)) => v1.extend_from_slice(v2),
+            (ElementsKind::Object(v1), ElementsKind::Object(v2)) => {
+                for val in v2 {
+                    gc_write_barrier(val);
+                }
+                v1.extend_from_slice(v2);
+            }
+            (this, other) => {
+                // Mixed types or transitioning
+                for i in 0..other.len() {
+                    this.push(other.get(i).unwrap_or(Value::hole()));
+                }
+            }
+        }
+    }
+
+    pub fn splice(&mut self, start: usize, delete_count: usize, items: &[Value]) -> ElementsKind {
+        let len = self.len();
+        let actual_start = start.min(len);
+        let actual_delete_count = delete_count.min(len - actual_start);
+        let deleted = self.slice(actual_start, actual_start + actual_delete_count);
+
+        if items.is_empty() {
+            match self {
+                ElementsKind::Smi(v) => {
+                    v.drain(actual_start..actual_start + actual_delete_count);
+                }
+                ElementsKind::Double(v) => {
+                    v.drain(actual_start..actual_start + actual_delete_count);
+                }
+                ElementsKind::Object(v) => {
+                    v.drain(actual_start..actual_start + actual_delete_count);
+                }
+            }
+            return deleted;
+        }
+
+        // Check compatibility
+        let mut compatible = true;
+        match self {
+            ElementsKind::Smi(_) => {
+                for item in items {
+                    if !item.is_int32() {
+                        compatible = false;
+                        break;
+                    }
+                }
+            }
+            ElementsKind::Double(_) => {
+                for item in items {
+                    if !item.is_number() && !item.is_int32() {
+                        compatible = false;
+                        break;
+                    }
+                }
+            }
+            ElementsKind::Object(_) => {}
+        }
+
+        if !compatible {
+            self.transition_to_object();
+        }
+
+        match self {
+            ElementsKind::Smi(v) => {
+                let smi_items: Vec<i32> = items.iter().map(|v| v.as_int32().unwrap()).collect();
+                v.splice(actual_start..actual_start + actual_delete_count, smi_items);
+            }
+            ElementsKind::Double(v) => {
+                let double_items: Vec<f64> = items
+                    .iter()
+                    .map(|v| {
+                        if v.is_int32() {
+                            v.as_int32().unwrap() as f64
+                        } else {
+                            v.as_number().unwrap()
+                        }
+                    })
+                    .collect();
+                v.splice(
+                    actual_start..actual_start + actual_delete_count,
+                    double_items,
+                );
+            }
+            ElementsKind::Object(v) => {
+                for item in items {
+                    gc_write_barrier(item);
+                }
+                v.splice(
+                    actual_start..actual_start + actual_delete_count,
+                    items.iter().cloned(),
+                );
+            }
+        }
+        deleted
+    }
+
+    pub fn copy_within(&mut self, to: usize, from: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let len = self.len();
+        if to >= len || from >= len {
+            return;
+        }
+        let actual_count = count.min(len - to).min(len - from);
+
+        match self {
+            ElementsKind::Smi(v) => {
+                v.copy_within(from..from + actual_count, to);
+            }
+            ElementsKind::Double(v) => {
+                v.copy_within(from..from + actual_count, to);
+            }
+            ElementsKind::Object(v) => {
+                v.copy_within(from..from + actual_count, to);
+            }
+        }
+    }
+
+    pub fn sort_with_comparator<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(&Value, &Value) -> std::cmp::Ordering,
+    {
+        match self {
+            ElementsKind::Smi(v) => {
+                let mut values: Vec<Value> = v.iter().map(|&x| Value::int32(x)).collect();
+                values.sort_by(|a, b| compare(a, b));
+                *v = values.iter().map(|v| v.as_int32().unwrap_or(0)).collect();
+            }
+            ElementsKind::Double(v) => {
+                let mut values: Vec<Value> = v.iter().map(|&x| Value::number(x)).collect();
+                values.sort_by(|a, b| compare(a, b));
+                *v = values
+                    .iter()
+                    .map(|v| v.as_number().unwrap_or(0.0))
+                    .collect();
+            }
+            ElementsKind::Object(v) => {
+                v.sort_by(|a, b| compare(a, b));
+            }
+        }
+    }
+}
+
+/// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
+/// for faster access. Additional properties overflow to the `properties` Vec.
+/// Both inline and overflow use `PropertyEntry` to support accessor properties.
 pub struct JsObject {
     /// Current shape of the object
     shape: ObjectCell<Arc<Shape>>,
@@ -754,7 +1202,7 @@ pub struct JsObject {
     /// Can be Value::object, Value::proxy, or Value::null
     prototype: ObjectCell<Value>,
     /// Array elements (for array-like objects)
-    pub elements: ObjectCell<Vec<Value>>,
+    pub elements: ObjectCell<ElementsKind>,
     /// Object flags (mutable for freeze/seal/preventExtensions)
     pub flags: ObjectCell<ObjectFlags>,
     /// Parameter mapping for mapped arguments objects (sloppy mode).
@@ -805,11 +1253,11 @@ impl JsObject {
     pub fn new(prototype: Value) -> Self {
         Self {
             shape: ObjectCell::new(Shape::root()),
-            inline_properties: ObjectCell::new([None, None, None, None]),
+            inline_properties: ObjectCell::new([None, None, None, None, None, None, None, None]),
             overflow_properties: ObjectCell::new(Vec::new()),
             dictionary_properties: ObjectCell::new(None),
             prototype: ObjectCell::new(prototype),
-            elements: ObjectCell::new(Vec::new()),
+            elements: ObjectCell::new(ElementsKind::new()),
             flags: ObjectCell::new(ObjectFlags {
                 extensible: true,
                 ..Default::default()
@@ -1115,6 +1563,10 @@ impl JsObject {
         self.flags.borrow().is_dictionary
     }
 
+    pub fn is_sparse(&self) -> bool {
+        self.flags.borrow().sparse_array_length.is_some()
+    }
+
     /// Debug: get the number of keys in the shape
     pub fn get_shape_key_count(&self) -> usize {
         self.shape.borrow().own_keys().len()
@@ -1201,7 +1653,7 @@ impl JsObject {
                 let elements = self.elements.borrow();
                 let idx = *i as usize;
                 if idx < elements.len() {
-                    return Some(elements[idx].clone());
+                    return Some(elements.get(idx).unwrap_or_else(Value::undefined));
                 }
                 return None;
             }
@@ -1244,7 +1696,7 @@ impl JsObject {
             }
             let elements = self.elements.borrow();
             if idx < elements.len() {
-                let val = &elements[idx];
+                let val = &elements.get(idx).unwrap_or(Value::undefined());
                 if !val.is_hole() {
                     return Some(val.clone());
                 }
@@ -1431,7 +1883,7 @@ impl JsObject {
                 let idx = *i as usize;
                 if idx < elements.len() {
                     return Some(PropertyDescriptor::Data {
-                        value: elements[idx].clone(),
+                        value: elements.get(idx).unwrap_or_else(Value::undefined),
                         attributes: PropertyAttributes {
                             writable: false,
                             enumerable: true,
@@ -1490,10 +1942,10 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
-            if idx < elements.len() && !elements[idx].is_hole() {
+            if idx < elements.len() && !elements.get(idx).unwrap_or(Value::undefined()).is_hole() {
                 let flags = self.flags.borrow();
                 return Some(PropertyDescriptor::Data {
-                    value: elements[idx].clone(),
+                    value: elements.get(idx).unwrap_or_else(Value::undefined),
                     attributes: PropertyAttributes {
                         writable: !flags.frozen,
                         enumerable: true,
@@ -1532,10 +1984,12 @@ impl JsObject {
                 if let PropertyKey::Index(i) = key {
                     let idx = *i as usize;
                     let elements = proto_obj.elements.borrow();
-                    if idx < elements.len() && !elements[idx].is_hole() {
+                    if idx < elements.len()
+                        && !elements.get(idx).unwrap_or(Value::undefined()).is_hole()
+                    {
                         let flags = proto_obj.flags.borrow();
                         return Some(PropertyDescriptor::Data {
-                            value: elements[idx].clone(),
+                            value: elements.get(idx).unwrap_or_else(Value::undefined),
                             attributes: PropertyAttributes {
                                 writable: !flags.frozen,
                                 enumerable: true,
@@ -1624,14 +2078,14 @@ impl JsObject {
                 // Also update elements for when mapping is later removed
                 let mut elements = self.elements.borrow_mut();
                 if idx < elements.len() {
-                    elements[idx] = value;
+                    elements.set(idx, value);
                 }
                 return Ok(());
             }
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
                 gc_write_barrier(&value);
-                elements[idx] = value;
+                elements.set(idx, value);
                 return Ok(());
             } else if is_array && extensible && !sealed {
                 // Cap dense element storage to avoid OOM on sparse arrays.
@@ -1640,7 +2094,7 @@ impl JsObject {
                 if idx < MAX_DENSE_LENGTH {
                     gc_write_barrier(&value);
                     elements.resize(idx + 1, Value::hole());
-                    elements[idx] = value;
+                    elements.set(idx, value);
                     self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
                     return Ok(());
                 }
@@ -1818,7 +2272,7 @@ impl JsObject {
             // If the element exists as an own property, deletion must fail.
             let element_exists = {
                 let elements = self.elements.borrow();
-                idx < elements.len() && !elements[idx].is_hole()
+                idx < elements.len() && !elements.get(idx).unwrap_or(Value::undefined()).is_hole()
             };
             if element_exists {
                 let flags = self.flags.borrow();
@@ -1835,9 +2289,12 @@ impl JsObject {
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
                 let original_len = elements.len();
-                elements[idx] = Value::hole();
+                elements.set(idx, Value::hole());
                 // Trim trailing holes to keep elements vec compact
-                while elements.last().map_or(false, |v| v.is_hole()) {
+                while elements
+                    .get(elements.len().saturating_sub(1))
+                    .map_or(false, |v| v.is_hole())
+                {
                     elements.pop();
                 }
                 let new_len = elements.len();
@@ -1968,7 +2425,8 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
-            return idx < elements.len() && !elements[idx].is_hole();
+            return idx < elements.len()
+                && !elements.get(idx).unwrap_or(Value::undefined()).is_hole();
         }
 
         false
@@ -2067,7 +2525,9 @@ impl JsObject {
         // Add indexed elements (skip holes — they are absent per spec)
         let elements = self.elements.borrow();
         for i in 0..elements.len() {
-            if !elements[i].is_hole() && !integer_keys.contains(&(i as u32)) {
+            if !elements.get(i).unwrap_or(Value::undefined()).is_hole()
+                && !integer_keys.contains(&(i as u32))
+            {
                 integer_keys.push(i as u32);
             }
         }
@@ -2809,7 +3269,13 @@ impl JsObject {
                 return self.ordinary_define_own_property(key, desc);
             }
             // Default data property in elements - just update value
-            if !self.elements.borrow()[idx].is_hole() {
+            if self
+                .elements
+                .borrow()
+                .get(idx)
+                .map(|v| !v.is_hole())
+                .unwrap_or(false)
+            {
                 // Existing element with default attributes
                 // Check if desc specifies non-default attributes
                 if desc.has_non_default_data_attributes() {
@@ -2817,7 +3283,7 @@ impl JsObject {
                     return self.ordinary_define_own_property(key, desc);
                 }
                 gc_write_barrier(&value);
-                self.elements.borrow_mut()[idx] = value;
+                self.elements.borrow_mut().set(idx, value);
             } else {
                 // Hole - create new element
                 if !self.flags.borrow().extensible {
@@ -2827,7 +3293,7 @@ impl JsObject {
                     return self.ordinary_define_own_property(key, desc);
                 }
                 gc_write_barrier(&value);
-                self.elements.borrow_mut()[idx] = value;
+                self.elements.borrow_mut().set(idx, value);
             }
         } else {
             // Beyond current elements
@@ -3245,6 +3711,16 @@ impl JsObject {
         self.flags.borrow().extensible
     }
 
+    pub fn array_length_writable(&self) -> bool {
+        self.flags.borrow().array_length_writable.unwrap_or(true)
+    }
+
+    pub fn is_proxy_pure_object(&self) -> bool {
+        // This is a placeholder since JsObject doesn't store is_proxy currently.
+        // In Otter, Proxies are Value::Proxy(GcRef<Proxy>).
+        false
+    }
+
     /// Mark this object as intrinsic (shared across contexts, protected from teardown clearing)
     pub fn mark_as_intrinsic(&self) {
         self.flags.borrow_mut().is_intrinsic = true;
@@ -3318,7 +3794,7 @@ impl JsObject {
         // This covers 99.9% of arrays.
         let elements = self.elements.borrow();
         if index < elements.len() {
-            let val = &elements[index];
+            let val = &elements.get(index).unwrap_or(Value::undefined());
             if !val.is_hole() {
                 return Some(val.clone());
             }
@@ -3347,7 +3823,7 @@ impl JsObject {
         let mut elements = self.elements.borrow_mut();
         if index < elements.len() {
             gc_write_barrier(&value);
-            elements[index] = value;
+            elements.set(index, value);
             return Ok(());
         }
         drop(elements);
@@ -3359,7 +3835,7 @@ impl JsObject {
             // Also update elements for when mapping is later removed
             let mut elements = self.elements.borrow_mut();
             if index < elements.len() {
-                elements[index] = value;
+                elements.set(index, value);
             }
             return Ok(());
         }
@@ -3367,7 +3843,7 @@ impl JsObject {
         let mut elements = self.elements.borrow_mut();
         if index < elements.len() {
             gc_write_barrier(&value);
-            elements[index] = value;
+            elements.set(index, value);
             return Ok(());
         }
 
@@ -3377,7 +3853,7 @@ impl JsObject {
             if index < MAX_DENSE_LENGTH {
                 gc_write_barrier(&value);
                 elements.resize(index + 1, Value::hole());
-                elements[index] = value;
+                elements.set(index, value);
                 self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
                 return Ok(());
             }
@@ -3402,7 +3878,7 @@ impl JsObject {
             "initialize_array_element expects preallocated dense storage"
         );
         if index < elements.len() {
-            elements[index] = value;
+            elements.set(index, value);
             return;
         }
         drop(elements);
@@ -3501,6 +3977,74 @@ impl JsObject {
         }
     }
 
+    pub fn array_shift(&self) -> Value {
+        let mut elements = self.elements.borrow_mut();
+        let val = elements.shift().unwrap_or(Value::undefined());
+        self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
+        if val.is_hole() {
+            Value::undefined()
+        } else {
+            val
+        }
+    }
+
+    pub fn array_unshift(&self, value: Value) -> usize {
+        gc_write_barrier(&value);
+        let mut elements = self.elements.borrow_mut();
+        elements.unshift(value);
+        let len = elements.len();
+        self.flags.borrow_mut().dense_array_length_hint = len as u32;
+        len
+    }
+
+    pub fn array_reverse(&self) {
+        let mut elements = self.elements.borrow_mut();
+        elements.reverse();
+    }
+
+    pub fn array_append_all(&self, other: &JsObject) {
+        let other_elements = other.elements.borrow();
+        let mut elements = self.elements.borrow_mut();
+        elements.append_all(&other_elements);
+        let len = elements.len();
+        self.flags.borrow_mut().dense_array_length_hint = len as u32;
+    }
+
+    pub fn array_splice(
+        &self,
+        start: usize,
+        delete_count: usize,
+        items: &[Value],
+        mm: &MemoryManager,
+    ) -> GcRef<JsObject> {
+        let mut elements = self.elements.borrow_mut();
+        let deleted_kind = elements.splice(start, delete_count, items);
+        let new_len = elements.len();
+        self.flags.borrow_mut().dense_array_length_hint = new_len as u32;
+
+        let deleted_obj = GcRef::new(JsObject::array(0));
+        {
+            let mut del_elements = deleted_obj.elements.borrow_mut();
+            *del_elements = deleted_kind;
+        }
+        deleted_obj.flags.borrow_mut().dense_array_length_hint =
+            deleted_obj.elements.borrow().len() as u32;
+        deleted_obj
+    }
+
+    pub fn array_copy_within(&self, to: usize, from: usize, count: usize) {
+        let mut elements = self.elements.borrow_mut();
+        elements.copy_within(to, from, count);
+    }
+
+    pub fn array_sort_with_comparator<F>(&self, compare: F)
+    where
+        F: FnMut(&Value, &Value) -> std::cmp::Ordering,
+    {
+        let mut elements = self.elements.borrow_mut();
+        elements.sort_with_comparator(compare);
+    }
+
     /// Get inline properties storage (for GC tracing)
     pub(crate) fn get_inline_properties_storage(
         &self,
@@ -3513,7 +4057,7 @@ impl JsObject {
         &self.overflow_properties
     }
 
-    pub(crate) fn get_elements_storage(&self) -> &ObjectCell<Vec<Value>> {
+    pub(crate) fn get_elements_storage(&self) -> &ObjectCell<ElementsKind> {
         &self.elements
     }
 

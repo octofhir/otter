@@ -483,6 +483,19 @@ pub fn init_array_prototype(
             let obj = this_val
                 .as_object()
                 .ok_or_else(|| "Array.prototype.push: this is not an object".to_string())?;
+
+            // Fast path for dense arrays
+            if obj.is_array() && obj.array_length_writable() && !obj.is_frozen() {
+                let mut len = 0;
+                for arg in args {
+                    len = obj.array_push(arg.clone());
+                }
+                if args.is_empty() {
+                    len = obj.array_length();
+                }
+                return Ok(Value::number(len as f64));
+            }
+
             let mut len = get_len(&obj);
             for arg in args {
                 let _ = obj.set(PropertyKey::Index(len as u32), arg.clone());
@@ -510,6 +523,12 @@ pub fn init_array_prototype(
             let obj = this_val
                 .as_object()
                 .ok_or_else(|| "Array.prototype.pop: this is not an object".to_string())?;
+
+            // Fast path for dense arrays
+            if obj.is_array() && obj.array_length_writable() && !obj.is_frozen() {
+                return Ok(obj.array_pop());
+            }
+
             let len = get_len(&obj);
             if len == 0 {
                 set_len(&obj, 0);
@@ -542,6 +561,12 @@ pub fn init_array_prototype(
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.shift: not an object".to_string())?;
+
+                // Fast path for dense arrays
+                if obj.is_array() && obj.array_length_writable() && !obj.is_frozen() {
+                    return Ok(obj.array_shift());
+                }
+
                 let len = get_len(&obj);
                 if len == 0 {
                     set_len(&obj, 0);
@@ -575,6 +600,19 @@ pub fn init_array_prototype(
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.unshift: not an object".to_string())?;
+
+                // Fast path for dense arrays
+                if obj.is_array() && obj.array_length_writable() && !obj.is_frozen() {
+                    let mut len = 0;
+                    for arg in args.iter().rev() {
+                        len = obj.array_unshift(arg.clone());
+                    }
+                    if args.is_empty() {
+                        len = obj.array_length();
+                    }
+                    return Ok(Value::number(len as f64));
+                }
+
                 let len = get_len(&obj);
                 let arg_count = args.len();
                 // Shift existing elements right
@@ -743,6 +781,29 @@ pub fn init_array_prototype(
                         }
                     })
                     .unwrap_or_else(|| ",".to_string());
+
+                // Fast path for dense arrays
+                if obj.is_array() && !obj.is_dictionary_mode() {
+                    let elements = obj.elements.borrow();
+                    let mut parts = Vec::with_capacity(len.min(1024));
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        let val_opt = elements.get(i as usize);
+                        if let Some(val) = val_opt {
+                            if val.is_undefined() || val.is_null() || val.is_hole() {
+                                parts.push(String::new());
+                            } else {
+                                parts.push(ncx.to_string_value(&val)?);
+                            }
+                        } else {
+                            parts.push(String::new());
+                        }
+                    }
+                    return Ok(Value::string(JsString::intern(&parts.join(&sep))));
+                }
+
                 // Don't pre-allocate with huge lengths (sparse arrays can have
                 // length up to 2^32-1 but only a few actual elements).
                 let mut parts = Vec::with_capacity(len.min(1024));
@@ -775,6 +836,30 @@ pub fn init_array_prototype(
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.toString: not an object".to_string())?;
+
+                // Fast path for dense arrays
+                if obj.is_array() && !obj.is_dictionary_mode() {
+                    let len = get_len(&obj);
+                    let elements = obj.elements.borrow();
+                    let mut parts = Vec::with_capacity(len.min(1024));
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        let val_opt = elements.get(i as usize);
+                        if let Some(val) = val_opt {
+                            if val.is_undefined() || val.is_null() || val.is_hole() {
+                                parts.push(String::new());
+                            } else {
+                                parts.push(ncx.to_string_value(&val)?);
+                            }
+                        } else {
+                            parts.push(String::new());
+                        }
+                    }
+                    return Ok(Value::string(JsString::intern(&parts.join(","))));
+                }
+
                 let len = get_len(&obj);
                 let mut parts = Vec::with_capacity(len.min(1024));
                 for i in 0..len {
@@ -839,7 +924,6 @@ pub fn init_array_prototype(
         )),
     );
 
-    // Array.prototype.slice
     arr_proto.define_property(
         PropertyKey::string("slice"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
@@ -847,7 +931,8 @@ pub fn init_array_prototype(
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.slice: not an object".to_string())?;
-                let len = get_len(&obj) as i64;
+                let len_val = get_len(&obj);
+                let len = len_val as i64;
                 let start = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i64;
                 let end = args
                     .get(1)
@@ -871,6 +956,15 @@ pub fn init_array_prototype(
                 } as usize;
                 let count = if to > from { to - from } else { 0 };
                 let result = array_species_create(&obj, count, ncx)?;
+
+                // Fast path for dense arrays
+                if obj.is_array() && result.is_array() && !obj.is_dictionary_mode() {
+                    let new_elements = obj.elements.borrow().slice(from, to);
+                    *result.elements.borrow_mut() = new_elements;
+                    result.flags.borrow_mut().dense_array_length_hint = count as u32;
+                    return Ok(Value::array(result));
+                }
+
                 for i in 0..count {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -907,17 +1001,21 @@ pub fn init_array_prototype(
                 let mut idx: u32 = 0;
                 // Copy elements from this (preserve holes)
                 {
-                    let len = get_len(&this_obj);
-                    for i in 0..len {
-                        if i & 0x3FF == 0 {
-                            ncx.check_for_interrupt()?;
+                    if this_obj.is_array() && !this_obj.is_dictionary_mode() && result.is_array() {
+                        result.array_append_all(&this_obj);
+                        idx += get_len(&this_obj) as u32;
+                    } else {
+                        let len = get_len(&this_obj);
+                        for i in 0..len {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if this_obj.has(&PropertyKey::Index(i as u32)) {
+                                let val = get_value(&this_obj, &PropertyKey::Index(i as u32), ncx)?;
+                                let _ = result.set(PropertyKey::Index(idx), val);
+                            }
+                            idx += 1;
                         }
-                        if this_obj.has(&PropertyKey::Index(i as u32)) {
-                            let val = js_get(&this_obj, &PropertyKey::Index(i as u32), ncx)?;
-                            let _ = result.set(PropertyKey::Index(idx), val);
-                        }
-                        // else: hole — leave result[idx] as hole
-                        idx += 1;
                     }
                 }
                 // Copy elements from each argument
@@ -942,16 +1040,21 @@ pub fn init_array_prototype(
 
                     if spreadable {
                         let arr = arg.as_object().unwrap();
-                        let len = get_len(&arr);
-                        for i in 0..len {
-                            if i & 0x3FF == 0 {
-                                ncx.check_for_interrupt()?;
+                        if arr.is_array() && !arr.is_dictionary_mode() && result.is_array() {
+                            result.array_append_all(&arr);
+                            idx += get_len(&arr) as u32;
+                        } else {
+                            let len = get_len(&arr);
+                            for i in 0..len {
+                                if i & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                if arr.has(&PropertyKey::Index(i as u32)) {
+                                    let val = get_value(&arr, &PropertyKey::Index(i as u32), ncx)?;
+                                    let _ = result.set(PropertyKey::Index(idx), val);
+                                }
+                                idx += 1;
                             }
-                            if arr.has(&PropertyKey::Index(i as u32)) {
-                                let val = get_value(&arr, &PropertyKey::Index(i as u32), ncx)?;
-                                let _ = result.set(PropertyKey::Index(idx), val);
-                            }
-                            idx += 1;
                         }
                     } else {
                         // Non-spreadable: push as single element
@@ -981,6 +1084,17 @@ pub fn init_array_prototype(
                 let obj = this_val
                     .as_object()
                     .ok_or_else(|| "Array.prototype.reverse: not an object".to_string())?;
+
+                // Fast path for dense arrays
+                if obj.is_array()
+                    && obj.array_length_writable()
+                    && !obj.is_frozen()
+                    && !obj.is_dictionary_mode()
+                {
+                    obj.array_reverse();
+                    return Ok(this_val.clone());
+                }
+
                 let len = get_len(&obj);
                 let mut lo = 0usize;
                 let mut hi = if len > 0 { len - 1 } else { 0 };
@@ -1117,6 +1231,35 @@ pub fn init_array_prototype(
                     .map(|n| (n as i64).max(0).min(len - actual_start as i64) as usize)
                     .unwrap_or((len - actual_start as i64).max(0) as usize);
                 let items = if args.len() > 2 { &args[2..] } else { &[] };
+                let item_count = items.len();
+                let ulen = len as usize;
+
+                // Fast-path for dense arrays
+                if obj.is_array()
+                    && !obj.is_dictionary_mode()
+                    && !obj.is_frozen()
+                    && obj.array_length_writable()
+                {
+                    // Check if it's a "standard" array (default constructor/species)
+                    let ctor = obj.get(&PropertyKey::string("constructor"));
+                    let is_standard = match ctor {
+                        Some(c_val) => ncx
+                            .global()
+                            .get(&PropertyKey::string("Array"))
+                            .map_or(false, |array_ctor| c_val == array_ctor),
+                        None => true,
+                    };
+
+                    if is_standard {
+                        let removed = obj.array_splice(
+                            actual_start,
+                            delete_count,
+                            items,
+                            ncx.memory_manager(),
+                        );
+                        return Ok(Value::array(removed));
+                    }
+                }
 
                 // Collect removed elements
                 let removed = array_species_create(&obj, delete_count, ncx)?;
@@ -1128,9 +1271,6 @@ pub fn init_array_prototype(
                     let _ = removed.set(PropertyKey::Index(i as u32), val);
                 }
                 set_len(&removed, delete_count);
-
-                let item_count = items.len();
-                let ulen = len as usize;
 
                 if item_count < delete_count {
                     // Shift elements left
@@ -1873,18 +2013,37 @@ pub fn init_array_prototype(
                 let mut concrete: Vec<Value> = Vec::with_capacity(len.min(1024));
                 let mut num_undefineds: usize = 0;
                 let mut num_holes: usize = 0;
-                for i in 0..len {
-                    if i & 0x3FF == 0 {
-                        ncx.check_for_interrupt()?;
-                    }
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
-                        num_holes += 1;
-                    } else {
-                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                        if val.is_undefined() {
+
+                let mut handled = false;
+                if obj.is_array() && !obj.is_dictionary_mode() && !obj.is_sparse() {
+                    let elements = obj.elements.borrow();
+                    for i in 0..elements.len() {
+                        let val = elements.get(i).unwrap_or(Value::hole());
+                        if val.is_hole() {
+                            num_holes += 1;
+                        } else if val.is_undefined() {
                             num_undefineds += 1;
                         } else {
                             concrete.push(val);
+                        }
+                    }
+                    handled = true;
+                }
+
+                if !handled {
+                    for i in 0..len {
+                        if i & 0x3FF == 0 {
+                            ncx.check_for_interrupt()?;
+                        }
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                            num_holes += 1;
+                        } else {
+                            let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                            if val.is_undefined() {
+                                num_undefineds += 1;
+                            } else {
+                                concrete.push(val);
+                            }
                         }
                     }
                 }
@@ -1933,16 +2092,35 @@ pub fn init_array_prototype(
 
                 // Write back: sorted values, then undefineds, then delete holes
                 let mut idx = 0usize;
-                for val in concrete {
-                    let _ = obj.set(PropertyKey::Index(idx as u32), val);
-                    idx += 1;
+                let mut written = false;
+                if obj.is_array() && !obj.is_dictionary_mode() && !obj.is_sparse() {
+                    let mut elements = obj.elements.borrow_mut();
+                    for val in &concrete {
+                        elements.set(idx, val.clone());
+                        idx += 1;
+                    }
+                    for _ in 0..num_undefineds {
+                        elements.set(idx, Value::undefined());
+                        idx += 1;
+                    }
+                    for i in idx..len {
+                        elements.set(i, Value::hole());
+                    }
+                    written = true;
                 }
-                for _ in 0..num_undefineds {
-                    let _ = obj.set(PropertyKey::Index(idx as u32), Value::undefined());
-                    idx += 1;
-                }
-                for i in idx..len {
-                    obj.delete(&PropertyKey::Index(i as u32));
+
+                if !written {
+                    for val in concrete {
+                        let _ = obj.set(PropertyKey::Index(idx as u32), val);
+                        idx += 1;
+                    }
+                    for _ in 0..num_undefineds {
+                        let _ = obj.set(PropertyKey::Index(idx as u32), Value::undefined());
+                        idx += 1;
+                    }
+                    for i in idx..len {
+                        obj.delete(&PropertyKey::Index(i as u32));
+                    }
                 }
                 Ok(this_val.clone())
             },
@@ -1991,6 +2169,19 @@ pub fn init_array_prototype(
                     end.min(len)
                 } as usize;
                 let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
+                let ulen = len as usize;
+
+                // Fast-path for dense arrays
+                if obj.is_array()
+                    && !obj.is_dictionary_mode()
+                    && !obj.is_frozen()
+                    && obj.array_length_writable()
+                    && from + count <= ulen
+                    && to + count <= ulen
+                {
+                    obj.array_copy_within(to, from, count);
+                    return Ok(this_val.clone());
+                }
 
                 // Copy in correct direction to handle overlapping
                 if from < to && to < from + count {

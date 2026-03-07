@@ -57,6 +57,17 @@ This separation:
 - Makes it easy to find the right implementation
 - Maintains consistency across modules
 
+### Intrinsic Registration Pattern
+
+New ECMAScript builtins, global namespaces, and Web API globals must follow the
+trait-based intrinsic registration flow used in `crates/otter-vm-core/src/builtin_builder.rs`.
+
+- Expose exactly one module entrypoint: `pub struct XIntrinsic` or `pub struct XNamespace` implementing `IntrinsicObject`.
+- In `Intrinsics::init_core()` and `Intrinsics::install_on_global()`, only dispatch `IntrinsicObject::init(&ctx)` calls. Do not add ad-hoc property definitions or object construction there.
+- Use `BuiltInBuilder` for constructor/prototype pairs and `NamespaceBuilder` for plain namespace objects.
+- If a module needs helper functions, keep them module-private and use names like `build_*`, `populate_*`, or `define_*`. Do not introduce new public `install_*` / `init_*` registration entrypoints.
+- If the builtin needs pre-allocated intrinsic objects, add them to `Intrinsics::allocate()`, wire their prototype chain in `Intrinsics::wire_prototype_chains()`, and populate them from the owning module's `IntrinsicObject::init()`.
+
 ## Development Philosophy
 
 - **Production-ready code**: No premature micro-optimizations. Write clean, idiomatic Rust first.

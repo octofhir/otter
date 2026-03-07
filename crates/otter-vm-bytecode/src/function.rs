@@ -83,15 +83,19 @@ pub enum InlineCacheState {
     Monomorphic {
         /// The shape identifier of the cached object
         shape_id: u64,
-        /// The offset into the object's properties
+        /// The shape identifier of the prototype (0 if on receiver)
+        proto_shape_id: u64,
+        /// Prototype chain depth (0 meaning no hop, on receiver)
+        depth: u8,
+        /// The offset into the object's (or prototype's) properties
         offset: u32,
     },
     /// Polymorphic state: multiple shapes and offsets cached (up to 4)
     Polymorphic {
         /// Number of cached entries (1-4)
         count: u8,
-        /// Array of (shape_id, offset) pairs
-        entries: [(u64, u32); 4],
+        /// Array of (shape_id, proto_shape_id, depth, offset)
+        entries: [(u64, u64, u8, u32); 4],
     },
     /// Megamorphic state: too many shapes seen, fallback to slow path
     Megamorphic,
@@ -279,7 +283,12 @@ impl InstructionMetadata {
 
     /// Transition IC to monomorphic state
     pub fn transition_to_monomorphic(&mut self, shape_id: u64, offset: u32) {
-        self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
+        self.ic_state = InlineCacheState::Monomorphic {
+            shape_id,
+            proto_shape_id: 0,
+            depth: 0,
+            offset,
+        };
     }
 
     /// Transition IC to monomorphic state with proto epoch
@@ -289,7 +298,12 @@ impl InstructionMetadata {
         offset: u32,
         proto_epoch: u64,
     ) {
-        self.ic_state = InlineCacheState::Monomorphic { shape_id, offset };
+        self.ic_state = InlineCacheState::Monomorphic {
+            shape_id,
+            proto_shape_id: 0,
+            depth: 0,
+            offset,
+        };
         self.proto_epoch = proto_epoch;
     }
 

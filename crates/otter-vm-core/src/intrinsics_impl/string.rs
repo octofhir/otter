@@ -154,7 +154,9 @@ impl IntrinsicObject for StringIntrinsic {
                             if let PropertyKey::Index(i) = key {
                                 let elements = obj.elements.borrow();
                                 if (*i as usize) < elements.len() {
-                                    return Ok(elements[*i as usize].clone());
+                                    return Ok(elements
+                                        .get(*i as usize)
+                                        .unwrap_or(Value::undefined()));
                                 }
                             }
                             Ok(Value::undefined())

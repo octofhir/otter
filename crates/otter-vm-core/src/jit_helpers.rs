@@ -281,41 +281,74 @@ extern "C" fn otter_rt_get_prop_const(
     // IC fast path — extract offset from IC state, then read property.
     // If the shape matches the IC entry, the object is guaranteed not in
     // dictionary mode (dictionary transitions invalidate shape-based IC).
-    let cached_offset: Option<u32> = match &ic.ic_state {
-        InlineCacheState::Monomorphic { shape_id, offset } => {
+    let mut cached_val = None;
+    match &mut ic.ic_state {
+        InlineCacheState::Monomorphic {
+            shape_id,
+            proto_shape_id,
+            depth,
+            offset,
+        } => {
             if obj_shape_ptr == *shape_id {
-                Some(*offset)
-            } else {
-                None
-            }
-        }
-        InlineCacheState::Polymorphic { count, entries } => {
-            let mut found = None;
-            for i in 0..(*count as usize) {
-                if obj_shape_ptr == entries[i].0 {
-                    found = Some(entries[i].1);
-                    break;
-                }
-            }
-            found
-        }
-        _ => None,
-    };
-
-    if let Some(offset) = cached_offset {
-        if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
-            ic.record_hit();
-            // MRU reordering for polymorphic
-            if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
-                for i in 1..(*count as usize) {
-                    if obj_shape_ptr == entries[i].0 {
-                        entries.swap(0, i);
-                        break;
+                if *depth == 0 {
+                    cached_val = unsafe { obj_ref.get_by_offset_unchecked(*offset as usize) };
+                } else {
+                    let mut current = obj_ref;
+                    let mut valid = true;
+                    for _ in 0..*depth {
+                        if let Some(proto) = current.prototype().as_object() {
+                            current = unsafe { &*(&*proto as *const _) };
+                        } else {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if valid && current.shape_ptr_raw() == *proto_shape_id {
+                        cached_val = unsafe { current.get_by_offset_unchecked(*offset as usize) };
                     }
                 }
             }
-            return val.to_jit_bits();
         }
+        InlineCacheState::Polymorphic { count, entries } => {
+            for i in 0..(*count as usize) {
+                if obj_shape_ptr == entries[i].0 {
+                    let proto_shape_id = entries[i].1;
+                    let depth = entries[i].2;
+                    let offset = entries[i].3;
+
+                    if depth == 0 {
+                        cached_val = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) };
+                    } else {
+                        let mut current = obj_ref;
+                        let mut valid = true;
+                        for _ in 0..depth {
+                            if let Some(proto) = current.prototype().as_object() {
+                                current = unsafe { &*(&*proto as *const _) };
+                            } else {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if valid && current.shape_ptr_raw() == proto_shape_id {
+                            cached_val =
+                                unsafe { current.get_by_offset_unchecked(offset as usize) };
+                        }
+                    }
+
+                    // MRU: promote to front
+                    if i > 0 && cached_val.is_some() {
+                        entries.swap(0, i);
+                    }
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(val) = cached_val {
+        ic.record_hit();
+        return val.to_jit_bits();
     }
 
     let Some(name_str) = (unsafe { resolve_constant_string(ctx, name_idx) }) else {
@@ -325,24 +358,50 @@ extern "C" fn otter_rt_get_prop_const(
 
     // Slow path on IC miss: resolve by shape offset and update IC.
     if !obj_ref.is_dictionary_mode() {
-        if let Some(offset) = obj_ref.shape_get_offset(&key) {
+        let mut current_obj = Some(obj_ref);
+        let mut depth = 0;
+        let mut found_offset = None;
+        let mut found_shape = 0;
+
+        while let Some(obj) = current_obj.take() {
+            if obj.is_dictionary_mode() {
+                break;
+            }
+            if let Some(offset) = obj.shape_get_offset(&key) {
+                found_offset = Some(offset);
+                found_shape = obj.shape_ptr_raw();
+                break;
+            }
+            if let Some(proto) = obj.prototype().as_object() {
+                current_obj = Some(unsafe { &*(&*proto as *const _) });
+                depth += 1;
+            }
+        }
+
+        if let Some(offset) = found_offset {
             let current_epoch = ctx.proto_epoch;
+            let proto_shape_id = if depth > 0 { found_shape } else { 0 };
+
             match &mut ic.ic_state {
                 InlineCacheState::Uninitialized => {
                     ic.ic_state = InlineCacheState::Monomorphic {
                         shape_id: obj_shape_ptr,
+                        proto_shape_id,
+                        depth,
                         offset: offset as u32,
                     };
                     ic.proto_epoch = current_epoch;
                 }
                 InlineCacheState::Monomorphic {
                     shape_id: old_shape,
+                    proto_shape_id: old_proto_shape,
+                    depth: old_depth,
                     offset: old_offset,
                 } => {
                     if *old_shape != obj_shape_ptr {
-                        let mut entries = [(0u64, 0u32); 4];
-                        entries[0] = (*old_shape, *old_offset);
-                        entries[1] = (obj_shape_ptr, offset as u32);
+                        let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                        entries[0] = (*old_shape, *old_proto_shape, *old_depth, *old_offset);
+                        entries[1] = (obj_shape_ptr, proto_shape_id, depth, offset as u32);
                         ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                         ic.proto_epoch = current_epoch;
                     }
@@ -357,7 +416,8 @@ extern "C" fn otter_rt_get_prop_const(
                     }
                     if !found {
                         if (*count as usize) < 4 {
-                            entries[*count as usize] = (obj_shape_ptr, offset as u32);
+                            entries[*count as usize] =
+                                (obj_shape_ptr, proto_shape_id, depth, offset as u32);
                             *count += 1;
                             ic.proto_epoch = current_epoch;
                         } else {
@@ -367,7 +427,15 @@ extern "C" fn otter_rt_get_prop_const(
                 }
                 _ => {}
             }
-            if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
+
+            // Read value back
+            let mut current = obj_ref;
+            for _ in 0..depth {
+                if let Some(proto) = current.prototype().as_object() {
+                    current = unsafe { &*(&*proto as *const _) };
+                }
+            }
+            if let Some(val) = unsafe { current.get_by_offset_unchecked(offset as usize) } {
                 return val.to_jit_bits();
             }
         }
@@ -454,7 +522,9 @@ extern "C" fn otter_rt_set_prop_const(
     // IC fast path — extract offset, then write.
     // Shape match implies object is not in dictionary mode.
     let cached_offset: Option<u32> = match &ic.ic_state {
-        InlineCacheState::Monomorphic { shape_id, offset } => {
+        InlineCacheState::Monomorphic {
+            shape_id, offset, ..
+        } => {
             if obj_shape_ptr == *shape_id {
                 Some(*offset)
             } else {
@@ -465,7 +535,7 @@ extern "C" fn otter_rt_set_prop_const(
             let mut found = None;
             for i in 0..(*count as usize) {
                 if obj_shape_ptr == entries[i].0 {
-                    found = Some(entries[i].1);
+                    found = Some(entries[i].3);
                     break;
                 }
             }
@@ -506,6 +576,8 @@ extern "C" fn otter_rt_set_prop_const(
                 InlineCacheState::Uninitialized => {
                     ic.ic_state = InlineCacheState::Monomorphic {
                         shape_id: obj_shape_ptr,
+                        proto_shape_id: 0,
+                        depth: 0,
                         offset: offset as u32,
                     };
                     ic.proto_epoch = current_epoch;
@@ -513,11 +585,12 @@ extern "C" fn otter_rt_set_prop_const(
                 InlineCacheState::Monomorphic {
                     shape_id: old_shape,
                     offset: old_offset,
+                    ..
                 } => {
                     if *old_shape != obj_shape_ptr {
-                        let mut entries = [(0u64, 0u32); 4];
-                        entries[0] = (*old_shape, *old_offset);
-                        entries[1] = (obj_shape_ptr, offset as u32);
+                        let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                        entries[0] = (*old_shape, 0, 0, *old_offset);
+                        entries[1] = (obj_shape_ptr, 0, 0, offset as u32);
                         ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                         ic.proto_epoch = current_epoch;
                     }
@@ -532,7 +605,7 @@ extern "C" fn otter_rt_set_prop_const(
                     }
                     if !found {
                         if (*count as usize) < 4 {
-                            entries[*count as usize] = (obj_shape_ptr, offset as u32);
+                            entries[*count as usize] = (obj_shape_ptr, 0, 0, offset as u32);
                             *count += 1;
                             ic.proto_epoch = current_epoch;
                         } else {
@@ -1010,6 +1083,7 @@ extern "C" fn otter_rt_get_global(ctx_raw: i64, name_idx: i64, ic_idx: i64) -> i
             if let InlineCacheState::Monomorphic {
                 shape_id: shape_addr,
                 offset,
+                ..
             } = &ic.ic_state
             {
                 if global_obj.shape_ptr_raw() == *shape_addr {
@@ -1407,8 +1481,8 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
         if let Some(n) = idx_val.as_int32() {
             if n >= 0 {
                 let elements = obj_ref.get_elements_storage().borrow();
-                if (n as usize) < elements.len() {
-                    return elements[n as usize].to_jit_bits();
+                if let Some(v) = elements.get(n as usize) {
+                    return v.to_jit_bits();
                 }
             }
         }
@@ -1431,7 +1505,9 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
             if ic.proto_epoch_matches(ctx.proto_epoch) {
                 let cached_offset = match &ic.ic_state {
-                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                    InlineCacheState::Monomorphic {
+                        shape_id, offset, ..
+                    } => {
                         if obj_shape_ptr == *shape_id {
                             Some(*offset)
                         } else {
@@ -1442,7 +1518,7 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
                         let mut found = None;
                         for i in 0..(*count as usize) {
                             if obj_shape_ptr == entries[i].0 {
-                                found = Some(entries[i].1);
+                                found = Some(entries[i].3);
                                 break;
                             }
                         }
@@ -1506,7 +1582,7 @@ extern "C" fn otter_rt_set_elem(
                 let mut elements = obj_ref.get_elements_storage().borrow_mut();
                 let idx = n as usize;
                 if idx < elements.len() {
-                    elements[idx] = write_val;
+                    elements.set(idx, write_val);
                     return 0;
                 } else if idx == elements.len() {
                     elements.push(write_val);
@@ -1541,7 +1617,9 @@ extern "C" fn otter_rt_set_elem(
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
             if ic.proto_epoch_matches(ctx.proto_epoch) {
                 let cached_offset = match &ic.ic_state {
-                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                    InlineCacheState::Monomorphic {
+                        shape_id, offset, ..
+                    } => {
                         if obj_shape_ptr == *shape_id {
                             Some(*offset)
                         } else {
@@ -1552,7 +1630,7 @@ extern "C" fn otter_rt_set_elem(
                         let mut found = None;
                         for i in 0..(*count as usize) {
                             if obj_shape_ptr == entries[i].0 {
-                                found = Some(entries[i].1);
+                                found = Some(entries[i].3);
                                 break;
                             }
                         }
@@ -1834,7 +1912,9 @@ extern "C" fn otter_rt_call_method(
             if !obj_ref.is_dictionary_mode() && ic.proto_epoch_matches(ctx.proto_epoch) {
                 let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
                 let cached_offset = match &mut ic.ic_state {
-                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                    InlineCacheState::Monomorphic {
+                        shape_id, offset, ..
+                    } => {
                         if obj_shape_ptr == *shape_id {
                             Some(*offset)
                         } else {
@@ -1845,7 +1925,7 @@ extern "C" fn otter_rt_call_method(
                         let mut found = None;
                         for i in 0..(*count as usize) {
                             if obj_shape_ptr == entries[i].0 {
-                                found = Some(entries[i].1);
+                                found = Some(entries[i].3);
                                 // MRU reordering
                                 if i > 0 {
                                     entries.swap(0, i);
@@ -1874,6 +1954,8 @@ extern "C" fn otter_rt_call_method(
                         InlineCacheState::Uninitialized => {
                             ic.ic_state = InlineCacheState::Monomorphic {
                                 shape_id: shape_ptr,
+                                proto_shape_id: 0,
+                                depth: 0,
                                 offset: offset as u32,
                             };
                             ic.proto_epoch = current_epoch;
@@ -1881,11 +1963,12 @@ extern "C" fn otter_rt_call_method(
                         InlineCacheState::Monomorphic {
                             shape_id: old_shape,
                             offset: old_offset,
+                            ..
                         } => {
                             if *old_shape != shape_ptr {
-                                let mut entries = [(0u64, 0u32); 4];
-                                entries[0] = (*old_shape, *old_offset);
-                                entries[1] = (shape_ptr, offset as u32);
+                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                entries[0] = (*old_shape, 0, 0, *old_offset);
+                                entries[1] = (shape_ptr, 0, 0, offset as u32);
                                 ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                                 ic.proto_epoch = current_epoch;
                             }
@@ -1900,7 +1983,7 @@ extern "C" fn otter_rt_call_method(
                             }
                             if !found {
                                 if (*count as usize) < 4 {
-                                    entries[*count as usize] = (shape_ptr, offset as u32);
+                                    entries[*count as usize] = (shape_ptr, 0, 0, offset as u32);
                                     *count += 1;
                                     ic.proto_epoch = current_epoch;
                                 } else {

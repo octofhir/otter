@@ -591,7 +591,7 @@ impl Trace for crate::object::JsObject {
             let elements = self.get_elements_storage();
             let elems = elements.borrow();
             for value in elems.iter() {
-                tracer.mark_value(value);
+                tracer.mark_value(&value);
             }
         }
 

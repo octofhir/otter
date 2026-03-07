@@ -2119,7 +2119,13 @@ pub fn translate_function_with_constants(
 
                 // Try monomorphic fast path based on compile-time IC snapshot
                 let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
-                    if let InlineCacheState::Monomorphic { shape_id, offset } = ic {
+                    if let InlineCacheState::Monomorphic {
+                        shape_id,
+                        offset,
+                        depth: 0,
+                        ..
+                    } = ic
+                    {
                         Some((*shape_id, *offset))
                     } else {
                         None
@@ -2164,7 +2170,13 @@ pub fn translate_function_with_constants(
                 let obj_val = read_local(builder, &local_vars, *local_idx);
 
                 let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
-                    if let InlineCacheState::Monomorphic { shape_id, offset } = ic {
+                    if let InlineCacheState::Monomorphic {
+                        shape_id,
+                        offset,
+                        depth: 0,
+                        ..
+                    } = ic
+                    {
                         Some((*shape_id, *offset))
                     } else {
                         None

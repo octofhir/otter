@@ -2882,6 +2882,7 @@ impl Interpreter {
                             if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                 shape_id: shape_addr,
                                 offset,
+                                ..
                             } = &ic.ic_state
                             {
                                 if global_obj.shape_ptr_raw() == *shape_addr {
@@ -2936,6 +2937,8 @@ impl Interpreter {
                                         otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                             shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
                                                 as u64,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                 }
@@ -3011,6 +3014,7 @@ impl Interpreter {
                             if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                 shape_id: shape_addr,
                                 offset,
+                                ..
                             } = &ic.ic_state
                             {
                                 if global_obj.shape_ptr_raw() == *shape_addr {
@@ -3076,6 +3080,8 @@ impl Interpreter {
                                         otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                             shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
                                                 as u64,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                 }
@@ -3792,7 +3798,9 @@ impl Interpreter {
 
                         if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                             match &mut ic.ic_state {
-                                InlineCacheState::Monomorphic { shape_id, offset } => {
+                                InlineCacheState::Monomorphic {
+                                    shape_id, offset, ..
+                                } => {
                                     if obj_shape_ptr == *shape_id {
                                         cached_proto = right_obj.get_by_offset(*offset as usize);
                                     }
@@ -3801,7 +3809,7 @@ impl Interpreter {
                                     for i in 0..(*count as usize) {
                                         if obj_shape_ptr == entries[i].0 {
                                             cached_proto =
-                                                right_obj.get_by_offset(entries[i].1 as usize);
+                                                right_obj.get_by_offset(entries[i].3 as usize);
                                             // MRU: promote to front
                                             if i > 0 {
                                                 entries.swap(0, i);
@@ -3845,6 +3853,8 @@ impl Interpreter {
                                     InlineCacheState::Uninitialized => {
                                         ic.ic_state = InlineCacheState::Monomorphic {
                                             shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                         ic.proto_epoch = current_epoch;
@@ -3852,11 +3862,12 @@ impl Interpreter {
                                     InlineCacheState::Monomorphic {
                                         shape_id: old_shape,
                                         offset: old_offset,
+                                        ..
                                     } => {
                                         if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u32); 4];
-                                            entries[0] = (*old_shape, *old_offset);
-                                            entries[1] = (shape_ptr, offset as u32);
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
                                             ic.ic_state =
                                                 InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
@@ -3873,7 +3884,7 @@ impl Interpreter {
                                         if !found {
                                             if (*count as usize) < 4 {
                                                 entries[*count as usize] =
-                                                    (shape_ptr, offset as u32);
+                                                    (shape_ptr, 0, 0, offset as u32);
                                                 *count += 1;
                                                 ic.proto_epoch = current_epoch;
                                             } else {
@@ -4880,6 +4891,7 @@ impl Interpreter {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
                             offset,
+                            ..
                         } = &ic.ic_state
                         {
                             if obj_ref.shape_ptr_raw() == *shape_addr {
@@ -4974,6 +4986,8 @@ impl Interpreter {
                                     InlineCacheState::Uninitialized => {
                                         ic.ic_state = InlineCacheState::Monomorphic {
                                             shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                         ic.proto_epoch = current_epoch;
@@ -4981,11 +4995,12 @@ impl Interpreter {
                                     InlineCacheState::Monomorphic {
                                         shape_id: old_shape,
                                         offset: old_offset,
+                                        ..
                                     } => {
                                         if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u32); 4];
-                                            entries[0] = (*old_shape, *old_offset);
-                                            entries[1] = (shape_ptr, offset as u32);
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
                                             ic.ic_state =
                                                 InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
@@ -5002,7 +5017,7 @@ impl Interpreter {
                                         if !found {
                                             if (*count as usize) < 4 {
                                                 entries[*count as usize] =
-                                                    (shape_ptr, offset as u32);
+                                                    (shape_ptr, 0, 0, offset as u32);
                                                 *count += 1;
                                                 ic.proto_epoch = current_epoch;
                                             } else {
@@ -5256,6 +5271,8 @@ impl Interpreter {
                                 ic.ic_state =
                                     otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                         shape_id: obj_ref.shape_ptr_raw(),
+                                        proto_shape_id: 0,
+                                        depth: 0,
                                         offset: offset as u32,
                                     };
                             }
@@ -5916,21 +5933,76 @@ impl Interpreter {
 
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
-                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    InlineCacheState::Monomorphic {
+                                        shape_id,
+                                        proto_shape_id,
+                                        depth,
+                                        offset,
+                                    } => {
                                         if obj_shape_ptr == *shape_id {
-                                            cached_val = obj_ref.get_by_offset(*offset as usize);
+                                            if *depth == 0 {
+                                                cached_val =
+                                                    obj_ref.get_by_offset(*offset as usize);
+                                            } else {
+                                                let mut current = obj_ref.clone();
+                                                let mut valid = true;
+                                                for _ in 0..*depth {
+                                                    if let Some(proto) =
+                                                        current.prototype().as_object()
+                                                    {
+                                                        current = proto.clone();
+                                                    } else {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if valid
+                                                    && current.shape_ptr_raw() == *proto_shape_id
+                                                {
+                                                    cached_val =
+                                                        current.get_by_offset(*offset as usize);
+                                                }
+                                            }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                cached_val =
-                                                    obj_ref.get_by_offset(entries[i].1 as usize);
+                                                let proto_shape_id = entries[i].1;
+                                                let depth = entries[i].2;
+                                                let offset = entries[i].3;
+
+                                                if depth == 0 {
+                                                    cached_val =
+                                                        obj_ref.get_by_offset(offset as usize);
+                                                } else {
+                                                    let mut current = obj_ref.clone();
+                                                    let mut valid = true;
+                                                    for _ in 0..depth {
+                                                        if let Some(proto) =
+                                                            current.prototype().as_object()
+                                                        {
+                                                            current = proto.clone();
+                                                        } else {
+                                                            valid = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if valid
+                                                        && current.shape_ptr_raw() == proto_shape_id
+                                                    {
+                                                        cached_val =
+                                                            current.get_by_offset(offset as usize);
+                                                    }
+                                                }
+
                                                 // MRU: promote to front
-                                                if i > 0 {
+                                                if i > 0 && cached_val.is_some() {
                                                     entries.swap(0, i);
                                                 }
-                                                break;
+                                                if cached_val.is_some() {
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -5981,7 +6053,27 @@ impl Interpreter {
                             // Slow path: full lookup and IC update
                             // Skip IC for dictionary mode objects
                             if !obj_ref.is_dictionary_mode() {
-                                if let Some(offset) = obj_ref.shape_get_offset(&key) {
+                                let mut current_obj = Some(obj_ref.clone());
+                                let mut depth = 0;
+                                let mut found_offset = None;
+                                let mut found_shape = 0;
+
+                                while let Some(obj) = current_obj.take() {
+                                    if obj.is_dictionary_mode() {
+                                        break; // Invalidate caching if any proto is dict mode
+                                    }
+                                    if let Some(offset) = obj.shape_get_offset(&key) {
+                                        found_offset = Some(offset);
+                                        found_shape = obj.shape_ptr_raw();
+                                        break;
+                                    }
+                                    if let Some(proto) = obj.prototype().as_object() {
+                                        current_obj = Some(proto.clone());
+                                        depth += 1;
+                                    }
+                                }
+
+                                if let Some(offset) = found_offset {
                                     let frame = ctx
                                         .current_frame()
                                         .ok_or_else(|| VmError::internal("no frame"))?;
@@ -5993,24 +6085,40 @@ impl Interpreter {
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = obj_ref.shape_ptr_raw();
+                                        let proto_shape_id =
+                                            if depth > 0 { found_shape } else { 0 };
                                         let current_epoch = ctx.cached_proto_epoch;
 
                                         match &mut ic.ic_state {
                                             InlineCacheState::Uninitialized => {
                                                 ic.ic_state = InlineCacheState::Monomorphic {
                                                     shape_id: shape_ptr,
+                                                    proto_shape_id: 0,
+                                                    depth: 0,
                                                     offset: offset as u32,
                                                 };
                                                 ic.proto_epoch = current_epoch;
                                             }
                                             InlineCacheState::Monomorphic {
                                                 shape_id: old_shape,
+                                                proto_shape_id: old_proto_shape,
+                                                depth: old_depth,
                                                 offset: old_offset,
                                             } => {
                                                 if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u32); 4];
-                                                    entries[0] = (*old_shape, *old_offset);
-                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                                    entries[0] = (
+                                                        *old_shape,
+                                                        *old_proto_shape,
+                                                        *old_depth,
+                                                        *old_offset,
+                                                    );
+                                                    entries[1] = (
+                                                        shape_ptr,
+                                                        proto_shape_id,
+                                                        depth,
+                                                        offset as u32,
+                                                    );
                                                     ic.ic_state = InlineCacheState::Polymorphic {
                                                         count: 2,
                                                         entries,
@@ -6028,8 +6136,12 @@ impl Interpreter {
                                                 }
                                                 if !found {
                                                     if (*count as usize) < 4 {
-                                                        entries[*count as usize] =
-                                                            (shape_ptr, offset as u32);
+                                                        entries[*count as usize] = (
+                                                            shape_ptr,
+                                                            proto_shape_id,
+                                                            depth,
+                                                            offset as u32,
+                                                        );
                                                         *count += 1;
                                                         ic.proto_epoch = current_epoch;
                                                     } else {
@@ -6040,30 +6152,34 @@ impl Interpreter {
                                             _ => {}
                                         }
 
-                                        // Quickening: when IC is monomorphic with enough hits,
+                                        // Quickening: when IC is monomorphic with enough hits and depth 0,
                                         // quicken to GetPropQuickened (skips proxy/string/array checks)
-                                        ic.hit_count = ic.hit_count.saturating_add(1);
-                                        if ic.hit_count
-                                            >= otter_vm_bytecode::function::QUICKENING_WARMUP
-                                        {
-                                            if let InlineCacheState::Monomorphic {
-                                                shape_id,
-                                                offset,
-                                            } = ic.ic_state
+                                        // We don't quicken prototype ICs yet, because GetPropQuickened doesn't support depth
+                                        if depth == 0 {
+                                            ic.hit_count = ic.hit_count.saturating_add(1);
+                                            if ic.hit_count
+                                                >= otter_vm_bytecode::function::QUICKENING_WARMUP
                                             {
-                                                let pc = frame.pc;
-                                                Self::try_quicken_property_access(
-                                                    func,
-                                                    pc,
-                                                    &Instruction::GetPropConst {
-                                                        dst: *dst,
-                                                        obj: *obj,
-                                                        name: *name,
-                                                        ic_index: *ic_index,
-                                                    },
+                                                if let InlineCacheState::Monomorphic {
                                                     shape_id,
                                                     offset,
-                                                );
+                                                    ..
+                                                } = ic.ic_state
+                                                {
+                                                    let pc = frame.pc;
+                                                    Self::try_quicken_property_access(
+                                                        func,
+                                                        pc,
+                                                        &Instruction::GetPropConst {
+                                                            dst: *dst,
+                                                            obj: *obj,
+                                                            name: *name,
+                                                            ic_index: *ic_index,
+                                                        },
+                                                        shape_id,
+                                                        offset,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -6184,7 +6300,9 @@ impl Interpreter {
 
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
-                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    InlineCacheState::Monomorphic {
+                                        shape_id, offset, ..
+                                    } => {
                                         if obj_shape_ptr == *shape_id {
                                             match obj
                                                 .set_by_offset(*offset as usize, val_val.clone())
@@ -6203,7 +6321,7 @@ impl Interpreter {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
                                                 match obj.set_by_offset(
-                                                    entries[i].1 as usize,
+                                                    entries[i].3 as usize,
                                                     val_val.clone(),
                                                 ) {
                                                     Ok(()) => cached = true,
@@ -6312,6 +6430,8 @@ impl Interpreter {
                                             InlineCacheState::Uninitialized => {
                                                 ic.ic_state = InlineCacheState::Monomorphic {
                                                     shape_id: shape_ptr,
+                                                    proto_shape_id: 0,
+                                                    depth: 0,
                                                     offset: offset as u32,
                                                 };
                                                 ic.proto_epoch = current_epoch;
@@ -6319,11 +6439,12 @@ impl Interpreter {
                                             InlineCacheState::Monomorphic {
                                                 shape_id: old_shape,
                                                 offset: old_offset,
+                                                ..
                                             } => {
                                                 if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u32); 4];
-                                                    entries[0] = (*old_shape, *old_offset);
-                                                    entries[1] = (shape_ptr, offset as u32);
+                                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                                    entries[0] = (*old_shape, 0, 0, *old_offset);
+                                                    entries[1] = (shape_ptr, 0, 0, offset as u32);
                                                     ic.ic_state = InlineCacheState::Polymorphic {
                                                         count: 2,
                                                         entries,
@@ -6342,7 +6463,7 @@ impl Interpreter {
                                                 if !found {
                                                     if (*count as usize) < 4 {
                                                         entries[*count as usize] =
-                                                            (shape_ptr, offset as u32);
+                                                            (shape_ptr, 0, 0, offset as u32);
                                                         *count += 1;
                                                         ic.proto_epoch = current_epoch;
                                                     } else {
@@ -6362,6 +6483,7 @@ impl Interpreter {
                                             if let InlineCacheState::Monomorphic {
                                                 shape_id,
                                                 offset,
+                                                ..
                                             } = ic.ic_state
                                             {
                                                 let pc = frame.pc;
@@ -6931,7 +7053,9 @@ impl Interpreter {
 
                                 if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                     match &mut ic.ic_state {
-                                        InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id, offset, ..
+                                        } => {
                                             if obj_shape_ptr == *shape_id {
                                                 cached_val = obj.get_by_offset(*offset as usize);
                                             }
@@ -6940,7 +7064,7 @@ impl Interpreter {
                                             for i in 0..(*count as usize) {
                                                 if obj_shape_ptr == entries[i].0 {
                                                     cached_val =
-                                                        obj.get_by_offset(entries[i].1 as usize);
+                                                        obj.get_by_offset(entries[i].3 as usize);
                                                     // MRU: promote to front
                                                     if i > 0 {
                                                         entries.swap(0, i);
@@ -6980,6 +7104,8 @@ impl Interpreter {
                                         InlineCacheState::Uninitialized => {
                                             ic.ic_state = InlineCacheState::Monomorphic {
                                                 shape_id: shape_ptr,
+                                                proto_shape_id: 0,
+                                                depth: 0,
                                                 offset: offset as u32,
                                             };
                                             ic.proto_epoch = current_epoch;
@@ -6987,11 +7113,12 @@ impl Interpreter {
                                         InlineCacheState::Monomorphic {
                                             shape_id: old_shape,
                                             offset: old_offset,
+                                            ..
                                         } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
+                                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                                entries[0] = (*old_shape, 0, 0, *old_offset);
+                                                entries[1] = (shape_ptr, 0, 0, offset as u32);
                                                 ic.ic_state = InlineCacheState::Polymorphic {
                                                     count: 2,
                                                     entries,
@@ -7010,7 +7137,7 @@ impl Interpreter {
                                             if !found {
                                                 if (*count as usize) < 4 {
                                                     entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
+                                                        (shape_ptr, 0, 0, offset as u32);
                                                     *count += 1;
                                                     ic.proto_epoch = current_epoch;
                                                 } else {
@@ -7096,7 +7223,9 @@ impl Interpreter {
 
                                 if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                     match &mut ic.ic_state {
-                                        InlineCacheState::Monomorphic { shape_id, offset } => {
+                                        InlineCacheState::Monomorphic {
+                                            shape_id, offset, ..
+                                        } => {
                                             if obj_shape_ptr == *shape_id {
                                                 match obj.set_by_offset(
                                                     *offset as usize,
@@ -7120,7 +7249,7 @@ impl Interpreter {
                                             for i in 0..(*count as usize) {
                                                 if obj_shape_ptr == entries[i].0 {
                                                     match obj.set_by_offset(
-                                                        entries[i].1 as usize,
+                                                        entries[i].3 as usize,
                                                         val_val.clone(),
                                                     ) {
                                                         Ok(()) => cached = true,
@@ -7173,6 +7302,8 @@ impl Interpreter {
                                         InlineCacheState::Uninitialized => {
                                             ic.ic_state = InlineCacheState::Monomorphic {
                                                 shape_id: shape_ptr,
+                                                proto_shape_id: 0,
+                                                depth: 0,
                                                 offset: offset as u32,
                                             };
                                             ic.proto_epoch = current_epoch;
@@ -7180,11 +7311,12 @@ impl Interpreter {
                                         InlineCacheState::Monomorphic {
                                             shape_id: old_shape,
                                             offset: old_offset,
+                                            ..
                                         } => {
                                             if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u32); 4];
-                                                entries[0] = (*old_shape, *old_offset);
-                                                entries[1] = (shape_ptr, offset as u32);
+                                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                                entries[0] = (*old_shape, 0, 0, *old_offset);
+                                                entries[1] = (shape_ptr, 0, 0, offset as u32);
                                                 ic.ic_state = InlineCacheState::Polymorphic {
                                                     count: 2,
                                                     entries,
@@ -7203,7 +7335,7 @@ impl Interpreter {
                                             if !found {
                                                 if (*count as usize) < 4 {
                                                     entries[*count as usize] =
-                                                        (shape_ptr, offset as u32);
+                                                        (shape_ptr, 0, 0, offset as u32);
                                                     *count += 1;
                                                     ic.proto_epoch = current_epoch;
                                                 } else {
@@ -7291,6 +7423,7 @@ impl Interpreter {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
                             offset,
+                            ..
                         } = &ic.ic_state
                         {
                             if obj.shape_ptr_raw() == *shape_addr {
@@ -7523,6 +7656,8 @@ impl Interpreter {
                                     InlineCacheState::Uninitialized => {
                                         ic.ic_state = InlineCacheState::Monomorphic {
                                             shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                         ic.proto_epoch = current_epoch;
@@ -7530,11 +7665,12 @@ impl Interpreter {
                                     InlineCacheState::Monomorphic {
                                         shape_id: old_shape,
                                         offset: old_offset,
+                                        ..
                                     } => {
                                         if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u32); 4];
-                                            entries[0] = (*old_shape, *old_offset);
-                                            entries[1] = (shape_ptr, offset as u32);
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
                                             ic.ic_state =
                                                 InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
@@ -7551,7 +7687,7 @@ impl Interpreter {
                                         if !found {
                                             if (*count as usize) < 4 {
                                                 entries[*count as usize] =
-                                                    (shape_ptr, offset as u32);
+                                                    (shape_ptr, 0, 0, offset as u32);
                                                 *count += 1;
                                                 ic.proto_epoch = current_epoch;
                                             } else {
@@ -7610,6 +7746,7 @@ impl Interpreter {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
                             offset,
+                            ..
                         } = &ic.ic_state
                         {
                             if obj.shape_ptr_raw() == *shape_addr {
@@ -7747,6 +7884,8 @@ impl Interpreter {
                                     InlineCacheState::Uninitialized => {
                                         ic.ic_state = InlineCacheState::Monomorphic {
                                             shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
                                             offset: offset as u32,
                                         };
                                         ic.proto_epoch = current_epoch;
@@ -7754,11 +7893,12 @@ impl Interpreter {
                                     InlineCacheState::Monomorphic {
                                         shape_id: old_shape,
                                         offset: old_offset,
+                                        ..
                                     } => {
                                         if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u32); 4];
-                                            entries[0] = (*old_shape, *old_offset);
-                                            entries[1] = (shape_ptr, offset as u32);
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
                                             ic.ic_state =
                                                 InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
@@ -7775,7 +7915,7 @@ impl Interpreter {
                                         if !found {
                                             if (*count as usize) < 4 {
                                                 entries[*count as usize] =
-                                                    (shape_ptr, offset as u32);
+                                                    (shape_ptr, 0, 0, offset as u32);
                                                 *count += 1;
                                                 ic.proto_epoch = current_epoch;
                                             } else {
@@ -8213,7 +8353,9 @@ impl Interpreter {
                             let obj_shape_ptr = obj_ref.shape_ptr_raw();
                             if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
                                 match &mut ic.ic_state {
-                                    InlineCacheState::Monomorphic { shape_id, offset } => {
+                                    InlineCacheState::Monomorphic {
+                                        shape_id, offset, ..
+                                    } => {
                                         if obj_shape_ptr == *shape_id {
                                             if let Some(val) =
                                                 obj_ref.get_by_offset(*offset as usize)
@@ -8227,7 +8369,7 @@ impl Interpreter {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
                                                 if let Some(val) =
-                                                    obj_ref.get_by_offset(entries[i].1 as usize)
+                                                    obj_ref.get_by_offset(entries[i].3 as usize)
                                                 {
                                                     // MRU: promote to front
                                                     if i > 0 {
@@ -10669,8 +10811,10 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if idx < elements.len() && !elements[idx].is_hole() {
-                return Some(elements[idx].clone());
+            if let Some(v) = elements.get(idx) {
+                if !v.is_hole() {
+                    return Some(v);
+                }
             }
         }
         None
@@ -10722,8 +10866,10 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if idx < elements.len() && !elements[idx].is_hole() {
-                return true;
+            if let Some(v) = elements.get(idx) {
+                if !v.is_hole() {
+                    return true;
+                }
             }
         }
         false
@@ -10766,12 +10912,14 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if idx < elements.len() && !elements[idx].is_hole() {
-                drop(elements);
-                if let Some(recv_obj) = receiver.as_object() {
-                    return Ok(recv_obj.set(*key, value).is_ok());
+            if let Some(v) = elements.get(idx) {
+                if !v.is_hole() {
+                    drop(elements);
+                    if let Some(recv_obj) = receiver.as_object() {
+                        return Ok(recv_obj.set(*key, value).is_ok());
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
             }
         }
         // 2. Walk prototype chain looking for proxy or accessor

@@ -163,6 +163,8 @@ fn is_property_access(inst: &Instruction) -> bool {
             | Instruction::GetPropConst { .. }
             | Instruction::SetPropConst { .. }
             | Instruction::GetPropQuickened { .. }
+            | Instruction::GetPropString { .. }
+            | Instruction::GetArrayLength { .. }
             | Instruction::SetPropQuickened { .. }
             | Instruction::GetLocalProp { .. }
             | Instruction::DeleteProp { .. }

@@ -4,10 +4,6 @@
 //! the VM must suspend execution and later resume when the Promise settles.
 //! This module provides types for capturing and restoring VM state.
 
-use std::sync::Arc;
-
-use otter_vm_bytecode::Module;
-
 use crate::gc::GcRef;
 use crate::promise::JsPromise;
 use crate::value::{UpvalueCell, Value};
@@ -67,8 +63,8 @@ impl AsyncContext {
 pub struct SavedFrame {
     /// Function index in the module
     pub function_index: u32,
-    /// The module this function belongs to
-    pub module: Arc<Module>,
+    /// Module id for O(1) lookup in VmContext::module_table
+    pub module_id: u64,
     /// Realm id for this frame
     pub realm_id: crate::realm::RealmId,
     /// Program counter (instruction index)

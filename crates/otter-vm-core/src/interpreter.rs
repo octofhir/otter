@@ -2,6 +2,7 @@
 //!
 //! Executes bytecode instructions.
 
+use otter_vm_bytecode::operand::{ConstantIndex, Register};
 use otter_vm_bytecode::{Instruction, Module, TypeFlags, UpvalueCapture};
 
 use crate::async_context::{AsyncContext, VmExecutionResult};
@@ -9,6 +10,7 @@ use crate::context::{TemplateCacheKey, VmContext};
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::generator::{GeneratorFrame, GeneratorState, JsGenerator};
+use crate::memory::MemoryManager;
 use crate::object::{
     JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey, SetPropertyError,
     get_proto_epoch,
@@ -155,6 +157,8 @@ fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
         | Instruction::AddNumber { dst, .. }
         | Instruction::SubNumber { dst, .. }
         | Instruction::GetPropQuickened { dst, .. }
+        | Instruction::GetPropString { dst, .. }
+        | Instruction::GetArrayLength { dst, .. }
         | Instruction::GetLocalProp { dst, .. } => vec![dst.0],
 
         _ => vec![],
@@ -188,6 +192,19 @@ fn trace_modified_registers(instruction: &Instruction, ctx: &VmContext) -> Vec<(
         .collect()
 }
 
+/// Walk the prototype chain to `depth` and read the property at `offset`.
+///
+/// Used by the IC hit path when `depth > 0` and the proto_epoch guard
+/// has confirmed the cached entry is still valid.
+#[inline]
+fn get_proto_value_at_depth(obj: &GcRef<JsObject>, depth: u8, offset: u32) -> Option<Value> {
+    let mut current = obj.prototype();
+    for _ in 1..depth {
+        current = current.as_object()?.prototype();
+    }
+    current.as_object()?.get_by_offset(offset as usize)
+}
+
 impl Interpreter {
     /// Create a new interpreter
     pub fn new() -> Self {
@@ -202,14 +219,12 @@ impl Interpreter {
         feedback_index: u16,
     ) -> Option<otter_vm_bytecode::function::ArithmeticType> {
         if let Some(frame) = ctx.current_frame() {
-            if let Some(func) = frame.module.function(frame.function_index) {
-                let feedback = func.feedback_vector.read();
-                if let Some(ic) = feedback.get(feedback_index as usize) {
-                    if let otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty) =
-                        ic.ic_state
-                    {
-                        return Some(ty);
-                    }
+            let feedback = frame.feedback().read();
+            if let Some(ic) = feedback.get(feedback_index as usize) {
+                if let otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty) =
+                    ic.ic_state
+                {
+                    return Some(ty);
                 }
             }
         }
@@ -219,35 +234,36 @@ impl Interpreter {
     #[inline]
     fn update_arithmetic_ic(ctx: &VmContext, feedback_index: u16, left: &Value, right: &Value) {
         if let Some(frame) = ctx.current_frame() {
-            if let Some(func) = frame.module.function(frame.function_index) {
-                let feedback = func.feedback_vector.write();
-                if let Some(ic) = feedback.get_mut(feedback_index as usize) {
-                    Self::observe_value_type(&mut ic.type_observations, left);
-                    Self::observe_value_type(&mut ic.type_observations, right);
+            let feedback = frame.feedback().write();
+            if let Some(ic) = feedback.get_mut(feedback_index as usize) {
+                Self::observe_value_type(&mut ic.type_observations, left);
+                Self::observe_value_type(&mut ic.type_observations, right);
 
-                    let new_ty = if ic.type_observations.is_int32_only() {
-                        Some(otter_vm_bytecode::function::ArithmeticType::Int32)
-                    } else if ic.type_observations.is_numeric_only() {
-                        Some(otter_vm_bytecode::function::ArithmeticType::Number)
-                    } else if !ic.type_observations.seen_object
-                        && !ic.type_observations.seen_function
-                        && ic.type_observations.seen_string
-                    {
-                        Some(otter_vm_bytecode::function::ArithmeticType::String)
-                    } else {
-                        None
-                    };
+                let new_ty = if ic.type_observations.is_int32_only() {
+                    Some(otter_vm_bytecode::function::ArithmeticType::Int32)
+                } else if ic.type_observations.is_numeric_only() {
+                    Some(otter_vm_bytecode::function::ArithmeticType::Number)
+                } else if !ic.type_observations.seen_object
+                    && !ic.type_observations.seen_function
+                    && ic.type_observations.seen_string
+                {
+                    Some(otter_vm_bytecode::function::ArithmeticType::String)
+                } else {
+                    None
+                };
 
-                    if let Some(ty) = new_ty {
-                        ic.ic_state =
-                            otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
-                    } else {
-                        ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
-                    }
+                if let Some(ty) = new_ty {
+                    ic.ic_state =
+                        otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
+                } else {
+                    ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
+                }
 
-                    // Quickening: after enough consistent observations, specialize the instruction
-                    ic.hit_count = ic.hit_count.saturating_add(1);
-                    if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
+                // Quickening: after enough consistent observations, specialize the instruction
+                ic.hit_count = ic.hit_count.saturating_add(1);
+                if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
+                    let frame_module = ctx.module_table.get(frame.module_id);
+                    if let Some(func) = frame_module.function(frame.function_index) {
                         let pc = frame.pc;
                         let instr = &func.instructions.read()[pc];
                         Self::try_quicken_arithmetic(func, pc, instr, &ic.type_observations);
@@ -284,6 +300,8 @@ impl Interpreter {
         instruction: &Instruction,
         shape_id: u64,
         offset: u32,
+        depth: u8,
+        proto_epoch: u64,
     ) {
         match instruction {
             Instruction::GetPropConst {
@@ -299,6 +317,8 @@ impl Interpreter {
                         obj: *obj,
                         shape_id,
                         offset,
+                        depth,
+                        proto_epoch,
                         name: *name,
                         ic_index: *ic_index,
                     },
@@ -696,9 +716,10 @@ impl Interpreter {
         ctx.set_pending_this(Value::object(ctx.global()));
 
         // Push initial frame with module reference
+        ctx.register_module(&module);
         ctx.push_frame(
             module.entry_point,
-            Arc::clone(&module),
+            module.module_id,
             entry_func.local_count,
             None,
             false,
@@ -811,9 +832,10 @@ impl Interpreter {
         ctx.set_pending_this(Value::object(ctx.global()));
 
         // Push initial frame with module reference
+        ctx.register_module(&module);
         if let Err(e) = ctx.push_frame(
             module.entry_point,
-            Arc::clone(&module),
+            module.module_id,
             entry_func.local_count,
             None,
             false,
@@ -1093,9 +1115,10 @@ impl Interpreter {
         ctx.set_pending_realm_id(realm_id);
         // Store callee value for arguments.callee
         ctx.set_pending_callee_value(func.clone());
+        ctx.register_module(&closure.module);
         ctx.push_frame(
             closure.function_index,
-            Arc::clone(&closure.module),
+            closure.module.module_id,
             func_info.local_count,
             Some(0), // Return register (unused, we get result from Return)
             false,   // Not a construct call
@@ -1111,7 +1134,7 @@ impl Interpreter {
                 None => return Err(VmError::internal("no frame")),
             };
 
-            let current_module = Arc::clone(&frame.module);
+            let current_module = Arc::clone(ctx.module_table.get(frame.module_id));
             let func = match current_module.function(frame.function_index) {
                 Some(f) => f,
                 None => return Err(VmError::internal("function not found")),
@@ -1225,7 +1248,7 @@ impl Interpreter {
                 }
                 InstructionResult::Call {
                     func_index,
-                    module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
@@ -1233,76 +1256,76 @@ impl Interpreter {
                     upvalues,
                 } => {
                     ctx.advance_pc();
-                    let func = module
-                        .function(func_index)
-                        .ok_or_else(|| VmError::internal("function not found"))?;
+                    // Extract func info from module table (borrow scoped, no Arc clone)
+                    let (local_count, became_hot, can_try_jit) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index)
+                            .ok_or_else(|| VmError::internal("function not found"))?;
+                        let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                        let jit = Self::can_jit(f, is_construct, is_async, argc);
+                        (f.local_count, hot, jit)
+                    };
 
-                    // Record the function call for hot function detection
-                    let became_hot =
-                        func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                    if became_hot {
-                        {
-                            if otter_vm_exec::is_jit_enabled() {
-                                otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                    // JIT paths (cold) — clone Arc only when needed
+                    if became_hot && otter_vm_exec::is_jit_enabled() {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        otter_vm_exec::enqueue_hot_function(&m, func_index, f);
+                        otter_vm_exec::compile_one_pending_request(
+                            crate::jit_runtime::runtime_helpers(),
+                        );
+                    }
+                    if can_try_jit {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        let jit_interp: *const Self = self;
+                        let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                        match crate::jit_runtime::try_execute_jit(
+                            module_id,
+                            func_index,
+                            f,
+                            ctx.pending_args(),
+                            ctx.cached_proto_epoch,
+                            jit_interp,
+                            jit_ctx_ptr,
+                            &m.constants as *const _,
+                            &upvalues,
+                            None,
+                        ) {
+                            crate::jit_runtime::JitCallResult::Ok(value) => {
+                                ctx.set_register(return_reg, value);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                ctx.set_pending_upvalues(upvalues);
+                                ctx.push_frame(
+                                    func_index,
+                                    module_id,
+                                    local_count,
+                                    Some(return_reg),
+                                    is_construct,
+                                    is_async,
+                                    argc as usize,
+                                )?;
+                                crate::jit_resume::resume_in_place(ctx, &state);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                otter_vm_exec::enqueue_hot_function(&m, func_index, f);
                                 otter_vm_exec::compile_one_pending_request(
                                     crate::jit_runtime::runtime_helpers(),
                                 );
                             }
-                        }
-                    }
-                    {
-                        let can_try_jit = Self::can_jit(func, is_construct, is_async, argc);
-                        if can_try_jit {
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module.module_id,
-                                func_index,
-                                func,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &module.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    let local_count = func.local_count;
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as usize,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&module, func_index, func);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
+                            crate::jit_runtime::JitCallResult::BailoutRestart
+                            | crate::jit_runtime::JitCallResult::NotCompiled => {}
                         }
                     }
 
-                    let local_count = func.local_count;
+                    // Hot path: push frame (no Arc clone)
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -1312,22 +1335,23 @@ impl Interpreter {
                 }
                 InstructionResult::TailCall {
                     func_index,
-                    module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
                 } => {
-                    // Tail call: pop current frame and push new one
                     ctx.pop_frame_discard();
-                    let local_count = module
-                        .function(func_index)
-                        .ok_or_else(|| VmError::internal("function not found"))?
-                        .local_count;
+                    let local_count = {
+                        let m = ctx.module_table.get(module_id);
+                        m.function(func_index)
+                            .ok_or_else(|| VmError::internal("function not found"))?
+                            .local_count
+                    };
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         false,
@@ -1473,7 +1497,7 @@ impl Interpreter {
 
             // Only clone Arc when frame changes (avoids atomic ops on hot path)
             if frame.frame_id != cached_frame_id {
-                cached_module = Some(Arc::clone(&frame.module));
+                cached_module = Some(Arc::clone(ctx.module_table.get(frame.module_id)));
                 cached_frame_id = frame.frame_id;
             }
 
@@ -1507,7 +1531,7 @@ impl Interpreter {
                 Some((
                     frame.pc,
                     frame.function_index,
-                    Arc::clone(&frame.module),
+                    Arc::clone(ctx.module_table.get(frame.module_id)),
                     instruction.clone(),
                 ))
             } else {
@@ -1665,116 +1689,98 @@ impl Interpreter {
                 }
                 InstructionResult::Call {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
                     is_async,
                     upvalues,
                 } => {
-                    ctx.advance_pc(); // Advance before pushing new frame
-
-                    let callee = match call_module.function(func_index) {
-                        Some(f) => f,
-                        None => {
-                            return VmExecutionResult::Error(VmError::internal(format!(
-                                "callee not found (func_index={}, function_count={})",
-                                func_index,
-                                call_module.function_count()
-                            )));
-                        }
+                    ctx.advance_pc();
+                    // Extract func info with scoped borrow (no Arc clone on hot path)
+                    let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = match m.function(func_index) {
+                            Some(f) => f,
+                            None => {
+                                return VmExecutionResult::Error(VmError::internal(format!(
+                                    "callee not found (func_index={}, function_count={})",
+                                    func_index,
+                                    m.function_count()
+                                )));
+                            }
+                        };
+                        let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                        let jit = Self::can_jit(f, is_construct, is_async, argc);
+                        (f.local_count, f.flags.has_rest, f.param_count as usize, hot, jit)
                     };
 
-                    // Record the function call for hot function detection
-                    let became_hot =
-                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                    if became_hot {
-                        {
-                            if otter_vm_exec::is_jit_enabled() {
-                                otter_vm_exec::enqueue_hot_function(
-                                    &call_module,
+                    // JIT paths (cold) — clone Arc only when needed
+                    if became_hot && otter_vm_exec::is_jit_enabled() {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        otter_vm_exec::enqueue_hot_function(&m, func_index, f);
+                        otter_vm_exec::compile_one_pending_request(
+                            crate::jit_runtime::runtime_helpers(),
+                        );
+                    }
+                    if can_try_jit {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        let jit_interp: *const Self = self;
+                        let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                        match crate::jit_runtime::try_execute_jit(
+                            module_id,
+                            func_index,
+                            f,
+                            ctx.pending_args(),
+                            ctx.cached_proto_epoch,
+                            jit_interp,
+                            jit_ctx_ptr,
+                            &m.constants as *const _,
+                            &upvalues,
+                            None,
+                        ) {
+                            crate::jit_runtime::JitCallResult::Ok(value) => {
+                                ctx.set_register(return_reg, value);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                ctx.set_pending_upvalues(upvalues);
+                                if let Err(e) = ctx.push_frame(
                                     func_index,
-                                    callee,
-                                );
+                                    module_id,
+                                    local_count,
+                                    Some(return_reg),
+                                    is_construct,
+                                    is_async,
+                                    argc as usize,
+                                ) {
+                                    return VmExecutionResult::Error(e);
+                                }
+                                crate::jit_resume::resume_in_place(ctx, &state);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                otter_vm_exec::enqueue_hot_function(&m, func_index, f);
                                 otter_vm_exec::compile_one_pending_request(
                                     crate::jit_runtime::runtime_helpers(),
                                 );
                             }
+                            crate::jit_runtime::JitCallResult::BailoutRestart
+                            | crate::jit_runtime::JitCallResult::NotCompiled => {}
                         }
                     }
-                    {
-                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
-                        if can_try_jit {
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                call_module.module_id,
-                                func_index,
-                                callee,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &call_module.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    let local_count = callee.local_count;
-                                    ctx.set_pending_upvalues(upvalues);
-                                    if let Err(e) = ctx.push_frame(
-                                        func_index,
-                                        call_module,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as usize,
-                                    ) {
-                                        return VmExecutionResult::Error(e);
-                                    }
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(
-                                        &call_module,
-                                        func_index,
-                                        callee,
-                                    );
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-                    }
-
-                    // Extract values before moving call_module
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
 
                     // Handle rest parameters
                     if has_rest {
                         let mut args = ctx.take_pending_args();
-
-                        // Collect extra arguments into rest array
                         let rest_args: Vec<Value> = if args.len() > param_count {
                             args.drain(param_count..).collect()
                         } else {
                             Vec::new()
                         };
-
-                        // Create rest array
                         let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                        // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -1785,19 +1791,15 @@ impl Interpreter {
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
-
-                        // Append rest array to args
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
                     }
 
-                    // Set pending upvalues (captured closure values) for the new frame
+                    // Hot path: push frame (no Arc clone)
                     ctx.set_pending_upvalues(upvalues);
-
-                    // Push frame with the callee's module (closures carry their own module)
                     if let Err(e) = ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -1809,33 +1811,30 @@ impl Interpreter {
                 }
                 InstructionResult::TailCall {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
                 } => {
-                    // Tail call optimization: pop current frame before pushing new one
                     ctx.pop_frame_discard();
-                    // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
-                    let callee = match call_module.function(func_index) {
-                        Some(f) => f,
-                        None => {
-                            return VmExecutionResult::Error(VmError::internal(format!(
-                                "callee not found (func_index={}, function_count={})",
-                                func_index,
-                                call_module.function_count()
-                            )));
-                        }
+                    let (local_count, has_rest, param_count) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = match m.function(func_index) {
+                            Some(f) => f,
+                            None => {
+                                return VmExecutionResult::Error(VmError::internal(format!(
+                                    "callee not found (func_index={}, function_count={})",
+                                    func_index,
+                                    m.function_count()
+                                )));
+                            }
+                        };
+                        (f.local_count, f.flags.has_rest, f.param_count as usize)
                     };
 
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
-
-                    // Handle rest parameters
                     if has_rest {
                         let mut args = ctx.take_pending_args();
                         let rest_args: Vec<Value> = if args.len() > param_count {
@@ -1859,10 +1858,9 @@ impl Interpreter {
                     }
 
                     ctx.set_pending_upvalues(upvalues);
-
                     if let Err(e) = ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         false,
@@ -1914,6 +1912,11 @@ impl Interpreter {
         }
     }
 
+    pub fn serialize(&self, _memory_manager: &MemoryManager) -> VmResult<Vec<u8>> {
+        // This function is a placeholder and should be implemented to serialize the VM state.
+        unimplemented!("Serialization is not yet implemented for the VM");
+    }
+
     /// Main execution loop
     fn run_loop(&self, ctx: &mut VmContext) -> VmResult<Value> {
         // If tracing is enabled, use the traced variant to keep the hot path clean
@@ -1954,7 +1957,7 @@ impl Interpreter {
 
             // Only clone Arc when frame changes (avoids atomic ops on hot path)
             if frame.frame_id != cached_frame_id {
-                cached_module = Some(Arc::clone(&frame.module));
+                cached_module = Some(Arc::clone(ctx.module_table.get(frame.module_id)));
                 cached_frame_id = frame.frame_id;
             }
 
@@ -2121,111 +2124,93 @@ impl Interpreter {
                 }
                 InstructionResult::Call {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
                     is_async,
                     upvalues,
                 } => {
-                    ctx.advance_pc(); // Advance before pushing new frame
+                    ctx.advance_pc();
+                    // Extract func info with scoped borrow (no Arc clone on hot path)
+                    let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index).ok_or_else(|| {
+                            VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                m.function_count()
+                            ))
+                        })?;
+                        let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                        let jit = Self::can_jit(f, is_construct, is_async, argc);
+                        (f.local_count, f.flags.has_rest, f.param_count as usize, hot, jit)
+                    };
 
-                    let callee = call_module.function(func_index).ok_or_else(|| {
-                        VmError::internal(format!(
-                            "callee not found (func_index={}, function_count={})",
+                    // JIT paths (cold) — clone Arc only when needed
+                    if became_hot && otter_vm_exec::is_jit_enabled() {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        otter_vm_exec::enqueue_hot_function(&m, func_index, f);
+                        otter_vm_exec::compile_one_pending_request(
+                            crate::jit_runtime::runtime_helpers(),
+                        );
+                    }
+                    if can_try_jit {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        let jit_interp: *const Self = self;
+                        let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                        match crate::jit_runtime::try_execute_jit(
+                            module_id,
                             func_index,
-                            call_module.function_count()
-                        ))
-                    })?;
-
-                    // Record the function call for hot function detection
-                    let became_hot =
-                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                    if became_hot {
-                        {
-                            if otter_vm_exec::is_jit_enabled() {
-                                otter_vm_exec::enqueue_hot_function(
-                                    &call_module,
+                            f,
+                            ctx.pending_args(),
+                            ctx.cached_proto_epoch,
+                            jit_interp,
+                            jit_ctx_ptr,
+                            &m.constants as *const _,
+                            &upvalues,
+                            None,
+                        ) {
+                            crate::jit_runtime::JitCallResult::Ok(value) => {
+                                ctx.set_register(return_reg, value);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                ctx.set_pending_upvalues(upvalues);
+                                ctx.push_frame(
                                     func_index,
-                                    callee,
-                                );
+                                    module_id,
+                                    local_count,
+                                    Some(return_reg),
+                                    is_construct,
+                                    is_async,
+                                    argc as usize,
+                                )?;
+                                crate::jit_resume::resume_in_place(ctx, &state);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                otter_vm_exec::enqueue_hot_function(&m, func_index, f);
                                 otter_vm_exec::compile_one_pending_request(
                                     crate::jit_runtime::runtime_helpers(),
                                 );
                             }
+                            crate::jit_runtime::JitCallResult::BailoutRestart
+                            | crate::jit_runtime::JitCallResult::NotCompiled => {}
                         }
                     }
-                    {
-                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
-                        if can_try_jit {
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                call_module.module_id,
-                                func_index,
-                                callee,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &call_module.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    let local_count = callee.local_count;
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        call_module,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as usize,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(
-                                        &call_module,
-                                        func_index,
-                                        callee,
-                                    );
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-                    }
-
-                    // Extract values before moving call_module
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
 
                     // Handle rest parameters
                     if has_rest {
                         let mut args = ctx.take_pending_args();
-
-                        // Collect extra arguments into rest array
                         let rest_args: Vec<Value> = if args.len() > param_count {
                             args.drain(param_count..).collect()
                         } else {
                             Vec::new()
                         };
-
-                        // Create rest array
                         let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                        // If `Array.prototype` is available, attach it so rest arrays are iterable.
                         if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                             && let Some(array_proto) = array_obj
                                 .get(&PropertyKey::string("prototype"))
@@ -2236,18 +2221,15 @@ impl Interpreter {
                         for (i, arg) in rest_args.into_iter().enumerate() {
                             let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
                         }
-
-                        // Append rest array to args
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
                     }
 
-                    // Set pending upvalues (captured closure values) for the new frame
+                    // Hot path: push frame (no Arc clone)
                     ctx.set_pending_upvalues(upvalues);
-
                     ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -2257,31 +2239,27 @@ impl Interpreter {
                 }
                 InstructionResult::TailCall {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
                 } => {
-                    // Tail call optimization: pop current frame before pushing new one
-                    // This prevents stack growth for recursive tail calls
                     ctx.pop_frame_discard();
-                    // Invalidate cache since frame changed
                     cached_frame_id = usize::MAX;
 
-                    let callee = call_module.function(func_index).ok_or_else(|| {
-                        VmError::internal(format!(
-                            "callee not found (func_index={}, function_count={})",
-                            func_index,
-                            call_module.function_count()
-                        ))
-                    })?;
+                    let (local_count, has_rest, param_count) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index).ok_or_else(|| {
+                            VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                m.function_count()
+                            ))
+                        })?;
+                        (f.local_count, f.flags.has_rest, f.param_count as usize)
+                    };
 
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
-
-                    // Handle rest parameters (same as regular call)
                     if has_rest {
                         let mut args = ctx.take_pending_args();
                         let rest_args: Vec<Value> = if args.len() > param_count {
@@ -2305,13 +2283,12 @@ impl Interpreter {
                     }
 
                     ctx.set_pending_upvalues(upvalues);
-
                     ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
-                        false, // tail calls are never construct
+                        false,
                         is_async,
                         argc as usize,
                     )?;
@@ -2320,7 +2297,6 @@ impl Interpreter {
                     promise,
                     resume_reg,
                 } => {
-                    // Store the pending promise state for later resumption
                     ctx.advance_pc();
 
                     // Poll the promise - if pending, we need to wait for async tasks
@@ -2391,7 +2367,7 @@ impl Interpreter {
             };
 
             if frame.frame_id != cached_frame_id {
-                cached_module = Some(Arc::clone(&frame.module));
+                cached_module = Some(Arc::clone(ctx.module_table.get(frame.module_id)));
                 cached_frame_id = frame.frame_id;
             }
 
@@ -2419,7 +2395,7 @@ impl Interpreter {
             let trace_data = Some((
                 frame.pc,
                 frame.function_index,
-                Arc::clone(&frame.module),
+                Arc::clone(ctx.module_table.get(frame.module_id)),
                 instruction.clone(),
             ));
             let trace_start_time = if trace_capture_timing {
@@ -2558,7 +2534,7 @@ impl Interpreter {
                 }
                 InstructionResult::Call {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
@@ -2566,75 +2542,76 @@ impl Interpreter {
                     upvalues,
                 } => {
                     ctx.advance_pc();
-                    let callee = call_module.function(func_index).ok_or_else(|| {
-                        VmError::internal(format!(
-                            "callee not found (func_index={}, function_count={})",
-                            func_index,
-                            call_module.function_count()
-                        ))
-                    })?;
-                    let became_hot =
-                        callee.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                    // Extract func info with scoped borrow (no Arc clone on hot path)
+                    let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index).ok_or_else(|| {
+                            VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                m.function_count()
+                            ))
+                        })?;
+                        let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                        let jit = Self::can_jit(f, is_construct, is_async, argc);
+                        (f.local_count, f.flags.has_rest, f.param_count as usize, hot, jit)
+                    };
+
+                    // JIT paths (cold) — clone Arc only when needed
                     if became_hot && otter_vm_exec::is_jit_enabled() {
-                        otter_vm_exec::enqueue_hot_function(&call_module, func_index, callee);
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        otter_vm_exec::enqueue_hot_function(&m, func_index, f);
                         otter_vm_exec::compile_one_pending_request(
                             crate::jit_runtime::runtime_helpers(),
                         );
                     }
-                    {
-                        let can_try_jit = Self::can_jit(callee, is_construct, is_async, argc);
-                        if can_try_jit {
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                call_module.module_id,
-                                func_index,
-                                callee,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &call_module.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    let local_count = callee.local_count;
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        call_module,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as usize,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(
-                                        &call_module,
-                                        func_index,
-                                        callee,
-                                    );
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
+                    if can_try_jit {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        let jit_interp: *const Self = self;
+                        let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                        match crate::jit_runtime::try_execute_jit(
+                            module_id,
+                            func_index,
+                            f,
+                            ctx.pending_args(),
+                            ctx.cached_proto_epoch,
+                            jit_interp,
+                            jit_ctx_ptr,
+                            &m.constants as *const _,
+                            &upvalues,
+                            None,
+                        ) {
+                            crate::jit_runtime::JitCallResult::Ok(value) => {
+                                ctx.set_register(return_reg, value);
+                                continue;
                             }
+                            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                ctx.set_pending_upvalues(upvalues);
+                                ctx.push_frame(
+                                    func_index,
+                                    module_id,
+                                    local_count,
+                                    Some(return_reg),
+                                    is_construct,
+                                    is_async,
+                                    argc as usize,
+                                )?;
+                                crate::jit_resume::resume_in_place(ctx, &state);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                otter_vm_exec::enqueue_hot_function(&m, func_index, f);
+                                otter_vm_exec::compile_one_pending_request(
+                                    crate::jit_runtime::runtime_helpers(),
+                                );
+                            }
+                            crate::jit_runtime::JitCallResult::BailoutRestart
+                            | crate::jit_runtime::JitCallResult::NotCompiled => {}
                         }
                     }
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
+
                     if has_rest {
                         let mut args = ctx.take_pending_args();
                         let rest_args: Vec<Value> = if args.len() > param_count {
@@ -2656,10 +2633,11 @@ impl Interpreter {
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
                     }
+
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -2669,7 +2647,7 @@ impl Interpreter {
                 }
                 InstructionResult::TailCall {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
@@ -2677,16 +2655,19 @@ impl Interpreter {
                 } => {
                     ctx.pop_frame_discard();
                     cached_frame_id = usize::MAX;
-                    let callee = call_module.function(func_index).ok_or_else(|| {
-                        VmError::internal(format!(
-                            "callee not found (func_index={}, function_count={})",
-                            func_index,
-                            call_module.function_count()
-                        ))
-                    })?;
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
+
+                    let (local_count, has_rest, param_count) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index).ok_or_else(|| {
+                            VmError::internal(format!(
+                                "callee not found (func_index={}, function_count={})",
+                                func_index,
+                                m.function_count()
+                            ))
+                        })?;
+                        (f.local_count, f.flags.has_rest, f.param_count as usize)
+                    };
+
                     if has_rest {
                         let mut args = ctx.take_pending_args();
                         let rest_args: Vec<Value> = if args.len() > param_count {
@@ -2708,10 +2689,11 @@ impl Interpreter {
                         args.push(Value::object(rest_arr));
                         ctx.set_pending_args(args);
                     }
+
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         false,
@@ -2872,12 +2854,7 @@ impl Interpreter {
                     } else {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.read();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
                             if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                 shape_id: shape_addr,
@@ -2922,12 +2899,7 @@ impl Interpreter {
                         if let Some(offset) = global_obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 if matches!(
                                     ic.ic_state,
@@ -3004,12 +2976,7 @@ impl Interpreter {
                     if !global_obj.is_dictionary_mode() {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.read();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().read();
                         if let Some(ic) = feedback.get(*ic_index as usize) {
                             if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                 shape_id: shape_addr,
@@ -3034,7 +3001,7 @@ impl Interpreter {
                 if !is_declaration {
                     let is_strict = ctx
                         .current_frame()
-                        .and_then(|frame| frame.module.function(frame.function_index))
+                        .and_then(|frame| module.function(frame.function_index))
                         .map(|func| func.flags.is_strict)
                         .unwrap_or(false);
 
@@ -3065,12 +3032,7 @@ impl Interpreter {
                         if let Some(offset) = global_obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 if matches!(
                                     ic.ic_state,
@@ -3786,12 +3748,7 @@ impl Interpreter {
                 {
                     let frame = ctx
                         .current_frame()
-                        .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
-                        .module
-                        .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.write();
+                        .ok_or_else(|| VmError::internal("no frame"))?;                    let feedback = frame.feedback().write();
                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                         use otter_vm_bytecode::function::InlineCacheState;
                         let obj_shape_ptr = right_obj.shape_ptr_raw();
@@ -3834,12 +3791,7 @@ impl Interpreter {
                     if let Some(offset) = right_obj.shape_get_offset(&proto_key) {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             // Skip IC for dictionary mode objects
@@ -4144,6 +4096,7 @@ impl Interpreter {
             }
 
             Instruction::AsyncClosure { dst, func } => {
+                let _mm = ctx.memory_manager().clone();
                 // Get the function definition to know what upvalues to capture
                 let func_def = module
                     .function(func.0)
@@ -4223,6 +4176,7 @@ impl Interpreter {
             }
 
             Instruction::GeneratorClosure { dst, func } => {
+                let _mm = ctx.memory_manager().clone();
                 // Get the function definition to know what upvalues to capture
                 let func_def = module
                     .function(func.0)
@@ -4316,6 +4270,7 @@ impl Interpreter {
             }
 
             Instruction::AsyncGeneratorClosure { dst, func } => {
+                let _mm = ctx.memory_manager().clone();
                 // Get the function definition to know what upvalues to capture
                 let func_def = module.function(func.0).ok_or_else(|| {
                     VmError::internal("function not found for async generator closure")
@@ -4423,20 +4378,18 @@ impl Interpreter {
                     // Record call target for JIT monomorphic call IC
                     if *ic_index > 0 {
                         if let Some(frame) = ctx.current_frame() {
-                            if let Some(func) = frame.module.function(frame.function_index) {
-                                if let Some(md) =
-                                    func.feedback_vector.write().get_mut(*ic_index as usize)
+                            if let Some(md) =
+                                frame.feedback().write().get_mut(*ic_index as usize)
+                            {
+                                let func_idx = closure.function_index;
+                                let mod_id = closure.module.module_id;
+                                if md.call_target_func_index == 0 {
+                                    md.call_target_func_index = func_idx.wrapping_add(1);
+                                    md.call_target_module_id = mod_id;
+                                } else if md.call_target_func_index != func_idx.wrapping_add(1)
+                                    || md.call_target_module_id != mod_id
                                 {
-                                    let func_idx = closure.function_index;
-                                    let mod_id = closure.module.module_id;
-                                    if md.call_target_func_index == 0 {
-                                        md.call_target_func_index = func_idx.wrapping_add(1);
-                                        md.call_target_module_id = mod_id;
-                                    } else if md.call_target_func_index != func_idx.wrapping_add(1)
-                                        || md.call_target_module_id != mod_id
-                                    {
-                                        md.call_target_func_index = u32::MAX;
-                                    }
+                                    md.call_target_func_index = u32::MAX;
                                 }
                             }
                         }
@@ -4453,7 +4406,7 @@ impl Interpreter {
 
                     return Ok(InstructionResult::Call {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: *argc,
                         return_reg: dst.0,
                         is_construct: false,
@@ -4569,7 +4522,7 @@ impl Interpreter {
 
                             return Ok(InstructionResult::Call {
                                 func_index: closure.function_index,
-                                module: Arc::clone(&closure.module),
+                                module_id: closure.module.module_id,
                                 argc,
                                 return_reg: dst.0,
                                 is_construct: false,
@@ -4611,7 +4564,7 @@ impl Interpreter {
 
                     return Ok(InstructionResult::Call {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: *argc,
                         return_reg: dst.0,
                         is_construct: false,
@@ -4663,7 +4616,7 @@ impl Interpreter {
 
                     return Ok(InstructionResult::TailCall {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: *argc,
                         return_reg,
                         is_async: closure.is_async,
@@ -4848,7 +4801,7 @@ impl Interpreter {
                     ctx.set_pending_realm_id(realm_id);
                     Ok(InstructionResult::Call {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: *argc,
                         return_reg: dst.0,
                         is_construct: true,
@@ -4881,12 +4834,7 @@ impl Interpreter {
                 let cached_method = if let Some(obj_ref) = receiver.as_object() {
                     let frame = ctx
                         .current_frame()
-                        .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
-                        .module
-                        .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.read();
+                        .ok_or_else(|| VmError::internal("no frame"))?;                    let feedback = frame.feedback().read();
                     if let Some(ic) = feedback.get(*ic_index as usize) {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
@@ -4971,12 +4919,7 @@ impl Interpreter {
                         if let Some(offset) = obj_ref.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
                                 let shape_ptr = obj_ref.shape_ptr_raw();
@@ -5257,12 +5200,7 @@ impl Interpreter {
                     if let Some(offset) = obj_ref.shape_get_offset(&key) {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             if matches!(
                                 ic.ic_state,
@@ -5374,7 +5312,7 @@ impl Interpreter {
 
                 Ok(InstructionResult::Call {
                     func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
+                    module_id: closure.module.module_id,
                     argc: args.len() as u8,
                     return_reg: dst.0,
                     is_construct: false,
@@ -5464,7 +5402,7 @@ impl Interpreter {
 
                 Ok(InstructionResult::Call {
                     func_index: closure.function_index,
-                    module: Arc::clone(&closure.module),
+                    module_id: closure.module.module_id,
                     argc: argc_u8,
                     return_reg: dst.0,
                     is_construct: true,
@@ -5627,7 +5565,7 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame"))?;
                 let argc = frame.argc;
-                let func = &frame.module.functions[frame.function_index as usize];
+                let func = &module.functions[frame.function_index as usize];
                 let param_count = func.param_count as usize;
                 let local_count = func.local_count as usize;
                 let is_strict = func.flags.is_strict;
@@ -5782,7 +5720,7 @@ impl Interpreter {
                 // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
                 let is_strict_context = ctx
                     .current_frame()
-                    .and_then(|frame| frame.module.functions.get(frame.function_index as usize))
+                    .and_then(|frame| module.functions.get(frame.function_index as usize))
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
@@ -5862,71 +5800,14 @@ impl Interpreter {
                 ic_index,
             } => {
                 let object = ctx.get_register(obj.0).clone();
-                let name_const = module
-                    .constants
-                    .get(name.0)
-                    .ok_or_else(|| VmError::internal("constant not found"))?;
-                let name_str = name_const
-                    .as_string()
-                    .ok_or_else(|| VmError::internal("expected string constant"))?;
-                // Proxy check - must be first
-                if let Some(proxy) = object.as_proxy() {
-                    let key = Self::utf16_key(name_str);
-                    let key_value = Value::string(JsString::intern_utf16(name_str));
-                    let receiver = object.clone();
-                    let result = {
-                        let mut ncx = crate::context::NativeContext::new(ctx, self);
-                        crate::proxy_operations::proxy_get(
-                            &mut ncx, proxy, &key, key_value, receiver,
-                        )?
-                    };
-                    ctx.set_register(dst.0, result);
-                    return Ok(InstructionResult::Continue);
-                }
 
-                if let Some(str_ref) = object.as_string() {
-                    if Self::utf16_eq_ascii(name_str, "length") {
-                        ctx.set_register(dst.0, Value::int32(str_ref.len_utf16() as i32));
-                        return Ok(InstructionResult::Continue);
-                    }
-
-                    if let Some(index) = Self::utf16_to_index(name_str) {
-                        let units = str_ref.as_utf16();
-                        if let Some(unit) = units.get(index as usize) {
-                            let ch = JsString::intern_utf16(&[*unit]);
-                            ctx.set_register(dst.0, Value::string(ch));
-                        } else {
-                            ctx.set_register(dst.0, Value::undefined());
-                        }
-                        return Ok(InstructionResult::Continue);
-                    }
-
-                    if let Some(proto) = ctx.string_prototype() {
-                        let key = Self::utf16_key(name_str);
-                        let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                        ctx.set_register(dst.0, value);
-                        return Ok(InstructionResult::Continue);
-                    }
-                }
-
-                // IC Fast Path
+                // Hot path: IC probe on regular object
                 if let Some(obj_ref) = object.as_object() {
-                    // Array .length fast path
-                    if obj_ref.is_array() && Self::utf16_eq_ascii(name_str, "length") {
-                        ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
-                        return Ok(InstructionResult::Continue);
-                    }
-
-                    let mut cached_val = None;
                     if !obj_ref.is_dictionary_mode() {
                         let frame = ctx
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
+                        let feedback = frame.feedback().write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = obj_ref.shape_ptr_raw();
@@ -5935,74 +5816,40 @@ impl Interpreter {
                                 match &mut ic.ic_state {
                                     InlineCacheState::Monomorphic {
                                         shape_id,
-                                        proto_shape_id,
                                         depth,
                                         offset,
+                                        ..
                                     } => {
                                         if obj_shape_ptr == *shape_id {
-                                            if *depth == 0 {
-                                                cached_val =
-                                                    obj_ref.get_by_offset(*offset as usize);
+                                            let val = if *depth == 0 {
+                                                obj_ref.get_by_offset(*offset as usize)
                                             } else {
-                                                let mut current = obj_ref.clone();
-                                                let mut valid = true;
-                                                for _ in 0..*depth {
-                                                    if let Some(proto) =
-                                                        current.prototype().as_object()
-                                                    {
-                                                        current = proto.clone();
-                                                    } else {
-                                                        valid = false;
-                                                        break;
-                                                    }
-                                                }
-                                                if valid
-                                                    && current.shape_ptr_raw() == *proto_shape_id
-                                                {
-                                                    cached_val =
-                                                        current.get_by_offset(*offset as usize);
-                                                }
+                                                get_proto_value_at_depth(&obj_ref, *depth, *offset)
+                                            };
+                                            if let Some(val) = val {
+                                                ctx.set_register(dst.0, val);
+                                                return Ok(InstructionResult::Continue);
                                             }
                                         }
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                let proto_shape_id = entries[i].1;
                                                 let depth = entries[i].2;
                                                 let offset = entries[i].3;
-
-                                                if depth == 0 {
-                                                    cached_val =
-                                                        obj_ref.get_by_offset(offset as usize);
+                                                let val = if depth == 0 {
+                                                    obj_ref.get_by_offset(offset as usize)
                                                 } else {
-                                                    let mut current = obj_ref.clone();
-                                                    let mut valid = true;
-                                                    for _ in 0..depth {
-                                                        if let Some(proto) =
-                                                            current.prototype().as_object()
-                                                        {
-                                                            current = proto.clone();
-                                                        } else {
-                                                            valid = false;
-                                                            break;
-                                                        }
-                                                    }
-                                                    if valid
-                                                        && current.shape_ptr_raw() == proto_shape_id
-                                                    {
-                                                        cached_val =
-                                                            current.get_by_offset(offset as usize);
-                                                    }
-                                                }
-
-                                                // MRU: promote to front
-                                                if i > 0 && cached_val.is_some() {
+                                                    get_proto_value_at_depth(&obj_ref, depth, offset)
+                                                };
+                                                if i > 0 && val.is_some() {
                                                     entries.swap(0, i);
                                                 }
-                                                if cached_val.is_some() {
-                                                    break;
+                                                if let Some(val) = val {
+                                                    ctx.set_register(dst.0, val);
+                                                    return Ok(InstructionResult::Continue);
                                                 }
+                                                break;
                                             }
                                         }
                                     }
@@ -6011,237 +5858,10 @@ impl Interpreter {
                             }
                         }
                     }
-
-                    if let Some(val) = cached_val {
-                        ctx.set_register(dst.0, val);
-                        return Ok(InstructionResult::Continue);
-                    }
                 }
 
-                if let Some(obj_ref) = object.as_object() {
-                    let receiver = object.clone();
-                    let key = Self::utf16_key(name_str);
-
-                    match obj_ref.lookup_property_descriptor(&key) {
-                        Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
-                            let Some(getter) = get else {
-                                ctx.set_register(dst.0, Value::undefined());
-                                return Ok(InstructionResult::Continue);
-                            };
-
-                            if let Some(native_fn) = getter.as_native_function() {
-                                let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
-                                ctx.set_register(dst.0, result);
-                                Ok(InstructionResult::Continue)
-                            } else if let Some(closure) = getter.as_function() {
-                                ctx.set_pending_args(Vec::new());
-                                ctx.set_pending_this(receiver);
-                                Ok(InstructionResult::Call {
-                                    func_index: closure.function_index,
-                                    module: Arc::clone(&closure.module),
-                                    argc: 0,
-                                    return_reg: dst.0,
-                                    is_construct: false,
-                                    is_async: closure.is_async,
-                                    upvalues: closure.upvalues.clone(),
-                                })
-                            } else {
-                                Err(VmError::type_error("getter is not a function"))
-                            }
-                        }
-                        _ => {
-                            // Slow path: full lookup and IC update
-                            // Skip IC for dictionary mode objects
-                            if !obj_ref.is_dictionary_mode() {
-                                let mut current_obj = Some(obj_ref.clone());
-                                let mut depth = 0;
-                                let mut found_offset = None;
-                                let mut found_shape = 0;
-
-                                while let Some(obj) = current_obj.take() {
-                                    if obj.is_dictionary_mode() {
-                                        break; // Invalidate caching if any proto is dict mode
-                                    }
-                                    if let Some(offset) = obj.shape_get_offset(&key) {
-                                        found_offset = Some(offset);
-                                        found_shape = obj.shape_ptr_raw();
-                                        break;
-                                    }
-                                    if let Some(proto) = obj.prototype().as_object() {
-                                        current_obj = Some(proto.clone());
-                                        depth += 1;
-                                    }
-                                }
-
-                                if let Some(offset) = found_offset {
-                                    let frame = ctx
-                                        .current_frame()
-                                        .ok_or_else(|| VmError::internal("no frame"))?;
-                                    let func = frame
-                                        .module
-                                        .function(frame.function_index)
-                                        .ok_or_else(|| VmError::internal("no function"))?;
-                                    let feedback = func.feedback_vector.write();
-                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                        use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = obj_ref.shape_ptr_raw();
-                                        let proto_shape_id =
-                                            if depth > 0 { found_shape } else { 0 };
-                                        let current_epoch = ctx.cached_proto_epoch;
-
-                                        match &mut ic.ic_state {
-                                            InlineCacheState::Uninitialized => {
-                                                ic.ic_state = InlineCacheState::Monomorphic {
-                                                    shape_id: shape_ptr,
-                                                    proto_shape_id: 0,
-                                                    depth: 0,
-                                                    offset: offset as u32,
-                                                };
-                                                ic.proto_epoch = current_epoch;
-                                            }
-                                            InlineCacheState::Monomorphic {
-                                                shape_id: old_shape,
-                                                proto_shape_id: old_proto_shape,
-                                                depth: old_depth,
-                                                offset: old_offset,
-                                            } => {
-                                                if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                                    entries[0] = (
-                                                        *old_shape,
-                                                        *old_proto_shape,
-                                                        *old_depth,
-                                                        *old_offset,
-                                                    );
-                                                    entries[1] = (
-                                                        shape_ptr,
-                                                        proto_shape_id,
-                                                        depth,
-                                                        offset as u32,
-                                                    );
-                                                    ic.ic_state = InlineCacheState::Polymorphic {
-                                                        count: 2,
-                                                        entries,
-                                                    };
-                                                    ic.proto_epoch = current_epoch;
-                                                }
-                                            }
-                                            InlineCacheState::Polymorphic { count, entries } => {
-                                                let mut found = false;
-                                                for i in 0..(*count as usize) {
-                                                    if entries[i].0 == shape_ptr {
-                                                        found = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !found {
-                                                    if (*count as usize) < 4 {
-                                                        entries[*count as usize] = (
-                                                            shape_ptr,
-                                                            proto_shape_id,
-                                                            depth,
-                                                            offset as u32,
-                                                        );
-                                                        *count += 1;
-                                                        ic.proto_epoch = current_epoch;
-                                                    } else {
-                                                        ic.ic_state = InlineCacheState::Megamorphic;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-
-                                        // Quickening: when IC is monomorphic with enough hits and depth 0,
-                                        // quicken to GetPropQuickened (skips proxy/string/array checks)
-                                        // We don't quicken prototype ICs yet, because GetPropQuickened doesn't support depth
-                                        if depth == 0 {
-                                            ic.hit_count = ic.hit_count.saturating_add(1);
-                                            if ic.hit_count
-                                                >= otter_vm_bytecode::function::QUICKENING_WARMUP
-                                            {
-                                                if let InlineCacheState::Monomorphic {
-                                                    shape_id,
-                                                    offset,
-                                                    ..
-                                                } = ic.ic_state
-                                                {
-                                                    let pc = frame.pc;
-                                                    Self::try_quicken_property_access(
-                                                        func,
-                                                        pc,
-                                                        &Instruction::GetPropConst {
-                                                            dst: *dst,
-                                                            obj: *obj,
-                                                            name: *name,
-                                                            ic_index: *ic_index,
-                                                        },
-                                                        shape_id,
-                                                        offset,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let key_value = Value::string(JsString::intern_utf16(name_str));
-                            let value = self
-                                .get_with_proxy_chain(ctx, &obj_ref, &key, key_value, &receiver)?;
-                            ctx.set_register(dst.0, value);
-                            Ok(InstructionResult::Continue)
-                        }
-                    }
-                } else if object.is_number() {
-                    // Autobox number -> Number.prototype
-                    let key = Self::utf16_key(name_str);
-                    if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
-                        if let Some(proto) = number_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    Ok(InstructionResult::Continue)
-                } else if object.is_boolean() {
-                    // Autobox boolean -> Boolean.prototype
-                    let key = Self::utf16_key(name_str);
-                    if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
-                    {
-                        if let Some(proto) = boolean_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    Ok(InstructionResult::Continue)
-                } else if object.is_symbol() {
-                    // Autobox symbol -> Symbol.prototype
-                    let key = Self::utf16_key(name_str);
-                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
-                        if let Some(proto) = symbol_obj
-                            .get(&PropertyKey::string("prototype"))
-                            .and_then(|v| v.as_object())
-                        {
-                            let value = self.get_property_value(ctx, &proto, &key, &object)?;
-                            ctx.set_register(dst.0, value);
-                            return Ok(InstructionResult::Continue);
-                        }
-                    }
-                    ctx.set_register(dst.0, Value::undefined());
-                    Ok(InstructionResult::Continue)
-                } else {
-                    ctx.set_register(dst.0, Value::undefined());
-                    Ok(InstructionResult::Continue)
-                }
+                // Cold slow path: proxy, string, array.length, IC miss, autoboxing
+                self.getprop_const_slow(ctx, module, *dst, *obj, *name, *ic_index, object)
             }
 
             Instruction::SetPropConst {
@@ -6254,7 +5874,7 @@ impl Interpreter {
                 let object = ctx.get_register(obj.0).clone();
                 let is_strict = ctx
                     .current_frame()
-                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .and_then(|frame| module.function(frame.function_index))
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
                 let name_const = module
@@ -6288,12 +5908,7 @@ impl Interpreter {
                     {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = obj.shape_ptr_raw();
@@ -6373,7 +5988,7 @@ impl Interpreter {
                                 ctx.set_pending_this(object.clone());
                                 Ok(InstructionResult::Call {
                                     func_index: closure.function_index,
-                                    module: Arc::clone(&closure.module),
+                                    module_id: closure.module.module_id,
                                     argc: 1,
                                     return_reg: 0, // Setter return value is ignored
                                     is_construct: false,
@@ -6415,12 +6030,7 @@ impl Interpreter {
                                 {
                                     let frame = ctx
                                         .current_frame()
-                                        .ok_or_else(|| VmError::internal("no frame"))?;
-                                    let func = frame
-                                        .module
-                                        .function(frame.function_index)
-                                        .ok_or_else(|| VmError::internal("no function"))?;
-                                    let feedback = func.feedback_vector.write();
+                                        .ok_or_else(|| VmError::internal("no frame"))?;                                    let feedback = frame.feedback().write();
                                     if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                         use otter_vm_bytecode::function::InlineCacheState;
                                         let shape_ptr = obj.shape_ptr_raw();
@@ -6486,19 +6096,23 @@ impl Interpreter {
                                                 ..
                                             } = ic.ic_state
                                             {
-                                                let pc = frame.pc;
-                                                Self::try_quicken_property_access(
-                                                    func,
-                                                    pc,
-                                                    &Instruction::SetPropConst {
-                                                        obj: obj_reg,
-                                                        name: *name,
-                                                        val: *val,
-                                                        ic_index: *ic_index,
-                                                    },
-                                                    shape_id,
-                                                    offset,
-                                                );
+                                                if let Some(func) = module.function(frame.function_index) {
+                                                    let pc = frame.pc;
+                                                    Self::try_quicken_property_access(
+                                                        func,
+                                                        pc,
+                                                        &Instruction::SetPropConst {
+                                                            obj: obj_reg,
+                                                            name: *name,
+                                                            val: *val,
+                                                            ic_index: *ic_index,
+                                                        },
+                                                        shape_id,
+                                                        offset,
+                                                        0, // SetProp always operates on the receiver
+                                                        ic.proto_epoch,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -6581,7 +6195,7 @@ impl Interpreter {
                 if !result {
                     let is_strict = ctx
                         .current_frame()
-                        .and_then(|frame| frame.module.function(frame.function_index))
+                        .and_then(|frame| module.function(frame.function_index))
                         .map(|func| func.flags.is_strict)
                         .unwrap_or(false);
                     if is_strict {
@@ -6717,7 +6331,7 @@ impl Interpreter {
                                 ctx.set_pending_this(receiver);
                                 Ok(InstructionResult::Call {
                                     func_index: closure.function_index,
-                                    module: Arc::clone(&closure.module),
+                                    module_id: closure.module.module_id,
                                     argc: 0,
                                     return_reg: dst.0,
                                     is_construct: false,
@@ -6803,7 +6417,7 @@ impl Interpreter {
                 let val_val = ctx.get_register(val.0).clone();
                 let is_strict = ctx
                     .current_frame()
-                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .and_then(|frame| module.function(frame.function_index))
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
@@ -6869,7 +6483,7 @@ impl Interpreter {
                                 ctx.set_pending_this(object.clone());
                                 Ok(InstructionResult::Call {
                                     func_index: closure.function_index,
-                                    module: Arc::clone(&closure.module),
+                                    module_id: closure.module.module_id,
                                     argc: 1,
                                     return_reg: 0, // Setter return value is ignored
                                     is_construct: false,
@@ -7041,12 +6655,7 @@ impl Interpreter {
                         {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
                                 let obj_shape_ptr = obj.shape_ptr_raw();
@@ -7089,12 +6698,7 @@ impl Interpreter {
                             if let Some(offset) = obj.shape_get_offset(&key) {
                                 let frame = ctx
                                     .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let feedback = func.feedback_vector.write();
+                                    .ok_or_else(|| VmError::internal("no frame"))?;                                let feedback = frame.feedback().write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = obj.shape_ptr_raw();
@@ -7173,7 +6777,7 @@ impl Interpreter {
                 let val_val = ctx.get_register(val.0).clone();
                 let is_strict = ctx
                     .current_frame()
-                    .and_then(|frame| frame.module.function(frame.function_index))
+                    .and_then(|frame| module.function(frame.function_index))
                     .map(|func| func.flags.is_strict)
                     .unwrap_or(false);
 
@@ -7211,12 +6815,7 @@ impl Interpreter {
                         {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
                                 let obj_shape_ptr = obj.shape_ptr_raw();
@@ -7287,12 +6886,7 @@ impl Interpreter {
                             if let Some(offset) = obj.shape_get_offset(&key) {
                                 let frame = ctx
                                     .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let func = frame
-                                    .module
-                                    .function(frame.function_index)
-                                    .ok_or_else(|| VmError::internal("no function"))?;
-                                let feedback = func.feedback_vector.write();
+                                    .ok_or_else(|| VmError::internal("no frame"))?;                                let feedback = frame.feedback().write();
                                 if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                     use otter_vm_bytecode::function::InlineCacheState;
                                     let shape_ptr = obj.shape_ptr_raw();
@@ -7370,7 +6964,7 @@ impl Interpreter {
                                 ctx.set_pending_this(array.clone());
                                 return Ok(InstructionResult::Call {
                                     func_index: closure.function_index,
-                                    module: Arc::clone(&closure.module),
+                                    module_id: closure.module.module_id,
                                     argc: 1,
                                     return_reg: 0, // Setter return value is ignored
                                     is_construct: false,
@@ -7413,12 +7007,7 @@ impl Interpreter {
                 let cached_method = if let Some(obj) = receiver.as_object() {
                     let frame = ctx
                         .current_frame()
-                        .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
-                        .module
-                        .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.read();
+                        .ok_or_else(|| VmError::internal("no frame"))?;                    let feedback = frame.feedback().read();
                     if let Some(ic) = feedback.get(*ic_index as usize) {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
@@ -7641,12 +7230,7 @@ impl Interpreter {
                         if let Some(offset) = obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
                                 let shape_ptr = obj.shape_ptr_raw();
@@ -7736,12 +7320,7 @@ impl Interpreter {
                 let cached_method = if let Some(obj) = receiver.as_object() {
                     let frame = ctx
                         .current_frame()
-                        .ok_or_else(|| VmError::internal("no frame"))?;
-                    let func = frame
-                        .module
-                        .function(frame.function_index)
-                        .ok_or_else(|| VmError::internal("no function"))?;
-                    let feedback = func.feedback_vector.read();
+                        .ok_or_else(|| VmError::internal("no frame"))?;                    let feedback = frame.feedback().read();
                     if let Some(ic) = feedback.get(*ic_index as usize) {
                         if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                             shape_id: shape_addr,
@@ -7869,12 +7448,7 @@ impl Interpreter {
                         if let Some(offset) = obj.shape_get_offset(&key) {
                             let frame = ctx
                                 .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let func = frame
-                                .module
-                                .function(frame.function_index)
-                                .ok_or_else(|| VmError::internal("no function"))?;
-                            let feedback = func.feedback_vector.write();
+                                .ok_or_else(|| VmError::internal("no frame"))?;                            let feedback = frame.feedback().write();
                             if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                                 use otter_vm_bytecode::function::InlineCacheState;
                                 let shape_ptr = obj.shape_ptr_raw();
@@ -8040,7 +7614,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Add and execute generic path
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Add {
@@ -8077,7 +7651,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Sub {
@@ -8123,7 +7697,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Mul
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Mul {
@@ -8174,7 +7748,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Div
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Div {
@@ -8221,7 +7795,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Add
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Add {
@@ -8256,7 +7830,7 @@ impl Interpreter {
                 let right = ctx.get_register(rhs.0).clone();
                 // De-quicken: revert to generic Sub
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::Sub {
@@ -8288,6 +7862,8 @@ impl Interpreter {
                 obj,
                 shape_id,
                 offset,
+                depth,
+                proto_epoch,
                 name,
                 ic_index,
             } => {
@@ -8297,16 +7873,27 @@ impl Interpreter {
                 if let Some(obj_ref) = object.as_object() {
                     let obj_shape_ptr = obj_ref.shape_ptr_raw();
                     if obj_shape_ptr == *shape_id {
-                        if let Some(val) = obj_ref.get_by_offset(*offset as usize) {
-                            ctx.set_register(dst.0, val);
-                            return Ok(InstructionResult::Continue);
+                        if *depth == 0 {
+                            // Own property: direct offset read
+                            if let Some(val) = obj_ref.get_by_offset(*offset as usize) {
+                                ctx.set_register(dst.0, val);
+                                return Ok(InstructionResult::Continue);
+                            }
+                        } else if *proto_epoch == ctx.cached_proto_epoch {
+                            // Inherited property: epoch guard confirms cached entry is valid.
+                            // Walk to the prototype at depth and read the offset.
+                            if let Some(val) = get_proto_value_at_depth(&obj_ref, *depth, *offset) {
+                                ctx.set_register(dst.0, val);
+                                return Ok(InstructionResult::Continue);
+                            }
                         }
+                        // else: epoch mismatch for depth>0, fall through to de-quicken
                     }
                 }
 
-                // Shape miss: de-quicken back to GetPropConst and execute the generic path.
+                // Shape miss or epoch mismatch: de-quicken back to GetPropConst.
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::GetPropConst {
@@ -8319,6 +7906,84 @@ impl Interpreter {
                     }
                 }
                 // Fall through to generic GetPropConst execution.
+                let fallback = Instruction::GetPropConst {
+                    dst: *dst,
+                    obj: *obj,
+                    name: *name,
+                    ic_index: *ic_index,
+                };
+                return self.execute_instruction(&fallback, module, ctx);
+            }
+
+            // Quickened: property access on a string primitive
+            Instruction::GetPropString {
+                dst,
+                obj,
+                name,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0).clone();
+                if object.as_string().is_some() {
+                    let name_const = module
+                        .constants
+                        .get(name.0)
+                        .ok_or_else(|| VmError::internal("constant not found"))?;
+                    let name_str = name_const
+                        .as_string()
+                        .ok_or_else(|| VmError::internal("expected string constant"))?;
+                    return self.handle_string_prop_access(ctx, &object, name_str, *dst);
+                }
+                // Type changed — de-quicken back to GetPropConst
+                if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = module.function(frame.function_index) {
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::GetPropConst {
+                                dst: *dst,
+                                obj: *obj,
+                                name: *name,
+                                ic_index: *ic_index,
+                            },
+                        );
+                    }
+                }
+                let fallback = Instruction::GetPropConst {
+                    dst: *dst,
+                    obj: *obj,
+                    name: *name,
+                    ic_index: *ic_index,
+                };
+                return self.execute_instruction(&fallback, module, ctx);
+            }
+
+            // Quickened: array .length fast access
+            Instruction::GetArrayLength {
+                dst,
+                obj,
+                name,
+                ic_index,
+            } => {
+                let object = ctx.get_register(obj.0);
+                if let Some(obj_ref) = object.as_object() {
+                    if obj_ref.is_array() {
+                        ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
+                        return Ok(InstructionResult::Continue);
+                    }
+                }
+                // Type changed — de-quicken back to GetPropConst
+                if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = module.function(frame.function_index) {
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::GetPropConst {
+                                dst: *dst,
+                                obj: *obj,
+                                name: *name,
+                                ic_index: *ic_index,
+                            },
+                        );
+                    }
+                }
                 let fallback = Instruction::GetPropConst {
                     dst: *dst,
                     obj: *obj,
@@ -8342,12 +8007,7 @@ impl Interpreter {
                     if !obj_ref.is_dictionary_mode() {
                         let frame = ctx
                             .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let func = frame
-                            .module
-                            .function(frame.function_index)
-                            .ok_or_else(|| VmError::internal("no function"))?;
-                        let feedback = func.feedback_vector.write();
+                            .ok_or_else(|| VmError::internal("no frame"))?;                        let feedback = frame.feedback().write();
                         if let Some(ic) = feedback.get_mut(*ic_index as usize) {
                             use otter_vm_bytecode::function::InlineCacheState;
                             let obj_shape_ptr = obj_ref.shape_ptr_raw();
@@ -8423,7 +8083,7 @@ impl Interpreter {
 
                 // Shape miss: de-quicken back to SetPropConst and execute the generic path.
                 if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = frame.module.function(frame.function_index) {
+                    if let Some(func) = module.function(frame.function_index) {
                         func.quicken_instruction(
                             frame.pc,
                             Instruction::SetPropConst {
@@ -8487,7 +8147,7 @@ impl Interpreter {
                     ctx.set_pending_this(obj);
                     Ok(InstructionResult::Call {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: 0,
                         return_reg: dst.0,
                         is_construct: false,
@@ -8561,7 +8221,7 @@ impl Interpreter {
                     ctx.set_pending_this(obj);
                     Ok(InstructionResult::Call {
                         func_index: closure.function_index,
-                        module: Arc::clone(&closure.module),
+                        module_id: closure.module.module_id,
                         argc: 0,
                         return_reg: dst.0,
                         is_construct: false,
@@ -8689,7 +8349,7 @@ impl Interpreter {
                 super_class,
             } => {
                 let ctor_value = ctx.get_register(ctor.0).clone();
-                let mm = ctx.memory_manager().clone();
+                let _mm = ctx.memory_manager().clone();
 
                 if let Some(super_reg) = super_class {
                     // Derived class: set up prototype chain
@@ -8849,7 +8509,7 @@ impl Interpreter {
                 for i in 0..(*argc as u16) {
                     args.push(ctx.get_register(args_base.0 + i).clone());
                 }
-                let mm = ctx.memory_manager().clone();
+                let _mm = ctx.memory_manager().clone();
 
                 // Check if the super constructor is also a derived class
                 let super_is_derived = super_ctor_val
@@ -8974,7 +8634,7 @@ impl Interpreter {
                     let ctor_key = PropertyKey::string("constructor");
                     super_proto.get(&ctor_key).unwrap_or_else(Value::undefined)
                 };
-                let mm = ctx.memory_manager().clone();
+                let _mm = ctx.memory_manager().clone();
 
                 let super_is_derived = super_ctor_val
                     .as_function()
@@ -9094,7 +8754,7 @@ impl Interpreter {
                     let ctor_key = PropertyKey::string("constructor");
                     super_proto.get(&ctor_key).unwrap_or_else(Value::undefined)
                 };
-                let mm = ctx.memory_manager().clone();
+                let _mm = ctx.memory_manager().clone();
 
                 let super_is_derived = super_ctor_val
                     .as_function()
@@ -9464,9 +9124,10 @@ impl Interpreter {
                     let frame = ctx
                         .current_frame()
                         .ok_or_else(|| VmError::internal("TemplateLiteral without active frame"))?;
+                    let mid = frame.module_id;
                     TemplateCacheKey {
                         realm_id: frame.realm_id,
-                        module_ptr: Arc::as_ptr(&frame.module) as usize,
+                        module_ptr: Arc::as_ptr(ctx.module_table.get(mid)) as usize,
                         site_id: *site_id,
                     }
                 };
@@ -9557,9 +9218,10 @@ impl Interpreter {
 
         let prev_stack_depth = ctx.stack_depth();
 
+        ctx.register_module(&module);
         ctx.push_frame(
             module.entry_point,
-            Arc::clone(&module),
+            module.module_id,
             entry_func.local_count,
             None,
             false,
@@ -9584,7 +9246,7 @@ impl Interpreter {
             let frame = ctx
                 .current_frame()
                 .ok_or_else(|| VmError::internal("eval: no frame"))?;
-            let current_module = Arc::clone(&frame.module);
+            let current_module = Arc::clone(ctx.module_table.get(frame.module_id));
             let eval_func_index = frame.function_index;
             let func = current_module
                 .function(eval_func_index)
@@ -9643,7 +9305,7 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::Call {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
@@ -9651,13 +9313,15 @@ impl Interpreter {
                     upvalues,
                 }) => {
                     ctx.advance_pc();
-                    let local_count = call_module
-                        .function(func_index)
-                        .ok_or_else(|| VmError::internal("eval: called function not found"))?
-                        .local_count;
+                    let local_count = {
+                        let m = ctx.module_table.get(module_id);
+                        m.function(func_index)
+                            .ok_or_else(|| VmError::internal("eval: called function not found"))?
+                            .local_count
+                    };
                     ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -10029,9 +9693,10 @@ impl Interpreter {
         ctx.set_pending_realm_id(realm_id);
         // Store callee value for arguments.callee
         ctx.set_pending_callee_value(func.clone());
+        ctx.register_module(&closure.module);
         ctx.push_frame(
             closure.function_index,
-            Arc::clone(&closure.module),
+            closure.module.module_id,
             func_info.local_count,
             Some(0), // Return register (unused, we get result from Return)
             true,    // Construct call
@@ -10047,7 +9712,7 @@ impl Interpreter {
                 None => return Err(VmError::internal("no frame")),
             };
 
-            let current_module = Arc::clone(&frame.module);
+            let current_module = Arc::clone(ctx.module_table.get(frame.module_id));
             let construct_func_index = frame.function_index;
             let func = match current_module.function(construct_func_index) {
                 Some(f) => f,
@@ -10125,7 +9790,7 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::Call {
                     func_index,
-                    module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
@@ -10133,76 +9798,76 @@ impl Interpreter {
                     upvalues,
                 }) => {
                     ctx.advance_pc();
-                    let func = module
-                        .function(func_index)
-                        .ok_or_else(|| VmError::internal("function not found"))?;
+                    // Extract func info with scoped borrow (no Arc clone on hot path)
+                    let (local_count, became_hot, can_try_jit) = {
+                        let m = ctx.module_table.get(module_id);
+                        let f = m.function(func_index)
+                            .ok_or_else(|| VmError::internal("function not found"))?;
+                        let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                        let jit = Self::can_jit(f, is_construct, is_async, argc);
+                        (f.local_count, hot, jit)
+                    };
 
-                    // Record the function call for hot function detection
-                    let became_hot =
-                        func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                    if became_hot {
-                        {
-                            if otter_vm_exec::is_jit_enabled() {
-                                otter_vm_exec::enqueue_hot_function(&module, func_index, func);
+                    // JIT paths (cold) — clone Arc only when needed
+                    if became_hot && otter_vm_exec::is_jit_enabled() {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        otter_vm_exec::enqueue_hot_function(&m, func_index, f);
+                        otter_vm_exec::compile_one_pending_request(
+                            crate::jit_runtime::runtime_helpers(),
+                        );
+                    }
+                    if can_try_jit {
+                        let m = Arc::clone(ctx.module_table.get(module_id));
+                        let f = m.function(func_index).unwrap();
+                        let jit_interp: *const Self = self;
+                        let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
+                        match crate::jit_runtime::try_execute_jit(
+                            module_id,
+                            func_index,
+                            f,
+                            ctx.pending_args(),
+                            ctx.cached_proto_epoch,
+                            jit_interp,
+                            jit_ctx_ptr,
+                            &m.constants as *const _,
+                            &upvalues,
+                            None,
+                        ) {
+                            crate::jit_runtime::JitCallResult::Ok(value) => {
+                                ctx.set_register(return_reg, value);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
+                                ctx.set_pending_upvalues(upvalues);
+                                ctx.push_frame(
+                                    func_index,
+                                    module_id,
+                                    local_count,
+                                    Some(return_reg),
+                                    is_construct,
+                                    is_async,
+                                    argc as usize,
+                                )?;
+                                crate::jit_resume::resume_in_place(ctx, &state);
+                                continue;
+                            }
+                            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
+                                otter_vm_exec::enqueue_hot_function(&m, func_index, f);
                                 otter_vm_exec::compile_one_pending_request(
                                     crate::jit_runtime::runtime_helpers(),
                                 );
                             }
-                        }
-                    }
-                    {
-                        let can_try_jit = Self::can_jit(func, is_construct, is_async, argc);
-                        if can_try_jit {
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module.module_id,
-                                func_index,
-                                func,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &module.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    let local_count = func.local_count;
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as usize,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&module, func_index, func);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
+                            crate::jit_runtime::JitCallResult::BailoutRestart
+                            | crate::jit_runtime::JitCallResult::NotCompiled => {}
                         }
                     }
 
-                    let local_count = func.local_count;
+                    // Hot path: push frame (no Arc clone)
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -10212,22 +9877,23 @@ impl Interpreter {
                 }
                 Ok(InstructionResult::TailCall {
                     func_index,
-                    module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
                 }) => {
-                    // Tail call: pop current frame and push new one
                     ctx.pop_frame_discard();
-                    let local_count = module
-                        .function(func_index)
-                        .ok_or_else(|| VmError::internal("function not found"))?
-                        .local_count;
+                    let local_count = {
+                        let m = ctx.module_table.get(module_id);
+                        m.function(func_index)
+                            .ok_or_else(|| VmError::internal("function not found"))?
+                            .local_count
+                    };
                     ctx.set_pending_upvalues(upvalues);
                     ctx.push_frame(
                         func_index,
-                        module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         false,
@@ -10447,7 +10113,7 @@ impl Interpreter {
             ctx.set_pending_callee_value(current_func.clone());
             return Ok(InstructionResult::Call {
                 func_index: closure.function_index,
-                module: Arc::clone(&closure.module),
+                module_id: closure.module.module_id,
                 argc,
                 return_reg,
                 is_construct: false,
@@ -10559,7 +10225,7 @@ impl Interpreter {
 
             return Ok(InstructionResult::Call {
                 func_index: closure.function_index,
-                module: Arc::clone(&closure.module),
+                module_id: closure.module.module_id,
                 argc,
                 return_reg,
                 is_construct: false,
@@ -10661,7 +10327,10 @@ impl Interpreter {
         let Some(frame) = ctx.current_frame() else {
             return injected;
         };
-        let Some(func) = frame.module.function(frame.function_index) else {
+        let frame_module_id = frame.module_id;
+        let frame_func_index = frame.function_index;
+        let frame_module = ctx.module_table.get(frame_module_id);
+        let Some(func) = frame_module.function(frame_func_index) else {
             return injected;
         };
 
@@ -10728,6 +10397,335 @@ impl Interpreter {
             }
             let _ = global.delete(key);
         }
+    }
+
+    /// Cold slow path for GetPropConst: handles proxy, string, array.length,
+    /// full IC miss with descriptor lookup + IC update, and primitive autoboxing.
+    /// Separated from the hot IC-hit path to keep the branch predictor clean.
+    #[cold]
+    #[inline(never)]
+    fn getprop_const_slow(
+        &self,
+        ctx: &mut VmContext,
+        module: &Arc<Module>,
+        dst: Register,
+        obj: Register,
+        name: ConstantIndex,
+        ic_index: u16,
+        object: Value,
+    ) -> VmResult<InstructionResult> {
+        let name_const = module
+            .constants
+            .get(name.0)
+            .ok_or_else(|| VmError::internal("constant not found"))?;
+        let name_str = name_const
+            .as_string()
+            .ok_or_else(|| VmError::internal("expected string constant"))?;
+
+        // 1. Proxy
+        if let Some(proxy) = object.as_proxy() {
+            let key = Self::utf16_key(name_str);
+            let key_value = Value::string(JsString::intern_utf16(name_str));
+            let receiver = object.clone();
+            let result = {
+                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                crate::proxy_operations::proxy_get(
+                    &mut ncx, proxy, &key, key_value, receiver,
+                )?
+            };
+            ctx.set_register(dst.0, result);
+            return Ok(InstructionResult::Continue);
+        }
+
+        // 2. String — quicken to GetPropString for future hits
+        if object.as_string().is_some() {
+            if let Some(frame) = ctx.current_frame() {
+                if let Some(func) = module.function(frame.function_index) {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::GetPropString {
+                            dst,
+                            obj,
+                            name,
+                            ic_index,
+                        },
+                    );
+                }
+            }
+            return self.handle_string_prop_access(ctx, &object, name_str, dst);
+        }
+
+        // 3. Object path: array.length, accessor dispatch, IC miss + update
+        if let Some(obj_ref) = object.as_object() {
+            // Array .length — quicken to GetArrayLength
+            if obj_ref.is_array() && Self::utf16_eq_ascii(name_str, "length") {
+                if let Some(frame) = ctx.current_frame() {
+                    if let Some(func) = module.function(frame.function_index) {
+                        func.quicken_instruction(
+                            frame.pc,
+                            Instruction::GetArrayLength {
+                                dst,
+                                obj,
+                                name,
+                                ic_index,
+                            },
+                        );
+                    }
+                }
+                ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
+                return Ok(InstructionResult::Continue);
+            }
+
+            let receiver = object.clone();
+            let key = Self::utf16_key(name_str);
+
+            match obj_ref.lookup_property_descriptor(&key) {
+                Some(crate::object::PropertyDescriptor::Accessor { get, .. }) => {
+                    let Some(getter) = get else {
+                        ctx.set_register(dst.0, Value::undefined());
+                        return Ok(InstructionResult::Continue);
+                    };
+
+                    if let Some(native_fn) = getter.as_native_function() {
+                        let result = self.call_native_fn(ctx, native_fn, &receiver, &[])?;
+                        ctx.set_register(dst.0, result);
+                        return Ok(InstructionResult::Continue);
+                    } else if let Some(closure) = getter.as_function() {
+                        ctx.set_pending_args(Vec::new());
+                        ctx.set_pending_this(receiver);
+                        return Ok(InstructionResult::Call {
+                            func_index: closure.function_index,
+                            module_id: closure.module.module_id,
+                            argc: 0,
+                            return_reg: dst.0,
+                            is_construct: false,
+                            is_async: closure.is_async,
+                            upvalues: closure.upvalues.clone(),
+                        });
+                    } else {
+                        return Err(VmError::type_error("getter is not a function"));
+                    }
+                }
+                _ => {
+                    // IC miss: full proto walk + IC state update
+                    if !obj_ref.is_dictionary_mode() {
+                        let mut current_obj = Some(obj_ref.clone());
+                        let mut depth = 0;
+                        let mut found_offset = None;
+                        let mut found_shape = 0;
+
+                        while let Some(cur) = current_obj.take() {
+                            if cur.is_dictionary_mode() {
+                                break;
+                            }
+                            if let Some(offset) = cur.shape_get_offset(&key) {
+                                found_offset = Some(offset);
+                                found_shape = cur.shape_ptr_raw();
+                                break;
+                            }
+                            if let Some(proto) = cur.prototype().as_object() {
+                                current_obj = Some(proto.clone());
+                                depth += 1;
+                            }
+                        }
+
+                        if let Some(offset) = found_offset {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let feedback = frame.feedback().write();
+                            if let Some(ic) = feedback.get_mut(ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = obj_ref.shape_ptr_raw();
+                                let proto_shape_id =
+                                    if depth > 0 { found_shape } else { 0 };
+                                let current_epoch = ctx.cached_proto_epoch;
+
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        proto_shape_id: old_proto_shape,
+                                        depth: old_depth,
+                                        offset: old_offset,
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (
+                                                *old_shape,
+                                                *old_proto_shape,
+                                                *old_depth,
+                                                *old_offset,
+                                            );
+                                            entries[1] = (
+                                                shape_ptr,
+                                                proto_shape_id,
+                                                depth,
+                                                offset as u32,
+                                            );
+                                            ic.ic_state = InlineCacheState::Polymorphic {
+                                                count: 2,
+                                                entries,
+                                            };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                    }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for i in 0..(*count as usize) {
+                                            if entries[i].0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] = (
+                                                    shape_ptr,
+                                                    proto_shape_id,
+                                                    depth,
+                                                    offset as u32,
+                                                );
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+
+                                // Quickening
+                                ic.hit_count = ic.hit_count.saturating_add(1);
+                                if ic.hit_count
+                                    >= otter_vm_bytecode::function::QUICKENING_WARMUP
+                                {
+                                    if let InlineCacheState::Monomorphic {
+                                        shape_id,
+                                        offset,
+                                        depth: ic_depth,
+                                        ..
+                                    } = ic.ic_state
+                                    {
+                                        if let Some(func) =
+                                            module.function(frame.function_index)
+                                        {
+                                            let pc = frame.pc;
+                                            Self::try_quicken_property_access(
+                                                func,
+                                                pc,
+                                                &Instruction::GetPropConst {
+                                                    dst,
+                                                    obj,
+                                                    name,
+                                                    ic_index,
+                                                },
+                                                shape_id,
+                                                offset,
+                                                ic_depth,
+                                                ic.proto_epoch,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let key_value = Value::string(JsString::intern_utf16(name_str));
+                    let value = self
+                        .get_with_proxy_chain(ctx, &obj_ref, &key, key_value, &receiver)?;
+                    ctx.set_register(dst.0, value);
+                    return Ok(InstructionResult::Continue);
+                }
+            }
+        }
+
+        // 4. Primitive autoboxing (number, boolean, symbol)
+        let key = Self::utf16_key(name_str);
+        if object.is_number() {
+            if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
+                if let Some(proto) = number_obj
+                    .get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+                {
+                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                    ctx.set_register(dst.0, value);
+                    return Ok(InstructionResult::Continue);
+                }
+            }
+        } else if object.is_boolean() {
+            if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
+                if let Some(proto) = boolean_obj
+                    .get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+                {
+                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                    ctx.set_register(dst.0, value);
+                    return Ok(InstructionResult::Continue);
+                }
+            }
+        } else if object.is_symbol() {
+            if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
+                if let Some(proto) = symbol_obj
+                    .get(&PropertyKey::string("prototype"))
+                    .and_then(|v| v.as_object())
+                {
+                    let value = self.get_property_value(ctx, &proto, &key, &object)?;
+                    ctx.set_register(dst.0, value);
+                    return Ok(InstructionResult::Continue);
+                }
+            }
+        }
+
+        ctx.set_register(dst.0, Value::undefined());
+        Ok(InstructionResult::Continue)
+    }
+
+    /// Handle string property access (length, index, String.prototype method).
+    /// Shared by GetPropConst slow path and GetPropString handler.
+    #[inline]
+    fn handle_string_prop_access(
+        &self,
+        ctx: &mut VmContext,
+        object: &Value,
+        name_str: &[u16],
+        dst: Register,
+    ) -> VmResult<InstructionResult> {
+        let str_ref = object.as_string().unwrap();
+        if Self::utf16_eq_ascii(name_str, "length") {
+            ctx.set_register(dst.0, Value::int32(str_ref.len_utf16() as i32));
+            return Ok(InstructionResult::Continue);
+        }
+
+        if let Some(index) = Self::utf16_to_index(name_str) {
+            let units = str_ref.as_utf16();
+            if let Some(unit) = units.get(index as usize) {
+                let ch = JsString::intern_utf16(&[*unit]);
+                ctx.set_register(dst.0, Value::string(ch));
+            } else {
+                ctx.set_register(dst.0, Value::undefined());
+            }
+            return Ok(InstructionResult::Continue);
+        }
+
+        if let Some(proto) = ctx.string_prototype() {
+            let key = Self::utf16_key(name_str);
+            let value = proto.get(&key).unwrap_or_else(Value::undefined);
+            ctx.set_register(dst.0, value);
+            return Ok(InstructionResult::Continue);
+        }
+
+        ctx.set_register(dst.0, Value::undefined());
+        Ok(InstructionResult::Continue)
     }
 
     /// Get a property from an object, walking the prototype chain with proxy trap support.
@@ -11764,7 +11762,9 @@ impl Interpreter {
             let frame = ctx
                 .current_frame()
                 .ok_or_else(|| VmError::internal("no frame for field init"))?;
-            (frame.module.clone(), frame.function_index)
+            let mid = frame.module_id;
+            let fidx = frame.function_index;
+            (Arc::clone(ctx.module_table.get(mid)), fidx)
         };
 
         // Look up the constructor's field_init_func
@@ -11848,9 +11848,10 @@ impl Interpreter {
 
         for (i, frame) in frames.iter().enumerate() {
             let frame_obj = GcRef::new(JsObject::new(Value::null()));
+            let frame_module = ctx.module_table.get(frame.module_id);
 
             // Get function name
-            if let Some(func_def) = frame.module.functions.get(frame.function_index as usize) {
+            if let Some(func_def) = frame_module.functions.get(frame.function_index as usize) {
                 let func_name = func_def
                     .name
                     .clone()
@@ -11867,7 +11868,7 @@ impl Interpreter {
             }
 
             // Get source file
-            let source_url = &frame.module.source_url;
+            let source_url = &frame_module.source_url;
             if !source_url.is_empty() {
                 let _ = frame_obj.set(
                     PropertyKey::string("file"),
@@ -11877,7 +11878,7 @@ impl Interpreter {
 
             // Resolve source location from function source map if present.
             // `frame.pc` can point at the next instruction, so also try `pc - 1`.
-            if let Some(func) = frame.module.functions.get(frame.function_index as usize) {
+            if let Some(func) = frame_module.functions.get(frame.function_index as usize) {
                 let entry = func.source_map.as_ref().and_then(|map| {
                     map.find(frame.pc as u32).or_else(|| {
                         frame
@@ -11939,7 +11940,7 @@ pub enum GeneratorResult {
 }
 
 fn make_iterator_result_object(
-    memory_manager: Arc<crate::memory::MemoryManager>,
+    _memory_manager: Arc<crate::memory::MemoryManager>,
     value: Value,
     done: bool,
 ) -> Value {
@@ -12216,9 +12217,10 @@ impl Interpreter {
         // Remember the stack depth before pushing the generator frame
         let initial_depth = ctx.stack_depth();
 
+        ctx.register_module(&generator.module);
         if let Err(e) = ctx.push_frame(
             generator.function_index,
-            Arc::clone(&generator.module),
+            generator.module.module_id,
             func.local_count,
             None,
             generator.is_construct(),
@@ -12360,9 +12362,10 @@ impl Interpreter {
             .function(frame.function_index)
             .ok_or_else(|| VmError::internal("Generator function not found"))?;
 
+        ctx.register_module(&frame.module);
         ctx.push_frame(
             frame.function_index,
-            Arc::clone(&frame.module),
+            frame.module.module_id,
             func.local_count,
             None,
             frame.is_construct,
@@ -12388,7 +12391,7 @@ impl Interpreter {
     fn save_generator_frame(
         &self,
         ctx: &mut VmContext,
-        module: &Arc<Module>,
+        _module: &Arc<Module>,
     ) -> VmResult<GeneratorFrame> {
         let current_frame = ctx
             .current_frame()
@@ -12411,7 +12414,7 @@ impl Interpreter {
         Ok(GeneratorFrame::new(
             current_frame.pc,
             current_frame.function_index,
-            Arc::clone(&current_frame.module),
+            Arc::clone(ctx.module_table.get(current_frame.module_id)),
             local_count,
             window,
             current_frame.upvalues.clone(),
@@ -12636,7 +12639,7 @@ impl Interpreter {
 
             // Cache module reference
             if frame.frame_id != cached_frame_id {
-                cached_module = Some(Arc::clone(&frame.module));
+                cached_module = Some(Arc::clone(ctx.module_table.get(frame.module_id)));
                 cached_frame_id = frame.frame_id;
             }
 
@@ -12677,7 +12680,7 @@ impl Interpreter {
                 Some((
                     frame.pc,
                     frame.function_index,
-                    Arc::clone(&frame.module),
+                    Arc::clone(ctx.module_table.get(frame.module_id)),
                     instruction.clone(),
                 ))
             } else {
@@ -12868,30 +12871,29 @@ impl Interpreter {
                 }
                 InstructionResult::Call {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_construct,
                     is_async,
                     upvalues,
                 } => {
-                    ctx.advance_pc(); // Advance before pushing new frame
-
-                    let callee = match call_module.function(func_index) {
-                        Some(f) => f,
-                        None => {
-                            generator.complete();
-                            return GeneratorResult::Error(VmError::internal(format!(
-                                "callee not found (func_index={}, function_count={})",
-                                func_index,
-                                call_module.function_count()
-                            )));
+                    ctx.advance_pc();
+                    // Extract func info with scoped borrow (no Arc clone)
+                    let (local_count, has_rest, param_count) = {
+                        let m = ctx.module_table.get(module_id);
+                        match m.function(func_index) {
+                            Some(f) => (f.local_count, f.flags.has_rest, f.param_count as usize),
+                            None => {
+                                generator.complete();
+                                return GeneratorResult::Error(VmError::internal(format!(
+                                    "callee not found (func_index={}, function_count={})",
+                                    func_index,
+                                    m.function_count()
+                                )));
+                            }
                         }
                     };
-
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
 
                     if has_rest {
                         let mut args = ctx.take_pending_args();
@@ -12921,7 +12923,7 @@ impl Interpreter {
 
                     if let Err(e) = ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         is_construct,
@@ -12934,31 +12936,29 @@ impl Interpreter {
                 }
                 InstructionResult::TailCall {
                     func_index,
-                    module: call_module,
+                    module_id,
                     argc,
                     return_reg,
                     is_async,
                     upvalues,
                 } => {
-                    // Tail call optimization: pop current frame before pushing new one
                     ctx.pop_frame_discard();
                     cached_frame_id = usize::MAX;
 
-                    let callee = match call_module.function(func_index) {
-                        Some(f) => f,
-                        None => {
-                            generator.complete();
-                            return GeneratorResult::Error(VmError::internal(format!(
-                                "callee not found (func_index={}, function_count={})",
-                                func_index,
-                                call_module.function_count()
-                            )));
+                    let (local_count, has_rest, param_count) = {
+                        let m = ctx.module_table.get(module_id);
+                        match m.function(func_index) {
+                            Some(f) => (f.local_count, f.flags.has_rest, f.param_count as usize),
+                            None => {
+                                generator.complete();
+                                return GeneratorResult::Error(VmError::internal(format!(
+                                    "callee not found (func_index={}, function_count={})",
+                                    func_index,
+                                    m.function_count()
+                                )));
+                            }
                         }
                     };
-
-                    let local_count = callee.local_count;
-                    let has_rest = callee.flags.has_rest;
-                    let param_count = callee.param_count as usize;
 
                     if has_rest {
                         let mut args = ctx.take_pending_args();
@@ -12986,7 +12986,7 @@ impl Interpreter {
 
                     if let Err(e) = ctx.push_frame(
                         func_index,
-                        call_module,
+                        module_id,
                         local_count,
                         Some(return_reg),
                         false,
@@ -13052,7 +13052,7 @@ enum InstructionResult {
     /// Call a function
     Call {
         func_index: u32,
-        module: Arc<Module>,
+        module_id: u64,
         argc: u8,
         return_reg: u16,
         is_construct: bool,
@@ -13062,7 +13062,7 @@ enum InstructionResult {
     /// Tail call - pop current frame and call function (no stack growth)
     TailCall {
         func_index: u32,
-        module: Arc<Module>,
+        module_id: u64,
         argc: u8,
         return_reg: u16,
         is_async: bool,
@@ -14546,7 +14546,7 @@ mod tests {
         use crate::object::get_proto_epoch;
 
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
 
         // Record initial epoch
         let initial_epoch = get_proto_epoch();
@@ -14817,7 +14817,7 @@ mod tests {
         use crate::object::{DICTIONARY_THRESHOLD, JsObject, PropertyKey};
 
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Initially not in dictionary mode
@@ -14858,69 +14858,101 @@ mod tests {
 
     #[test]
     fn test_dictionary_mode_delete_trigger() {
-        // Test that deleting a property triggers dictionary mode
+        // Test that deleting properties defers dictionary mode until 3+ deletes
         use crate::object::{JsObject, PropertyKey};
 
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Add a few properties
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
+        let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
         let _ = obj.set(key_a.clone(), Value::int32(1));
         let _ = obj.set(key_b.clone(), Value::int32(2));
+        let _ = obj.set(key_c.clone(), Value::int32(3));
+        let _ = obj.set(key_d.clone(), Value::int32(4));
 
         assert!(
             !obj.is_dictionary_mode(),
             "Object should not be in dictionary mode before delete"
         );
 
-        // Delete a property
+        // Delete 1 property — should stay shaped (slot-clearing)
         obj.delete(&key_a);
-
         assert!(
-            obj.is_dictionary_mode(),
-            "Object should be in dictionary mode after delete"
+            !obj.is_dictionary_mode(),
+            "Object should stay shaped after 1 delete"
+        );
+        // Deleted property should be absent
+        assert!(!obj.has_own(&key_a));
+        // Remaining properties still accessible
+        assert_eq!(obj.get(&key_b), Some(Value::int32(2)));
+
+        // Delete 2nd property — still shaped
+        obj.delete(&key_b);
+        assert!(
+            !obj.is_dictionary_mode(),
+            "Object should stay shaped after 2 deletes"
         );
 
-        // Verify we can still access the remaining property
-        assert_eq!(obj.get(&key_b), Some(Value::int32(2)));
+        // Delete 3rd property — triggers dictionary mode
+        obj.delete(&key_c);
+        assert!(
+            obj.is_dictionary_mode(),
+            "Object should be in dictionary mode after 3 deletes"
+        );
+
+        // Remaining property still accessible
+        assert_eq!(obj.get(&key_d), Some(Value::int32(4)));
     }
 
     #[test]
     fn test_dictionary_mode_storage_correctness() {
-        // Test that dictionary mode storage works correctly
+        // Test that slot-clearing and dictionary mode storage work correctly
         use crate::object::{JsObject, PropertyKey};
 
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
-        // Add a property
+        // Add properties
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
-        let _ = obj.set(key_a.clone(), Value::int32(42));
-
-        // Trigger dictionary mode via delete
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        let _ = obj.set(key_a.clone(), Value::int32(42));
         let _ = obj.set(key_b.clone(), Value::int32(100));
+
+        // Delete key_b (slot-clearing, not dict mode yet)
         obj.delete(&key_b);
+        assert!(!obj.is_dictionary_mode());
 
-        assert!(obj.is_dictionary_mode());
-
-        // Add a new property in dictionary mode
-        let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
-        let _ = obj.set(key_c.clone(), Value::int32(200));
-
-        // Verify all properties work correctly
-        assert_eq!(obj.get(&key_a), Some(Value::int32(42)));
-        assert_eq!(obj.get(&key_b), None); // Deleted
-        assert_eq!(obj.get(&key_c), Some(Value::int32(200)));
-
-        // Verify has_own works
+        // Verify has_own and get work with cleared slot
         assert!(obj.has_own(&key_a));
         assert!(!obj.has_own(&key_b));
-        assert!(obj.has_own(&key_c));
+        assert_eq!(obj.get(&key_a), Some(Value::int32(42)));
+        assert_eq!(obj.get(&key_b), None); // Deleted (cleared slot)
+
+        // Re-insert key_b (re-creates data property in cleared slot)
+        let _ = obj.set(key_b.clone(), Value::int32(200));
+        assert_eq!(obj.get(&key_b), Some(Value::int32(200)));
+        assert!(obj.has_own(&key_b));
+
+        // Now trigger dictionary mode with 3 deletes
+        let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
+        let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
+        let _ = obj.set(key_c.clone(), Value::int32(300));
+        let _ = obj.set(key_d.clone(), Value::int32(400));
+        obj.delete(&key_b); // delete_count = 2 (had 1 before re-insert)
+        obj.delete(&key_c); // delete_count = 3 → dictionary mode
+        assert!(obj.is_dictionary_mode());
+
+        // Verify dictionary mode storage
+        assert_eq!(obj.get(&key_a), Some(Value::int32(42)));
+        assert!(!obj.has_own(&key_b));
+        assert!(!obj.has_own(&key_c));
+        assert_eq!(obj.get(&key_d), Some(Value::int32(400)));
     }
 
     #[test]
@@ -14930,16 +14962,27 @@ mod tests {
         use otter_vm_bytecode::function::InlineCacheState;
 
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
-        // Add and delete a property to trigger dictionary mode
+        // Add properties and trigger dictionary mode via 3 deletes
         let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
         let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
+        let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
+        let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
         let _ = obj.set(key_a.clone(), Value::int32(1));
         let _ = obj.set(key_b.clone(), Value::int32(2));
-        obj.delete(&key_a);
+        let _ = obj.set(key_c.clone(), Value::int32(3));
+        let _ = obj.set(key_d.clone(), Value::int32(4));
 
+        // 1-2 deletes: still shaped, IC remains valid
+        obj.delete(&key_a);
+        assert!(!obj.is_dictionary_mode());
+        obj.delete(&key_b);
+        assert!(!obj.is_dictionary_mode());
+
+        // 3rd delete: transitions to dictionary mode
+        obj.delete(&key_c);
         assert!(obj.is_dictionary_mode());
 
         // Create an IC metadata and verify it can detect dictionary mode

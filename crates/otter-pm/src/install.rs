@@ -96,14 +96,12 @@ impl Installer {
             if !node_modules_empty {
                 // Check if already installed with correct version
                 let pkg_json = self.node_modules.join(name).join("package.json");
-                if pkg_json.exists() {
-                    if let Ok(content) = fs::read_to_string(&pkg_json) {
-                        if let Ok(existing) = serde_json::from_str::<PackageJson>(&content) {
-                            if existing.version.as_deref() == Some(&entry.version) {
-                                continue; // Already installed
-                            }
-                        }
-                    }
+                if pkg_json.exists()
+                    && let Ok(content) = fs::read_to_string(&pkg_json)
+                    && let Ok(existing) = serde_json::from_str::<PackageJson>(&content)
+                    && existing.version.as_deref() == Some(&entry.version)
+                {
+                    continue; // Already installed
                 }
             }
 
@@ -190,14 +188,12 @@ impl Installer {
             if !node_modules_empty {
                 // Check if already installed with correct version
                 let pkg_json = self.node_modules.join(name).join("package.json");
-                if pkg_json.exists() {
-                    if let Ok(content) = fs::read_to_string(&pkg_json) {
-                        if let Ok(existing) = serde_json::from_str::<PackageJson>(&content) {
-                            if existing.version.as_deref() == Some(&entry.version) {
-                                continue; // Already installed
-                            }
-                        }
-                    }
+                if pkg_json.exists()
+                    && let Ok(content) = fs::read_to_string(&pkg_json)
+                    && let Ok(existing) = serde_json::from_str::<PackageJson>(&content)
+                    && existing.version.as_deref() == Some(&entry.version)
+                {
+                    continue; // Already installed
                 }
             }
 
@@ -258,18 +254,18 @@ impl Installer {
 
         // Try frozen install from binary lockfile first (fastest path)
         let binary_lockfile_path = package_json.parent().unwrap().join("otter.lockb");
-        if let Ok(binary_lock) = BinaryLockfile::load(&binary_lockfile_path) {
-            if let Some(result) = self.try_binary_frozen_install(&binary_lock, &deps)? {
-                return Ok(result);
-            }
+        if let Ok(binary_lock) = BinaryLockfile::load(&binary_lockfile_path)
+            && let Some(result) = self.try_binary_frozen_install(&binary_lock, &deps)?
+        {
+            return Ok(result);
         }
 
         // Try JSON lockfile as fallback
         let lockfile_path = package_json.parent().unwrap().join("otter.lock");
-        if let Ok(lockfile) = Lockfile::load(&lockfile_path) {
-            if let Some(result) = self.try_frozen_install(&lockfile, &deps).await? {
-                return Ok(result);
-            }
+        if let Ok(lockfile) = Lockfile::load(&lockfile_path)
+            && let Some(result) = self.try_frozen_install(&lockfile, &deps).await?
+        {
+            return Ok(result);
         }
 
         // We are about to do network work; enable interactive progress for this path only.
@@ -453,14 +449,11 @@ impl Installer {
         let pkg_dir = self.node_modules.join(&pkg.name);
         let pkg_json = pkg_dir.join("package.json");
 
-        if !pkg_json.exists() {
-            return false;
-        }
-
-        if let Ok(content) = fs::read_to_string(&pkg_json) {
-            if let Ok(existing) = serde_json::from_str::<PackageJson>(&content) {
-                return existing.version.as_deref() == Some(&pkg.version);
-            }
+        if pkg_json.exists()
+            && let Ok(content) = fs::read_to_string(&pkg_json)
+            && let Ok(existing) = serde_json::from_str::<PackageJson>(&content)
+        {
+            return existing.version.as_deref() == Some(&pkg.version);
         }
 
         false
@@ -528,10 +521,10 @@ async fn download_package(
     let cache_path = cache_dir.join(format!("{}-{}.tgz", safe_name, pkg.version));
 
     // Check cache first
-    if cache_path.exists() {
-        if let Ok(data) = fs::read(&cache_path) {
-            return Ok(data);
-        }
+    if cache_path.exists()
+        && let Ok(data) = fs::read(&cache_path)
+    {
+        return Ok(data);
     }
 
     // Download from registry
@@ -587,7 +580,7 @@ impl BinField {
         match self {
             BinField::Single(path) => {
                 // Use package name (without scope) as command name
-                let cmd_name = package_name.split('/').last().unwrap_or(package_name);
+                let cmd_name = package_name.split('/').next_back().unwrap_or(package_name);
                 let mut map = HashMap::new();
                 map.insert(cmd_name.to_string(), path.clone());
                 map

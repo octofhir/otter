@@ -7,7 +7,6 @@ use crate::gc::GcRef;
 use crate::object::JsObject;
 use crate::value::Value;
 use std::cell::RefCell;
-use std::sync::Arc;
 
 /// A JavaScript ArrayBuffer
 ///
@@ -222,7 +221,7 @@ mod tests {
     use super::*;
     use crate::memory::MemoryManager;
 
-    fn make_test_env() -> (Arc<MemoryManager>, crate::runtime::VmRuntime) {
+    fn make_test_env() -> (std::sync::Arc<MemoryManager>, crate::runtime::VmRuntime) {
         let rt = crate::runtime::VmRuntime::new();
         let mm = rt.memory_manager().clone();
         (mm, rt)
@@ -230,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_create_array_buffer() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(16, None);
         assert_eq!(ab.byte_length(), 16);
         assert!(!ab.is_detached());
@@ -239,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_create_resizable() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new_resizable(8, 16, None);
         assert_eq!(ab.byte_length(), 8);
         assert_eq!(ab.max_byte_length(), Some(16));
@@ -248,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_get_set() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(4, None);
         assert!(ab.set(0, 42));
         assert_eq!(ab.get(0), Some(42));
@@ -257,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_detach() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(8, None);
         assert!(!ab.is_detached());
         ab.detach();
@@ -267,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_transfer() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(8, None);
         ab.set(0, 42);
         let new_ab = ab.transfer().unwrap();
@@ -278,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_slice() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(16, None);
         ab.set(4, 1);
         ab.set(5, 2);
@@ -295,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_resize() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new_resizable(8, 16, None);
         ab.set(0, 42);
 
@@ -308,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_read_write_bytes() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let ab = JsArrayBuffer::new(8, None);
         let src = [1, 2, 3, 4];
         assert!(ab.write_bytes(2, &src));

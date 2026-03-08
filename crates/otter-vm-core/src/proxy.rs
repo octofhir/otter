@@ -156,12 +156,11 @@ mod tests {
     use super::*;
     use crate::gc::GcRef;
     use crate::object::JsObject;
-    use std::sync::Arc;
 
     #[test]
     fn test_proxy_creation() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null()));
         let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
@@ -174,7 +173,7 @@ mod tests {
     #[test]
     fn test_proxy_revoke() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null()));
         let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));
@@ -189,7 +188,7 @@ mod tests {
     #[test]
     fn test_revocable_proxy() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null()));
         let handler = GcRef::new(JsObject::new(Value::null()));
         let RevocableProxy { proxy, revoke } =
@@ -203,7 +202,7 @@ mod tests {
     #[test]
     fn test_get_trap_missing() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let target = GcRef::new(JsObject::new(Value::null()));
         let handler = GcRef::new(JsObject::new(Value::null()));
         let proxy = JsProxy::new(Value::object(target), Value::object(handler));

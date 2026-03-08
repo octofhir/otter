@@ -57,7 +57,7 @@ impl PeepholeOptimizer {
     }
 
     /// Single optimization pass
-    fn optimize_pass(&mut self, instructions: &mut Vec<Instruction>) -> bool {
+    fn optimize_pass(&mut self, instructions: &mut [Instruction]) -> bool {
         let mut changed = false;
 
         // Dead code elimination - remove unreachable code after return/throw
@@ -79,34 +79,32 @@ impl PeepholeOptimizer {
         let mut i = 0;
         while i < instructions.len() {
             // Try 2-instruction window optimizations
-            if i + 1 < instructions.len() {
-                if let Some(replacement) =
+            if i + 1 < instructions.len()
+                && let Some(replacement) =
                     self.optimize_window_2(&instructions[i], &instructions[i + 1])
-                {
-                    match replacement {
-                        WindowResult::Replace1(instr) => {
-                            instructions[i] = instr;
-                            instructions[i + 1] = Instruction::Nop;
-                            changed = true;
-                        }
-                        WindowResult::Replace2(instr1, instr2) => {
-                            instructions[i] = instr1;
-                            instructions[i + 1] = instr2;
-                            changed = true;
-                        }
-                        WindowResult::Remove1 => {
-                            instructions[i] = Instruction::Nop;
-                            changed = true;
-                        }
-                        WindowResult::Remove2 => {
-                            instructions[i] = Instruction::Nop;
-                            instructions[i + 1] = Instruction::Nop;
-                            changed = true;
-                        }
+            {
+                match replacement {
+                    WindowResult::Replace1(instr) => {
+                        instructions[i] = instr;
+                        instructions[i + 1] = Instruction::Nop;
+                        changed = true;
+                    }
+                    WindowResult::Replace2(instr1, instr2) => {
+                        instructions[i] = instr1;
+                        instructions[i + 1] = instr2;
+                        changed = true;
+                    }
+                    WindowResult::Remove1 => {
+                        instructions[i] = Instruction::Nop;
+                        changed = true;
+                    }
+                    WindowResult::Remove2 => {
+                        instructions[i] = Instruction::Nop;
+                        instructions[i + 1] = Instruction::Nop;
+                        changed = true;
                     }
                 }
             }
-
             // Single instruction optimizations
             if let Some(replacement) = self.optimize_single(&instructions[i]) {
                 instructions[i] = replacement;
@@ -121,7 +119,7 @@ impl PeepholeOptimizer {
 
     /// Remove `Nop`s and patch relative jump offsets.
     ///
-    /// Many optimizations replace instructions with `Nop` (or remove windows),
+    /// Many optimizations replace instructions with `Nop` (or removed windows),
     /// which changes instruction indices once we compact the stream. Since jump
     /// offsets are encoded relative to the current instruction index, we must
     /// rewrite them after compaction.
@@ -213,7 +211,7 @@ impl PeepholeOptimizer {
     /// This removes instructions that follow Return, ReturnUndefined, or Throw
     /// until the next potential jump target. Since we don't have explicit labels,
     /// we can only safely remove code at the end of basic blocks.
-    fn eliminate_dead_code(&self, instructions: &mut Vec<Instruction>) -> bool {
+    fn eliminate_dead_code(&self, instructions: &mut [Instruction]) -> bool {
         if instructions.is_empty() {
             return false;
         }
@@ -270,7 +268,7 @@ impl PeepholeOptimizer {
                 Instruction::JumpIfNotNullish { offset, .. } => Some(offset.0),
                 Instruction::TryStart { catch_offset } => {
                     // Catch block is a jump target
-                    let catch_target = (i as i32 + catch_offset.0 as i32) as usize;
+                    let catch_target = (i as i32 + catch_offset.0) as usize;
                     targets.insert(catch_target);
                     None
                 }
@@ -280,7 +278,7 @@ impl PeepholeOptimizer {
 
             if let Some(off) = offset {
                 // Calculate target index: current index + offset
-                let target = (i as i32 + off as i32) as usize;
+                let target = (i as i32 + off) as usize;
                 if target < instructions.len() {
                     targets.insert(target);
                 }
@@ -295,21 +293,21 @@ impl PeepholeOptimizer {
     /// When we see `Move dst, src`, we know that dst holds the same value as src.
     /// We can then substitute uses of dst with src in subsequent instructions,
     /// potentially allowing the Move to be eliminated later.
-    fn propagate_copies(&self, instructions: &mut Vec<Instruction>) -> bool {
+    fn propagate_copies(&self, instructions: &mut [Instruction]) -> bool {
         let mut changed = false;
         let jump_targets = self.find_jump_targets(instructions);
 
         // Map from register to its copy source (dst -> src means dst = src)
         let mut copies: HashMap<u16, u16> = HashMap::new();
 
-        for i in 0..instructions.len() {
+        for (i, instr) in instructions.iter_mut().enumerate() {
             // At jump targets, invalidate all copies (control flow merge)
             if jump_targets.contains(&i) {
                 copies.clear();
             }
 
             // Process the instruction
-            match &instructions[i] {
+            match instr {
                 Instruction::Move { dst, src } => {
                     // Record the copy: dst now holds the value of src
                     // But first, resolve src through existing copies
@@ -320,13 +318,13 @@ impl PeepholeOptimizer {
                 }
                 _ => {
                     // For other instructions, try to substitute source registers
-                    if let Some(new_instr) = self.substitute_copies(&instructions[i], &copies) {
-                        instructions[i] = new_instr;
+                    if let Some(new_instr) = self.substitute_copies(instr, &copies) {
+                        *instr = new_instr;
                         changed = true;
                     }
 
                     // Invalidate any copy whose destination is written by this instruction
-                    if let Some(written_reg) = self.get_written_register(&instructions[i]) {
+                    if let Some(written_reg) = self.get_written_register(instr) {
                         copies.remove(&written_reg);
                         // Also remove any copies that depend on this register
                         copies.retain(|_, &mut src| src != written_reg);
@@ -335,7 +333,7 @@ impl PeepholeOptimizer {
             }
 
             // Control flow instructions invalidate all copies
-            if self.is_control_flow(&instructions[i]) {
+            if self.is_control_flow(instr) {
                 copies.clear();
             }
         }
@@ -635,7 +633,7 @@ impl PeepholeOptimizer {
     /// And r1 is not used after the Add, we can rewrite to:
     ///   Add r2, r0, r3
     /// And eliminate the Move.
-    fn coalesce_registers(&self, instructions: &mut Vec<Instruction>) -> bool {
+    fn coalesce_registers(&self, instructions: &mut [Instruction]) -> bool {
         let mut changed = false;
 
         // Find Move instructions that can be eliminated
@@ -731,12 +729,12 @@ impl PeepholeOptimizer {
         from: usize,
         reg: Register,
     ) -> bool {
-        for i in from..instructions.len() {
-            if self.instruction_uses_register(&instructions[i], reg) {
+        for instr in instructions.iter().skip(from) {
+            if self.instruction_uses_register(instr, reg) {
                 return true;
             }
             // If the register is written, stop searching (it's redefined)
-            if self.get_written_register(&instructions[i]) == Some(reg.0) {
+            if self.get_written_register(instr) == Some(reg.0) {
                 return false;
             }
         }
@@ -892,25 +890,24 @@ impl PeepholeOptimizer {
                 idx: idx2,
             },
         ) = (first, second)
+            && idx1 == idx2
         {
-            if idx1 == idx2 {
-                // Replace GetLocal with Move
-                return Some(WindowResult::Replace2(
-                    first.clone(),
-                    Instruction::Move {
-                        dst: *dst2,
-                        src: *src1,
-                    },
-                ));
-            }
+            // Replace GetLocal with Move
+            return Some(WindowResult::Replace2(
+                first.clone(),
+                Instruction::Move {
+                    dst: *dst2,
+                    src: *src1,
+                },
+            ));
         }
 
         // Jump to next instruction is dead code
-        if let Instruction::Jump { offset } = first {
-            if offset.0 == 1 {
-                // Jump offset 1 means jump to next instruction
-                return Some(WindowResult::Remove1);
-            }
+        if let Instruction::Jump { offset } = first
+            && offset.0 == 1
+        {
+            // Jump offset 1 means jump to next instruction
+            return Some(WindowResult::Remove1);
         }
 
         // Superinstruction: GetLocal + GetPropConst → GetLocalProp
@@ -929,15 +926,14 @@ impl PeepholeOptimizer {
                 ic_index,
             },
         ) = (first, second)
+            && local_dst == obj
         {
-            if local_dst == obj {
-                return Some(WindowResult::Replace1(Instruction::GetLocalProp {
-                    dst: *prop_dst,
-                    local_idx: *local_idx,
-                    name: *name,
-                    ic_index: *ic_index,
-                }));
-            }
+            return Some(WindowResult::Replace1(Instruction::GetLocalProp {
+                dst: *prop_dst,
+                local_idx: *local_idx,
+                name: *name,
+                ic_index: *ic_index,
+            }));
         }
 
         None

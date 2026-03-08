@@ -73,14 +73,13 @@ impl NpmRegistry {
             .map_err(|e| RegistryError::Network(e.to_string()))?;
 
         // 5. Handle 304 Not Modified - use cached data
-        if response.status() == 304 {
-            if let Some(data) = cached_data {
-                // Update memory cache
-                let mut cache = self.cache.write().await;
-                cache.insert(name.to_string(), data.clone());
-                return Ok(data);
-            }
-            // Shouldn't happen - 304 without cached data
+        if response.status() == 304
+            && let Some(data) = cached_data
+        {
+            // Update memory cache
+            let mut cache = self.cache.write().await;
+            cache.insert(name.to_string(), data.clone());
+            return Ok(data);
         }
 
         if response.status() == 404 {

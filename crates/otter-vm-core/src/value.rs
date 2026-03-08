@@ -31,7 +31,7 @@ use crate::data_view::JsDataView;
 use crate::gc::GcRef;
 use crate::generator::JsGenerator;
 use crate::map_data::{MapData, SetData};
-use crate::object::JsObject;
+use crate::object::{AccessorPair, JsObject};
 use crate::promise::JsPromise;
 use crate::proxy::JsProxy;
 use crate::regexp::JsRegExp;
@@ -613,6 +613,14 @@ impl Value {
     /// Create Symbol value
     pub fn symbol(sym: GcRef<Symbol>) -> Self {
         let ptr = sym.as_ptr() as u64;
+        Self {
+            bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
+        }
+    }
+
+    /// Create accessor pair value (for accessor property slots)
+    pub fn accessor_pair(pair: GcRef<AccessorPair>) -> Self {
+        let ptr = pair.as_ptr() as u64;
         Self {
             bits: TAG_PTR_OTHER | (ptr & PAYLOAD_MASK),
         }
@@ -1402,8 +1410,8 @@ impl Value {
         let raw_ptr = self.raw_heap_ptr();
         debug_assert!(!raw_ptr.is_null());
         let header_offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
-        let header_ptr = raw_ptr.sub(header_offset) as *const otter_vm_gc::GcHeader;
-        (*header_ptr).tag()
+        let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const otter_vm_gc::GcHeader };
+        unsafe { (*header_ptr).tag() }
     }
 
     /// Extract a `GcRef<T>` from NaN-boxed pointer bits.
@@ -1416,10 +1424,26 @@ impl Value {
         let raw_ptr = self.raw_heap_ptr();
         debug_assert!(!raw_ptr.is_null());
         let offset = std::mem::offset_of!(crate::gc::GcBox<T>, value);
-        let box_ptr = raw_ptr.sub(offset) as *mut crate::gc::GcBox<T>;
-        GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
-            box_ptr,
-        )))
+        let box_ptr = unsafe { raw_ptr.sub(offset) as *mut crate::gc::GcBox<T> };
+        unsafe {
+            GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
+                box_ptr,
+            )))
+        }
+    }
+
+    /// Get as AccessorPair (for accessor property slots)
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn as_accessor_pair(&self) -> Option<GcRef<AccessorPair>> {
+        if (self.bits & TAG_MASK) == TAG_PTR_OTHER
+            && unsafe { self.gc_header_tag_from_bits() }
+                == otter_vm_gc::object::tags::ACCESSOR_PAIR
+        {
+            Some(unsafe { self.extract_gcref::<AccessorPair>() })
+        } else {
+            None
+        }
     }
 
     // ========================================================================
@@ -1691,7 +1715,6 @@ impl PartialEq for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_undefined() {

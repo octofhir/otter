@@ -2512,6 +2512,7 @@ dependencies = [
  "otter-profiler",
  "otter-sql",
  "otter-vm-core",
+ "otter-vm-gc",
  "serde",
  "serde_json",
  "strsim",

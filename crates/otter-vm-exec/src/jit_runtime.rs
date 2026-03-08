@@ -114,13 +114,12 @@ pub struct DeoptFrameSnapshot {
 
 // Compile-time GC safety assertions: deopt types must be Send + Sync
 // (impossible if they contained GcRef which is !Send + !Sync).
-const _: () = {
+#[allow(dead_code)]
+fn assert_deopt_types_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
-    fn check() {
-        assert_send_sync::<DeoptFrameSnapshot>();
-        assert_send_sync::<DeoptResumeMode>();
-    }
-};
+    assert_send_sync::<DeoptFrameSnapshot>();
+    assert_send_sync::<DeoptResumeMode>();
+}
 
 #[derive(Debug, Clone, Copy)]
 struct BailoutTelemetry {

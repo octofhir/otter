@@ -140,6 +140,8 @@ pub struct AllocationRegistry {
     trace_table: [Option<TraceFn>; 256],
     /// Timestamp when incremental marking started (for pause time tracking)
     mark_start: Cell<Option<Instant>>,
+    /// GC pause histogram (bucket counts by duration)
+    pause_histogram: RefCell<GcPauseHistogram>,
 
     // --- Per-isolate GC state (formerly thread-locals) ---
     /// Write barrier buffer: collects grayed objects during incremental marking.
@@ -171,6 +173,7 @@ impl AllocationRegistry {
             mark_worklist: RefCell::new(VecDeque::new()),
             trace_table: [None; 256],
             mark_start: Cell::new(None),
+            pause_histogram: RefCell::new(GcPauseHistogram::default()),
             write_barrier_buf: RefCell::new(Vec::with_capacity(256)),
             dealloc_in_progress: Cell::new(false),
         }
@@ -183,6 +186,10 @@ impl AllocationRegistry {
         registry
     }
 
+    /// Register a type for GC tracing.
+    ///
+    /// This builds a static lookup table for the mark phase to find trace
+    /// functions based on object tags.
     pub fn register_type<T: GcTraceable>(&mut self) {
         if T::NEEDS_TRACE {
             self.trace_table[T::TYPE_ID as usize] = Some(trace_gc_box::<T>);
@@ -255,6 +262,11 @@ impl AllocationRegistry {
         block_count + large_count
     }
 
+    /// Get a copy of the GC pause histogram.
+    pub fn pause_histogram(&self) -> GcPauseHistogram {
+        *self.pause_histogram.borrow()
+    }
+
     /// Get collection statistics
     pub fn stats(&self) -> RegistryStats {
         RegistryStats {
@@ -321,6 +333,7 @@ impl AllocationRegistry {
         // Measure pause time
         let elapsed = start.elapsed();
         let elapsed_nanos = elapsed.as_nanos() as u64;
+        self.pause_histogram.borrow_mut().record(elapsed);
 
         // Update stats
         #[cfg(feature = "gc_logging")]
@@ -465,6 +478,7 @@ impl AllocationRegistry {
 
         let elapsed = start.elapsed();
         let elapsed_nanos = elapsed.as_nanos() as u64;
+        self.pause_histogram.borrow_mut().record(elapsed);
 
         #[cfg(feature = "gc_logging")]
         let collection_num = self.collection_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -744,7 +758,9 @@ impl AllocationRegistry {
 
         // Measure total time (from start_incremental_gc to finish_gc)
         if let Some(start) = self.mark_start.get() {
-            let elapsed_nanos = start.elapsed().as_nanos() as u64;
+            let elapsed = start.elapsed();
+            let elapsed_nanos = elapsed.as_nanos() as u64;
+            self.pause_histogram.borrow_mut().record(elapsed);
             self.total_pause_nanos
                 .fetch_add(elapsed_nanos, Ordering::Relaxed);
             self.last_pause_nanos
@@ -819,6 +835,55 @@ pub struct RegistryStats {
     pub total_pause_time: Duration,
     /// Pause time of the last collection
     pub last_pause_time: Duration,
+}
+
+/// GC pause time histogram with fixed buckets.
+///
+/// Buckets: <1ms, 1-5ms, 5-10ms, 10-50ms, 50-100ms, >100ms
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcPauseHistogram {
+    /// Pauses < 1ms
+    pub under_1ms: u32,
+    /// Pauses 1ms - 5ms
+    pub ms_1_to_5: u32,
+    /// Pauses 5ms - 10ms
+    pub ms_5_to_10: u32,
+    /// Pauses 10ms - 50ms
+    pub ms_10_to_50: u32,
+    /// Pauses 50ms - 100ms
+    pub ms_50_to_100: u32,
+    /// Pauses > 100ms
+    pub over_100ms: u32,
+}
+
+impl GcPauseHistogram {
+    /// Record a GC pause duration into the appropriate bucket.
+    pub fn record(&mut self, duration: Duration) {
+        let ms = duration.as_millis();
+        if ms < 1 {
+            self.under_1ms += 1;
+        } else if ms < 5 {
+            self.ms_1_to_5 += 1;
+        } else if ms < 10 {
+            self.ms_5_to_10 += 1;
+        } else if ms < 50 {
+            self.ms_10_to_50 += 1;
+        } else if ms < 100 {
+            self.ms_50_to_100 += 1;
+        } else {
+            self.over_100ms += 1;
+        }
+    }
+
+    /// Total number of recorded pauses.
+    pub fn total(&self) -> u32 {
+        self.under_1ms
+            + self.ms_1_to_5
+            + self.ms_5_to_10
+            + self.ms_10_to_50
+            + self.ms_50_to_100
+            + self.over_100ms
+    }
 }
 
 // Thread-local allocation registry pointer for the GC.

@@ -525,12 +525,13 @@ impl RuntimeHelpers {
 
 /// Module-level function IDs for declared helper imports.
 /// Created once per [`crate::JitCompiler`].
-pub(crate) struct HelperFuncIds {
+pub struct HelperFuncIds {
     ids: [Option<FuncId>; HELPER_COUNT],
 }
 
 impl HelperFuncIds {
     /// Declare all available helpers as imported functions on the module.
+    #[allow(dead_code)]
     pub fn declare<M: Module>(helpers: &RuntimeHelpers, module: &mut M) -> Result<Self, JitError> {
         Self::declare_with_call_conv(helpers, module, cranelift_codegen::isa::CallConv::SystemV)
     }
@@ -567,7 +568,7 @@ impl HelperFuncIds {
 /// Per-compiled-function helper references.
 /// Created for each function compilation by declaring module FuncIds
 /// into the function's IR context.
-pub(crate) struct HelperRefs {
+pub struct HelperRefs {
     refs: [Option<ir::FuncRef>; HELPER_COUNT],
 }
 
@@ -593,6 +594,7 @@ impl HelperRefs {
     }
 
     /// Get the FuncRef, or return UnsupportedInstruction error.
+    #[allow(dead_code)]
     pub fn require(
         &self,
         kind: HelperKind,

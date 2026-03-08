@@ -278,10 +278,11 @@ impl RuntimeHostHooks {
 impl VmHostHooks for RuntimeHostHooks {
     fn import_module(&self, ctx: &mut VmContext, module_spec: &[u16]) -> Result<Value, VmError> {
         let specifier = String::from_utf16_lossy(module_spec);
-        let referrer = ctx
-            .current_frame()
-            .map(|frame| frame.module.source_url.clone())
-            .unwrap_or_else(|| "main.js".to_string());
+        let referrer = {
+            let mid = ctx.current_frame().map(|frame| frame.module_id);
+            mid.map(|mid| ctx.get_module(mid).source_url.clone())
+                .unwrap_or_else(|| "main.js".to_string())
+        };
         let resolution = self
             .loader
             .resolve(&specifier, &referrer)
@@ -1135,13 +1136,12 @@ impl Otter {
     /// exports are not automatically captured like in the synchronous `execute()`.
     /// This replicates the export-capture logic from `interpreter.rs:execute()`.
     fn capture_exports_from_frame(ctx: &mut VmContext) {
-        let frame = match ctx.current_frame() {
-            Some(f) => f,
+        let (module_id, func_idx) = match ctx.current_frame() {
+            Some(f) => (f.module_id, f.function_index),
             None => return,
         };
 
-        let module = frame.module.clone();
-        let func_idx = frame.function_index;
+        let module = std::sync::Arc::clone(ctx.get_module(module_id));
         let entry_func = match module.function(func_idx) {
             Some(f) => f,
             None => return,
@@ -1535,13 +1535,17 @@ impl Otter {
 
                         // Determine if we're in strict mode context (for direct eval)
                         // Per ES2023 §19.2.1.1: Direct eval inherits strict mode from calling context
-                        let is_strict_context = ctx
-                            .current_frame()
-                            .and_then(|frame| {
-                                frame.module.functions.get(frame.function_index as usize)
-                            })
-                            .map(|func| func.flags.is_strict)
-                            .unwrap_or(false);
+                        let is_strict_context = {
+                            let frame_info = ctx
+                                .current_frame()
+                                .map(|frame| (frame.module_id, frame.function_index));
+                            frame_info
+                                .and_then(|(mid, fidx)| {
+                                    ctx.get_module(mid).functions.get(fidx as usize)
+                                })
+                                .map(|func| func.flags.is_strict)
+                                .unwrap_or(false)
+                        };
 
                         let compiler = Compiler::new();
                         let module = match compiler.compile(&code, "<eval>", is_strict_context) {

@@ -229,13 +229,12 @@ impl ScopeChain {
 
         let mut scope_idx = current_idx;
         loop {
-            if let Some(existing) = self.scopes[scope_idx].bindings.get(name) {
-                if existing.kind != VariableKind::Var
-                    && existing.kind != VariableKind::BlockScopedFunction
-                    && existing.kind != VariableKind::Parameter
-                {
-                    return None;
-                }
+            if let Some(existing) = self.scopes[scope_idx].bindings.get(name)
+                && existing.kind != VariableKind::Var
+                && existing.kind != VariableKind::BlockScopedFunction
+                && existing.kind != VariableKind::Parameter
+            {
+                return None;
             }
             if scope_idx == function_scope_idx {
                 break;
@@ -243,10 +242,10 @@ impl ScopeChain {
             scope_idx = self.scopes[scope_idx].parent?;
         }
 
-        if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name) {
-            if existing.kind == VariableKind::Var || existing.kind == VariableKind::Parameter {
-                return Some((existing.index, false));
-            }
+        if let Some(existing) = self.scopes[function_scope_idx].bindings.get(name)
+            && (existing.kind == VariableKind::Var || existing.kind == VariableKind::Parameter)
+        {
+            return Some((existing.index, false));
         }
 
         let index = self.scopes[function_scope_idx].next_local;
@@ -280,10 +279,10 @@ impl ScopeChain {
         let mut scope_idx = self.current?;
         loop {
             let scope = &self.scopes[scope_idx];
-            if let Some(binding) = scope.bindings.get(name) {
-                if binding.kind == VariableKind::CatchParameter {
-                    return Some(binding.index);
-                }
+            if let Some(binding) = scope.bindings.get(name)
+                && binding.kind == VariableKind::CatchParameter
+            {
+                return Some(binding.index);
             }
             if scope.is_function {
                 break;

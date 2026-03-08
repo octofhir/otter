@@ -45,12 +45,11 @@ pub fn from_rusqlite_value(row: &Row, index: usize) -> SqlValue {
         Ok(ValueRef::Text(s)) => {
             let text = String::from_utf8_lossy(s).to_string();
             // Try to parse as JSON if it looks like JSON
-            if (text.starts_with('[') && text.ends_with(']'))
-                || (text.starts_with('{') && text.ends_with('}'))
+            if ((text.starts_with('[') && text.ends_with(']'))
+                || (text.starts_with('{') && text.ends_with('}')))
+                && let Ok(json) = serde_json::from_str(&text)
             {
-                if let Ok(json) = serde_json::from_str(&text) {
-                    return SqlValue::Json(json);
-                }
+                return SqlValue::Json(json);
             }
             SqlValue::Text(text)
         }

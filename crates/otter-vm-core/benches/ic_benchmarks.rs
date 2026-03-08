@@ -86,7 +86,7 @@ fn bench_monomorphic_property_access(c: &mut Criterion) {
     c.bench_function("ic_monomorphic_1000_reads", |b| {
         b.iter(|| {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let result = interpreter.execute(black_box(&module), &mut ctx).unwrap();
             black_box(result)
         });
@@ -250,7 +250,7 @@ fn bench_polymorphic_property_access(c: &mut Criterion) {
     c.bench_function("ic_polymorphic_300_reads", |b| {
         b.iter(|| {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let result = interpreter.execute(black_box(&module), &mut ctx).unwrap();
             black_box(result)
         });
@@ -313,7 +313,7 @@ fn bench_property_set(c: &mut Criterion) {
     c.bench_function("ic_property_set_100", |b| {
         b.iter(|| {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let result = interpreter.execute(black_box(&module), &mut ctx).unwrap();
             black_box(result)
         });

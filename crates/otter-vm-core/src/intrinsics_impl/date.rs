@@ -322,7 +322,8 @@ fn local_to_utc_ms(year: f64, month: f64, day: f64, h: f64, min: f64, sec: f64, 
     let total_secs = (approx_utc_ms / 1000.0).floor() as i64;
     let sub_ms = approx_utc_ms.rem_euclid(1000.0) as u32;
 
-    let naive = chrono::NaiveDateTime::from_timestamp_opt(total_secs, sub_ms * 1_000_000);
+    let naive =
+        chrono::DateTime::from_timestamp(total_secs, sub_ms * 1_000_000).map(|dt| dt.naive_utc());
     if let Some(n) = naive {
         let res = Local.from_local_datetime(&n);
         local_to_ms(res)
@@ -339,7 +340,7 @@ fn set_date_value(this_val: &Value, ts: f64) -> Result<Value, VmError> {
     let new_ts = time_clip(ts);
     if let Some(obj) = this_val.as_object() {
         obj.set(PropertyKey::string("__timestamp__"), Value::number(new_ts))
-            .unwrap();
+            .ok();
     }
     Ok(Value::number(new_ts))
 }
@@ -509,10 +510,11 @@ pub fn create_date_constructor()
         };
 
         if let Some(obj) = this.as_object() {
-            let _ = obj.set(
+            obj.set(
                 PropertyKey::string("__timestamp__"),
                 Value::number(timestamp),
-            );
+            )
+            .ok();
         }
         Ok(Value::undefined())
     })

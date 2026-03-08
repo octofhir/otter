@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_create_dataview() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
         assert_eq!(dv.byte_length(), 16);
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_create_with_offset() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let dv = JsDataView::new(buf.clone(), 4, Some(8)).unwrap();
         assert_eq!(dv.byte_length(), 8);
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_int8() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(4, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_uint8() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(4, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_int16_endianness() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(4, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_int32_endianness() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(8, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_float32() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(8, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_float64() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_big_int64() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_bounds_check() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(4, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_detached_buffer() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
 
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_invalid_construction() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(8, None));
 
         // Offset past end

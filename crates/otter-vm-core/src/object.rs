@@ -49,10 +49,14 @@ const MAX_PROTOTYPE_CHAIN_DEPTH: usize = 100;
 pub const INLINE_PROPERTY_COUNT: usize = 8;
 
 /// Threshold for transitioning to dictionary mode.
-/// Objects with more than this many properties, or objects that have had
-/// properties deleted, switch to HashMap-based storage for better memory
-/// efficiency at the cost of IC cacheability.
-pub const DICTIONARY_THRESHOLD: usize = 32;
+/// Objects with more than this many properties switch to HashMap-based storage
+/// for better memory efficiency at the cost of IC cacheability.
+pub const DICTIONARY_THRESHOLD: usize = 64;
+
+/// Number of property deletions before forcing dictionary mode transition.
+/// Slot-clearing keeps IC working for 1-2 deletes; beyond that, dictionary
+/// mode avoids accumulating too many dead slots in the shape chain.
+const DELETE_DICTIONARY_THRESHOLD: u8 = 3;
 use crate::string::JsString;
 use crate::value::Value;
 
@@ -83,7 +87,7 @@ fn gc_write_barrier_slow(value: &Value) {
     }
 }
 
-/// Write barrier for a PropertyDescriptor being stored.
+/// Write barrier for a PropertyDescriptor being stored (used in dictionary mode).
 #[inline]
 fn gc_write_barrier_desc(desc: &PropertyDescriptor) {
     let registry = otter_vm_gc::global_registry();
@@ -101,6 +105,156 @@ fn gc_write_barrier_desc(desc: &PropertyDescriptor) {
             }
         }
         PropertyDescriptor::Deleted => {}
+    }
+}
+
+/// GC-managed accessor pair holding getter and setter values.
+/// Stored as a Value in accessor property slots via `Value::accessor_pair()`.
+pub struct AccessorPair {
+    /// Getter function (or undefined if no getter)
+    pub getter: Value,
+    /// Setter function (or undefined if no setter)
+    pub setter: Value,
+}
+
+// SAFETY: AccessorPair is only accessed from the single VM thread.
+// Thread confinement is enforced by the Isolate abstraction.
+unsafe impl Send for AccessorPair {}
+unsafe impl Sync for AccessorPair {}
+
+impl otter_vm_gc::GcTraceable for AccessorPair {
+    const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::ACCESSOR_PAIR;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        self.getter.trace(tracer);
+        self.setter.trace(tracer);
+    }
+}
+
+/// Packed 1-byte metadata per property slot.
+///
+/// Encodes property kind (data/accessor/empty/deleted) and attributes
+/// (writable, enumerable, configurable) in a single byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct SlotMeta(u8);
+
+impl SlotMeta {
+    // Kind bits (lower 2 bits)
+    const KIND_MASK: u8 = 0b0000_0011;
+    const KIND_EMPTY: u8 = 0b00;
+    const KIND_DATA: u8 = 0b01;
+    const KIND_ACCESSOR: u8 = 0b10;
+
+    // Attribute bits
+    const WRITABLE_BIT: u8 = 0b0000_0100;
+    const ENUMERABLE_BIT: u8 = 0b0000_1000;
+    const CONFIGURABLE_BIT: u8 = 0b0001_0000;
+
+    /// Empty slot (no property stored here)
+    pub const EMPTY: Self = Self(Self::KIND_EMPTY);
+
+    /// Create metadata for a data property
+    #[inline]
+    pub fn data(attrs: PropertyAttributes) -> Self {
+        let mut bits = Self::KIND_DATA;
+        if attrs.writable {
+            bits |= Self::WRITABLE_BIT;
+        }
+        if attrs.enumerable {
+            bits |= Self::ENUMERABLE_BIT;
+        }
+        if attrs.configurable {
+            bits |= Self::CONFIGURABLE_BIT;
+        }
+        Self(bits)
+    }
+
+    /// Create metadata for an accessor property
+    #[inline]
+    pub fn accessor(attrs: PropertyAttributes) -> Self {
+        let mut bits = Self::KIND_ACCESSOR;
+        if attrs.enumerable {
+            bits |= Self::ENUMERABLE_BIT;
+        }
+        if attrs.configurable {
+            bits |= Self::CONFIGURABLE_BIT;
+        }
+        Self(bits)
+    }
+
+    /// Default data property metadata (writable, enumerable, configurable)
+    pub const DEFAULT_DATA: Self = Self(Self::KIND_DATA | Self::WRITABLE_BIT | Self::ENUMERABLE_BIT | Self::CONFIGURABLE_BIT);
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 & Self::KIND_MASK == Self::KIND_EMPTY
+    }
+
+    #[inline]
+    pub fn is_data(self) -> bool {
+        self.0 & Self::KIND_MASK == Self::KIND_DATA
+    }
+
+    #[inline]
+    pub fn is_accessor(self) -> bool {
+        self.0 & Self::KIND_MASK == Self::KIND_ACCESSOR
+    }
+
+    #[inline]
+    pub fn is_writable(self) -> bool {
+        self.0 & Self::WRITABLE_BIT != 0
+    }
+
+    #[inline]
+    pub fn is_enumerable(self) -> bool {
+        self.0 & Self::ENUMERABLE_BIT != 0
+    }
+
+    #[inline]
+    pub fn is_configurable(self) -> bool {
+        self.0 & Self::CONFIGURABLE_BIT != 0
+    }
+
+    /// Convert to PropertyAttributes
+    #[inline]
+    pub fn to_attributes(self) -> PropertyAttributes {
+        PropertyAttributes {
+            writable: self.is_writable(),
+            enumerable: self.is_enumerable(),
+            configurable: self.is_configurable(),
+        }
+    }
+
+    /// Update writable bit
+    #[inline]
+    pub fn with_writable(self, w: bool) -> Self {
+        if w {
+            Self(self.0 | Self::WRITABLE_BIT)
+        } else {
+            Self(self.0 & !Self::WRITABLE_BIT)
+        }
+    }
+
+    /// Update configurable bit
+    #[inline]
+    pub fn with_configurable(self, c: bool) -> Self {
+        if c {
+            Self(self.0 | Self::CONFIGURABLE_BIT)
+        } else {
+            Self(self.0 & !Self::CONFIGURABLE_BIT)
+        }
+    }
+
+    /// Update enumerable bit
+    #[inline]
+    pub fn with_enumerable(self, e: bool) -> Self {
+        if e {
+            Self(self.0 | Self::ENUMERABLE_BIT)
+        } else {
+            Self(self.0 & !Self::ENUMERABLE_BIT)
+        }
     }
 }
 
@@ -433,12 +587,7 @@ impl PropertyDescriptor {
     }
 }
 
-/// Internal property storage entry
-#[derive(Clone, Debug)]
-pub(crate) struct PropertyEntry {
-    /// Descriptor for the property (Data or Accessor)
-    pub(crate) desc: PropertyDescriptor,
-}
+// PropertyEntry removed — properties are now stored as flat Value slots + SlotMeta.
 
 /// Error returned when a property assignment fails.
 ///
@@ -740,7 +889,7 @@ pub struct ArgumentMapping {
 ///
 /// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
 /// for faster access. Additional properties overflow to the `properties` Vec.
-/// Both inline and overflow use `PropertyEntry` to support accessor properties.
+/// Both inline and overflow use flat Value slots + SlotMeta for storage.
 
 /// The internal storage kind for indexed properties (elements).
 /// Used to optimize array storage and operations for common types (SMI and Doubles).
@@ -1187,17 +1336,21 @@ impl ElementsKind {
 
 /// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
 /// for faster access. Additional properties overflow to the `properties` Vec.
-/// Both inline and overflow use `PropertyEntry` to support accessor properties.
+/// Both inline and overflow use flat Value slots + SlotMeta for storage.
 pub struct JsObject {
     /// Current shape of the object
     shape: ObjectCell<Arc<Shape>>,
-    /// Inline property storage for first N properties
-    inline_properties: ObjectCell<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]>,
-    /// Overflow properties storage (for properties beyond INLINE_PROPERTY_COUNT)
-    overflow_properties: ObjectCell<Vec<PropertyEntry>>,
+    /// Inline value slots for first N properties
+    inline_slots: ObjectCell<[Value; INLINE_PROPERTY_COUNT]>,
+    /// Inline metadata for first N properties
+    inline_meta: ObjectCell<[SlotMeta; INLINE_PROPERTY_COUNT]>,
+    /// Overflow value slots (for properties beyond INLINE_PROPERTY_COUNT)
+    overflow_slots: ObjectCell<Vec<Value>>,
+    /// Overflow metadata (parallel to overflow_slots)
+    overflow_meta: ObjectCell<Vec<SlotMeta>>,
     /// Dictionary mode property storage (used when is_dictionary flag is set)
     /// When in dictionary mode, shape/inline/overflow are ignored for property access.
-    dictionary_properties: ObjectCell<Option<IndexMap<PropertyKey, PropertyEntry>>>,
+    dictionary_properties: ObjectCell<Option<IndexMap<PropertyKey, PropertyDescriptor>>>,
     /// Prototype (null for Object.prototype, mutable via Reflect.setPrototypeOf)
     /// Can be Value::object, Value::proxy, or Value::null
     prototype: ObjectCell<Value>,
@@ -1243,6 +1396,9 @@ pub struct ObjectFlags {
     pub is_array_push: bool,
     /// Fast path: this is the Array.prototype.pop native function
     pub is_array_pop: bool,
+    /// Number of named property deletions performed on this object.
+    /// Used to defer dictionary mode transition (slot-clearing is cheaper for 1-2 deletes).
+    pub delete_count: u8,
 }
 
 impl JsObject {
@@ -1253,8 +1409,10 @@ impl JsObject {
     pub fn new(prototype: Value) -> Self {
         Self {
             shape: ObjectCell::new(Shape::root()),
-            inline_properties: ObjectCell::new([None, None, None, None, None, None, None, None]),
-            overflow_properties: ObjectCell::new(Vec::new()),
+            inline_slots: ObjectCell::new([Value::undefined(); INLINE_PROPERTY_COUNT]),
+            inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
+            overflow_slots: ObjectCell::new(Vec::new()),
+            overflow_meta: ObjectCell::new(Vec::new()),
             dictionary_properties: ObjectCell::new(None),
             prototype: ObjectCell::new(prototype),
             elements: ObjectCell::new(ElementsKind::new()),
@@ -1373,16 +1531,20 @@ impl JsObject {
     #[inline]
     pub fn get_by_offset(&self, offset: usize) -> Option<Value> {
         if offset < INLINE_PROPERTY_COUNT {
-            let inline = self.inline_properties.borrow();
-            inline[offset]
-                .as_ref()
-                .and_then(|e| e.desc.value().cloned())
+            let meta = self.inline_meta.borrow();
+            if meta[offset].is_data() {
+                Some(self.inline_slots.borrow()[offset])
+            } else {
+                None
+            }
         } else {
-            let overflow = self.overflow_properties.borrow();
-            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            overflow
-                .get(overflow_idx)
-                .and_then(|e| e.desc.value().cloned())
+            let idx = offset - INLINE_PROPERTY_COUNT;
+            let meta = self.overflow_meta.borrow();
+            if idx < meta.len() && meta[idx].is_data() {
+                self.overflow_slots.borrow().get(idx).copied()
+            } else {
+                None
+            }
         }
     }
 
@@ -1396,32 +1558,72 @@ impl JsObject {
     #[allow(unsafe_code)]
     pub(crate) unsafe fn get_by_offset_unchecked(&self, offset: usize) -> Option<Value> {
         if offset < INLINE_PROPERTY_COUNT {
-            unsafe { self.inline_properties.get_unchecked() }
-                .get(offset)
-                .and_then(|entry| entry.as_ref())
-                .and_then(|entry| entry.desc.value().cloned())
+            let meta = unsafe { self.inline_meta.get_unchecked() };
+            if meta[offset].is_data() {
+                Some(unsafe { self.inline_slots.get_unchecked() }[offset])
+            } else {
+                None
+            }
         } else {
-            unsafe { self.overflow_properties.get_unchecked() }
-                .get(offset - INLINE_PROPERTY_COUNT)
-                .and_then(|entry| entry.desc.value().cloned())
+            let idx = offset - INLINE_PROPERTY_COUNT;
+            let meta = unsafe { self.overflow_meta.get_unchecked() };
+            if idx < meta.len() && meta[idx].is_data() {
+                unsafe { self.overflow_slots.get_unchecked() }.get(idx).copied()
+            } else {
+                None
+            }
         }
     }
 
-    /// Get property entry by offset (includes accessor properties)
+
+    /// Get property entry by offset (includes accessor properties).
+    /// Reconstructs a PropertyDescriptor from the slot value and metadata.
     #[inline]
     pub fn get_property_entry_by_offset(&self, offset: usize) -> Option<PropertyDescriptor> {
-        let desc = if offset < INLINE_PROPERTY_COUNT {
-            let inline = self.inline_properties.borrow();
-            inline[offset].as_ref().map(|e| e.desc.clone())?
+        if offset < INLINE_PROPERTY_COUNT {
+            let meta = self.inline_meta.borrow();
+            let m = meta[offset];
+            if m.is_empty() {
+                return None;
+            }
+            let slot = self.inline_slots.borrow()[offset];
+            Self::descriptor_from_slot_meta(slot, m)
         } else {
-            let overflow = self.overflow_properties.borrow();
-            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            overflow.get(overflow_idx).map(|e| e.desc.clone())?
-        };
+            let idx = offset - INLINE_PROPERTY_COUNT;
+            let meta = self.overflow_meta.borrow();
+            if idx >= meta.len() {
+                return None;
+            }
+            let m = meta[idx];
+            if m.is_empty() {
+                return None;
+            }
+            let slot = self.overflow_slots.borrow().get(idx).copied().unwrap_or(Value::undefined());
+            Self::descriptor_from_slot_meta(slot, m)
+        }
+    }
 
-        match desc {
-            PropertyDescriptor::Deleted => None,
-            other => Some(other),
+    /// Reconstruct a PropertyDescriptor from a slot value and its metadata.
+    #[inline]
+    fn descriptor_from_slot_meta(slot: Value, meta: SlotMeta) -> Option<PropertyDescriptor> {
+        if meta.is_data() {
+            Some(PropertyDescriptor::Data {
+                value: slot,
+                attributes: meta.to_attributes(),
+            })
+        } else if meta.is_accessor() {
+            if let Some(pair) = slot.as_accessor_pair() {
+                Some(PropertyDescriptor::Accessor {
+                    get: if pair.getter.is_undefined() { None } else { Some(pair.getter) },
+                    set: if pair.setter.is_undefined() { None } else { Some(pair.setter) },
+                    attributes: meta.to_attributes(),
+                })
+            } else {
+                // Malformed accessor slot — treat as absent
+                None
+            }
+        } else {
+            None
         }
     }
 
@@ -1438,67 +1640,56 @@ impl JsObject {
         drop(flags);
 
         if offset < INLINE_PROPERTY_COUNT {
-            let mut inline = self.inline_properties.borrow_mut();
-            if let Some(entry) = inline[offset].as_mut() {
-                match &mut entry.desc {
-                    PropertyDescriptor::Deleted => {
-                        if !is_extensible {
-                            return Err(SetPropertyError::NonExtensible);
-                        }
-                        if is_sealed {
-                            return Err(SetPropertyError::Sealed);
-                        }
-                        gc_write_barrier(&value);
-                        entry.desc = PropertyDescriptor::data(value);
-                        return Ok(());
-                    }
-                    PropertyDescriptor::Data {
-                        value: v,
-                        attributes,
-                    } => {
-                        if attributes.writable {
-                            gc_write_barrier(&value);
-                            *v = value;
-                            return Ok(());
-                        }
-                        return Err(SetPropertyError::NonWritable);
-                    }
-                    PropertyDescriptor::Accessor { .. } => {
-                        return Err(SetPropertyError::AccessorWithoutSetter);
-                    }
+            let m = self.inline_meta.borrow()[offset];
+            if m.is_data() {
+                if m.is_writable() {
+                    gc_write_barrier(&value);
+                    self.inline_slots.borrow_mut()[offset] = value;
+                    return Ok(());
                 }
+                return Err(SetPropertyError::NonWritable);
+            } else if m.is_accessor() {
+                return Err(SetPropertyError::AccessorWithoutSetter);
+            } else {
+                // Empty slot (deleted) — re-create as data property
+                if !is_extensible {
+                    return Err(SetPropertyError::NonExtensible);
+                }
+                if is_sealed {
+                    return Err(SetPropertyError::Sealed);
+                }
+                gc_write_barrier(&value);
+                self.inline_slots.borrow_mut()[offset] = value;
+                self.inline_meta.borrow_mut()[offset] = SlotMeta::DEFAULT_DATA;
+                return Ok(());
             }
-            Err(SetPropertyError::NonExtensible)
         } else {
-            let mut overflow = self.overflow_properties.borrow_mut();
-            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            if let Some(entry) = overflow.get_mut(overflow_idx) {
-                match &mut entry.desc {
-                    PropertyDescriptor::Deleted => {
-                        if !is_extensible {
-                            return Err(SetPropertyError::NonExtensible);
-                        }
-                        if is_sealed {
-                            return Err(SetPropertyError::Sealed);
-                        }
+            let idx = offset - INLINE_PROPERTY_COUNT;
+            let meta = self.overflow_meta.borrow();
+            if idx < meta.len() {
+                let m = meta[idx];
+                drop(meta);
+                if m.is_data() {
+                    if m.is_writable() {
                         gc_write_barrier(&value);
-                        entry.desc = PropertyDescriptor::data(value);
+                        self.overflow_slots.borrow_mut()[idx] = value;
                         return Ok(());
                     }
-                    PropertyDescriptor::Data {
-                        value: v,
-                        attributes,
-                    } => {
-                        if attributes.writable {
-                            gc_write_barrier(&value);
-                            *v = value;
-                            return Ok(());
-                        }
-                        return Err(SetPropertyError::NonWritable);
+                    return Err(SetPropertyError::NonWritable);
+                } else if m.is_accessor() {
+                    return Err(SetPropertyError::AccessorWithoutSetter);
+                } else {
+                    // Empty slot (deleted) — re-create as data property
+                    if !is_extensible {
+                        return Err(SetPropertyError::NonExtensible);
                     }
-                    PropertyDescriptor::Accessor { .. } => {
-                        return Err(SetPropertyError::AccessorWithoutSetter);
+                    if is_sealed {
+                        return Err(SetPropertyError::Sealed);
                     }
+                    gc_write_barrier(&value);
+                    self.overflow_slots.borrow_mut()[idx] = value;
+                    self.overflow_meta.borrow_mut()[idx] = SlotMeta::DEFAULT_DATA;
+                    return Ok(());
                 }
             }
             Err(SetPropertyError::NonExtensible)
@@ -1508,10 +1699,9 @@ impl JsObject {
     /// Get total property count (inline + overflow)
     #[allow(dead_code)]
     fn property_count(&self) -> usize {
-        let inline = self.inline_properties.borrow();
-        let inline_count = inline.iter().filter(|v| v.is_some()).count();
-        let overflow = self.overflow_properties.borrow();
-        inline_count + overflow.len()
+        let inline_count = self.inline_meta.borrow().iter().filter(|m| !m.is_empty()).count();
+        let overflow_count = self.overflow_meta.borrow().iter().filter(|m| !m.is_empty()).count();
+        inline_count + overflow_count
     }
 
     /// Get current shape (clones Arc — atomic refcount bump).
@@ -1572,12 +1762,12 @@ impl JsObject {
         self.shape.borrow().own_keys().len()
     }
 
-    /// Debug: get number of non-None inline property slots
+    /// Debug: get number of non-empty inline property slots
     pub fn get_inline_occupied_count(&self) -> usize {
-        self.inline_properties
+        self.inline_meta
             .borrow()
             .iter()
-            .filter(|e| e.is_some())
+            .filter(|m| !m.is_empty())
             .count()
     }
 
@@ -1590,35 +1780,46 @@ impl JsObject {
             return; // Already in dictionary mode
         }
 
-        // Build HashMap from existing properties
+        // Build HashMap from existing properties (slots + meta → PropertyDescriptor)
         let mut dict = IndexMap::new();
 
         let shape = self.shape.borrow();
-        let inline = self.inline_properties.borrow();
-        let overflow = self.overflow_properties.borrow();
+        let inline_slots = self.inline_slots.borrow();
+        let inline_meta = self.inline_meta.borrow();
+        let overflow_slots = self.overflow_slots.borrow();
+        let overflow_meta = self.overflow_meta.borrow();
 
         // Iterate over all properties in the shape
         // IMPORTANT: Use the actual offset from shape, not a sequential counter
         for key in shape.own_keys() {
             if let Some(offset) = shape.get_offset(&key) {
-                let entry = if offset < INLINE_PROPERTY_COUNT {
-                    inline[offset].clone()
+                let (slot, meta) = if offset < INLINE_PROPERTY_COUNT {
+                    (inline_slots[offset], inline_meta[offset])
                 } else {
-                    overflow.get(offset - INLINE_PROPERTY_COUNT).cloned()
+                    let idx = offset - INLINE_PROPERTY_COUNT;
+                    if idx < overflow_slots.len() {
+                        (overflow_slots[idx], overflow_meta[idx])
+                    } else {
+                        continue;
+                    }
                 };
 
-                if let Some(entry) = entry {
-                    // Skip deleted entries
-                    if !matches!(entry.desc, PropertyDescriptor::Deleted) {
-                        dict.insert(key, entry);
-                    }
+                // Skip empty slots
+                if meta.is_empty() {
+                    continue;
+                }
+
+                if let Some(desc) = Self::descriptor_from_slot_meta(slot, meta) {
+                    dict.insert(key, desc);
                 }
             }
         }
 
         drop(shape);
-        drop(inline);
-        drop(overflow);
+        drop(inline_slots);
+        drop(inline_meta);
+        drop(overflow_slots);
+        drop(overflow_meta);
 
         // Store the dictionary
         *self.dictionary_properties.borrow_mut() = Some(dict);
@@ -1662,8 +1863,8 @@ impl JsObject {
         // Dictionary mode: use HashMap lookup
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-                if let Some(entry) = dict.get(key) {
-                    match &entry.desc {
+                if let Some(desc) = dict.get(key) {
+                    match desc {
                         PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
                         PropertyDescriptor::Accessor { .. } => return None,
                         PropertyDescriptor::Deleted => {}
@@ -1724,8 +1925,8 @@ impl JsObject {
                 // Check proto: dictionary mode first, then shape lookup
                 if proto_obj.is_dictionary_mode() {
                     if let Some(dict) = proto_obj.dictionary_properties.borrow().as_ref() {
-                        if let Some(entry) = dict.get(key) {
-                            match &entry.desc {
+                        if let Some(desc) = dict.get(key) {
+                            match desc {
                                 PropertyDescriptor::Data { value, .. } => {
                                     return Some(value.clone());
                                 }
@@ -1782,44 +1983,54 @@ impl JsObject {
         }
         let mut values = Vec::new();
 
-        // Clear inline properties
+        // Clear inline slots
         {
-            let mut inline = self.inline_properties.borrow_mut();
-            for slot in inline.iter_mut() {
-                if let Some(entry) = slot.take() {
-                    match entry.desc {
-                        PropertyDescriptor::Data { value, .. } => values.push(value),
-                        PropertyDescriptor::Accessor { get, set, .. } => {
-                            if let Some(v) = get {
-                                values.push(v);
+            let mut slots = self.inline_slots.borrow_mut();
+            let mut meta = self.inline_meta.borrow_mut();
+            for i in 0..INLINE_PROPERTY_COUNT {
+                if !meta[i].is_empty() {
+                    let slot = slots[i];
+                    if meta[i].is_accessor() {
+                        if let Some(pair) = slot.as_accessor_pair() {
+                            if !pair.getter.is_undefined() {
+                                values.push(pair.getter);
                             }
-                            if let Some(v) = set {
-                                values.push(v);
+                            if !pair.setter.is_undefined() {
+                                values.push(pair.setter);
                             }
                         }
-                        PropertyDescriptor::Deleted => {}
+                    } else {
+                        values.push(slot);
                     }
+                    slots[i] = Value::undefined();
+                    meta[i] = SlotMeta::EMPTY;
                 }
             }
         }
 
-        // Clear overflow properties
+        // Clear overflow slots
         {
-            let mut overflow = self.overflow_properties.borrow_mut();
-            for entry in overflow.drain(..) {
-                match entry.desc {
-                    PropertyDescriptor::Data { value, .. } => values.push(value),
-                    PropertyDescriptor::Accessor { get, set, .. } => {
-                        if let Some(v) = get {
-                            values.push(v);
+            let mut slots = self.overflow_slots.borrow_mut();
+            let mut meta = self.overflow_meta.borrow_mut();
+            for i in 0..slots.len() {
+                if !meta[i].is_empty() {
+                    let slot = slots[i];
+                    if meta[i].is_accessor() {
+                        if let Some(pair) = slot.as_accessor_pair() {
+                            if !pair.getter.is_undefined() {
+                                values.push(pair.getter);
+                            }
+                            if !pair.setter.is_undefined() {
+                                values.push(pair.setter);
+                            }
                         }
-                        if let Some(v) = set {
-                            values.push(v);
-                        }
+                    } else {
+                        values.push(slot);
                     }
-                    PropertyDescriptor::Deleted => {}
                 }
             }
+            slots.clear();
+            meta.clear();
         }
 
         // Clear elements
@@ -1898,14 +2109,14 @@ impl JsObject {
         // Dictionary mode: lookup in HashMap first (may contain accessor properties)
         if self.is_dictionary_mode() {
             if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-                if let Some(e) = dict.get(key) {
-                    return Some(e.desc.clone());
+                if let Some(desc) = dict.get(key) {
+                    return Some(desc.clone());
                 }
                 // For Index keys, also try as String (e.g., Index(2) -> String("2"))
                 if let PropertyKey::Index(i) = key {
                     let str_key = PropertyKey::string(&i.to_string());
-                    if let Some(e) = dict.get(&str_key) {
-                        return Some(e.desc.clone());
+                    if let Some(desc) = dict.get(&str_key) {
+                        return Some(desc.clone());
                     }
                 }
             }
@@ -2112,7 +2323,7 @@ impl JsObject {
             if let Some(map) = dict.as_mut() {
                 // If the property already exists, check writability and preserve attributes
                 if let Some(existing) = map.get(&key) {
-                    match &existing.desc {
+                    match existing {
                         PropertyDescriptor::Data { attributes, .. } => {
                             if !attributes.writable {
                                 return Err(SetPropertyError::NonWritable);
@@ -2122,11 +2333,9 @@ impl JsObject {
                             gc_write_barrier(&value);
                             map.insert(
                                 key,
-                                PropertyEntry {
-                                    desc: PropertyDescriptor::Data {
-                                        value,
-                                        attributes: attrs,
-                                    },
+                                PropertyDescriptor::Data {
+                                    value,
+                                    attributes: attrs,
                                 },
                             );
                             return Ok(());
@@ -2141,10 +2350,7 @@ impl JsObject {
                 }
                 // New property or deleted slot — use default attributes
                 gc_write_barrier(&value);
-                let entry = PropertyEntry {
-                    desc: PropertyDescriptor::data(value),
-                };
-                map.insert(key, entry);
+                map.insert(key, PropertyDescriptor::data(value));
                 return Ok(());
             }
             return Err(SetPropertyError::NonExtensible);
@@ -2177,11 +2383,8 @@ impl JsObject {
                 let mut dict = self.dictionary_properties.borrow_mut();
                 if let Some(map) = dict.as_mut() {
                     gc_write_barrier(&value);
-                    let entry = PropertyEntry {
-                        desc: PropertyDescriptor::data(value),
-                    };
                     // Re-insert the key we were adding
-                    map.insert(next_shape.key.clone().unwrap(), entry);
+                    map.insert(next_shape.key.clone().unwrap(), PropertyDescriptor::data(value));
                     return Ok(());
                 }
                 return Err(SetPropertyError::NonExtensible);
@@ -2190,27 +2393,22 @@ impl JsObject {
             *shape_write = next_shape;
 
             gc_write_barrier(&value);
-            let entry = PropertyEntry {
-                desc: PropertyDescriptor::data(value),
-            };
 
             if offset < INLINE_PROPERTY_COUNT {
                 // Store in inline slot
-                let mut inline = self.inline_properties.borrow_mut();
-                inline[offset] = Some(entry);
+                self.inline_slots.borrow_mut()[offset] = value;
+                self.inline_meta.borrow_mut()[offset] = SlotMeta::DEFAULT_DATA;
             } else {
                 // Store in overflow
-                let mut overflow = self.overflow_properties.borrow_mut();
                 let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-                if overflow_idx >= overflow.len() {
-                    overflow.resize(
-                        overflow_idx + 1,
-                        PropertyEntry {
-                            desc: PropertyDescriptor::Deleted,
-                        },
-                    );
+                let mut slots = self.overflow_slots.borrow_mut();
+                let mut meta = self.overflow_meta.borrow_mut();
+                if overflow_idx >= slots.len() {
+                    slots.resize(overflow_idx + 1, Value::undefined());
+                    meta.resize(overflow_idx + 1, SlotMeta::EMPTY);
                 }
-                overflow[overflow_idx] = entry;
+                slots[overflow_idx] = value;
+                meta[overflow_idx] = SlotMeta::DEFAULT_DATA;
             }
             Ok(())
         } else if !extensible {
@@ -2315,8 +2513,8 @@ impl JsObject {
         if self.is_dictionary_mode() {
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
-                if let Some(entry) = map.get(key) {
-                    if !entry.desc.is_configurable() {
+                if let Some(desc) = map.get(key) {
+                    if !desc.is_configurable() {
                         return false;
                     }
                 }
@@ -2348,13 +2546,34 @@ impl JsObject {
                 return false;
             }
 
-            // Transition to dictionary mode on delete (creates sparse storage)
-            self.transition_to_dictionary();
+            let mut flags = self.flags.borrow_mut();
+            flags.delete_count = flags.delete_count.saturating_add(1);
 
-            // Now remove from dictionary
-            let mut dict = self.dictionary_properties.borrow_mut();
-            if let Some(map) = dict.as_mut() {
-                map.shift_remove(key);
+            if flags.delete_count >= DELETE_DICTIONARY_THRESHOLD {
+                drop(flags);
+                // Too many deletes — transition to dictionary mode
+                self.transition_to_dictionary();
+                let mut dict = self.dictionary_properties.borrow_mut();
+                if let Some(map) = dict.as_mut() {
+                    map.shift_remove(key);
+                }
+            } else {
+                drop(flags);
+                // Clear the slot in-place (shape stays intact, IC remains valid)
+                if offset < INLINE_PROPERTY_COUNT {
+                    self.inline_slots.borrow_mut()[offset] = Value::undefined();
+                    self.inline_meta.borrow_mut()[offset] = SlotMeta::EMPTY;
+                } else {
+                    let idx = offset - INLINE_PROPERTY_COUNT;
+                    let mut slots = self.overflow_slots.borrow_mut();
+                    let mut meta = self.overflow_meta.borrow_mut();
+                    if idx < slots.len() {
+                        slots[idx] = Value::undefined();
+                    }
+                    if idx < meta.len() {
+                        meta[idx] = SlotMeta::EMPTY;
+                    }
+                }
             }
             return true;
         }
@@ -2647,7 +2866,7 @@ impl JsObject {
             if let Some(map) = dict.as_mut() {
                 // Validate change against existing property (if any)
                 if let Some(existing) = map.get(&key) {
-                    if Self::validate_property_descriptor_change(&existing.desc, &desc).is_err() {
+                    if Self::validate_property_descriptor_change(existing, &desc).is_err() {
                         return false;
                     }
                 } else if !self.flags.borrow().extensible {
@@ -2655,7 +2874,7 @@ impl JsObject {
                     return false;
                 }
                 gc_write_barrier_desc(&desc);
-                map.insert(key, PropertyEntry { desc });
+                map.insert(key, desc);
                 return true;
             }
             return false;
@@ -2673,31 +2892,13 @@ impl JsObject {
             }
 
             // Update existing property - validate change
-            if off < INLINE_PROPERTY_COUNT {
-                let mut inline = self.inline_properties.borrow_mut();
-                if let Some(entry) = inline[off].as_mut() {
-                    // Validate the property descriptor change
-                    if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
-                        return false;
-                    }
-                    gc_write_barrier_desc(&desc);
-                    entry.desc = desc;
-                    return true;
-                }
-            } else {
-                let mut overflow = self.overflow_properties.borrow_mut();
-                let overflow_idx = off - INLINE_PROPERTY_COUNT;
-                if let Some(entry) = overflow.get_mut(overflow_idx) {
-                    // Validate the property descriptor change
-                    if Self::validate_property_descriptor_change(&entry.desc, &desc).is_err() {
-                        return false;
-                    }
-                    gc_write_barrier_desc(&desc);
-                    entry.desc = desc;
-                    return true;
+            if let Some(existing) = self.get_property_entry_by_offset(off) {
+                if Self::validate_property_descriptor_change(&existing, &desc).is_err() {
+                    return false;
                 }
             }
-            return false;
+            Self::write_desc_to_slot(self, off, &desc);
+            return true;
         }
 
         // Can't add new properties if not extensible or sealed
@@ -2722,7 +2923,7 @@ impl JsObject {
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
                 gc_write_barrier_desc(&desc);
-                map.insert(key, PropertyEntry { desc });
+                map.insert(key, desc);
                 return true;
             }
             return false;
@@ -2730,39 +2931,59 @@ impl JsObject {
 
         *shape_write = next_shape;
 
-        gc_write_barrier_desc(&desc);
-        let entry = PropertyEntry { desc };
+        Self::write_desc_to_slot(self, offset, &desc);
+        true
+    }
+
+    /// Write a PropertyDescriptor into the flat slot + meta storage at `offset`.
+    fn write_desc_to_slot(obj: &JsObject, offset: usize, desc: &PropertyDescriptor) {
+        let (slot_val, meta) = Self::desc_to_slot_meta(desc);
+        gc_write_barrier(&slot_val);
 
         if offset < INLINE_PROPERTY_COUNT {
-            // Store in inline slot
-            let mut inline = self.inline_properties.borrow_mut();
-            inline[offset] = Some(entry);
+            obj.inline_slots.borrow_mut()[offset] = slot_val;
+            obj.inline_meta.borrow_mut()[offset] = meta;
         } else {
-            // Store in overflow
-            let mut overflow = self.overflow_properties.borrow_mut();
-            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            if overflow_idx >= overflow.len() {
-                overflow.resize(
-                    overflow_idx + 1,
-                    PropertyEntry {
-                        desc: PropertyDescriptor::Deleted,
-                    },
-                );
+            let idx = offset - INLINE_PROPERTY_COUNT;
+            let mut slots = obj.overflow_slots.borrow_mut();
+            let mut metas = obj.overflow_meta.borrow_mut();
+            if idx >= slots.len() {
+                slots.resize(idx + 1, Value::undefined());
+                metas.resize(idx + 1, SlotMeta::EMPTY);
             }
-            overflow[overflow_idx] = entry;
+            slots[idx] = slot_val;
+            metas[idx] = meta;
         }
-        true
+    }
+
+    /// Convert a PropertyDescriptor into a (Value, SlotMeta) pair for slot storage.
+    fn desc_to_slot_meta(desc: &PropertyDescriptor) -> (Value, SlotMeta) {
+        match desc {
+            PropertyDescriptor::Data { value, attributes } => {
+                (*value, SlotMeta::data(*attributes))
+            }
+            PropertyDescriptor::Accessor { get, set, attributes } => {
+                let pair = GcRef::new(AccessorPair {
+                    getter: get.unwrap_or(Value::undefined()),
+                    setter: set.unwrap_or(Value::undefined()),
+                });
+                (Value::accessor_pair(pair), SlotMeta::accessor(*attributes))
+            }
+            PropertyDescriptor::Deleted => {
+                (Value::undefined(), SlotMeta::EMPTY)
+            }
+        }
     }
 
     /// Store a property without validation checks.
     /// Used by `define_own_property` after it has already validated the operation.
     fn store_property(&self, key: PropertyKey, desc: PropertyDescriptor) {
-        gc_write_barrier_desc(&desc);
         // Dictionary mode: store directly in HashMap
         if self.flags.borrow().is_dictionary {
+            gc_write_barrier_desc(&desc);
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
-                map.insert(key, PropertyEntry { desc });
+                map.insert(key, desc);
             }
             return;
         }
@@ -2771,17 +2992,7 @@ impl JsObject {
 
         if let Some(off) = offset {
             // Update existing slot
-            let entry = PropertyEntry { desc };
-            if off < INLINE_PROPERTY_COUNT {
-                let mut inline = self.inline_properties.borrow_mut();
-                inline[off] = Some(entry);
-            } else {
-                let mut overflow = self.overflow_properties.borrow_mut();
-                let overflow_idx = off - INLINE_PROPERTY_COUNT;
-                if overflow_idx < overflow.len() {
-                    overflow[overflow_idx] = entry;
-                }
-            }
+            Self::write_desc_to_slot(self, off, &desc);
             return;
         }
 
@@ -2795,31 +3006,16 @@ impl JsObject {
         if offset >= DICTIONARY_THRESHOLD {
             drop(shape_write);
             self.transition_to_dictionary();
+            gc_write_barrier_desc(&desc);
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
-                map.insert(key, PropertyEntry { desc });
+                map.insert(key, desc);
             }
             return;
         }
 
         *shape_write = next_shape;
-        let entry = PropertyEntry { desc };
-        if offset < INLINE_PROPERTY_COUNT {
-            let mut inline = self.inline_properties.borrow_mut();
-            inline[offset] = Some(entry);
-        } else {
-            let mut overflow = self.overflow_properties.borrow_mut();
-            let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            if overflow_idx >= overflow.len() {
-                overflow.resize(
-                    overflow_idx + 1,
-                    PropertyEntry {
-                        desc: PropertyDescriptor::Deleted,
-                    },
-                );
-            }
-            overflow[overflow_idx] = entry;
-        }
+        Self::write_desc_to_slot(self, offset, &desc);
     }
 
     /// [[DefineOwnProperty]] per ES2026 §10.1.6.1 / §10.1.6.3 (ValidateAndApplyPropertyDescriptor).
@@ -3542,43 +3738,33 @@ impl JsObject {
         drop(flags);
 
         // Make all inline properties non-writable and non-configurable
-        let mut inline = self.inline_properties.borrow_mut();
-        for entry_opt in inline.iter_mut() {
-            if let Some(entry) = entry_opt {
-                match &mut entry.desc {
-                    PropertyDescriptor::Data { attributes, .. } => {
-                        attributes.writable = false;
-                        attributes.configurable = false;
-                    }
-                    PropertyDescriptor::Accessor { attributes, .. } => {
-                        attributes.configurable = false;
-                    }
-                    PropertyDescriptor::Deleted => {}
+        {
+            let mut meta = self.inline_meta.borrow_mut();
+            for m in meta.iter_mut() {
+                if m.is_data() {
+                    *m = m.with_writable(false).with_configurable(false);
+                } else if m.is_accessor() {
+                    *m = m.with_configurable(false);
                 }
             }
         }
-        drop(inline);
 
         // Make all overflow properties non-writable and non-configurable
-        let mut overflow = self.overflow_properties.borrow_mut();
-        for entry in overflow.iter_mut() {
-            match &mut entry.desc {
-                PropertyDescriptor::Data { attributes, .. } => {
-                    attributes.writable = false;
-                    attributes.configurable = false;
+        {
+            let mut meta = self.overflow_meta.borrow_mut();
+            for m in meta.iter_mut() {
+                if m.is_data() {
+                    *m = m.with_writable(false).with_configurable(false);
+                } else if m.is_accessor() {
+                    *m = m.with_configurable(false);
                 }
-                PropertyDescriptor::Accessor { attributes, .. } => {
-                    attributes.configurable = false;
-                }
-                PropertyDescriptor::Deleted => {}
             }
         }
-        drop(overflow);
 
         // Make all dictionary-mode properties non-writable and non-configurable
         if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
-            for entry in dict.values_mut() {
-                match &mut entry.desc {
+            for desc in dict.values_mut() {
+                match desc {
                     PropertyDescriptor::Data { attributes, .. } => {
                         attributes.writable = false;
                         attributes.configurable = false;
@@ -3630,41 +3816,29 @@ impl JsObject {
         drop(flags);
 
         // Make all inline properties non-configurable
-        let mut inline = self.inline_properties.borrow_mut();
-        for entry_opt in inline.iter_mut() {
-            if let Some(entry) = entry_opt {
-                match &mut entry.desc {
-                    PropertyDescriptor::Data { attributes, .. } => {
-                        attributes.configurable = false;
-                    }
-                    PropertyDescriptor::Accessor { attributes, .. } => {
-                        attributes.configurable = false;
-                    }
-                    PropertyDescriptor::Deleted => {}
+        {
+            let mut meta = self.inline_meta.borrow_mut();
+            for m in meta.iter_mut() {
+                if !m.is_empty() {
+                    *m = m.with_configurable(false);
                 }
             }
         }
-        drop(inline);
 
         // Make all overflow properties non-configurable
-        let mut overflow = self.overflow_properties.borrow_mut();
-        for entry in overflow.iter_mut() {
-            match &mut entry.desc {
-                PropertyDescriptor::Data { attributes, .. } => {
-                    attributes.configurable = false;
+        {
+            let mut meta = self.overflow_meta.borrow_mut();
+            for m in meta.iter_mut() {
+                if !m.is_empty() {
+                    *m = m.with_configurable(false);
                 }
-                PropertyDescriptor::Accessor { attributes, .. } => {
-                    attributes.configurable = false;
-                }
-                PropertyDescriptor::Deleted => {}
-            };
+            }
         }
-        drop(overflow);
 
         // Make all dictionary-mode properties non-configurable
         if let Some(dict) = self.dictionary_properties.borrow_mut().as_mut() {
-            for entry in dict.values_mut() {
-                match &mut entry.desc {
+            for desc in dict.values_mut() {
+                match desc {
                     PropertyDescriptor::Data { attributes, .. } => {
                         attributes.configurable = false;
                     }
@@ -3904,12 +4078,7 @@ impl JsObject {
         // where keys are unique after parsing.
         if self.flags.borrow().is_dictionary {
             if let Some(map) = self.dictionary_properties.borrow_mut().as_mut() {
-                map.insert(
-                    key,
-                    PropertyEntry {
-                        desc: PropertyDescriptor::data(value),
-                    },
-                );
+                map.insert(key, PropertyDescriptor::data(value));
             }
             return;
         }
@@ -3924,36 +4093,26 @@ impl JsObject {
             drop(shape_write);
             self.transition_to_dictionary();
             if let Some(map) = self.dictionary_properties.borrow_mut().as_mut() {
-                map.insert(
-                    key,
-                    PropertyEntry {
-                        desc: PropertyDescriptor::data(value),
-                    },
-                );
+                map.insert(key, PropertyDescriptor::data(value));
             }
             return;
         }
 
         *shape_write = next_shape;
 
-        let entry = PropertyEntry {
-            desc: PropertyDescriptor::data(value),
-        };
         if offset < INLINE_PROPERTY_COUNT {
-            let mut inline = self.inline_properties.borrow_mut();
-            inline[offset] = Some(entry);
+            self.inline_slots.borrow_mut()[offset] = value;
+            self.inline_meta.borrow_mut()[offset] = SlotMeta::DEFAULT_DATA;
         } else {
-            let mut overflow = self.overflow_properties.borrow_mut();
             let overflow_idx = offset - INLINE_PROPERTY_COUNT;
-            if overflow_idx >= overflow.len() {
-                overflow.resize(
-                    overflow_idx + 1,
-                    PropertyEntry {
-                        desc: PropertyDescriptor::Deleted,
-                    },
-                );
+            let mut slots = self.overflow_slots.borrow_mut();
+            let mut meta = self.overflow_meta.borrow_mut();
+            if overflow_idx >= slots.len() {
+                slots.resize(overflow_idx + 1, Value::undefined());
+                meta.resize(overflow_idx + 1, SlotMeta::EMPTY);
             }
-            overflow[overflow_idx] = entry;
+            slots[overflow_idx] = value;
+            meta[overflow_idx] = SlotMeta::DEFAULT_DATA;
         }
     }
 
@@ -4015,7 +4174,7 @@ impl JsObject {
         start: usize,
         delete_count: usize,
         items: &[Value],
-        mm: &MemoryManager,
+        _mm: &MemoryManager,
     ) -> GcRef<JsObject> {
         let mut elements = self.elements.borrow_mut();
         let deleted_kind = elements.splice(start, delete_count, items);
@@ -4045,16 +4204,24 @@ impl JsObject {
         elements.sort_with_comparator(compare);
     }
 
-    /// Get inline properties storage (for GC tracing)
-    pub(crate) fn get_inline_properties_storage(
-        &self,
-    ) -> &ObjectCell<[Option<PropertyEntry>; INLINE_PROPERTY_COUNT]> {
-        &self.inline_properties
+    /// Get inline slots storage (for GC tracing)
+    pub(crate) fn get_inline_slots(&self) -> &ObjectCell<[Value; INLINE_PROPERTY_COUNT]> {
+        &self.inline_slots
     }
 
-    /// Get overflow properties storage (for GC tracing)
-    pub(crate) fn get_overflow_properties_storage(&self) -> &ObjectCell<Vec<PropertyEntry>> {
-        &self.overflow_properties
+    /// Get inline meta storage (for GC tracing)
+    pub(crate) fn get_inline_meta(&self) -> &ObjectCell<[SlotMeta; INLINE_PROPERTY_COUNT]> {
+        &self.inline_meta
+    }
+
+    /// Get overflow slots storage (for GC tracing)
+    pub(crate) fn get_overflow_slots(&self) -> &ObjectCell<Vec<Value>> {
+        &self.overflow_slots
+    }
+
+    /// Get overflow meta storage (for GC tracing)
+    pub(crate) fn get_overflow_meta(&self) -> &ObjectCell<Vec<SlotMeta>> {
+        &self.overflow_meta
     }
 
     pub(crate) fn get_elements_storage(&self) -> &ObjectCell<ElementsKind> {
@@ -4068,13 +4235,12 @@ impl JsObject {
 
 impl std::fmt::Debug for JsObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inline = self.inline_properties.borrow();
-        let inline_count = inline.iter().filter(|e| e.is_some()).count();
-        let overflow = self.overflow_properties.borrow();
+        let inline_count = self.inline_meta.borrow().iter().filter(|m| !m.is_empty()).count();
+        let overflow_count = self.overflow_meta.borrow().iter().filter(|m| !m.is_empty()).count();
         let flags = self.flags.borrow();
         f.debug_struct("JsObject")
-            .field("inline_properties", &inline_count)
-            .field("overflow_properties", &overflow.len())
+            .field("inline_slots", &inline_count)
+            .field("overflow_slots", &overflow_count)
             .field("is_array", &flags.is_array)
             .finish()
     }
@@ -4130,7 +4296,7 @@ mod tests {
     #[test]
     fn test_own_keys_uses_canonical_array_indices_only() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
 
         let _ = obj.set(PropertyKey::String(JsString::intern("2")), Value::int32(1));
@@ -4149,19 +4315,21 @@ mod tests {
     #[test]
     fn test_object_get_set() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
 
-        obj.set(PropertyKey::string("foo"), Value::int32(42));
+        obj.set(PropertyKey::string("foo"), Value::int32(42))
+            .unwrap();
         assert_eq!(obj.get(&PropertyKey::string("foo")), Some(Value::int32(42)));
     }
 
     #[test]
     fn test_object_has() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
-        obj.set(PropertyKey::string("foo"), Value::int32(42));
+        obj.set(PropertyKey::string("foo"), Value::int32(42))
+            .unwrap();
 
         assert!(obj.has(&PropertyKey::string("foo")));
         assert!(!obj.has(&PropertyKey::string("bar")));
@@ -4170,14 +4338,14 @@ mod tests {
     #[test]
     fn test_array() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(3);
         assert!(arr.is_array());
         assert_eq!(arr.array_length(), 3);
 
-        arr.set(PropertyKey::Index(0), Value::int32(1));
-        arr.set(PropertyKey::Index(1), Value::int32(2));
-        arr.set(PropertyKey::Index(2), Value::int32(3));
+        arr.set(PropertyKey::Index(0), Value::int32(1)).unwrap();
+        arr.set(PropertyKey::Index(1), Value::int32(2)).unwrap();
+        arr.set(PropertyKey::Index(2), Value::int32(3)).unwrap();
 
         assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(1)));
         assert_eq!(arr.get(&PropertyKey::Index(1)), Some(Value::int32(2)));
@@ -4187,11 +4355,11 @@ mod tests {
     #[test]
     fn test_array_holes() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(3);
-        arr.set(PropertyKey::Index(0), Value::int32(10));
-        arr.set(PropertyKey::Index(1), Value::int32(20));
-        arr.set(PropertyKey::Index(2), Value::int32(30));
+        arr.set(PropertyKey::Index(0), Value::int32(10)).unwrap();
+        arr.set(PropertyKey::Index(1), Value::int32(20)).unwrap();
+        arr.set(PropertyKey::Index(2), Value::int32(30)).unwrap();
 
         // Delete creates a hole
         assert!(arr.delete(&PropertyKey::Index(1)));
@@ -4216,7 +4384,7 @@ mod tests {
     #[test]
     fn test_array_prefill_holes() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(5);
         // new Array(5) should create holes, not present elements
         assert!(!arr.has_own(&PropertyKey::Index(0)));
@@ -4227,13 +4395,13 @@ mod tests {
     #[test]
     fn test_array_length_truncate() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(0);
-        arr.set(PropertyKey::Index(0), Value::int32(1));
-        arr.set(PropertyKey::Index(1), Value::int32(2));
-        arr.set(PropertyKey::Index(2), Value::int32(3));
-        arr.set(PropertyKey::Index(3), Value::int32(4));
-        arr.set(PropertyKey::Index(4), Value::int32(5));
+        arr.set(PropertyKey::Index(0), Value::int32(1)).unwrap();
+        arr.set(PropertyKey::Index(1), Value::int32(2)).unwrap();
+        arr.set(PropertyKey::Index(2), Value::int32(3)).unwrap();
+        arr.set(PropertyKey::Index(3), Value::int32(4)).unwrap();
+        arr.set(PropertyKey::Index(4), Value::int32(5)).unwrap();
         assert_eq!(arr.array_length(), 5);
 
         // arr.length = 2 should truncate
@@ -4252,14 +4420,15 @@ mod tests {
     #[test]
     fn test_array_length_set_via_property() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let arr = JsObject::array(0);
-        arr.set(PropertyKey::Index(0), Value::int32(10));
-        arr.set(PropertyKey::Index(1), Value::int32(20));
-        arr.set(PropertyKey::Index(2), Value::int32(30));
+        arr.set(PropertyKey::Index(0), Value::int32(10)).unwrap();
+        arr.set(PropertyKey::Index(1), Value::int32(20)).unwrap();
+        arr.set(PropertyKey::Index(2), Value::int32(30)).unwrap();
 
         // Setting length via set("length", 1) should truncate
-        arr.set(PropertyKey::string("length"), Value::number(1.0));
+        arr.set(PropertyKey::string("length"), Value::number(1.0))
+            .unwrap();
         assert_eq!(arr.array_length(), 1);
         assert_eq!(arr.get(&PropertyKey::Index(0)), Some(Value::int32(10)));
         assert_eq!(arr.get(&PropertyKey::Index(1)), None);
@@ -4274,9 +4443,10 @@ mod tests {
     #[test]
     fn test_object_freeze() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
-        obj.set(PropertyKey::string("foo"), Value::int32(42));
+        obj.set(PropertyKey::string("foo"), Value::int32(42))
+            .unwrap();
 
         assert!(!obj.is_frozen());
         assert!(obj.is_extensible());
@@ -4309,7 +4479,7 @@ mod tests {
     #[test]
     fn test_object_seal() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -4345,7 +4515,7 @@ mod tests {
     #[test]
     fn test_object_prevent_extensions() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj = JsObject::new(Value::null());
         let _ = obj.set(PropertyKey::string("foo"), Value::int32(42));
 
@@ -4377,12 +4547,12 @@ mod tests {
     #[test]
     fn test_deep_prototype_chain() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         // Build a prototype chain of depth 100
         let mut proto_val = Value::null();
         for i in 0..100 {
             let obj = GcRef::new(JsObject::new(proto_val));
-            obj.set(
+            let _ = obj.set(
                 PropertyKey::string(&format!("prop{}", i)),
                 Value::int32(i as i32),
             );
@@ -4406,13 +4576,13 @@ mod tests {
     #[test]
     fn test_prototype_chain_depth_limit() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         // Build a prototype chain that exceeds the limit (100)
         let mut proto_val = Value::null();
         for i in 0..110 {
             let obj = GcRef::new(JsObject::new(proto_val));
             if i == 0 {
-                obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
+                let _ = obj.set(PropertyKey::string("deep_prop"), Value::int32(42));
             }
             proto_val = Value::object(obj);
         }
@@ -4427,7 +4597,7 @@ mod tests {
     #[test]
     fn test_prototype_cycle_prevention() {
         let _rt = crate::runtime::VmRuntime::new();
-        let memory_manager = _rt.memory_manager().clone();
+        let _memory_manager = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null()));
         let obj2 = GcRef::new(JsObject::new(Value::object(obj1)));
         let obj3 = GcRef::new(JsObject::new(Value::object(obj2)));
@@ -4465,29 +4635,39 @@ impl otter_vm_gc::GcTraceable for JsObject {
         // every subsequent property-name lookup into a use-after-free.
         self.shape.borrow().trace_keys(tracer);
 
-        // Trace values in inline properties
-        for entry_opt in self.inline_properties.borrow().iter() {
-            if let Some(entry) = entry_opt {
-                entry.desc.trace(tracer);
+        // Trace values in inline slots (data values and accessor pair GcRefs)
+        {
+            let slots = self.inline_slots.borrow();
+            let meta = self.inline_meta.borrow();
+            for i in 0..INLINE_PROPERTY_COUNT {
+                if !meta[i].is_empty() {
+                    slots[i].trace(tracer);
+                }
             }
         }
 
-        // Trace values in overflow properties
-        for entry in self.overflow_properties.borrow().iter() {
-            entry.desc.trace(tracer);
+        // Trace values in overflow slots
+        {
+            let slots = self.overflow_slots.borrow();
+            let meta = self.overflow_meta.borrow();
+            for i in 0..slots.len() {
+                if !meta[i].is_empty() {
+                    slots[i].trace(tracer);
+                }
+            }
         }
 
         // Trace keys AND values in dictionary properties.
         // Keys are GcRef<JsString>/GcRef<Symbol> just like shape keys and must
         // be kept alive for the same reason.
         if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-            for (key, entry) in dict.iter() {
+            for (key, desc) in dict.iter() {
                 match key {
                     PropertyKey::String(s) => tracer(s.header() as *const _),
                     PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
                     PropertyKey::Index(_) => {}
                 }
-                entry.desc.trace(tracer);
+                desc.trace(tracer);
             }
         }
 

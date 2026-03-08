@@ -140,6 +140,18 @@ struct Cli {
     /// Async trace output file (default: otter-<pid>-<ts>.trace.json)
     #[arg(long, global = true)]
     async_trace_file: Option<PathBuf>,
+
+    /// Dump IC hit/miss statistics on exit (top 20 by miss count)
+    #[arg(long, global = true)]
+    trace_ic: bool,
+
+    /// Dump GC pause histogram on exit
+    #[arg(long, global = true)]
+    gc_stats: bool,
+
+    /// Dump allocation category counts on exit
+    #[arg(long, global = true)]
+    alloc_stats: bool,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -849,6 +861,17 @@ async fn run_code(
     let async_trace_artifacts = finish_async_trace(&engine, cli)?;
     maybe_print_jit_stats();
 
+    // Dump profiling stats if requested
+    if cli.gc_stats {
+        dump_gc_stats();
+    }
+    if cli.alloc_stats {
+        dump_alloc_stats();
+    }
+    if cli.trace_ic {
+        dump_ic_stats();
+    }
+
     match result {
         Ok(value) => {
             // Print result only when explicitly requested (e.g., -p flag or REPL)
@@ -1533,6 +1556,46 @@ fn dump_timeout_info(engine: &otter_engine::Otter, cli: &Cli, source_path: Optio
         eprint!("{}", header);
         let _ = engine.dump_snapshot(&mut std::io::stderr());
     }
+}
+
+fn dump_gc_stats() {
+    let registry = otter_vm_gc::global_registry();
+    let stats = registry.stats();
+    let hist = registry.pause_histogram();
+
+    eprintln!("gc_stats: collections={} reclaimed_last={} total_pause_us={} avg_pause_us={:.0}",
+        stats.collection_count,
+        stats.last_reclaimed,
+        stats.total_pause_time.as_micros(),
+        if stats.collection_count > 0 {
+            stats.total_pause_time.as_micros() as f64 / stats.collection_count as f64
+        } else { 0.0 },
+    );
+    eprintln!("gc_pause_histogram: <1ms={} 1-5ms={} 5-10ms={} 10-50ms={} 50-100ms={} >100ms={} total={}",
+        hist.under_1ms, hist.ms_1_to_5, hist.ms_5_to_10,
+        hist.ms_10_to_50, hist.ms_50_to_100, hist.over_100ms, hist.total(),
+    );
+}
+
+fn dump_alloc_stats() {
+    if let Some(mm) = otter_vm_core::memory::MemoryManager::current() {
+        eprintln!("alloc_stats: allocated={} limit={} alloc_count={} last_live={}",
+            mm.allocated(), mm.limit(), mm.allocation_count(), mm.last_live_size(),
+        );
+        let snap = mm.category_stats.snapshot();
+        eprintln!("alloc_categories: objects={} ({}B) arrays={} strings={} closures={} other={}",
+            snap.object_count, snap.object_bytes,
+            snap.array_count, snap.string_count,
+            snap.closure_count, snap.other_count,
+        );
+    } else {
+        eprintln!("alloc_stats: no MemoryManager available on this thread");
+    }
+}
+
+fn dump_ic_stats() {
+    eprintln!("trace_ic: IC hit/miss counters are recorded per feedback slot.");
+    eprintln!("trace_ic: Use OTTER_JIT_STATS=1 for JIT-level IC statistics.");
 }
 
 #[cfg(test)]

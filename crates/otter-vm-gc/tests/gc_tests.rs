@@ -7,6 +7,7 @@ use otter_vm_gc::{AllocationRegistry, GcHeader, GcTraceable, gc_alloc_in};
 
 /// Simple test object for GC testing
 struct TestObject {
+    #[allow(dead_code)]
     value: i32,
     /// Optional reference to another object's GcHeader
     reference: Option<*const GcHeader>,

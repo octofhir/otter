@@ -9,8 +9,7 @@
 use crate::builtin_builder::{IntrinsicContext, IntrinsicObject, NamespaceBuilder};
 use crate::context::NativeContext;
 use crate::error::VmError;
-use crate::gc::GcRef;
-use crate::object::{JsObject, PropertyKey};
+use crate::object::PropertyKey;
 use crate::value::Value;
 use otter_macros::dive;
 

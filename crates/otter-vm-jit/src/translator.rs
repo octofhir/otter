@@ -218,7 +218,9 @@ fn instruction_dst_register(instruction: &Instruction) -> Option<u16> {
         | Instruction::Catch { dst }
         | Instruction::CallWithReceiver { dst, .. }
         | Instruction::CallMethodComputed { dst, .. }
-        | Instruction::GetPropQuickened { dst, .. } => Some(dst.0),
+        | Instruction::GetPropQuickened { dst, .. }
+        | Instruction::GetPropString { dst, .. }
+        | Instruction::GetArrayLength { dst, .. } => Some(dst.0),
         _ => None,
     }
 }
@@ -375,6 +377,8 @@ fn is_supported_with_helpers(instruction: &Instruction) -> bool {
             Instruction::GetPropConst { .. }
                 | Instruction::SetPropConst { .. }
                 | Instruction::GetPropQuickened { .. }
+                | Instruction::GetPropString { .. }
+                | Instruction::GetArrayLength { .. }
                 | Instruction::SetPropQuickened { .. }
                 | Instruction::Call { .. }
                 | Instruction::GetLocalProp { .. }
@@ -2887,7 +2891,7 @@ pub fn translate_function_with_constants(
                         builder.ins().iconst(types::I64, 0) // null pointer
                     };
 
-                    let (call, result) = if let Some(expected_idx) = mono_func_index {
+                    let (_call, result) = if let Some(expected_idx) = mono_func_index {
                         // Monomorphic: use CallMono with expected function_index hint
                         let helper_ref = helpers
                             .and_then(|h| h.get(HelperKind::CallMono))
@@ -3168,6 +3172,10 @@ pub fn translate_function_with_constants(
                 emit_bailout_return(builder);
 
                 builder.switch_to_block(continue_block);
+            }
+            // --- Quickened string/array.length — bail out to interpreter ---
+            Instruction::GetPropString { .. } | Instruction::GetArrayLength { .. } => {
+                emit_bailout_return(builder);
             }
             // --- LoadThis ---
             Instruction::LoadThis { dst } => {

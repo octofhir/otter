@@ -100,7 +100,9 @@ pub struct DeoptMetadata {
 // Compile-time GC safety assertions: ensure deopt types are Send + Sync
 // (impossible if they contained GcRef which is !Send + !Sync).
 const _: () = {
+    #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
     fn check() {
         assert_send_sync::<DeoptResumeSite>();
         assert_send_sync::<DeoptMetadata>();
@@ -387,7 +389,10 @@ fn apply_instruction_uses(instruction: &Instruction, state: &mut LivenessState) 
             state.mark_register(key.0);
             state.mark_register(func.0);
         }
-        Instruction::GetPropConst { obj, .. } | Instruction::GetPropQuickened { obj, .. } => {
+        Instruction::GetPropConst { obj, .. }
+        | Instruction::GetPropQuickened { obj, .. }
+        | Instruction::GetPropString { obj, .. }
+        | Instruction::GetArrayLength { obj, .. } => {
             state.mark_register(obj.0);
         }
         Instruction::SetPropConst { obj, val, .. }
@@ -597,6 +602,8 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::AddNumber { dst, .. }
         | Instruction::SubNumber { dst, .. }
         | Instruction::GetPropQuickened { dst, .. }
+        | Instruction::GetPropString { dst, .. }
+        | Instruction::GetArrayLength { dst, .. }
         | Instruction::GetLocalProp { dst, .. } => state.kill_register(dst.0),
         Instruction::SetUpvalue { .. }
         | Instruction::SetGlobal { .. }
@@ -707,13 +714,21 @@ pub enum JitError {
 
     /// Bytecode instruction is not supported by the baseline translator yet.
     #[error("unsupported instruction at pc {pc}: {opcode}")]
-    UnsupportedInstruction { pc: usize, opcode: String },
+    UnsupportedInstruction {
+        /// Bytecode program counter.
+        pc: usize,
+        /// Mnemonic or opcode name.
+        opcode: String,
+    },
 
     /// Jump target is outside the bytecode function bounds.
     #[error("invalid jump target from pc {pc} with offset {offset} (len={instruction_count})")]
     InvalidJumpTarget {
+        /// Bytecode program counter of the jump instruction.
         pc: usize,
+        /// Jump offset.
         offset: i32,
+        /// Total number of instructions in the function.
         instruction_count: usize,
     },
 }

@@ -267,6 +267,24 @@ pub struct InstructionMetadata {
     pub call_target_func_index: u32,
     /// Call target IC: module_id of the cached callee.
     pub call_target_module_id: u64,
+
+    // --- Profiling counters (only active with `profiling` feature) ---
+    /// Number of IC cache hits (monomorphic or polymorphic)
+    #[cfg(feature = "profiling")]
+    #[serde(default, skip)]
+    pub ic_hits: u32,
+    /// Number of IC cache misses (fell through to slow path)
+    #[cfg(feature = "profiling")]
+    #[serde(default, skip)]
+    pub ic_misses: u32,
+    /// Number of polymorphic IC hits
+    #[cfg(feature = "profiling")]
+    #[serde(default, skip)]
+    pub ic_poly_hits: u32,
+    /// Number of megamorphic fallbacks
+    #[cfg(feature = "profiling")]
+    #[serde(default, skip)]
+    pub ic_mega_misses: u32,
 }
 
 impl InstructionMetadata {
@@ -311,6 +329,54 @@ impl InstructionMetadata {
     pub fn transition_to_megamorphic(&mut self) {
         self.ic_state = InlineCacheState::Megamorphic;
     }
+
+    /// Record an IC cache hit (monomorphic)
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn record_ic_hit(&mut self) {
+        self.ic_hits = self.ic_hits.saturating_add(1);
+    }
+
+    /// Record an IC cache hit (monomorphic) - no-op without profiling
+    #[cfg(not(feature = "profiling"))]
+    #[inline]
+    pub fn record_ic_hit(&mut self) {}
+
+    /// Record an IC cache miss (fell through to slow path)
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn record_ic_miss(&mut self) {
+        self.ic_misses = self.ic_misses.saturating_add(1);
+    }
+
+    /// Record an IC cache miss - no-op without profiling
+    #[cfg(not(feature = "profiling"))]
+    #[inline]
+    pub fn record_ic_miss(&mut self) {}
+
+    /// Record a polymorphic IC hit
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn record_ic_poly_hit(&mut self) {
+        self.ic_poly_hits = self.ic_poly_hits.saturating_add(1);
+    }
+
+    /// Record a polymorphic IC hit - no-op without profiling
+    #[cfg(not(feature = "profiling"))]
+    #[inline]
+    pub fn record_ic_poly_hit(&mut self) {}
+
+    /// Record a megamorphic miss
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn record_ic_mega_miss(&mut self) {
+        self.ic_mega_misses = self.ic_mega_misses.saturating_add(1);
+    }
+
+    /// Record a megamorphic miss - no-op without profiling
+    #[cfg(not(feature = "profiling"))]
+    #[inline]
+    pub fn record_ic_mega_miss(&mut self) {}
 
     /// Check if proto_epoch matches (for invalidation)
     #[inline]

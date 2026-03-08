@@ -2000,8 +2000,7 @@ extern "C" fn otter_rt_call_method(
         if method.is_none() {
             method = obj_ref.get(&method_key);
         }
-        // Must drop feedback borrow before calling interpreter
-        drop(feedback);
+        // ic is no longer used here, so feedback can be dropped at end of scope.
     } else {
         let vm_ctx = unsafe { &mut *ctx.vm_ctx };
         method = if receiver.is_string() {
@@ -3232,7 +3231,7 @@ extern "C" fn otter_rt_define_class(
     };
     let ctor_obj = &ctor_closure.object;
 
-    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    let _vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
     if super_val.is_undefined() || super_val.is_null() {
         // Base class: ensure ctor.prototype.constructor = ctor
@@ -3756,7 +3755,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
         }
     } else if super_ctor_val.as_native_function().is_some() {
         // Native built-in constructor
-        let mm = vm_ctx.memory_manager().clone();
+        let _mm = vm_ctx.memory_manager().clone();
         let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(
             new_target_proto.clone(),
         )));
@@ -3781,7 +3780,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
             Err(_) => return BAILOUT_SENTINEL,
         }
     } else {
-        let mm = vm_ctx.memory_manager().clone();
+        let _mm = vm_ctx.memory_manager().clone();
         let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(new_target_proto)));
         let new_obj_value = crate::value::Value::object(new_obj);
         match interpreter.call_function(vm_ctx, &super_ctor_val, new_obj_value.clone(), &args) {
@@ -3833,7 +3832,7 @@ extern "C" fn otter_rt_async_closure(ctx_raw: i64, func_idx: i64) -> i64 {
 
     // Get the module from the current frame
     let module = match vm_ctx.current_frame() {
-        Some(frame) => frame.module.clone(),
+        Some(frame) => std::sync::Arc::clone(vm_ctx.module_table.get(frame.module_id)),
         None => return BAILOUT_SENTINEL,
     };
 
@@ -3924,7 +3923,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
 
     // Get the module from the current frame
     let module = match vm_ctx.current_frame() {
-        Some(frame) => frame.module.clone(),
+        Some(frame) => std::sync::Arc::clone(vm_ctx.module_table.get(frame.module_id)),
         None => return BAILOUT_SENTINEL,
     };
 
@@ -4045,7 +4044,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
 
     // Get the module from the current frame
     let module = match vm_ctx.current_frame() {
-        Some(frame) => frame.module.clone(),
+        Some(frame) => std::sync::Arc::clone(vm_ctx.module_table.get(frame.module_id)),
         None => return BAILOUT_SENTINEL,
     };
 
@@ -4389,7 +4388,7 @@ fn f64_to_int32(n: f64) -> i32 {
         return 0;
     }
     // Truncate, mod 2^32, interpret as signed
-    (n as i64 as i32)
+    n as i64 as i32
 }
 
 /// Convert f64 to Uint32 per ECMAScript ToUint32 spec.
@@ -4398,7 +4397,7 @@ fn f64_to_uint32(n: f64) -> u32 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }
-    (n as i64 as u32)
+    n as i64 as u32
 }
 
 /// Generic bitwise operation for non-int32 operands.

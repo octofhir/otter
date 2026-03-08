@@ -122,8 +122,8 @@ mod tests {
         let runtime = VmRuntime::new();
         let mut ctx = runtime.create_context();
         let module = build_test_module(vec![Instruction::Return { src: Register(0) }]);
-
-        ctx.push_frame(0, module, 2, None, false, false, 0).unwrap();
+        ctx.register_module(&module);
+        ctx.push_frame(0, module.module_id, 2, None, false, false, 0).unwrap();
         ctx.set_local(0, Value::int32(1)).unwrap();
         ctx.set_local(1, Value::int32(2)).unwrap();
         ctx.set_register(0, Value::int32(10));
@@ -166,8 +166,8 @@ mod tests {
             .build();
         builder.add_function(func);
         let module = Arc::new(builder.build());
-
-        ctx.push_frame(0, Arc::clone(&module), 1, None, false, false, 0)
+        ctx.register_module(&module);
+        ctx.push_frame(0, module.module_id, 1, None, false, false, 0)
             .unwrap();
         ctx.set_local(0, Value::int32(5)).unwrap();
         ctx.set_register(0, Value::int32(10));

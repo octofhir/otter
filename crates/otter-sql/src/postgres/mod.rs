@@ -131,7 +131,7 @@ impl PostgresOptions {
 /// PostgreSQL database adapter with connection pooling
 pub struct PostgresAdapter {
     pool: Pool,
-    options: PostgresOptions,
+    _options: PostgresOptions,
 }
 
 impl PostgresAdapter {
@@ -173,7 +173,10 @@ impl PostgresAdapter {
         // Test connection
         let _client = pool.get().await?;
 
-        Ok(Self { pool, options })
+        Ok(Self {
+            pool,
+            _options: options,
+        })
     }
 
     /// Convert a tokio_postgres Row to SqlRow

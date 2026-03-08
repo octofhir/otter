@@ -69,6 +69,7 @@ impl<T> ObjectCell<T> {
         // SAFETY: Caller guarantees aliasing/borrow invariants.
         unsafe { &*self.value.as_ptr() }
     }
+
 }
 
 // SAFETY: ObjectCell is only ever accessed from a single thread.

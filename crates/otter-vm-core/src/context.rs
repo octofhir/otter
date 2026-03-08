@@ -13,6 +13,7 @@ use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::interpreter::PreferredType;
+use otter_vm_bytecode::function::FeedbackVector;
 use crate::object::JsObject;
 use crate::realm::{RealmId, RealmRegistry};
 use crate::string::JsString;
@@ -26,6 +27,43 @@ use otter_profiler::RuntimeStats;
 
 /// Default maximum call stack depth (matches RuntimeConfig default)
 pub const DEFAULT_MAX_STACK_DEPTH: usize = 10000;
+
+/// Table mapping `module_id` → `Arc<Module>` for O(1) lookup.
+/// Holds the owning Arc so CallFrame can store a lightweight `module_id: u64`
+/// instead of cloning the Arc on every function call/return.
+pub struct ModuleTable {
+    modules: Vec<Option<Arc<Module>>>,
+}
+
+impl ModuleTable {
+    pub fn new() -> Self {
+        Self {
+            modules: Vec::new(),
+        }
+    }
+
+    /// Register a module (no-op if already present).
+    #[inline]
+    pub fn register(&mut self, module: &Arc<Module>) {
+        let id = module.module_id as usize;
+        if id < self.modules.len() {
+            if self.modules[id].is_some() {
+                return;
+            }
+        } else {
+            self.modules.resize_with(id + 1, || None);
+        }
+        self.modules[id] = Some(Arc::clone(module));
+    }
+
+    /// Look up a module by id. Panics if not registered.
+    #[inline]
+    pub fn get(&self, id: u64) -> &Arc<Module> {
+        self.modules[id as usize]
+            .as_ref()
+            .expect("module not registered in ModuleTable")
+    }
+}
 
 /// Context passed to native functions, enabling VM re-entry.
 ///
@@ -397,13 +435,31 @@ const INITIAL_REGISTER_POOL: usize = 4096;
 /// Increased from 1000 to reduce GC check overhead (GC was taking 43% CPU)
 pub const INTERRUPT_CHECK_INTERVAL: u32 = 10_000;
 
+/// A Send-safe wrapper for a raw pointer to FeedbackVector.
+///
+/// SAFETY: The pointed-to FeedbackVector lives inside an `Arc<Module>` which
+/// is also stored on the CallFrame. The VM is single-threaded (one isolate =
+/// one thread), so no data races are possible.
+#[derive(Clone, Copy)]
+struct FeedbackPtr(*const FeedbackVector);
+
+// SAFETY: FeedbackVector itself is Send (see function.rs). The pointer
+// targets memory owned by Arc<Module> — same Send guarantee applies.
+unsafe impl Send for FeedbackPtr {}
+
+impl std::fmt::Debug for FeedbackPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FeedbackPtr").field(&self.0).finish()
+    }
+}
+
 /// A call stack frame
 #[derive(Debug)]
 pub struct CallFrame {
     /// Function index in the module
     pub function_index: u32,
-    /// The module this function belongs to
-    pub module: std::sync::Arc<otter_vm_bytecode::Module>,
+    /// Module id for O(1) lookup in VmContext::module_table
+    pub module_id: u64,
     /// Realm id for this call frame
     pub realm_id: RealmId,
     /// Program counter (instruction index)
@@ -446,6 +502,27 @@ pub struct CallFrame {
     pub is_derived: bool,
     /// The callee function value (for arguments.callee in sloppy mode)
     pub callee_value: Option<Value>,
+    /// Cached pointer to the function's FeedbackVector.
+    /// Eliminates 3 pointer chases (Arc<Module> → functions Vec → Function → feedback_vector)
+    /// on every IC probe — reduces to a single deref.
+    ///
+    /// SAFETY: Points into `module.functions[function_index].feedback_vector`.
+    /// Valid as long as `self.module` (Arc) is alive, which is the frame's entire lifetime.
+    feedback_ptr: FeedbackPtr,
+}
+
+impl CallFrame {
+    /// Get a reference to this frame's FeedbackVector.
+    ///
+    /// This is the fast path for IC probes — a single pointer deref instead of
+    /// traversing Arc<Module> → functions Vec → Function → feedback_vector.
+    #[inline(always)]
+    pub fn feedback(&self) -> &FeedbackVector {
+        // SAFETY: `feedback_ptr` points to `module.functions[function_index].feedback_vector`.
+        // The `module` field (Arc<Module>) keeps the Module alive for the frame's entire
+        // lifetime, so the FeedbackVector is guaranteed valid.
+        unsafe { &*self.feedback_ptr.0 }
+    }
 }
 
 /// Source location for error reporting
@@ -469,6 +546,9 @@ pub struct VmContext {
     registers: Vec<Value>,
     /// Call stack
     pub(crate) call_stack: Vec<CallFrame>,
+    /// Module table: `module_id → Arc<Module>` for O(1) lookup.
+    /// Owns the Arc so CallFrame can store a lightweight `module_id: u64`.
+    pub(crate) module_table: ModuleTable,
     /// Global object
     global: GcRef<JsObject>,
     /// Exception state
@@ -730,6 +810,7 @@ impl VmContext {
         Self {
             registers: vec![Value::undefined(); INITIAL_REGISTER_POOL],
             call_stack: Vec::with_capacity(64),
+            module_table: ModuleTable::new(),
             global,
             exception: None,
             try_stack: Vec::new(),
@@ -825,6 +906,16 @@ impl VmContext {
     /// Take the pending throw value (if any), clearing it.
     pub fn take_pending_throw(&mut self) -> Option<Value> {
         self.pending_throw.take()
+    }
+
+    /// Register a module in the module table so push_frame can use module_id.
+    pub fn register_module(&mut self, module: &Arc<otter_vm_bytecode::Module>) {
+        self.module_table.register(module);
+    }
+
+    /// Look up a module by id. Panics if not registered.
+    pub fn get_module(&self, module_id: u64) -> &Arc<otter_vm_bytecode::Module> {
+        self.module_table.get(module_id)
     }
 
     /// Get the memory manager
@@ -1174,12 +1265,13 @@ impl VmContext {
         snapshot.native_call_depth = self.native_call_depth();
 
         if let Some(frame) = self.call_stack.last() {
+            let frame_module = self.module_table.get(frame.module_id);
             snapshot.pc = Some(frame.pc);
             snapshot.function_index = Some(frame.function_index);
-            snapshot.module_url = Some(frame.module.source_url.clone());
+            snapshot.module_url = Some(frame_module.source_url.clone());
             snapshot.is_async = Some(frame.is_async);
             snapshot.is_construct = Some(frame.is_construct);
-            if let Some(func) = frame.module.function(frame.function_index) {
+            if let Some(func) = frame_module.function(frame.function_index) {
                 snapshot.function_name = func.name.clone();
                 snapshot.is_generator = Some(func.flags.is_generator);
                 if frame.pc < func.instructions.read().len() {
@@ -1189,7 +1281,7 @@ impl VmContext {
             }
 
             // Add current frame snapshot
-            if let Some(func) = frame.module.function(frame.function_index) {
+            if let Some(func) = frame_module.function(frame.function_index) {
                 let instruction = if frame.pc < func.instructions.read().len() {
                     Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
@@ -1200,7 +1292,7 @@ impl VmContext {
                     function_name: func.name.clone(),
                     pc: frame.pc,
                     instruction,
-                    module_url: frame.module.source_url.clone(),
+                    module_url: frame_module.source_url.clone(),
                     is_async: frame.is_async,
                     is_generator: func.flags.is_generator,
                     is_construct: frame.is_construct,
@@ -1210,7 +1302,8 @@ impl VmContext {
 
         // Capture a few top frames for better watchdog debugging.
         for frame in self.call_stack.iter().rev().take(5) {
-            if let Some(func) = frame.module.function(frame.function_index) {
+            let frame_module = self.module_table.get(frame.module_id);
+            if let Some(func) = frame_module.function(frame.function_index) {
                 let instruction = if frame.pc < func.instructions.read().len() {
                     Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
@@ -1221,7 +1314,7 @@ impl VmContext {
                     function_name: func.name.clone(),
                     pc: frame.pc,
                     instruction,
-                    module_url: frame.module.source_url.clone(),
+                    module_url: frame_module.source_url.clone(),
                     is_async: frame.is_async,
                     is_generator: func.flags.is_generator,
                     is_construct: frame.is_construct,
@@ -1231,7 +1324,8 @@ impl VmContext {
 
         // Capture ALL frames for full call stack
         for frame in self.call_stack.iter().rev() {
-            if let Some(func) = frame.module.function(frame.function_index) {
+            let frame_module = self.module_table.get(frame.module_id);
+            if let Some(func) = frame_module.function(frame.function_index) {
                 let instruction = if frame.pc < func.instructions.read().len() {
                     Some(format!("{:?}", func.instructions.read()[frame.pc]))
                 } else {
@@ -1242,7 +1336,7 @@ impl VmContext {
                     function_name: func.name.clone(),
                     pc: frame.pc,
                     instruction,
-                    module_url: frame.module.source_url.clone(),
+                    module_url: frame_module.source_url.clone(),
                     is_async: frame.is_async,
                     is_generator: func.flags.is_generator,
                     is_construct: frame.is_construct,
@@ -1947,11 +2041,12 @@ impl VmContext {
         let _ = self.global.set(key, value);
     }
 
-    /// Push a new call frame
+    /// Push a new call frame.
+    /// The module must be registered in `self.module_table` before calling this.
     pub fn push_frame(
         &mut self,
         function_index: u32,
-        module: std::sync::Arc<otter_vm_bytecode::Module>,
+        module_id: u64,
         local_count: u16,
         return_register: Option<u16>,
         is_construct: bool,
@@ -1968,14 +2063,28 @@ impl VmContext {
             .map(|f| f.register_base + f.register_count)
             .unwrap_or(0);
 
-        let func = &module.functions[function_index as usize];
-        let local_count = local_count as usize;
-        // Legacy fallback for hand-built bytecode/tests missing register_count.
-        let scratch_regs = if func.register_count == 0 {
-            MAX_REGISTERS
-        } else {
-            func.register_count as usize
+        // Extract all function info upfront so the module_table borrow ends
+        // before we need &mut self for register/pending operations.
+        let (scratch_regs, param_count, has_rest, is_strict, feedback_ptr, func_name_is_assert) = {
+            let module = self.module_table.get(module_id);
+            let func = &module.functions[function_index as usize];
+            let scratch = if func.register_count == 0 {
+                MAX_REGISTERS
+            } else {
+                func.register_count as usize
+            };
+            let fptr = FeedbackPtr(&func.feedback_vector);
+            let name_is_assert = func.name.as_deref() == Some("assert");
+            (
+                scratch,
+                func.param_count as usize,
+                func.flags.has_rest,
+                func.flags.is_strict,
+                fptr,
+                name_is_assert,
+            )
         };
+        let local_count = local_count as usize;
         // Total window = locals (params + vars) + scratch registers
         let window_size = local_count + scratch_regs;
 
@@ -1992,8 +2101,6 @@ impl VmContext {
         }
 
         // Consume pending arguments directly into local slots in the register window.
-        let param_count = func.param_count as usize;
-        let has_rest = func.flags.has_rest;
         let effective_param_count = if has_rest {
             param_count + 1
         } else {
@@ -2084,18 +2191,16 @@ impl VmContext {
 
         static TRACE_ASSERT_ARGS: OnceLock<bool> = OnceLock::new();
         if *TRACE_ASSERT_ARGS.get_or_init(|| std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok()) {
-            if let Some(func) = module.functions.get(function_index as usize) {
-                if func.name.as_deref() == Some("assert") {
-                    let arg_types: Vec<_> = self.registers
-                        [register_base..register_base + param_count.min(local_count)]
-                        .iter()
-                        .map(|v| v.type_of())
-                        .collect();
-                    eprintln!(
-                        "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
-                        param_count, arg_types
-                    );
-                }
+            if func_name_is_assert {
+                let arg_types: Vec<_> = self.registers
+                    [register_base..register_base + param_count.min(local_count)]
+                    .iter()
+                    .map(|v| v.type_of())
+                    .collect();
+                eprintln!(
+                    "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
+                    param_count, arg_types
+                );
             }
         }
 
@@ -2105,7 +2210,7 @@ impl VmContext {
         // Take pending this value (defaults to undefined)
         // ES2023 §10.2.1.1: In non-strict mode, undefined/null this becomes globalThis
         let mut this_value = self.take_pending_this();
-        if this_value.is_undefined() && !func.flags.is_strict && !is_construct {
+        if this_value.is_undefined() && !is_strict && !is_construct {
             this_value = Value::object(frame_global);
         }
 
@@ -2123,7 +2228,7 @@ impl VmContext {
 
         self.call_stack.push(CallFrame {
             function_index,
-            module,
+            module_id,
             realm_id: frame_realm_id,
             pc: 0,
             register_base,
@@ -2144,6 +2249,7 @@ impl VmContext {
             this_initialized: !is_derived,
             is_derived,
             callee_value,
+            feedback_ptr,
         });
         self.switch_realm(frame_realm_id);
         Ok(())
@@ -2540,7 +2646,7 @@ impl VmContext {
             .iter()
             .rev()
             .map(|frame| {
-                let func = frame.module.function(frame.function_index);
+                let func = self.module_table.get(frame.module_id).function(frame.function_index);
                 let func_name = func
                     .and_then(|f| f.name.clone())
                     .unwrap_or_else(|| "(anonymous)".to_string());
@@ -2574,7 +2680,7 @@ impl VmContext {
             .drain(..)
             .map(|frame| SavedFrame {
                 function_index: frame.function_index,
-                module: frame.module,
+                module_id: frame.module_id,
                 realm_id: frame.realm_id,
                 pc: frame.pc,
                 local_count: frame.local_count,
@@ -2610,9 +2716,13 @@ impl VmContext {
 
         // Rebuild call stack from saved frame metadata
         for saved in saved_frames.into_iter() {
+            let saved_module = self.module_table.get(saved.module_id);
+            let feedback_ptr = FeedbackPtr(
+                &saved_module.functions[saved.function_index as usize].feedback_vector,
+            );
             self.call_stack.push(CallFrame {
                 function_index: saved.function_index,
-                module: saved.module,
+                module_id: saved.module_id,
                 realm_id: saved.realm_id,
                 pc: saved.pc,
                 register_base: saved.register_base,
@@ -2632,6 +2742,7 @@ impl VmContext {
                 this_initialized: true,
                 is_derived: false,
                 callee_value: None,
+                feedback_ptr,
             });
 
             // Update next_frame_id to be greater than any restored frame
@@ -3093,7 +3204,9 @@ mod tests {
         let runtime = crate::runtime::VmRuntime::new();
         let mut ctx = runtime.create_context();
 
-        ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)
+        let module = dummy_module();
+        ctx.register_module(&module);
+        ctx.push_frame(0, module.module_id, 0, None, false, false, 0)
             .unwrap();
         ctx.set_register(0, Value::int32(42));
 
@@ -3105,7 +3218,9 @@ mod tests {
         let runtime = crate::runtime::VmRuntime::new();
         let mut ctx = runtime.create_context();
 
-        ctx.push_frame(0, dummy_module(), 3, None, false, false, 0)
+        let module = dummy_module();
+        ctx.register_module(&module);
+        ctx.push_frame(0, module.module_id, 3, None, false, false, 0)
             .unwrap();
         ctx.set_local(0, Value::int32(1)).unwrap();
         ctx.set_local(1, Value::int32(2)).unwrap();
@@ -3121,8 +3236,9 @@ mod tests {
         let runtime = crate::runtime::VmRuntime::new();
         let mut ctx = runtime.create_context();
         let module = dummy_module();
+        ctx.register_module(&module);
 
-        ctx.push_frame(0, module.clone(), 1, None, false, false, 0)
+        ctx.push_frame(0, module.module_id, 1, None, false, false, 0)
             .unwrap();
         ctx.set_local(0, Value::int32(42)).unwrap();
 
@@ -3143,8 +3259,9 @@ mod tests {
         let runtime = crate::runtime::VmRuntime::new();
         let mut ctx = runtime.create_context();
         let module = dummy_module();
+        ctx.register_module(&module);
 
-        ctx.push_frame(0, module.clone(), 1, None, false, false, 0)
+        ctx.push_frame(0, module.module_id, 1, None, false, false, 0)
             .unwrap();
         ctx.set_local(0, Value::int32(10)).unwrap();
         let _cell = ctx.get_or_create_open_upvalue(0).unwrap();
@@ -3152,7 +3269,7 @@ mod tests {
         assert_eq!(ctx.call_stack()[0].open_upvalue_count, 1);
         assert_eq!(ctx.open_upvalues_to_trace().len(), 1);
 
-        ctx.push_frame(0, module, 1, None, false, false, 0).unwrap();
+        ctx.push_frame(0, module.module_id, 1, None, false, false, 0).unwrap();
         ctx.set_local(0, Value::int32(99)).unwrap();
         assert_eq!(
             ctx.current_frame().expect("inner frame").open_upvalue_count,
@@ -3175,15 +3292,16 @@ mod tests {
             memory_manager,
         );
         let module = dummy_module();
+        ctx.register_module(&module);
 
         // Push frames until overflow
         for _ in 0..test_max_depth {
-            ctx.push_frame(0, Arc::clone(&module), 0, None, false, false, 0)
+            ctx.push_frame(0, module.module_id, 0, None, false, false, 0)
                 .unwrap();
         }
 
         // Next push should fail
-        let result = ctx.push_frame(0, module, 0, None, false, false, 0);
+        let result = ctx.push_frame(0, module.module_id, 0, None, false, false, 0);
         assert!(matches!(result, Err(VmError::StackOverflow)));
     }
 
@@ -3212,7 +3330,9 @@ mod tests {
         let runtime = crate::runtime::VmRuntime::new();
         let mut ctx = runtime.create_context();
 
-        ctx.push_frame(0, dummy_module(), 0, None, false, false, 0)
+        let module = dummy_module();
+        ctx.register_module(&module);
+        ctx.push_frame(0, module.module_id, 0, None, false, false, 0)
             .unwrap();
         assert_eq!(ctx.pc(), 0);
 
@@ -3240,8 +3360,9 @@ mod tests {
             .build();
         builder.add_function(func);
         let module = Arc::new(builder.build());
+        ctx.register_module(&module);
 
-        ctx.push_frame(0, module, 2, None, false, false, 0).unwrap();
+        ctx.push_frame(0, module.module_id, 2, None, false, false, 0).unwrap();
         ctx.set_local(0, Value::int32(10)).unwrap();
         ctx.set_local(1, Value::int32(20)).unwrap();
         ctx.set_register(0, Value::int32(30));

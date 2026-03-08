@@ -250,10 +250,10 @@ impl ContentStore {
 
         // Try clonefile (macOS CoW - fastest), then hardlink, then copy
         // clonefile and hardlink preserve permissions, only copy needs chmod
-        let needs_chmod = if try_clonefile(&store_path, dest).is_ok() {
-            false // clonefile preserves permissions
-        } else if fs::hard_link(&store_path, dest).is_ok() {
-            false // hardlink shares inode, same permissions
+        let needs_chmod = if try_clonefile(&store_path, dest).is_ok()
+            || fs::hard_link(&store_path, dest).is_ok()
+        {
+            false // clonefile/hardlink preserve permissions
         } else {
             // Hardlink failed (cross-device?), copy instead
             fs::copy(&store_path, dest).map_err(|e| {
@@ -317,13 +317,12 @@ impl ContentStore {
             }
 
             // If the assembled tree is missing but we have the CAS index, build it once and retry.
-            if self.maybe_build_package_store_from_index(index).is_ok() {
-                if self
+            if self.maybe_build_package_store_from_index(index).is_ok()
+                && self
                     .install_from_existing_package_store(index, dest)
                     .is_ok()
-                {
-                    return Ok(());
-                }
+            {
+                return Ok(());
             }
         }
 
@@ -357,10 +356,10 @@ impl ContentStore {
             candidates.push(exec_file);
         }
 
-        if candidates.is_empty() {
-            if let Some(first) = index.files.first() {
-                candidates.push((first.path.trim_start_matches('/'), first.mode));
-            }
+        if candidates.is_empty()
+            && let Some(first) = index.files.first()
+        {
+            candidates.push((first.path.trim_start_matches('/'), first.mode));
         }
 
         for (rel, expected_mode) in candidates.into_iter().take(2) {
@@ -424,7 +423,7 @@ impl ContentStore {
 
         let pkg_parent = pkg_dir
             .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid package store path"))?;
+            .ok_or_else(|| io::Error::other("Invalid package store path"))?;
         fs::create_dir_all(pkg_parent)?;
 
         let temp_dir = pkg_parent.join(format!(
@@ -503,10 +502,10 @@ impl ContentStore {
 
                 // Try clonefile, then hardlink, then copy
                 // clonefile and hardlink preserve permissions, only copy needs chmod
-                let needs_chmod = if try_clonefile(&store_path, &file_dest).is_ok() {
-                    false // clonefile preserves permissions
-                } else if fs::hard_link(&store_path, &file_dest).is_ok() {
-                    false // hardlink shares inode, same permissions
+                let needs_chmod = if try_clonefile(&store_path, &file_dest).is_ok()
+                    || fs::hard_link(&store_path, &file_dest).is_ok()
+                {
+                    false // clonefile/hardlink preserve permissions
                 } else {
                     fs::copy(&store_path, &file_dest).map_err(|e| {
                         io::Error::new(

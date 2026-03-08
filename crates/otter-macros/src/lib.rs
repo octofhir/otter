@@ -175,21 +175,21 @@ fn detect_pattern(input: &ItemFn) -> ParamPattern {
         }
     }
 
-    if params.len() == 1 && is_native_context(&params[0]) {
+    if params.len() == 1 && is_native_context(params[0]) {
         return ParamPattern::NcxOnly;
     }
 
     // Typed parameters
     let mut typed_params = Vec::new();
     for arg in &params {
-        if let FnArg::Typed(pat_type) = arg {
-            if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
-                // Skip ncx parameter if it's the last one
-                if is_native_context(arg) {
-                    continue;
-                }
-                typed_params.push((pat_ident.ident.clone(), pat_type.ty.clone()));
+        if let FnArg::Typed(pat_type) = arg
+            && let syn::Pat::Ident(pat_ident) = &*pat_type.pat
+        {
+            // Skip ncx parameter if it's the last one
+            if is_native_context(arg) {
+                continue;
             }
+            typed_params.push((pat_ident.ident.clone(), pat_type.ty.clone()));
         }
     }
 
@@ -203,12 +203,12 @@ fn is_value_ref(arg: &FnArg) -> bool {
     if let FnArg::Typed(pat_type) = arg {
         let ty_str = quote!(#pat_type.ty).to_string();
         // Check the actual type
-        if let Type::Reference(type_ref) = &*pat_type.ty {
-            if let Type::Path(type_path) = &*type_ref.elem {
-                if let Some(seg) = type_path.path.segments.last() {
-                    return seg.ident == "Value";
-                }
-            }
+        if let Type::Reference(type_ref) = &*pat_type.ty
+            && let Type::Path(type_path) = &*type_ref.elem
+            && let Some(seg) = type_path.path.segments.last()
+            && seg.ident == "Value"
+        {
+            return true;
         }
         // Fallback: string match
         return ty_str.contains("& Value") || ty_str.contains("&Value");
@@ -219,14 +219,12 @@ fn is_value_ref(arg: &FnArg) -> bool {
 /// Check if a FnArg is `&[Value]` (slice of Value)
 fn is_value_slice(arg: &FnArg) -> bool {
     if let FnArg::Typed(pat_type) = arg {
-        if let Type::Reference(type_ref) = &*pat_type.ty {
-            if let Type::Slice(type_slice) = &*type_ref.elem {
-                if let Type::Path(type_path) = &*type_slice.elem {
-                    if let Some(seg) = type_path.path.segments.last() {
-                        return seg.ident == "Value";
-                    }
-                }
-            }
+        if let Type::Reference(type_ref) = &*pat_type.ty
+            && let Type::Slice(type_slice) = &*type_ref.elem
+            && let Type::Path(type_path) = &*type_slice.elem
+            && let Some(seg) = type_path.path.segments.last()
+        {
+            return seg.ident == "Value";
         }
     }
     false
@@ -235,14 +233,12 @@ fn is_value_slice(arg: &FnArg) -> bool {
 /// Check if a FnArg is `&mut NativeContext` or `&mut NativeContext<'_>`
 fn is_native_context(arg: &FnArg) -> bool {
     if let FnArg::Typed(pat_type) = arg {
-        if let Type::Reference(type_ref) = &*pat_type.ty {
-            if type_ref.mutability.is_some() {
-                if let Type::Path(type_path) = &*type_ref.elem {
-                    if let Some(seg) = type_path.path.segments.last() {
-                        return seg.ident == "NativeContext";
-                    }
-                }
-            }
+        if let Type::Reference(type_ref) = &*pat_type.ty
+            && type_ref.mutability.is_some()
+            && let Type::Path(type_path) = &*type_ref.elem
+            && let Some(seg) = type_path.path.segments.last()
+        {
+            return seg.ident == "NativeContext";
         }
     }
     false
@@ -250,12 +246,7 @@ fn is_native_context(arg: &FnArg) -> bool {
 
 /// Check if the last param is `&mut NativeContext`
 fn has_trailing_ncx(input: &ItemFn) -> bool {
-    input
-        .sig
-        .inputs
-        .last()
-        .map(|arg| is_native_context(arg))
-        .unwrap_or(false)
+    input.sig.inputs.last().map_or(false, is_native_context)
 }
 
 /// Marks a function as callable from JavaScript.
@@ -306,7 +297,7 @@ fn expand_dive_native(input: ItemFn, args: DiveArgs) -> TokenStream {
     let pattern = detect_pattern(&input);
 
     // Auto-infer length from typed params count if not explicitly set
-    let length = args.length.unwrap_or_else(|| match &pattern {
+    let length = args.length.unwrap_or(match &pattern {
         ParamPattern::Typed { params } => params.len() as u32,
         _ => 0,
     });
@@ -480,26 +471,25 @@ fn generate_return_handling(input: &ItemFn) -> ReturnHandling {
         syn::ReturnType::Default => ReturnHandling::Unit,
         syn::ReturnType::Type(_, ty) => {
             // Check for Result<T, E>
-            if let Type::Path(type_path) = ty.as_ref() {
-                if let Some(seg) = type_path.path.segments.last() {
-                    if seg.ident == "Result" {
-                        // Check if the Ok type is Value
-                        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                            if let Some(syn::GenericArgument::Type(ok_type)) = args.args.first() {
-                                if is_value_type(ok_type) {
-                                    return ReturnHandling::ResultValue;
-                                }
-                            }
-                        }
-                        return ReturnHandling::ResultTyped;
-                    }
+            if let Type::Path(type_path) = ty.as_ref()
+                && let Some(seg) = type_path.path.segments.last()
+                && seg.ident == "Result"
+            {
+                // Check if the Ok type is Value
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+                    && let Some(syn::GenericArgument::Type(ok_type)) = args.args.first()
+                    && is_value_type(ok_type)
+                {
+                    return ReturnHandling::ResultValue;
                 }
+                return ReturnHandling::ResultTyped;
             }
+
             // Check for unit type ()
-            if let Type::Tuple(tuple) = ty.as_ref() {
-                if tuple.elems.is_empty() {
-                    return ReturnHandling::Unit;
-                }
+            if let Type::Tuple(tuple) = ty.as_ref()
+                && tuple.elems.is_empty()
+            {
+                return ReturnHandling::Unit;
             }
             ReturnHandling::PlainTyped
         }
@@ -508,10 +498,11 @@ fn generate_return_handling(input: &ItemFn) -> ReturnHandling {
 
 /// Check if a type is `Value`
 fn is_value_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if let Some(seg) = type_path.path.segments.last() {
-            return seg.ident == "Value";
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(seg) = type_path.path.segments.last()
+        && seg.ident == "Value"
+    {
+        return true;
     }
     false
 }
@@ -873,13 +864,13 @@ fn expand_js_class_struct(input: ItemStruct, args: JsClassArgs) -> TokenStream {
             .filter(|a| !a.path().is_ident("js_skip") && !a.path().is_ident("js_readonly"))
             .collect();
 
-        if let Some(ident) = &field.ident {
-            if !is_skip {
-                if is_readonly {
-                    js_readonly.push(ident.clone());
-                } else {
-                    js_properties.push(ident.clone());
-                }
+        if let Some(ident) = &field.ident
+            && !is_skip
+        {
+            if is_readonly {
+                js_readonly.push(ident.clone());
+            } else {
+                js_properties.push(ident.clone());
             }
         }
 
@@ -1064,9 +1055,7 @@ fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
                     let f = CACHED
                         .get_or_init(|| {
                             std::sync::Arc::new(
-                                |this: &otter_vm_core::value::Value,
-                                 args: &[otter_vm_core::value::Value],
-                                 ncx: &mut otter_vm_core::context::NativeContext<'_>|
+                                |this, args, ncx|
                                  -> std::result::Result<
                                     otter_vm_core::value::Value,
                                     otter_vm_core::error::VmError,

@@ -131,13 +131,17 @@ impl CopyFormat {
             CopyFormat::Binary => "BINARY",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for CopyFormat {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "csv" => CopyFormat::Csv,
             "binary" => CopyFormat::Binary,
             _ => CopyFormat::Text,
-        }
+        })
     }
 }
 

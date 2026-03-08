@@ -62,7 +62,7 @@ fn bench_int32_loop(c: &mut Criterion) {
     c.bench_function("numeric_int32_loop_1000", |b| {
         b.iter(|| {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let result = interpreter.execute(black_box(&module), &mut ctx).unwrap();
             black_box(result)
         });
@@ -72,7 +72,7 @@ fn bench_int32_loop(c: &mut Criterion) {
 /// Benchmark: Simple loop with float additions (forces quickening to Number)
 fn bench_f64_loop(c: &mut Criterion) {
     let mut builder = Module::builder("bench.js");
-    let iterations = 1000u32;
+    let _iterations = 1000u32;
     builder.constants_mut().add_number(0.5);
     builder.constants_mut().add_number(1000.0);
 
@@ -119,7 +119,7 @@ fn bench_f64_loop(c: &mut Criterion) {
     c.bench_function("numeric_f64_loop_1000", |b| {
         b.iter(|| {
             let mut ctx = create_test_context();
-            let mut interpreter = Interpreter::new();
+            let interpreter = Interpreter::new();
             let result = interpreter.execute(black_box(&module), &mut ctx).unwrap();
             black_box(result)
         });

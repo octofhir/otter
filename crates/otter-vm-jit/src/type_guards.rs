@@ -61,16 +61,19 @@ pub(crate) const PTR_MASK: i64 = 0xFFFF_0000_0000_0000_u64 as i64;
 
 /// Mask to test for any pointer sub-tag (zeroes bits 48-49, keeps 50-63).
 /// All 4 pointer sub-tags (0x7FFC..0x7FFF) map to 0x7FFC under this mask.
+#[allow(dead_code)]
 pub(crate) const PTR_TAG_MASK: i64 = 0xFFFC_0000_0000_0000_u64 as i64;
 
 /// Pointer sub-tags (must match otter-vm-core/src/value.rs)
 const TAG_PTR_OBJECT: i64 = 0x7FFC_0000_0000_0000_u64 as i64; // JsObject (plain or array)
+#[allow(dead_code)]
 const TAG_PTR_STRING: i64 = 0x7FFD_0000_0000_0000_u64 as i64; // JsString
 const TAG_PTR_FUNCTION: i64 = 0x7FFE_0000_0000_0000_u64 as i64; // Closure or NativeFunctionObject
 #[allow(dead_code)]
 const TAG_PTR_OTHER: i64 = 0x7FFF_0000_0000_0000_u64 as i64; // Everything else
 
 /// 48-bit payload mask for extracting raw pointer from NaN-boxed value.
+#[allow(dead_code)]
 pub(crate) const PAYLOAD_MASK: i64 = 0x0000_FFFF_FFFF_FFFF_u64 as i64;
 
 /// Emit: is this value an Object (or Array, or Function)?
@@ -91,12 +94,11 @@ pub(crate) fn emit_is_object(builder: &mut FunctionBuilder, val: Value) -> Value
 /// Emit: is this value any NaN-boxed pointer (Object, String, Function, or Other)?
 ///
 /// Returns a Cranelift `i8` value (0 or 1).
+#[allow(dead_code)]
 pub(crate) fn emit_is_pointer(builder: &mut FunctionBuilder, val: Value) -> Value {
     let mask = builder.ins().iconst(types::I64, PTR_TAG_MASK);
     let tag = builder.ins().band(val, mask);
-    builder
-        .ins()
-        .icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT as i64)
+    builder.ins().icmp_imm(IntCC::Equal, tag, TAG_PTR_OBJECT)
 }
 
 /// Emit: is this value a NaN-boxed int32?
@@ -340,6 +342,7 @@ pub(crate) fn emit_guarded_i32_arith(
 /// signed i32 comparison, and returns TAG_TRUE or TAG_FALSE.
 ///
 /// On type-check failure, branches to `slow_block` for the generic path.
+#[allow(dead_code)]
 pub(crate) fn emit_guarded_i32_cmp(
     builder: &mut FunctionBuilder,
     cc: IntCC,
@@ -1536,6 +1539,7 @@ pub(crate) fn emit_specialized_arith(
 /// Emit type-specialized comparison based on feedback-vector observations.
 ///
 /// Like `emit_specialized_arith`, selects the guard pattern matching the type profile.
+#[allow(dead_code)]
 pub(crate) fn emit_specialized_cmp(
     builder: &mut FunctionBuilder,
     int_cc: IntCC,
@@ -1563,6 +1567,7 @@ pub(crate) fn emit_specialized_cmp(
 ///
 /// The caller guarantees both operands are NaN-boxed int32. On overflow,
 /// branches to `slow_block` for the caller to fill in.
+#[allow(dead_code)]
 pub(crate) fn emit_bare_i32_arith(
     builder: &mut FunctionBuilder,
     op: ArithOp,
@@ -1611,6 +1616,7 @@ pub(crate) fn emit_bare_i32_arith(
 /// The caller guarantees both operands are NaN-boxed int32.
 /// Always succeeds — no slow path needed, but we keep the same GuardedResult
 /// pattern for uniformity (slow_block is never reached).
+#[allow(dead_code)]
 pub(crate) fn emit_bare_i32_cmp(
     builder: &mut FunctionBuilder,
     cc: IntCC,
@@ -1639,6 +1645,7 @@ pub(crate) fn emit_bare_i32_cmp(
 /// Emit bare i32 increment (no type guard, overflow-only slow path).
 ///
 /// The caller guarantees the operand is NaN-boxed int32.
+#[allow(dead_code)]
 pub(crate) fn emit_bare_i32_inc(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
     let box_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -1668,6 +1675,7 @@ pub(crate) fn emit_bare_i32_inc(builder: &mut FunctionBuilder, val: Value) -> Gu
 /// Emit bare i32 decrement (no type guard, overflow-only slow path).
 ///
 /// The caller guarantees the operand is NaN-boxed int32.
+#[allow(dead_code)]
 pub(crate) fn emit_bare_i32_dec(builder: &mut FunctionBuilder, val: Value) -> GuardedResult {
     let box_block = builder.create_block();
     let slow_block = builder.create_block();

@@ -298,6 +298,8 @@ impl<T> GcRef<T> {
         let alloc_size = std::mem::size_of::<GcBox<T>>();
         if let Some(mm) = crate::memory::MemoryManager::current() {
             let _ = mm.alloc(alloc_size);
+            #[cfg(feature = "profiling")]
+            mm.category_stats.record(T::TYPE_ID, alloc_size);
         }
 
         // Allocate and register with GC
@@ -538,50 +540,24 @@ impl Trace for crate::object::JsObject {
         // Trace the current shape
         tracer.mark(self.shape().as_ref());
 
-        use crate::object::PropertyDescriptor;
-
-        // Trace inline property values (first INLINE_PROPERTY_COUNT)
+        // Trace inline slot values (non-empty slots only)
         {
-            let inline = self.get_inline_properties_storage();
-            let inline_props = inline.borrow();
-            for slot in inline_props.iter() {
-                if let Some(entry) = slot {
-                    match &entry.desc {
-                        PropertyDescriptor::Data { value, .. } => {
-                            tracer.mark_value(value);
-                        }
-                        PropertyDescriptor::Accessor { get, set, .. } => {
-                            if let Some(v) = get {
-                                tracer.mark_value(v);
-                            }
-                            if let Some(v) = set {
-                                tracer.mark_value(v);
-                            }
-                        }
-                        PropertyDescriptor::Deleted => {}
-                    }
+            let slots = self.get_inline_slots().borrow();
+            let meta = self.get_inline_meta().borrow();
+            for i in 0..crate::object::INLINE_PROPERTY_COUNT {
+                if !meta[i].is_empty() {
+                    tracer.mark_value(&slots[i]);
                 }
             }
         }
 
-        // Trace overflow property values (Data or Accessor)
+        // Trace overflow slot values (non-empty slots only)
         {
-            let overflow = self.get_overflow_properties_storage();
-            let overflow_props = overflow.borrow();
-            for entry in overflow_props.iter() {
-                match &entry.desc {
-                    PropertyDescriptor::Data { value, .. } => {
-                        tracer.mark_value(value);
-                    }
-                    PropertyDescriptor::Accessor { get, set, .. } => {
-                        if let Some(v) = get {
-                            tracer.mark_value(v);
-                        }
-                        if let Some(v) = set {
-                            tracer.mark_value(v);
-                        }
-                    }
-                    PropertyDescriptor::Deleted => {}
+            let slots = self.get_overflow_slots().borrow();
+            let meta = self.get_overflow_meta().borrow();
+            for i in 0..slots.len() {
+                if !meta[i].is_empty() {
+                    tracer.mark_value(&slots[i]);
                 }
             }
         }
@@ -889,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_basic() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -909,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_multiple_values() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -941,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_nested() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         {
             let scope1 = HandleScope::new(&mut ctx);
@@ -984,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_with_objects() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         {
             let scope = HandleScope::new(&mut ctx);
@@ -995,7 +971,7 @@ mod tests {
             assert_eq!(scope.context().root_count(), 1);
 
             // Modify the object
-            obj.set("test".into(), Value::int32(42));
+            let _ = obj.set("test".into(), Value::int32(42));
 
             // Verify the modification persists
             assert_eq!(obj.get(&"test".into()), Some(Value::int32(42)));
@@ -1007,11 +983,11 @@ mod tests {
     #[test]
     fn test_gc_ref_basic() {
         let _rt = VmRuntime::new();
-        let mm = _rt.memory_manager().clone();
+        let _mm = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Set a property
-        obj.set("foo".into(), Value::int32(123));
+        let _ = obj.set("foo".into(), Value::int32(123));
 
         // Get the property back
         assert_eq!(obj.get(&"foo".into()), Some(Value::int32(123)));
@@ -1020,9 +996,9 @@ mod tests {
     #[test]
     fn test_gc_ref_clone() {
         let _rt = VmRuntime::new();
-        let mm = _rt.memory_manager().clone();
+        let _mm = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null()));
-        obj1.set("value".into(), Value::int32(99));
+        let _ = obj1.set("value".into(), Value::int32(99));
 
         // Clone the reference
         let obj2 = obj1.clone();
@@ -1031,14 +1007,14 @@ mod tests {
         assert_eq!(obj2.get(&"value".into()), Some(Value::int32(99)));
 
         // Modifying through obj2 should affect obj1
-        obj2.set("value".into(), Value::int32(100));
+        let _ = obj2.set("value".into(), Value::int32(100));
         assert_eq!(obj1.get(&"value".into()), Some(Value::int32(100)));
     }
 
     #[test]
     fn test_gc_ref_equality() {
         let _rt = VmRuntime::new();
-        let mm = _rt.memory_manager().clone();
+        let _mm = _rt.memory_manager().clone();
         let obj1 = GcRef::new(JsObject::new(Value::null()));
         let obj2 = GcRef::new(JsObject::new(Value::null()));
 
@@ -1053,7 +1029,7 @@ mod tests {
     #[test]
     fn test_gc_ref_pointer_identity() {
         let _rt = VmRuntime::new();
-        let mm = _rt.memory_manager().clone();
+        let _mm = _rt.memory_manager().clone();
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Clone and verify pointer identity
@@ -1068,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_handle_is_valid() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let handle = scope.root_value(Value::int32(42));
@@ -1080,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_handle_copy_semantics() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let h1 = scope.root_value(Value::int32(42));
@@ -1110,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_handle_scope_marker_stack() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         // Create scopes and verify they clean up properly
         // We can't directly test scope_markers since there's no public accessor,
@@ -1143,11 +1119,11 @@ mod tests {
 
     #[test]
     fn test_handle_survives_gc_safepoint() {
-        let (mut ctx, mm, _rt) = create_gc_test_context();
+        let (mut ctx, _mm, _rt) = create_gc_test_context();
 
         let scope = HandleScope::new(&mut ctx);
         let obj = GcRef::new(JsObject::new(Value::null()));
-        obj.set("important".into(), Value::int32(999));
+        let _ = obj.set("important".into(), Value::int32(999));
 
         let handle = scope.root_value(Value::object(obj.clone()));
 

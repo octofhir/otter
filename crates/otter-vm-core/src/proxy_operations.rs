@@ -1003,7 +1003,7 @@ fn validate_define_property_invariants(
 }
 
 /// Convert a PropertyDescriptor to a descriptor object Value
-fn descriptor_to_object(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
+fn descriptor_to_object(desc: &PropertyDescriptor, _ncx: &NativeContext) -> Value {
     let obj = GcRef::new(JsObject::new(Value::null()));
 
     match desc {

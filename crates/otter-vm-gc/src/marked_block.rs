@@ -507,9 +507,6 @@ mod tests {
     /// Dummy drop function for testing
     unsafe fn dummy_drop(_ptr: *mut u8) {}
 
-    /// Dummy trace function for testing
-    unsafe fn dummy_trace(_ptr: *const u8, _tracer: &mut dyn FnMut(*const GcHeader)) {}
-
     #[test]
     fn test_size_class_index() {
         assert_eq!(size_class_index(1), Some(0)); // → 16

@@ -23,10 +23,16 @@ static GC_LOCK: Mutex<()> = Mutex::new(());
 /// Helper function to create a test VM context.
 /// Returns VmRuntime to keep the GC registry alive.
 fn create_test_context() -> (VmContext, Arc<MemoryManager>, VmRuntime) {
-    let runtime = VmRuntime::new();
-    let mm = runtime.memory_manager().clone();
+    let (mm, runtime) = make_test_env();
     let ctx = runtime.create_context();
     (ctx, mm, runtime)
+}
+
+/// Helper function to create a test VM environment (MemoryManager and VmRuntime).
+fn make_test_env() -> (Arc<MemoryManager>, VmRuntime) {
+    let rt = VmRuntime::new();
+    let mm = rt.memory_manager().clone();
+    (mm, rt)
 }
 
 // ============================================================================
@@ -36,7 +42,7 @@ fn create_test_context() -> (VmContext, Arc<MemoryManager>, VmRuntime) {
 #[test]
 fn test_circular_reference_two_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     let initial_stats = ctx.gc_stats();
 
@@ -46,11 +52,15 @@ fn test_circular_reference_two_objects() {
         let obj_b = GcRef::new(JsObject::new(Value::null()));
 
         // Set up circular references: a.b = b, b.a = a
-        obj_a.set(PropertyKey::string("b"), Value::object(obj_b));
-        obj_b.set(PropertyKey::string("a"), Value::object(obj_a));
+        obj_a
+            .set(PropertyKey::string("b"), Value::object(obj_b))
+            .ok();
+        obj_b
+            .set(PropertyKey::string("a"), Value::object(obj_a))
+            .ok();
 
-        obj_a.set(PropertyKey::string("name"), Value::int32(1));
-        obj_b.set(PropertyKey::string("name"), Value::int32(2));
+        obj_a.set(PropertyKey::string("name"), Value::int32(1)).ok();
+        obj_b.set(PropertyKey::string("name"), Value::int32(2)).ok();
 
         assert!(obj_a.get(&PropertyKey::string("b")).is_some());
         assert!(obj_b.get(&PropertyKey::string("a")).is_some());
@@ -75,16 +85,22 @@ fn test_circular_reference_two_objects() {
 #[test]
 fn test_circular_reference_chain() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     {
         let obj_a = GcRef::new(JsObject::new(Value::null()));
         let obj_b = GcRef::new(JsObject::new(Value::null()));
         let obj_c = GcRef::new(JsObject::new(Value::null()));
 
-        obj_a.set(PropertyKey::string("next"), Value::object(obj_b));
-        obj_b.set(PropertyKey::string("next"), Value::object(obj_c));
-        obj_c.set(PropertyKey::string("next"), Value::object(obj_a));
+        obj_a
+            .set(PropertyKey::string("next"), Value::object(obj_b))
+            .ok();
+        obj_b
+            .set(PropertyKey::string("next"), Value::object(obj_c))
+            .ok();
+        obj_c
+            .set(PropertyKey::string("next"), Value::object(obj_a))
+            .ok();
     }
 
     ctx.collect_garbage();
@@ -96,11 +112,12 @@ fn test_circular_reference_chain() {
 #[test]
 fn test_self_referencing_object() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     {
         let obj = GcRef::new(JsObject::new(Value::null()));
-        obj.set(PropertyKey::string("self"), Value::object(obj));
+        obj.set(PropertyKey::string("self"), Value::object(obj))
+            .ok();
     }
 
     ctx.collect_garbage();
@@ -116,13 +133,14 @@ fn test_self_referencing_object() {
 #[test]
 fn test_gc_stress_many_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     const NUM_OBJECTS: usize = 10_000;
 
     for i in 0..NUM_OBJECTS {
         let obj = GcRef::new(JsObject::new(Value::null()));
-        obj.set(PropertyKey::string("value"), Value::int32(i as i32));
+        obj.set(PropertyKey::string("value"), Value::int32(i as i32))
+            .ok();
     }
 
     let reclaimed = ctx.collect_garbage();
@@ -138,14 +156,14 @@ fn test_gc_stress_many_objects() {
 #[test]
 fn test_gc_stress_with_properties() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         for j in 0..10 {
             let key = PropertyKey::string(&format!("prop{}", j));
-            obj.set(key, Value::int32(j));
+            obj.set(key, Value::int32(j)).ok();
         }
     }
 
@@ -158,7 +176,7 @@ fn test_gc_stress_with_properties() {
 #[test]
 fn test_gc_stress_nested_objects() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     for _ in 0..100 {
         let root = GcRef::new(JsObject::new(Value::null()));
@@ -166,8 +184,12 @@ fn test_gc_stress_nested_objects() {
 
         for depth in 0..10 {
             let child = GcRef::new(JsObject::new(Value::null()));
-            child.set(PropertyKey::string("depth"), Value::int32(depth));
-            current.set(PropertyKey::string("child"), Value::object(child));
+            child
+                .set(PropertyKey::string("depth"), Value::int32(depth))
+                .ok();
+            current
+                .set(PropertyKey::string("child"), Value::object(child))
+                .ok();
             current = child;
         }
     }
@@ -185,12 +207,13 @@ fn test_gc_stress_nested_objects() {
 #[test]
 #[ignore = "SIGSEGV: GC rooting bug — rooted object freed during collection"]
 fn test_gc_retains_rooted_objects() {
-    let (mut ctx, mm, _rt) = create_test_context();
+    let (mut ctx, _mm, _rt) = create_test_context();
 
     let scope = HandleScope::new(&mut ctx);
 
     let obj = GcRef::new(JsObject::new(Value::null()));
-    obj.set(PropertyKey::string("important"), Value::int32(42));
+    obj.set(PropertyKey::string("important"), Value::int32(42))
+        .ok();
 
     assert_eq!(
         obj.get(&PropertyKey::string("important")),
@@ -222,21 +245,23 @@ fn test_gc_retains_rooted_objects() {
 #[test]
 #[ignore = "SIGSEGV: GC rooting bug"]
 fn test_gc_retains_objects_reachable_from_roots() {
-    let (mut ctx, mm, _rt) = create_test_context();
+    let (mut ctx, _mm, _rt) = create_test_context();
 
     let scope = HandleScope::new(&mut ctx);
 
     // Create a chain: obj1 -> obj2 -> obj3
     let obj3 = GcRef::new(JsObject::new(Value::null()));
-    obj3.set(PropertyKey::string("value"), Value::int32(3));
+    obj3.set(PropertyKey::string("value"), Value::int32(3)).ok();
 
     let obj2 = GcRef::new(JsObject::new(Value::null()));
-    obj2.set(PropertyKey::string("next"), Value::object(obj3));
-    obj2.set(PropertyKey::string("value"), Value::int32(2));
+    obj2.set(PropertyKey::string("next"), Value::object(obj3))
+        .ok();
+    obj2.set(PropertyKey::string("value"), Value::int32(2)).ok();
 
     let obj1 = GcRef::new(JsObject::new(Value::null()));
-    obj1.set(PropertyKey::string("next"), Value::object(obj2));
-    obj1.set(PropertyKey::string("value"), Value::int32(1));
+    obj1.set(PropertyKey::string("next"), Value::object(obj2))
+        .ok();
+    obj1.set(PropertyKey::string("value"), Value::int32(1)).ok();
 
     assert_eq!(
         obj1.get(&PropertyKey::string("value")),
@@ -295,17 +320,17 @@ fn test_gc_retains_objects_reachable_from_roots() {
 
 #[test]
 fn test_gc_nested_handle_scopes() {
-    let (mut ctx, mm, _rt) = create_test_context();
+    let (mut ctx, _mm, _rt) = create_test_context();
 
     let scope1 = HandleScope::new(&mut ctx);
     let obj1 = GcRef::new(JsObject::new(Value::null()));
-    obj1.set(PropertyKey::string("level"), Value::int32(1));
+    obj1.set(PropertyKey::string("level"), Value::int32(1)).ok();
     let h1 = scope1.root_value(Value::object(obj1));
 
     {
         let scope2 = HandleScope::new(scope1.context_mut());
         let obj2 = GcRef::new(JsObject::new(Value::null()));
-        obj2.set(PropertyKey::string("level"), Value::int32(2));
+        obj2.set(PropertyKey::string("level"), Value::int32(2)).ok();
         let h2 = scope2.root_value(Value::object(obj2));
 
         assert_eq!(scope2.context().root_count(), 2);
@@ -333,7 +358,7 @@ fn test_gc_nested_handle_scopes() {
 #[test]
 fn test_gc_stats_tracking() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     let initial_stats = ctx.gc_stats();
 
@@ -366,7 +391,7 @@ fn test_gc_stats_tracking() {
 #[ignore = "SIGSEGV: GC rooting bug"]
 fn test_gc_pause_time_recorded() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     for _ in 0..1000 {
         let _obj = GcRef::new(JsObject::new(Value::null()));
@@ -388,7 +413,7 @@ fn test_gc_pause_time_recorded() {
 #[test]
 fn test_gc_threshold_trigger() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     ctx.set_gc_threshold(1024); // 1KB
 
@@ -396,7 +421,8 @@ fn test_gc_threshold_trigger() {
 
     for _ in 0..100 {
         let obj = GcRef::new(JsObject::new(Value::null()));
-        obj.set(PropertyKey::string("data"), Value::int32(12345));
+        obj.set(PropertyKey::string("data"), Value::int32(12345))
+            .ok();
     }
 
     let triggered = ctx.maybe_collect_garbage();
@@ -410,7 +436,7 @@ fn test_gc_threshold_trigger() {
 #[test]
 fn test_heap_size_reporting() {
     let _lock = GC_LOCK.lock().unwrap();
-    let (ctx, mm, _rt) = create_test_context();
+    let (ctx, _mm, _rt) = create_test_context();
 
     let initial_heap = ctx.heap_size();
 
@@ -427,7 +453,7 @@ fn test_heap_size_reporting() {
     );
 
     for obj in &objects {
-        obj.set(PropertyKey::string("mark"), Value::int32(1));
+        obj.set(PropertyKey::string("mark"), Value::int32(1)).ok();
     }
     drop(objects);
     ctx.collect_garbage();

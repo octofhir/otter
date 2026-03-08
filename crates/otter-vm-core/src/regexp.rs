@@ -3,7 +3,6 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use regress::{Flags, Regex};
-use std::sync::Arc;
 
 /// JavaScript RegExp object
 #[derive(Debug)]

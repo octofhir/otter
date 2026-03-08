@@ -6,7 +6,7 @@ use oxc_ast::ast::{NumericLiteral, RegExpLiteral, StringLiteral, TemplateLiteral
 use oxc_regular_expression::{LiteralParser, Options as RegExpOptions};
 
 /// ECMAScript version for validation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EcmaVersion {
     /// ECMAScript 5
     Es5,
@@ -29,13 +29,8 @@ pub enum EcmaVersion {
     /// ECMAScript 2023
     Es2023,
     /// Latest ECMAScript version
+    #[default]
     Latest,
-}
-
-impl Default for EcmaVersion {
-    fn default() -> Self {
-        Self::Latest
-    }
 }
 
 /// Source location information
@@ -95,6 +90,12 @@ pub struct LiteralValidator {
     ecma_version: EcmaVersion,
 }
 
+impl Default for LiteralValidator {
+    fn default() -> Self {
+        Self::new(false, EcmaVersion::default())
+    }
+}
+
 impl LiteralValidator {
     /// Create a new literal validator
     pub fn new(strict_mode: bool, ecma_version: EcmaVersion) -> Self {
@@ -102,11 +103,6 @@ impl LiteralValidator {
             strict_mode,
             ecma_version,
         }
-    }
-
-    /// Create a validator with default settings
-    pub fn default() -> Self {
-        Self::new(false, EcmaVersion::default())
     }
 
     /// Create a validator for strict mode
@@ -302,11 +298,13 @@ impl LiteralValidator {
 
         // Cannot have separators around exponent (only for decimal literals)
         // In hex literals, 'e' is a valid digit, so '_e' or 'e_' is allowed.
-        if !is_non_decimal {
-            if raw.contains("_e") || raw.contains("_E") || raw.contains("e_") || raw.contains("E_")
-            {
-                return false;
-            }
+        if !is_non_decimal
+            && (raw.contains("_e")
+                || raw.contains("_E")
+                || raw.contains("e_")
+                || raw.contains("E_"))
+        {
+            return false;
         }
 
         true
@@ -479,10 +477,7 @@ impl LiteralValidator {
                             '0'..='7' => {
                                 // Special case for \0: allowed in strict mode if not followed by decimal digit
                                 if next_ch == '0' {
-                                    let is_legacy_octal = match chars.peek() {
-                                        Some(&digit) if digit.is_ascii_digit() => true,
-                                        _ => false,
-                                    };
+                                    let is_legacy_octal = matches!(chars.peek(), Some(&digit) if digit.is_ascii_digit());
 
                                     if !is_legacy_octal {
                                         // It's a null character escape \0, valid in strict mode
@@ -712,6 +707,7 @@ impl LiteralValidator {
     }
 
     /// Validate RegExp pattern syntax
+    #[allow(dead_code)]
     fn validate_regexp_pattern(&self, pattern: &str, start_pos: u32) -> CompileResult<()> {
         // Check for basic syntax errors that would make the pattern invalid
 
@@ -739,7 +735,7 @@ impl LiteralValidator {
         // Try to compile the pattern to catch other syntax errors
         // Note: We use a simple approach here - in a full implementation,
         // we'd want to use a proper ECMAScript RegExp parser
-        if let Err(_) = regex::Regex::new(&self.convert_js_regex_to_rust_regex(pattern)) {
+        if regex::Regex::new(&self.convert_js_regex_to_rust_regex(pattern)).is_err() {
             // Only report as error if it's clearly a syntax issue
             if self.has_obvious_syntax_errors(pattern) {
                 return Err(CompileError::invalid_literal(
@@ -754,6 +750,7 @@ impl LiteralValidator {
     }
 
     /// Validate RegExp flags
+    #[allow(dead_code)]
     fn validate_regexp_flags(&self, flags: &str, start_pos: u32) -> CompileResult<()> {
         let mut seen_flags = std::collections::HashSet::new();
 
@@ -797,6 +794,7 @@ impl LiteralValidator {
     }
 
     /// Check if forward slash usage is valid in pattern
+    #[allow(dead_code)]
     fn is_valid_slash_usage(&self, pattern: &str) -> bool {
         let mut chars = pattern.chars().peekable();
         let mut in_char_class = false;
@@ -825,6 +823,7 @@ impl LiteralValidator {
     }
 
     /// Validate escape sequences in RegExp pattern
+    #[allow(dead_code)]
     fn validate_regexp_escape_sequences(&self, pattern: &str, start_pos: u32) -> CompileResult<()> {
         let mut chars = pattern.chars().peekable();
         let mut position = 0;
@@ -890,6 +889,7 @@ impl LiteralValidator {
     }
 
     /// Validate character classes in RegExp pattern
+    #[allow(dead_code)]
     fn validate_regexp_character_classes(
         &self,
         pattern: &str,
@@ -934,6 +934,7 @@ impl LiteralValidator {
     }
 
     /// Validate quantifiers in RegExp pattern
+    #[allow(dead_code)]
     fn validate_regexp_quantifiers(&self, pattern: &str, _start_pos: u32) -> CompileResult<()> {
         // Basic quantifier validation
         // This is a simplified check - a full implementation would be more comprehensive
@@ -951,6 +952,7 @@ impl LiteralValidator {
     }
 
     /// Validate groups in RegExp pattern
+    #[allow(dead_code)]
     fn validate_regexp_groups(&self, pattern: &str, start_pos: u32) -> CompileResult<()> {
         let mut chars = pattern.chars().peekable();
         let mut position = 0;
@@ -1013,10 +1015,9 @@ impl LiteralValidator {
                                     // but we can clone the iterator for a short check check?
                                     // Or just continue parsing. Current loop structure makes simple check hard.
                                     // Let's just do a quick lookahead here.
-                                    let mut temp_chars = chars.clone();
+                                    let temp_chars = chars.clone();
                                     let mut has_colon = false;
-
-                                    while let Some(flag) = temp_chars.next() {
+                                    for flag in temp_chars {
                                         if flag == ':' {
                                             has_colon = true;
                                             break;
@@ -1096,6 +1097,7 @@ impl LiteralValidator {
     }
 
     /// Convert JavaScript RegExp pattern to Rust regex (simplified)
+    #[allow(dead_code)]
     fn convert_js_regex_to_rust_regex(&self, pattern: &str) -> String {
         // This is a very simplified conversion
         // A full implementation would handle all the differences between JS and Rust regex
@@ -1103,6 +1105,7 @@ impl LiteralValidator {
     }
 
     /// Check for obvious syntax errors in RegExp pattern
+    #[allow(dead_code)]
     fn has_obvious_syntax_errors(&self, pattern: &str) -> bool {
         // Check for some obvious syntax errors
         pattern.contains("(?") || // Incomplete group syntax
@@ -1658,7 +1661,7 @@ mod tests {
     #[test]
     fn test_string_escape_sequence_validation() {
         let validator = LiteralValidator::default();
-        let strict_validator = LiteralValidator::strict();
+        let _strict_validator = LiteralValidator::strict();
 
         // Valid escape sequences
         assert!(

@@ -143,7 +143,7 @@ fn create_js_promise_wrapper(
 
 /// Create a JavaScript Promise wrapper with explicit memory manager and context.
 fn create_js_promise_wrapper_with_mm(
-    mm: &Arc<MemoryManager>,
+    _mm: &Arc<MemoryManager>,
     ctx: &crate::context::VmContext,
     internal: GcRef<JsPromise>,
 ) -> Value {
@@ -554,7 +554,7 @@ pub fn install_promise_statics(
             |_this, args, ncx| {
                 let items = extract_array_items(args.first())?;
                 let result_promise = JsPromise::new();
-                let mm = ncx.memory_manager().clone();
+                let _mm = ncx.memory_manager().clone();
 
                 // Empty array resolves immediately with []
                 if items.is_empty() {
@@ -706,7 +706,7 @@ pub fn install_promise_statics(
             |_this, args, ncx| {
                 let items = extract_array_items(args.first())?;
                 let result_promise = JsPromise::new();
-                let mm = ncx.memory_manager().clone();
+                let _mm = ncx.memory_manager().clone();
 
                 // Empty array resolves immediately with []
                 if items.is_empty() {
@@ -817,7 +817,7 @@ pub fn install_promise_statics(
             move |_this, args, ncx| {
                 let items = extract_array_items(args.first())?;
                 let result_promise = JsPromise::new();
-                let mm = ncx.memory_manager().clone();
+                let _mm = ncx.memory_manager().clone();
 
                 // Empty array rejects with AggregateError
                 if items.is_empty() {

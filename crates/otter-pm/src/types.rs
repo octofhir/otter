@@ -10,10 +10,10 @@ use std::fs;
 use std::path::Path;
 
 fn write_if_changed(path: &Path, contents: &str) -> Result<(), TypesError> {
-    if let Ok(existing) = fs::read(path) {
-        if existing == contents.as_bytes() {
-            return Ok(());
-        }
+    if let Ok(existing) = fs::read(path)
+        && existing == contents.as_bytes()
+    {
+        return Ok(());
     }
 
     fs::write(path, contents).map_err(|e| TypesError::Io(e.to_string()))?;

@@ -25,7 +25,7 @@ impl SqliteAdapter {
     ///
     /// # Arguments
     /// * `path` - Database path. Use `:memory:` for in-memory database,
-    ///           or a file path (optionally with `sqlite://` prefix)
+    ///   or a file path (optionally with params)
     pub fn open(path: &str) -> SqlResult<Self> {
         let normalized_path = normalize_path(path);
         let conn = if normalized_path == ":memory:" {

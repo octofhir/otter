@@ -5,10 +5,9 @@
 
 use crate::array_buffer::JsArrayBuffer;
 use crate::gc::GcRef;
-use crate::memory::MemoryManager;
+
 use crate::object::JsObject;
 use crate::value::Value;
-use std::sync::Arc;
 
 /// The kind of TypedArray - determines element size and interpretation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,7 +556,7 @@ mod tests {
     use super::*;
     use crate::memory::MemoryManager;
 
-    fn make_test_env() -> (Arc<MemoryManager>, crate::runtime::VmRuntime) {
+    fn make_test_env() -> (std::sync::Arc<MemoryManager>, crate::runtime::VmRuntime) {
         let rt = crate::runtime::VmRuntime::new();
         let mm = rt.memory_manager().clone();
         (mm, rt)
@@ -565,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_create_int32_array() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let object = GcRef::new(JsObject::new(Value::null()));
         let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
@@ -576,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_with_length() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Float64, 10, None);
         assert_eq!(arr.length(), 10);
         assert_eq!(arr.byte_length(), 80);
@@ -584,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_get_set_int32() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 4, None);
         arr.set(0, 42.0);
         arr.set(1, -100.0);
@@ -599,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_uint8_clamped() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Uint8Clamped, 4, None);
         arr.set(0, 300.0); // Should clamp to 255
         arr.set(1, -50.0); // Should clamp to 0
@@ -612,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_subarray() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None);
         for i in 0..10 {
             arr.set(i, i as f64);
@@ -631,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_slice() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 10, None);
         for i in 0..10 {
             arr.set(i, i as f64);
@@ -648,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_fill() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None);
         arr.fill(42.0, None, None);
 
@@ -659,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_reverse() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let arr = JsTypedArray::with_length(TypedArrayKind::Int32, 5, None);
         for i in 0..5 {
             arr.set(i, i as f64);
@@ -676,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_detached_buffer() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let object = GcRef::new(JsObject::new(Value::null()));
         let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
@@ -694,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_alignment_error() {
-        let (mm, _rt) = make_test_env();
+        let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let object = GcRef::new(JsObject::new(Value::null()));
         let result = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 1, 3);

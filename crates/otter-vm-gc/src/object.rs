@@ -228,6 +228,8 @@ pub mod tags {
     pub const TEMPORAL: u8 = 25;
     /// Upvalue cell (closure-captured mutable variable)
     pub const UPVALUE: u8 = 26;
+    /// Accessor pair (getter + setter for accessor properties)
+    pub const ACCESSOR_PAIR: u8 = 27;
 }
 
 #[cfg(test)]

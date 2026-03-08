@@ -1148,12 +1148,18 @@ pub enum Instruction {
     },
     /// Quickened GetPropConst: IC is monomorphic (single shape).
     /// Skips proxy/string/array checks, goes directly to shape check + offset load.
+    /// For depth > 0 (inherited properties), trusts the proto_epoch guard and walks
+    /// the prototype chain to the cached depth.
     /// On shape miss → de-quicken to GetPropConst.
     GetPropQuickened {
         dst: Register,
         obj: Register,
         shape_id: u64,
         offset: u32,
+        /// Prototype chain depth (0 = own property, 1+ = inherited).
+        depth: u8,
+        /// Proto epoch snapshot at quickening time (for invalidation).
+        proto_epoch: u64,
         /// Original property name index for fallback on shape miss.
         name: ConstantIndex,
         /// Original IC index for fallback on shape miss.
@@ -1170,6 +1176,26 @@ pub enum Instruction {
         /// Original property name index for fallback on shape miss.
         name: ConstantIndex,
         /// Original IC index for fallback on shape miss.
+        ic_index: u16,
+    },
+
+    /// Quickened GetPropConst: target is consistently a string primitive.
+    /// Handles string.length, string[index], and String.prototype methods.
+    /// On type miss (not a string) → de-quicken to GetPropConst.
+    GetPropString {
+        dst: Register,
+        obj: Register,
+        name: ConstantIndex,
+        ic_index: u16,
+    },
+    /// Quickened GetPropConst: target is consistently an array and property is "length".
+    /// On type miss (not an array) → de-quicken to GetPropConst.
+    GetArrayLength {
+        dst: Register,
+        obj: Register,
+        /// Original property name index for fallback on type miss.
+        name: ConstantIndex,
+        /// Original IC index for fallback on type miss.
         ic_index: u16,
     },
 

@@ -2012,7 +2012,7 @@ pub fn init_array_prototype(
                 // Collect concrete values, undefineds, and count holes (§23.1.3.30)
                 let mut concrete: Vec<Value> = Vec::with_capacity(len.min(1024));
                 let mut num_undefineds: usize = 0;
-                let mut num_holes: usize = 0;
+                let mut _num_holes: usize = 0;
 
                 let mut handled = false;
                 if obj.is_array() && !obj.is_dictionary_mode() && !obj.is_sparse() {
@@ -2020,7 +2020,7 @@ pub fn init_array_prototype(
                     for i in 0..elements.len() {
                         let val = elements.get(i).unwrap_or(Value::hole());
                         if val.is_hole() {
-                            num_holes += 1;
+                            _num_holes += 1;
                         } else if val.is_undefined() {
                             num_undefineds += 1;
                         } else {
@@ -2036,7 +2036,7 @@ pub fn init_array_prototype(
                             ncx.check_for_interrupt()?;
                         }
                         if !obj.has(&PropertyKey::Index(i as u32)) {
-                            num_holes += 1;
+                            _num_holes += 1;
                         } else {
                             let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                             if val.is_undefined() {
@@ -2723,7 +2723,7 @@ pub fn install_array_statics(
     ctor.define_property(
         PropertyKey::string("of"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
-            |_this, args, ncx| {
+            |_this, args, _ncx| {
                 let result = GcRef::new(JsObject::array(args.len()));
                 for (i, arg) in args.iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), arg.clone());

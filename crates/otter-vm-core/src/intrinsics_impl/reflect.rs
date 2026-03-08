@@ -14,7 +14,6 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::value::Value;
 use otter_macros::dive;
-use std::sync::Arc;
 
 /// Helper to convert Value to PropertyKey
 pub fn to_property_key(value: &Value) -> PropertyKey {
@@ -116,65 +115,6 @@ fn is_constructor_value(value: &Value) -> bool {
         }
     }
     true
-}
-
-fn descriptor_from_attributes(attr_obj: &GcRef<JsObject>) -> PropertyDescriptor {
-    let has_value = attr_obj.has(&PropertyKey::from("value"));
-    let has_writable = attr_obj.has(&PropertyKey::from("writable"));
-    let has_get = attr_obj.has(&PropertyKey::from("get"));
-    let has_set = attr_obj.has(&PropertyKey::from("set"));
-
-    let enumerable = attr_obj
-        .get(&PropertyKey::from("enumerable"))
-        .map(|v| v.to_boolean())
-        .unwrap_or(false);
-    let configurable = attr_obj
-        .get(&PropertyKey::from("configurable"))
-        .map(|v| v.to_boolean())
-        .unwrap_or(false);
-
-    if has_value || has_writable {
-        let value = attr_obj
-            .get(&PropertyKey::from("value"))
-            .unwrap_or(Value::undefined());
-        let writable = attr_obj
-            .get(&PropertyKey::from("writable"))
-            .map(|v| v.to_boolean())
-            .unwrap_or(false);
-        PropertyDescriptor::Data {
-            value,
-            attributes: PropertyAttributes {
-                writable,
-                enumerable,
-                configurable,
-            },
-        }
-    } else if has_get || has_set {
-        let get = attr_obj
-            .get(&PropertyKey::from("get"))
-            .filter(|v| !v.is_undefined());
-        let set = attr_obj
-            .get(&PropertyKey::from("set"))
-            .filter(|v| !v.is_undefined());
-        PropertyDescriptor::Accessor {
-            get,
-            set,
-            attributes: PropertyAttributes {
-                writable: false,
-                enumerable,
-                configurable,
-            },
-        }
-    } else {
-        PropertyDescriptor::Data {
-            value: Value::undefined(),
-            attributes: PropertyAttributes {
-                writable: false,
-                enumerable,
-                configurable,
-            },
-        }
-    }
 }
 
 fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {

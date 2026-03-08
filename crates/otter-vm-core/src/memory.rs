@@ -88,6 +88,85 @@ const MIN_GC_THRESHOLD: usize = 1024 * 1024;
 /// Increased from 1,000 to reduce GC frequency (GC was taking 43% CPU)
 const DEFAULT_ALLOCATION_COUNT_THRESHOLD: usize = 10_000;
 
+/// Allocation category counters for profiling.
+///
+/// Only active when the `profiling` feature is enabled; otherwise a zero-size struct.
+#[cfg(feature = "profiling")]
+#[derive(Debug, Default)]
+pub struct AllocationCategoryStats {
+    /// Object allocations
+    pub object_count: AtomicUsize,
+    /// Object bytes allocated
+    pub object_bytes: AtomicUsize,
+    /// Array allocations
+    pub array_count: AtomicUsize,
+    /// String allocations
+    pub string_count: AtomicUsize,
+    /// Closure/function allocations
+    pub closure_count: AtomicUsize,
+    /// Other allocations (BigInt, Symbol, etc.)
+    pub other_count: AtomicUsize,
+}
+
+#[cfg(feature = "profiling")]
+impl AllocationCategoryStats {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an allocation by category tag.
+    /// Tags: OBJECT=3, STRING=1, ARRAY=2, CLOSURE=5, FUNCTION=4
+    #[inline]
+    pub fn record(&self, tag: u8, bytes: usize) {
+        match tag {
+            3 => {
+                self.object_count.fetch_add(1, Ordering::Relaxed);
+                self.object_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            1 => { self.string_count.fetch_add(1, Ordering::Relaxed); }
+            2 => { self.array_count.fetch_add(1, Ordering::Relaxed); }
+            4 | 5 => { self.closure_count.fetch_add(1, Ordering::Relaxed); }
+            _ => { self.other_count.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
+
+    /// Record an array allocation specifically.
+    #[inline]
+    pub fn record_array(&self) {
+        self.array_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the current values.
+    pub fn snapshot(&self) -> AllocationCategorySnapshot {
+        AllocationCategorySnapshot {
+            object_count: self.object_count.load(Ordering::Relaxed) as u64,
+            object_bytes: self.object_bytes.load(Ordering::Relaxed) as u64,
+            array_count: self.array_count.load(Ordering::Relaxed) as u64,
+            string_count: self.string_count.load(Ordering::Relaxed) as u64,
+            closure_count: self.closure_count.load(Ordering::Relaxed) as u64,
+            other_count: self.other_count.load(Ordering::Relaxed) as u64,
+        }
+    }
+}
+
+/// Snapshot of allocation category stats (for reporting).
+#[cfg(feature = "profiling")]
+#[derive(Debug, Clone)]
+pub struct AllocationCategorySnapshot {
+    /// Object allocations
+    pub object_count: u64,
+    /// Object bytes allocated
+    pub object_bytes: u64,
+    /// Array allocations
+    pub array_count: u64,
+    /// String allocations
+    pub string_count: u64,
+    /// Closure/function allocations
+    pub closure_count: u64,
+    /// Other allocations
+    pub other_count: u64,
+}
+
 /// Manages memory limits and accounting for a VM instance
 pub struct MemoryManager {
     /// Total bytes currently allocated
@@ -107,6 +186,9 @@ pub struct MemoryManager {
     /// GC stress mode: collect on every `should_collect_garbage()` check.
     /// Enable with `GC_STRESS=1` environment variable.
     gc_stress: bool,
+    /// Per-category allocation counters (profiling only)
+    #[cfg(feature = "profiling")]
+    pub category_stats: AllocationCategoryStats,
 }
 
 impl MemoryManager {
@@ -124,6 +206,8 @@ impl MemoryManager {
             allocation_count_threshold: AtomicUsize::new(DEFAULT_ALLOCATION_COUNT_THRESHOLD),
             cached_gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
             gc_stress,
+            #[cfg(feature = "profiling")]
+            category_stats: AllocationCategoryStats::new(),
         }
     }
 

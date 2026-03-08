@@ -37,14 +37,15 @@ fn gc_pause_benchmark(c: &mut Criterion) {
                     let mut total_duration = std::time::Duration::ZERO;
 
                     for _ in 0..iters {
-                        let (ctx, mm) = create_test_context();
+                        let (ctx, _mm) = create_test_context();
 
                         // Pre-allocate objects to simulate a working heap
                         // Keep some alive, let others become garbage
                         let mut live_objects = Vec::with_capacity(n / 2);
                         for i in 0..n {
                             let obj = GcRef::new(JsObject::new(Value::null()));
-                            obj.set(PropertyKey::string("value"), Value::int32(i as i32));
+                            obj.set(PropertyKey::string("value"), Value::int32(i as i32))
+                                .ok();
                             if i % 2 == 0 {
                                 live_objects.push(obj);
                             }
@@ -75,10 +76,10 @@ fn allocation_throughput_benchmark(c: &mut Criterion) {
 
     group.bench_function("simple_objects_1000", |b| {
         b.iter(|| {
-            let (_, mm) = create_test_context();
+            let (_, _mm) = create_test_context();
             for i in 0..1000 {
                 let obj = GcRef::new(JsObject::new(Value::null()));
-                obj.set(PropertyKey::string("x"), Value::int32(i));
+                obj.set(PropertyKey::string("x"), Value::int32(i)).ok();
                 black_box(&obj);
             }
         });
@@ -86,13 +87,13 @@ fn allocation_throughput_benchmark(c: &mut Criterion) {
 
     group.bench_function("objects_with_properties_1000", |b| {
         b.iter(|| {
-            let (_, mm) = create_test_context();
+            let (_, _mm) = create_test_context();
             for i in 0..1000 {
                 let obj = GcRef::new(JsObject::new(Value::null()));
                 // Add multiple properties
-                obj.set(PropertyKey::string("a"), Value::int32(i));
-                obj.set(PropertyKey::string("b"), Value::int32(i * 2));
-                obj.set(PropertyKey::string("c"), Value::int32(i * 3));
+                obj.set(PropertyKey::string("a"), Value::int32(i)).ok();
+                obj.set(PropertyKey::string("b"), Value::int32(i * 2)).ok();
+                obj.set(PropertyKey::string("c"), Value::int32(i * 3)).ok();
                 black_box(&obj);
             }
         });
@@ -110,14 +111,14 @@ fn gc_circular_refs_benchmark(c: &mut Criterion) {
             let mut total_duration = std::time::Duration::ZERO;
 
             for _ in 0..iters {
-                let (ctx, mm) = create_test_context();
+                let (ctx, _mm) = create_test_context();
 
                 // Create 100 circular reference pairs
                 for _ in 0..100 {
                     let a = GcRef::new(JsObject::new(Value::null()));
                     let b = GcRef::new(JsObject::new(Value::null()));
-                    a.set(PropertyKey::string("ref"), Value::object(b));
-                    b.set(PropertyKey::string("ref"), Value::object(a));
+                    a.set(PropertyKey::string("ref"), Value::object(b)).ok();
+                    b.set(PropertyKey::string("ref"), Value::object(a)).ok();
                     // Drop both - creates garbage cycle
                 }
 
@@ -135,12 +136,13 @@ fn gc_circular_refs_benchmark(c: &mut Criterion) {
             let mut total_duration = std::time::Duration::ZERO;
 
             for _ in 0..iters {
-                let (ctx, mm) = create_test_context();
+                let (ctx, _mm) = create_test_context();
 
                 // Create 100 self-referencing objects
                 for _ in 0..100 {
                     let obj = GcRef::new(JsObject::new(Value::null()));
-                    obj.set(PropertyKey::string("self"), Value::object(obj));
+                    obj.set(PropertyKey::string("self"), Value::object(obj))
+                        .ok();
                 }
 
                 let start = std::time::Instant::now();
@@ -165,15 +167,19 @@ fn gc_mark_benchmark(c: &mut Criterion) {
             let mut total_duration = std::time::Duration::ZERO;
 
             for _ in 0..iters {
-                let (ctx, mm) = create_test_context();
+                let (ctx, _mm) = create_test_context();
 
                 // Create a chain of 100 objects
                 let root = GcRef::new(JsObject::new(Value::null()));
                 let mut current = root;
                 for depth in 0..100 {
                     let next = GcRef::new(JsObject::new(Value::null()));
-                    current.set(PropertyKey::string("next"), Value::object(next));
-                    current.set(PropertyKey::string("depth"), Value::int32(depth));
+                    current
+                        .set(PropertyKey::string("next"), Value::object(next))
+                        .ok();
+                    current
+                        .set(PropertyKey::string("depth"), Value::int32(depth))
+                        .ok();
                     current = next;
                 }
 
@@ -202,13 +208,14 @@ fn gc_mark_benchmark(c: &mut Criterion) {
                 // Create a tree with fanout 10 and depth 3 (1 + 10 + 100 + 1000 = 1111 objects)
                 fn create_tree(mm: &Arc<MemoryManager>, depth: i32) -> GcRef<JsObject> {
                     let node = GcRef::new(JsObject::new(Value::null()));
-                    node.set(PropertyKey::string("depth"), Value::int32(depth));
+                    node.set(PropertyKey::string("depth"), Value::int32(depth))
+                        .ok();
 
                     if depth > 0 {
                         for i in 0..10 {
                             let child = create_tree(mm, depth - 1);
                             let key = PropertyKey::string(&format!("child{}", i));
-                            node.set(key, Value::object(child));
+                            node.set(key, Value::object(child)).ok();
                         }
                     }
 
@@ -239,7 +246,7 @@ fn gc_realistic_workload_benchmark(c: &mut Criterion) {
             let mut total_duration = std::time::Duration::ZERO;
 
             for _ in 0..iters {
-                let (ctx, mm) = create_test_context();
+                let (ctx, _mm) = create_test_context();
 
                 // Simulate a realistic workload:
                 // - Some long-lived objects
@@ -250,14 +257,14 @@ fn gc_realistic_workload_benchmark(c: &mut Criterion) {
                 let mut long_lived = Vec::new();
                 for i in 0..50 {
                     let obj = GcRef::new(JsObject::new(Value::null()));
-                    obj.set(PropertyKey::string("id"), Value::int32(i));
+                    obj.set(PropertyKey::string("id"), Value::int32(i)).ok();
                     long_lived.push(obj);
                 }
 
                 // Short-lived garbage
                 for i in 0..200 {
                     let obj = GcRef::new(JsObject::new(Value::null()));
-                    obj.set(PropertyKey::string("temp"), Value::int32(i));
+                    obj.set(PropertyKey::string("temp"), Value::int32(i)).ok();
                     // Immediately becomes garbage
                 }
 
@@ -265,8 +272,8 @@ fn gc_realistic_workload_benchmark(c: &mut Criterion) {
                 for _ in 0..20 {
                     let a = GcRef::new(JsObject::new(Value::null()));
                     let b = GcRef::new(JsObject::new(Value::null()));
-                    a.set(PropertyKey::string("peer"), Value::object(b));
-                    b.set(PropertyKey::string("peer"), Value::object(a));
+                    a.set(PropertyKey::string("peer"), Value::object(b)).ok();
+                    b.set(PropertyKey::string("peer"), Value::object(a)).ok();
                 }
 
                 black_box(&long_lived);
@@ -289,12 +296,12 @@ fn gc_reclamation_benchmark(c: &mut Criterion) {
 
     group.bench_function("reclaim_5000_objects", |b| {
         b.iter(|| {
-            let (ctx, mm) = create_test_context();
+            let (ctx, _mm) = create_test_context();
 
             // Allocate and immediately drop 5000 objects
             for i in 0..5000 {
                 let obj = GcRef::new(JsObject::new(Value::null()));
-                obj.set(PropertyKey::string("data"), Value::int32(i));
+                obj.set(PropertyKey::string("data"), Value::int32(i)).ok();
             }
 
             // Measure reclamation

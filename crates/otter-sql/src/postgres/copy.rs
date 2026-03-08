@@ -41,26 +41,26 @@ fn build_copy_from_sql(options: &CopyFromOptions) -> String {
         with_options.push("HEADER".to_string());
     }
 
-    if let Some(delim) = options.delimiter {
-        if options.format != CopyFormat::Binary {
-            with_options.push(format!("DELIMITER '{}'", delim));
-        }
+    if let Some(delim) = options.delimiter
+        && options.format != CopyFormat::Binary
+    {
+        with_options.push(format!("DELIMITER '{}'", delim));
     }
 
-    if let Some(ref null_str) = options.null_string {
-        with_options.push(format!("NULL '{}'", null_str.replace('\'', "''")));
+    if let Some(null_str) = options.null_string.as_ref() {
+        with_options.push(format!("NULL '{}'", null_str));
     }
 
-    if let Some(quote) = options.quote {
-        if options.format == CopyFormat::Csv {
-            with_options.push(format!("QUOTE '{}'", quote));
-        }
+    if let Some(quote) = options.quote
+        && options.format == CopyFormat::Csv
+    {
+        with_options.push(format!("QUOTE '{}'", quote));
     }
 
-    if let Some(escape) = options.escape {
-        if options.format == CopyFormat::Csv {
-            with_options.push(format!("ESCAPE '{}'", escape));
-        }
+    if let Some(escape) = options.escape
+        && options.format == CopyFormat::Csv
+    {
+        with_options.push(format!("ESCAPE '{}'", escape));
     }
 
     if !with_options.is_empty() {
@@ -110,10 +110,10 @@ fn build_copy_to_sql(options: &CopyToOptions) -> String {
         with_options.push("HEADER".to_string());
     }
 
-    if let Some(delim) = options.delimiter {
-        if options.format != CopyFormat::Binary {
-            with_options.push(format!("DELIMITER '{}'", delim));
-        }
+    if let Some(delim) = options.delimiter
+        && options.format != CopyFormat::Binary
+    {
+        with_options.push(format!("DELIMITER '{}'", delim));
     }
 
     if let Some(ref null_str) = options.null_string {

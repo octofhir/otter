@@ -89,9 +89,9 @@ pub struct GeneratorFrame {
     /// Whether this is a constructor call (new.target)
     pub is_construct: bool,
     /// Unique frame ID for upvalue tracking
-    pub frame_id: usize,
+    pub frame_id: u32,
     /// Number of arguments passed to this function
-    pub argc: usize,
+    pub argc: u16,
     /// Value sent via next(value) - to be received after yield
     pub received_value: Option<Value>,
     /// Pending throw value (for generator.throw())
@@ -149,8 +149,8 @@ impl GeneratorFrame {
         try_stack: Vec<TryEntry>,
         this_value: Value,
         is_construct: bool,
-        frame_id: usize,
-        argc: usize,
+        frame_id: u32,
+        argc: u16,
     ) -> Self {
         Self {
             pc,
@@ -182,8 +182,8 @@ impl GeneratorFrame {
         try_stack: Vec<TryEntry>,
         this_value: Value,
         is_construct: bool,
-        frame_id: usize,
-        argc: usize,
+        frame_id: u32,
+        argc: u16,
         yield_dst: u16,
     ) -> Self {
         Self {

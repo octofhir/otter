@@ -207,7 +207,7 @@ pub(crate) extern "C" fn otter_rt_get_prop_mono_impl(
         None => return BAILOUT_SENTINEL,
     };
 
-    if unsafe { obj_ref.shape_ptr_raw_unchecked() } != expected_shape as u64 {
+    if unsafe { obj_ref.shape_id_unchecked() } != expected_shape as u64 {
         return BAILOUT_SENTINEL;
     }
 
@@ -264,7 +264,7 @@ extern "C" fn otter_rt_get_prop_const(
     }
 
     // Get shape pointer for comparison — avoids Arc clone (no atomic refcount).
-    let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+    let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
 
     // Read IC from feedback vector
     let function = unsafe { &*ctx.function_ptr };
@@ -303,7 +303,7 @@ extern "C" fn otter_rt_get_prop_const(
                             break;
                         }
                     }
-                    if valid && current.shape_ptr_raw() == *proto_shape_id {
+                    if valid && current.shape_id() == *proto_shape_id {
                         cached_val = unsafe { current.get_by_offset_unchecked(*offset as usize) };
                     }
                 }
@@ -329,7 +329,7 @@ extern "C" fn otter_rt_get_prop_const(
                                 break;
                             }
                         }
-                        if valid && current.shape_ptr_raw() == proto_shape_id {
+                        if valid && current.shape_id() == proto_shape_id {
                             cached_val =
                                 unsafe { current.get_by_offset_unchecked(offset as usize) };
                         }
@@ -369,7 +369,7 @@ extern "C" fn otter_rt_get_prop_const(
             }
             if let Some(offset) = obj.shape_get_offset(&key) {
                 found_offset = Some(offset);
-                found_shape = obj.shape_ptr_raw();
+                found_shape = obj.shape_id();
                 break;
             }
             if let Some(proto) = obj.prototype().as_object() {
@@ -491,7 +491,7 @@ extern "C" fn otter_rt_set_prop_const(
     let obj_ref = unsafe { &*(raw_ptr as *const JsObject) };
 
     // Get shape pointer — avoids Arc clone (no atomic refcount).
-    let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+    let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
 
     let function = unsafe { &*ctx.function_ptr };
     let feedback = function.feedback_vector.write();
@@ -1086,7 +1086,7 @@ extern "C" fn otter_rt_get_global(ctx_raw: i64, name_idx: i64, ic_idx: i64) -> i
                 ..
             } = &ic.ic_state
             {
-                if global_obj.shape_ptr_raw() == *shape_addr {
+                if global_obj.shape_id() == *shape_addr {
                     if let Some(val) = global_obj.get_by_offset(*offset as usize) {
                         return val.to_jit_bits();
                     }
@@ -1499,7 +1499,7 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+        let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -1582,9 +1582,11 @@ extern "C" fn otter_rt_set_elem(
                 let mut elements = obj_ref.get_elements_storage().borrow_mut();
                 let idx = n as usize;
                 if idx < elements.len() {
+                    crate::object::gc_write_barrier(&write_val);
                     elements.set(idx, write_val);
                     return 0;
                 } else if idx == elements.len() {
+                    crate::object::gc_write_barrier(&write_val);
                     elements.push(write_val);
                     // Update length property
                     let length_key = PropertyKey::string("length");
@@ -1611,7 +1613,7 @@ extern "C" fn otter_rt_set_elem(
     }
 
     if matches!(&key, PropertyKey::String(_)) {
-        let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+        let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
@@ -1910,7 +1912,7 @@ extern "C" fn otter_rt_call_method(
         if let Some(ic) = feedback.get_mut(ic_idx as usize) {
             // IC fast path
             if !obj_ref.is_dictionary_mode() && ic.proto_epoch_matches(ctx.proto_epoch) {
-                let obj_shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+                let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
                 let cached_offset = match &mut ic.ic_state {
                     InlineCacheState::Monomorphic {
                         shape_id, offset, ..
@@ -1948,7 +1950,7 @@ extern "C" fn otter_rt_call_method(
             // Slow path on IC miss: resolve method and update IC.
             if method.is_none() && !obj_ref.is_dictionary_mode() {
                 if let Some(offset) = obj_ref.shape_get_offset(&method_key) {
-                    let shape_ptr = unsafe { obj_ref.shape_ptr_raw_unchecked() };
+                    let shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
                     let current_epoch = ctx.proto_epoch;
                     match &mut ic.ic_state {
                         InlineCacheState::Uninitialized => {
@@ -3685,7 +3687,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
             .new_target_proto
             .clone()
             .unwrap_or_else(|| home_object.clone());
-        let argc = frame.argc;
+        let argc = frame.argc as usize;
         let callee_value = frame.callee_value.clone();
         (home_object, new_target_proto, argc, callee_value)
     };
@@ -3798,7 +3800,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
     // Update frame's this_value
     if let Some(frame) = vm_ctx.current_frame_mut() {
         frame.this_value = this_value.clone();
-        frame.this_initialized = true;
+        frame.flags.set_this_initialized(true);
     }
 
     // Run field initializers

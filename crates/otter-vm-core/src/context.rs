@@ -4,6 +4,7 @@
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -13,13 +14,14 @@ use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::interpreter::PreferredType;
-use otter_vm_bytecode::function::FeedbackVector;
 use crate::object::JsObject;
+use crate::promise::JsPromise;
 use crate::realm::{RealmId, RealmRegistry};
 use crate::string::JsString;
 use crate::symbol_registry::SymbolRegistry;
 use crate::value::{UpvalueCell, Value};
 use num_bigint::BigInt as NumBigInt;
+use otter_vm_bytecode::function::FeedbackVector;
 use otter_vm_bytecode::{Constant, ConstantPool, Module};
 
 #[cfg(feature = "profiling")]
@@ -456,52 +458,12 @@ impl std::fmt::Debug for FeedbackPtr {
 /// A call stack frame
 #[derive(Debug)]
 pub struct CallFrame {
-    /// Function index in the module
-    pub function_index: u32,
-    /// Module id for O(1) lookup in VmContext::module_table
-    pub module_id: u64,
-    /// Realm id for this call frame
-    pub realm_id: RealmId,
+    // ── Hot fields (accessed every instruction or most instructions) ──
     /// Program counter (instruction index)
     pub pc: usize,
     /// Base index in the shared register array.
     /// Layout: `[local0..localN | reg0..regK]`
     pub register_base: usize,
-    /// Number of local variable slots at the start of the window.
-    pub local_count: usize,
-    /// Total window size in the shared register array (local_count + scratch registers).
-    pub register_count: usize,
-    /// Captured upvalues (heap-allocated cells for shared mutable access)
-    pub upvalues: Vec<UpvalueCell>,
-    /// Return register (where to put the result)
-    pub return_register: Option<u16>,
-    /// Source location for error reporting
-    pub source_location: Option<SourceLocation>,
-    /// The `this` value for this call frame
-    pub this_value: Value,
-    /// Whether this call is a `new`/constructor invocation
-    pub is_construct: bool,
-    /// Whether this is an async function (return value should be wrapped in Promise)
-    pub is_async: bool,
-    /// Unique frame ID for tracking open upvalues
-    pub frame_id: usize,
-    /// Number of open upvalues owned by this frame.
-    /// Used to keep local access on a fast path for frames without captures.
-    pub open_upvalue_count: usize,
-    /// Number of arguments passed to this function
-    pub argc: usize,
-    /// Home object for methods (used for `super` resolution)
-    pub home_object: Option<GcRef<JsObject>>,
-    /// The prototype to use when creating `this` in super() chain (new.target.prototype).
-    /// Propagated from the outermost derived constructor through the chain.
-    pub new_target_proto: Option<GcRef<JsObject>>,
-    /// Whether `this` has been initialized in a derived constructor
-    /// (super() must be called before accessing `this`)
-    pub this_initialized: bool,
-    /// Whether this is a derived constructor (class extends)
-    pub is_derived: bool,
-    /// The callee function value (for arguments.callee in sloppy mode)
-    pub callee_value: Option<Value>,
     /// Cached pointer to the function's FeedbackVector.
     /// Eliminates 3 pointer chases (Arc<Module> → functions Vec → Function → feedback_vector)
     /// on every IC probe — reduces to a single deref.
@@ -509,6 +471,102 @@ pub struct CallFrame {
     /// SAFETY: Points into `module.functions[function_index].feedback_vector`.
     /// Valid as long as `self.module` (Arc) is alive, which is the frame's entire lifetime.
     feedback_ptr: FeedbackPtr,
+    /// Unique frame ID for tracking open upvalues
+    pub frame_id: u32,
+    /// Function index in the module
+    pub function_index: u32,
+    /// Number of local variable slots at the start of the window.
+    pub local_count: u16,
+    /// Total window size in the shared register array (local_count + scratch registers).
+    pub register_count: u16,
+    /// Number of open upvalues owned by this frame.
+    /// Used to keep local access on a fast path for frames without captures.
+    pub open_upvalue_count: u16,
+    /// Return register (where to put the result)
+    pub return_register: Option<u16>,
+
+    // ── Warm fields (accessed at call/return boundaries) ──
+    /// Module id for O(1) lookup in VmContext::module_table
+    pub module_id: u64,
+    /// The `this` value for this call frame
+    pub this_value: Value,
+    /// Captured upvalues (heap-allocated cells for shared mutable access)
+    pub upvalues: Vec<UpvalueCell>,
+    /// Realm id for this call frame
+    pub realm_id: RealmId,
+    /// Number of arguments passed to this function
+    pub argc: u16,
+    /// Packed boolean flags: is_construct | is_async | this_initialized | is_derived
+    pub flags: CallFrameFlags,
+
+    // ── Cold fields (rarely accessed) ──
+    /// Home object for methods (used for `super` resolution)
+    pub home_object: Option<GcRef<JsObject>>,
+    /// The prototype to use when creating `this` in super() chain (new.target.prototype).
+    /// Propagated from the outermost derived constructor through the chain.
+    pub new_target_proto: Option<GcRef<JsObject>>,
+    /// The callee function value (for arguments.callee in sloppy mode)
+    pub callee_value: Option<Value>,
+}
+
+/// Packed boolean flags for CallFrame to reduce struct size.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallFrameFlags(u8);
+
+impl CallFrameFlags {
+    const CONSTRUCT: u8 = 1 << 0;
+    const ASYNC: u8 = 1 << 1;
+    const THIS_INITIALIZED: u8 = 1 << 2;
+    const DERIVED: u8 = 1 << 3;
+
+    #[inline]
+    pub fn new(
+        is_construct: bool,
+        is_async: bool,
+        this_initialized: bool,
+        is_derived: bool,
+    ) -> Self {
+        let mut f = 0u8;
+        if is_construct {
+            f |= Self::CONSTRUCT;
+        }
+        if is_async {
+            f |= Self::ASYNC;
+        }
+        if this_initialized {
+            f |= Self::THIS_INITIALIZED;
+        }
+        if is_derived {
+            f |= Self::DERIVED;
+        }
+        Self(f)
+    }
+
+    #[inline]
+    pub fn is_construct(self) -> bool {
+        self.0 & Self::CONSTRUCT != 0
+    }
+    #[inline]
+    pub fn is_async(self) -> bool {
+        self.0 & Self::ASYNC != 0
+    }
+    #[inline]
+    pub fn this_initialized(self) -> bool {
+        self.0 & Self::THIS_INITIALIZED != 0
+    }
+    #[inline]
+    pub fn is_derived(self) -> bool {
+        self.0 & Self::DERIVED != 0
+    }
+
+    #[inline]
+    pub fn set_this_initialized(&mut self, val: bool) {
+        if val {
+            self.0 |= Self::THIS_INITIALIZED;
+        } else {
+            self.0 &= !Self::THIS_INITIALIZED;
+        }
+    }
 }
 
 impl CallFrame {
@@ -525,15 +583,42 @@ impl CallFrame {
     }
 }
 
-/// Source location for error reporting
-#[derive(Debug, Clone)]
-pub struct SourceLocation {
-    /// File path
-    pub file: String,
-    /// Line number
-    pub line: u32,
-    /// Column number
-    pub column: u32,
+/// Non-continue action that `execute_instruction` signals to the main loop.
+///
+/// When `execute_instruction` returns `Ok(())`, the default action is "advance PC".
+/// For any other outcome (jump, return, call, etc.) the instruction handler stores
+/// a `DispatchAction` on `VmContext` before returning `Ok(())`, and the loop
+/// picks it up via `take_dispatch_action()`.
+#[derive(Debug)]
+pub(crate) enum DispatchAction {
+    Jump(i32),
+    Return(Value),
+    Call {
+        func_index: u32,
+        module_id: u64,
+        argc: u8,
+        return_reg: u16,
+        is_construct: bool,
+        is_async: bool,
+        upvalues: Vec<UpvalueCell>,
+    },
+    TailCall {
+        func_index: u32,
+        module_id: u64,
+        argc: u8,
+        return_reg: u16,
+        is_async: bool,
+        upvalues: Vec<UpvalueCell>,
+    },
+    Suspend {
+        promise: GcRef<JsPromise>,
+        resume_reg: u16,
+    },
+    Yield {
+        value: Value,
+        yield_dst: u16,
+    },
+    Throw(Value),
 }
 
 /// VM execution context
@@ -557,10 +642,14 @@ pub struct VmContext {
     try_stack: Vec<TryHandler>,
     /// Is context running
     running: bool,
-    /// Pending arguments for next call
-    pending_args: Vec<Value>,
+    /// Non-continue dispatch action set by `execute_instruction`.
+    /// `None` means "advance PC" (the common case).
+    pub(crate) dispatch_action: Option<DispatchAction>,
+    /// Pending arguments for next call.
+    /// Inline storage for up to 8 args avoids heap allocation on common paths.
+    pending_args: SmallVec<[Value; 8]>,
     /// Fast path: args are still in caller's register window.
-    /// (absolute_start_index, count) — avoids copying into pending_args Vec.
+    /// (absolute_start_index, count) — avoids copying into pending_args SmallVec.
     pending_args_register_source: Option<(usize, usize)>,
     /// Pending `this` value for next call
     pending_this: Option<Value>,
@@ -579,9 +668,9 @@ pub struct VmContext {
     /// Open upvalues: maps (frame_id, local_idx) to the cell.
     /// When a closure captures a local, we create/reuse a cell here.
     /// Multiple closures in the same frame share the same cell.
-    open_upvalues: FxHashMap<(usize, u16), UpvalueCell>,
+    open_upvalues: FxHashMap<(u32, u16), UpvalueCell>,
     /// Next frame ID counter (monotonically increasing)
-    next_frame_id: usize,
+    next_frame_id: u32,
     /// Interrupt flag for timeout/cancellation support
     interrupt_flag: Arc<AtomicBool>,
     /// Maximum call stack depth (configurable)
@@ -815,7 +904,8 @@ impl VmContext {
             exception: None,
             try_stack: Vec::new(),
             running: false,
-            pending_args: Vec::new(),
+            dispatch_action: None,
+            pending_args: SmallVec::new(),
             pending_args_register_source: None,
             pending_this: None,
             pending_upvalues: Vec::new(),
@@ -1038,6 +1128,28 @@ impl VmContext {
     // ─────────────────────────────────────────────────────────────────────────────
     // Trace management
     // ─────────────────────────────────────────────────────────────────────────────
+
+    pub fn captured_module_exports_to_trace(&self) -> &Option<HashMap<String, Value>> {
+        &self.captured_module_exports
+    }
+
+    pub fn pending_throw_to_trace(&self) -> &Option<Value> {
+        &self.pending_throw
+    }
+
+    pub fn template_cache_to_trace(
+        &self,
+    ) -> &HashMap<crate::context::TemplateCacheKey, GcRef<JsObject>> {
+        &self.template_cache
+    }
+
+    pub fn regexp_cache_to_trace(&self) -> &HashMap<(u64, u32), Value> {
+        &self.regexp_cache
+    }
+
+    pub fn string_prototype_cache_to_trace(&self) -> &Option<GcRef<JsObject>> {
+        &self.string_prototype_cache
+    }
 
     /// Set trace configuration and enable tracing.
     pub fn set_trace_config(&mut self, config: crate::trace::TraceConfig) {
@@ -1269,8 +1381,8 @@ impl VmContext {
             snapshot.pc = Some(frame.pc);
             snapshot.function_index = Some(frame.function_index);
             snapshot.module_url = Some(frame_module.source_url.clone());
-            snapshot.is_async = Some(frame.is_async);
-            snapshot.is_construct = Some(frame.is_construct);
+            snapshot.is_async = Some(frame.flags.is_async());
+            snapshot.is_construct = Some(frame.flags.is_construct());
             if let Some(func) = frame_module.function(frame.function_index) {
                 snapshot.function_name = func.name.clone();
                 snapshot.is_generator = Some(func.flags.is_generator);
@@ -1293,9 +1405,9 @@ impl VmContext {
                     pc: frame.pc,
                     instruction,
                     module_url: frame_module.source_url.clone(),
-                    is_async: frame.is_async,
+                    is_async: frame.flags.is_async(),
                     is_generator: func.flags.is_generator,
-                    is_construct: frame.is_construct,
+                    is_construct: frame.flags.is_construct(),
                 });
             }
         }
@@ -1315,9 +1427,9 @@ impl VmContext {
                     pc: frame.pc,
                     instruction,
                     module_url: frame_module.source_url.clone(),
-                    is_async: frame.is_async,
+                    is_async: frame.flags.is_async(),
                     is_generator: func.flags.is_generator,
-                    is_construct: frame.is_construct,
+                    is_construct: frame.flags.is_construct(),
                 });
             }
         }
@@ -1337,9 +1449,9 @@ impl VmContext {
                     pc: frame.pc,
                     instruction,
                     module_url: frame_module.source_url.clone(),
-                    is_async: frame.is_async,
+                    is_async: frame.flags.is_async(),
                     is_generator: func.flags.is_generator,
-                    is_construct: frame.is_construct,
+                    is_construct: frame.flags.is_construct(),
                 });
             }
         }
@@ -1400,7 +1512,7 @@ impl VmContext {
         #[cfg(not(debug_assertions))]
         {
             let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
-            let abs = frame.register_base + frame.local_count + index as usize;
+            let abs = frame.register_base + frame.local_count as usize + index as usize;
             return unsafe { self.registers.get_unchecked(abs) };
         }
 
@@ -1411,8 +1523,8 @@ impl VmContext {
                 Some(f) => f,
                 None => return &UNDEFINED,
             };
-            let abs = frame.register_base + frame.local_count + index as usize;
-            debug_assert!(abs < frame.register_base + frame.register_count);
+            let abs = frame.register_base + frame.local_count as usize + index as usize;
+            debug_assert!(abs < frame.register_base + frame.register_count as usize);
             &self.registers[abs]
         }
     }
@@ -1423,7 +1535,7 @@ impl VmContext {
         #[cfg(not(debug_assertions))]
         {
             let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
-            let abs = frame.register_base + frame.local_count + index as usize;
+            let abs = frame.register_base + frame.local_count as usize + index as usize;
             unsafe {
                 *self.registers.get_unchecked_mut(abs) = value;
             }
@@ -1436,8 +1548,8 @@ impl VmContext {
                 Some(f) => f,
                 None => return,
             };
-            let abs = frame.register_base + frame.local_count + index as usize;
-            debug_assert!(abs < frame.register_base + frame.register_count);
+            let abs = frame.register_base + frame.local_count as usize + index as usize;
+            debug_assert!(abs < frame.register_base + frame.register_count as usize);
             self.registers[abs] = value;
         }
     }
@@ -1488,7 +1600,7 @@ impl VmContext {
                 .call_stack
                 .last()
                 .expect("read_local_unchecked requires an active call frame");
-            debug_assert!((index as usize) < frame.local_count);
+            debug_assert!(index < frame.local_count);
 
             if frame.open_upvalue_count != 0 {
                 if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index)) {
@@ -1537,7 +1649,7 @@ impl VmContext {
     pub fn snapshot_window(&self) -> Vec<Value> {
         let frame = self.call_stack.last().expect("snapshot_window: no frame");
         let start = frame.register_base;
-        let end = (start + frame.register_count).min(self.registers.len());
+        let end = (start + frame.register_count as usize).min(self.registers.len());
         self.registers[start..end].to_vec()
     }
 
@@ -1585,7 +1697,7 @@ impl VmContext {
                 .call_stack
                 .last()
                 .expect("write_local_unchecked requires an active call frame");
-            debug_assert!((index as usize) < frame.local_count);
+            debug_assert!(index < frame.local_count);
             let abs = frame.register_base + index as usize;
             let frame_id = frame.frame_id;
             let has_open = frame.open_upvalue_count != 0;
@@ -1609,7 +1721,7 @@ impl VmContext {
             let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
             let base = frame.register_base;
             let local_abs = base + local_index as usize;
-            let reg_abs = base + frame.local_count + dst as usize;
+            let reg_abs = base + frame.local_count as usize + dst as usize;
 
             let value = if frame.open_upvalue_count != 0 {
                 if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, local_index)) {
@@ -1642,7 +1754,7 @@ impl VmContext {
         {
             let frame = unsafe { self.call_stack.last().unwrap_unchecked() };
             let base = frame.register_base;
-            let reg_abs = base + frame.local_count + src as usize;
+            let reg_abs = base + frame.local_count as usize + src as usize;
             let local_abs = base + local_index as usize;
 
             let value = unsafe { *self.registers.get_unchecked(reg_abs) };
@@ -2051,7 +2163,7 @@ impl VmContext {
         return_register: Option<u16>,
         is_construct: bool,
         is_async: bool,
-        argc: usize,
+        argc: u16,
     ) -> VmResult<()> {
         if self.call_stack.len() >= self.max_stack_depth {
             return Err(VmError::StackOverflow);
@@ -2060,7 +2172,7 @@ impl VmContext {
         let register_base = self
             .call_stack
             .last()
-            .map(|f| f.register_base + f.register_count)
+            .map(|f| f.register_base + f.register_count as usize)
             .unwrap_or(0);
 
         // Extract all function info upfront so the module_table borrow ends
@@ -2148,7 +2260,7 @@ impl VmContext {
                 }
             }
         } else {
-            // Slow path: args are in the pending_args Vec.
+            // Slow path: args are in the pending_args SmallVec.
             let pending_arg_len = self.pending_args.len();
             let extra_args_count = if pending_arg_len > effective_param_count {
                 pending_arg_len - effective_param_count
@@ -2227,29 +2339,24 @@ impl VmContext {
         self.next_frame_id += 1;
 
         self.call_stack.push(CallFrame {
-            function_index,
-            module_id,
-            realm_id: frame_realm_id,
             pc: 0,
             register_base,
-            local_count,
-            register_count: window_size,
-            upvalues,
-            return_register,
-            source_location: None,
-            this_value,
-            is_construct,
-            is_async,
+            feedback_ptr,
             frame_id,
+            function_index,
+            local_count: local_count as u16,
+            register_count: window_size as u16,
             open_upvalue_count: 0,
+            return_register,
+            module_id,
+            this_value,
+            upvalues,
+            realm_id: frame_realm_id,
             argc,
+            flags: CallFrameFlags::new(is_construct, is_async, !is_derived, is_derived),
             home_object,
             new_target_proto: self.pending_new_target_proto.take(),
-            // In derived constructors, this is NOT initialized until super() is called
-            this_initialized: !is_derived,
-            is_derived,
             callee_value,
-            feedback_ptr,
         });
         self.switch_realm(frame_realm_id);
         Ok(())
@@ -2272,7 +2379,7 @@ impl VmContext {
             // Overwrite locals (at base + 0..local_count)
             for slot in locals {
                 let local_index = slot.index as usize;
-                if local_index >= frame.local_count {
+                if local_index >= frame.local_count as usize {
                     break;
                 }
                 let idx = base + local_index;
@@ -2281,10 +2388,10 @@ impl VmContext {
                 }
             }
             // Overwrite scratch registers (at base + local_count..)
-            let reg_offset = base + frame.local_count;
+            let reg_offset = base + frame.local_count as usize;
             for slot in registers {
                 let idx = reg_offset + slot.index as usize;
-                if idx >= base + frame.register_count {
+                if idx >= base + frame.register_count as usize {
                     break;
                 }
                 if idx < self.registers.len() {
@@ -2329,7 +2436,7 @@ impl VmContext {
         if let Some(frame) = self.pop_frame() {
             // Clear register window (locals + scratch regs) so GC won't trace stale pointers
             let base = frame.register_base;
-            let end = (base + frame.register_count).min(self.registers.len());
+            let end = (base + frame.register_count as usize).min(self.registers.len());
             for reg in &mut self.registers[base..end] {
                 *reg = Value::undefined();
             }
@@ -2403,10 +2510,46 @@ impl VmContext {
         self.exception.take()
     }
 
-    /// Set pending arguments for next function call
-    pub fn set_pending_args(&mut self, args: Vec<Value>) {
+    /// Set pending arguments for next function call (from SmallVec)
+    pub fn set_pending_args(&mut self, args: SmallVec<[Value; 8]>) {
         self.pending_args_register_source = None;
         self.pending_args = args;
+    }
+
+    /// Set pending arguments from a Vec (converts to SmallVec, inlining ≤8 args)
+    #[inline]
+    pub fn set_pending_args_from_vec(&mut self, args: Vec<Value>) {
+        self.pending_args_register_source = None;
+        self.pending_args = SmallVec::from_vec(args);
+    }
+
+    /// Set pending arguments from a slice (copies into inline buffer for ≤8 args)
+    #[inline]
+    pub fn set_pending_args_from_slice(&mut self, args: &[Value]) {
+        self.pending_args_register_source = None;
+        self.pending_args.clear();
+        self.pending_args.extend_from_slice(args);
+    }
+
+    /// Take the dispatch action (returns `None` for the common "advance PC" case).
+    #[inline]
+    pub(crate) fn take_dispatch_action(&mut self) -> Option<DispatchAction> {
+        self.dispatch_action.take()
+    }
+
+    /// Clear pending arguments (no allocation)
+    #[inline]
+    pub fn set_pending_args_empty(&mut self) {
+        self.pending_args_register_source = None;
+        self.pending_args.clear();
+    }
+
+    /// Set a single pending argument (inline, no heap allocation)
+    #[inline]
+    pub fn set_pending_args_one(&mut self, val: Value) {
+        self.pending_args_register_source = None;
+        self.pending_args.clear();
+        self.pending_args.push(val);
     }
 
     /// Fill pending arguments from a contiguous register range.
@@ -2427,9 +2570,9 @@ impl VmContext {
             return;
         };
         let frame_start = frame.register_base;
-        let frame_end = frame_start + frame.register_count;
+        let frame_end = frame_start + frame.register_count as usize;
         // Register indices are relative to the scratch area (after locals).
-        let abs_start = frame_start + frame.local_count + start as usize;
+        let abs_start = frame_start + frame.local_count as usize + start as usize;
 
         // Fast path: all args are within bounds — just record the source range.
         if abs_start + count_usize <= frame_end && abs_start + count_usize <= self.registers.len() {
@@ -2462,10 +2605,10 @@ impl VmContext {
     }
 
     /// Take pending arguments (transfers ownership).
-    /// Materializes the Vec if args are still in registers.
-    pub fn take_pending_args(&mut self) -> Vec<Value> {
+    /// Materializes from registers if args are still in the register window.
+    pub fn take_pending_args(&mut self) -> SmallVec<[Value; 8]> {
         if let Some((start, count)) = self.pending_args_register_source.take() {
-            self.registers[start..start + count].to_vec()
+            SmallVec::from_slice(&self.registers[start..start + count])
         } else {
             std::mem::take(&mut self.pending_args)
         }
@@ -2603,7 +2746,7 @@ impl VmContext {
     }
 
     /// Clean up all open upvalues for a frame that's being popped
-    pub fn close_all_upvalues_for_frame(&mut self, frame_id: usize) {
+    pub fn close_all_upvalues_for_frame(&mut self, frame_id: u32) {
         self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
         if let Some(frame) = self.current_frame_mut() {
             if frame.frame_id == frame_id {
@@ -2630,14 +2773,6 @@ impl VmContext {
     }
 
     /// Get stack trace for error reporting
-    pub fn stack_trace(&self) -> Vec<SourceLocation> {
-        self.call_stack
-            .iter()
-            .rev()
-            .filter_map(|frame| frame.source_location.clone())
-            .collect()
-    }
-
     /// Capture current JS stack for CPU profiling
     /// Returns frames with function names, files, and line numbers
     #[cfg(feature = "profiling")]
@@ -2646,15 +2781,14 @@ impl VmContext {
             .iter()
             .rev()
             .map(|frame| {
-                let func = self.module_table.get(frame.module_id).function(frame.function_index);
+                let func = self
+                    .module_table
+                    .get(frame.module_id)
+                    .function(frame.function_index);
                 let func_name = func
                     .and_then(|f| f.name.clone())
                     .unwrap_or_else(|| "(anonymous)".to_string());
-                let (file, line, column) = frame
-                    .source_location
-                    .as_ref()
-                    .map(|loc| (Some(loc.file.clone()), Some(loc.line), Some(loc.column)))
-                    .unwrap_or((None, None, None));
+                let (file, line, column) = (None, None, None);
 
                 otter_profiler::StackFrame {
                     function: func_name,
@@ -2689,8 +2823,8 @@ impl VmContext {
                 upvalues: frame.upvalues,
                 return_register: frame.return_register,
                 this_value: frame.this_value,
-                is_construct: frame.is_construct,
-                is_async: frame.is_async,
+                is_construct: frame.flags.is_construct(),
+                is_async: frame.flags.is_async(),
                 frame_id: frame.frame_id,
                 argc: frame.argc,
             })
@@ -2717,32 +2851,27 @@ impl VmContext {
         // Rebuild call stack from saved frame metadata
         for saved in saved_frames.into_iter() {
             let saved_module = self.module_table.get(saved.module_id);
-            let feedback_ptr = FeedbackPtr(
-                &saved_module.functions[saved.function_index as usize].feedback_vector,
-            );
+            let feedback_ptr =
+                FeedbackPtr(&saved_module.functions[saved.function_index as usize].feedback_vector);
             self.call_stack.push(CallFrame {
-                function_index: saved.function_index,
-                module_id: saved.module_id,
-                realm_id: saved.realm_id,
                 pc: saved.pc,
                 register_base: saved.register_base,
+                feedback_ptr,
+                frame_id: saved.frame_id,
+                function_index: saved.function_index,
                 local_count: saved.local_count,
                 register_count: saved.register_count,
-                upvalues: saved.upvalues,
-                return_register: saved.return_register,
-                source_location: None,
-                this_value: saved.this_value,
-                is_construct: saved.is_construct,
-                is_async: saved.is_async,
-                frame_id: saved.frame_id,
                 open_upvalue_count: 0,
+                return_register: saved.return_register,
+                module_id: saved.module_id,
+                this_value: saved.this_value,
+                upvalues: saved.upvalues,
+                realm_id: saved.realm_id,
                 argc: saved.argc,
+                flags: CallFrameFlags::new(saved.is_construct, saved.is_async, true, false),
                 home_object: None,
                 new_target_proto: None,
-                this_initialized: true,
-                is_derived: false,
                 callee_value: None,
-                feedback_ptr,
             });
 
             // Update next_frame_id to be greater than any restored frame
@@ -2772,7 +2901,7 @@ impl VmContext {
     pub(crate) fn for_each_live_register(&self, mut f: impl FnMut(&Value)) {
         for frame in &self.call_stack {
             let start = frame.register_base;
-            let end = (start + frame.register_count).min(self.registers.len());
+            let end = (start + frame.register_count as usize).min(self.registers.len());
             for value in &self.registers[start..end] {
                 f(value);
             }
@@ -2807,7 +2936,11 @@ impl VmContext {
         &self.pending_upvalues
     }
 
-    pub fn open_upvalues_to_trace(&self) -> &FxHashMap<(usize, u16), UpvalueCell> {
+    pub fn dispatch_action_to_trace(&self) -> &Option<DispatchAction> {
+        &self.dispatch_action
+    }
+
+    pub fn open_upvalues_to_trace(&self) -> &FxHashMap<(u32, u16), UpvalueCell> {
         &self.open_upvalues
     }
 
@@ -2927,6 +3060,10 @@ impl VmContext {
 
     /// Trigger GC if allocation threshold is exceeded.
     ///
+    /// Prioritizes minor GC (nursery only) when the nursery is filling up.
+    /// Falls back to major GC (full heap) when the overall allocation
+    /// threshold is exceeded or an explicit GC was requested.
+    ///
     /// Uses incremental marking when possible: starts marking, then processes
     /// a budget of gray objects per safepoint. Falls back to full STW collection
     /// when ephemeron tables are present (fixpoint requires complete worklist).
@@ -2950,7 +3087,19 @@ impl VmContext {
             return true;
         }
 
-        // Check if we should start a new GC cycle
+        // Check if nursery needs minor GC (fast, cheap collection)
+        if registry.should_minor_gc() {
+            let roots = self.collect_gc_roots();
+            let _reclaimed = registry
+                .collect_minor_with_pre_sweep_hook(&roots, crate::weak_gc::combined_pre_sweep_hook);
+            // Don't reset allocation count — minor GC is cheap.
+            // Only update live bytes for accurate threshold tracking.
+            let live_bytes = registry.total_bytes();
+            self.memory_manager.set_last_live_size(live_bytes);
+            return true;
+        }
+
+        // Check if we should start a new major GC cycle
         if self.memory_manager.should_collect_garbage() {
             let roots = self.collect_gc_roots();
             let ephemeron_tables = self.collect_ephemeron_tables();
@@ -3269,7 +3418,8 @@ mod tests {
         assert_eq!(ctx.call_stack()[0].open_upvalue_count, 1);
         assert_eq!(ctx.open_upvalues_to_trace().len(), 1);
 
-        ctx.push_frame(0, module.module_id, 1, None, false, false, 0).unwrap();
+        ctx.push_frame(0, module.module_id, 1, None, false, false, 0)
+            .unwrap();
         ctx.set_local(0, Value::int32(99)).unwrap();
         assert_eq!(
             ctx.current_frame().expect("inner frame").open_upvalue_count,
@@ -3362,7 +3512,8 @@ mod tests {
         let module = Arc::new(builder.build());
         ctx.register_module(&module);
 
-        ctx.push_frame(0, module.module_id, 2, None, false, false, 0).unwrap();
+        ctx.push_frame(0, module.module_id, 2, None, false, false, 0)
+            .unwrap();
         ctx.set_local(0, Value::int32(10)).unwrap();
         ctx.set_local(1, Value::int32(20)).unwrap();
         ctx.set_register(0, Value::int32(30));

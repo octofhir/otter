@@ -60,48 +60,55 @@ const DELETE_DICTIONARY_THRESHOLD: u8 = 3;
 use crate::string::JsString;
 use crate::value::Value;
 
-/// Write barrier for incremental GC.
+/// Combined write barrier for incremental + generational GC.
 ///
-/// When the GC is in the Marking phase and a value is being stored into an
-/// object, this ensures the stored value's GcHeader is grayed and pushed to
-/// the barrier buffer so the incremental marker will visit it.
+/// **Incremental** (Dijkstra): during marking phase, ensures stored values are
+/// grayed so the incremental marker visits them.
 ///
-/// Fast path: single `Cell::get()` check — zero cost when GC is idle (99.9% of the time).
+/// **Generational**: if the stored value is in the nursery (young generation),
+/// adds it to the remembered set so the young-only minor GC can find it.
+///
+/// Fast path for non-heap values: `gc_header()` returns None → immediate return.
+/// Fast path for old-gen heap values: nursery range check (2 comparisons) → false.
 #[inline]
 pub fn gc_write_barrier(value: &Value) {
+    // Fast exit for non-heap values (numbers, booleans, undefined, null)
+    let header_ptr = match value.gc_header() {
+        Some(ptr) => ptr,
+        None => return,
+    };
+
+    // Generational barrier: if value is in the nursery, add to remembered set.
+    otter_vm_gc::remembered_set_add_if_young(header_ptr);
+
+    // Incremental barrier: only active during marking phase.
     let registry = otter_vm_gc::global_registry();
-    if !registry.is_marking() {
-        return;
+    if registry.is_marking() {
+        gc_write_barrier_incremental(header_ptr);
     }
-    gc_write_barrier_slow(value);
 }
 
+/// Incremental GC barrier slow path — gray the object and push to worklist.
 #[inline(never)]
-fn gc_write_barrier_slow(value: &Value) {
-    if let Some(header_ptr) = value.gc_header() {
-        let header = unsafe { &*header_ptr };
-        if header.mark() == MarkColor::White {
-            header.set_mark(MarkColor::Gray);
-            otter_vm_gc::barrier_push(header_ptr);
-        }
+fn gc_write_barrier_incremental(header_ptr: *const otter_vm_gc::GcHeader) {
+    let header = unsafe { &*header_ptr };
+    if header.mark() == MarkColor::White {
+        header.set_mark(MarkColor::Gray);
+        otter_vm_gc::barrier_push(header_ptr);
     }
 }
 
 /// Write barrier for a PropertyDescriptor being stored (used in dictionary mode).
 #[inline]
 fn gc_write_barrier_desc(desc: &PropertyDescriptor) {
-    let registry = otter_vm_gc::global_registry();
-    if !registry.is_marking() {
-        return;
-    }
     match desc {
-        PropertyDescriptor::Data { value, .. } => gc_write_barrier_slow(value),
+        PropertyDescriptor::Data { value, .. } => gc_write_barrier(value),
         PropertyDescriptor::Accessor { get, set, .. } => {
             if let Some(g) = get {
-                gc_write_barrier_slow(g);
+                gc_write_barrier(g);
             }
             if let Some(s) = set {
-                gc_write_barrier_slow(s);
+                gc_write_barrier(s);
             }
         }
         PropertyDescriptor::Deleted => {}
@@ -185,7 +192,8 @@ impl SlotMeta {
     }
 
     /// Default data property metadata (writable, enumerable, configurable)
-    pub const DEFAULT_DATA: Self = Self(Self::KIND_DATA | Self::WRITABLE_BIT | Self::ENUMERABLE_BIT | Self::CONFIGURABLE_BIT);
+    pub const DEFAULT_DATA: Self =
+        Self(Self::KIND_DATA | Self::WRITABLE_BIT | Self::ENUMERABLE_BIT | Self::CONFIGURABLE_BIT);
 
     #[inline]
     pub fn is_empty(self) -> bool {
@@ -349,6 +357,9 @@ impl PropertyKey {
             Self::String(s) => {
                 // GcRef provides header() via GcBox wrapper
                 tracer.mark_header(s.header() as *const _);
+            }
+            Self::Symbol(sym) => {
+                tracer.mark_header(sym.header() as *const _);
             }
             _ => {}
         }
@@ -1430,7 +1441,9 @@ impl JsObject {
         let mut elements = self.elements.borrow_mut();
         elements.clear();
         for unit in s.encode_utf16() {
-            elements.push(Value::string(JsString::intern_utf16(&[unit])));
+            let val = Value::string(JsString::intern_utf16(&[unit]));
+            gc_write_barrier(&val);
+            elements.push(val);
         }
         let len = elements.len() as u32;
         drop(elements);
@@ -1568,13 +1581,14 @@ impl JsObject {
             let idx = offset - INLINE_PROPERTY_COUNT;
             let meta = unsafe { self.overflow_meta.get_unchecked() };
             if idx < meta.len() && meta[idx].is_data() {
-                unsafe { self.overflow_slots.get_unchecked() }.get(idx).copied()
+                unsafe { self.overflow_slots.get_unchecked() }
+                    .get(idx)
+                    .copied()
             } else {
                 None
             }
         }
     }
-
 
     /// Get property entry by offset (includes accessor properties).
     /// Reconstructs a PropertyDescriptor from the slot value and metadata.
@@ -1598,7 +1612,12 @@ impl JsObject {
             if m.is_empty() {
                 return None;
             }
-            let slot = self.overflow_slots.borrow().get(idx).copied().unwrap_or(Value::undefined());
+            let slot = self
+                .overflow_slots
+                .borrow()
+                .get(idx)
+                .copied()
+                .unwrap_or(Value::undefined());
             Self::descriptor_from_slot_meta(slot, m)
         }
     }
@@ -1614,8 +1633,16 @@ impl JsObject {
         } else if meta.is_accessor() {
             if let Some(pair) = slot.as_accessor_pair() {
                 Some(PropertyDescriptor::Accessor {
-                    get: if pair.getter.is_undefined() { None } else { Some(pair.getter) },
-                    set: if pair.setter.is_undefined() { None } else { Some(pair.setter) },
+                    get: if pair.getter.is_undefined() {
+                        None
+                    } else {
+                        Some(pair.getter)
+                    },
+                    set: if pair.setter.is_undefined() {
+                        None
+                    } else {
+                        Some(pair.setter)
+                    },
                     attributes: meta.to_attributes(),
                 })
             } else {
@@ -1699,8 +1726,18 @@ impl JsObject {
     /// Get total property count (inline + overflow)
     #[allow(dead_code)]
     fn property_count(&self) -> usize {
-        let inline_count = self.inline_meta.borrow().iter().filter(|m| !m.is_empty()).count();
-        let overflow_count = self.overflow_meta.borrow().iter().filter(|m| !m.is_empty()).count();
+        let inline_count = self
+            .inline_meta
+            .borrow()
+            .iter()
+            .filter(|m| !m.is_empty())
+            .count();
+        let overflow_count = self
+            .overflow_meta
+            .borrow()
+            .iter()
+            .filter(|m| !m.is_empty())
+            .count();
         inline_count + overflow_count
     }
 
@@ -1729,6 +1766,24 @@ impl JsObject {
     /// Returns `Arc::as_ptr()` without cloning the Arc, avoiding the atomic
     /// reference count increment/decrement overhead. The returned value is
     /// only valid for pointer comparison (not for dereferencing).
+    /// Get unique shape ID.
+    #[inline]
+    pub(crate) fn shape_id(&self) -> u64 {
+        self.shape.borrow().id
+    }
+
+    /// Get unique shape ID without borrow tracking overhead.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee no active mutable borrow of `shape`.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn shape_id_unchecked(&self) -> u64 {
+        unsafe { self.shape.get_unchecked() }.id
+    }
+
+    /// Get raw shape pointer... (for pointer comparison only)
     #[inline]
     pub(crate) fn shape_ptr_raw(&self) -> u64 {
         let borrow = self.shape.borrow();
@@ -2384,7 +2439,10 @@ impl JsObject {
                 if let Some(map) = dict.as_mut() {
                     gc_write_barrier(&value);
                     // Re-insert the key we were adding
-                    map.insert(next_shape.key.clone().unwrap(), PropertyDescriptor::data(value));
+                    map.insert(
+                        next_shape.key.clone().unwrap(),
+                        PropertyDescriptor::data(value),
+                    );
                     return Ok(());
                 }
                 return Err(SetPropertyError::NonExtensible);
@@ -2959,19 +3017,19 @@ impl JsObject {
     /// Convert a PropertyDescriptor into a (Value, SlotMeta) pair for slot storage.
     fn desc_to_slot_meta(desc: &PropertyDescriptor) -> (Value, SlotMeta) {
         match desc {
-            PropertyDescriptor::Data { value, attributes } => {
-                (*value, SlotMeta::data(*attributes))
-            }
-            PropertyDescriptor::Accessor { get, set, attributes } => {
+            PropertyDescriptor::Data { value, attributes } => (*value, SlotMeta::data(*attributes)),
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attributes,
+            } => {
                 let pair = GcRef::new(AccessorPair {
                     getter: get.unwrap_or(Value::undefined()),
                     setter: set.unwrap_or(Value::undefined()),
                 });
                 (Value::accessor_pair(pair), SlotMeta::accessor(*attributes))
             }
-            PropertyDescriptor::Deleted => {
-                (Value::undefined(), SlotMeta::EMPTY)
-            }
+            PropertyDescriptor::Deleted => (Value::undefined(), SlotMeta::EMPTY),
         }
     }
 
@@ -4235,8 +4293,18 @@ impl JsObject {
 
 impl std::fmt::Debug for JsObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inline_count = self.inline_meta.borrow().iter().filter(|m| !m.is_empty()).count();
-        let overflow_count = self.overflow_meta.borrow().iter().filter(|m| !m.is_empty()).count();
+        let inline_count = self
+            .inline_meta
+            .borrow()
+            .iter()
+            .filter(|m| !m.is_empty())
+            .count();
+        let overflow_count = self
+            .overflow_meta
+            .borrow()
+            .iter()
+            .filter(|m| !m.is_empty())
+            .count();
         let flags = self.flags.borrow();
         f.debug_struct("JsObject")
             .field("inline_slots", &inline_count)

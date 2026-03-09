@@ -20,6 +20,7 @@ pub mod ephemeron;
 pub mod finalization;
 pub mod mark_sweep;
 pub mod marked_block;
+pub mod nursery;
 pub mod object;
 pub mod weak_ref;
 
@@ -29,10 +30,11 @@ pub use barrier::{
 };
 pub use ephemeron::EphemeronTable;
 pub use finalization::FinalizationRegistryData;
+pub use nursery::Nursery;
 pub use mark_sweep::{
     AllocationRegistry, GcPauseHistogram, GcPhase, GcTraceable, RegistryStats, barrier_push,
     clear_thread_registry, clear_thread_registry_if, gc_alloc, gc_alloc_in, global_registry,
-    is_dealloc_in_progress, set_thread_registry,
+    is_dealloc_in_progress, remembered_set_add_if_young, set_thread_registry,
 };
 pub use object::{GcHeader, GcObject};
 pub use weak_ref::WeakRefCell;

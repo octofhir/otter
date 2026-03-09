@@ -57,9 +57,9 @@ fn get_builtin_proto(global: &GcRef<JsObject>, name: &str) -> Option<GcRef<JsObj
 pub(crate) fn to_object_for_builtin(
     ncx: &mut NativeContext<'_>,
     value: &Value,
-) -> Result<GcRef<JsObject>, VmError> {
+) -> Result<(GcRef<JsObject>, RootSlotGuard), VmError> {
     if let Some(obj) = value.as_object() {
-        return Ok(obj);
+        return Ok((obj, RootSlotGuard::empty()));
     }
     if value.is_null() || value.is_undefined() {
         return Err(VmError::type_error(
@@ -91,9 +91,42 @@ pub(crate) fn to_object_for_builtin(
         proto.map(Value::object).unwrap_or_else(Value::null),
     ));
     let _ = obj.set(PropertyKey::string(slot_key), slot_value);
-    Ok(obj)
+
+    ncx.ctx.push_root_slot(Value::object(obj.clone()));
+    let guard = RootSlotGuard::new(ncx, 1);
+
+    Ok((obj, guard))
 }
 
+pub(crate) struct RootSlotGuard {
+    pub ctx: *mut crate::context::VmContext,
+    pub count: usize,
+}
+
+impl RootSlotGuard {
+    pub fn new(ncx: &mut NativeContext<'_>, count: usize) -> Self {
+        Self {
+            ctx: ncx.ctx as *mut crate::context::VmContext,
+            count,
+        }
+    }
+    pub fn empty() -> Self {
+        Self {
+            ctx: std::ptr::null_mut(),
+            count: 0,
+        }
+    }
+}
+
+impl Drop for RootSlotGuard {
+    fn drop(&mut self) {
+        if self.count > 0 && !self.ctx.is_null() {
+            unsafe {
+                (*self.ctx).pop_root_slots(self.count);
+            }
+        }
+    }
+}
 /// Initialize Object.prototype methods
 pub fn init_object_prototype(
     object_proto: GcRef<JsObject>,
@@ -246,7 +279,7 @@ pub fn init_object_prototype(
                     return Ok(Value::boolean(desc.is_some()));
                 }
 
-                let obj = to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = to_object_for_builtin(ncx, this_val)?;
                 let key = to_property_key(&key_val);
                 Ok(Value::boolean(obj.has_own(&key)))
             },
@@ -299,7 +332,7 @@ pub fn init_object_prototype(
                     ));
                 }
 
-                let obj = to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = to_object_for_builtin(ncx, this_val)?;
                 let key = to_property_key(&key_val);
                 Ok(Value::boolean(
                     obj.get_own_property_descriptor(&key)
@@ -475,7 +508,7 @@ pub fn init_object_constructor(
                 use crate::intrinsics_impl::reflect::to_property_key;
                 let pk = to_property_key(&key_val);
 
-                if let Some(desc) = obj.get_own_property_descriptor(&pk) {
+                if let Some(desc) = obj.0.get_own_property_descriptor(&pk) {
                     // Build descriptor object with Object.prototype
                     let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
                         .map(Value::object)
@@ -538,28 +571,38 @@ pub fn init_object_constructor(
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
                 let obj = if proxy.is_none() {
-                    Some(to_object_for_builtin(ncx, &arg)?)
+                    let (o, _guard) = to_object_for_builtin(ncx, &arg)?;
+                    Some(o)
                 } else {
                     None
                 };
 
-                let keys = if let Some(p) = proxy {
+                let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
                 } else {
-                    obj.unwrap().own_keys()
+                    obj.as_ref().unwrap().own_keys()
                 };
 
+                let mut anchored_keys = Vec::with_capacity(raw_keys.len());
+                for key in raw_keys {
+                    let val = crate::proxy_operations::property_key_to_value_pub(&key);
+                    ncx.ctx.push_root_slot(val.clone());
+                    anchored_keys.push((key, val));
+                }
+
                 let mut names = Vec::new();
-                for key in keys {
-                    match &key {
+                for (key, key_value) in anchored_keys.iter() {
+                    match key {
                         PropertyKey::String(s) => {
                             let desc = if let Some(p) = proxy {
-                                let key_value = Value::string(*s);
                                 crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx, p, &key, key_value,
+                                    ncx,
+                                    p,
+                                    key,
+                                    key_value.clone(),
                                 )?
                             } else {
-                                obj.unwrap().get_own_property_descriptor(&key)
+                                obj.as_ref().unwrap().get_own_property_descriptor(key)
                             };
                             if let Some(desc) = desc {
                                 if desc.enumerable() {
@@ -569,12 +612,14 @@ pub fn init_object_constructor(
                         }
                         PropertyKey::Index(i) => {
                             let desc = if let Some(p) = proxy {
-                                let key_value = Value::string(JsString::intern(&i.to_string()));
                                 crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx, p, &key, key_value,
+                                    ncx,
+                                    p,
+                                    key,
+                                    key_value.clone(),
                                 )?
                             } else {
-                                obj.unwrap().get_own_property_descriptor(&key)
+                                obj.as_ref().unwrap().get_own_property_descriptor(key)
                             };
                             if let Some(desc) = desc {
                                 if desc.enumerable() {
@@ -585,6 +630,7 @@ pub fn init_object_constructor(
                         _ => {}
                     }
                 }
+
                 let result = GcRef::new(JsObject::array(names.len()));
                 if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
                     if let Some(array_obj) = array_ctor.as_object() {
@@ -598,6 +644,9 @@ pub fn init_object_constructor(
                 for (i, name) in names.into_iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), name);
                 }
+
+                ncx.ctx.pop_root_slots(anchored_keys.len());
+
                 Ok(Value::array(result))
             },
             mm.clone(),
@@ -613,33 +662,37 @@ pub fn init_object_constructor(
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
                 let obj = if proxy.is_none() {
-                    Some(to_object_for_builtin(ncx, &arg)?)
+                    let (o, _guard) = to_object_for_builtin(ncx, &arg)?;
+                    Some(o)
                 } else {
                     None
                 };
 
-                let keys = if let Some(p) = proxy {
+                let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
                 } else {
-                    obj.unwrap().own_keys()
+                    obj.as_ref().unwrap().own_keys()
                 };
+
+                let mut anchored_keys = Vec::with_capacity(raw_keys.len());
+                for key in raw_keys {
+                    let val = crate::proxy_operations::property_key_to_value_pub(&key);
+                    ncx.ctx.push_root_slot(val.clone());
+                    anchored_keys.push((key, val));
+                }
+
                 let mut values = Vec::new();
                 let receiver = arg.clone();
-                for key in keys {
-                    let key_value = match &key {
-                        PropertyKey::String(s) => Value::string(*s),
-                        PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
-                        PropertyKey::Symbol(sym) => Value::symbol(*sym),
-                    };
+                for (key, key_value) in anchored_keys.iter() {
                     let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
                             ncx,
                             p,
-                            &key,
+                            key,
                             key_value.clone(),
                         )?
                     } else {
-                        obj.unwrap().get_own_property_descriptor(&key)
+                        obj.as_ref().unwrap().get_own_property_descriptor(key)
                     };
                     if let Some(desc) = desc {
                         if !desc.enumerable() {
@@ -649,12 +702,12 @@ pub fn init_object_constructor(
                             crate::proxy_operations::proxy_get(
                                 ncx,
                                 p,
-                                &key,
-                                key_value,
+                                key,
+                                key_value.clone(),
                                 receiver.clone(),
                             )?
                         } else {
-                            crate::object::get_value_full(obj.as_ref().unwrap(), &key, ncx)?
+                            crate::object::get_value_full(obj.as_ref().unwrap(), key, ncx)?
                         };
                         values.push(value);
                     }
@@ -672,6 +725,9 @@ pub fn init_object_constructor(
                 for (i, value) in values.into_iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), value);
                 }
+
+                ncx.ctx.pop_root_slots(anchored_keys.len());
+
                 Ok(Value::array(result))
             },
             mm.clone(),
@@ -686,34 +742,38 @@ pub fn init_object_constructor(
             |_this, args, ncx_inner| {
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
-                let obj = if proxy.is_none() {
+                let obj_and_guard = if proxy.is_none() {
                     Some(to_object_for_builtin(ncx_inner, &arg)?)
                 } else {
                     None
                 };
+                let obj = obj_and_guard.as_ref().map(|x| &x.0);
 
-                let keys = if let Some(p) = proxy {
+                let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx_inner, p)?
                 } else {
-                    obj.unwrap().own_keys()
+                    obj.as_ref().unwrap().own_keys()
                 };
+
+                let mut anchored_keys = Vec::with_capacity(raw_keys.len());
+                for key in raw_keys {
+                    let val = crate::proxy_operations::property_key_to_value_pub(&key);
+                    ncx_inner.ctx.push_root_slot(val.clone());
+                    anchored_keys.push((key, val));
+                }
+
                 let mut entries = Vec::new();
                 let receiver = arg.clone();
-                for key in keys {
-                    let key_value = match &key {
-                        PropertyKey::String(s) => Value::string(*s),
-                        PropertyKey::Index(i) => Value::string(JsString::intern(&i.to_string())),
-                        PropertyKey::Symbol(sym) => Value::symbol(*sym),
-                    };
+                for (key, key_value) in anchored_keys.iter() {
                     let desc = if let Some(p) = proxy {
                         crate::proxy_operations::proxy_get_own_property_descriptor(
                             ncx_inner,
                             p,
-                            &key,
+                            key,
                             key_value.clone(),
                         )?
                     } else {
-                        obj.unwrap().get_own_property_descriptor(&key)
+                        obj.as_ref().unwrap().get_own_property_descriptor(key)
                     };
                     if let Some(desc) = desc {
                         if !desc.enumerable() {
@@ -723,14 +783,14 @@ pub fn init_object_constructor(
                             crate::proxy_operations::proxy_get(
                                 ncx_inner,
                                 p,
-                                &key,
-                                key_value,
+                                key,
+                                key_value.clone(),
                                 receiver.clone(),
                             )?
                         } else {
-                            crate::object::get_value_full(obj.as_ref().unwrap(), &key, ncx_inner)?
+                            crate::object::get_value_full(obj.as_ref().unwrap(), key, ncx_inner)?
                         };
-                        let key_str = match &key {
+                        let key_str = match key {
                             PropertyKey::String(s) => Value::string(*s),
                             PropertyKey::Index(i) => {
                                 Value::string(JsString::intern(&i.to_string()))
@@ -769,6 +829,9 @@ pub fn init_object_constructor(
                 for (i, entry) in entries.into_iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), entry);
                 }
+
+                ncx_inner.ctx.pop_root_slots(anchored_keys.len());
+
                 Ok(Value::array(result))
             },
             mm.clone(),
@@ -1898,18 +1961,21 @@ pub fn create_object_rest_helper(fn_proto: GcRef<JsObject>, mm: &Arc<MemoryManag
                 }
             }
 
-            let proto = get_builtin_proto(&ncx.global(), "Object");
+            let global_obj = ncx.global();
+            let source_obj = to_object_for_builtin(ncx, &source)?;
+
+            let proto = get_builtin_proto(&global_obj, "Object");
             let result = GcRef::new(JsObject::new(
                 proto.map(Value::object).unwrap_or_else(Value::null),
             ));
 
-            for key in source_obj.own_keys() {
+            for key in source_obj.0.own_keys() {
                 if excluded_keys.iter().any(|k| *k == key) {
                     continue;
                 }
-                if let Some(desc) = source_obj.get_own_property_descriptor(&key)
+                if let Some(desc) = source_obj.0.get_own_property_descriptor(&key)
                     && desc.enumerable()
-                    && let Some(value) = source_obj.get(&key)
+                    && let Some(value) = source_obj.0.get(&key)
                 {
                     let _ = result.set(key, value);
                 }

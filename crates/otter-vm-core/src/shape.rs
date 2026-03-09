@@ -45,6 +45,15 @@ pub struct Shape {
     /// Lazily-built cache of all property offsets. Populated on first lookup
     /// when depth >= SNAPSHOT_DEPTH, or on demand via `ensure_cached_map()`.
     cached_map: RefCell<Option<FxHashMap<PropertyKey, usize>>>,
+    /// Unique identifier for this shape (non-reused across process lifetime).
+    /// Used for stable Inline Cache hits even if shapes are re-allocated.
+    pub id: u64,
+}
+
+static NEXT_SHAPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_shape_id() -> u64 {
+    NEXT_SHAPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // SAFETY: Shape is only accessed from a single VM thread.
@@ -107,6 +116,7 @@ impl Shape {
             depth: 0,
             transitions: RefCell::new(FxHashMap::default()),
             cached_map: RefCell::new(None),
+            id: next_shape_id(),
         })
     }
 
@@ -147,6 +157,7 @@ impl Shape {
             depth: next_depth,
             transitions: RefCell::new(FxHashMap::default()),
             cached_map: RefCell::new(None),
+            id: next_shape_id(),
         });
 
         transitions.insert(key, Arc::downgrade(&new_shape));

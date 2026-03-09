@@ -1211,6 +1211,22 @@ pub enum Instruction {
         name: ConstantIndex,
         ic_index: u16,
     },
+
+    /// Fused GetLocal + GetLocal: loads two local variables in a single dispatch.
+    /// Emitted by the peephole optimizer for consecutive GetLocal pairs (e.g. `a + b`).
+    GetLocal2 {
+        dst1: Register,
+        idx1: LocalIndex,
+        dst2: Register,
+        idx2: LocalIndex,
+    },
+
+    /// Fused Inc + SetLocal: increments a register and stores it back to a local
+    /// in one dispatch. Common pattern for loop counter `i++`.
+    IncLocal {
+        local_idx: LocalIndex,
+        src: Register,
+    },
 }
 
 #[cfg(test)]

@@ -112,12 +112,12 @@ unsafe impl Sync for LargeAllocation {}
 /// Supports both full stop-the-world collection (`collect()`) and incremental
 /// marking (`start_incremental_gc()` / `incremental_mark_step()` / `finish_gc()`).
 pub struct AllocationRegistry {
-    /// Per-size-class block directories for small objects.
+    /// Per-size-class block directories for small objects (old space).
     /// Index = size class index (0..NUM_SIZE_CLASSES).
     directories: Vec<BlockDirectory>,
     /// Large objects tracked individually.
     large_objects: RefCell<Vec<LargeAllocation>>,
-    /// Total bytes allocated (across blocks + large objects).
+    /// Total bytes allocated (across blocks + large objects + nursery).
     total_bytes: AtomicUsize,
     /// Threshold for triggering GC (default 1MB)
     gc_threshold: AtomicUsize,
@@ -129,6 +129,14 @@ pub struct AllocationRegistry {
     total_pause_nanos: AtomicU64,
     /// Last pause time in nanoseconds
     last_pause_nanos: AtomicU64,
+
+    // --- Nursery (young generation) ---
+    /// Bump allocator for short-lived objects.
+    nursery: crate::nursery::Nursery,
+    /// Remembered set: old-gen objects that point to nursery objects.
+    remembered_set: crate::barrier::RememberedSet,
+    /// Number of minor GC collections performed.
+    minor_collection_count: AtomicUsize,
 
     // --- Incremental marking state ---
     /// Current GC phase (Idle or Marking)
@@ -169,6 +177,9 @@ impl AllocationRegistry {
             last_reclaimed: AtomicUsize::new(0),
             total_pause_nanos: AtomicU64::new(0),
             last_pause_nanos: AtomicU64::new(0),
+            nursery: crate::nursery::Nursery::new(),
+            remembered_set: crate::barrier::RememberedSet::new(),
+            minor_collection_count: AtomicUsize::new(0),
             gc_phase: Cell::new(GcPhase::Idle),
             mark_worklist: RefCell::new(VecDeque::new()),
             trace_table: [None; 256],
@@ -235,6 +246,211 @@ impl AllocationRegistry {
         ptr
     }
 
+    /// Try to allocate a cell in the nursery (young generation).
+    ///
+    /// Returns a pointer to the start of the cell, or `None` if nursery is full.
+    /// Nursery allocation is bump-pointer fast (~3ns).
+    #[inline]
+    pub fn allocate_in_nursery(&self, actual_size: usize, drop_fn: DropFn) -> Option<*mut u8> {
+        let ptr = self.nursery.alloc(actual_size, drop_fn)?;
+        self.total_bytes.fetch_add(actual_size, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    /// Check if a pointer is in the nursery.
+    #[inline]
+    pub fn is_nursery_ptr(&self, ptr: *const u8) -> bool {
+        self.nursery.contains(ptr)
+    }
+
+    /// Get nursery usage ratio (0.0 to 1.0).
+    #[inline]
+    pub fn nursery_usage(&self) -> f64 {
+        self.nursery.usage()
+    }
+
+    /// Check if a minor GC should be triggered.
+    ///
+    /// Returns true if the nursery is 80%+ full.
+    #[inline]
+    pub fn should_minor_gc(&self) -> bool {
+        self.nursery.usage() >= 0.8
+    }
+
+    /// Get a reference to the remembered set.
+    pub fn remembered_set(&self) -> &crate::barrier::RememberedSet {
+        &self.remembered_set
+    }
+
+    /// Number of live objects currently in the nursery.
+    #[inline]
+    pub fn nursery_live_count(&self) -> usize {
+        self.nursery.live_count()
+    }
+
+    /// Perform a minor GC (young generation collection).
+    ///
+    /// Only marks and sweeps nursery objects + remembered set roots.
+    /// Much cheaper than a full collection — no old-gen scanning.
+    ///
+    /// Returns bytes reclaimed.
+    pub fn collect_minor(&self, roots: &[*const GcHeader]) -> usize {
+        self.collect_minor_with_pre_sweep_hook(roots, || {})
+    }
+
+    /// Perform a minor GC with a pre-sweep hook.
+    ///
+    /// The `pre_sweep` hook runs after marking (live objects are Black) but
+    /// before sweeping (dead objects' memory and values are still intact).
+    /// Use this to prune weak data structures (e.g., string intern table)
+    /// that may reference nursery objects about to be freed.
+    pub fn collect_minor_with_pre_sweep_hook<F: FnOnce()>(
+        &self,
+        roots: &[*const GcHeader],
+        pre_sweep: F,
+    ) -> usize {
+        let start = Instant::now();
+
+        // Phase 1: Reset marks (O(1) via version bump).
+        // All objects appear White. Young-only marking will only
+        // mark nursery objects; old-gen stays White (harmless until full GC).
+        self.reset_marks();
+
+        // Phase 2: Young-only mark from roots + remembered set.
+        // Only enqueues nursery objects, only follows nursery children.
+        // O(nursery_objects) instead of O(reachable_heap).
+        self.mark_minor(roots);
+
+        // Phase 3: Pre-sweep hook — prune weak references (e.g., string table)
+        // while marks are valid but dead objects are still alive in memory.
+        pre_sweep();
+
+        // Phase 4: Sweep nursery — skip tenured cells (they weren't marked
+        // in young-only mode and must not be freed).
+        let (reclaimed, _tenured) = self.nursery.sweep_young_only();
+        self.total_bytes.fetch_sub(reclaimed, Ordering::Relaxed);
+
+        // Phase 5: Compact nursery if possible
+        self.nursery.compact_if_possible();
+
+        // Phase 6: Clean remembered set — remove dead/tenured entries.
+        // Don't clear entirely: live young entries must persist for next minor GC.
+        self.clean_remembered_set();
+
+        // Update stats
+        let elapsed = start.elapsed();
+        let elapsed_nanos = elapsed.as_nanos() as u64;
+        self.pause_histogram.borrow_mut().record(elapsed);
+        self.minor_collection_count.fetch_add(1, Ordering::Relaxed);
+        self.last_reclaimed.store(reclaimed, Ordering::Relaxed);
+        self.total_pause_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.last_pause_nanos.store(elapsed_nanos, Ordering::Relaxed);
+
+        reclaimed
+    }
+
+    /// Young-only mark phase for minor GC.
+    ///
+    /// Only traces nursery (young) objects. Old-gen objects are skipped entirely.
+    /// Correctness relies on the generational write barrier: every store of a
+    /// young value into an old object adds the young value to the remembered set.
+    ///
+    /// Complexity: O(nursery_objects) instead of O(reachable_heap).
+    fn mark_minor(&self, roots: &[*const GcHeader]) {
+        let mut worklist: VecDeque<*const GcHeader> = VecDeque::new();
+
+        // Step 1: From roots, only enqueue young (nursery) objects.
+        for &root in roots {
+            if !root.is_null() && self.nursery.contains(root as *const u8) {
+                unsafe {
+                    if (*root).mark() == MarkColor::White && (*root).is_young() {
+                        (*root).set_mark(MarkColor::Gray);
+                        worklist.push_back(root);
+                    }
+                }
+            }
+        }
+
+        // Step 2: Enqueue remembered set entries (young objects ref'd from old-gen).
+        {
+            let rs_entries = self.remembered_set.roots();
+            for entry in rs_entries {
+                if !entry.is_null() && self.nursery.contains(entry as *const u8) {
+                    unsafe {
+                        if (*entry).mark() == MarkColor::White && (*entry).is_young() {
+                            (*entry).set_mark(MarkColor::Gray);
+                            worklist.push_back(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Process worklist — trace children, only follow young children.
+        while let Some(ptr) = worklist.pop_front() {
+            unsafe {
+                let header = &*ptr;
+
+                if header.mark() == MarkColor::Black {
+                    continue;
+                }
+
+                // Trace this young object's references
+                let tag = header.tag();
+                if let Some(trace_fn) = self.trace_table[tag as usize] {
+                    trace_fn(ptr as *const u8, &mut |child_header| {
+                        if !child_header.is_null()
+                            && self.nursery.contains(child_header as *const u8)
+                            && (*child_header).mark() == MarkColor::White
+                            && (*child_header).is_young()
+                        {
+                            (*child_header).set_mark(MarkColor::Gray);
+                            worklist.push_back(child_header);
+                        }
+                    });
+                }
+
+                header.set_mark(MarkColor::Black);
+            }
+        }
+    }
+
+    /// Clean remembered set after minor GC.
+    ///
+    /// Removes entries for objects that were freed (white after marking) or
+    /// tenured (no longer young). Keeps entries for live young objects so
+    /// they remain discoverable in the next minor GC.
+    fn clean_remembered_set(&self) {
+        let entries = self.remembered_set.roots();
+        let mut to_remove = Vec::new();
+        for entry in entries {
+            if entry.is_null() {
+                to_remove.push(entry);
+                continue;
+            }
+            if !self.nursery.contains(entry as *const u8) {
+                // Not in nursery — shouldn't be here
+                to_remove.push(entry);
+                continue;
+            }
+            unsafe {
+                let header = &*entry;
+                // Remove if dead (white) or tenured (no longer young)
+                if header.mark() != MarkColor::Black || !header.is_young() {
+                    to_remove.push(entry);
+                }
+            }
+        }
+        for entry in to_remove {
+            self.remembered_set.remove(entry);
+        }
+    }
+
+    /// Get the number of minor collections performed.
+    pub fn minor_collection_count(&self) -> usize {
+        self.minor_collection_count.load(Ordering::Relaxed)
+    }
+
     /// Get total allocated bytes
     pub fn total_bytes(&self) -> usize {
         self.total_bytes.load(Ordering::Relaxed)
@@ -259,7 +475,8 @@ impl AllocationRegistry {
     pub fn allocation_count(&self) -> usize {
         let block_count: usize = self.directories.iter().map(|d| d.live_count()).sum();
         let large_count = self.large_objects.borrow().len();
-        block_count + large_count
+        let nursery_count = self.nursery.live_count();
+        block_count + large_count + nursery_count
     }
 
     /// Get a copy of the GC pause histogram.
@@ -575,7 +792,14 @@ impl AllocationRegistry {
     fn sweep(&self) -> usize {
         let mut reclaimed: usize = 0;
 
-        // Sweep all block directories
+        // Sweep nursery (young generation)
+        let (nursery_reclaimed, _tenured) = self.nursery.sweep_after_minor_gc();
+        reclaimed += nursery_reclaimed;
+        self.nursery.compact_if_possible();
+        // After a full GC, clear the remembered set (all cross-gen refs re-established)
+        self.remembered_set.clear();
+
+        // Sweep all block directories (old generation)
         for dir in &self.directories {
             reclaimed += dir.sweep();
         }
@@ -788,6 +1012,10 @@ impl AllocationRegistry {
         // Use per-isolate flag (on self) instead of thread-local
         self.dealloc_in_progress.set(true);
 
+        // Dealloc nursery objects first
+        self.nursery.dealloc_all();
+        self.remembered_set.clear();
+
         // Dealloc all block-allocated objects
         for dir in &self.directories {
             dir.dealloc_all();
@@ -949,6 +1177,27 @@ pub fn global_registry() -> &'static AllocationRegistry {
     })
 }
 
+/// Check if a GcHeader pointer is in the nursery and add to remembered set.
+///
+/// Used by the generational write barrier: when a value is stored into a
+/// GC-managed object, check if the value is a young (nursery) object. If so,
+/// record it in the remembered set for the next minor GC.
+///
+/// This is the fast path for the generational barrier — returns immediately
+/// if the pointer is not in the nursery range (2 integer comparisons).
+#[inline]
+pub fn remembered_set_add_if_young(header_ptr: *const GcHeader) {
+    THREAD_REGISTRY.with(|r| {
+        let reg_ptr = r.get();
+        if !reg_ptr.is_null() {
+            let reg = unsafe { &*reg_ptr };
+            if reg.nursery.contains(header_ptr as *const u8) {
+                reg.remembered_set.add(header_ptr);
+            }
+        }
+    });
+}
+
 /// Allocate a GC-managed value
 ///
 /// # Safety
@@ -973,17 +1222,26 @@ where
     let alloc_size = layout.size();
 
     let ptr: *mut GcAllocation<T>;
+    let is_young: bool;
 
     if alloc_size <= LARGE_OBJECT_THRESHOLD {
-        // Small object: allocate from block directory.
+        // Small object: try nursery first for fast bump allocation (~3ns).
         // Use drop_gc_box_in_block which only drops in-place (no dealloc —
-        // the block owns the memory).
+        // both nursery and block allocator own their memory).
         let drop_fn: DropFn = drop_gc_box_in_block::<T>;
-        let cell_ptr = registry.allocate_in_block(alloc_size, drop_fn);
-        ptr = cell_ptr as *mut GcAllocation<T>;
+
+        if let Some(cell_ptr) = registry.allocate_in_nursery(alloc_size, drop_fn) {
+            ptr = cell_ptr as *mut GcAllocation<T>;
+            is_young = true;
+        } else {
+            // Nursery full — allocate in old space (block directory).
+            let cell_ptr = registry.allocate_in_block(alloc_size, drop_fn);
+            ptr = cell_ptr as *mut GcAllocation<T>;
+            is_young = false;
+        }
     } else {
         // Large object: allocate individually via global allocator.
-        // Use drop_gc_box which also calls dealloc.
+        // Large objects always go to old space (not worth nursery-ing).
         let drop_fn: DropFn = drop_gc_box::<T>;
         // SAFETY: Layout is valid and non-zero sized
         let raw = unsafe { std::alloc::alloc(layout) as *mut GcAllocation<T> };
@@ -991,6 +1249,7 @@ where
             std::alloc::handle_alloc_error(layout);
         }
         ptr = raw;
+        is_young = false;
 
         // Register with the large object tracker
         let header_ptr = ptr as *mut GcHeader;
@@ -1000,9 +1259,13 @@ where
     }
 
     // Initialize header and value
-    // SAFETY: ptr is non-null and properly aligned (from block or alloc)
+    // SAFETY: ptr is non-null and properly aligned (from nursery, block, or alloc)
     unsafe {
-        std::ptr::write(&mut (*ptr).header, GcHeader::new(T::TYPE_ID));
+        if is_young {
+            std::ptr::write(&mut (*ptr).header, GcHeader::new_young(T::TYPE_ID));
+        } else {
+            std::ptr::write(&mut (*ptr).header, GcHeader::new(T::TYPE_ID));
+        }
         std::ptr::write(&mut (*ptr).value, value);
 
         // Black allocation: objects allocated during marking are pre-marked Black.
@@ -1441,5 +1704,111 @@ mod tests {
 
         // Both objects survive (ptr2 was saved by the write barrier)
         assert_eq!(registry.allocation_count(), 2);
+    }
+
+    #[test]
+    fn test_nursery_allocation_goes_to_nursery() {
+        let registry = AllocationRegistry::new();
+
+        // Small objects should go to nursery
+        let ptr = unsafe { gc_alloc_in(&registry, 42i32) };
+
+        // Verify it's in the nursery
+        let header_ptr = unsafe {
+            (ptr as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
+        unsafe {
+            assert!((*header_ptr).is_young(), "small object should be in nursery");
+        }
+
+        assert_eq!(registry.allocation_count(), 1);
+        assert!(registry.nursery_usage() > 0.0);
+    }
+
+    #[test]
+    fn test_minor_gc_reclaims_unreachable_nursery_objects() {
+        let registry = AllocationRegistry::new();
+
+        // Allocate objects in nursery
+        let _ptr1 = unsafe { gc_alloc_in(&registry, 100i32) };
+        let _ptr2 = unsafe { gc_alloc_in(&registry, 200i32) };
+        let ptr3 = unsafe { gc_alloc_in(&registry, 300i32) };
+
+        assert_eq!(registry.allocation_count(), 3);
+        let bytes_before = registry.total_bytes();
+
+        // Root only ptr3
+        let header3 = unsafe {
+            (ptr3 as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
+
+        // Run minor GC with only ptr3 rooted
+        let reclaimed = registry.collect_minor(&[header3]);
+        assert!(reclaimed > 0, "minor GC should reclaim unreachable objects");
+        assert_eq!(registry.allocation_count(), 1, "only rooted object should survive");
+        assert!(registry.total_bytes() < bytes_before);
+    }
+
+    #[test]
+    fn test_minor_gc_preserves_rooted_objects() {
+        let registry = AllocationRegistry::new();
+
+        let ptr1 = unsafe { gc_alloc_in(&registry, 42i32) };
+        let ptr2 = unsafe { gc_alloc_in(&registry, 84i32) };
+
+        let header1 = unsafe {
+            (ptr1 as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
+        let header2 = unsafe {
+            (ptr2 as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
+        };
+
+        // Root both
+        let reclaimed = registry.collect_minor(&[header1, header2]);
+        assert_eq!(reclaimed, 0, "no objects should be reclaimed when all are rooted");
+        assert_eq!(registry.allocation_count(), 2);
+
+        // Values should still be accessible
+        unsafe {
+            assert_eq!(*ptr1, 42);
+            assert_eq!(*ptr2, 84);
+        }
+    }
+
+    #[test]
+    fn test_should_minor_gc_threshold() {
+        // Create a small nursery to test threshold quickly
+        let mut registry = AllocationRegistry::new();
+        // The nursery is 2MB — we need to fill 80% to trigger should_minor_gc()
+
+        assert!(!registry.should_minor_gc(), "empty nursery should not trigger minor GC");
+
+        // Allocate enough to pass the 80% threshold
+        // Each i32 GcAllocation is ~12 bytes, so we need many allocations
+        let nursery_size = 2 * 1024 * 1024; // 2MB
+        let threshold = (nursery_size as f64 * 0.8) as usize;
+        let alloc_size = std::mem::size_of::<GcAllocation<i32>>();
+        let needed = threshold / alloc_size;
+
+        for _ in 0..needed {
+            unsafe { gc_alloc_in(&registry, 0i32); }
+        }
+
+        assert!(registry.should_minor_gc(), "nursery at 80%+ should trigger minor GC");
+    }
+
+    #[test]
+    fn test_minor_collection_count() {
+        let registry = AllocationRegistry::new();
+
+        assert_eq!(registry.minor_collection_count(), 0);
+
+        let _ptr = unsafe { gc_alloc_in(&registry, 42i32) };
+        registry.collect_minor(&[]);
+
+        assert_eq!(registry.minor_collection_count(), 1);
+
+        registry.collect_minor(&[]);
+        assert_eq!(registry.minor_collection_count(), 2);
     }
 }

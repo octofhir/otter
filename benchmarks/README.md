@@ -34,6 +34,39 @@ node --experimental-strip-types benchmarks/cpu/fibonacci.ts
 bun benchmarks/cpu/fibonacci.ts
 ```
 
+## Phase Regression Testing
+
+The `phase_baseline.sh` script runs the `flamegraph.ts` benchmark across Otter, Node, Bun, and Deno, and can detect performance regressions.
+
+```bash
+# Run baseline and save results
+./benchmarks/cpu/phase_baseline.sh
+
+# Run and compare against a previous baseline
+./benchmarks/cpu/phase_baseline.sh --compare benchmarks/results/phase-baseline-PREV.json
+
+# Customize regression threshold (default: 10%)
+REGRESSION_THRESHOLD_PCT=15 ./benchmarks/cpu/phase_baseline.sh --compare prev.json
+```
+
+The `--compare` flag:
+- Prints delta % for each Otter phase vs the previous run
+- Exits non-zero if any phase regressed by more than `REGRESSION_THRESHOLD_PCT` (default 10%)
+- Only compares Otter phases (other runtimes are informational)
+
+### Profiling Flags
+
+```bash
+# GC pause histogram
+otter run --gc-stats script.ts
+
+# Allocation category breakdown (objects, strings, closures, etc.)
+otter run --alloc-stats script.ts
+
+# IC hit/miss summary
+otter run --trace-ic script.ts
+```
+
 ## Benchmark Categories
 
 ### Startup (`startup/`)

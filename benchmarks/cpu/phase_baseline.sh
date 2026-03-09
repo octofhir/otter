@@ -8,6 +8,30 @@ RESULTS_DIR="$REPO_ROOT/benchmarks/results"
 OTTER_BIN="${OTTER_BIN:-$REPO_ROOT/target/release/otter}"
 OTTER_TIMEOUT_SECONDS="${OTTER_TIMEOUT_SECONDS:-45}"
 SLOW_PHASE_THRESHOLD_MS="${SLOW_PHASE_THRESHOLD_MS:-25000}"
+REGRESSION_THRESHOLD_PCT="${REGRESSION_THRESHOLD_PCT:-10}"
+COMPARE_FILE=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --compare)
+      shift
+      COMPARE_FILE="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Usage: $0 [--compare <previous-results.json>]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$COMPARE_FILE" && ! -f "$COMPARE_FILE" ]]; then
+  echo "Compare file not found: $COMPARE_FILE" >&2
+  exit 2
+fi
+
 mkdir -p "$RESULTS_DIR"
 
 if ! [[ "$OTTER_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -72,7 +96,7 @@ for runtime in "${runtimes[@]}"; do
 
     status="ok"
     if [[ $exit_code -ne 0 ]]; then
-      if rg -qi "timed out|timeout" "$log_file"; then
+      if rg -qi "timed out|timeout|Execution interrupted" "$log_file"; then
         status="timeout"
       else
         status="error"
@@ -165,3 +189,60 @@ echo "Wrote:"
 echo "  $RAW_JSON"
 echo "  $RAW_TSV"
 echo "  $DASHBOARD"
+
+# --- Comparison mode ---
+if [[ -n "$COMPARE_FILE" ]]; then
+  echo
+  echo "=== Regression comparison (threshold: ${REGRESSION_THRESHOLD_PCT}%) ==="
+  echo
+
+  regressed=0
+
+  for phase in "${phases[@]}"; do
+    # Extract previous Otter phase_ms from JSON
+    prev_ms="$(python3 -c "
+import json, sys
+with open('$COMPARE_FILE') as f:
+    data = json.load(f)
+for r in data['results']:
+    if r['runtime'] == 'otter' and r['phase'] == '$phase' and r['phase_ms'] is not None:
+        print(r['phase_ms'])
+        sys.exit(0)
+print('')
+" 2>/dev/null || echo "")"
+
+    # Extract current Otter phase_ms from TSV
+    curr_ms="$(awk -F'|' -v ph="$phase" '$1=="otter" && $2==ph {print $6}' "$RAW_TSV")"
+
+    if [[ -z "$prev_ms" || -z "$curr_ms" ]]; then
+      printf "  %-10s  prev=%-10s  curr=%-10s  delta=n/a\n" "$phase" "${prev_ms:-n/a}" "${curr_ms:-n/a}"
+      continue
+    fi
+
+    # Compute delta percentage
+    delta_pct="$(python3 -c "
+prev=$prev_ms; curr=$curr_ms
+if prev > 0:
+    delta = ((curr - prev) / prev) * 100
+    print(f'{delta:+.1f}')
+else:
+    print('n/a')
+")"
+
+    flag=""
+    if python3 -c "exit(0 if ($curr_ms - $prev_ms) / $prev_ms * 100 > $REGRESSION_THRESHOLD_PCT else 1)" 2>/dev/null; then
+      flag=" << REGRESSION"
+      regressed=1
+    fi
+
+    printf "  %-10s  prev=%-10s  curr=%-10s  delta=%s%%%s\n" "$phase" "$prev_ms" "$curr_ms" "$delta_pct" "$flag"
+  done
+
+  echo
+  if [[ $regressed -eq 1 ]]; then
+    echo "FAIL: One or more Otter phases regressed by >${REGRESSION_THRESHOLD_PCT}%"
+    exit 1
+  else
+    echo "PASS: No regressions detected (threshold: ${REGRESSION_THRESHOLD_PCT}%)"
+  fi
+fi

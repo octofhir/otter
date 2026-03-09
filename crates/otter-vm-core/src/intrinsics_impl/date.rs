@@ -67,7 +67,16 @@ fn get_timestamp_value(this_val: &Value) -> Result<f64, VmError> {
 }
 
 /// Helper to convert value to object — delegates to the full ToObject from object.rs
-fn to_object(ncx: &mut NativeContext<'_>, val: &Value) -> Result<GcRef<JsObject>, VmError> {
+fn to_object(
+    ncx: &mut NativeContext<'_>,
+    val: &Value,
+) -> Result<
+    (
+        GcRef<JsObject>,
+        crate::intrinsics_impl::object::RootSlotGuard,
+    ),
+    VmError,
+> {
     crate::intrinsics_impl::object::to_object_for_builtin(ncx, val)
 }
 
@@ -1479,7 +1488,7 @@ pub fn init_date_prototype(
         1,
         Box::new(|this_val, _args, ncx| {
             // 1. Let O be ? ToObject(this value).
-            let obj = to_object(ncx, this_val)?;
+            let (obj, _guard) = to_object(ncx, this_val)?;
             let obj_val = Value::object(obj.clone());
             // 2. Let tv be ? ToPrimitive(O, number).
             let tv = ncx.to_primitive(&obj_val, PreferredType::Number)?;

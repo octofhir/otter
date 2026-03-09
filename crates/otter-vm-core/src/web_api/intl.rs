@@ -805,7 +805,7 @@ fn canonicalize_locale_list(
         locales.clone()
     } else {
         wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, locales)?;
-        Value::object(wrapped)
+        Value::object(wrapped.0.clone())
     };
 
     {
@@ -1111,7 +1111,7 @@ fn get_option_string(
             obj
         } else {
             wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, options)?;
-            wrapped
+            wrapped.0
         };
         crate::object::get_value_full(&obj, &PropertyKey::string(name), ncx)?
     };
@@ -1150,7 +1150,7 @@ fn get_option_bool(
             obj
         } else {
             wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, options)?;
-            wrapped
+            wrapped.0
         };
         crate::object::get_value_full(&obj, &PropertyKey::string(name), ncx)?
     };
@@ -1212,7 +1212,7 @@ fn get_option_number(
             obj
         } else {
             wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, options)?;
-            wrapped
+            wrapped.0
         };
         crate::object::get_value_full(&obj, &PropertyKey::string(name), ncx)?
     };
@@ -1248,7 +1248,7 @@ fn get_option_value(
             obj
         } else {
             wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, options)?;
-            wrapped
+            wrapped.0
         };
         crate::object::get_value_full(&obj, &PropertyKey::string(name), ncx)?
     };
@@ -1447,7 +1447,7 @@ fn resolved_options(
             PropertyKey::string("trailingZeroDisplay"),
             data(get_slot(INTL_NF_TRAILING_ZERO_DISPLAY_KEY)),
         );
-        return Ok(Value::object(obj));
+        return Ok(Value::object(obj.clone()));
     }
 
     let mapping = [
@@ -1482,7 +1482,7 @@ fn resolved_options(
         }
     }
 
-    Ok(Value::object(obj))
+    Ok(Value::object(obj.clone()))
 }
 
 #[derive(Clone)]
@@ -3867,7 +3867,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
                     PropertyDescriptor::data(case_first),
                 );
             }
-            Ok(Value::object(obj))
+            Ok(Value::object(obj.clone()))
         },
         mm.clone(),
         fn_proto.clone(),

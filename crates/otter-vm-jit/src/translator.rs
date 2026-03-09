@@ -362,6 +362,7 @@ fn is_supported_baseline_opcode(instruction: &Instruction) -> bool {
             | Instruction::DivInt32 { .. }
             | Instruction::AddNumber { .. }
             | Instruction::SubNumber { .. }
+            | Instruction::GetLocal2 { .. }
     )
 }
 
@@ -445,6 +446,7 @@ fn is_supported_with_helpers(instruction: &Instruction) -> bool {
                 | Instruction::GetAsyncIterator { .. }
                 | Instruction::ForInNext { .. }
                 | Instruction::Yield { .. }
+                | Instruction::IncLocal { .. }
         )
 }
 
@@ -4003,6 +4005,18 @@ pub fn translate_function_with_constants(
                 let result =
                     emit_helper_call_with_bailout(builder, helper_ref, &[ctx_ptr, src_val]);
                 write_reg(builder, &reg_vars, *dst, result);
+            }
+            // --- Superinstructions: handle natively when possible ---
+            Instruction::GetLocal2 { dst1, idx1, dst2, idx2 } => {
+                // Two GetLocals fused into one dispatch
+                let val1 = read_local(builder, &local_vars, *idx1);
+                write_reg(builder, &reg_vars, *dst1, val1);
+                let val2 = read_local(builder, &local_vars, *idx2);
+                write_reg(builder, &reg_vars, *dst2, val2);
+            }
+            Instruction::IncLocal { .. } => {
+                // IncLocal involves numeric coercion — bail out to interpreter
+                emit_bailout_return(builder);
             }
             Instruction::ForInNext { dst, obj, offset } => {
                 let helper_ref = helpers

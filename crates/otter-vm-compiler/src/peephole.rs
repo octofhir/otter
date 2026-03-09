@@ -12,7 +12,7 @@
 //! - **Identity elimination**: Remove Move r0, r0; double negation; etc.
 
 use otter_vm_bytecode::instruction::Instruction;
-use otter_vm_bytecode::operand::{JumpOffset, Register};
+use otter_vm_bytecode::operand::{JumpOffset, LocalIndex, Register};
 use std::collections::HashMap;
 
 /// Peephole optimizer that optimizes bytecode instructions
@@ -933,6 +933,41 @@ impl PeepholeOptimizer {
                 local_idx: *local_idx,
                 name: *name,
                 ic_index: *ic_index,
+            }));
+        }
+
+        // Superinstruction: GetLocal + GetLocal → GetLocal2
+        // Fuses two consecutive local variable loads into a single dispatch.
+        if let (
+            Instruction::GetLocal {
+                dst: dst1,
+                idx: idx1,
+            },
+            Instruction::GetLocal {
+                dst: dst2,
+                idx: idx2,
+            },
+        ) = (first, second)
+        {
+            return Some(WindowResult::Replace1(Instruction::GetLocal2 {
+                dst1: *dst1,
+                idx1: *idx1,
+                dst2: *dst2,
+                idx2: *idx2,
+            }));
+        }
+
+        // Superinstruction: Inc + SetLocal → IncLocal
+        // Fuses increment with local variable store (common in loop counters: i++).
+        if let (
+            Instruction::Inc { dst, src },
+            Instruction::SetLocal { idx, src: set_src },
+        ) = (first, second)
+            && dst == set_src
+        {
+            return Some(WindowResult::Replace1(Instruction::IncLocal {
+                local_idx: *idx,
+                src: *src,
             }));
         }
 

@@ -46,13 +46,18 @@ pub struct GcHeader {
     mark: AtomicU8,
     /// Object type tag
     tag: u8,
+    /// GC flags. Bit 0: is_young (allocated in nursery).
+    flags: AtomicU8,
     /// Explicit padding to align `mark_version` to a 4-byte boundary.
-    _pad: [u8; 2],
+    _pad: u8,
     /// Logical mark version. Object is "white" if
     /// this doesn't match `MARK_VERSION`. u32 prevents wrap-around after
     /// 256 GC cycles that u8 was susceptible to.
     mark_version: AtomicU32,
 }
+
+/// GcHeader flag bits.
+const FLAG_YOUNG: u8 = 1 << 0;
 
 /// Mark color for tri-color marking
 #[repr(u8)]
@@ -113,9 +118,39 @@ impl GcHeader {
         Self {
             mark: AtomicU8::new(MarkColor::White as u8),
             tag,
-            _pad: [0; 2],
+            flags: AtomicU8::new(0),
+            _pad: 0,
             mark_version: AtomicU32::new(0),
         }
+    }
+
+    /// Create a new header for a nursery-allocated (young) object.
+    pub const fn new_young(tag: u8) -> Self {
+        Self {
+            mark: AtomicU8::new(MarkColor::White as u8),
+            tag,
+            flags: AtomicU8::new(FLAG_YOUNG),
+            _pad: 0,
+            mark_version: AtomicU32::new(0),
+        }
+    }
+
+    /// Whether this object is in the young generation (nursery).
+    #[inline]
+    pub fn is_young(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & FLAG_YOUNG != 0
+    }
+
+    /// Mark this object as young (nursery-allocated).
+    #[inline]
+    pub fn set_young(&self) {
+        self.flags.fetch_or(FLAG_YOUNG, Ordering::Relaxed);
+    }
+
+    /// Promote this object to old generation (clear young flag).
+    #[inline]
+    pub fn set_tenured(&self) {
+        self.flags.fetch_and(!FLAG_YOUNG, Ordering::Relaxed);
     }
 
     /// Get mark color, taking logical versioning into account.
@@ -157,7 +192,8 @@ impl Clone for GcHeader {
         Self {
             mark: AtomicU8::new(MarkColor::White as u8),
             tag: self.tag,
-            _pad: [0; 2],
+            flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
+            _pad: 0,
             mark_version: AtomicU32::new(0),
         }
     }

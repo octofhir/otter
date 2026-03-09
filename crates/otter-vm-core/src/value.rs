@@ -73,8 +73,10 @@ impl UpvalueData {
     }
 
     /// Write a new value (no locking).
+    /// Includes generational write barrier for nursery GC.
     #[inline]
     pub fn set(&self, value: Value) {
+        crate::object::gc_write_barrier(&value);
         self.value.set(value);
     }
 }

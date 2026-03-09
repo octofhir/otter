@@ -70,11 +70,11 @@ pub struct SavedFrame {
     /// Program counter (instruction index)
     pub pc: usize,
     /// Number of local variable slots at the start of the register window
-    pub local_count: usize,
+    pub local_count: u16,
     /// Base index in the flat register array
     pub register_base: usize,
     /// Total window size (local_count + scratch registers)
-    pub register_count: usize,
+    pub register_count: u16,
     /// Captured upvalues (heap-allocated cells)
     pub upvalues: Vec<UpvalueCell>,
     /// Return register (where to put the result)
@@ -86,9 +86,9 @@ pub struct SavedFrame {
     /// Whether this is an async function
     pub is_async: bool,
     /// Unique frame ID for tracking
-    pub frame_id: usize,
+    pub frame_id: u32,
     /// Number of arguments passed to this function
-    pub argc: usize,
+    pub argc: u16,
 }
 
 /// Result of VM execution that can indicate suspension

@@ -81,7 +81,9 @@ impl MapData {
                 return v.clone();
             }
         }
-        // Key not found — insert
+        // Key not found — insert (barrier for generational GC)
+        crate::object::gc_write_barrier(key.value());
+        crate::object::gc_write_barrier(&default_value);
         let idx = inner.entries.len();
         inner.index.insert(key.clone(), idx);
         inner.entries.push(Some((key, default_value.clone())));
@@ -96,6 +98,8 @@ impl MapData {
 
     /// Insert or update `key` → `value`. Returns `true` if this was an update.
     pub fn set(&self, key: MapKey, value: Value) -> bool {
+        crate::object::gc_write_barrier(key.value());
+        crate::object::gc_write_barrier(&value);
         let mut inner = self.inner.borrow_mut();
         if let Some(&idx) = inner.index.get(&key) {
             // Update existing entry in-place (preserves insertion order)
@@ -240,6 +244,7 @@ impl SetData {
         if inner.index.contains_key(&key) {
             return true; // already present
         }
+        crate::object::gc_write_barrier(key.value());
         let idx = inner.entries.len();
         inner.index.insert(key.clone(), idx);
         inner.entries.push(Some(key));

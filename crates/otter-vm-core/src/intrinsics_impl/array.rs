@@ -645,7 +645,7 @@ pub fn init_array_prototype(
         PropertyKey::string("indexOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let search = args.first().cloned().unwrap_or(Value::undefined());
                 let from = if let Some(v) = args.get(1) {
@@ -685,7 +685,7 @@ pub fn init_array_prototype(
         PropertyKey::string("lastIndexOf"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 if len == 0 {
                     return Ok(Value::number(-1.0));
@@ -728,7 +728,7 @@ pub fn init_array_prototype(
         PropertyKey::string("includes"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let search = args.first().cloned().unwrap_or(Value::undefined());
                 let from = if let Some(v) = args.get(1) {
@@ -1385,7 +1385,7 @@ pub fn init_array_prototype(
         PropertyKey::string("forEach"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1424,7 +1424,7 @@ pub fn init_array_prototype(
         PropertyKey::string("map"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1477,7 +1477,7 @@ pub fn init_array_prototype(
         PropertyKey::string("filter"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1539,7 +1539,7 @@ pub fn init_array_prototype(
         PropertyKey::string("find"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1581,7 +1581,7 @@ pub fn init_array_prototype(
         PropertyKey::string("findIndex"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1619,7 +1619,7 @@ pub fn init_array_prototype(
         PropertyKey::string("findLast"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1661,7 +1661,7 @@ pub fn init_array_prototype(
         PropertyKey::string("findLastIndex"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1699,7 +1699,7 @@ pub fn init_array_prototype(
         PropertyKey::string("every"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1741,7 +1741,7 @@ pub fn init_array_prototype(
         PropertyKey::string("some"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
                 let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1783,7 +1783,7 @@ pub fn init_array_prototype(
         PropertyKey::string("reduce"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
 
@@ -1854,7 +1854,7 @@ pub fn init_array_prototype(
         PropertyKey::string("reduceRight"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |this_val, args, ncx| {
-                let obj = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
+                let (obj, _guard) = crate::intrinsics_impl::object::to_object_for_builtin(ncx, this_val)?;
                 let len = get_len_ncx(&obj, ncx)?;
                 let callback = args.first().cloned().unwrap_or(Value::undefined());
 

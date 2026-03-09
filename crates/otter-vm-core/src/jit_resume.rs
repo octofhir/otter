@@ -61,7 +61,7 @@ pub(crate) fn try_materialize_generator_yield(
     try_stack: Vec<TryEntry>,
     this_value: Value,
     is_construct: bool,
-    argc: usize,
+    argc: u16,
 ) -> Option<GeneratorYieldResume> {
     let instructions = func.instructions.read();
     let Some(Instruction::Yield { dst, src }) = instructions.get(state.bailout_pc as usize) else {

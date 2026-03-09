@@ -300,6 +300,14 @@ fn apply_instruction_uses(instruction: &Instruction, state: &mut LivenessState) 
         Instruction::GetLocal { idx, .. } | Instruction::GetLocalProp { local_idx: idx, .. } => {
             state.mark_local(idx.index());
         }
+        Instruction::GetLocal2 { idx1, idx2, .. } => {
+            state.mark_local(idx1.index());
+            state.mark_local(idx2.index());
+        }
+        Instruction::IncLocal { local_idx, src } => {
+            state.mark_register(src.0);
+            state.mark_local(local_idx.index());
+        }
         Instruction::SetLocal { idx, src } => {
             state.mark_register(src.0);
             state.kill_local(idx.index());
@@ -605,6 +613,15 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::GetPropString { dst, .. }
         | Instruction::GetArrayLength { dst, .. }
         | Instruction::GetLocalProp { dst, .. } => state.kill_register(dst.0),
+        Instruction::GetLocal2 { dst1, idx1, dst2, idx2, .. } => {
+            state.kill_register(dst1.0);
+            state.kill_register(dst2.0);
+            // GetLocal2 also "uses" the locals, but for defs we kill destinations
+        }
+        Instruction::IncLocal { local_idx, src } => {
+            state.kill_register(src.0);
+            state.kill_local(local_idx.index());
+        }
         Instruction::SetUpvalue { .. }
         | Instruction::SetGlobal { .. }
         | Instruction::CloseUpvalue { .. }

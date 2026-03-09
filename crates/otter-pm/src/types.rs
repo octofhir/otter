@@ -32,6 +32,9 @@ const OTTER_SQL_TYPES: &str = include_str!("types/otter/sql.d.ts");
 /// Otter serve types
 const OTTER_SERVE_TYPES: &str = include_str!("types/otter/serve.d.ts");
 
+/// Otter ffi types
+const OTTER_FFI_TYPES: &str = include_str!("types/otter/ffi.d.ts");
+
 /// Install bundled type definitions to node_modules
 pub fn install_bundled_types(node_modules: &Path) -> Result<(), TypesError> {
     install_otter_types(node_modules)
@@ -47,6 +50,7 @@ fn install_otter_types(node_modules: &Path) -> Result<(), TypesError> {
     write_if_changed(&types_dir.join("globals.d.ts"), OTTER_GLOBALS_TYPES)?;
     write_if_changed(&types_dir.join("sql.d.ts"), OTTER_SQL_TYPES)?;
     write_if_changed(&types_dir.join("serve.d.ts"), OTTER_SERVE_TYPES)?;
+    write_if_changed(&types_dir.join("ffi.d.ts"), OTTER_FFI_TYPES)?;
 
     // Write package.json with @types/node dependency
     let package_json = r#"{
@@ -105,6 +109,7 @@ mod tests {
         assert!(node_modules.join("otter-types/globals.d.ts").exists());
         assert!(node_modules.join("otter-types/sql.d.ts").exists());
         assert!(node_modules.join("otter-types/serve.d.ts").exists());
+        assert!(node_modules.join("otter-types/ffi.d.ts").exists());
         assert!(node_modules.join("otter-types/package.json").exists());
 
         // Verify package.json has @types/node dependency

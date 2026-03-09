@@ -719,6 +719,29 @@ impl Trace for crate::context::VmContext {
             cell.trace(tracer);
         }
 
+        // Trace dispatch action (may hold Values, GcRef<JsPromise>, UpvalueCell)
+        if let Some(action) = self.dispatch_action_to_trace() {
+            match action {
+                crate::context::DispatchAction::Return(v)
+                | crate::context::DispatchAction::Throw(v) => {
+                    tracer.mark_value(v);
+                }
+                crate::context::DispatchAction::Yield { value, .. } => {
+                    tracer.mark_value(value);
+                }
+                crate::context::DispatchAction::Suspend { promise, .. } => {
+                    tracer.mark(promise.as_ref());
+                }
+                crate::context::DispatchAction::Call { upvalues, .. }
+                | crate::context::DispatchAction::TailCall { upvalues, .. } => {
+                    for cell in upvalues.iter() {
+                        cell.trace(tracer);
+                    }
+                }
+                crate::context::DispatchAction::Jump(_) => {}
+            }
+        }
+
         // Trace open upvalues
         for cell in self.open_upvalues_to_trace().values() {
             cell.trace(tracer);
@@ -741,6 +764,33 @@ impl Trace for crate::context::VmContext {
 
         if let Some(registry) = self.realm_registry() {
             registry.trace_roots(&mut |header| tracer.mark_header(header));
+        }
+
+        // Trace captured module exports
+        if let Some(exports) = self.captured_module_exports_to_trace() {
+            for value in exports.values() {
+                tracer.mark_value(value);
+            }
+        }
+
+        // Trace pending throw
+        if let Some(throw) = self.pending_throw_to_trace() {
+            tracer.mark_value(throw);
+        }
+
+        // Trace template cache
+        for obj in self.template_cache_to_trace().values() {
+            tracer.mark(obj.as_ref());
+        }
+
+        // Trace RegExp cache
+        for value in self.regexp_cache_to_trace().values() {
+            tracer.mark_value(value);
+        }
+
+        // Trace string prototype cache
+        if let Some(proto) = self.string_prototype_cache_to_trace() {
+            tracer.mark(proto.as_ref());
         }
     }
 }

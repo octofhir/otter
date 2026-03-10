@@ -991,6 +991,21 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                         PropertyAttributes::permanent(),
                     ),
                 );
+
+                // ES2026 §22.2.2.3 %TypedArray%.prototype
+                typed_array_ctor_obj.define_property(
+                    PropertyKey::string("prototype"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::object(intrinsics.typed_array_prototype.clone()),
+                        PropertyAttributes::frozen(), // { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
+                    ),
+                );
+
+                // ES2026 §22.2.3.1 %TypedArray%.prototype.constructor
+                intrinsics.typed_array_prototype.define_property(
+                    PropertyKey::string("constructor"),
+                    PropertyDescriptor::builtin_data(typed_array_ctor.clone()),
+                );
                 typed_array_ctor_obj.define_property(
                     PropertyKey::string("from"),
                     PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
@@ -1064,7 +1079,7 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                         .inherits(intrinsics.typed_array_prototype)
                         .constructor_fn(create_typed_array_constructor(kind, proto), 3)
                         .build_and_install(&global);
-                    ctor.set_prototype(Value::object(typed_array_ctor_obj));
+                    ctor.set_prototype(typed_array_ctor.clone());
                     ctor.define_property(
                         PropertyKey::string("BYTES_PER_ELEMENT"),
                         PropertyDescriptor::builtin_data(Value::int32(kind.element_size() as i32)),

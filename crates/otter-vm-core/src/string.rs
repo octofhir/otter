@@ -36,7 +36,7 @@ use std::sync::{Arc, OnceLock};
 // guard. It points to the `StringTable` owned by `VmRuntime`, which outlives
 // any guard.
 thread_local! {
-    static THREAD_STRING_TABLE: Cell<*const StringTable> = const { Cell::new(std::ptr::null()) };
+    pub(crate) static THREAD_STRING_TABLE: Cell<*const StringTable> = const { Cell::new(std::ptr::null()) };
 }
 
 // ============================================================================
@@ -323,6 +323,21 @@ pub struct JsString {
 }
 
 impl JsString {
+    /// Ensure this string and its children (if it's a rope) are tenured.
+    ///
+    /// Tenuring an object prevents it from being swept during minor GC cycles,
+    /// which is necessary when a non-GC object (like a Shape transition)
+    /// holds a reference to it.
+    pub fn ensure_tenured(&self) {
+        if let StringRepr::Rope { left, right, .. } = &self.repr {
+            left.header().set_tenured();
+            right.header().set_tenured();
+            // We recursively tenure children to ensure the whole rope survives.
+            left.ensure_tenured();
+            right.ensure_tenured();
+        }
+    }
+
     /// Create or retrieve an interned string.
     ///
     /// Uses the per-runtime `StringTable` via `THREAD_STRING_TABLE`.
@@ -648,6 +663,24 @@ impl std::fmt::Display for JsString {
 
 impl PartialEq for JsString {
     fn eq(&self, other: &Self) -> bool {
+        // Debug guard: detect near-null/freed pointer access.
+        // The crash at address 0x58 means self or other is ~0x8, which happens
+        // when a freed GcBox is accessed (first word = freelist ptr).
+        let self_ptr = self as *const Self as usize;
+        let other_ptr = other as *const Self as usize;
+        if self_ptr < 0x1000 || other_ptr < 0x1000 {
+            let valid_key = if other_ptr >= 0x1000 {
+                other.as_str()
+            } else if self_ptr >= 0x1000 {
+                self.as_str()
+            } else {
+                "<both invalid>"
+            };
+            panic!(
+                "JsString::eq called with a freed/invalid pointer: self={:#x} other={:#x} (valid key='{}')",
+                self_ptr, other_ptr, valid_key
+            );
+        }
         // Fast path: same hash means likely same string
         if self.hash_value() != other.hash_value() {
             return false;

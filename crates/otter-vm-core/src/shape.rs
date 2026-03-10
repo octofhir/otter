@@ -84,26 +84,40 @@ impl Shape {
     ///
     /// Walks the parent chain from this shape to root, tracing each key.
     /// Also traces keys in the transitions map.
+    /// Trace all GC-managed property keys in this shape for the garbage collector.
+    ///
+    /// Walks up to the root of the shape tree and traces every key in every
+    /// reachable transition branch. This ensures that all property keys held
+    /// by live (via Arc or Weak) Shapes are protected from GC collection.
     pub fn trace_keys(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
-        // Walk the chain from this shape to root, tracing each key
-        let mut current = Some(self);
-        while let Some(shape) = current {
-            if let Some(key) = &shape.key {
-                match key {
-                    PropertyKey::String(s) => tracer(s.header() as *const _),
-                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
-                    PropertyKey::Index(_) => {}
-                }
+        let mut root = self;
+        while let Some(parent) = &root.parent {
+            root = parent;
+        }
+        root.trace_down(tracer);
+    }
+
+    /// Internal helper for recursive downward tracing of property keys.
+    fn trace_down(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
+        // Trace current shape's own key
+        if let Some(key) = &self.key {
+            match key {
+                PropertyKey::String(s) => tracer(s.header() as *const _),
+                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                PropertyKey::Index(_) => {}
             }
-            // Also trace keys in this shape's transitions map
-            for (key, _) in shape.transitions.borrow().iter() {
-                match key {
-                    PropertyKey::String(s) => tracer(s.header() as *const _),
-                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
-                    PropertyKey::Index(_) => {}
-                }
+        }
+
+        // Trace all keys in transitions and recurse into child shapes
+        for (key, child_weak) in self.transitions.borrow().iter() {
+            match key {
+                PropertyKey::String(s) => tracer(s.header() as *const _),
+                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                PropertyKey::Index(_) => {}
             }
-            current = shape.parent.as_deref();
+            if let Some(child) = child_weak.upgrade() {
+                child.trace_down(tracer);
+            }
         }
     }
 
@@ -159,6 +173,9 @@ impl Shape {
             cached_map: RefCell::new(None),
             id: next_shape_id(),
         });
+
+        // Ensure the key is tenured so it survives minor GCs while held by this Shape.
+        key.ensure_tenured();
 
         transitions.insert(key, Arc::downgrade(&new_shape));
         new_shape
@@ -248,6 +265,39 @@ impl Shape {
     /// Get the number of properties defined in this shape.
     pub fn property_count(&self) -> usize {
         self.depth as usize
+    }
+
+    /// Build a shape chain for a known set of keys at once.
+    ///
+    /// Uses the transition mechanism so that subsequent objects with the same
+    /// key sequence share the same shape (and IC caches hit).
+    /// Returns the final (leaf) shape.
+    pub fn from_keys(root: &Arc<Self>, keys: &[PropertyKey]) -> Arc<Self> {
+        let mut current = Arc::clone(root);
+        for key in keys {
+            current = current.transition(key.clone());
+        }
+        current
+    }
+
+    /// Get all own property keys with their slot offsets, in insertion order.
+    ///
+    /// Returns (key, offset) pairs suitable for direct slot access during
+    /// JSON.stringify fast path — avoids separate own_keys() + get_offset() calls.
+    pub fn own_keys_with_offsets(&self) -> Vec<(PropertyKey, usize)> {
+        if self.depth == 0 {
+            return Vec::new();
+        }
+        let mut pairs = Vec::with_capacity(self.depth as usize);
+        let mut current = Some(self);
+        while let Some(shape) = current {
+            if let (Some(k), Some(off)) = (&shape.key, shape.offset) {
+                pairs.push((k.clone(), off));
+            }
+            current = shape.parent.as_deref();
+        }
+        pairs.reverse();
+        pairs
     }
 }
 

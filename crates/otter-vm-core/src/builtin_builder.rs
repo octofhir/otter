@@ -2,7 +2,7 @@
 //!
 //! Spec: <https://tc39.es/ecma262/#sec-ecmascript-standard-built-in-objects>
 //!
-//! ## Trait-based registration (Boa-inspired)
+//! ## Trait-based registration
 //!
 //! Each built-in type implements [`IntrinsicObject`] (and optionally [`BuiltInConstructor`])
 //! to self-initialize using the shared [`IntrinsicContext`]:
@@ -652,6 +652,11 @@ fn make_native_fn(
     fn_obj.define_property(
         PropertyKey::string("name"),
         PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
+    );
+
+    fn_obj.define_property(
+        PropertyKey::string("__non_constructor"),
+        PropertyDescriptor::data_with_attrs(Value::boolean(true), PropertyAttributes::permanent()),
     );
 
     Value::native_function_with_proto_and_object(func, mm.clone(), fn_proto, fn_obj)

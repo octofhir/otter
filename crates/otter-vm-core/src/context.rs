@@ -589,7 +589,7 @@ impl CallFrame {
 /// For any other outcome (jump, return, call, etc.) the instruction handler stores
 /// a `DispatchAction` on `VmContext` before returning `Ok(())`, and the loop
 /// picks it up via `take_dispatch_action()`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum DispatchAction {
     Jump(i32),
     Return(Value),
@@ -3239,6 +3239,11 @@ impl VmContext {
             roots.push(template_obj.header() as *const _);
         }
 
+        // Add cached RegExp objects
+        for value in self.regexp_cache.values() {
+            value.trace(&mut |header| roots.push(header));
+        }
+
         // Add open upvalues
         for cell in self.open_upvalues.values() {
             cell.get().trace(&mut |header| roots.push(header));
@@ -3272,12 +3277,48 @@ impl VmContext {
         self.symbol_registry
             .trace_roots(&mut |header| roots.push(header));
 
-        // NOTE: The global string intern table is NOT added as a root here.
-        // Instead, `combined_pre_sweep_hook()` is called as a pre-sweep hook
-        // (see `collect_garbage` / `maybe_collect_garbage`).  This hook:
-        // 1. Prunes dead string table entries (weak interning)
-        // 2. Clears dead WeakRef targets from the side table
-        // 3. Sweeps FinalizationRegistry entries for dead targets
+        // Add global string intern table.
+        // NOTE: We trace the ENTIRE table as a root because interned strings
+        // are often held as temporary GcRef variables on the Rust stack (e.g.
+        // property names during lookup). Since we don't have a native stack
+        // scanner for the VM thread's Rust stack, the interning table must
+        // act as a strong root to prevent these strings from being swept.
+        if let Some(table_ptr) = crate::string::THREAD_STRING_TABLE.with(|cell| {
+            let p = cell.get();
+            if p.is_null() { None } else { Some(p) }
+        }) {
+            // SAFETY: THREAD_STRING_TABLE is valid while VmRuntime is active.
+            unsafe { (*table_ptr).trace_all(&mut |header| roots.push(header)) };
+        }
+
+        // Add captured module exports
+        if let Some(exports) = &self.captured_module_exports {
+            for value in exports.values() {
+                value.trace(&mut |header| roots.push(header));
+            }
+        }
+
+        // Add pending throw
+        if let Some(throw_val) = &self.pending_throw {
+            throw_val.trace(&mut |header| roots.push(header));
+        }
+
+        // Add dispatch action values
+        if let Some(action) = &self.dispatch_action {
+            match action {
+                DispatchAction::Throw(val) => val.trace(&mut |header| roots.push(header)),
+                DispatchAction::Yield { value, .. } => {
+                    value.trace(&mut |header| roots.push(header))
+                }
+                _ => {}
+            }
+        }
+
+        // NOTE: Standard weak interning pruning `combined_pre_sweep_hook()`
+        // still runs before sweep (see `collect_garbage` / `maybe_collect_garbage`).
+        // After we added `trace_all` above, pruning won't collect anything
+        // this cycle, but it still cleans up WeakRefs/FinalizationRegistries
+        // and provides the hook for future weak-string support.
 
         roots
     }

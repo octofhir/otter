@@ -177,7 +177,11 @@ impl Interpreter {
 
     /// Convert value to UTF-16 code units of ToString(value), preserving lone surrogates
     /// for existing JS string values.
-    pub(super) fn to_string_utf16_units(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Vec<u16>> {
+    pub(super) fn to_string_utf16_units(
+        &self,
+        ctx: &mut VmContext,
+        value: &Value,
+    ) -> VmResult<Vec<u16>> {
         if let Some(s) = value.as_string() {
             return Ok(s.as_utf16().to_vec());
         }
@@ -290,7 +294,11 @@ impl Interpreter {
     }
 
     /// Convert object to primitive using number hint.
-    pub(super) fn to_primitive_number(&self, ctx: &mut VmContext, value: &Value) -> VmResult<Value> {
+    pub(super) fn to_primitive_number(
+        &self,
+        ctx: &mut VmContext,
+        value: &Value,
+    ) -> VmResult<Value> {
         self.to_primitive(ctx, value, PreferredType::Number)
     }
 
@@ -364,9 +372,9 @@ impl Interpreter {
             PropertyKey::string("stack"),
             Value::string(JsString::intern(&stack)),
         );
-        let _ = obj.set(PropertyKey::string("__isError__"), Value::boolean(true));
+        let _ = obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let _ = obj.set(
-            PropertyKey::string("__errorType__"),
+            PropertyKey::string("__error_type__"),
             Value::string(JsString::intern(name)),
         );
         if let Some(ctor) = ctor_value {
@@ -403,7 +411,11 @@ impl Interpreter {
         Ok(Numeric::Number(self.to_number(&prim)))
     }
 
-    pub(super) fn numeric_compare(&self, left: Numeric, right: Numeric) -> VmResult<Option<Ordering>> {
+    pub(super) fn numeric_compare(
+        &self,
+        left: Numeric,
+        right: Numeric,
+    ) -> VmResult<Option<Ordering>> {
         match (left, right) {
             (Numeric::Number(left), Numeric::Number(right)) => {
                 if left.is_nan() || right.is_nan() {
@@ -422,7 +434,11 @@ impl Interpreter {
         }
     }
 
-    pub(super) fn compare_bigint_number(&self, bigint: &NumBigInt, number: f64) -> Option<Ordering> {
+    pub(super) fn compare_bigint_number(
+        &self,
+        bigint: &NumBigInt,
+        number: f64,
+    ) -> Option<Ordering> {
         if number.is_nan() {
             return None;
         }
@@ -533,7 +549,11 @@ impl Interpreter {
     }
 
     /// Convert a Value to a PropertyKey for object property access
-    pub(super) fn value_to_property_key(&self, ctx: &mut VmContext, value: &Value) -> VmResult<PropertyKey> {
+    pub(super) fn value_to_property_key(
+        &self,
+        ctx: &mut VmContext,
+        value: &Value,
+    ) -> VmResult<PropertyKey> {
         if let Some(sym) = value.as_symbol() {
             return Ok(PropertyKey::Symbol(sym));
         }
@@ -562,7 +582,12 @@ impl Interpreter {
     /// # Recursion Protection
     /// Depth-limited to MAX_ABSTRACT_EQUAL_DEPTH to prevent stack overflow
     /// from malicious valueOf/toString implementations.
-    pub(super) fn abstract_equal(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<bool> {
+    pub(super) fn abstract_equal(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+    ) -> VmResult<bool> {
         self.abstract_equal_impl(ctx, left, right, 0)
     }
 

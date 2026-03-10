@@ -1439,8 +1439,7 @@ impl Value {
     #[allow(unsafe_code)]
     pub fn as_accessor_pair(&self) -> Option<GcRef<AccessorPair>> {
         if (self.bits & TAG_MASK) == TAG_PTR_OTHER
-            && unsafe { self.gc_header_tag_from_bits() }
-                == otter_vm_gc::object::tags::ACCESSOR_PAIR
+            && unsafe { self.gc_header_tag_from_bits() } == otter_vm_gc::object::tags::ACCESSOR_PAIR
         {
             Some(unsafe { self.extract_gcref::<AccessorPair>() })
         } else {

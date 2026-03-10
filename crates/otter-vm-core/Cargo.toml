@@ -36,6 +36,7 @@ writeable = "0.6.2"
 temporal_rs = { version = "0.2.0", features = ["compiled_data"] }
 iana-time-zone = "0.1"
 smallvec = "1"
+itoa = "1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

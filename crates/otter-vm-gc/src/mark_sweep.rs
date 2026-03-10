@@ -343,8 +343,10 @@ impl AllocationRegistry {
         self.pause_histogram.borrow_mut().record(elapsed);
         self.minor_collection_count.fetch_add(1, Ordering::Relaxed);
         self.last_reclaimed.store(reclaimed, Ordering::Relaxed);
-        self.total_pause_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
-        self.last_pause_nanos.store(elapsed_nanos, Ordering::Relaxed);
+        self.total_pause_nanos
+            .fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.last_pause_nanos
+            .store(elapsed_nanos, Ordering::Relaxed);
 
         reclaimed
     }
@@ -363,7 +365,7 @@ impl AllocationRegistry {
         for &root in roots {
             if !root.is_null() && self.nursery.contains(root as *const u8) {
                 unsafe {
-                    if (*root).mark() == MarkColor::White && (*root).is_young() {
+                    if (*root).mark() == MarkColor::White {
                         (*root).set_mark(MarkColor::Gray);
                         worklist.push_back(root);
                     }
@@ -371,13 +373,15 @@ impl AllocationRegistry {
             }
         }
 
-        // Step 2: Enqueue remembered set entries (young objects ref'd from old-gen).
+        // Step 2: Enqueue remembered set entries (objects ref'ing nursery).
         {
             let rs_entries = self.remembered_set.roots();
             for entry in rs_entries {
-                if !entry.is_null() && self.nursery.contains(entry as *const u8) {
+                if !entry.is_null() {
                     unsafe {
-                        if (*entry).mark() == MarkColor::White && (*entry).is_young() {
+                        // Enqueue if White. If it's in nursery, it survives sweep.
+                        // If it's old-gen, it acts as a root to find young children.
+                        if (*entry).mark() == MarkColor::White {
                             (*entry).set_mark(MarkColor::Gray);
                             worklist.push_back(entry);
                         }
@@ -402,7 +406,6 @@ impl AllocationRegistry {
                         if !child_header.is_null()
                             && self.nursery.contains(child_header as *const u8)
                             && (*child_header).mark() == MarkColor::White
-                            && (*child_header).is_young()
                         {
                             (*child_header).set_mark(MarkColor::Gray);
                             worklist.push_back(child_header);
@@ -428,18 +431,22 @@ impl AllocationRegistry {
                 to_remove.push(entry);
                 continue;
             }
-            if !self.nursery.contains(entry as *const u8) {
-                // Not in nursery — shouldn't be here
-                to_remove.push(entry);
-                continue;
-            }
-            unsafe {
-                let header = &*entry;
-                // Remove if dead (white) or tenured (no longer young)
-                if header.mark() != MarkColor::Black || !header.is_young() {
-                    to_remove.push(entry);
+
+            // If it's in the nursery, we only keep it if it's still alive (marked Black)
+            // AND it's still young (non-tenured). If it's tenured, it's logically old
+            // and will be added back if it points to nursery, OR we can just keep it.
+            // For now, follow the existing pattern for nursery objects.
+            if self.nursery.contains(entry as *const u8) {
+                unsafe {
+                    let header = &*entry;
+                    if header.mark() != MarkColor::Black || !header.is_young() {
+                        to_remove.push(entry);
+                    }
                 }
             }
+            // If it's NOT in the nursery, it's an old-gen object.
+            // We keep it in the remembered set. Ideally we'd only keep it if it
+            // still points to the nursery, but we don't have that info here easily.
         }
         for entry in to_remove {
             self.remembered_set.remove(entry);
@@ -1718,7 +1725,10 @@ mod tests {
             (ptr as *mut u8).sub(std::mem::offset_of!(GcAllocation<i32>, value)) as *const GcHeader
         };
         unsafe {
-            assert!((*header_ptr).is_young(), "small object should be in nursery");
+            assert!(
+                (*header_ptr).is_young(),
+                "small object should be in nursery"
+            );
         }
 
         assert_eq!(registry.allocation_count(), 1);
@@ -1745,7 +1755,11 @@ mod tests {
         // Run minor GC with only ptr3 rooted
         let reclaimed = registry.collect_minor(&[header3]);
         assert!(reclaimed > 0, "minor GC should reclaim unreachable objects");
-        assert_eq!(registry.allocation_count(), 1, "only rooted object should survive");
+        assert_eq!(
+            registry.allocation_count(),
+            1,
+            "only rooted object should survive"
+        );
         assert!(registry.total_bytes() < bytes_before);
     }
 
@@ -1765,7 +1779,10 @@ mod tests {
 
         // Root both
         let reclaimed = registry.collect_minor(&[header1, header2]);
-        assert_eq!(reclaimed, 0, "no objects should be reclaimed when all are rooted");
+        assert_eq!(
+            reclaimed, 0,
+            "no objects should be reclaimed when all are rooted"
+        );
         assert_eq!(registry.allocation_count(), 2);
 
         // Values should still be accessible
@@ -1781,7 +1798,10 @@ mod tests {
         let mut registry = AllocationRegistry::new();
         // The nursery is 2MB — we need to fill 80% to trigger should_minor_gc()
 
-        assert!(!registry.should_minor_gc(), "empty nursery should not trigger minor GC");
+        assert!(
+            !registry.should_minor_gc(),
+            "empty nursery should not trigger minor GC"
+        );
 
         // Allocate enough to pass the 80% threshold
         // Each i32 GcAllocation is ~12 bytes, so we need many allocations
@@ -1791,10 +1811,15 @@ mod tests {
         let needed = threshold / alloc_size;
 
         for _ in 0..needed {
-            unsafe { gc_alloc_in(&registry, 0i32); }
+            unsafe {
+                gc_alloc_in(&registry, 0i32);
+            }
         }
 
-        assert!(registry.should_minor_gc(), "nursery at 80%+ should trigger minor GC");
+        assert!(
+            registry.should_minor_gc(),
+            "nursery at 80%+ should trigger minor GC"
+        );
     }
 
     #[test]

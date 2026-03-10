@@ -2424,6 +2424,7 @@ dependencies = [
  "icu_decimal",
  "icu_locale",
  "indexmap",
+ "itoa",
  "num-bigint",
  "num-traits",
  "otter-macros",

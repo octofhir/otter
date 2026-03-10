@@ -278,6 +278,22 @@ pub enum PropertyKey {
 }
 
 impl PropertyKey {
+    /// Ensure any GC-managed components (Strings/Symbols) in this key are tenured.
+    ///
+    /// This is required when storing keys in non-GC objects like Shapes,
+    /// because the GC won't see them as roots unless they are tenured or
+    /// the specific Shape is traced (which only happens from live JsObjects).
+    pub fn ensure_tenured(&self) {
+        match self {
+            Self::String(s) => {
+                s.header().set_tenured();
+                s.ensure_tenured();
+            }
+            Self::Symbol(sym) => sym.header().set_tenured(),
+            Self::Index(_) => {}
+        }
+    }
+
     /// Maximum valid array index per ECMA-262: 0 .. 2^32 - 2.
     /// The value 2^32 - 1 (4294967295) is NOT a valid array index.
     pub const MAX_ARRAY_INDEX: u32 = u32::MAX - 1; // 4294967294
@@ -1424,6 +1440,50 @@ impl JsObject {
             inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
             overflow_slots: ObjectCell::new(Vec::new()),
             overflow_meta: ObjectCell::new(Vec::new()),
+            dictionary_properties: ObjectCell::new(None),
+            prototype: ObjectCell::new(prototype),
+            elements: ObjectCell::new(ElementsKind::new()),
+            flags: ObjectCell::new(ObjectFlags {
+                extensible: true,
+                ..Default::default()
+            }),
+            argument_mapping: ObjectCell::new(None),
+        }
+    }
+
+    /// Create an object with a pre-built shape and slot values.
+    ///
+    /// Used by JSON.parse fast path to avoid per-property shape transitions.
+    /// `shape` must have exactly `values.len()` properties. Values are written
+    /// directly into inline/overflow slots by offset. All slots are data+writable.
+    pub(crate) fn with_shape_and_values(
+        prototype: Value,
+        shape: Arc<Shape>,
+        values: &[Value],
+    ) -> Self {
+        let mut inline_slots = [Value::undefined(); INLINE_PROPERTY_COUNT];
+        let mut inline_meta = [SlotMeta::EMPTY; INLINE_PROPERTY_COUNT];
+        let overflow_count = values.len().saturating_sub(INLINE_PROPERTY_COUNT);
+        let mut overflow_slots = Vec::with_capacity(overflow_count);
+        let mut overflow_meta = Vec::with_capacity(overflow_count);
+
+        for (i, val) in values.iter().enumerate() {
+            gc_write_barrier(val);
+            if i < INLINE_PROPERTY_COUNT {
+                inline_slots[i] = *val;
+                inline_meta[i] = SlotMeta::DEFAULT_DATA;
+            } else {
+                overflow_slots.push(*val);
+                overflow_meta.push(SlotMeta::DEFAULT_DATA);
+            }
+        }
+
+        Self {
+            shape: ObjectCell::new(shape),
+            inline_slots: ObjectCell::new(inline_slots),
+            inline_meta: ObjectCell::new(inline_meta),
+            overflow_slots: ObjectCell::new(overflow_slots),
+            overflow_meta: ObjectCell::new(overflow_meta),
             dictionary_properties: ObjectCell::new(None),
             prototype: ObjectCell::new(prototype),
             elements: ObjectCell::new(ElementsKind::new()),

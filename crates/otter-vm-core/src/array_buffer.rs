@@ -171,11 +171,11 @@ impl JsArrayBuffer {
 
     /// Write a byte at the given index
     pub fn set(&self, index: usize, value: u8) -> bool {
-        if let Some(data) = self.data.borrow_mut().as_mut() {
-            if let Some(cell) = data.get_mut(index) {
-                *cell = value;
-                return true;
-            }
+        if let Some(data) = self.data.borrow_mut().as_mut()
+            && let Some(cell) = data.get_mut(index)
+        {
+            *cell = value;
+            return true;
         }
         false
     }
@@ -183,11 +183,11 @@ impl JsArrayBuffer {
     /// Read bytes into a slice
     pub fn read_bytes(&self, offset: usize, dest: &mut [u8]) -> bool {
         let guard = self.data.borrow();
-        if let Some(data) = guard.as_ref() {
-            if offset + dest.len() <= data.len() {
-                dest.copy_from_slice(&data[offset..offset + dest.len()]);
-                return true;
-            }
+        if let Some(data) = guard.as_ref()
+            && offset + dest.len() <= data.len()
+        {
+            dest.copy_from_slice(&data[offset..offset + dest.len()]);
+            return true;
         }
         false
     }
@@ -195,11 +195,11 @@ impl JsArrayBuffer {
     /// Write bytes from a slice
     pub fn write_bytes(&self, offset: usize, src: &[u8]) -> bool {
         let mut guard = self.data.borrow_mut();
-        if let Some(data) = guard.as_mut() {
-            if offset + src.len() <= data.len() {
-                data[offset..offset + src.len()].copy_from_slice(src);
-                return true;
-            }
+        if let Some(data) = guard.as_mut()
+            && offset + src.len() <= data.len()
+        {
+            data[offset..offset + src.len()].copy_from_slice(src);
+            return true;
         }
         false
     }

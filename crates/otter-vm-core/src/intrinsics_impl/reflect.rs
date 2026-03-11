@@ -17,10 +17,12 @@ use otter_macros::dive;
 
 /// Helper to convert Value to PropertyKey
 pub fn to_property_key(value: &Value) -> PropertyKey {
-    if let Some(n) = value.as_number() {
-        if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
-            return PropertyKey::Index(n as u32);
-        }
+    if let Some(n) = value.as_number()
+        && n.fract() == 0.0
+        && n >= 0.0
+        && n <= u32::MAX as f64
+    {
+        return PropertyKey::Index(n as u32);
     }
     if let Some(s) = value.as_string() {
         // Use PropertyKey::string() to canonicalize numeric strings like "0" → Index(0)
@@ -45,7 +47,7 @@ pub fn to_property_key(value: &Value) -> PropertyKey {
 /// Get object from value
 fn get_target_object(value: &Value) -> Result<GcRef<JsObject>, VmError> {
     value.as_object().ok_or_else(|| {
-        VmError::type_error(&format!(
+        VmError::type_error(format!(
             "Reflect method requires an object target (got {})",
             value.type_of()
         ))
@@ -53,11 +55,11 @@ fn get_target_object(value: &Value) -> Result<GcRef<JsObject>, VmError> {
 }
 
 fn builtin_tag_for_value(value: &Value) -> Option<GcRef<JsString>> {
-    let mut current = value.clone();
-    if let Some(proxy) = current.as_proxy() {
-        if let Some(target) = proxy.target() {
-            current = target;
-        }
+    let mut current = *value;
+    if let Some(proxy) = current.as_proxy()
+        && let Some(target) = proxy.target()
+    {
+        current = target;
     }
     current
         .as_object()
@@ -105,14 +107,13 @@ fn is_constructor_value(value: &Value) -> bool {
     if !value.is_callable() {
         return false;
     }
-    if let Some(obj) = value.as_object() {
-        if obj
+    if let Some(obj) = value.as_object()
+        && obj
             .get(&PropertyKey::string("__non_constructor"))
             .and_then(|v| v.as_boolean())
             == Some(true)
-        {
-            return false;
-        }
+    {
+        return false;
     }
     true
 }
@@ -202,17 +203,11 @@ fn reflect_get(
     let property_key = args
         .get(1)
         .ok_or("Reflect.get requires a propertyKey argument")?;
-    let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
+    let receiver = args.get(2).cloned().unwrap_or(*target);
 
     if let Some(proxy) = target.as_proxy() {
         let key = to_property_key(property_key);
-        return crate::proxy_operations::proxy_get(
-            ncx,
-            proxy,
-            &key,
-            property_key.clone(),
-            receiver,
-        );
+        return crate::proxy_operations::proxy_get(ncx, proxy, &key, *property_key, receiver);
     }
 
     let obj = get_target_object(target)?;
@@ -222,10 +217,10 @@ fn reflect_get(
         match desc {
             PropertyDescriptor::Data { value, .. } => Ok(value),
             PropertyDescriptor::Accessor { get, .. } => {
-                if let Some(getter) = get {
-                    if !getter.is_undefined() {
-                        return ncx.call_function(&getter, receiver, &[]);
-                    }
+                if let Some(getter) = get
+                    && !getter.is_undefined()
+                {
+                    return ncx.call_function(&getter, receiver, &[]);
                 }
                 Ok(Value::undefined())
             }
@@ -250,18 +245,12 @@ fn reflect_set(
         .get(1)
         .ok_or("Reflect.set requires a propertyKey argument")?;
     let value = args.get(2).cloned().unwrap_or(Value::undefined());
-    let receiver = args.get(3).cloned().unwrap_or_else(|| target.clone());
+    let receiver = args.get(3).cloned().unwrap_or(*target);
 
     if let Some(proxy) = target.as_proxy() {
         let key = to_property_key(property_key);
-        let success = crate::proxy_operations::proxy_set(
-            ncx,
-            proxy,
-            &key,
-            property_key.clone(),
-            value,
-            receiver,
-        )?;
+        let success =
+            crate::proxy_operations::proxy_set(ncx, proxy, &key, *property_key, value, receiver)?;
         return Ok(Value::boolean(success));
     }
 
@@ -287,7 +276,7 @@ fn reflect_has(
 
     if let Some(proxy) = target.as_proxy() {
         let key = to_property_key(property_key);
-        let result = crate::proxy_operations::proxy_has(ncx, proxy, &key, property_key.clone())?;
+        let result = crate::proxy_operations::proxy_has(ncx, proxy, &key, *property_key)?;
         return Ok(Value::boolean(result));
     }
 
@@ -313,7 +302,7 @@ fn reflect_delete_property(
     if let Some(proxy) = target.as_proxy() {
         let key = to_property_key(property_key);
         let result =
-            crate::proxy_operations::proxy_delete_property(ncx, proxy, &key, property_key.clone())?;
+            crate::proxy_operations::proxy_delete_property(ncx, proxy, &key, *property_key)?;
         return Ok(Value::boolean(result));
     }
 
@@ -370,7 +359,7 @@ fn reflect_get_own_property_descriptor(
             ncx,
             proxy,
             &key,
-            property_key.clone(),
+            *property_key,
         )?;
         return Ok(result_desc
             .map(|desc| descriptor_to_value(desc, ncx))
@@ -425,8 +414,8 @@ fn reflect_define_property(
 
     if let Some(proxy) = target.as_proxy() {
         let full_desc = if desc.is_accessor_descriptor() {
-            let get_val = desc.get.clone().unwrap_or(Value::undefined());
-            let set_val = desc.set.clone().unwrap_or(Value::undefined());
+            let get_val = desc.get.unwrap_or(Value::undefined());
+            let set_val = desc.set.unwrap_or(Value::undefined());
             PropertyDescriptor::Accessor {
                 get: if get_val.is_undefined() {
                     None
@@ -446,7 +435,7 @@ fn reflect_define_property(
             }
         } else {
             PropertyDescriptor::data_with_attrs(
-                desc.value.clone().unwrap_or(Value::undefined()),
+                desc.value.unwrap_or(Value::undefined()),
                 PropertyAttributes {
                     writable: desc.writable.unwrap_or(false),
                     enumerable: desc.enumerable.unwrap_or(false),
@@ -458,7 +447,7 @@ fn reflect_define_property(
             ncx,
             proxy,
             &key,
-            property_key.clone(),
+            *property_key,
             &full_desc,
         )?;
         return Ok(Value::boolean(result));
@@ -617,7 +606,7 @@ fn reflect_construct(
     let args_list = args
         .get(1)
         .ok_or("Reflect.construct requires an argumentsList argument")?;
-    let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
+    let new_target = args.get(2).cloned().unwrap_or(*target);
 
     if let Some(proxy) = target.as_proxy() {
         if !is_constructor_value(&new_target) {
@@ -662,7 +651,7 @@ fn reflect_construct(
     let new_obj = GcRef::new(JsObject::new(proto));
     let this_val = Value::object(new_obj);
 
-    let result = ncx.call_function_construct(target, this_val.clone(), &args_array)?;
+    let result = ncx.call_function_construct(target, this_val, &args_array)?;
     if result.is_object() {
         Ok(result)
     } else {

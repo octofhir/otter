@@ -65,7 +65,7 @@ fn proxy_revocable(
         return Err(VmError::type_error("Proxy handler must be an object"));
     }
 
-    let revocable = JsProxy::revocable(target.clone(), handler.clone());
+    let revocable = JsProxy::revocable(*target, *handler);
 
     let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set("proxy".into(), Value::proxy(revocable.proxy));
@@ -156,6 +156,6 @@ pub fn proxy_constructor(
         return Err(VmError::type_error("Proxy handler must be an object"));
     }
 
-    let proxy = JsProxy::new(target.clone(), handler.clone());
+    let proxy = JsProxy::new(*target, *handler);
     Ok(Value::proxy(proxy))
 }

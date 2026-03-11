@@ -257,6 +257,7 @@ impl SlotMeta {
 
     /// Update enumerable bit
     #[inline]
+    #[allow(dead_code)]
     pub fn with_enumerable(self, e: bool) -> Self {
         if e {
             Self(self.0 | Self::ENUMERABLE_BIT)
@@ -727,7 +728,7 @@ impl PartialDescriptor {
     pub fn from_full(desc: &PropertyDescriptor) -> Self {
         match desc {
             PropertyDescriptor::Data { value, attributes } => PartialDescriptor {
-                value: Some(value.clone()),
+                value: Some(*value),
                 writable: Some(attributes.writable),
                 get: None,
                 set: None,
@@ -741,8 +742,8 @@ impl PartialDescriptor {
             } => PartialDescriptor {
                 value: None,
                 writable: None,
-                get: Some(get.clone().unwrap_or(Value::undefined())),
-                set: Some(set.clone().unwrap_or(Value::undefined())),
+                get: Some((*get).unwrap_or(Value::undefined())),
+                set: Some((*set).unwrap_or(Value::undefined())),
                 enumerable: Some(attributes.enumerable),
                 configurable: Some(attributes.configurable),
             },
@@ -771,11 +772,11 @@ pub fn get_value_full(
         match desc {
             PropertyDescriptor::Data { value, .. } => Ok(value),
             PropertyDescriptor::Accessor { get, .. } => {
-                if let Some(getter) = get {
-                    if !getter.is_undefined() {
-                        let this_val = Value::object(obj.clone());
-                        return ncx.call_function(&getter, this_val, &[]);
-                    }
+                if let Some(getter) = get
+                    && !getter.is_undefined()
+                {
+                    let this_val = Value::object(*obj);
+                    return ncx.call_function(&getter, this_val, &[]);
                 }
                 Ok(Value::undefined())
             }
@@ -798,12 +799,12 @@ pub(crate) fn set_value_full(
     if let Some(desc) = obj.lookup_property_descriptor(key) {
         match desc {
             PropertyDescriptor::Accessor { set, .. } => {
-                if let Some(setter) = set {
-                    if !setter.is_undefined() {
-                        let this_val = Value::object(obj.clone());
-                        ncx.call_function(&setter, this_val, &[value])?;
-                        return Ok(());
-                    }
+                if let Some(setter) = set
+                    && !setter.is_undefined()
+                {
+                    let this_val = Value::object(*obj);
+                    ncx.call_function(&setter, this_val, &[value])?;
+                    return Ok(());
                 }
                 return Err(crate::error::VmError::type_error(
                     "Cannot set property which has only a getter",
@@ -815,14 +816,14 @@ pub(crate) fn set_value_full(
                         "Cannot assign to read only property",
                     ));
                 }
-                let _ = obj.set(key.clone(), value);
+                let _ = obj.set(*key, value);
                 return Ok(());
             }
             PropertyDescriptor::Deleted => {}
         }
     }
     // Property doesn't exist or was deleted — add it
-    let _ = obj.set(key.clone(), value);
+    let _ = obj.set(*key, value);
     Ok(())
 }
 
@@ -933,7 +934,7 @@ pub struct ArgumentMapping {
 /// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
 /// for faster access. Additional properties overflow to the `properties` Vec.
 /// Both inline and overflow use flat Value slots + SlotMeta for storage.
-
+///
 /// The internal storage kind for indexed properties (elements).
 /// Used to optimize array storage and operations for common types (SMI and Doubles).
 #[derive(Clone, Debug)]
@@ -946,10 +947,16 @@ pub enum ElementsKind {
     Object(Vec<Value>),
 }
 
+impl Default for ElementsKind {
+    fn default() -> Self {
+        ElementsKind::Object(Vec::new())
+    }
+}
+
 impl ElementsKind {
     /// Create a new empty Object elements store
     pub fn new() -> Self {
-        ElementsKind::Object(Vec::new())
+        Self::default()
     }
 
     /// Return the length of the elements vector
@@ -964,8 +971,6 @@ impl ElementsKind {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-
 
     /// Clear the elements
     pub fn clear(&mut self) {
@@ -1476,6 +1481,7 @@ impl JsObject {
     /// Used by JSON.parse fast path to avoid per-property shape transitions.
     /// `shape` must have exactly `values.len()` properties. Values are written
     /// directly into inline/overflow slots by offset. All slots are data+writable.
+    #[allow(dead_code)]
     pub(crate) fn with_shape_and_values(
         prototype: Value,
         shape: Arc<Shape>,
@@ -1586,16 +1592,16 @@ impl JsObject {
         mapping
             .as_ref()
             .and_then(|m| m.cells.get(index))
-            .and_then(|cell| cell.clone())
+            .and_then(|cell| *cell)
     }
 
     /// Unmap a specific argument index (e.g., after defineProperty with accessor)
     pub fn unmap_argument(&self, index: usize) {
         let mut mapping = self.argument_mapping.borrow_mut();
-        if let Some(m) = mapping.as_mut() {
-            if index < m.cells.len() {
-                m.cells[index] = None;
-            }
+        if let Some(m) = mapping.as_mut()
+            && index < m.cells.len()
+        {
+            m.cells[index] = None;
         }
     }
 
@@ -1608,7 +1614,7 @@ impl JsObject {
     pub fn argument_mapping_cells(&self) -> Vec<UpvalueCell> {
         let mapping = self.argument_mapping.borrow();
         match mapping.as_ref() {
-            Some(m) => m.cells.iter().filter_map(|c| c.clone()).collect(),
+            Some(m) => m.cells.iter().filter_map(|c| *c).collect(),
             None => Vec::new(),
         }
     }
@@ -1755,8 +1761,8 @@ impl JsObject {
                 attributes: meta.to_attributes(),
             })
         } else if meta.is_accessor() {
-            if let Some(pair) = slot.as_accessor_pair() {
-                Some(PropertyDescriptor::Accessor {
+            slot.as_accessor_pair()
+                .map(|pair| PropertyDescriptor::Accessor {
                     get: if pair.getter.is_undefined() {
                         None
                     } else {
@@ -1769,10 +1775,6 @@ impl JsObject {
                     },
                     attributes: meta.to_attributes(),
                 })
-            } else {
-                // Malformed accessor slot — treat as absent
-                None
-            }
         } else {
             None
         }
@@ -1798,9 +1800,9 @@ impl JsObject {
                     self.inline_slots.borrow_mut()[offset] = value;
                     return Ok(());
                 }
-                return Err(SetPropertyError::NonWritable);
+                Err(SetPropertyError::NonWritable)
             } else if m.is_accessor() {
-                return Err(SetPropertyError::AccessorWithoutSetter);
+                Err(SetPropertyError::AccessorWithoutSetter)
             } else {
                 // Empty slot (deleted) — re-create as data property
                 if !is_extensible {
@@ -1812,7 +1814,7 @@ impl JsObject {
                 gc_write_barrier(&value);
                 self.inline_slots.borrow_mut()[offset] = value;
                 self.inline_meta.borrow_mut()[offset] = SlotMeta::DEFAULT_DATA;
-                return Ok(());
+                Ok(())
             }
         } else {
             let idx = offset - INLINE_PROPERTY_COUNT;
@@ -1909,6 +1911,7 @@ impl JsObject {
 
     /// Get raw shape pointer... (for pointer comparison only)
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn shape_ptr_raw(&self) -> u64 {
         let borrow = self.shape.borrow();
         std::sync::Arc::as_ptr(&*borrow) as u64
@@ -1920,7 +1923,7 @@ impl JsObject {
     ///
     /// Caller must guarantee no active mutable borrow of `shape`.
     #[inline]
-    #[allow(unsafe_code)]
+    #[allow(unsafe_code, dead_code)]
     pub(crate) unsafe fn shape_ptr_raw_unchecked(&self) -> u64 {
         std::sync::Arc::as_ptr(unsafe { self.shape.get_unchecked() }) as u64
     }
@@ -2024,10 +2027,10 @@ impl JsObject {
 
         // String exotic objects: synthesize "length" and character indices
         if self.flags.borrow().is_string_exotic {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    return Some(Value::int32(self.elements.borrow().len() as i32));
-                }
+            if let PropertyKey::String(s) = key
+                && s.as_str() == "length"
+            {
+                return Some(Value::int32(self.elements.borrow().len() as i32));
             }
             if let PropertyKey::Index(i) = key {
                 let elements = self.elements.borrow();
@@ -2041,28 +2044,28 @@ impl JsObject {
 
         // Dictionary mode: use HashMap lookup
         if self.is_dictionary_mode() {
-            if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-                if let Some(desc) = dict.get(key) {
-                    match desc {
-                        PropertyDescriptor::Data { value, .. } => return Some(value.clone()),
-                        PropertyDescriptor::Accessor { .. } => return None,
-                        PropertyDescriptor::Deleted => {}
-                    }
+            if let Some(dict) = self.dictionary_properties.borrow().as_ref()
+                && let Some(desc) = dict.get(key)
+            {
+                match desc {
+                    PropertyDescriptor::Data { value, .. } => return Some(*value),
+                    PropertyDescriptor::Accessor { .. } => return None,
+                    PropertyDescriptor::Deleted => {}
                 }
             }
             // Fall through to indexed elements and prototype chain
         } else {
             // Check own properties first via shape lookup
             let shape = self.shape.borrow();
-            if let Some(offset) = shape.get_offset(key) {
-                if let Some(desc) = self.get_property_entry_by_offset(offset) {
-                    match desc {
-                        PropertyDescriptor::Data { value, .. } => return Some(value),
-                        // Accessors are handled via `lookup_property_descriptor` in the interpreter.
-                        // For this low-level helper, treat them as non-values.
-                        PropertyDescriptor::Accessor { .. } => return None,
-                        PropertyDescriptor::Deleted => {}
-                    }
+            if let Some(offset) = shape.get_offset(key)
+                && let Some(desc) = self.get_property_entry_by_offset(offset)
+            {
+                match desc {
+                    PropertyDescriptor::Data { value, .. } => return Some(value),
+                    // Accessors are handled via `lookup_property_descriptor` in the interpreter.
+                    // For this low-level helper, treat them as non-values.
+                    PropertyDescriptor::Accessor { .. } => return None,
+                    PropertyDescriptor::Deleted => {}
                 }
             }
         }
@@ -2076,9 +2079,9 @@ impl JsObject {
             }
             let elements = self.elements.borrow();
             if idx < elements.len() {
-                let val = &elements.get(idx).unwrap_or(Value::undefined());
+                let val = &elements.get(idx).unwrap_or_default();
                 if !val.is_hole() {
-                    return Some(val.clone());
+                    return Some(*val);
                 }
                 // Hole: fall through to prototype chain (returns None → undefined)
             }
@@ -2089,7 +2092,7 @@ impl JsObject {
         }
 
         // Check prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.borrow().clone();
+        let mut current_proto: Value = *self.prototype.borrow();
         let mut depth = 0;
 
         loop {
@@ -2103,31 +2106,31 @@ impl JsObject {
 
                 // Check proto: dictionary mode first, then shape lookup
                 if proto_obj.is_dictionary_mode() {
-                    if let Some(dict) = proto_obj.dictionary_properties.borrow().as_ref() {
-                        if let Some(desc) = dict.get(key) {
-                            match desc {
-                                PropertyDescriptor::Data { value, .. } => {
-                                    return Some(value.clone());
-                                }
-                                PropertyDescriptor::Accessor { .. } => return None,
-                                PropertyDescriptor::Deleted => {}
+                    if let Some(dict) = proto_obj.dictionary_properties.borrow().as_ref()
+                        && let Some(desc) = dict.get(key)
+                    {
+                        match desc {
+                            PropertyDescriptor::Data { value, .. } => {
+                                return Some(*value);
                             }
+                            PropertyDescriptor::Accessor { .. } => return None,
+                            PropertyDescriptor::Deleted => {}
                         }
                     }
                 } else {
                     let shape = proto_obj.shape.borrow();
-                    if let Some(offset) = shape.get_offset(key) {
-                        if let Some(desc) = proto_obj.get_property_entry_by_offset(offset) {
-                            match desc {
-                                PropertyDescriptor::Data { value, .. } => return Some(value),
-                                PropertyDescriptor::Accessor { .. } => return None,
-                                PropertyDescriptor::Deleted => {}
-                            }
+                    if let Some(offset) = shape.get_offset(key)
+                        && let Some(desc) = proto_obj.get_property_entry_by_offset(offset)
+                    {
+                        match desc {
+                            PropertyDescriptor::Data { value, .. } => return Some(value),
+                            PropertyDescriptor::Accessor { .. } => return None,
+                            PropertyDescriptor::Deleted => {}
                         }
                     }
                 }
 
-                current_proto = proto_obj.prototype.borrow().clone();
+                current_proto = *proto_obj.prototype.borrow();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 // Note: This bypasses proxy traps, which is incorrect per spec, but
@@ -2236,37 +2239,36 @@ impl JsObject {
     /// Get own property descriptor (does not walk prototype chain).
     pub fn get_own_property_descriptor(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // Array "length" property: synthesize as non-configurable, non-enumerable, writable
-        if self.is_array() {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    let flags = self.flags.borrow();
-                    return Some(PropertyDescriptor::Data {
-                        value: Value::number(self.array_length() as f64),
-                        attributes: PropertyAttributes {
-                            writable: !flags.frozen && flags.array_length_writable.unwrap_or(true),
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    });
-                }
-            }
+        if self.is_array()
+            && let PropertyKey::String(s) = key
+            && s.as_str() == "length"
+        {
+            let flags = self.flags.borrow();
+            return Some(PropertyDescriptor::Data {
+                value: Value::number(self.array_length() as f64),
+                attributes: PropertyAttributes {
+                    writable: !flags.frozen && flags.array_length_writable.unwrap_or(true),
+                    enumerable: false,
+                    configurable: false,
+                },
+            });
         }
 
         // ES §10.4.3.1: String exotic [[GetOwnProperty]] — synthesize
         // character-index descriptors and "length" for String wrapper objects.
         if self.flags.borrow().is_string_exotic {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    let len = self.elements.borrow().len();
-                    return Some(PropertyDescriptor::Data {
-                        value: Value::number(len as f64),
-                        attributes: PropertyAttributes {
-                            writable: false,
-                            enumerable: false,
-                            configurable: false,
-                        },
-                    });
-                }
+            if let PropertyKey::String(s) = key
+                && s.as_str() == "length"
+            {
+                let len = self.elements.borrow().len();
+                return Some(PropertyDescriptor::Data {
+                    value: Value::number(len as f64),
+                    attributes: PropertyAttributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    },
+                });
             }
             if let PropertyKey::Index(i) = key {
                 let elements = self.elements.borrow();
@@ -2332,7 +2334,7 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
-            if idx < elements.len() && !elements.get(idx).unwrap_or(Value::undefined()).is_hole() {
+            if idx < elements.len() && !elements.get(idx).unwrap_or_default().is_hole() {
                 let flags = self.flags.borrow();
                 return Some(PropertyDescriptor::Data {
                     value: elements.get(idx).unwrap_or_else(Value::undefined),
@@ -2355,7 +2357,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.borrow().clone();
+        let mut current_proto: Value = *self.prototype.borrow();
         let mut depth = 0;
 
         loop {
@@ -2389,7 +2391,7 @@ impl JsObject {
                     }
                 }
 
-                current_proto = proto_obj.prototype.borrow().clone();
+                current_proto = *proto_obj.prototype.borrow();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 depth += 1;
@@ -2428,19 +2430,18 @@ impl JsObject {
         }
 
         // Array exotic: intercept `length` writes to truncate/extend
-        if is_array {
-            if let PropertyKey::String(s) = &key {
-                if s.as_str() == "length" {
-                    let new_len = crate::globals::to_number(&value);
-                    if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
-                        return Err(SetPropertyError::InvalidArrayLength);
-                    }
-                    if self.set_array_length(new_len as u32) {
-                        return Ok(());
-                    }
-                    return Err(SetPropertyError::InvalidArrayLength);
-                }
+        if is_array
+            && let PropertyKey::String(s) = &key
+            && s.as_str() == "length"
+        {
+            let new_len = crate::globals::to_number(&value);
+            if new_len < 0.0 || new_len != (new_len as u32 as f64) || new_len.is_nan() {
+                return Err(SetPropertyError::InvalidArrayLength);
             }
+            if self.set_array_length(new_len as u32) {
+                return Ok(());
+            }
+            return Err(SetPropertyError::InvalidArrayLength);
         }
 
         // String exotic objects: character indices are non-writable
@@ -2451,10 +2452,10 @@ impl JsObject {
                     return Err(SetPropertyError::NonWritable);
                 }
             }
-            if let PropertyKey::String(s) = &key {
-                if s.as_str() == "length" {
-                    return Err(SetPropertyError::NonWritable);
-                }
+            if let PropertyKey::String(s) = &key
+                && s.as_str() == "length"
+            {
+                return Err(SetPropertyError::NonWritable);
             }
         }
 
@@ -2464,7 +2465,7 @@ impl JsObject {
             // For mapped arguments: write through UpvalueCell for aliased parameters
             if let Some(cell) = self.get_argument_cell(idx) {
                 gc_write_barrier(&value);
-                cell.set(value.clone());
+                cell.set(value);
                 // Also update elements for when mapping is later removed
                 let mut elements = self.elements.borrow_mut();
                 if idx < elements.len() {
@@ -2563,10 +2564,7 @@ impl JsObject {
                 if let Some(map) = dict.as_mut() {
                     gc_write_barrier(&value);
                     // Re-insert the key we were adding
-                    map.insert(
-                        next_shape.key.clone().unwrap(),
-                        PropertyDescriptor::data(value),
-                    );
+                    map.insert(next_shape.key.unwrap(), PropertyDescriptor::data(value));
                     return Ok(());
                 }
                 return Err(SetPropertyError::NonExtensible);
@@ -2603,12 +2601,11 @@ impl JsObject {
     /// Delete property
     pub fn delete(&self, key: &PropertyKey) -> bool {
         // String exotic objects: "length" property is non-configurable
-        if self.flags.borrow().is_string_exotic {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    return false;
-                }
-            }
+        if self.flags.borrow().is_string_exotic
+            && let PropertyKey::String(s) = key
+            && s.as_str() == "length"
+        {
+            return false;
         }
         // For mapped arguments: unmap the index on delete
         if let PropertyKey::Index(i) = key {
@@ -2652,7 +2649,7 @@ impl JsObject {
             // If the element exists as an own property, deletion must fail.
             let element_exists = {
                 let elements = self.elements.borrow();
-                idx < elements.len() && !elements.get(idx).unwrap_or(Value::undefined()).is_hole()
+                idx < elements.len() && !elements.get(idx).unwrap_or_default().is_hole()
             };
             if element_exists {
                 let flags = self.flags.borrow();
@@ -2674,7 +2671,7 @@ impl JsObject {
                 // Trim trailing holes to keep elements vec compact
                 while elements
                     .get(elements.len().saturating_sub(1))
-                    .map_or(false, |v| v.is_hole())
+                    .is_some_and(|v| v.is_hole())
                 {
                     elements.pop();
                 }
@@ -2696,10 +2693,10 @@ impl JsObject {
         if self.is_dictionary_mode() {
             let mut dict = self.dictionary_properties.borrow_mut();
             if let Some(map) = dict.as_mut() {
-                if let Some(desc) = map.get(key) {
-                    if !desc.is_configurable() {
-                        return false;
-                    }
+                if let Some(desc) = map.get(key)
+                    && !desc.is_configurable()
+                {
+                    return false;
                 }
                 map.shift_remove(key);
             }
@@ -2769,20 +2766,19 @@ impl JsObject {
     /// Check if object has own property
     pub fn has_own(&self, key: &PropertyKey) -> bool {
         // Array "length" is a virtual property (synthesized, not stored in shape)
-        if self.is_array() {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    return true;
-                }
-            }
+        if self.is_array()
+            && let PropertyKey::String(s) = key
+            && s.as_str() == "length"
+        {
+            return true;
         }
 
         // String exotic objects: character indices and "length" are own properties
         if self.flags.borrow().is_string_exotic {
-            if let PropertyKey::String(s) = key {
-                if s.as_str() == "length" {
-                    return true;
-                }
+            if let PropertyKey::String(s) = key
+                && s.as_str() == "length"
+            {
+                return true;
             }
             if let PropertyKey::Index(i) = key {
                 let idx = *i as usize;
@@ -2806,19 +2802,19 @@ impl JsObject {
             }
         } else {
             let shape = self.shape.borrow();
-            if let Some(offset) = shape.get_offset(key) {
-                if self.get_property_entry_by_offset(offset).is_some() {
-                    return true;
-                }
+            if let Some(offset) = shape.get_offset(key)
+                && self.get_property_entry_by_offset(offset).is_some()
+            {
+                return true;
             }
             // For Index keys, also try as String (e.g., Index(1) -> String("1"))
             // because set() converts non-array Index keys to String for shape storage
             if let PropertyKey::Index(i) = key {
                 let str_key = PropertyKey::String(JsString::intern(&i.to_string()));
-                if let Some(offset) = shape.get_offset(&str_key) {
-                    if self.get_property_entry_by_offset(offset).is_some() {
-                        return true;
-                    }
+                if let Some(offset) = shape.get_offset(&str_key)
+                    && self.get_property_entry_by_offset(offset).is_some()
+                {
+                    return true;
                 }
             }
         }
@@ -2827,8 +2823,7 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
-            return idx < elements.len()
-                && !elements.get(idx).unwrap_or(Value::undefined()).is_hole();
+            return idx < elements.len() && !elements.get(idx).unwrap_or_default().is_hole();
         }
 
         false
@@ -2841,7 +2836,7 @@ impl JsObject {
         }
 
         // Walk prototype chain iteratively to avoid stack overflow
-        let mut current_proto: Value = self.prototype.borrow().clone();
+        let mut current_proto: Value = *self.prototype.borrow();
         let mut depth = 0;
 
         loop {
@@ -2855,7 +2850,7 @@ impl JsObject {
                     return true;
                 }
 
-                current_proto = proto_obj.prototype.borrow().clone();
+                current_proto = *proto_obj.prototype.borrow();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - look at target transparently
                 depth += 1;
@@ -2895,10 +2890,10 @@ impl JsObject {
                             {
                                 integer_keys.push(n);
                             } else {
-                                string_keys.push(key.clone());
+                                string_keys.push(*key);
                             }
                         }
-                        _ => string_keys.push(key.clone()),
+                        _ => string_keys.push(*key),
                     }
                 }
             }
@@ -2927,8 +2922,7 @@ impl JsObject {
         // Add indexed elements (skip holes — they are absent per spec)
         let elements = self.elements.borrow();
         for i in 0..elements.len() {
-            if !elements.get(i).unwrap_or(Value::undefined()).is_hole()
-                && !integer_keys.contains(&(i as u32))
+            if !elements.get(i).unwrap_or_default().is_hole() && !integer_keys.contains(&(i as u32))
             {
                 integer_keys.push(i as u32);
             }
@@ -3030,7 +3024,7 @@ impl JsObject {
                 } else if let PropertyDescriptor::Data { value, .. } = &desc {
                     // Data descriptor with explicit value: update through cell then unmap
                     if let Some(cell) = self.get_argument_cell(idx) {
-                        cell.set(value.clone());
+                        cell.set(*value);
                     }
                 }
             }
@@ -3075,10 +3069,10 @@ impl JsObject {
             }
 
             // Update existing property - validate change
-            if let Some(existing) = self.get_property_entry_by_offset(off) {
-                if Self::validate_property_descriptor_change(&existing, &desc).is_err() {
-                    return false;
-                }
+            if let Some(existing) = self.get_property_entry_by_offset(off)
+                && Self::validate_property_descriptor_change(&existing, &desc).is_err()
+            {
+                return false;
             }
             Self::write_desc_to_slot(self, off, &desc);
             return true;
@@ -3093,7 +3087,7 @@ impl JsObject {
         let mut shape_write = self.shape.borrow_mut();
 
         // Transition to new shape
-        let next_shape = shape_write.transition(key.clone());
+        let next_shape = shape_write.transition(key);
         let offset = next_shape
             .offset
             .expect("Shape transition should have an offset");
@@ -3181,7 +3175,7 @@ impl JsObject {
 
         // New property: transition shape
         let mut shape_write = self.shape.borrow_mut();
-        let next_shape = shape_write.transition(key.clone());
+        let next_shape = shape_write.transition(key);
         let offset = next_shape
             .offset
             .expect("Shape transition should have an offset");
@@ -3210,10 +3204,10 @@ impl JsObject {
 
         // Array exotic [[DefineOwnProperty]] (ES2026 §10.4.2.1)
         if self.is_array() {
-            if let PropertyKey::String(ref s) = key {
-                if s.as_str() == "length" {
-                    return self.array_define_own_length(desc);
-                }
+            if let PropertyKey::String(ref s) = key
+                && s.as_str() == "length"
+            {
+                return self.array_define_own_length(desc);
             }
             // Check if key is an array index
             if let Some(index) = Self::to_array_index(&key) {
@@ -3227,10 +3221,10 @@ impl JsObject {
             if self.get_argument_cell(idx).is_some() {
                 if desc.is_accessor_descriptor() {
                     self.unmap_argument(idx);
-                } else if let Some(ref val) = desc.value {
-                    if let Some(cell) = self.get_argument_cell(idx) {
-                        cell.set(val.clone());
-                    }
+                } else if let Some(ref val) = desc.value
+                    && let Some(cell) = self.get_argument_cell(idx)
+                {
+                    cell.set(*val);
                 }
             }
         }
@@ -3247,8 +3241,8 @@ impl JsObject {
                 }
                 // Step 2.c-d: Create new property from partial with defaults
                 let new_desc = if desc.is_accessor_descriptor() {
-                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
-                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    let get_val = desc.get.unwrap_or_default();
+                    let set_val = desc.set.unwrap_or_default();
                     PropertyDescriptor::Accessor {
                         get: if get_val.is_undefined() {
                             None
@@ -3268,7 +3262,7 @@ impl JsObject {
                     }
                 } else {
                     PropertyDescriptor::Data {
-                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        value: desc.value.unwrap_or_default(),
                         attributes: PropertyAttributes {
                             writable: desc.writable.unwrap_or(false),
                             enumerable: desc.enumerable.unwrap_or(false),
@@ -3277,7 +3271,7 @@ impl JsObject {
                     }
                 };
                 self.store_property(key, new_desc);
-                return true;
+                true
             }
             Some(ref existing) => {
                 // Step 3: If every field in desc is absent, return true
@@ -3295,10 +3289,10 @@ impl JsObject {
                         return false;
                     }
                     // 4.b: Cannot change enumerable
-                    if let Some(new_enum) = desc.enumerable {
-                        if new_enum != current_enumerable {
-                            return false;
-                        }
+                    if let Some(new_enum) = desc.enumerable
+                        && new_enum != current_enumerable
+                    {
+                        return false;
                     }
                 }
 
@@ -3333,20 +3327,18 @@ impl JsObject {
                         value: curr_val,
                         attributes: curr_attrs,
                     } = existing
+                        && !current_configurable
+                        && !curr_attrs.writable
                     {
-                        if !current_configurable {
-                            if !curr_attrs.writable {
-                                // Step 7.a.i: Cannot make writable
-                                if desc.writable == Some(true) {
-                                    return false;
-                                }
-                                // Step 7.a.ii: Cannot change value (SameValue check)
-                                if let Some(ref new_val) = desc.value {
-                                    if !same_value(&curr_val, new_val) {
-                                        return false;
-                                    }
-                                }
-                            }
+                        // Step 7.a.i: Cannot make writable
+                        if desc.writable == Some(true) {
+                            return false;
+                        }
+                        // Step 7.a.ii: Cannot change value (SameValue check)
+                        if let Some(ref new_val) = desc.value
+                            && !same_value(curr_val, new_val)
+                        {
+                            return false;
                         }
                     }
                     let merged = Self::merge_partial_with_current(existing, desc);
@@ -3360,21 +3352,20 @@ impl JsObject {
                     set: curr_set,
                     ..
                 } = &existing
+                    && !current_configurable
                 {
-                    if !current_configurable {
-                        // Step 8.a.i: Cannot change set
-                        if let Some(ref new_set) = desc.set {
-                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                            if !same_value(&curr_set_val, new_set) {
-                                return false;
-                            }
+                    // Step 8.a.i: Cannot change set
+                    if let Some(ref new_set) = desc.set {
+                        let curr_set_val = (*curr_set).unwrap_or(Value::undefined());
+                        if !same_value(&curr_set_val, new_set) {
+                            return false;
                         }
-                        // Step 8.a.ii: Cannot change get
-                        if let Some(ref new_get) = desc.get {
-                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                            if !same_value(&curr_get_val, new_get) {
-                                return false;
-                            }
+                    }
+                    // Step 8.a.ii: Cannot change get
+                    if let Some(ref new_get) = desc.get {
+                        let curr_get_val = (*curr_get).unwrap_or(Value::undefined());
+                        if !same_value(&curr_get_val, new_get) {
+                            return false;
                         }
                     }
                 }
@@ -3396,7 +3387,7 @@ impl JsObject {
                 value: curr_val,
                 attributes: curr_attrs,
             } => {
-                let new_value = desc.value.clone().unwrap_or_else(|| curr_val.clone());
+                let new_value = desc.value.unwrap_or(*curr_val);
                 let new_writable = desc.writable.unwrap_or(curr_attrs.writable);
                 let new_enumerable = desc.enumerable.unwrap_or(curr_attrs.enumerable);
                 let new_configurable = desc.configurable.unwrap_or(curr_attrs.configurable);
@@ -3417,14 +3408,14 @@ impl JsObject {
                 // For get/set: None in partial = absent (preserve current),
                 // Some(undefined) = explicitly clear, Some(fn) = set to fn.
                 let new_get = match &desc.get {
-                    None => curr_get.clone(),
+                    None => *curr_get,
                     Some(v) if v.is_undefined() => None,
-                    Some(v) => Some(v.clone()),
+                    Some(v) => Some(*v),
                 };
                 let new_set = match &desc.set {
-                    None => curr_set.clone(),
+                    None => *curr_set,
                     Some(v) if v.is_undefined() => None,
-                    Some(v) => Some(v.clone()),
+                    Some(v) => Some(*v),
                 };
                 let new_enumerable = desc.enumerable.unwrap_or(curr_attrs.enumerable);
                 let new_configurable = desc.configurable.unwrap_or(curr_attrs.configurable);
@@ -3441,8 +3432,8 @@ impl JsObject {
             PropertyDescriptor::Deleted => {
                 // Shouldn't happen (caller checks), but handle gracefully
                 if desc.is_accessor_descriptor() {
-                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
-                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    let get_val = desc.get.unwrap_or_default();
+                    let set_val = desc.set.unwrap_or_default();
                     PropertyDescriptor::Accessor {
                         get: if get_val.is_undefined() {
                             None
@@ -3462,7 +3453,7 @@ impl JsObject {
                     }
                 } else {
                     PropertyDescriptor::Data {
-                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        value: desc.value.unwrap_or_default(),
                         attributes: PropertyAttributes {
                             writable: desc.writable.unwrap_or(false),
                             enumerable: desc.enumerable.unwrap_or(false),
@@ -3485,8 +3476,8 @@ impl JsObject {
 
         if desc.is_accessor_descriptor() {
             // Converting to accessor
-            let get_val = desc.get.clone().unwrap_or(Value::undefined());
-            let set_val = desc.set.clone().unwrap_or(Value::undefined());
+            let get_val = desc.get.unwrap_or_default();
+            let set_val = desc.set.unwrap_or_default();
             PropertyDescriptor::Accessor {
                 get: if get_val.is_undefined() {
                     None
@@ -3507,7 +3498,7 @@ impl JsObject {
         } else {
             // Converting to data
             PropertyDescriptor::Data {
-                value: desc.value.clone().unwrap_or(Value::undefined()),
+                value: desc.value.unwrap_or_default(),
                 attributes: PropertyAttributes {
                     writable: desc.writable.unwrap_or(false),
                     enumerable: desc.enumerable.unwrap_or(curr_enumerable),
@@ -3550,7 +3541,7 @@ impl JsObject {
                 }
                 return true;
             }
-            Some(v) => v.clone(),
+            Some(v) => *v,
         };
 
         // ToUint32
@@ -3580,10 +3571,10 @@ impl JsObject {
             // Growing or same: just validate and set
             if !old_len_writable {
                 // Non-writable length: can only succeed if value is same
-                if let Some(ref v) = new_desc.value {
-                    if !same_value(&Value::number(old_len as f64), v) {
-                        return false;
-                    }
+                if let Some(ref v) = new_desc.value
+                    && !same_value(&Value::number(old_len as f64), v)
+                {
+                    return false;
                 }
             }
             self.set_array_length(new_len);
@@ -3630,7 +3621,7 @@ impl JsObject {
 
         // For simple data properties on arrays, store in elements array
         let idx = index as usize;
-        let value = desc.value.clone().unwrap_or(Value::undefined());
+        let value = desc.value.unwrap_or_default();
 
         // Check if element already exists in elements
         let elements_len = self.elements.borrow().len();
@@ -3720,8 +3711,8 @@ impl JsObject {
                     return false;
                 }
                 let new_desc = if desc.is_accessor_descriptor() {
-                    let get_val = desc.get.clone().unwrap_or(Value::undefined());
-                    let set_val = desc.set.clone().unwrap_or(Value::undefined());
+                    let get_val = desc.get.unwrap_or_default();
+                    let set_val = desc.set.unwrap_or_default();
                     PropertyDescriptor::Accessor {
                         get: if get_val.is_undefined() {
                             None
@@ -3741,7 +3732,7 @@ impl JsObject {
                     }
                 } else {
                     PropertyDescriptor::Data {
-                        value: desc.value.clone().unwrap_or(Value::undefined()),
+                        value: desc.value.unwrap_or_default(),
                         attributes: PropertyAttributes {
                             writable: desc.writable.unwrap_or(false),
                             enumerable: desc.enumerable.unwrap_or(false),
@@ -3761,10 +3752,10 @@ impl JsObject {
                     if desc.configurable == Some(true) {
                         return false;
                     }
-                    if let Some(new_enum) = desc.enumerable {
-                        if new_enum != existing.enumerable() {
-                            return false;
-                        }
+                    if let Some(new_enum) = desc.enumerable
+                        && new_enum != existing.enumerable()
+                    {
+                        return false;
                     }
                 }
                 if desc.is_generic_descriptor() {
@@ -3787,16 +3778,16 @@ impl JsObject {
                         value: curr_val,
                         attributes: curr_attrs,
                     } = existing
+                        && !current_configurable
+                        && !curr_attrs.writable
                     {
-                        if !current_configurable && !curr_attrs.writable {
-                            if desc.writable == Some(true) {
-                                return false;
-                            }
-                            if let Some(ref new_val) = desc.value {
-                                if !same_value(&curr_val, new_val) {
-                                    return false;
-                                }
-                            }
+                        if desc.writable == Some(true) {
+                            return false;
+                        }
+                        if let Some(ref new_val) = desc.value
+                            && !same_value(curr_val, new_val)
+                        {
+                            return false;
                         }
                     }
                     let merged = Self::merge_partial_with_current(existing, desc);
@@ -3809,19 +3800,18 @@ impl JsObject {
                     set: curr_set,
                     ..
                 } = &existing
+                    && !current_configurable
                 {
-                    if !current_configurable {
-                        if let Some(ref new_set) = desc.set {
-                            let curr_set_val = curr_set.clone().unwrap_or(Value::undefined());
-                            if !same_value(&curr_set_val, new_set) {
-                                return false;
-                            }
+                    if let Some(ref new_set) = desc.set {
+                        let curr_set_val = (*curr_set).unwrap_or(Value::undefined());
+                        if !same_value(&curr_set_val, new_set) {
+                            return false;
                         }
-                        if let Some(ref new_get) = desc.get {
-                            let curr_get_val = curr_get.clone().unwrap_or(Value::undefined());
-                            if !same_value(&curr_get_val, new_get) {
-                                return false;
-                            }
+                    }
+                    if let Some(ref new_get) = desc.get {
+                        let curr_get_val = (*curr_get).unwrap_or(Value::undefined());
+                        if !same_value(&curr_get_val, new_get) {
+                            return false;
                         }
                     }
                 }
@@ -3834,7 +3824,7 @@ impl JsObject {
 
     /// Get prototype
     pub fn prototype(&self) -> Value {
-        self.prototype.borrow().clone()
+        *self.prototype.borrow()
     }
 
     /// Set prototype
@@ -3847,7 +3837,7 @@ impl JsObject {
 
         // Check for cycles and excessive depth
         let self_ptr = self as *const JsObject;
-        let mut current_proto = prototype.clone();
+        let mut current_proto = prototype;
         let mut depth = 0;
 
         loop {
@@ -3859,7 +3849,7 @@ impl JsObject {
                 if proto_obj.as_ptr() == self_ptr {
                     return false; // Would create cycle
                 }
-                current_proto = proto_obj.prototype.borrow().clone();
+                current_proto = *proto_obj.prototype.borrow();
             } else if let Some(proxy) = current_proto.as_proxy() {
                 // Proxy in prototype chain - check its target for cycles
                 depth += 1;
@@ -3985,10 +3975,10 @@ impl JsObject {
                 if desc.is_configurable() {
                     return false;
                 }
-                if let PropertyDescriptor::Data { attributes, .. } = &desc {
-                    if attributes.writable {
-                        return false;
-                    }
+                if let PropertyDescriptor::Data { attributes, .. } = &desc
+                    && attributes.writable
+                {
+                    return false;
                 }
             }
         }
@@ -4054,10 +4044,10 @@ impl JsObject {
         drop(flags);
         // Slow path: check every own property
         for key in self.own_keys() {
-            if let Some(desc) = self.get_own_property_descriptor(&key) {
-                if desc.is_configurable() {
-                    return false;
-                }
+            if let Some(desc) = self.get_own_property_descriptor(&key)
+                && desc.is_configurable()
+            {
+                return false;
             }
         }
         true
@@ -4157,9 +4147,9 @@ impl JsObject {
         // This covers 99.9% of arrays.
         let elements = self.elements.borrow();
         if index < elements.len() {
-            let val = &elements.get(index).unwrap_or(Value::undefined());
+            let val = &elements.get(index).unwrap_or_default();
             if !val.is_hole() {
-                return Some(val.clone());
+                return Some(*val);
             }
         }
         drop(elements);
@@ -4194,7 +4184,7 @@ impl JsObject {
         // For mapped arguments: write through UpvalueCell for aliased parameters
         if let Some(cell) = self.get_argument_cell(index) {
             gc_write_barrier(&value);
-            cell.set(value.clone());
+            cell.set(value);
             // Also update elements for when mapping is later removed
             let mut elements = self.elements.borrow_mut();
             if index < elements.len() {
@@ -4236,6 +4226,7 @@ impl JsObject {
     /// Used by parsers/builders (e.g. JSON.parse) that create fresh arrays and
     /// fill dense elements in order. This skips generic [[Set]] checks.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn initialize_array_element(&self, index: usize, value: Value) {
         gc_write_barrier(&value);
         let mut elements = self.elements.borrow_mut();
@@ -4276,7 +4267,7 @@ impl JsObject {
         }
 
         let mut shape_write = self.shape.borrow_mut();
-        let next_shape = shape_write.transition(key.clone());
+        let next_shape = shape_write.transition(key);
         let offset = next_shape
             .offset
             .expect("Shape transition should have an offset");
@@ -4319,7 +4310,7 @@ impl JsObject {
 
     pub fn array_pop(&self) -> Value {
         let mut elements = self.elements.borrow_mut();
-        let val = elements.pop().unwrap_or(Value::undefined());
+        let val = elements.pop().unwrap_or_default();
         self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
         if val.is_hole() {
             Value::undefined()
@@ -4330,7 +4321,7 @@ impl JsObject {
 
     pub fn array_shift(&self) -> Value {
         let mut elements = self.elements.borrow_mut();
-        let val = elements.shift().unwrap_or(Value::undefined());
+        let val = elements.shift().unwrap_or_default();
         self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;
         if val.is_hole() {
             Value::undefined()
@@ -4420,6 +4411,7 @@ impl JsObject {
         &self.elements
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_prototype_storage(&self) -> &ObjectCell<Value> {
         &self.prototype
     }
@@ -4457,6 +4449,95 @@ impl std::fmt::Debug for JsObject {
 // GcRef's bounds: `T: Send + Sync`), enabling Isolate thread migration.
 unsafe impl Send for JsObject {}
 unsafe impl Sync for JsObject {}
+
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
+
+impl otter_vm_gc::GcTraceable for JsObject {
+    const NEEDS_TRACE: bool = true;
+    const TYPE_ID: u8 = otter_vm_gc::object::tags::OBJECT;
+
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        // Trace prototype (now a Value)
+        self.prototype.borrow().trace(tracer);
+
+        // Trace shape property keys.
+        //
+        // Shapes are Arc-managed (not GC-managed), but they hold GcRef<JsString>
+        // and GcRef<Symbol> as property key identifiers.  Without this call the
+        // GC sees those strings/symbols as unreachable and collects them, turning
+        // every subsequent property-name lookup into a use-after-free.
+        self.shape.borrow().trace_keys(tracer);
+
+        // Trace values in inline slots (data values and accessor pair GcRefs)
+        {
+            let slots = self.inline_slots.borrow();
+            let meta = self.inline_meta.borrow();
+            for i in 0..INLINE_PROPERTY_COUNT {
+                if !meta[i].is_empty() {
+                    slots[i].trace(tracer);
+                }
+            }
+        }
+
+        // Trace values in overflow slots
+        {
+            let slots = self.overflow_slots.borrow();
+            let meta = self.overflow_meta.borrow();
+            for i in 0..slots.len() {
+                if !meta[i].is_empty() {
+                    slots[i].trace(tracer);
+                }
+            }
+        }
+
+        // Trace keys AND values in dictionary properties.
+        // Keys are GcRef<JsString>/GcRef<Symbol> just like shape keys and must
+        // be kept alive for the same reason.
+        if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
+            for (key, desc) in dict.iter() {
+                match key {
+                    PropertyKey::String(s) => tracer(s.header() as *const _),
+                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                    PropertyKey::Index(_) => {}
+                }
+                desc.trace(tracer);
+            }
+        }
+
+        // Trace array elements
+        for value in self.elements.borrow().iter() {
+            value.trace(tracer);
+        }
+
+        // Trace argument mapping upvalue cells (sloppy mode mapped arguments)
+        if let Some(mapping) = self.argument_mapping.borrow().as_ref() {
+            for cell in mapping.cells.iter().flatten() {
+                cell.get().trace(tracer);
+            }
+        }
+    }
+}
+
+impl PropertyDescriptor {
+    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        match self {
+            PropertyDescriptor::Data { value, .. } => {
+                value.trace(tracer);
+            }
+            PropertyDescriptor::Accessor { get, set, .. } => {
+                if let Some(getter) = get {
+                    getter.trace(tracer);
+                }
+                if let Some(setter) = set {
+                    setter.trace(tracer);
+                }
+            }
+            PropertyDescriptor::Deleted => {}
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4754,10 +4835,7 @@ mod tests {
         let mut proto_val = Value::null();
         for i in 0..100 {
             let obj = GcRef::new(JsObject::new(proto_val));
-            let _ = obj.set(
-                PropertyKey::string(&format!("prop{}", i)),
-                Value::int32(i as i32),
-            );
+            let _ = obj.set(PropertyKey::string(&format!("prop{}", i)), Value::int32(i));
             proto_val = Value::object(obj);
         }
 
@@ -4814,96 +4892,5 @@ mod tests {
         // Setting to an unrelated object should work
         let unrelated = GcRef::new(JsObject::new(Value::null()));
         assert!(obj1.set_prototype(Value::object(unrelated)));
-    }
-}
-
-// ============================================================================
-// GC Tracing Implementation
-// ============================================================================
-
-impl otter_vm_gc::GcTraceable for JsObject {
-    const NEEDS_TRACE: bool = true;
-    const TYPE_ID: u8 = otter_vm_gc::object::tags::OBJECT;
-
-    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        // Trace prototype (now a Value)
-        self.prototype.borrow().trace(tracer);
-
-        // Trace shape property keys.
-        //
-        // Shapes are Arc-managed (not GC-managed), but they hold GcRef<JsString>
-        // and GcRef<Symbol> as property key identifiers.  Without this call the
-        // GC sees those strings/symbols as unreachable and collects them, turning
-        // every subsequent property-name lookup into a use-after-free.
-        self.shape.borrow().trace_keys(tracer);
-
-        // Trace values in inline slots (data values and accessor pair GcRefs)
-        {
-            let slots = self.inline_slots.borrow();
-            let meta = self.inline_meta.borrow();
-            for i in 0..INLINE_PROPERTY_COUNT {
-                if !meta[i].is_empty() {
-                    slots[i].trace(tracer);
-                }
-            }
-        }
-
-        // Trace values in overflow slots
-        {
-            let slots = self.overflow_slots.borrow();
-            let meta = self.overflow_meta.borrow();
-            for i in 0..slots.len() {
-                if !meta[i].is_empty() {
-                    slots[i].trace(tracer);
-                }
-            }
-        }
-
-        // Trace keys AND values in dictionary properties.
-        // Keys are GcRef<JsString>/GcRef<Symbol> just like shape keys and must
-        // be kept alive for the same reason.
-        if let Some(dict) = self.dictionary_properties.borrow().as_ref() {
-            for (key, desc) in dict.iter() {
-                match key {
-                    PropertyKey::String(s) => tracer(s.header() as *const _),
-                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
-                    PropertyKey::Index(_) => {}
-                }
-                desc.trace(tracer);
-            }
-        }
-
-        // Trace array elements
-        for value in self.elements.borrow().iter() {
-            value.trace(tracer);
-        }
-
-        // Trace argument mapping upvalue cells (sloppy mode mapped arguments)
-        if let Some(mapping) = self.argument_mapping.borrow().as_ref() {
-            for cell_opt in &mapping.cells {
-                if let Some(cell) = cell_opt {
-                    cell.get().trace(tracer);
-                }
-            }
-        }
-    }
-}
-
-impl PropertyDescriptor {
-    fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        match self {
-            PropertyDescriptor::Data { value, .. } => {
-                value.trace(tracer);
-            }
-            PropertyDescriptor::Accessor { get, set, .. } => {
-                if let Some(getter) = get {
-                    getter.trace(tracer);
-                }
-                if let Some(setter) = set {
-                    setter.trace(tracer);
-                }
-            }
-            PropertyDescriptor::Deleted => {}
-        }
     }
 }

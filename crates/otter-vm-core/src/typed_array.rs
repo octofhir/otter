@@ -111,7 +111,7 @@ impl JsTypedArray {
         let elem_size = kind.element_size();
 
         // Validate alignment
-        if byte_offset % elem_size != 0 {
+        if !byte_offset.is_multiple_of(elem_size) {
             return Err("byte offset must be aligned to element size");
         }
 
@@ -262,9 +262,7 @@ impl JsTypedArray {
                     bytes[0] = value as u8;
                 }
                 TypedArrayKind::Uint8Clamped => {
-                    bytes[0] = if value.is_nan() {
-                        0
-                    } else if value < 0.0 {
+                    bytes[0] = if value.is_nan() || value < 0.0 {
                         0
                     } else if value > 255.0 {
                         255
@@ -391,7 +389,7 @@ impl JsTypedArray {
 
         Ok(JsTypedArray {
             object,
-            buffer: self.buffer.clone(),
+            buffer: self.buffer,
             byte_offset: new_byte_offset,
             length: new_length,
             kind: self.kind,
@@ -678,7 +676,7 @@ mod tests {
         let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
         let object = GcRef::new(JsObject::new(Value::null()));
-        let arr = JsTypedArray::new(object, buf.clone(), TypedArrayKind::Int32, 0, 4).unwrap();
+        let arr = JsTypedArray::new(object, buf, TypedArrayKind::Int32, 0, 4).unwrap();
 
         arr.set(0, 42.0);
         assert_eq!(arr.get(0), Some(42.0));

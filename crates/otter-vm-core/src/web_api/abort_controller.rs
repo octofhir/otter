@@ -50,8 +50,8 @@ impl AbortSignal {
 
         let signal = create_signal_object(ncx, false, Value::undefined())?;
         let timeout_reason = create_timeout_reason(ncx);
-        let signal_for_cb = signal.clone();
-        let reason_for_cb = timeout_reason.clone();
+        let signal_for_cb = signal;
+        let reason_for_cb = timeout_reason;
 
         let fn_proto = ncx
             .ctx
@@ -60,7 +60,7 @@ impl AbortSignal {
 
         let timeout_cb = Value::native_function_with_proto(
             move |_this, _args, cb_ncx| {
-                abort_signal(&signal_for_cb, reason_for_cb.clone(), cb_ncx)?;
+                abort_signal(&signal_for_cb, reason_for_cb, cb_ncx)?;
                 Ok(Value::undefined())
             },
             ncx.memory_manager().clone(),
@@ -172,7 +172,7 @@ impl AbortController {
     ) -> Result<Value, VmError> {
         let signal = create_signal_object(ncx, false, Value::undefined())?;
         set_property(this, SIGNAL_KEY, signal)?;
-        Ok(this.clone())
+        Ok(*this)
     }
 
     #[js_method(name = "signal", kind = "getter")]
@@ -209,10 +209,9 @@ fn get_property(obj_val: &Value, key: &str) -> Result<Option<Value>, VmError> {
 
 fn set_property(obj_val: &Value, key: &str, val: Value) -> Result<Value, VmError> {
     if let Some(obj) = obj_val.as_object() {
-        obj.set(PropertyKey::string(key), val.clone())
-            .map_err(|e| {
-                VmError::type_error(format!("Failed to set property '{}': {:?}", key, e))
-            })?;
+        obj.set(PropertyKey::string(key), val).map_err(|e| {
+            VmError::type_error(format!("Failed to set property '{}': {:?}", key, e))
+        })?;
         Ok(val)
     } else {
         Err(VmError::type_error("Expected object"))
@@ -233,9 +232,9 @@ fn abort_signal(signal: &Value, reason: Value, ncx: &mut NativeContext) -> Resul
         let event = JsObject::new(Value::null());
         let event_val = Value::object(GcRef::new(event));
         set_property(&event_val, "type", Value::string(JsString::intern("abort")))?;
-        set_property(&event_val, "target", signal.clone())?;
+        set_property(&event_val, "target", *signal)?;
 
-        ncx.call_function(&onabort, signal.clone(), &[event_val])?;
+        ncx.call_function(&onabort, *signal, &[event_val])?;
     }
 
     Ok(())

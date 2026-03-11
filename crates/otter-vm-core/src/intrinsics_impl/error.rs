@@ -178,47 +178,45 @@ fn error_stack_getter(
             format!("{}: {}", name, message)
         };
 
-        if let Some(frames_val) = frames {
-            if let Some(frames_arr) = frames_val.as_object() {
-                if let Some(len_val) = frames_arr.get(&PropertyKey::string("length")) {
-                    if let Some(len) = len_val.as_number() {
-                        for i in 0..(len as u32) {
-                            if let Some(frame_val) = frames_arr.get(&PropertyKey::Index(i)) {
-                                if let Some(frame) = frame_val.as_object() {
-                                    let func = frame
-                                        .get(&PropertyKey::string("function"))
-                                        .and_then(|v| v.as_string())
-                                        .map(|s| s.as_str().to_string())
-                                        .unwrap_or_else(|| "<anonymous>".to_string());
-                                    let file = frame
-                                        .get(&PropertyKey::string("file"))
-                                        .and_then(|v| v.as_string())
-                                        .map(|s| s.as_str().to_string());
-                                    let line = frame
-                                        .get(&PropertyKey::string("line"))
-                                        .and_then(|v| v.as_number())
-                                        .map(|n| n as u32);
-                                    let column = frame
-                                        .get(&PropertyKey::string("column"))
-                                        .and_then(|v| v.as_number())
-                                        .map(|n| n as u32);
+        if let Some(frames_val) = frames
+            && let Some(frames_arr) = frames_val.as_object()
+            && let Some(len_val) = frames_arr.get(&PropertyKey::string("length"))
+            && let Some(len) = len_val.as_number()
+        {
+            for i in 0..(len as u32) {
+                if let Some(frame_val) = frames_arr.get(&PropertyKey::Index(i))
+                    && let Some(frame) = frame_val.as_object()
+                {
+                    let func = frame
+                        .get(&PropertyKey::string("function"))
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    let file = frame
+                        .get(&PropertyKey::string("file"))
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.as_str().to_string());
+                    let line = frame
+                        .get(&PropertyKey::string("line"))
+                        .and_then(|v| v.as_number())
+                        .map(|n| n as u32);
+                    let column = frame
+                        .get(&PropertyKey::string("column"))
+                        .and_then(|v| v.as_number())
+                        .map(|n| n as u32);
 
-                                    stack.push_str("\n    at ");
-                                    stack.push_str(&func);
-                                    if let Some(file_str) = file {
-                                        stack.push_str(" (");
-                                        stack.push_str(&file_str);
-                                        if let Some(l) = line {
-                                            stack.push_str(&format!(":{}", l));
-                                            if let Some(c) = column {
-                                                stack.push_str(&format!(":{}", c));
-                                            }
-                                        }
-                                        stack.push(')');
-                                    }
-                                }
+                    stack.push_str("\n    at ");
+                    stack.push_str(&func);
+                    if let Some(file_str) = file {
+                        stack.push_str(" (");
+                        stack.push_str(&file_str);
+                        if let Some(l) = line {
+                            stack.push_str(&format!(":{}", l));
+                            if let Some(c) = column {
+                                stack.push_str(&format!(":{}", c));
                             }
                         }
+                        stack.push(')');
                     }
                 }
             }
@@ -263,7 +261,7 @@ pub fn init_error_prototypes(
     let _ = error_proto.set(PropertyKey::string("__is_error__"), Value::boolean(true));
 
     let (_to_string_name, to_string_native, _to_string_length) = error_to_string_decl();
-    let to_string_fn = native_from_decl_with_function_proto(to_string_native, mm, fn_proto.clone());
+    let to_string_fn = native_from_decl_with_function_proto(to_string_native, mm, fn_proto);
 
     // Error.prototype.toString
     error_proto.define_property(
@@ -275,7 +273,7 @@ pub fn init_error_prototypes(
     // This is a lazy getter that formats the __stack_frames__ property
     // The actual stack frames are captured in interpreter.rs during Error construction
     let (_stack_name, stack_native, _stack_length) = error_stack_getter_decl();
-    let stack_getter = native_from_decl_with_function_proto(stack_native, mm, fn_proto.clone());
+    let stack_getter = native_from_decl_with_function_proto(stack_native, mm, fn_proto);
     error_proto.define_property(
         PropertyKey::string("stack"),
         PropertyDescriptor::Accessor {
@@ -332,33 +330,31 @@ pub fn create_error_constructor(
         // which already has the correct ErrorType.prototype)
         if let Some(obj) = this.as_object() {
             // §20.5.1.1: Only set message if first arg is not undefined
-            if let Some(msg) = args.first() {
-                if !msg.is_undefined() {
-                    // message: { writable: true, enumerable: false, configurable: true }
-                    obj.define_property(
-                        PropertyKey::string("message"),
-                        PropertyDescriptor::data_with_attrs(
-                            Value::string(JsString::intern(&crate::globals::to_string(msg))),
-                            PropertyAttributes::builtin_method(),
-                        ),
-                    );
-                }
+            if let Some(msg) = args.first()
+                && !msg.is_undefined()
+            {
+                // message: { writable: true, enumerable: false, configurable: true }
+                obj.define_property(
+                    PropertyKey::string("message"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::string(JsString::intern(&crate::globals::to_string(msg))),
+                        PropertyAttributes::builtin_method(),
+                    ),
+                );
             }
             // §20.5.1.1 step 5: InstallErrorCause(O, options)
-            if let Some(options) = args.get(1) {
-                if let Some(opts_obj) = options.as_object() {
-                    if opts_obj.has(&PropertyKey::string("cause")) {
-                        if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
-                            obj.define_property(
-                                PropertyKey::string("cause"),
-                                PropertyDescriptor::data_with_attrs(
-                                    cause,
-                                    PropertyAttributes::builtin_method(),
-                                ),
-                            );
-                        }
-                    }
-                }
+            if let Some(options) = args.get(1)
+                && let Some(opts_obj) = options.as_object()
+                && opts_obj.has(&PropertyKey::string("cause"))
+                && let Some(cause) = opts_obj.get(&PropertyKey::string("cause"))
+            {
+                obj.define_property(
+                    PropertyKey::string("cause"),
+                    PropertyDescriptor::data_with_attrs(
+                        cause,
+                        PropertyAttributes::builtin_method(),
+                    ),
+                );
             }
             // Note: `name` is inherited from prototype, NOT set on instances
         }
@@ -386,34 +382,32 @@ pub fn create_aggregate_error_constructor() -> Box<
         if let Some(obj) = this.as_object() {
             let errors_arg = args.first().cloned().unwrap_or(Value::undefined());
             // Step 3: message (BEFORE errors per spec)
-            if let Some(msg) = args.get(1) {
-                if !msg.is_undefined() {
-                    let msg_str = ncx.to_string_value(msg)?;
-                    obj.define_property(
-                        PropertyKey::string("message"),
-                        PropertyDescriptor::data_with_attrs(
-                            Value::string(JsString::intern(&msg_str)),
-                            PropertyAttributes::builtin_method(),
-                        ),
-                    );
-                }
+            if let Some(msg) = args.get(1)
+                && !msg.is_undefined()
+            {
+                let msg_str = ncx.to_string_value(msg)?;
+                obj.define_property(
+                    PropertyKey::string("message"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::string(JsString::intern(&msg_str)),
+                        PropertyAttributes::builtin_method(),
+                    ),
+                );
             }
 
             // Step 4: InstallErrorCause(O, options)
-            if let Some(options) = args.get(2) {
-                if let Some(opts_obj) = options.as_object() {
-                    if opts_obj.has(&PropertyKey::string("cause")) {
-                        if let Some(cause) = opts_obj.get(&PropertyKey::string("cause")) {
-                            obj.define_property(
-                                PropertyKey::string("cause"),
-                                PropertyDescriptor::data_with_attrs(
-                                    cause,
-                                    PropertyAttributes::builtin_method(),
-                                ),
-                            );
-                        }
-                    }
-                }
+            if let Some(options) = args.get(2)
+                && let Some(opts_obj) = options.as_object()
+                && opts_obj.has(&PropertyKey::string("cause"))
+                && let Some(cause) = opts_obj.get(&PropertyKey::string("cause"))
+            {
+                obj.define_property(
+                    PropertyKey::string("cause"),
+                    PropertyDescriptor::data_with_attrs(
+                        cause,
+                        PropertyAttributes::builtin_method(),
+                    ),
+                );
             }
 
             // Step 5: IterableToList(errors)
@@ -465,7 +459,7 @@ fn iterable_to_list(ncx: &mut NativeContext<'_>, iterable: &Value) -> Result<Val
     };
 
     // Call(method, obj) — get iterator
-    let iterator = ncx.call_function(&iter_method, iterable.clone(), &[])?;
+    let iterator = ncx.call_function(&iter_method, *iterable, &[])?;
     let iter_obj = iterator.as_object().ok_or_else(|| {
         VmError::type_error("Result of the Symbol.iterator method is not an object")
     })?;
@@ -484,7 +478,7 @@ fn iterable_to_list(ncx: &mut NativeContext<'_>, iterable: &Value) -> Result<Val
     let loop_result: Result<(), VmError> = (|| {
         loop {
             // IteratorStep: call next()
-            let step = ncx.call_function(&next_fn, Value::object(iter_obj.clone()), &[])?;
+            let step = ncx.call_function(&next_fn, Value::object(iter_obj), &[])?;
             let step_obj = step
                 .as_object()
                 .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;

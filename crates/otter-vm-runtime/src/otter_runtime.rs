@@ -217,7 +217,7 @@ impl RuntimeHostHooks {
     fn collect_for_in_keys(&self, target: &Value) -> Vec<Value> {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
-        let mut current = Some(target.clone());
+        let mut current = Some(*target);
 
         while let Some(value) = current {
             if let Some(obj) = value.as_object() {
@@ -269,7 +269,7 @@ impl RuntimeHostHooks {
             return None;
         }
 
-        let out = cursor.keys[cursor.index].clone();
+        let out = cursor.keys[cursor.index];
         cursor.index += 1;
         Some(out)
     }
@@ -960,7 +960,7 @@ impl Otter {
                 VmExecutionResult::Complete(value) => {
                     Self::capture_exports_from_frame(ctx);
                     ctx.pop_frame();
-                    result_promise.resolve(value.clone());
+                    result_promise.resolve(value);
                     self.drain_microtasks(ctx)?;
                     final_value = value;
                     // Module done immediately, fall through to event loop
@@ -1026,7 +1026,7 @@ impl Otter {
                         VmExecutionResult::Complete(value) => {
                             Self::capture_exports_from_frame(ctx);
                             ctx.pop_frame();
-                            result_promise.resolve(value.clone());
+                            result_promise.resolve(value);
                             self.drain_microtasks(ctx)?;
                             final_value = value;
                             // Module done, continue loop for detached work
@@ -1446,8 +1446,7 @@ impl Otter {
             );
             if let Some(namespace_obj) = ext.load_module(specifier, &mut load_ctx) {
                 // Both otter: and node: specifiers use their canonical URL directly
-                self.loader
-                    .register_native_module(specifier, namespace_obj);
+                self.loader.register_native_module(specifier, namespace_obj);
             }
         }
 
@@ -1514,7 +1513,7 @@ impl Otter {
                     };
 
                     let code_value = match args.first() {
-                        Some(value) => value.clone(),
+                        Some(value) => *value,
                         None => return Ok(result_ok(Value::undefined())),
                     };
 
@@ -1608,7 +1607,7 @@ impl Otter {
                         let eval_fn = Value::native_function_with_proto(
                             move |_this: &Value, args: &[Value], _mm| {
                                 let code_value = match args.first() {
-                                    Some(value) => value.clone(),
+                                    Some(value) => *value,
                                     None => return Ok(Value::undefined()),
                                 };
 
@@ -1676,8 +1675,8 @@ impl Otter {
 
         // group/groupCollapsed/groupEnd alias to log
         if let Some(log_fn) = global.get(&PropertyKey::string("__console_log")) {
-            let _ = console_obj.set(PropertyKey::string("group"), log_fn.clone());
-            let _ = console_obj.set(PropertyKey::string("groupCollapsed"), log_fn.clone());
+            let _ = console_obj.set(PropertyKey::string("group"), log_fn);
+            let _ = console_obj.set(PropertyKey::string("groupCollapsed"), log_fn);
             let _ = console_obj.set(PropertyKey::string("groupEnd"), log_fn);
         }
 
@@ -1813,6 +1812,7 @@ impl Otter {
 
                         let json_args: Vec<serde_json::Value> =
                             args.iter().map(value_to_json).collect();
+                        #[cfg(feature = "profiling")]
                         let args_len_for_trace = json_args.len();
 
                         let future = async_fn(&json_args);
@@ -2228,11 +2228,7 @@ impl Otter {
                 let key_value = Value::string(JsString::intern("then"));
                 let mut ncx = otter_vm_core::context::NativeContext::new(ctx, interpreter);
                 return otter_vm_core::proxy_operations::proxy_get(
-                    &mut ncx,
-                    proxy,
-                    &key,
-                    key_value,
-                    value.clone(),
+                    &mut ncx, proxy, &key, key_value, *value,
                 );
             }
 
@@ -2245,7 +2241,7 @@ impl Otter {
                     let Some(getter) = get else {
                         return Ok(Value::undefined());
                     };
-                    interpreter.call_function(ctx, &getter, value.clone(), &[])
+                    interpreter.call_function(ctx, &getter, *value, &[])
                 }
                 Some(PropertyDescriptor::Data {
                     value: prop_value, ..
@@ -2627,7 +2623,7 @@ impl Otter {
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
                                 let result_clone = promise;
-                                let original_clone = original_value.clone();
+                                let original_clone = original_value;
                                 gate_promise.then_with_enqueue(
                                     move |_| {
                                         let job = JsPromiseJob {
@@ -2636,7 +2632,7 @@ impl Otter {
                                             this_arg: Value::undefined(),
                                             result_promise: Some(result_clone),
                                         };
-                                        enqueue_js(job, vec![original_clone.clone()]);
+                                        enqueue_js(job, vec![original_clone]);
                                     },
                                     enqueue_microtask,
                                 );
@@ -2713,7 +2709,7 @@ impl Otter {
                                 let enqueue_microtask = make_microtask_enqueuer();
                                 let enqueue_js = make_js_enqueuer();
                                 let result_clone = promise;
-                                let original_clone = original_reason.clone();
+                                let original_clone = original_reason;
                                 gate_promise.then_with_enqueue(
                                     move |_| {
                                         let job = JsPromiseJob {
@@ -2722,7 +2718,7 @@ impl Otter {
                                             this_arg: Value::undefined(),
                                             result_promise: Some(result_clone),
                                         };
-                                        enqueue_js(job, vec![original_clone.clone()]);
+                                        enqueue_js(job, vec![original_clone]);
                                     },
                                     enqueue_microtask,
                                 );
@@ -3299,7 +3295,7 @@ mod tests {
     #[test]
     fn test_value_json_conversion() {
         let _rt = Otter::new(); // sets up thread-local GC registry via Isolate
-        let mm = Arc::new(otter_vm_core::MemoryManager::test());
+        let _mm = Arc::new(otter_vm_core::MemoryManager::test());
         // Test primitives
         assert_eq!(value_to_json(&Value::null()), serde_json::Value::Null);
         assert_eq!(
@@ -3307,7 +3303,10 @@ mod tests {
             serde_json::Value::Bool(true)
         );
         assert_eq!(value_to_json(&Value::int32(42)), serde_json::json!(42));
-        assert_eq!(value_to_json(&Value::number(3.14)), serde_json::json!(3.14));
+        assert_eq!(
+            value_to_json(&Value::number(3.125)),
+            serde_json::json!(3.125)
+        );
 
         // Test string
         let s = Value::string(otter_vm_core::string::JsString::intern("hello"));
@@ -3329,8 +3328,8 @@ mod tests {
             Some(42)
         );
         assert_eq!(
-            json_to_value(&serde_json::json!(3.14), mm.clone()).as_number(),
-            Some(3.14)
+            json_to_value(&serde_json::json!(3.125), mm.clone()).as_number(),
+            Some(3.125)
         );
 
         // Test string

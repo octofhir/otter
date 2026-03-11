@@ -129,25 +129,25 @@ fn function_to_string(
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    if this_val.is_function() {
-        if let Some(closure) = this_val.as_function() {
-            return Ok(Value::string(JsString::intern(&format!(
-                "function {}() {{ [native code] }}",
-                if closure.is_async { "async " } else { "" }
-            ))));
-        }
+    if this_val.is_function()
+        && let Some(closure) = this_val.as_function()
+    {
+        return Ok(Value::string(JsString::intern(&format!(
+            "function {}() {{ [native code] }}",
+            if closure.is_async { "async " } else { "" }
+        ))));
     }
     if this_val.is_native_function() {
         return Ok(Value::string(JsString::intern(
             "function () { [native code] }",
         )));
     }
-    if let Some(obj) = this_val.as_object() {
-        if obj.has(&PropertyKey::string("__boundFunction__")) {
-            return Ok(Value::string(JsString::intern(
-                "function bound() { [native code] }",
-            )));
-        }
+    if let Some(obj) = this_val.as_object()
+        && obj.has(&PropertyKey::string("__boundFunction__"))
+    {
+        return Ok(Value::string(JsString::intern(
+            "function bound() { [native code] }",
+        )));
     }
     Err(VmError::type_error(
         "Function.prototype.toString requires a function",
@@ -199,7 +199,7 @@ fn function_apply(
         for i in 0..len {
             extracted.push(
                 crate::object::get_value_full(&arr_obj, &PropertyKey::Index(i as u32), ncx)
-                    .unwrap_or(Value::undefined()),
+                    .unwrap_or_default(),
             );
         }
         extracted
@@ -241,13 +241,13 @@ fn function_bind(
         .unwrap_or_else(Value::null);
 
     let bound = GcRef::new(JsObject::new(fn_proto));
-    let _ = bound.set(PropertyKey::string("__boundFunction__"), this_val.clone());
+    let _ = bound.set(PropertyKey::string("__boundFunction__"), *this_val);
     let _ = bound.set(PropertyKey::string("__boundThis__"), this_arg);
 
     if args.len() > 1 {
         let arr = GcRef::new(JsObject::new(Value::null()));
         for (i, arg) in args[1..].iter().enumerate() {
-            let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
+            let _ = arr.set(PropertyKey::Index(i as u32), *arg);
         }
         let _ = arr.set(
             PropertyKey::string("length"),
@@ -262,8 +262,6 @@ fn function_bind(
             .and_then(|v| v.as_string())
             .map(|s| s.as_str().to_string())
             .unwrap_or_default()
-    } else if this_val.is_native_function() || this_val.is_function() {
-        String::new()
     } else {
         String::new()
     };

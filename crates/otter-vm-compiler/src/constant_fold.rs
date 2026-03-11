@@ -486,9 +486,9 @@ mod tests {
         assert_eq!(
             try_fold_unary(
                 UnaryOperator::UnaryNegation,
-                &CompileTimeValue::Number(3.14)
+                &CompileTimeValue::Number(3.125)
             ),
-            Some(CompileTimeValue::Number(-3.14))
+            Some(CompileTimeValue::Number(-3.125))
         );
     }
 

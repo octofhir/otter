@@ -54,7 +54,7 @@ impl FFIType {
     pub fn from_u8(n: u8) -> Option<Self> {
         if n <= 17 {
             // Safety: FFIType is repr(u8) with values 0..=17
-            Some(unsafe { std::mem::transmute(n) })
+            Some(unsafe { std::mem::transmute::<u8, FFIType>(n) })
         } else {
             None
         }
@@ -66,8 +66,14 @@ impl FFIType {
             Self::Char | Self::I8 | Self::U8 | Self::Bool => 1,
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
-            Self::I64 | Self::U64 | Self::F64 | Self::Ptr | Self::CString
-            | Self::Function | Self::I64Fast | Self::U64Fast => 8,
+            Self::I64
+            | Self::U64
+            | Self::F64
+            | Self::Ptr
+            | Self::CString
+            | Self::Function
+            | Self::I64Fast
+            | Self::U64Fast => 8,
             Self::Void => 0,
         }
     }

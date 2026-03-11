@@ -89,7 +89,7 @@ impl StringTable {
     pub fn clear_thread_default_if(table: &StringTable) {
         THREAD_STRING_TABLE.with(|cell| {
             let current = cell.get();
-            if current == table as *const StringTable {
+            if std::ptr::eq(current, table) {
                 cell.set(std::ptr::null());
             }
         });
@@ -102,13 +102,13 @@ impl StringTable {
         let hash = JsString::compute_hash_str(s);
 
         // Check if already interned
-        if let Ok(borrowed) = self.strings.try_borrow() {
-            if let Some(bucket) = borrowed.get(&hash) {
-                for existing in bucket.iter() {
-                    if JsString::utf16_equals_str(existing.as_utf16(), s) {
-                        Self::perform_read_barrier(*existing);
-                        return *existing;
-                    }
+        if let Ok(borrowed) = self.strings.try_borrow()
+            && let Some(bucket) = borrowed.get(&hash)
+        {
+            for existing in bucket.iter() {
+                if JsString::utf16_equals_str(existing.as_utf16(), s) {
+                    Self::perform_read_barrier(*existing);
+                    return *existing;
                 }
             }
         }
@@ -133,13 +133,13 @@ impl StringTable {
         let hash = JsString::compute_hash_units(units);
 
         // Check if already interned
-        if let Ok(borrowed) = self.strings.try_borrow() {
-            if let Some(bucket) = borrowed.get(&hash) {
-                for existing in bucket.iter() {
-                    if existing.as_utf16() == units {
-                        Self::perform_read_barrier(*existing);
-                        return *existing;
-                    }
+        if let Ok(borrowed) = self.strings.try_borrow()
+            && let Some(bucket) = borrowed.get(&hash)
+        {
+            for existing in bucket.iter() {
+                if existing.as_utf16() == units {
+                    Self::perform_read_barrier(*existing);
+                    return *existing;
                 }
             }
         }

@@ -31,7 +31,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::int32(pd.year()))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -55,7 +55,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::int32(pd.month() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -79,7 +79,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::int32(pd.day() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -105,7 +105,7 @@ pub(super) fn install_plain_date_prototype(
                     ))))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -129,7 +129,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::string(JsString::intern(pd.calendar().identifier())))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -153,7 +153,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::undefined())
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -177,7 +177,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::undefined())
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -221,7 +221,7 @@ pub(super) fn install_plain_date_prototype(
                         Ok(Value::int32(f(&pd)))
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -245,7 +245,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::boolean(pd.in_leap_year()))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -272,7 +272,7 @@ pub(super) fn install_plain_date_prototype(
                     }
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -299,7 +299,7 @@ pub(super) fn install_plain_date_prototype(
                     }
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -322,7 +322,7 @@ pub(super) fn install_plain_date_prototype(
                     Ok(Value::int32(7))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -349,7 +349,7 @@ pub(super) fn install_plain_date_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "equals",
         1,
     );
@@ -382,7 +382,7 @@ pub(super) fn install_plain_date_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "add",
         1,
     );
@@ -415,7 +415,7 @@ pub(super) fn install_plain_date_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "subtract",
         1,
     );
@@ -441,7 +441,7 @@ pub(super) fn install_plain_date_prototype(
             construct_duration_value(ncx, &duration)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "since",
         1,
     );
@@ -467,7 +467,7 @@ pub(super) fn install_plain_date_prototype(
             construct_duration_value(ncx, &duration)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "until",
         1,
     );
@@ -490,7 +490,7 @@ pub(super) fn install_plain_date_prototype(
             let cur_d = cur_pd.day() as i32;
 
             let item = args.first().cloned().unwrap_or(Value::undefined());
-            if !item.as_object().is_some() && item.as_proxy().is_none() {
+            if item.as_object().is_none() && item.as_proxy().is_none() {
                 return Err(VmError::type_error("with argument must be an object"));
             }
 
@@ -605,10 +605,10 @@ pub(super) fn install_plain_date_prototype(
             // Resolve month from monthCode
             let month = if let Some(ref mc) = mc_str {
                 let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-                if let Some(mn) = month_n {
-                    if mn != mc_month {
-                        return Err(VmError::range_error("month and monthCode must agree"));
-                    }
+                if let Some(mn) = month_n
+                    && mn != mc_month
+                {
+                    return Err(VmError::range_error("month and monthCode must agree"));
                 }
                 mc_month
             } else {
@@ -632,7 +632,7 @@ pub(super) fn install_plain_date_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "with",
         1,
     );
@@ -663,7 +663,7 @@ pub(super) fn install_plain_date_prototype(
             construct_plain_date_time_value(ncx, &pdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainDateTime",
         0,
     );
@@ -685,7 +685,7 @@ pub(super) fn install_plain_date_prototype(
             construct_plain_year_month_value(ncx, pym.year(), pym.month() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainYearMonth",
         0,
     );
@@ -708,7 +708,7 @@ pub(super) fn install_plain_date_prototype(
             construct_plain_month_day_value(ncx, month, pmd.day() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainMonthDay",
         0,
     );
@@ -735,7 +735,7 @@ pub(super) fn install_plain_date_prototype(
             construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "withCalendar",
         1,
     );
@@ -748,7 +748,7 @@ pub(super) fn install_plain_date_prototype(
     // .getISOFields()
     // ========================================================================
     let get_iso_fn = Value::native_function_with_proto_named(
-        |this, _args, ncx| {
+        |this, _args, _ncx| {
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("getISOFields called on non-object"))?;
@@ -773,7 +773,7 @@ pub(super) fn install_plain_date_prototype(
             Ok(Value::object(result))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "getISOFields",
         0,
     );
@@ -793,19 +793,18 @@ pub(super) fn install_plain_date_prototype(
             // Check calendarName option
             let options_val = args.first().cloned().unwrap_or(Value::undefined());
             // Per spec: GetOptionsObject — undefined → empty obj, object/proxy → ok, else TypeError
-            if !options_val.is_undefined() {
-                if options_val.is_null()
+            if !options_val.is_undefined()
+                && (options_val.is_null()
                     || options_val.is_boolean()
                     || options_val.is_number()
                     || options_val.is_string()
                     || options_val.is_bigint()
-                    || options_val.as_symbol().is_some()
-                {
-                    return Err(VmError::type_error(format!(
-                        "options must be an object or undefined, got {}",
-                        options_val.type_of()
-                    )));
-                }
+                    || options_val.as_symbol().is_some())
+            {
+                return Err(VmError::type_error(format!(
+                    "options must be an object or undefined, got {}",
+                    options_val.type_of()
+                )));
             }
             let (show_calendar, is_critical) = if !options_val.is_undefined() {
                 let cn =
@@ -847,7 +846,7 @@ pub(super) fn install_plain_date_prototype(
             }
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toString",
         0,
     );
@@ -871,7 +870,7 @@ pub(super) fn install_plain_date_prototype(
             ))))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toJSON",
         0,
     );
@@ -888,7 +887,7 @@ pub(super) fn install_plain_date_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "valueOf",
         0,
     );
@@ -912,7 +911,7 @@ pub(super) fn install_plain_date_prototype(
             ))))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toLocaleString",
         0,
     );
@@ -967,7 +966,7 @@ pub(super) fn install_plain_date_prototype(
             construct_zoned_date_time_value(ncx, &zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toZonedDateTime",
         1,
     );

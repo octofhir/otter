@@ -13,17 +13,15 @@ use crate::value::Value;
 
 fn create_args_array(ncx: &mut NativeContext, args: &[Value]) -> GcRef<JsObject> {
     let arr = GcRef::new(JsObject::array(args.len()));
-    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array")) {
-        if let Some(array_obj) = array_ctor.as_object() {
-            if let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype")) {
-                if let Some(proto_obj) = proto_val.as_object() {
-                    arr.set_prototype(Value::object(proto_obj));
-                }
-            }
-        }
+    if let Some(array_ctor) = ncx.global().get(&PropertyKey::string("Array"))
+        && let Some(array_obj) = array_ctor.as_object()
+        && let Some(proto_val) = array_obj.get(&PropertyKey::string("prototype"))
+        && let Some(proto_obj) = proto_val.as_object()
+    {
+        arr.set_prototype(Value::object(proto_obj));
     }
     for (i, arg) in args.iter().enumerate() {
-        let _ = arr.set(PropertyKey::Index(i as u32), arg.clone());
+        let _ = arr.set(PropertyKey::Index(i as u32), *arg);
     }
     arr
 }
@@ -61,7 +59,7 @@ fn get_property_value(
 ) -> VmResult<Value> {
     if let Some(proxy) = receiver.as_proxy() {
         ncx.ctx.enter_native_call()?;
-        let result = proxy_get(ncx, proxy, key, key_value, receiver.clone());
+        let result = proxy_get(ncx, proxy, key, key_value, *receiver);
         ncx.ctx.exit_native_call();
         return result;
     }
@@ -75,7 +73,7 @@ fn get_property_value(
             PropertyDescriptor::Data { value, .. } => Ok(value),
             PropertyDescriptor::Accessor { get, .. } => {
                 if let Some(getter) = get {
-                    ncx.call_function(&getter, receiver.clone(), &[])
+                    ncx.call_function(&getter, *receiver, &[])
                 } else {
                     Ok(Value::undefined())
                 }
@@ -354,7 +352,7 @@ fn proxy_get_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.get(target, key, receiver)
-    let trap_args = &[target.clone(), key_value.clone(), receiver.clone()];
+    let trap_args = &[target, key_value, receiver];
     let trap_result = invoke_trap(ncx, proxy, "get", trap_args)?;
 
     // If no trap, perform default [[Get]] on target
@@ -386,12 +384,13 @@ fn validate_get_trap_invariants(
             PropertyDescriptor::Data { value, attributes } => {
                 // If property is non-configurable and non-writable,
                 // trap result must be SameValue as target's value
-                if !attributes.configurable && !attributes.writable {
-                    if !same_value(trap_result, &value) {
-                        return Err(VmError::type_error(
-                            "Proxy 'get' trap returned value that doesn't match non-configurable, non-writable data property",
-                        ));
-                    }
+                if !attributes.configurable
+                    && !attributes.writable
+                    && !same_value(trap_result, &value)
+                {
+                    return Err(VmError::type_error(
+                        "Proxy 'get' trap returned value that doesn't match non-configurable, non-writable data property",
+                    ));
                 }
             }
             PropertyDescriptor::Accessor {
@@ -399,12 +398,10 @@ fn validate_get_trap_invariants(
             } => {
                 // If property is non-configurable accessor with undefined getter,
                 // trap result must be undefined
-                if !attributes.configurable && get.is_none() {
-                    if !trap_result.is_undefined() {
-                        return Err(VmError::type_error(
-                            "Proxy 'get' trap must return undefined for non-configurable accessor property with undefined getter",
-                        ));
-                    }
+                if !attributes.configurable && get.is_none() && !trap_result.is_undefined() {
+                    return Err(VmError::type_error(
+                        "Proxy 'get' trap must return undefined for non-configurable accessor property with undefined getter",
+                    ));
                 }
             }
             PropertyDescriptor::Deleted => {
@@ -445,12 +442,7 @@ fn proxy_set_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.set(target, key, value, receiver)
-    let trap_args = &[
-        target.clone(),
-        key_value.clone(),
-        value.clone(),
-        receiver.clone(),
-    ];
+    let trap_args = &[target, key_value, value, receiver];
     let trap_result = invoke_trap(ncx, proxy, "set", trap_args)?;
 
     // If no trap, perform default [[Set]] on target
@@ -490,12 +482,13 @@ fn validate_set_trap_invariants(
             } => {
                 // If property is non-configurable and non-writable,
                 // cannot change the value
-                if !attributes.configurable && !attributes.writable {
-                    if !same_value(value, &target_value) {
-                        return Err(VmError::type_error(
-                            "Cannot set non-configurable, non-writable property via proxy",
-                        ));
-                    }
+                if !attributes.configurable
+                    && !attributes.writable
+                    && !same_value(value, &target_value)
+                {
+                    return Err(VmError::type_error(
+                        "Cannot set non-configurable, non-writable property via proxy",
+                    ));
                 }
             }
             PropertyDescriptor::Accessor {
@@ -543,7 +536,7 @@ fn proxy_has_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.has(target, key)
-    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_args = &[target, key_value];
     let trap_result = invoke_trap(ncx, proxy, "has", trap_args)?;
 
     // If no trap, perform default [[HasProperty]] on target
@@ -568,7 +561,7 @@ fn validate_has_trap_invariants(
     key_value: Value,
     trap_result: bool,
 ) -> VmResult<()> {
-    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value.clone())?;
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     if let Some(desc) = target_desc {
         // If property exists on target and is non-configurable,
@@ -582,12 +575,13 @@ fn validate_has_trap_invariants(
 
     // If target is non-extensible and property exists,
     // trap must return true
-    if !target_is_extensible(ncx, target)? {
-        if target_has_own(ncx, target, key, key_value)? && !trap_result {
-            return Err(VmError::type_error(
-                "Proxy 'has' trap returned false for property of non-extensible target",
-            ));
-        }
+    if !target_is_extensible(ncx, target)?
+        && target_has_own(ncx, target, key, key_value)?
+        && !trap_result
+    {
+        return Err(VmError::type_error(
+            "Proxy 'has' trap returned false for property of non-extensible target",
+        ));
     }
 
     Ok(())
@@ -618,7 +612,7 @@ fn proxy_delete_property_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.deleteProperty(target, key)
-    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_args = &[target, key_value];
     let trap_result = invoke_trap(ncx, proxy, "deleteProperty", trap_args)?;
 
     // If no trap, perform default [[Delete]] on target
@@ -679,7 +673,7 @@ fn proxy_own_keys_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.ownKeys(target)
-    let trap_args = &[target.clone()];
+    let trap_args = &[target];
     let trap_result = invoke_trap(ncx, proxy, "ownKeys", trap_args)?;
 
     // If no trap, perform default [[OwnPropertyKeys]] on target
@@ -711,7 +705,7 @@ fn proxy_own_keys_impl(
         // ES §9.5.11 step 8: CreateListFromArrayLike(trapResultArray, « String, Symbol »)
         // Only String and Symbol types are allowed
         if let Some(s) = element.as_string() {
-            trap_keys.push(PropertyKey::String(s.clone()));
+            trap_keys.push(PropertyKey::String(s));
         } else if let Some(sym) = element.as_symbol() {
             trap_keys.push(PropertyKey::Symbol(sym));
         } else {
@@ -743,14 +737,13 @@ fn validate_own_keys_trap_invariants(
             target,
             target_key,
             property_key_to_value(target_key),
-        )? {
-            if !desc.is_configurable() {
-                // Non-configurable property must be in trap result
-                if !trap_keys.contains(target_key) {
-                    return Err(VmError::type_error(
-                        "Proxy 'ownKeys' trap result must contain all non-configurable property keys",
-                    ));
-                }
+        )? && !desc.is_configurable()
+        {
+            // Non-configurable property must be in trap result
+            if !trap_keys.contains(target_key) {
+                return Err(VmError::type_error(
+                    "Proxy 'ownKeys' trap result must contain all non-configurable property keys",
+                ));
             }
         }
     }
@@ -804,7 +797,7 @@ fn proxy_get_own_property_descriptor_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.getOwnPropertyDescriptor(target, key)
-    let trap_args = &[target.clone(), key_value.clone()];
+    let trap_args = &[target, key_value];
     let trap_result = invoke_trap(ncx, proxy, "getOwnPropertyDescriptor", trap_args)?;
 
     // If no trap, perform default [[GetOwnProperty]] on target
@@ -818,14 +811,12 @@ fn proxy_get_own_property_descriptor_impl(
     // Trap result must be undefined or an object
     if result_value.is_undefined() {
         // Validate: if target property is non-configurable, trap cannot return undefined
-        if let Some(target_desc) =
-            target_get_own_property_descriptor(ncx, &target, key, key_value.clone())?
+        if let Some(target_desc) = target_get_own_property_descriptor(ncx, &target, key, key_value)?
+            && !target_desc.is_configurable()
         {
-            if !target_desc.is_configurable() {
-                return Err(VmError::type_error(
-                    "Proxy 'getOwnPropertyDescriptor' trap cannot return undefined for non-configurable property",
-                ));
-            }
+            return Err(VmError::type_error(
+                "Proxy 'getOwnPropertyDescriptor' trap cannot return undefined for non-configurable property",
+            ));
         }
 
         // If target is non-extensible and property exists, trap cannot return undefined
@@ -859,7 +850,7 @@ fn validate_get_own_property_descriptor_invariants(
     key_value: Value,
     trap_desc: &PropertyDescriptor,
 ) -> VmResult<()> {
-    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value.clone())?;
+    let target_desc = target_get_own_property_descriptor(ncx, target, key, key_value)?;
 
     if let Some(target_desc) = target_desc {
         // If target property is non-configurable, trap result must match
@@ -876,31 +867,28 @@ fn validate_get_own_property_descriptor_invariants(
                 value: target_value,
                 attributes: target_attrs,
             } = &target_desc
-            {
-                if let PropertyDescriptor::Data {
+                && let PropertyDescriptor::Data {
                     value: trap_value,
                     attributes: trap_attrs,
                 } = trap_desc
-                {
-                    // ES §9.5.5 step 17.b.i: If trap reports writable: false but target has writable: true, throw TypeError
-                    if target_attrs.writable && !trap_attrs.writable && !trap_desc.is_configurable()
-                    {
-                        return Err(VmError::type_error(
-                            "Proxy 'getOwnPropertyDescriptor' trap cannot report writable property as non-writable when non-configurable",
-                        ));
-                    }
-                    // Trap cannot report non-writable as writable
-                    if !target_attrs.writable && trap_attrs.writable {
-                        return Err(VmError::type_error(
-                            "Proxy 'getOwnPropertyDescriptor' trap cannot report non-writable property as writable",
-                        ));
-                    }
-                    // For non-configurable, non-writable properties, value must match
-                    if !target_attrs.writable && !same_value(trap_value, target_value) {
-                        return Err(VmError::type_error(
-                            "Proxy 'getOwnPropertyDescriptor' trap must report same value for non-configurable, non-writable property",
-                        ));
-                    }
+            {
+                // ES §9.5.5 step 17.b.i: If trap reports writable: false but target has writable: true, throw TypeError
+                if target_attrs.writable && !trap_attrs.writable && !trap_desc.is_configurable() {
+                    return Err(VmError::type_error(
+                        "Proxy 'getOwnPropertyDescriptor' trap cannot report writable property as non-writable when non-configurable",
+                    ));
+                }
+                // Trap cannot report non-writable as writable
+                if !target_attrs.writable && trap_attrs.writable {
+                    return Err(VmError::type_error(
+                        "Proxy 'getOwnPropertyDescriptor' trap cannot report non-writable property as writable",
+                    ));
+                }
+                // For non-configurable, non-writable properties, value must match
+                if !target_attrs.writable && !same_value(trap_value, target_value) {
+                    return Err(VmError::type_error(
+                        "Proxy 'getOwnPropertyDescriptor' trap must report same value for non-configurable, non-writable property",
+                    ));
                 }
             }
         }
@@ -954,7 +942,7 @@ fn proxy_define_property_impl(
     let desc_obj = descriptor_to_object(desc, ncx);
 
     // Invoke trap: handler.defineProperty(target, key, descriptor)
-    let trap_args = &[target.clone(), key_value.clone(), desc_obj];
+    let trap_args = &[target, key_value, desc_obj];
     let trap_result = invoke_trap(ncx, proxy, "defineProperty", trap_args)?;
 
     // If no trap, perform default [[DefineOwnProperty]] on target
@@ -991,12 +979,13 @@ fn validate_define_property_invariants(
     }
 
     // If target has non-configurable property, cannot change it to configurable
-    if let Some(target_desc) = target_desc {
-        if !target_desc.is_configurable() && desc.is_configurable() {
-            return Err(VmError::type_error(
-                "Cannot change non-configurable property to configurable via proxy",
-            ));
-        }
+    if let Some(target_desc) = target_desc
+        && !target_desc.is_configurable()
+        && desc.is_configurable()
+    {
+        return Err(VmError::type_error(
+            "Cannot change non-configurable property to configurable via proxy",
+        ));
     }
 
     Ok(())
@@ -1008,7 +997,7 @@ fn descriptor_to_object(desc: &PropertyDescriptor, _ncx: &NativeContext) -> Valu
 
     match desc {
         PropertyDescriptor::Data { value, attributes } => {
-            let _ = obj.set(PropertyKey::from("value"), value.clone());
+            let _ = obj.set(PropertyKey::from("value"), *value);
             let _ = obj.set(
                 PropertyKey::from("writable"),
                 Value::boolean(attributes.writable),
@@ -1028,10 +1017,10 @@ fn descriptor_to_object(desc: &PropertyDescriptor, _ncx: &NativeContext) -> Valu
             attributes,
         } => {
             if let Some(getter) = get {
-                let _ = obj.set(PropertyKey::from("get"), getter.clone());
+                let _ = obj.set(PropertyKey::from("get"), *getter);
             }
             if let Some(setter) = set {
-                let _ = obj.set(PropertyKey::from("set"), setter.clone());
+                let _ = obj.set(PropertyKey::from("set"), *setter);
             }
             let _ = obj.set(
                 PropertyKey::from("enumerable"),
@@ -1069,9 +1058,7 @@ fn descriptor_from_object(obj: &GcRef<JsObject>) -> VmResult<PropertyDescriptor>
     // Determine if it's a data or accessor descriptor
     if has_value || has_writable {
         // Data descriptor
-        let value = obj
-            .get(&PropertyKey::from("value"))
-            .unwrap_or(Value::undefined());
+        let value = obj.get(&PropertyKey::from("value")).unwrap_or_default();
         let writable = obj
             .get(&PropertyKey::from("writable"))
             .map(|v| v.to_boolean())
@@ -1137,7 +1124,7 @@ fn proxy_get_prototype_of_impl(
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.getPrototypeOf(target)
-    let trap_args = &[target.clone()];
+    let trap_args = &[target];
     let trap_result = invoke_trap(ncx, proxy, "getPrototypeOf", trap_args)?;
 
     // If no trap, perform default [[GetPrototypeOf]] on target
@@ -1215,12 +1202,12 @@ fn proxy_set_prototype_of_impl(
 
     // Convert prototype to Value
     let proto_value = match &proto {
-        Some(p) => Value::object(p.clone()),
+        Some(p) => Value::object(*p),
         None => Value::null(),
     };
 
     // Invoke trap: handler.setPrototypeOf(target, proto)
-    let trap_args = &[target.clone(), proto_value];
+    let trap_args = &[target, proto_value];
     let trap_result = invoke_trap(ncx, proxy, "setPrototypeOf", trap_args)?;
 
     // If no trap, perform default [[SetPrototypeOf]] on target
@@ -1280,7 +1267,7 @@ fn proxy_is_extensible_impl(ncx: &mut NativeContext, proxy: GcRef<JsProxy>) -> V
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.isExtensible(target)
-    let trap_args = &[target.clone()];
+    let trap_args = &[target];
     let trap_result = invoke_trap(ncx, proxy, "isExtensible", trap_args)?;
 
     // If no trap, perform default [[IsExtensible]] on target
@@ -1317,7 +1304,7 @@ fn proxy_prevent_extensions_impl(ncx: &mut NativeContext, proxy: GcRef<JsProxy>)
     let target = proxy_target_value(proxy)?;
 
     // Invoke trap: handler.preventExtensions(target)
-    let trap_args = &[target.clone()];
+    let trap_args = &[target];
     let trap_result = invoke_trap(ncx, proxy, "preventExtensions", trap_args)?;
 
     // If no trap, perform default [[PreventExtensions]] on target
@@ -1369,11 +1356,7 @@ fn proxy_apply_impl(
     let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.apply(target, thisValue, args)
-    let trap_args = &[
-        target.clone(),
-        this_value.clone(),
-        Value::object(args_array),
-    ];
+    let trap_args = &[target, this_value, Value::object(args_array)];
     let trap_result = invoke_trap(ncx, proxy, "apply", trap_args)?;
 
     // If no trap, perform default [[Call]] on target
@@ -1420,11 +1403,7 @@ fn proxy_construct_impl(
     let args_array = create_args_array(ncx, args);
 
     // Invoke trap: handler.construct(target, args, newTarget)
-    let trap_args = &[
-        target.clone(),
-        Value::object(args_array),
-        new_target.clone(),
-    ];
+    let trap_args = &[target, Value::object(args_array), new_target];
     let trap_result = invoke_trap(ncx, proxy, "construct", trap_args)?;
 
     // If no trap, perform default [[Construct]] on target
@@ -1470,24 +1449,20 @@ fn same_value(x: &Value, y: &Value) -> bool {
     }
 
     // Handle numbers (integers and floats)
-    match (x.as_int32(), y.as_int32()) {
-        (Some(a), Some(b)) => return a == b,
-        _ => {}
+    if let (Some(a), Some(b)) = (x.as_int32(), y.as_int32()) {
+        return a == b;
     }
 
-    match (x.as_number(), y.as_number()) {
-        (Some(a), Some(b)) => {
-            // Handle NaN: NaN is SameValue to itself
-            if a.is_nan() && b.is_nan() {
-                return true;
-            }
-            // Handle -0 and +0: they are NOT SameValue
-            if a == 0.0 && b == 0.0 {
-                return a.is_sign_positive() == b.is_sign_positive();
-            }
-            return a == b;
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        // Handle NaN: NaN is SameValue to itself
+        if a.is_nan() && b.is_nan() {
+            return true;
         }
-        _ => {}
+        // Handle -0 and +0: they are NOT SameValue
+        if a == 0.0 && b == 0.0 {
+            return a.is_sign_positive() == b.is_sign_positive();
+        }
+        return a == b;
     }
 
     // Handle strings

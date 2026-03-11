@@ -123,7 +123,7 @@ impl ModuleNamespace {
     pub fn entries(&self) -> Vec<(String, Value)> {
         self.exports
             .read()
-            .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|e| e.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default()
     }
 
@@ -150,7 +150,7 @@ impl ModuleNamespace {
 }
 
 /// Convert a [`ModuleNamespace`] into a plain JS object whose properties mirror the exports.
-pub fn namespace_to_object(namespace: &ModuleNamespace, mm: Arc<MemoryManager>) -> Value {
+pub fn namespace_to_object(namespace: &ModuleNamespace, _mm: Arc<MemoryManager>) -> Value {
     let obj = GcRef::new(JsObject::new(Value::null()));
     for (key, value) in namespace.entries() {
         let _ = obj.set(PropertyKey::string(&key), value);
@@ -325,7 +325,7 @@ pub mod interop {
             .unwrap_or_else(Value::undefined);
 
         // ESM default binding always maps to module.exports for CJS modules.
-        result.set("default", module_exports.clone());
+        result.set("default", module_exports);
 
         // Named exports come from enumerable own keys of module.exports.
         if let Some(exports_obj) = module_exports.as_object() {
@@ -517,7 +517,7 @@ impl ModuleLoader {
                                 "  Captured named export (from context): {} = {:?}",
                                 exported, val
                             );
-                            guard.namespace.set(&exported, val.clone());
+                            guard.namespace.set(&exported, *val);
                         } else if let Some(val) = global.get(&exported.as_str().into()) {
                             println!(
                                 "  Captured named export (from global): {} = {:?}",
@@ -543,7 +543,7 @@ impl ModuleLoader {
                     otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
                         // First check captured exports (for ESM)
                         if let Some(val) = captured.and_then(|c| c.get("default")) {
-                            guard.namespace.set("default", val.clone());
+                            guard.namespace.set("default", *val);
                         } else if let Some(val) = global.get(&"default".into()) {
                             guard.namespace.set("default", val);
                         } else if let Some(val) = ctx
@@ -1119,7 +1119,7 @@ try {{
             .map_err(|_| ModuleError::NotFound(normalized.clone()))?;
 
         let tmp = ModuleNamespace::new();
-        tmp.set("module.exports", module_exports.clone());
+        tmp.set("module.exports", module_exports);
         let esm_view = interop::cjs_to_esm(&tmp);
 
         guard.namespace.clear();
@@ -1784,7 +1784,7 @@ mod tests {
 
         loader.load(&module_url, ModuleType::CommonJS).unwrap();
 
-        let mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
+        let _mm = Arc::new(otter_vm_core::memory::MemoryManager::test());
         let exports_obj = GcRef::new(JsObject::new(Value::null()));
         exports_obj
             .set(PropertyKey::string("named"), Value::int32(7))

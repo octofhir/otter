@@ -349,7 +349,11 @@ fn test_array_elem() {
         .name("main")
         .feedback_vector_size(2)
         // NewArray r0, 3
-        .instruction(Instruction::NewArray { dst: Register(0), len: 3, packed: false })
+        .instruction(Instruction::NewArray {
+            dst: Register(0),
+            len: 3,
+            packed: false,
+        })
         // LoadInt32 r1, 10
         .instruction(Instruction::LoadInt32 {
             dst: Register(1),
@@ -1062,7 +1066,11 @@ fn test_ic_coverage_array_integer_access() {
         .name("main")
         .feedback_vector_size(2)
         // Create array with 3 elements
-        .instruction(Instruction::NewArray { dst: Register(0), len: 3, packed: false })
+        .instruction(Instruction::NewArray {
+            dst: Register(0),
+            len: 3,
+            packed: false,
+        })
         // Set arr[1] = 42
         .instruction(Instruction::LoadInt32 {
             dst: Register(1),
@@ -1147,7 +1155,7 @@ fn test_ic_state_machine_uninitialized_to_mono() {
     // Check IC state transitioned to Monomorphic
     let func = module.function(0).unwrap();
     let feedback = func.feedback_vector.read();
-    if let Some(ic) = feedback.get(0) {
+    if let Some(ic) = feedback.first() {
         match &ic.ic_state {
             InlineCacheState::Monomorphic { .. } => {}
             state => panic!("Expected Monomorphic IC state, got {:?}", state),
@@ -1241,7 +1249,7 @@ fn test_ic_state_machine_mono_to_poly() {
     // Check IC state transitioned to Polymorphic
     let func = module.function(0).unwrap();
     let feedback = func.feedback_vector.read();
-    if let Some(ic) = feedback.get(0) {
+    if let Some(ic) = feedback.first() {
         match &ic.ic_state {
             InlineCacheState::Polymorphic { count, .. } => {
                 assert!(*count >= 2, "Expected at least 2 shapes cached");
@@ -1441,7 +1449,7 @@ fn test_ic_state_machine_poly_to_mega() {
     // Check IC state transitioned to Megamorphic
     let func = module.function(0).unwrap();
     let feedback = func.feedback_vector.read();
-    if let Some(ic) = feedback.get(0) {
+    if let Some(ic) = feedback.first() {
         match &ic.ic_state {
             InlineCacheState::Megamorphic => {}
             state => panic!("Expected Megamorphic IC state, got {:?}", state),
@@ -1467,7 +1475,7 @@ fn test_proto_chain_cache_epoch_bump() {
     let obj2 = GcRef::new(JsObject::new(Value::null()));
 
     // Set prototype should bump epoch
-    obj1.set_prototype(Value::object(obj2.clone()));
+    obj1.set_prototype(Value::object(obj2));
 
     let after_first = get_proto_epoch();
     assert!(
@@ -1537,7 +1545,7 @@ fn test_proto_chain_cache_ic_stores_epoch() {
     // Check that IC has proto_epoch stored
     let func = module.function(0).unwrap();
     let feedback = func.feedback_vector.read();
-    if let Some(ic) = feedback.get(0) {
+    if let Some(ic) = feedback.first() {
         match &ic.ic_state {
             InlineCacheState::Monomorphic { .. } => {
                 // proto_epoch should be >= epoch_before (execution may have bumped it)
@@ -1639,7 +1647,7 @@ fn test_proto_chain_cache_epoch_consistency() {
     // Check that IC has transitioned to Polymorphic and has proto_epoch
     let func = module.function(0).unwrap();
     let feedback = func.feedback_vector.read();
-    if let Some(ic) = feedback.get(0) {
+    if let Some(ic) = feedback.first() {
         match &ic.ic_state {
             InlineCacheState::Polymorphic { count, .. } => {
                 assert!(*count >= 2, "Expected at least 2 shapes cached");
@@ -1713,10 +1721,10 @@ fn test_dictionary_mode_delete_trigger() {
     let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
     let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
     let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
-    let _ = obj.set(key_a.clone(), Value::int32(1));
-    let _ = obj.set(key_b.clone(), Value::int32(2));
-    let _ = obj.set(key_c.clone(), Value::int32(3));
-    let _ = obj.set(key_d.clone(), Value::int32(4));
+    let _ = obj.set(key_a, Value::int32(1));
+    let _ = obj.set(key_b, Value::int32(2));
+    let _ = obj.set(key_c, Value::int32(3));
+    let _ = obj.set(key_d, Value::int32(4));
 
     assert!(
         !obj.is_dictionary_mode(),
@@ -1764,8 +1772,8 @@ fn test_dictionary_mode_storage_correctness() {
     // Add properties
     let key_a = PropertyKey::String(crate::string::JsString::intern("a"));
     let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
-    let _ = obj.set(key_a.clone(), Value::int32(42));
-    let _ = obj.set(key_b.clone(), Value::int32(100));
+    let _ = obj.set(key_a, Value::int32(42));
+    let _ = obj.set(key_b, Value::int32(100));
 
     // Delete key_b (slot-clearing, not dict mode yet)
     obj.delete(&key_b);
@@ -1778,15 +1786,15 @@ fn test_dictionary_mode_storage_correctness() {
     assert_eq!(obj.get(&key_b), None); // Deleted (cleared slot)
 
     // Re-insert key_b (re-creates data property in cleared slot)
-    let _ = obj.set(key_b.clone(), Value::int32(200));
+    let _ = obj.set(key_b, Value::int32(200));
     assert_eq!(obj.get(&key_b), Some(Value::int32(200)));
     assert!(obj.has_own(&key_b));
 
     // Now trigger dictionary mode with 3 deletes
     let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
     let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
-    let _ = obj.set(key_c.clone(), Value::int32(300));
-    let _ = obj.set(key_d.clone(), Value::int32(400));
+    let _ = obj.set(key_c, Value::int32(300));
+    let _ = obj.set(key_d, Value::int32(400));
     obj.delete(&key_b); // delete_count = 2 (had 1 before re-insert)
     obj.delete(&key_c); // delete_count = 3 → dictionary mode
     assert!(obj.is_dictionary_mode());
@@ -1813,10 +1821,10 @@ fn test_dictionary_mode_ic_skip() {
     let key_b = PropertyKey::String(crate::string::JsString::intern("b"));
     let key_c = PropertyKey::String(crate::string::JsString::intern("c"));
     let key_d = PropertyKey::String(crate::string::JsString::intern("d"));
-    let _ = obj.set(key_a.clone(), Value::int32(1));
-    let _ = obj.set(key_b.clone(), Value::int32(2));
-    let _ = obj.set(key_c.clone(), Value::int32(3));
-    let _ = obj.set(key_d.clone(), Value::int32(4));
+    let _ = obj.set(key_a, Value::int32(1));
+    let _ = obj.set(key_b, Value::int32(2));
+    let _ = obj.set(key_c, Value::int32(3));
+    let _ = obj.set(key_d, Value::int32(4));
 
     // 1-2 deletes: still shaped, IC remains valid
     obj.delete(&key_a);

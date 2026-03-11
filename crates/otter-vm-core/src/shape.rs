@@ -141,10 +141,10 @@ impl Shape {
         // Check if transition already exists
         {
             let transitions = self.transitions.borrow();
-            if let Some(weak_shape) = transitions.get(&key) {
-                if let Some(shape) = weak_shape.upgrade() {
-                    return shape;
-                }
+            if let Some(weak_shape) = transitions.get(&key)
+                && let Some(shape) = weak_shape.upgrade()
+            {
+                return shape;
             }
         }
 
@@ -152,10 +152,10 @@ impl Shape {
         let mut transitions = self.transitions.borrow_mut();
 
         // Double-check after acquiring mutable borrow
-        if let Some(weak_shape) = transitions.get(&key) {
-            if let Some(shape) = weak_shape.upgrade() {
-                return shape;
-            }
+        if let Some(weak_shape) = transitions.get(&key)
+            && let Some(shape) = weak_shape.upgrade()
+        {
+            return shape;
         }
 
         // Prune dead Weak entries so the map is bounded by currently live shapes.
@@ -166,7 +166,7 @@ impl Shape {
 
         let new_shape = Arc::new(Self {
             parent: Some(Arc::clone(self)),
-            key: Some(key.clone()),
+            key: Some(key),
             offset: Some(next_offset),
             depth: next_depth,
             transitions: RefCell::new(FxHashMap::default()),
@@ -207,10 +207,10 @@ impl Shape {
     fn walk_get_offset(&self, key: &PropertyKey) -> Option<usize> {
         let mut current = Some(self);
         while let Some(shape) = current {
-            if let Some(ref k) = shape.key {
-                if k == key {
-                    return shape.offset;
-                }
+            if let Some(ref k) = shape.key
+                && k == key
+            {
+                return shape.offset;
             }
             current = shape.parent.as_deref();
         }
@@ -230,7 +230,7 @@ impl Shape {
             if let (Some(k), Some(off)) = (&shape.key, shape.offset) {
                 // Don't overwrite — first seen (closest to leaf) wins.
                 // But in our linear chain, each key appears exactly once.
-                map.entry(k.clone()).or_insert(off);
+                map.entry(*k).or_insert(off);
             }
             current = shape.parent.as_deref();
         }
@@ -254,7 +254,7 @@ impl Shape {
         let mut current = Some(self);
         while let Some(shape) = current {
             if let Some(ref k) = shape.key {
-                keys.push(k.clone());
+                keys.push(*k);
             }
             current = shape.parent.as_deref();
         }
@@ -275,7 +275,7 @@ impl Shape {
     pub fn from_keys(root: &Arc<Self>, keys: &[PropertyKey]) -> Arc<Self> {
         let mut current = Arc::clone(root);
         for key in keys {
-            current = current.transition(key.clone());
+            current = current.transition(*key);
         }
         current
     }
@@ -292,7 +292,7 @@ impl Shape {
         let mut current = Some(self);
         while let Some(shape) = current {
             if let (Some(k), Some(off)) = (&shape.key, shape.offset) {
-                pairs.push((k.clone(), off));
+                pairs.push((*k, off));
             }
             current = shape.parent.as_deref();
         }

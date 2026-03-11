@@ -678,7 +678,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use std::io::Write;
+
     use tar::Builder;
 
     #[test]

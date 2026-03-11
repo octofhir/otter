@@ -663,7 +663,7 @@ mod tests {
         let map = store.to_hash_map();
         assert_eq!(map.get("A"), Some(&"1".to_string()));
         assert_eq!(map.get("B"), Some(&"2".to_string()));
-        assert!(map.get("HOME").is_none());
+        assert!(!map.contains_key("HOME"));
     }
 
     #[test]

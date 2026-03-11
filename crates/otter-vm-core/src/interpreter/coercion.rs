@@ -23,7 +23,7 @@ impl Interpreter {
         hint: PreferredType,
     ) -> VmResult<Value> {
         if !value.is_object() {
-            return Ok(value.clone());
+            return Ok(*value);
         }
 
         // Handle proxy: use proxy_get for property lookups
@@ -40,7 +40,7 @@ impl Interpreter {
                     proxy,
                     &to_prim_key,
                     to_prim_key_value,
-                    value.clone(),
+                    *value,
                 )?
             };
             if !method.is_undefined() && !method.is_null() {
@@ -55,7 +55,7 @@ impl Interpreter {
                     PreferredType::String => "string",
                 };
                 let hint_val = Value::string(JsString::intern(hint_str));
-                let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
+                let result = self.call_function(ctx, &method, *value, &[hint_val])?;
                 if !result.is_object() {
                     return Ok(result);
                 }
@@ -74,16 +74,10 @@ impl Interpreter {
                 let key_value = Value::string(JsString::intern(name));
                 let method = {
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                    crate::proxy_operations::proxy_get(
-                        &mut ncx,
-                        proxy,
-                        &key,
-                        key_value,
-                        value.clone(),
-                    )?
+                    crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, *value)?
                 };
                 if method.is_callable() {
-                    let result = self.call_function(ctx, &method, value.clone(), &[])?;
+                    let result = self.call_function(ctx, &method, *value, &[])?;
                     if !result.is_object() {
                         return Ok(result);
                     }
@@ -96,7 +90,7 @@ impl Interpreter {
         }
 
         let Some(obj) = value.as_object() else {
-            return Ok(value.clone());
+            return Ok(*value);
         };
 
         // 1. @@toPrimitive
@@ -114,7 +108,7 @@ impl Interpreter {
                 PreferredType::String => "string",
             };
             let hint_val = Value::string(JsString::intern(hint_str));
-            let result = self.call_function(ctx, &method, value.clone(), &[hint_val])?;
+            let result = self.call_function(ctx, &method, *value, &[hint_val])?;
             if !result.is_object() {
                 return Ok(result);
             }
@@ -131,7 +125,7 @@ impl Interpreter {
         for name in [first, second] {
             let method = self.get_property_value(ctx, &obj, &PropertyKey::string(name), value)?;
             if method.is_callable() {
-                let result = self.call_function(ctx, &method, value.clone(), &[])?;
+                let result = self.call_function(ctx, &method, *value, &[])?;
                 if !result.is_object() {
                     return Ok(result);
                 }
@@ -177,6 +171,7 @@ impl Interpreter {
 
     /// Convert value to UTF-16 code units of ToString(value), preserving lone surrogates
     /// for existing JS string values.
+    #[allow(dead_code)]
     pub(super) fn to_string_utf16_units(
         &self,
         ctx: &mut VmContext,
@@ -193,7 +188,7 @@ impl Interpreter {
         let prim = if value.is_object() {
             self.to_primitive(ctx, value, PreferredType::Number)?
         } else {
-            value.clone()
+            *value
         };
         if prim.is_symbol() {
             return Err(VmError::type_error(
@@ -269,31 +264,31 @@ impl Interpreter {
         let _ = obj.set(PropertyKey::string("_internal"), Value::promise(internal));
 
         // Try to get Promise.prototype and copy its methods
-        if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object()) {
-            if let Some(proto) = promise_ctor
+        if let Some(promise_ctor) = ctx.get_global("Promise").and_then(|v| v.as_object())
+            && let Some(proto) = promise_ctor
                 .get(&PropertyKey::string("prototype"))
                 .and_then(|v| v.as_object())
-            {
-                // Copy then, catch, finally from prototype
-                if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
-                    let _ = obj.set(PropertyKey::string("then"), then_fn);
-                }
-                if let Some(catch_fn) = proto.get(&PropertyKey::string("catch")) {
-                    let _ = obj.set(PropertyKey::string("catch"), catch_fn);
-                }
-                if let Some(finally_fn) = proto.get(&PropertyKey::string("finally")) {
-                    let _ = obj.set(PropertyKey::string("finally"), finally_fn);
-                }
-
-                // Set prototype for proper inheritance
-                obj.set_prototype(Value::object(proto));
+        {
+            // Copy then, catch, finally from prototype
+            if let Some(then_fn) = proto.get(&PropertyKey::string("then")) {
+                let _ = obj.set(PropertyKey::string("then"), then_fn);
             }
+            if let Some(catch_fn) = proto.get(&PropertyKey::string("catch")) {
+                let _ = obj.set(PropertyKey::string("catch"), catch_fn);
+            }
+            if let Some(finally_fn) = proto.get(&PropertyKey::string("finally")) {
+                let _ = obj.set(PropertyKey::string("finally"), finally_fn);
+            }
+
+            // Set prototype for proper inheritance
+            obj.set_prototype(Value::object(proto));
         }
 
         Value::object(obj)
     }
 
     /// Convert object to primitive using number hint.
+    #[allow(dead_code)]
     pub(super) fn to_primitive_number(
         &self,
         ctx: &mut VmContext,
@@ -400,7 +395,7 @@ impl Interpreter {
         let prim = if value.is_object() {
             self.to_primitive(ctx, value, PreferredType::Number)?
         } else {
-            value.clone()
+            *value
         };
         if let Some(bigint) = self.bigint_value(&prim)? {
             return Ok(Numeric::BigInt(bigint));
@@ -468,16 +463,15 @@ impl Interpreter {
             (false, trimmed, false)
         };
 
-        if had_sign {
-            if digits.starts_with("0x")
+        if had_sign
+            && (digits.starts_with("0x")
                 || digits.starts_with("0X")
                 || digits.starts_with("0o")
                 || digits.starts_with("0O")
                 || digits.starts_with("0b")
-                || digits.starts_with("0B")
-            {
-                return Err(VmError::syntax_error("Invalid BigInt"));
-            }
+                || digits.starts_with("0B"))
+        {
+            return Err(VmError::syntax_error("Invalid BigInt"));
         }
 
         let (radix, digits) = if let Some(rest) = digits.strip_prefix("0x") {
@@ -560,16 +554,16 @@ impl Interpreter {
         let prim = if value.is_object() {
             self.to_primitive(ctx, value, PreferredType::String)?
         } else {
-            value.clone()
+            *value
         };
         if let Some(sym) = prim.as_symbol() {
             return Ok(PropertyKey::Symbol(sym));
         }
         let key_str = self.to_string_value(ctx, &prim)?;
-        if let Ok(n) = key_str.parse::<u32>() {
-            if n.to_string() == key_str {
-                return Ok(PropertyKey::Index(n));
-            }
+        if let Ok(n) = key_str.parse::<u32>()
+            && n.to_string() == key_str
+        {
+            return Ok(PropertyKey::Index(n));
         }
         Ok(PropertyKey::string_transient(&key_str))
     }

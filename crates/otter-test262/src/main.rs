@@ -613,10 +613,10 @@ async fn run_tests_core(cli: Cli) -> TestReport {
             }
 
             // JSONL log
-            if let Some(ref mut writer) = log_writer {
-                if let Ok(line) = serde_json::to_string(result) {
-                    let _ = writeln!(writer, "{}", line);
-                }
+            if let Some(ref mut writer) = log_writer
+                && let Ok(line) = serde_json::to_string(result)
+            {
+                let _ = writeln!(writer, "{}", line);
             }
 
             summary.record(result, save_results);
@@ -639,38 +639,38 @@ async fn run_tests_core(cli: Cli) -> TestReport {
         }
 
         // Incremental save every 500 tests to survive crashes
-        if save_results && summary.total.is_multiple_of(500) {
-            if let Some(ref save_path) = save_path {
-                let interim_report = TestReport {
-                    total: summary.total,
-                    passed: summary.passed,
-                    failed: summary.failed,
-                    skipped: summary.skipped,
-                    timeout: summary.timeout,
-                    crashed: summary.crashed,
-                    pass_rate: {
-                        let run =
-                            summary.passed + summary.failed + summary.timeout + summary.crashed;
-                        if run > 0 {
-                            (summary.passed as f64 / run as f64) * 100.0
-                        } else {
-                            0.0
-                        }
-                    },
-                    by_feature: summary.by_feature.clone(),
-                    failures: summary.failures.clone(),
-                    timeouts: summary.timeouts.clone(),
-                };
-                let persisted = PersistedReport {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    otter_version: env!("CARGO_PKG_VERSION").to_string(),
-                    test262_commit: None,
-                    duration_secs: run_start.elapsed().as_secs_f64(),
-                    summary: interim_report,
-                    results: summary.all_results.clone(),
-                };
-                let _ = persisted.save(save_path);
-            }
+        if save_results
+            && summary.total.is_multiple_of(500)
+            && let Some(ref save_path) = save_path
+        {
+            let interim_report = TestReport {
+                total: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                timeout: summary.timeout,
+                crashed: summary.crashed,
+                pass_rate: {
+                    let run = summary.passed + summary.failed + summary.timeout + summary.crashed;
+                    if run > 0 {
+                        (summary.passed as f64 / run as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                },
+                by_feature: summary.by_feature.clone(),
+                failures: summary.failures.clone(),
+                timeouts: summary.timeouts.clone(),
+            };
+            let persisted = PersistedReport {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                otter_version: env!("CARGO_PKG_VERSION").to_string(),
+                test262_commit: None,
+                duration_secs: run_start.elapsed().as_secs_f64(),
+                summary: interim_report,
+                results: summary.all_results.clone(),
+            };
+            let _ = persisted.save(save_path);
         }
     }
 
@@ -822,14 +822,14 @@ async fn run_advance(mut cli: Cli, batch_size: usize) {
     if report.failed == 0 && report.total > 0 && report.crashed == 0 && report.timeout == 0 {
         progress.skip += batch_size;
         let content = serde_json::to_string_pretty(&progress).unwrap();
-        if let Ok(()) = std::fs::write(&progress_path, content) {
-            if !cli.json {
-                eprintln!(
-                    "{} All tests passed! Next skip: {}",
-                    "SUCCESS:".bold().green(),
-                    progress.skip
-                );
-            }
+        if let Ok(()) = std::fs::write(&progress_path, content)
+            && !cli.json
+        {
+            eprintln!(
+                "{} All tests passed! Next skip: {}",
+                "SUCCESS:".bold().green(),
+                progress.skip
+            );
         }
     } else {
         if !cli.json {

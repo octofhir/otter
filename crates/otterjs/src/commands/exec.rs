@@ -164,11 +164,10 @@ fn find_bin_in_package(cache_path: &Path, package: &str) -> Result<PathBuf> {
 /// Parse package[@version] spec
 fn parse_package_spec(spec: &str) -> (String, Option<&str>) {
     // Handle scoped packages: @scope/pkg@version
-    if spec.starts_with('@') {
-        if let Some(at_idx) = spec[1..].find('@') {
-            let split_idx = at_idx + 1;
-            let name = &spec[..split_idx];
-            let version = &spec[split_idx + 1..];
+    if let Some(rest) = spec.strip_prefix('@') {
+        if let Some(at_idx) = rest.find('@') {
+            let name = &spec[..at_idx + 1];
+            let version = &rest[at_idx + 1..];
             return (name.to_string(), Some(version));
         }
         return (spec.to_string(), None);
@@ -184,7 +183,7 @@ fn parse_package_spec(spec: &str) -> (String, Option<&str>) {
 
 /// Check if package is trusted (skip confirmation)
 fn is_trusted(package: &str) -> bool {
-    let name = package.split('/').last().unwrap_or(package);
+    let name = package.split('/').next_back().unwrap_or(package);
     TRUSTED_PACKAGES.contains(&name) || package.starts_with("@types/")
 }
 

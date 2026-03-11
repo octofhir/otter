@@ -455,16 +455,17 @@ impl Compiler {
                 continue;
             }
             let is_last = idx == total - 1;
-            if is_last && self.eval_mode {
-                if let Statement::ExpressionStatement(expr_stmt) = stmt {
-                    // Last statement is an expression — compile it and emit Return
-                    let reg = self.compile_expression(&expr_stmt.expression)?;
-                    self.codegen.emit(Instruction::Return { src: reg });
-                    self.codegen.free_reg(reg);
-                    // Mark that we already returned so compile() doesn't add ReturnUndefined
-                    self.last_was_return = true;
-                    continue;
-                }
+            if is_last
+                && self.eval_mode
+                && let Statement::ExpressionStatement(expr_stmt) = stmt
+            {
+                // Last statement is an expression — compile it and emit Return
+                let reg = self.compile_expression(&expr_stmt.expression)?;
+                self.codegen.emit(Instruction::Return { src: reg });
+                self.codegen.free_reg(reg);
+                // Mark that we already returned so compile() doesn't add ReturnUndefined
+                self.last_was_return = true;
+                continue;
             }
             self.compile_statement(stmt)?;
         }
@@ -493,6 +494,7 @@ impl Compiler {
     /// This implements JavaScript's hoisting behavior where:
     /// - `var` declarations are hoisted (name only, value is undefined)
     /// - `function` declarations are hoisted (name and body are available)
+    ///
     /// Returns a set of statement indices that were hoisted and should be skipped during
     /// normal compilation.
     fn hoist_function_declarations(
@@ -619,11 +621,11 @@ impl Compiler {
         // declarations in any nested block within this scope.
         let mut top_level_lexical: HashSet<String> = HashSet::new();
         for stmt in statements {
-            if let Statement::VariableDeclaration(decl) = stmt {
-                if decl.kind != VariableDeclarationKind::Var {
-                    for declarator in &decl.declarations {
-                        Self::collect_binding_names(&declarator.id, &mut top_level_lexical);
-                    }
+            if let Statement::VariableDeclaration(decl) = stmt
+                && decl.kind != VariableDeclarationKind::Var
+            {
+                for declarator in &decl.declarations {
+                    Self::collect_binding_names(&declarator.id, &mut top_level_lexical);
                 }
             }
         }
@@ -785,11 +787,11 @@ impl Compiler {
                 let mut blocked = blocked_var_names.clone();
                 for case in &switch.cases {
                     for s in &case.consequent {
-                        if let Statement::VariableDeclaration(decl) = s {
-                            if decl.kind != VariableDeclarationKind::Var {
-                                for declarator in &decl.declarations {
-                                    Self::collect_binding_names(&declarator.id, &mut blocked);
-                                }
+                        if let Statement::VariableDeclaration(decl) = s
+                            && decl.kind != VariableDeclarationKind::Var
+                        {
+                            for declarator in &decl.declarations {
+                                Self::collect_binding_names(&declarator.id, &mut blocked);
                             }
                         }
                     }
@@ -1026,14 +1028,11 @@ impl Compiler {
                 // This covers the hoisting AND compilation phases.
                 let mut block_lexical_names = HashSet::new();
                 for s in &block.body {
-                    if let Statement::VariableDeclaration(decl) = s {
-                        if decl.kind != VariableDeclarationKind::Var {
-                            for declarator in &decl.declarations {
-                                Self::collect_binding_names(
-                                    &declarator.id,
-                                    &mut block_lexical_names,
-                                );
-                            }
+                    if let Statement::VariableDeclaration(decl) = s
+                        && decl.kind != VariableDeclarationKind::Var
+                    {
+                        for declarator in &decl.declarations {
+                            Self::collect_binding_names(&declarator.id, &mut block_lexical_names);
                         }
                     }
                 }
@@ -1548,12 +1547,11 @@ impl Compiler {
         // However, if the class has a `static name()` method, skip name inference
         // because the static method should define the `.name` property instead.
         let has_static_name = class_expr.body.body.iter().any(|elem| {
-            if let ClassElement::MethodDefinition(m) = elem {
-                if m.r#static {
-                    if let PropertyKey::StaticIdentifier(id) = &m.key {
-                        return id.name.as_str() == "name";
-                    }
-                }
+            if let ClassElement::MethodDefinition(m) = elem
+                && m.r#static
+                && let PropertyKey::StaticIdentifier(id) = &m.key
+            {
+                return id.name.as_str() == "name";
             }
             false
         });
@@ -2182,12 +2180,11 @@ impl Compiler {
             // Compile initializer first
             // Per ES2023 §14.3.2.4 step 7: if binding is a simple identifier
             // and init is an anonymous function, set the function's name.
-            if let Some(init) = &declarator.init {
-                if let BindingPattern::BindingIdentifier(ident) = &declarator.id {
-                    if Self::is_anonymous_function_definition(init) {
-                        self.pending_inferred_name = Some(ident.name.to_string());
-                    }
-                }
+            if let Some(init) = &declarator.init
+                && let BindingPattern::BindingIdentifier(ident) = &declarator.id
+                && Self::is_anonymous_function_definition(init)
+            {
+                self.pending_inferred_name = Some(ident.name.to_string());
             }
             let init_reg = if let Some(init) = &declarator.init {
                 self.compile_expression(init)?
@@ -2331,10 +2328,10 @@ impl Compiler {
 
                             // It is undefined, evaluate default (right)
                             // Per ES2023 §13.15.5.3: set function name if default is anonymous
-                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
-                                if Self::is_anonymous_function_definition(&assign_pat.right) {
-                                    self.pending_inferred_name = Some(id.name.to_string());
-                                }
+                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left
+                                && Self::is_anonymous_function_definition(&assign_pat.right)
+                            {
+                                self.pending_inferred_name = Some(id.name.to_string());
                             }
                             let default_val = self.compile_expression(&assign_pat.right)?;
                             self.codegen.emit(Instruction::Move {
@@ -2373,7 +2370,11 @@ impl Compiler {
                 if let Some(rest) = &obj_pattern.rest {
                     // Build excluded keys array
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                        packed: false,
+                    });
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
                         self.codegen.emit(Instruction::LoadInt32 {
@@ -2478,10 +2479,10 @@ impl Compiler {
 
                             // Value is undefined — evaluate default
                             // Set inferred name if the default is an anonymous function
-                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
-                                if Self::is_anonymous_function_definition(&assign_pat.right) {
-                                    self.pending_inferred_name = Some(id.name.to_string());
-                                }
+                            if let BindingPattern::BindingIdentifier(id) = &assign_pat.left
+                                && Self::is_anonymous_function_definition(&assign_pat.right)
+                            {
+                                self.pending_inferred_name = Some(id.name.to_string());
                             }
                             let default_val = self.compile_expression(&assign_pat.right)?;
                             self.codegen.emit(Instruction::Move {
@@ -2554,10 +2555,10 @@ impl Compiler {
                 self.codegen.free_reg(undef_reg);
 
                 // Set inferred name for anonymous functions
-                if let BindingPattern::BindingIdentifier(id) = &assign_pat.left {
-                    if Self::is_anonymous_function_definition(&assign_pat.right) {
-                        self.pending_inferred_name = Some(id.name.to_string());
-                    }
+                if let BindingPattern::BindingIdentifier(id) = &assign_pat.left
+                    && Self::is_anonymous_function_definition(&assign_pat.right)
+                {
+                    self.pending_inferred_name = Some(id.name.to_string());
                 }
                 let default_val = self.compile_expression(&assign_pat.right)?;
                 // Overwrite value_reg with default — but value_reg may be read-only
@@ -2614,7 +2615,7 @@ impl Compiler {
             self.codegen.patch_jump(jump_else, else_offset);
 
             // Compile alternate
-            if matches!(&*alternate, Statement::FunctionDeclaration(_)) {
+            if matches!(alternate, Statement::FunctionDeclaration(_)) {
                 self.codegen.enter_scope();
                 self.compile_statement(alternate)?;
                 self.codegen.exit_scope();
@@ -2864,10 +2865,10 @@ impl Compiler {
             }
             let reg = self.compile_expression(update)?;
             self.codegen.free_reg(reg);
-        } else if !per_iteration_let_names.is_empty() {
-            if let Some(loop_ctl) = self.loop_stack.last_mut() {
-                loop_ctl.continue_target = Some(effective_continue_target);
-            }
+        } else if !per_iteration_let_names.is_empty()
+            && let Some(loop_ctl) = self.loop_stack.last_mut()
+        {
+            loop_ctl.continue_target = Some(effective_continue_target);
         }
 
         // Jump back to start
@@ -3178,35 +3179,33 @@ impl Compiler {
                             ic_index,
                         });
                         kr
-                    } else {
-                        if let Some(key_name) = Self::non_computed_property_key_name(&prop.key) {
-                            let key_idx = self.codegen.add_string(&key_name);
-                            let ic_index = self.codegen.alloc_ic();
-                            self.codegen.emit(Instruction::GetPropConst {
-                                dst: prop_reg,
-                                obj: source_reg,
-                                name: key_idx,
-                                ic_index,
-                            });
+                    } else if let Some(key_name) = Self::non_computed_property_key_name(&prop.key) {
+                        let key_idx = self.codegen.add_string(&key_name);
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetPropConst {
+                            dst: prop_reg,
+                            obj: source_reg,
+                            name: key_idx,
+                            ic_index,
+                        });
 
-                            // For rest, we need the key as a register
-                            let kr = self.codegen.alloc_reg();
-                            self.codegen.emit(Instruction::LoadConst {
-                                dst: kr,
-                                idx: key_idx,
-                            });
-                            kr
-                        } else {
-                            let kr = self.compile_property_key(&prop.key)?;
-                            let ic_index = self.codegen.alloc_ic();
-                            self.codegen.emit(Instruction::GetProp {
-                                dst: prop_reg,
-                                obj: source_reg,
-                                key: kr,
-                                ic_index,
-                            });
-                            kr
-                        }
+                        // For rest, we need the key as a register
+                        let kr = self.codegen.alloc_reg();
+                        self.codegen.emit(Instruction::LoadConst {
+                            dst: kr,
+                            idx: key_idx,
+                        });
+                        kr
+                    } else {
+                        let kr = self.compile_property_key(&prop.key)?;
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetProp {
+                            dst: prop_reg,
+                            obj: source_reg,
+                            key: kr,
+                            ic_index,
+                        });
+                        kr
                     };
 
                     if obj_pat.rest.is_some() {
@@ -3221,7 +3220,11 @@ impl Compiler {
 
                 if let Some(rest) = &obj_pat.rest {
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                        packed: false,
+                    });
 
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
@@ -3623,36 +3626,34 @@ impl Compiler {
                                     ic_index,
                                 });
                                 kr
-                            } else {
-                                if let Some(key_name) =
-                                    Self::non_computed_property_key_name(&p.name)
-                                {
-                                    let key_idx = self.codegen.add_string(&key_name);
-                                    let ic_index = self.codegen.alloc_ic();
-                                    self.codegen.emit(Instruction::GetPropConst {
-                                        dst: prop_reg,
-                                        obj: source_reg,
-                                        name: key_idx,
-                                        ic_index,
-                                    });
+                            } else if let Some(key_name) =
+                                Self::non_computed_property_key_name(&p.name)
+                            {
+                                let key_idx = self.codegen.add_string(&key_name);
+                                let ic_index = self.codegen.alloc_ic();
+                                self.codegen.emit(Instruction::GetPropConst {
+                                    dst: prop_reg,
+                                    obj: source_reg,
+                                    name: key_idx,
+                                    ic_index,
+                                });
 
-                                    let kr = self.codegen.alloc_reg();
-                                    self.codegen.emit(Instruction::LoadConst {
-                                        dst: kr,
-                                        idx: key_idx,
-                                    });
-                                    kr
-                                } else {
-                                    let kr = self.compile_property_key(&p.name)?;
-                                    let ic_index = self.codegen.alloc_ic();
-                                    self.codegen.emit(Instruction::GetProp {
-                                        dst: prop_reg,
-                                        obj: source_reg,
-                                        key: kr,
-                                        ic_index,
-                                    });
-                                    kr
-                                }
+                                let kr = self.codegen.alloc_reg();
+                                self.codegen.emit(Instruction::LoadConst {
+                                    dst: kr,
+                                    idx: key_idx,
+                                });
+                                kr
+                            } else {
+                                let kr = self.compile_property_key(&p.name)?;
+                                let ic_index = self.codegen.alloc_ic();
+                                self.codegen.emit(Instruction::GetProp {
+                                    dst: prop_reg,
+                                    obj: source_reg,
+                                    key: kr,
+                                    ic_index,
+                                });
+                                kr
                             };
 
                             if obj_target.rest.is_some() {
@@ -3705,7 +3706,11 @@ impl Compiler {
 
                 if let Some(rest) = &obj_target.rest {
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
+                    self.codegen.emit(Instruction::NewArray {
+                        dst: excluded_array,
+                        len: excluded_keys.len() as u16,
+                        packed: false,
+                    });
 
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
@@ -5476,7 +5481,11 @@ impl Compiler {
 
         if has_spread {
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+                packed: false,
+            });
 
             for arg in &intrinsic.arguments {
                 match arg {
@@ -7443,7 +7452,11 @@ impl Compiler {
             // Build a spread array from arguments, then use CallSuperForward-style handling
             // For now, build the array and use CallSuper with the expanded args
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+                packed: false,
+            });
 
             for arg in &call.arguments {
                 match arg {
@@ -7553,7 +7566,11 @@ impl Compiler {
             // For super method calls with spread, use func.apply(this, argsArray)
             // 1. Build the spread array
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+                packed: false,
+            });
 
             for arg in &call.arguments {
                 match arg {
@@ -7795,7 +7812,11 @@ impl Compiler {
         if has_spread {
             // Build spread array
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+                packed: false,
+            });
 
             for arg in &call.arguments {
                 match arg {
@@ -7935,7 +7956,11 @@ impl Compiler {
             // For spread with computed method call, use CallMethodComputedSpread
             // Build spread array first
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+            self.codegen.emit(Instruction::NewArray {
+                dst: args_arr,
+                len: 0,
+                packed: false,
+            });
 
             for arg in &call.arguments {
                 match arg {
@@ -8050,7 +8075,11 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Create an array to hold all arguments (including spread)
         let args_arr = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+        self.codegen.emit(Instruction::NewArray {
+            dst: args_arr,
+            len: 0,
+            packed: false,
+        });
 
         // Process each argument
         for arg in &call.arguments {
@@ -8128,7 +8157,11 @@ impl Compiler {
                 // Generic spread path for forms like:
                 // `new Ctor(...a, b)` or `new Ctor(...a, ...b, c)`.
                 let args_arr = self.codegen.alloc_reg();
-                self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
+                self.codegen.emit(Instruction::NewArray {
+                    dst: args_arr,
+                    len: 0,
+                    packed: false,
+                });
 
                 for arg in &new_expr.arguments {
                     match arg {
@@ -9045,7 +9078,11 @@ impl Compiler {
 
         if !has_spread {
             let len = arr.elements.len() as u16;
-            self.codegen.emit(Instruction::NewArray { dst, len, packed: !has_elision });
+            self.codegen.emit(Instruction::NewArray {
+                dst,
+                len,
+                packed: !has_elision,
+            });
 
             for (i, elem) in arr.elements.iter().enumerate() {
                 match elem {
@@ -9076,7 +9113,11 @@ impl Compiler {
         }
 
         // With spread: build dynamically using `length` and `Spread` instruction.
-        self.codegen.emit(Instruction::NewArray { dst, len: 0, packed: false });
+        self.codegen.emit(Instruction::NewArray {
+            dst,
+            len: 0,
+            packed: false,
+        });
         let length_key = self.codegen.add_string("length");
 
         for elem in &arr.elements {
@@ -10257,7 +10298,7 @@ mod tests {
             .compile("enum Color { Red, Green, Blue }", "test.ts", false)
             .unwrap();
 
-        assert!(module.functions.len() >= 1);
+        assert!(!module.functions.is_empty());
     }
 
     #[test]
@@ -10267,7 +10308,7 @@ mod tests {
             .compile("enum Status { Active = 1, Inactive = 2 }", "test.ts", false)
             .unwrap();
 
-        assert!(module.functions.len() >= 1);
+        assert!(!module.functions.is_empty());
     }
 
     #[test]
@@ -10281,7 +10322,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(module.functions.len() >= 1);
+        assert!(!module.functions.is_empty());
     }
 
     #[test]
@@ -10361,7 +10402,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(module.functions.len() >= 1);
+        assert!(!module.functions.is_empty());
     }
 
     #[test]
@@ -10475,7 +10516,7 @@ mod tests {
         "#;
         let compiler = Compiler::new();
         let module = compiler.compile(code, "test.js", false).unwrap();
-        assert!(module.functions.len() >= 1);
+        assert!(!module.functions.is_empty());
     }
 
     #[test]
@@ -10528,8 +10569,7 @@ mod tests {
             let result = compiler.compile(code, "test.js", false);
             // Note: Some of these might be caught by the parser first,
             // but if they reach our validator, they should fail
-            if result.is_err() {
-                let err = result.unwrap_err();
+            if let Err(err) = result {
                 // Could be either a parse error or our validation error
                 assert!(
                     matches!(err, CompileError::Parse(_))
@@ -10614,8 +10654,7 @@ mod tests {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js", false);
             // These should either be caught by parser or our validator
-            if result.is_err() {
-                let err = result.unwrap_err();
+            if let Err(err) = result {
                 assert!(
                     matches!(err, CompileError::Parse(_))
                         || matches!(err, CompileError::InvalidLiteral { .. })
@@ -10654,8 +10693,7 @@ mod tests {
             let compiler = Compiler::new();
             let result = compiler.compile(code, "test.js", false);
             // These should be caught by our validator
-            if result.is_err() {
-                let err = result.unwrap_err();
+            if let Err(err) = result {
                 assert!(
                     matches!(err, CompileError::Parse(_))
                         || matches!(err, CompileError::InvalidLiteral { .. })
@@ -10770,7 +10808,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile integer literal: {}", value);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
 
             #[test]
@@ -10785,7 +10823,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile hex literal: 0x{:X}", value);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
 
             #[test]
@@ -10800,7 +10838,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile string literal: \"{}\"", text);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
 
             #[test]
@@ -10815,7 +10853,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile boolean literal: {}", value);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
 
             #[test]
@@ -10836,7 +10874,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile mixed literals: {}", code);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
 
             #[test]
@@ -10855,7 +10893,7 @@ mod tests {
                 prop_assert!(result.is_ok(), "Failed to compile valid literals in strict_mode={}: {}", strict_mode, code);
 
                 let module = result.unwrap();
-                prop_assert!(module.functions.len() >= 1);
+                prop_assert!(!module.functions.is_empty());
             }
         }
     }

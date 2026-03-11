@@ -6,6 +6,8 @@ use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKe
 use crate::string::JsString;
 use crate::temporal_value::TemporalValue;
 use crate::value::Value;
+// chrono re-exports kept for future use
+#[allow(unused_imports)]
 use chrono::{Datelike, Timelike};
 use std::sync::Arc;
 
@@ -65,7 +67,7 @@ pub(super) fn install_plain_date_time_prototype(
                         Ok(f(&pdt))
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -92,7 +94,7 @@ pub(super) fn install_plain_date_time_prototype(
                     ))))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -116,7 +118,7 @@ pub(super) fn install_plain_date_time_prototype(
                     Ok(Value::string(JsString::intern("iso8601")))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -140,7 +142,7 @@ pub(super) fn install_plain_date_time_prototype(
                         Ok(Value::undefined())
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -191,7 +193,7 @@ pub(super) fn install_plain_date_time_prototype(
                         Ok(Value::int32(f(&pd)))
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -218,7 +220,7 @@ pub(super) fn install_plain_date_time_prototype(
                     Ok(Value::boolean(pd.in_leap_year()))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -245,7 +247,7 @@ pub(super) fn install_plain_date_time_prototype(
                     }
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -272,7 +274,7 @@ pub(super) fn install_plain_date_time_prototype(
                     }
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -376,7 +378,7 @@ pub(super) fn install_plain_date_time_prototype(
         let us = rounded.microsecond();
         let ns = rounded.nanosecond();
 
-        let date_part = if y < 0 || y > 9999 {
+        let date_part = if !(0..=9999).contains(&y) {
             format!("{:+07}-{:02}-{:02}", y, mo, d)
         } else {
             format!("{:04}-{:02}-{:02}", y, mo, d)
@@ -413,7 +415,8 @@ pub(super) fn install_plain_date_time_prototype(
         let cal_suffix = match calendar_name {
             "always" => "[u-ca=iso8601]",
             "critical" => "[!u-ca=iso8601]",
-            "auto" | "never" | _ => "",
+            "auto" | "never" => "",
+            _ => "",
         };
 
         Ok(format!("{}{}{}", date_part, time_part, cal_suffix))
@@ -530,7 +533,7 @@ pub(super) fn install_plain_date_time_prototype(
             )?)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toString",
         0,
     );
@@ -549,12 +552,12 @@ pub(super) fn install_plain_date_time_prototype(
             let _ = extract_plain_date_time(&obj)?;
             // Delegate to toString
             if let Some(ts) = obj.get(&PropertyKey::string("toString")) {
-                return ncx.call_function(&ts, this.clone(), &[]);
+                return ncx.call_function(&ts, *this, &[]);
             }
             Err(VmError::type_error("toJSON called on non-PlainDateTime"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toJSON",
         0,
     );
@@ -571,7 +574,7 @@ pub(super) fn install_plain_date_time_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "valueOf",
         0,
     );
@@ -588,14 +591,14 @@ pub(super) fn install_plain_date_time_prototype(
                 .ok_or_else(|| VmError::type_error("toLocaleString called on non-object"))?;
             let _ = extract_plain_date_time(&obj)?;
             if let Some(ts) = obj.get(&PropertyKey::string("toString")) {
-                return ncx.call_function(&ts, this.clone(), &[]);
+                return ncx.call_function(&ts, *this, &[]);
             }
             Err(VmError::type_error(
                 "toLocaleString called on non-PlainDateTime",
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toLocaleString",
         0,
     );
@@ -632,7 +635,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainDate",
         0,
     );
@@ -664,20 +667,18 @@ pub(super) fn install_plain_date_time_prototype(
             let item = args.first().cloned().unwrap_or(Value::undefined());
 
             // Helper: get property from object or proxy
-            let get_prop = |ncx: &mut NativeContext<'_>,
-                            item: &Value,
-                            name: &str|
-             -> Result<Value, VmError> {
-                if let Some(proxy) = item.as_proxy() {
-                    let key = PropertyKey::string(name);
-                    let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
-                    crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, item.clone())
-                } else if let Some(obj) = item.as_object() {
-                    ncx.get_property(&obj, &PropertyKey::string(name))
-                } else {
-                    Err(VmError::type_error("with argument must be an object"))
-                }
-            };
+            let get_prop =
+                |ncx: &mut NativeContext<'_>, item: &Value, name: &str| -> Result<Value, VmError> {
+                    if let Some(proxy) = item.as_proxy() {
+                        let key = PropertyKey::string(name);
+                        let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
+                        crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, *item)
+                    } else if let Some(obj) = item.as_object() {
+                        ncx.get_property(&obj, &PropertyKey::string(name))
+                    } else {
+                        Err(VmError::type_error("with argument must be an object"))
+                    }
+                };
 
             // Argument must be an object (including Proxy)
             if item.as_object().is_none() && item.as_proxy().is_none() {
@@ -685,17 +686,15 @@ pub(super) fn install_plain_date_time_prototype(
             }
 
             // Reject if item is a known Temporal type
-            if let Some(item_obj) = item.as_object() {
-                if let Some(item_ty) = item_obj
+            if let Some(item_obj) = item.as_object()
+                && let Some(item_ty) = item_obj
                     .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                     .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                {
-                    if !item_ty.is_empty() {
-                        return Err(VmError::type_error(
-                            "with argument must be a partial object, not a Temporal type",
-                        ));
-                    }
-                }
+                && !item_ty.is_empty()
+            {
+                return Err(VmError::type_error(
+                    "with argument must be a partial object, not a Temporal type",
+                ));
             }
 
             // Step 1: RejectObjectWithCalendarOrTimeZone — BEFORE field reads
@@ -905,10 +904,10 @@ pub(super) fn install_plain_date_time_prototype(
             let month = if let Some(ref mc) = mc_str {
                 validate_month_code_syntax(mc.as_str())?;
                 let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-                if let Some(mn) = month_n {
-                    if mn != mc_month {
-                        return Err(VmError::range_error("month and monthCode must agree"));
-                    }
+                if let Some(mn) = month_n
+                    && mn != mc_month
+                {
+                    return Err(VmError::range_error("month and monthCode must agree"));
                 }
                 mc_month
             } else {
@@ -955,7 +954,7 @@ pub(super) fn install_plain_date_time_prototype(
             Ok(Value::object(result_obj))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "with",
         1,
     );
@@ -1061,7 +1060,7 @@ pub(super) fn install_plain_date_time_prototype(
             construct_zoned_date_time_value(ncx, &zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toZonedDateTime",
         1,
     );
@@ -1086,7 +1085,7 @@ pub(super) fn install_plain_date_time_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "equals",
         1,
     );
@@ -1401,10 +1400,10 @@ pub(super) fn install_plain_date_time_prototype(
         }
 
         // Check for array or function (not valid duration)
-        if let Some(obj) = item.as_object() {
-            if obj.is_array() {
-                return Err(VmError::type_error("cannot convert array to a Duration"));
-            }
+        if let Some(obj) = item.as_object()
+            && obj.is_array()
+        {
+            return Err(VmError::type_error("cannot convert array to a Duration"));
         }
         if item.is_callable() {
             return Err(VmError::type_error("cannot convert function to a Duration"));
@@ -1593,7 +1592,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "since",
         1,
     );
@@ -1643,7 +1642,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "until",
         1,
     );
@@ -1693,7 +1692,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "add",
         1,
     );
@@ -1743,7 +1742,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "subtract",
         1,
     );
@@ -1779,7 +1778,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainTime",
         0,
     );
@@ -1851,7 +1850,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "withPlainTime",
         0,
     );
@@ -1899,7 +1898,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "withCalendar",
         1,
     );
@@ -2023,7 +2022,7 @@ pub(super) fn install_plain_date_time_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "round",
         1,
     );

@@ -65,7 +65,9 @@ fn test_call_negate() {
     );
 
     let lib = FfiLibrary::open(&test_lib_path(), &sigs).expect("Failed to open test lib");
-    let result = lib.call_raw("negate", &[42]).expect("Failed to call negate");
+    let result = lib
+        .call_raw("negate", &[42])
+        .expect("Failed to call negate");
     assert_eq!(result as i32, -42);
 }
 
@@ -84,7 +86,9 @@ fn test_call_multiply() {
 
     let a = 3.5_f64.to_bits();
     let b = 2.0_f64.to_bits();
-    let result = lib.call_raw("multiply", &[a, b]).expect("Failed to call multiply");
+    let result = lib
+        .call_raw("multiply", &[a, b])
+        .expect("Failed to call multiply");
     let result_f64 = f64::from_bits(result);
     assert!((result_f64 - 7.0).abs() < f64::EPSILON);
 }
@@ -124,7 +128,9 @@ fn test_call_void() {
     );
 
     let lib = FfiLibrary::open(&test_lib_path(), &sigs).expect("Failed to open test lib");
-    let result = lib.call_raw("do_nothing", &[]).expect("Failed to call do_nothing");
+    let result = lib
+        .call_raw("do_nothing", &[])
+        .expect("Failed to call do_nothing");
     assert_eq!(result, 0);
 }
 
@@ -159,7 +165,9 @@ fn test_call_add_float() {
 
     let a = 1.5_f32.to_bits() as u64;
     let b = 2.5_f32.to_bits() as u64;
-    let result = lib.call_raw("add_float", &[a, b]).expect("Failed to call add_float");
+    let result = lib
+        .call_raw("add_float", &[a, b])
+        .expect("Failed to call add_float");
     let result_f32 = f32::from_bits(result as u32);
     assert!((result_f32 - 4.0).abs() < f32::EPSILON);
 }

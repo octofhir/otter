@@ -134,7 +134,7 @@ pub struct ServerOptions {
     pub h2c: bool,
     pub reuse_port: bool,
     pub ipv6_only: bool,
-    pub idle_timeout: Option<Duration>,
+    pub _idle_timeout: Option<Duration>,
     pub ws_config: WebSocketServerConfig,
     pub ws_enabled: bool,
 }
@@ -149,11 +149,11 @@ enum WsOutgoing {
 
 struct WsConnection {
     server_id: u64,
-    socket_id: u64,
+    _socket_id: u64,
     sender: mpsc::UnboundedSender<WsOutgoing>,
     buffered_amount: Arc<AtomicU64>,
     subscriptions: Mutex<HashSet<String>>,
-    remote_addr: Option<String>,
+    _remote_addr: Option<String>,
     ws_config: WebSocketServerConfig,
 }
 
@@ -506,11 +506,11 @@ impl HttpServerManager {
             socket_id,
             WsConnection {
                 server_id,
-                socket_id,
+                _socket_id: socket_id,
                 sender: ws_tx,
                 buffered_amount: Arc::clone(&buffered_amount),
                 subscriptions: Mutex::new(HashSet::new()),
-                remote_addr: remote_addr.clone(),
+                _remote_addr: remote_addr.clone(),
                 ws_config: ws_config.clone(),
             },
         );
@@ -666,7 +666,7 @@ impl HttpServerManager {
         let mut subs = conn.subscriptions.lock().unwrap();
         if subs.insert(topic.to_string()) {
             let key = topic_key(conn.server_id, topic);
-            let entry = self.ws_topics.entry(key).or_insert_with(DashSet::new);
+            let entry = self.ws_topics.entry(key).or_default();
             entry.insert(socket_id);
         }
         true
@@ -711,14 +711,14 @@ impl HttpServerManager {
 
         for socket_id in subscribers.iter() {
             let socket_id = *socket_id;
-            if let Some(sender_id) = sender {
-                if sender_id == socket_id {
-                    let Some(conn) = self.ws_connections.get(&socket_id) else {
-                        continue;
-                    };
-                    if !conn.ws_config.publish_to_self {
-                        continue;
-                    }
+            if let Some(sender_id) = sender
+                && sender_id == socket_id
+            {
+                let Some(conn) = self.ws_connections.get(&socket_id) else {
+                    continue;
+                };
+                if !conn.ws_config.publish_to_self {
+                    continue;
                 }
             }
 

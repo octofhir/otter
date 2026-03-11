@@ -242,7 +242,7 @@ fn build_tracked_mock_fn(
     let calls_for_wrapper = calls_arr;
     let contexts_for_wrapper = contexts_arr;
     let results_for_wrapper = results_arr;
-    let mm_clone = mm.clone();
+    let _mm_clone = mm.clone();
 
     let wrapper: Arc<
         dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync,
@@ -1619,7 +1619,7 @@ fn test_run(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Va
 }
 
 fn build_tests_stream_instance(
-    ncx: &NativeContext,
+    _ncx: &NativeContext,
     emitter_proto: GcRef<JsObject>,
 ) -> Result<GcRef<JsObject>, VmError> {
     let stream = GcRef::new(JsObject::new(Value::object(emitter_proto)));
@@ -1921,7 +1921,7 @@ fn build_test_event_data(
     test_number: u64,
     nesting: u32,
     duration_ms: f64,
-    ncx: &NativeContext,
+    _ncx: &NativeContext,
 ) -> Value {
     let event = GcRef::new(JsObject::new(Value::null()));
     let _ = event.set(

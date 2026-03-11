@@ -1,6 +1,7 @@
 //! Integration tests for the #[dive] macro (native-first)
 
 #![allow(dead_code)]
+#![allow(clippy::type_complexity)]
 
 use otter_macros::dive;
 use otter_vm_core::context::NativeContext;

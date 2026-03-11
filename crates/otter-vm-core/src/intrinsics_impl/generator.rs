@@ -55,7 +55,7 @@ impl IntrinsicObject for GeneratorIntrinsic {
 /// Helper: convert a GeneratorResult into an iterator result object for sync generators.
 fn sync_generator_result_to_value(
     gen_result: GeneratorResult,
-    mm: &Arc<MemoryManager>,
+    _mm: &Arc<MemoryManager>,
 ) -> std::result::Result<Value, VmError> {
     match gen_result {
         GeneratorResult::Yielded(v) => {
@@ -82,7 +82,7 @@ fn async_generator_result_to_promise(
     gen_result: GeneratorResult,
     ncx: &mut crate::context::NativeContext<'_>,
 ) -> Value {
-    let mm = ncx.memory_manager().clone();
+    let _mm = ncx.memory_manager().clone();
     let js_queue = ncx.js_job_queue();
     let promise = JsPromise::new();
 
@@ -134,7 +134,7 @@ fn async_generator_result_to_promise(
             promise: awaited_promise,
             ..
         } => {
-            let result_promise = promise.clone();
+            let result_promise = promise;
             let js_queue = js_queue.clone();
             awaited_promise.then(move |resolved_value| {
                 let iter_result = GcRef::new(JsObject::new(Value::null()));
@@ -270,7 +270,7 @@ fn generator_symbol_iterator(
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    Ok(this_val.clone())
+    Ok(*this_val)
 }
 
 #[dive(name = "next", length = 1)]
@@ -359,7 +359,7 @@ fn async_generator_symbol_async_iterator(
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    Ok(this_val.clone())
+    Ok(*this_val)
 }
 
 // ============================================================================
@@ -382,16 +382,16 @@ pub fn init_generator_prototype(
     symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     let (_next_name, next_native, _next_length) = generator_next_decl();
-    let next_fn = native_from_decl_with_function_proto(next_native, mm, fn_proto.clone());
+    let next_fn = native_from_decl_with_function_proto(next_native, mm, fn_proto);
 
     let (_return_name, return_native, _return_length) = generator_return_decl();
-    let return_fn = native_from_decl_with_function_proto(return_native, mm, fn_proto.clone());
+    let return_fn = native_from_decl_with_function_proto(return_native, mm, fn_proto);
 
     let (_throw_name, throw_native, _throw_length) = generator_throw_decl();
-    let throw_fn = native_from_decl_with_function_proto(throw_native, mm, fn_proto.clone());
+    let throw_fn = native_from_decl_with_function_proto(throw_native, mm, fn_proto);
 
     let (_iter_name, iter_native, _iter_length) = generator_symbol_iterator_decl();
-    let iter_fn = native_from_decl_with_function_proto(iter_native, mm, fn_proto.clone());
+    let iter_fn = native_from_decl_with_function_proto(iter_native, mm, fn_proto);
 
     // Generator.prototype.next(value) — §27.5.1.2
     proto.define_property(
@@ -444,16 +444,16 @@ pub fn init_async_generator_prototype(
     symbol_to_string_tag: crate::gc::GcRef<crate::value::Symbol>,
 ) {
     let (_next_name, next_native, _next_length) = async_generator_next_decl();
-    let next_fn = native_from_decl_with_function_proto(next_native, mm, fn_proto.clone());
+    let next_fn = native_from_decl_with_function_proto(next_native, mm, fn_proto);
 
     let (_return_name, return_native, _return_length) = async_generator_return_decl();
-    let return_fn = native_from_decl_with_function_proto(return_native, mm, fn_proto.clone());
+    let return_fn = native_from_decl_with_function_proto(return_native, mm, fn_proto);
 
     let (_throw_name, throw_native, _throw_length) = async_generator_throw_decl();
-    let throw_fn = native_from_decl_with_function_proto(throw_native, mm, fn_proto.clone());
+    let throw_fn = native_from_decl_with_function_proto(throw_native, mm, fn_proto);
 
     let (_iter_name, iter_native, _iter_length) = async_generator_symbol_async_iterator_decl();
-    let iter_fn = native_from_decl_with_function_proto(iter_native, mm, fn_proto.clone());
+    let iter_fn = native_from_decl_with_function_proto(iter_native, mm, fn_proto);
 
     // AsyncGenerator.prototype.next(value) — §27.6.1.2
     proto.define_property(

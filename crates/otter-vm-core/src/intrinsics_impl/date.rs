@@ -433,7 +433,7 @@ pub fn create_date_constructor()
         use chrono::Local;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let is_constructor_call = this.as_object().map_or(false, |obj| {
+        let is_constructor_call = this.as_object().is_some_and(|obj| {
             let proto = obj.prototype();
             !proto.is_null() && !proto.is_undefined()
         });
@@ -507,7 +507,7 @@ pub fn create_date_constructor()
                 .unwrap_or(0.0)
                 .trunc();
 
-            let full_year = if year >= 0.0 && year <= 99.0 {
+            let full_year = if (0.0..=99.0).contains(&year) {
                 1900.0 + year
             } else {
                 year
@@ -546,7 +546,7 @@ pub fn install_date_statics(
             Ok(Value::number(timestamp))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     if let Some(obj) = now_fn.as_object() {
         obj.define_property(
@@ -569,14 +569,14 @@ pub fn install_date_statics(
             let s_val = if args.is_empty() {
                 "undefined".to_string()
             } else {
-                ncx.to_string_value(args.get(0).unwrap())?
+                ncx.to_string_value(args.first().unwrap())?
             };
 
             let ts = parse_date_string(&s_val);
             Ok(Value::number(ts))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     if let Some(obj) = parse_fn.as_object() {
         obj.define_property(
@@ -601,7 +601,7 @@ pub fn install_date_statics(
     let utc_fn = Value::native_function_with_proto(
         |_this, args, ncx| {
             let year = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let month = if args.len() > 1 {
                 ncx.to_number_value(&args[1])?.trunc()
@@ -646,7 +646,7 @@ pub fn install_date_statics(
             }
 
             let y_int = year as i32;
-            let full_year = if y_int >= 0 && y_int <= 99 {
+            let full_year = if (0..=99).contains(&y_int) {
                 1900.0 + year
             } else {
                 year
@@ -658,7 +658,7 @@ pub fn install_date_statics(
             Ok(Value::number(clipped))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     if let Some(obj) = utc_fn.as_object() {
         obj.define_property(
@@ -686,7 +686,6 @@ pub fn install_date_statics(
 }
 
 fn parse_date_string(s: &str) -> f64 {
-    use chrono::TimeZone;
     let s = s.trim();
 
     if s.contains("-000000") {
@@ -724,8 +723,8 @@ fn parse_extended_year(year: i64, rest: &str) -> f64 {
     let y = year as f64;
     let (month, day, hour, min, sec, ms, is_utc) = if rest.is_empty() {
         (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, true)
-    } else if rest.starts_with('-') {
-        let parts = &rest[1..]; // skip leading '-'
+    } else if let Some(parts) = rest.strip_prefix('-') {
+        // skip leading '-'
         // Parse MM
         if parts.len() < 2 {
             return f64::NAN;
@@ -749,8 +748,8 @@ fn parse_extended_year(year: i64, rest: &str) -> f64 {
             } else if parts.len() >= 11 && parts.as_bytes()[5] == b'T' {
                 // Parse time: HH:MM, HH:MM:SS, or HH:MM:SS.sss, possibly followed by Z
                 let time_part = &parts[6..];
-                let (time_str, utc) = if time_part.ends_with('Z') {
-                    (&time_part[..time_part.len() - 1], true)
+                let (time_str, utc) = if let Some(stripped) = time_part.strip_suffix('Z') {
+                    (stripped, true)
                 } else {
                     (time_part, false) // treat as local time
                 };
@@ -798,8 +797,7 @@ fn parse_date_string_internal(s: &str) -> f64 {
     use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         dt.timestamp_millis() as f64
-    } else if s.ends_with('Z') {
-        let base = &s[..s.len() - 1];
+    } else if let Some(base) = s.strip_suffix('Z') {
         if let Ok(dt) = NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S") {
             dt.and_utc().timestamp_millis() as f64
         } else if let Ok(dt) = NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S%.f") {
@@ -837,9 +835,9 @@ fn parse_date_string_internal(s: &str) -> f64 {
         } else {
             f64::NAN
         }
-    } else if s.ends_with(" GMT") {
+    } else if let Some(stripped) = s.strip_suffix(" GMT") {
         // RFC 1123 / toUTCString format: "Thu, 01 Jan 1970 00:00:00 GMT"
-        if let Ok(dt) = NaiveDateTime::parse_from_str(&s[..s.len() - 4], "%a, %d %b %Y %H:%M:%S") {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(stripped, "%a, %d %b %Y %H:%M:%S") {
             dt.and_utc().timestamp_millis() as f64
         } else {
             f64::NAN
@@ -870,8 +868,6 @@ pub fn init_date_prototype(
     // Helper to define methods with correct attributes
     let define_method = {
         let mm = mm.clone();
-        let fn_proto = fn_proto.clone();
-        let date_proto = date_proto.clone();
         move |name: &str,
               length: i32,
               func: Box<
@@ -883,7 +879,7 @@ pub fn init_date_prototype(
                 + Send
                 + Sync,
         >| {
-            let fn_val = Value::native_function_with_proto(func, mm.clone(), fn_proto.clone());
+            let fn_val = Value::native_function_with_proto(func, mm.clone(), fn_proto);
             if let Some(fn_obj) = fn_val.as_object() {
                 fn_obj.define_property(
                     PropertyKey::string("name"),
@@ -920,7 +916,7 @@ pub fn init_date_prototype(
             let _obj = this_val
                 .as_object()
                 .ok_or_else(|| VmError::type_error("toPrimitive called on non-object"))?;
-            let prim_arg = args.get(0).cloned().unwrap_or_else(Value::undefined);
+            let prim_arg = args.first().cloned().unwrap_or_else(Value::undefined);
             if !prim_arg.is_string() {
                 return Err(VmError::type_error(
                     "Symbol.toPrimitive hint must be a string",
@@ -937,19 +933,19 @@ pub fn init_date_prototype(
             };
 
             for name in method_names {
-                if let Some(obj) = this_val.as_object() {
-                    if let Some(func) = obj.get(&PropertyKey::string(name)) {
-                        // Check if callable
-                        let is_callable = func.is_callable();
-                        if is_callable {
-                            match ncx.call_function(&func, this_val.clone(), &[]) {
-                                Ok(res) => {
-                                    if !res.is_object() {
-                                        return Ok(res);
-                                    }
+                if let Some(obj) = this_val.as_object()
+                    && let Some(func) = obj.get(&PropertyKey::string(name))
+                {
+                    // Check if callable
+                    let is_callable = func.is_callable();
+                    if is_callable {
+                        match ncx.call_function(&func, *this_val, &[]) {
+                            Ok(res) => {
+                                if !res.is_object() {
+                                    return Ok(res);
                                 }
-                                Err(e) => return Err(e),
                             }
+                            Err(e) => return Err(e),
                         }
                     }
                 }
@@ -959,7 +955,7 @@ pub fn init_date_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     if let Some(fn_obj) = to_prim_fn.as_object() {
         fn_obj.define_property(
@@ -1489,14 +1485,14 @@ pub fn init_date_prototype(
         Box::new(|this_val, _args, ncx| {
             // 1. Let O be ? ToObject(this value).
             let (obj, _guard) = to_object(ncx, this_val)?;
-            let obj_val = Value::object(obj.clone());
+            let obj_val = Value::object(obj);
             // 2. Let tv be ? ToPrimitive(O, number).
             let tv = ncx.to_primitive(&obj_val, PreferredType::Number)?;
             // 3. If Type(tv) is Number and tv is not finite, return null.
-            if let Some(n) = tv.as_number() {
-                if n.is_nan() || n.is_infinite() {
-                    return Ok(Value::null());
-                }
+            if let Some(n) = tv.as_number()
+                && (n.is_nan() || n.is_infinite())
+            {
+                return Ok(Value::null());
             }
             if let Some(i) = tv.as_int32() {
                 // int32 is always finite, continue
@@ -1505,7 +1501,7 @@ pub fn init_date_prototype(
             // 4. Return ? Invoke(O, "toISOString").
             // Use spec-compliant [[Get]] that invokes getters
             let key = PropertyKey::string("toISOString");
-            let func = get_value_from_object(ncx, &obj, &key, obj_val.clone())?;
+            let func = get_value_from_object(ncx, &obj, &key, obj_val)?;
             if !func.is_callable() {
                 return Err(VmError::type_error("toISOString is not a function"));
             }
@@ -1522,12 +1518,12 @@ pub fn init_date_prototype(
                 .ctx
                 .realm_intrinsics(ncx.ctx.realm_id())
                 .expect("intrinsics");
-            let fn_val = Value::object(intrinsics.date_prototype.clone())
+            let fn_val = Value::object(intrinsics.date_prototype)
                 .as_object()
                 .unwrap()
                 .get(&PropertyKey::string("toString"))
                 .unwrap();
-            ncx.call_function(&fn_val, this_val.clone(), &[])
+            ncx.call_function(&fn_val, *this_val, &[])
         }),
     );
     define_method(
@@ -1538,12 +1534,12 @@ pub fn init_date_prototype(
                 .ctx
                 .realm_intrinsics(ncx.ctx.realm_id())
                 .expect("intrinsics");
-            let fn_val = Value::object(intrinsics.date_prototype.clone())
+            let fn_val = Value::object(intrinsics.date_prototype)
                 .as_object()
                 .unwrap()
                 .get(&PropertyKey::string("toDateString"))
                 .unwrap();
-            ncx.call_function(&fn_val, this_val.clone(), &[])
+            ncx.call_function(&fn_val, *this_val, &[])
         }),
     );
     define_method(
@@ -1554,12 +1550,12 @@ pub fn init_date_prototype(
                 .ctx
                 .realm_intrinsics(ncx.ctx.realm_id())
                 .expect("intrinsics");
-            let fn_val = Value::object(intrinsics.date_prototype.clone())
+            let fn_val = Value::object(intrinsics.date_prototype)
                 .as_object()
                 .unwrap()
                 .get(&PropertyKey::string("toTimeString"))
                 .unwrap();
-            ncx.call_function(&fn_val, this_val.clone(), &[])
+            ncx.call_function(&fn_val, *this_val, &[])
         }),
     );
 
@@ -1587,7 +1583,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let ms = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             if ts.is_nan() {
                 return Ok(Value::nan());
@@ -1645,7 +1641,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let ms = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             if ts.is_nan() {
                 return Ok(Value::nan());
@@ -1700,7 +1696,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let sec = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let ms = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -1764,7 +1760,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let sec = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let ms = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -1829,7 +1825,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let min = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let sec = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -1901,7 +1897,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let min = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let sec = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -1970,7 +1966,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let hour = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let min = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -2048,7 +2044,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             let hour = ncx
-                .to_number_value(args.get(0).unwrap_or(&Value::undefined()))?
+                .to_number_value(args.first().unwrap_or(&Value::undefined()))?
                 .trunc();
             let min = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?.trunc())
@@ -2219,7 +2215,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             // Evaluate args BEFORE NaN check (for side effects)
-            let mon = ncx.to_number_value(args.get(0).unwrap_or(&Value::undefined()))?;
+            let mon = ncx.to_number_value(args.first().unwrap_or(&Value::undefined()))?;
             let date_arg = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?)
             } else {
@@ -2243,7 +2239,7 @@ pub fn init_date_prototype(
         Box::new(|this_val, args, ncx| {
             let ts = get_timestamp_value(this_val)?;
             // Evaluate args BEFORE NaN check (for side effects)
-            let mon = ncx.to_number_value(args.get(0).unwrap_or(&Value::undefined()))?;
+            let mon = ncx.to_number_value(args.first().unwrap_or(&Value::undefined()))?;
             let date_arg = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?)
             } else {
@@ -2270,7 +2266,7 @@ pub fn init_date_prototype(
             let ts = get_timestamp_value(this_val)?;
             // Per spec: If t is NaN, let t be +0
             let t = if ts.is_nan() { 0.0 } else { ts };
-            let y = ncx.to_number_value(args.get(0).unwrap_or(&Value::undefined()))?;
+            let y = ncx.to_number_value(args.first().unwrap_or(&Value::undefined()))?;
             let mon_arg = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?)
             } else {
@@ -2297,7 +2293,7 @@ pub fn init_date_prototype(
             let ts = get_timestamp_value(this_val)?;
             // Per spec: If t is NaN, let t be +0
             let t = if ts.is_nan() { 0.0 } else { ts };
-            let y = ncx.to_number_value(args.get(0).unwrap_or(&Value::undefined()))?;
+            let y = ncx.to_number_value(args.first().unwrap_or(&Value::undefined()))?;
             let mon_arg = if args.len() > 1 {
                 Some(ncx.to_number_value(&args[1])?)
             } else {
@@ -2336,7 +2332,7 @@ pub fn init_date_prototype(
             let t = if ts.is_nan() { 0.0 } else { ts };
             // 6. MakeFullYear: if 0 <= y <= 99, yyyy = 1900 + y, else yyyy = y
             let y_int = y.trunc();
-            let full_year = if y_int >= 0.0 && y_int <= 99.0 {
+            let full_year = if (0.0..=99.0).contains(&y_int) {
                 1900.0 + y_int
             } else {
                 y_int
@@ -2403,7 +2399,7 @@ pub fn init_date_prototype(
             let ns_str = ns.to_string();
 
             // Create a Temporal.Instant-like object with epochNanoseconds
-            let mm = ncx.memory_manager().clone();
+            let _mm = ncx.memory_manager().clone();
             let global = ncx.global();
 
             // Try to get Temporal.Instant prototype if it exists

@@ -32,16 +32,16 @@ fn to_temporal_instant(
         }
         // Generic object: call toString, then parse as ISO string
         let s = ncx.to_string_value(val)?;
-        return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
+        return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
-        return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
+        return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     // Try toString for proxies
     if val.as_proxy().is_some() {
         let s = ncx.to_string_value(val)?;
-        return temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
+        return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     Err(VmError::type_error("Cannot convert to Instant"))
 }
@@ -72,13 +72,13 @@ pub(super) fn install_instant(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let proto = GcRef::new(JsObject::new(Value::object(*obj_proto)));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(*fn_proto)));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(proto.clone()),
+            Value::object(proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -96,7 +96,7 @@ pub(super) fn install_instant(
     );
 
     // Constructor: new Temporal.Instant(epochNanoseconds)
-    let proto_for_ctor = proto.clone();
+    let proto_for_ctor = proto;
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
     > = Box::new(move |this, args, _ncx| {
@@ -167,17 +167,14 @@ pub(super) fn install_instant(
     let ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        *fn_proto,
+        ctor_obj,
     );
 
     // prototype.constructor
     proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // epochMilliseconds getter
@@ -190,7 +187,7 @@ pub(super) fn install_instant(
             Ok(Value::number(instant.epoch_milliseconds() as f64))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "get epochMilliseconds",
         0,
     );
@@ -209,7 +206,7 @@ pub(super) fn install_instant(
             Ok(Value::bigint(instant.epoch_nanoseconds().0.to_string()))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "get epochNanoseconds",
         0,
     );
@@ -232,7 +229,7 @@ pub(super) fn install_instant(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "equals",
         1,
     );
@@ -254,7 +251,7 @@ pub(super) fn install_instant(
             construct_instant_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "add",
         1,
     );
@@ -276,7 +273,7 @@ pub(super) fn install_instant(
             construct_instant_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "subtract",
         1,
     );
@@ -300,7 +297,7 @@ pub(super) fn install_instant(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "until",
         1,
     );
@@ -324,7 +321,7 @@ pub(super) fn install_instant(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "since",
         1,
     );
@@ -346,7 +343,7 @@ pub(super) fn install_instant(
             construct_instant_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "round",
         1,
     );
@@ -378,7 +375,7 @@ pub(super) fn install_instant(
             construct_zoned_date_time_value(ncx, &zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toZonedDateTimeISO",
         1,
     );
@@ -402,7 +399,7 @@ pub(super) fn install_instant(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toString",
         0,
     );
@@ -428,7 +425,7 @@ pub(super) fn install_instant(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toJSON",
         0,
     );
@@ -454,7 +451,7 @@ pub(super) fn install_instant(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toLocaleString",
         0,
     );
@@ -471,7 +468,7 @@ pub(super) fn install_instant(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "valueOf",
         0,
     );
@@ -496,7 +493,7 @@ pub(super) fn install_instant(
     // === Static methods ===
 
     // Instant.from(item)
-    let from_ctor = ctor_value.clone();
+    let from_ctor = ctor_value;
     let from_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let item = args.first().cloned().unwrap_or(Value::undefined());
@@ -523,7 +520,7 @@ pub(super) fn install_instant(
                 // Generic object: call toString, then parse as ISO string
                 let s = ncx.to_string_value(&item)?;
                 let instant =
-                    temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err)?;
+                    temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 let ns = instant.epoch_nanoseconds().0;
                 return ncx.call_function_construct(
                     &from_ctor,
@@ -536,7 +533,7 @@ pub(super) fn install_instant(
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
                 let instant =
-                    temporal_rs::Instant::from_utf8(s.as_str().as_bytes()).map_err(temporal_err)?;
+                    temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 let ns = instant.epoch_nanoseconds().0;
                 return ncx.call_function_construct(
                     &from_ctor,
@@ -548,7 +545,7 @@ pub(super) fn install_instant(
             Err(VmError::type_error("Cannot convert to Instant"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "from",
         1,
     );
@@ -575,7 +572,7 @@ pub(super) fn install_instant(
             }))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "compare",
         2,
     );
@@ -585,7 +582,7 @@ pub(super) fn install_instant(
     );
 
     // Instant.fromEpochMilliseconds(epochMilliseconds)
-    let from_ms_ctor = ctor_value.clone();
+    let from_ms_ctor = ctor_value;
     let from_epoch_ms_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let ms_val = args.first().cloned().unwrap_or(Value::undefined());
@@ -597,7 +594,7 @@ pub(super) fn install_instant(
             }
             let ns = (ms as i128) * 1_000_000;
             const MAX_NS: i128 = 8_640_000_000_000_000_000_000;
-            if ns < -MAX_NS || ns > MAX_NS {
+            if !(-MAX_NS..=MAX_NS).contains(&ns) {
                 return Err(VmError::range_error("epoch nanoseconds out of range"));
             }
             ncx.call_function_construct(
@@ -607,7 +604,7 @@ pub(super) fn install_instant(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "fromEpochMilliseconds",
         1,
     );
@@ -617,7 +614,7 @@ pub(super) fn install_instant(
     );
 
     // Instant.fromEpochNanoseconds(epochNanoseconds)
-    let from_ns_ctor = ctor_value.clone();
+    let from_ns_ctor = ctor_value;
     let from_epoch_ns_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let ns_val = args.first().cloned().unwrap_or(Value::undefined());
@@ -627,7 +624,7 @@ pub(super) fn install_instant(
             ncx.call_function_construct(&from_ns_ctor, Value::undefined(), &[ns_val])
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "fromEpochNanoseconds",
         1,
     );
@@ -637,7 +634,7 @@ pub(super) fn install_instant(
     );
 
     // Instant.fromEpochSeconds(epochSeconds)
-    let from_s_ctor = ctor_value.clone();
+    let from_s_ctor = ctor_value;
     let from_epoch_s_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let s_val = args.first().cloned().unwrap_or(Value::undefined());
@@ -649,7 +646,7 @@ pub(super) fn install_instant(
             }
             let ns = (s as i128) * 1_000_000_000;
             const MAX_NS: i128 = 8_640_000_000_000_000_000_000;
-            if ns < -MAX_NS || ns > MAX_NS {
+            if !(-MAX_NS..=MAX_NS).contains(&ns) {
                 return Err(VmError::range_error("epoch nanoseconds out of range"));
             }
             ncx.call_function_construct(
@@ -659,7 +656,7 @@ pub(super) fn install_instant(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "fromEpochSeconds",
         1,
     );
@@ -829,7 +826,7 @@ fn parse_instant_to_string_options(
             ));
         }
         let d = n.floor();
-        if d < 0.0 || d > 9.0 || !d.is_finite() {
+        if !(0.0..=9.0).contains(&d) || !d.is_finite() {
             return Err(VmError::range_error(
                 "fractionalSecondDigits must be 0-9 or 'auto'",
             ));
@@ -902,7 +899,7 @@ fn get_options_object(val: &Value) -> Result<Value, VmError> {
     {
         return Err(VmError::type_error("Options must be an object"));
     }
-    Ok(val.clone())
+    Ok(*val)
 }
 
 /// Get a single option value from an options object.

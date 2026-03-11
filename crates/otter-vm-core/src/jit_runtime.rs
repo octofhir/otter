@@ -98,34 +98,34 @@ fn map_exec_result(
             }
         }
         otter_vm_exec::JitExecResult::Bailout(snapshot) => {
-            if snapshot.resume_mode == otter_vm_exec::DeoptResumeMode::ResumeAtPc {
-                if let Some(pc) = snapshot.bailout_pc {
-                    let (locals, registers) = if let Some(metadata) =
-                        otter_vm_exec::deopt_metadata_snapshot(module_id, function_index)
-                    {
-                        if let Some(site) = metadata.site(pc) {
-                            (
-                                decode_sparse_slots(deopt_locals, &site.live_locals),
-                                decode_sparse_slots(deopt_regs, &site.live_registers),
-                            )
-                        } else {
-                            (
-                                decode_dense_slots(deopt_locals),
-                                decode_dense_slots(deopt_regs),
-                            )
-                        }
+            if snapshot.resume_mode == otter_vm_exec::DeoptResumeMode::ResumeAtPc
+                && let Some(pc) = snapshot.bailout_pc
+            {
+                let (locals, registers) = if let Some(metadata) =
+                    otter_vm_exec::deopt_metadata_snapshot(module_id, function_index)
+                {
+                    if let Some(site) = metadata.site(pc) {
+                        (
+                            decode_sparse_slots(deopt_locals, &site.live_locals),
+                            decode_sparse_slots(deopt_regs, &site.live_registers),
+                        )
                     } else {
                         (
                             decode_dense_slots(deopt_locals),
                             decode_dense_slots(deopt_regs),
                         )
-                    };
-                    return JitCallResult::BailoutResume(JitResumeState {
-                        bailout_pc: pc,
-                        locals,
-                        registers,
-                    });
-                }
+                    }
+                } else {
+                    (
+                        decode_dense_slots(deopt_locals),
+                        decode_dense_slots(deopt_regs),
+                    )
+                };
+                return JitCallResult::BailoutResume(JitResumeState {
+                    bailout_pc: pc,
+                    locals,
+                    registers,
+                });
             }
             JitCallResult::BailoutRestart
         }
@@ -233,7 +233,7 @@ pub(crate) fn try_execute_jit(
         } else {
             let vm = unsafe { &*vm_ctx };
             vm.pending_home_object_to_trace()
-                .map(|obj| Value::object(obj.clone()).to_jit_bits())
+                .map(|obj| Value::object(*obj).to_jit_bits())
                 .unwrap_or_else(|| Value::null().to_jit_bits())
         },
         secondary_result: 0,

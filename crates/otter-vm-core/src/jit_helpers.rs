@@ -148,10 +148,10 @@ fn is_length_constant(ctx: &JitContext, name_idx: i64) -> bool {
         return false;
     }
     let pool = unsafe { &*ctx.constants };
-    if let Some(constant) = pool.get(name_idx as u32) {
-        if let otter_vm_bytecode::Constant::String(units) = constant {
-            return units.as_slice() == LENGTH_UTF16;
-        }
+    if let Some(constant) = pool.get(name_idx as u32)
+        && let otter_vm_bytecode::Constant::String(units) = constant
+    {
+        return units.as_slice() == LENGTH_UTF16;
     }
     false
 }
@@ -169,6 +169,7 @@ fn is_length_constant(ctx: &JitContext, name_idx: i64) -> bool {
 /// - `ctx_raw` must point to a valid `JitContext`
 /// - `obj_raw` must be a valid NaN-boxed value
 /// - No GC must occur during this call (guaranteed by caller)
+///
 /// Extract a JsObject reference from NaN-boxed bits (TAG_POINTER with OBJECT/ARRAY tag).
 /// Returns None if not a valid heap object.
 #[inline]
@@ -408,8 +409,8 @@ extern "C" fn otter_rt_get_prop_const(
                 }
                 InlineCacheState::Polymorphic { count, entries } => {
                     let mut found = false;
-                    for i in 0..(*count as usize) {
-                        if entries[i].0 == obj_shape_ptr {
+                    for entry in &entries[..(*count as usize)] {
+                        if entry.0 == obj_shape_ptr {
                             found = true;
                             break;
                         }
@@ -435,7 +436,7 @@ extern "C" fn otter_rt_get_prop_const(
                     current = unsafe { &*(&*proto as *const _) };
                 }
             }
-            if let Some(val) = unsafe { current.get_by_offset_unchecked(offset as usize) } {
+            if let Some(val) = unsafe { current.get_by_offset_unchecked(offset) } {
                 return val.to_jit_bits();
             }
         }
@@ -533,9 +534,9 @@ extern "C" fn otter_rt_set_prop_const(
         }
         InlineCacheState::Polymorphic { count, entries } => {
             let mut found = None;
-            for i in 0..(*count as usize) {
-                if obj_shape_ptr == entries[i].0 {
-                    found = Some(entries[i].3);
+            for entry in &entries[..(*count as usize)] {
+                if obj_shape_ptr == entry.0 {
+                    found = Some(entry.3);
                     break;
                 }
             }
@@ -544,23 +545,20 @@ extern "C" fn otter_rt_set_prop_const(
         _ => None,
     };
 
-    if let Some(offset) = cached_offset {
-        if obj_ref
-            .set_by_offset(offset as usize, write_value.clone())
-            .is_ok()
-        {
-            ic.record_hit();
-            // MRU reordering for polymorphic
-            if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
-                for i in 1..(*count as usize) {
-                    if obj_shape_ptr == entries[i].0 {
-                        entries.swap(0, i);
-                        break;
-                    }
+    if let Some(offset) = cached_offset
+        && obj_ref.set_by_offset(offset as usize, write_value).is_ok()
+    {
+        ic.record_hit();
+        // MRU reordering for polymorphic
+        if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
+            for i in 1..(*count as usize) {
+                if obj_shape_ptr == entries[i].0 {
+                    entries.swap(0, i);
+                    break;
                 }
             }
-            return 0;
         }
+        return 0;
     }
 
     let Some(name_str) = (unsafe { resolve_constant_string(ctx, name_idx) }) else {
@@ -569,59 +567,56 @@ extern "C" fn otter_rt_set_prop_const(
     let key = PropertyKey::from_js_string(JsString::intern_utf16(name_str));
 
     // Slow path on IC miss: resolve by shape offset and update IC.
-    if !obj_ref.is_dictionary_mode() {
-        if let Some(offset) = obj_ref.shape_get_offset(&key) {
-            let current_epoch = ctx.proto_epoch;
-            match &mut ic.ic_state {
-                InlineCacheState::Uninitialized => {
-                    ic.ic_state = InlineCacheState::Monomorphic {
-                        shape_id: obj_shape_ptr,
-                        proto_shape_id: 0,
-                        depth: 0,
-                        offset: offset as u32,
-                    };
+    if !obj_ref.is_dictionary_mode()
+        && let Some(offset) = obj_ref.shape_get_offset(&key)
+    {
+        let current_epoch = ctx.proto_epoch;
+        match &mut ic.ic_state {
+            InlineCacheState::Uninitialized => {
+                ic.ic_state = InlineCacheState::Monomorphic {
+                    shape_id: obj_shape_ptr,
+                    proto_shape_id: 0,
+                    depth: 0,
+                    offset: offset as u32,
+                };
+                ic.proto_epoch = current_epoch;
+            }
+            InlineCacheState::Monomorphic {
+                shape_id: old_shape,
+                offset: old_offset,
+                ..
+            } => {
+                if *old_shape != obj_shape_ptr {
+                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                    entries[0] = (*old_shape, 0, 0, *old_offset);
+                    entries[1] = (obj_shape_ptr, 0, 0, offset as u32);
+                    ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                     ic.proto_epoch = current_epoch;
                 }
-                InlineCacheState::Monomorphic {
-                    shape_id: old_shape,
-                    offset: old_offset,
-                    ..
-                } => {
-                    if *old_shape != obj_shape_ptr {
-                        let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                        entries[0] = (*old_shape, 0, 0, *old_offset);
-                        entries[1] = (obj_shape_ptr, 0, 0, offset as u32);
-                        ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
+            }
+            InlineCacheState::Polymorphic { count, entries } => {
+                let mut found = false;
+                for entry in &entries[..(*count as usize)] {
+                    if entry.0 == obj_shape_ptr {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    if (*count as usize) < 4 {
+                        entries[*count as usize] = (obj_shape_ptr, 0, 0, offset as u32);
+                        *count += 1;
                         ic.proto_epoch = current_epoch;
+                    } else {
+                        ic.ic_state = InlineCacheState::Megamorphic;
                     }
                 }
-                InlineCacheState::Polymorphic { count, entries } => {
-                    let mut found = false;
-                    for i in 0..(*count as usize) {
-                        if entries[i].0 == obj_shape_ptr {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        if (*count as usize) < 4 {
-                            entries[*count as usize] = (obj_shape_ptr, 0, 0, offset as u32);
-                            *count += 1;
-                            ic.proto_epoch = current_epoch;
-                        } else {
-                            ic.ic_state = InlineCacheState::Megamorphic;
-                        }
-                    }
-                }
-                _ => {}
             }
+            _ => {}
+        }
 
-            if obj_ref
-                .set_by_offset(offset as usize, write_value.clone())
-                .is_ok()
-            {
-                return 0;
-            }
+        if obj_ref.set_by_offset(offset, write_value).is_ok() {
+            return 0;
         }
     }
 
@@ -674,88 +669,87 @@ extern "C" fn otter_rt_call_function(
                     box_ptr,
                 )))
             };
-            if !closure.is_generator && !closure.is_async {
-                if let Some(func_info) = closure.module.function(closure.function_index) {
-                    if !func_info.flags.has_rest {
-                        // Ultra-fast path: callee has JIT code — call directly via
-                        // rewritten JitContext, avoiding a full new JitContext allocation.
-                        let jit_ptr = func_info.jit_entry_ptr();
-                        if jit_ptr != 0 {
-                            let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
-                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-                            let this_raw = if func_info.flags.is_strict {
-                                crate::value::Value::undefined().to_jit_bits()
-                            } else {
-                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                            };
-                            let reentry = JitCallReentryState::new(
-                                func_info as *const Function,
-                                &closure.module.constants as *const _,
-                                if closure.upvalues.is_empty() {
-                                    std::ptr::null()
-                                } else {
-                                    closure.upvalues.as_ptr()
-                                },
-                                closure.upvalues.len() as u32,
-                                this_raw,
-                                callee_raw,
-                                crate::value::Value::null().to_jit_bits(),
-                            );
-
-                            let args_ptr = if argc == 0 {
-                                std::ptr::null()
-                            } else {
-                                argv_ptr_raw as *const i64
-                            };
-                            let result = unsafe {
-                                call_with_reentry_state(
-                                    ctx_raw as *mut JitContext,
-                                    args_ptr,
-                                    argc as u32,
-                                    jit_ptr,
-                                    &reentry,
-                                )
-                            };
-
-                            if result != BAILOUT_SENTINEL {
-                                return result;
-                            }
-                            // JIT bailout → fall through to interpreter
+            if !closure.is_generator
+                && !closure.is_async
+                && let Some(func_info) = closure.module.function(closure.function_index)
+                && !func_info.flags.has_rest
+            {
+                // Ultra-fast path: callee has JIT code — call directly via
+                // rewritten JitContext, avoiding a full new JitContext allocation.
+                let jit_ptr = func_info.jit_entry_ptr();
+                if jit_ptr != 0 {
+                    let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+                    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                    let this_raw = if func_info.flags.is_strict {
+                        crate::value::Value::undefined().to_jit_bits()
+                    } else {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    };
+                    let reentry = JitCallReentryState::new(
+                        func_info as *const Function,
+                        &closure.module.constants as *const _,
+                        if closure.upvalues.is_empty() {
+                            std::ptr::null()
                         } else {
-                            // No JIT code yet — try full JIT path (may compile)
-                            let args_ptr = if argc == 0 {
-                                std::ptr::null()
-                            } else {
-                                argv_ptr_raw as *const i64
-                            };
-                            let ctx = unsafe { &*(ctx_raw as *const JitContext) };
-                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-                            let this_raw = if func_info.flags.is_strict {
-                                crate::value::Value::undefined().to_jit_bits()
-                            } else {
-                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                            };
-                            match crate::jit_runtime::try_execute_jit_from_raw_args(
-                                closure.module.module_id,
-                                closure.function_index,
-                                func_info,
-                                argc as u32,
-                                args_ptr,
-                                this_raw,
-                                callee_raw,
-                                crate::value::Value::null().to_jit_bits(),
-                                vm_ctx.cached_proto_epoch,
-                                ctx.interpreter,
-                                ctx.vm_ctx,
-                                &closure.module.constants as *const _,
-                                &closure.upvalues,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    return value.to_jit_bits();
-                                }
-                                _ => {}
-                            }
-                        }
+                            closure.upvalues.as_ptr()
+                        },
+                        closure.upvalues.len() as u32,
+                        this_raw,
+                        callee_raw,
+                        crate::value::Value::null().to_jit_bits(),
+                    );
+
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    let result = unsafe {
+                        call_with_reentry_state(
+                            ctx_raw as *mut JitContext,
+                            args_ptr,
+                            argc as u32,
+                            jit_ptr,
+                            &reentry,
+                        )
+                    };
+
+                    if result != BAILOUT_SENTINEL {
+                        return result;
+                    }
+                    // JIT bailout → fall through to interpreter
+                } else {
+                    // No JIT code yet — try full JIT path (may compile)
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+                    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                    let this_raw = if func_info.flags.is_strict {
+                        crate::value::Value::undefined().to_jit_bits()
+                    } else {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    };
+                    if let crate::jit_runtime::JitCallResult::Ok(value) =
+                        crate::jit_runtime::try_execute_jit_from_raw_args(
+                            closure.module.module_id,
+                            closure.function_index,
+                            func_info,
+                            argc as u32,
+                            args_ptr,
+                            this_raw,
+                            callee_raw,
+                            crate::value::Value::null().to_jit_bits(),
+                            vm_ctx.cached_proto_epoch,
+                            ctx.interpreter,
+                            ctx.vm_ctx,
+                            &closure.module.constants as *const _,
+                            &closure.upvalues,
+                        )
+                    {
+                        return value.to_jit_bits();
                     }
                 }
             }
@@ -826,85 +820,83 @@ pub(crate) extern "C" fn otter_rt_call_mono_impl(
             let mono_hit = expected_func_index != 0
                 && closure.function_index.wrapping_add(1) == expected_func_index;
 
-            if mono_hit || (!closure.is_generator && !closure.is_async) {
-                if let Some(func_info) = closure.module.function(closure.function_index) {
-                    if mono_hit || !func_info.flags.has_rest {
-                        let jit_ptr = func_info.jit_entry_ptr();
-                        if jit_ptr != 0 {
-                            let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
-                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-                            let this_raw = if func_info.flags.is_strict {
-                                crate::value::Value::undefined().to_jit_bits()
-                            } else {
-                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                            };
-                            let reentry = JitCallReentryState::new(
-                                func_info as *const Function,
-                                &closure.module.constants as *const _,
-                                if closure.upvalues.is_empty() {
-                                    std::ptr::null()
-                                } else {
-                                    closure.upvalues.as_ptr()
-                                },
-                                closure.upvalues.len() as u32,
-                                this_raw,
-                                callee_raw,
-                                crate::value::Value::null().to_jit_bits(),
-                            );
-
-                            let args_ptr = if argc == 0 {
-                                std::ptr::null()
-                            } else {
-                                argv_ptr_raw as *const i64
-                            };
-                            let result = unsafe {
-                                call_with_reentry_state(
-                                    ctx_raw as *mut JitContext,
-                                    args_ptr,
-                                    argc as u32,
-                                    jit_ptr,
-                                    &reentry,
-                                )
-                            };
-
-                            if result != BAILOUT_SENTINEL {
-                                return result;
-                            }
+            if (mono_hit || (!closure.is_generator && !closure.is_async))
+                && let Some(func_info) = closure.module.function(closure.function_index)
+                && (mono_hit || !func_info.flags.has_rest)
+            {
+                let jit_ptr = func_info.jit_entry_ptr();
+                if jit_ptr != 0 {
+                    let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+                    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                    let this_raw = if func_info.flags.is_strict {
+                        crate::value::Value::undefined().to_jit_bits()
+                    } else {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    };
+                    let reentry = JitCallReentryState::new(
+                        func_info as *const Function,
+                        &closure.module.constants as *const _,
+                        if closure.upvalues.is_empty() {
+                            std::ptr::null()
                         } else {
-                            // No JIT code yet — try full JIT path
-                            let args_ptr = if argc == 0 {
-                                std::ptr::null()
-                            } else {
-                                argv_ptr_raw as *const i64
-                            };
-                            let ctx = unsafe { &*(ctx_raw as *const JitContext) };
-                            let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-                            let this_raw = if func_info.flags.is_strict {
-                                crate::value::Value::undefined().to_jit_bits()
-                            } else {
-                                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                            };
-                            match crate::jit_runtime::try_execute_jit_from_raw_args(
-                                closure.module.module_id,
-                                closure.function_index,
-                                func_info,
-                                argc as u32,
-                                args_ptr,
-                                this_raw,
-                                callee_raw,
-                                crate::value::Value::null().to_jit_bits(),
-                                vm_ctx.cached_proto_epoch,
-                                ctx.interpreter,
-                                ctx.vm_ctx,
-                                &closure.module.constants as *const _,
-                                &closure.upvalues,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    return value.to_jit_bits();
-                                }
-                                _ => {}
-                            }
-                        }
+                            closure.upvalues.as_ptr()
+                        },
+                        closure.upvalues.len() as u32,
+                        this_raw,
+                        callee_raw,
+                        crate::value::Value::null().to_jit_bits(),
+                    );
+
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    let result = unsafe {
+                        call_with_reentry_state(
+                            ctx_raw as *mut JitContext,
+                            args_ptr,
+                            argc as u32,
+                            jit_ptr,
+                            &reentry,
+                        )
+                    };
+
+                    if result != BAILOUT_SENTINEL {
+                        return result;
+                    }
+                } else {
+                    // No JIT code yet — try full JIT path
+                    let args_ptr = if argc == 0 {
+                        std::ptr::null()
+                    } else {
+                        argv_ptr_raw as *const i64
+                    };
+                    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+                    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                    let this_raw = if func_info.flags.is_strict {
+                        crate::value::Value::undefined().to_jit_bits()
+                    } else {
+                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+                    };
+                    if let crate::jit_runtime::JitCallResult::Ok(value) =
+                        crate::jit_runtime::try_execute_jit_from_raw_args(
+                            closure.module.module_id,
+                            closure.function_index,
+                            func_info,
+                            argc as u32,
+                            args_ptr,
+                            this_raw,
+                            callee_raw,
+                            crate::value::Value::null().to_jit_bits(),
+                            vm_ctx.cached_proto_epoch,
+                            ctx.interpreter,
+                            ctx.vm_ctx,
+                            &closure.module.constants as *const _,
+                            &closure.upvalues,
+                        )
+                    {
+                        return value.to_jit_bits();
                     }
                 }
             }
@@ -989,13 +981,12 @@ extern "C" fn otter_rt_new_array(ctx_raw: i64, len_raw: i64) -> i64 {
         .map(|intrinsics| intrinsics.array_prototype)
     {
         arr.set_prototype(crate::value::Value::object(array_proto));
-    } else if let Some(array_obj) = vm_ctx.get_global("Array").and_then(|v| v.as_object()) {
-        if let Some(array_proto) = array_obj
+    } else if let Some(array_obj) = vm_ctx.get_global("Array").and_then(|v| v.as_object())
+        && let Some(array_proto) = array_obj
             .get(&crate::object::PropertyKey::string("prototype"))
             .and_then(|v| v.as_object())
-        {
-            arr.set_prototype(crate::value::Value::object(array_proto));
-        }
+    {
+        arr.set_prototype(crate::value::Value::object(array_proto));
     }
 
     crate::value::Value::array(arr).to_jit_bits()
@@ -1079,19 +1070,16 @@ extern "C" fn otter_rt_get_global(ctx_raw: i64, name_idx: i64, ic_idx: i64) -> i
     if !global_obj.is_dictionary_mode() {
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.read();
-        if let Some(ic) = feedback.get(ic_idx as usize) {
-            if let InlineCacheState::Monomorphic {
+        if let Some(ic) = feedback.get(ic_idx as usize)
+            && let InlineCacheState::Monomorphic {
                 shape_id: shape_addr,
                 offset,
                 ..
             } = &ic.ic_state
-            {
-                if global_obj.shape_id() == *shape_addr {
-                    if let Some(val) = global_obj.get_by_offset(*offset as usize) {
-                        return val.to_jit_bits();
-                    }
-                }
-            }
+            && global_obj.shape_id() == *shape_addr
+            && let Some(val) = global_obj.get_by_offset(*offset as usize)
+        {
+            return val.to_jit_bits();
         }
     }
 
@@ -1315,28 +1303,28 @@ fn value_to_property_key_simple(value: &crate::value::Value) -> Option<PropertyK
     if let Some(sym) = value.as_symbol() {
         return Some(PropertyKey::Symbol(sym));
     }
-    if let Some(n) = value.as_int32() {
-        if n >= 0 {
-            return Some(PropertyKey::Index(n as u32));
-        }
+    if let Some(n) = value.as_int32()
+        && n >= 0
+    {
+        return Some(PropertyKey::Index(n as u32));
     }
     if let Some(s) = value.as_string() {
         // Check if it's an array index
         let str_val = s.as_str();
-        if let Ok(idx) = str_val.parse::<u32>() {
-            if idx.to_string() == str_val {
-                return Some(PropertyKey::Index(idx));
-            }
+        if let Ok(idx) = str_val.parse::<u32>()
+            && idx.to_string() == str_val
+        {
+            return Some(PropertyKey::Index(idx));
         }
         return Some(PropertyKey::from_js_string(s));
     }
     if let Some(n) = value.as_number() {
         // Numeric keys like 1.5 become string "1.5"
         let s = crate::globals::js_number_to_string(n);
-        if let Ok(idx) = s.parse::<u32>() {
-            if idx.to_string() == s {
-                return Some(PropertyKey::Index(idx));
-            }
+        if let Ok(idx) = s.parse::<u32>()
+            && idx.to_string() == s
+        {
+            return Some(PropertyKey::Index(idx));
         }
         return Some(PropertyKey::string_transient(&s));
     }
@@ -1475,16 +1463,15 @@ extern "C" fn otter_rt_get_elem_int(_ctx_raw: i64, obj_raw: i64, idx_raw: i64) -
         return BAILOUT_SENTINEL;
     };
 
-    if obj_ref.is_array() {
-        if let Some(n) = idx_val.as_int32() {
-            if n >= 0 {
-                let elements = obj_ref.get_elements_storage().borrow();
-                if let Some(v) = elements.get(n as usize) {
-                    if !v.is_hole() {
-                        return v.to_jit_bits();
-                    }
-                }
-            }
+    if obj_ref.is_array()
+        && let Some(n) = idx_val.as_int32()
+        && n >= 0
+    {
+        let elements = obj_ref.get_elements_storage().borrow();
+        if let Some(v) = elements.get(n as usize)
+            && !v.is_hole()
+        {
+            return v.to_jit_bits();
         }
     }
 
@@ -1512,16 +1499,15 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
     };
 
     // Fast path: array with integer index
-    if obj_ref.is_array() {
-        if let Some(n) = idx_val.as_int32() {
-            if n >= 0 {
-                let elements = obj_ref.get_elements_storage().borrow();
-                if let Some(v) = elements.get(n as usize) {
-                    if !v.is_hole() {
-                        return v.to_jit_bits();
-                    }
-                }
-            }
+    if obj_ref.is_array()
+        && let Some(n) = idx_val.as_int32()
+        && n >= 0
+    {
+        let elements = obj_ref.get_elements_storage().borrow();
+        if let Some(v) = elements.get(n as usize)
+            && !v.is_hole()
+        {
+            return v.to_jit_bits();
         }
     }
 
@@ -1539,46 +1525,46 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
         let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
-        if let Some(ic) = feedback.get_mut(ic_idx as usize) {
-            if ic.proto_epoch_matches(ctx.proto_epoch) {
-                let cached_offset = match &ic.ic_state {
-                    InlineCacheState::Monomorphic {
-                        shape_id, offset, ..
-                    } => {
-                        if obj_shape_ptr == *shape_id {
-                            Some(*offset)
-                        } else {
-                            None
-                        }
-                    }
-                    InlineCacheState::Polymorphic { count, entries } => {
-                        let mut found = None;
-                        for i in 0..(*count as usize) {
-                            if obj_shape_ptr == entries[i].0 {
-                                found = Some(entries[i].3);
-                                break;
-                            }
-                        }
-                        found
-                    }
-                    _ => None,
-                };
-                if let Some(offset) = cached_offset {
-                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
-                        ic.record_hit();
-                        return val.to_jit_bits();
+        if let Some(ic) = feedback.get_mut(ic_idx as usize)
+            && ic.proto_epoch_matches(ctx.proto_epoch)
+        {
+            let cached_offset = match &ic.ic_state {
+                InlineCacheState::Monomorphic {
+                    shape_id, offset, ..
+                } => {
+                    if obj_shape_ptr == *shape_id {
+                        Some(*offset)
+                    } else {
+                        None
                     }
                 }
+                InlineCacheState::Polymorphic { count, entries } => {
+                    let mut found = None;
+                    for entry in &entries[..(*count as usize)] {
+                        if obj_shape_ptr == entry.0 {
+                            found = Some(entry.3);
+                            break;
+                        }
+                    }
+                    found
+                }
+                _ => None,
+            };
+            if let Some(offset) = cached_offset
+                && let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
+            {
+                ic.record_hit();
+                return val.to_jit_bits();
             }
         }
     }
 
     // For integer indices on non-array objects (e.g., arguments, typed arrays),
     // try direct property lookup
-    if let PropertyKey::Index(idx) = &key {
-        if let Some(val) = obj_ref.get(&PropertyKey::Index(*idx)) {
-            return val.to_jit_bits();
-        }
+    if let PropertyKey::Index(idx) = &key
+        && let Some(val) = obj_ref.get(&PropertyKey::Index(*idx))
+    {
+        return val.to_jit_bits();
     }
 
     BAILOUT_SENTINEL
@@ -1613,29 +1599,26 @@ extern "C" fn otter_rt_set_elem(
     };
 
     // Fast path: array with integer index
-    if obj_ref.is_array() {
-        if let Some(n) = idx_val.as_int32() {
-            if n >= 0 {
-                let mut elements = obj_ref.get_elements_storage().borrow_mut();
-                let idx = n as usize;
-                if idx < elements.len() {
-                    crate::object::gc_write_barrier(&write_val);
-                    elements.set(idx, write_val);
-                    return 0;
-                } else if idx == elements.len() {
-                    crate::object::gc_write_barrier(&write_val);
-                    elements.push(write_val);
-                    // Update length property
-                    let length_key = PropertyKey::string("length");
-                    if let Some(len_offset) = obj_ref.shape_get_offset(&length_key) {
-                        let _ = obj_ref.set_by_offset(
-                            len_offset,
-                            crate::value::Value::number((idx + 1) as f64),
-                        );
-                    }
-                    return 0;
-                }
+    if obj_ref.is_array()
+        && let Some(n) = idx_val.as_int32()
+        && n >= 0
+    {
+        let mut elements = obj_ref.get_elements_storage().borrow_mut();
+        let idx = n as usize;
+        if idx < elements.len() {
+            crate::object::gc_write_barrier(&write_val);
+            elements.set(idx, write_val);
+            return 0;
+        } else if idx == elements.len() {
+            crate::object::gc_write_barrier(&write_val);
+            elements.push(write_val);
+            // Update length property
+            let length_key = PropertyKey::string("length");
+            if let Some(len_offset) = obj_ref.shape_get_offset(&length_key) {
+                let _ = obj_ref
+                    .set_by_offset(len_offset, crate::value::Value::number((idx + 1) as f64));
             }
+            return 0;
         }
     }
 
@@ -1653,51 +1636,45 @@ extern "C" fn otter_rt_set_elem(
         let obj_shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
         let function = unsafe { &*ctx.function_ptr };
         let feedback = function.feedback_vector.write();
-        if let Some(ic) = feedback.get_mut(ic_idx as usize) {
-            if ic.proto_epoch_matches(ctx.proto_epoch) {
-                let cached_offset = match &ic.ic_state {
-                    InlineCacheState::Monomorphic {
-                        shape_id, offset, ..
-                    } => {
-                        if obj_shape_ptr == *shape_id {
-                            Some(*offset)
-                        } else {
-                            None
-                        }
-                    }
-                    InlineCacheState::Polymorphic { count, entries } => {
-                        let mut found = None;
-                        for i in 0..(*count as usize) {
-                            if obj_shape_ptr == entries[i].0 {
-                                found = Some(entries[i].3);
-                                break;
-                            }
-                        }
-                        found
-                    }
-                    _ => None,
-                };
-                if let Some(offset) = cached_offset {
-                    if obj_ref
-                        .set_by_offset(offset as usize, write_val.clone())
-                        .is_ok()
-                    {
-                        ic.record_hit();
-                        return 0;
+        if let Some(ic) = feedback.get_mut(ic_idx as usize)
+            && ic.proto_epoch_matches(ctx.proto_epoch)
+        {
+            let cached_offset = match &ic.ic_state {
+                InlineCacheState::Monomorphic {
+                    shape_id, offset, ..
+                } => {
+                    if obj_shape_ptr == *shape_id {
+                        Some(*offset)
+                    } else {
+                        None
                     }
                 }
+                InlineCacheState::Polymorphic { count, entries } => {
+                    let mut found = None;
+                    for entry in &entries[..(*count as usize)] {
+                        if obj_shape_ptr == entry.0 {
+                            found = Some(entry.3);
+                            break;
+                        }
+                    }
+                    found
+                }
+                _ => None,
+            };
+            if let Some(offset) = cached_offset
+                && obj_ref.set_by_offset(offset as usize, write_val).is_ok()
+            {
+                ic.record_hit();
+                return 0;
             }
         }
     }
 
     // For integer indices, try direct set on the object
-    if let PropertyKey::Index(idx) = &key {
-        if obj_ref
-            .set(PropertyKey::Index(*idx), write_val.clone())
-            .is_ok()
-        {
-            return 0;
-        }
+    if let PropertyKey::Index(idx) = &key
+        && obj_ref.set(PropertyKey::Index(*idx), write_val).is_ok()
+    {
+        return 0;
     }
 
     BAILOUT_SENTINEL
@@ -1922,7 +1899,7 @@ extern "C" fn otter_rt_call_method(
         _ => return BAILOUT_SENTINEL,
     };
     let method_name = JsString::intern_utf16(method_name_units);
-    let method_key = PropertyKey::from_js_string(method_name.clone());
+    let method_key = PropertyKey::from_js_string(method_name);
 
     // Very hot path in string benchmark: `(i % 10).toString()`.
     // Skip method lookup/call overhead for no-arg primitive toString.
@@ -1976,64 +1953,65 @@ extern "C" fn otter_rt_call_method(
                     }
                     _ => None,
                 };
-                if let Some(offset) = cached_offset {
-                    if let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) } {
-                        ic.record_hit();
-                        method = Some(val);
-                    }
+                if let Some(offset) = cached_offset
+                    && let Some(val) = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) }
+                {
+                    ic.record_hit();
+                    method = Some(val);
                 }
             }
 
             // Slow path on IC miss: resolve method and update IC.
-            if method.is_none() && !obj_ref.is_dictionary_mode() {
-                if let Some(offset) = obj_ref.shape_get_offset(&method_key) {
-                    let shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
-                    let current_epoch = ctx.proto_epoch;
-                    match &mut ic.ic_state {
-                        InlineCacheState::Uninitialized => {
-                            ic.ic_state = InlineCacheState::Monomorphic {
-                                shape_id: shape_ptr,
-                                proto_shape_id: 0,
-                                depth: 0,
-                                offset: offset as u32,
-                            };
+            if method.is_none()
+                && !obj_ref.is_dictionary_mode()
+                && let Some(offset) = obj_ref.shape_get_offset(&method_key)
+            {
+                let shape_ptr = unsafe { obj_ref.shape_id_unchecked() };
+                let current_epoch = ctx.proto_epoch;
+                match &mut ic.ic_state {
+                    InlineCacheState::Uninitialized => {
+                        ic.ic_state = InlineCacheState::Monomorphic {
+                            shape_id: shape_ptr,
+                            proto_shape_id: 0,
+                            depth: 0,
+                            offset: offset as u32,
+                        };
+                        ic.proto_epoch = current_epoch;
+                    }
+                    InlineCacheState::Monomorphic {
+                        shape_id: old_shape,
+                        offset: old_offset,
+                        ..
+                    } => {
+                        if *old_shape != shape_ptr {
+                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                            entries[1] = (shape_ptr, 0, 0, offset as u32);
+                            ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                             ic.proto_epoch = current_epoch;
                         }
-                        InlineCacheState::Monomorphic {
-                            shape_id: old_shape,
-                            offset: old_offset,
-                            ..
-                        } => {
-                            if *old_shape != shape_ptr {
-                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                entries[0] = (*old_shape, 0, 0, *old_offset);
-                                entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
-                                ic.proto_epoch = current_epoch;
-                            }
-                        }
-                        InlineCacheState::Polymorphic { count, entries } => {
-                            let mut found = false;
-                            for i in 0..(*count as usize) {
-                                if entries[i].0 == shape_ptr {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                if (*count as usize) < 4 {
-                                    entries[*count as usize] = (shape_ptr, 0, 0, offset as u32);
-                                    *count += 1;
-                                    ic.proto_epoch = current_epoch;
-                                } else {
-                                    ic.ic_state = InlineCacheState::Megamorphic;
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                    method = unsafe { obj_ref.get_by_offset_unchecked(offset as usize) };
+                    InlineCacheState::Polymorphic { count, entries } => {
+                        let mut found = false;
+                        for entry in &entries[..(*count as usize)] {
+                            if entry.0 == shape_ptr {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            if (*count as usize) < 4 {
+                                entries[*count as usize] = (shape_ptr, 0, 0, offset as u32);
+                                *count += 1;
+                                ic.proto_epoch = current_epoch;
+                            } else {
+                                ic.ic_state = InlineCacheState::Megamorphic;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+                method = unsafe { obj_ref.get_by_offset_unchecked(offset) };
             }
         }
         if method.is_none() {
@@ -2078,30 +2056,32 @@ extern "C" fn otter_rt_call_method(
     // Array push/pop fast path for JIT
     if let Some(fn_obj) = method.native_function_object() {
         let flags = fn_obj.flags.borrow();
-        if flags.is_array_push || flags.is_array_pop {
-            if let Some(receiver_obj) = receiver.as_object() {
-                if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() && receiver_obj.array_length_writable() && !receiver_obj.is_frozen() {
-                    if flags.is_array_push {
-                        return match unsafe {
-                            with_collected_args(argc, argv_ptr_raw, |args| {
-                                let mut last_len = receiver_obj.array_length();
-                                for arg in args {
-                                    last_len = receiver_obj.array_push(arg.clone());
-                                }
-                                if args.is_empty() {
-                                    last_len = receiver_obj.array_length();
-                                }
-                                crate::value::Value::number(last_len as f64)
-                            })
-                        } {
-                            Some(result) => result.to_jit_bits(),
-                            _ => BAILOUT_SENTINEL,
-                        };
-                    } else if flags.is_array_pop {
-                        let val = receiver_obj.array_pop();
-                        return val.to_jit_bits();
-                    }
-                }
+        if (flags.is_array_push || flags.is_array_pop)
+            && let Some(receiver_obj) = receiver.as_object()
+            && receiver_obj.is_array()
+            && !receiver_obj.is_dictionary_mode()
+            && receiver_obj.array_length_writable()
+            && !receiver_obj.is_frozen()
+        {
+            if flags.is_array_push {
+                return match unsafe {
+                    with_collected_args(argc, argv_ptr_raw, |args| {
+                        let mut last_len = receiver_obj.array_length();
+                        for arg in args {
+                            last_len = receiver_obj.array_push(*arg);
+                        }
+                        if args.is_empty() {
+                            last_len = receiver_obj.array_length();
+                        }
+                        crate::value::Value::number(last_len as f64)
+                    })
+                } {
+                    Some(result) => result.to_jit_bits(),
+                    _ => BAILOUT_SENTINEL,
+                };
+            } else if flags.is_array_pop {
+                let val = receiver_obj.array_pop();
+                return val.to_jit_bits();
             }
         }
     }
@@ -2154,48 +2134,44 @@ extern "C" fn otter_rt_call_with_receiver(
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
     // Fast path: direct JIT-to-JIT call for JS closures with compiled code.
-    if let Some(closure) = callee.as_function() {
-        if !closure.is_generator && !closure.is_async {
-            if let Some(func_info) = closure.module.function(closure.function_index) {
-                if !func_info.flags.has_rest {
-                    let args_ptr = if argc == 0 {
-                        std::ptr::null()
-                    } else {
-                        argv_ptr_raw as *const i64
-                    };
-                    if argc > 0 && args_ptr.is_null() {
-                        return BAILOUT_SENTINEL;
-                    }
-                    let this_raw_for_jit = if !func_info.flags.is_strict
-                        && (this_val.is_undefined() || this_val.is_null())
-                    {
-                        crate::value::Value::object(vm_ctx.global()).to_jit_bits()
-                    } else {
-                        this_val.to_jit_bits()
-                    };
-                    match crate::jit_runtime::try_execute_jit_from_raw_args(
-                        closure.module.module_id,
-                        closure.function_index,
-                        func_info,
-                        argc as u32,
-                        args_ptr,
-                        this_raw_for_jit,
-                        callee.to_jit_bits(),
-                        crate::value::Value::null().to_jit_bits(),
-                        vm_ctx.cached_proto_epoch,
-                        ctx.interpreter,
-                        ctx.vm_ctx,
-                        &closure.module.constants as *const _,
-                        &closure.upvalues,
-                    ) {
-                        crate::jit_runtime::JitCallResult::Ok(value) => {
-                            return value.to_jit_bits();
-                        }
-                        // Bailout or not compiled: fall through to interpreter path.
-                        _ => {}
-                    }
-                }
-            }
+    if let Some(closure) = callee.as_function()
+        && !closure.is_generator
+        && !closure.is_async
+        && let Some(func_info) = closure.module.function(closure.function_index)
+        && !func_info.flags.has_rest
+    {
+        let args_ptr = if argc == 0 {
+            std::ptr::null()
+        } else {
+            argv_ptr_raw as *const i64
+        };
+        if argc > 0 && args_ptr.is_null() {
+            return BAILOUT_SENTINEL;
+        }
+        let this_raw_for_jit =
+            if !func_info.flags.is_strict && (this_val.is_undefined() || this_val.is_null()) {
+                crate::value::Value::object(vm_ctx.global()).to_jit_bits()
+            } else {
+                this_val.to_jit_bits()
+            };
+        if let crate::jit_runtime::JitCallResult::Ok(value) =
+            crate::jit_runtime::try_execute_jit_from_raw_args(
+                closure.module.module_id,
+                closure.function_index,
+                func_info,
+                argc as u32,
+                args_ptr,
+                this_raw_for_jit,
+                callee.to_jit_bits(),
+                crate::value::Value::null().to_jit_bits(),
+                vm_ctx.cached_proto_epoch,
+                ctx.interpreter,
+                ctx.vm_ctx,
+                &closure.module.constants as *const _,
+                &closure.upvalues,
+            )
+        {
+            return value.to_jit_bits();
         }
     }
 
@@ -2265,30 +2241,32 @@ extern "C" fn otter_rt_call_method_computed(
     // Array push/pop fast path for JIT
     if let Some(fn_obj) = method.native_function_object() {
         let flags = fn_obj.flags.borrow();
-        if flags.is_array_push || flags.is_array_pop {
-            if let Some(receiver_obj) = receiver.as_object() {
-                if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() && receiver_obj.array_length_writable() && !receiver_obj.is_frozen() {
-                    if flags.is_array_push {
-                        return match unsafe {
-                            with_collected_args(argc, argv_ptr_raw, |args| {
-                                let mut last_len = receiver_obj.array_length();
-                                for arg in args {
-                                    last_len = receiver_obj.array_push(arg.clone());
-                                }
-                                if args.is_empty() {
-                                    last_len = receiver_obj.array_length();
-                                }
-                                crate::value::Value::number(last_len as f64)
-                            })
-                        } {
-                            Some(result) => result.to_jit_bits(),
-                            _ => BAILOUT_SENTINEL,
-                        };
-                    } else if flags.is_array_pop {
-                        let val = receiver_obj.array_pop();
-                        return val.to_jit_bits();
-                    }
-                }
+        if (flags.is_array_push || flags.is_array_pop)
+            && let Some(receiver_obj) = receiver.as_object()
+            && receiver_obj.is_array()
+            && !receiver_obj.is_dictionary_mode()
+            && receiver_obj.array_length_writable()
+            && !receiver_obj.is_frozen()
+        {
+            if flags.is_array_push {
+                return match unsafe {
+                    with_collected_args(argc, argv_ptr_raw, |args| {
+                        let mut last_len = receiver_obj.array_length();
+                        for arg in args {
+                            last_len = receiver_obj.array_push(*arg);
+                        }
+                        if args.is_empty() {
+                            last_len = receiver_obj.array_length();
+                        }
+                        crate::value::Value::number(last_len as f64)
+                    })
+                } {
+                    Some(result) => result.to_jit_bits(),
+                    _ => BAILOUT_SENTINEL,
+                };
+            } else if flags.is_array_pop {
+                let val = receiver_obj.array_pop();
+                return val.to_jit_bits();
             }
         }
     }
@@ -3265,27 +3243,25 @@ extern "C" fn otter_rt_get_super_prop(ctx_raw: i64, name_idx: i64) -> i64 {
     match proto_obj.get(&key) {
         Some(val) => {
             // Check if it's an accessor with getter — need to call with correct this
-            if let Some(desc) = proto_obj.lookup_property_descriptor(&key) {
-                if let PropertyDescriptor::Accessor {
+            if let Some(desc) = proto_obj.lookup_property_descriptor(&key)
+                && let PropertyDescriptor::Accessor {
                     get: Some(getter), ..
                 } = desc
-                {
-                    // Call getter with `this` from JitContext
-                    if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
-                        return BAILOUT_SENTINEL;
-                    }
-                    let this_val = unsafe {
-                        crate::value::Value::from_raw_bits_unchecked(ctx.this_raw as u64)
-                    };
-                    let Some(this_val) = this_val else {
-                        return BAILOUT_SENTINEL;
-                    };
-                    let interpreter = unsafe { &*ctx.interpreter };
-                    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
-                    match interpreter.call_function(vm_ctx, &getter, this_val, &[]) {
-                        Ok(result) => return result.to_jit_bits(),
-                        Err(_) => return BAILOUT_SENTINEL,
-                    }
+            {
+                // Call getter with `this` from JitContext
+                if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
+                    return BAILOUT_SENTINEL;
+                }
+                let this_val =
+                    unsafe { crate::value::Value::from_raw_bits_unchecked(ctx.this_raw as u64) };
+                let Some(this_val) = this_val else {
+                    return BAILOUT_SENTINEL;
+                };
+                let interpreter = unsafe { &*ctx.interpreter };
+                let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+                match interpreter.call_function(vm_ctx, &getter, this_val, &[]) {
+                    Ok(result) => return result.to_jit_bits(),
+                    Err(_) => return BAILOUT_SENTINEL,
                 }
             }
             val.to_jit_bits()
@@ -3336,10 +3312,10 @@ extern "C" fn otter_rt_define_class(
 
     if super_val.is_undefined() || super_val.is_null() {
         // Base class: ensure ctor.prototype.constructor = ctor
-        if let Some(proto_val) = ctor_obj.get(&PropertyKey::string("prototype")) {
-            if let Some(proto_obj) = proto_val.as_object() {
-                let _ = proto_obj.set(PropertyKey::string("constructor"), ctor_val.clone());
-            }
+        if let Some(proto_val) = ctor_obj.get(&PropertyKey::string("prototype"))
+            && let Some(proto_obj) = proto_val.as_object()
+        {
+            let _ = proto_obj.set(PropertyKey::string("constructor"), ctor_val);
         }
         return ctor_val.to_jit_bits();
     }
@@ -3369,14 +3345,14 @@ extern "C" fn otter_rt_define_class(
     // Set ctor.prototype = derived_proto
     let _ = ctor_obj.set(
         PropertyKey::string("prototype"),
-        crate::value::Value::object(derived_proto.clone()),
+        crate::value::Value::object(derived_proto),
     );
 
     // Set derived_proto.constructor = ctor
-    let _ = derived_proto.set(PropertyKey::string("constructor"), ctor_val.clone());
+    let _ = derived_proto.set(PropertyKey::string("constructor"), ctor_val);
 
     // Set ctor.__proto__ = super for static method inheritance
-    ctor_obj.set_prototype(super_val.clone());
+    ctor_obj.set_prototype(super_val);
 
     ctor_val.to_jit_bits()
 }
@@ -3778,16 +3754,13 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
             Some(f) => f,
             None => return BAILOUT_SENTINEL,
         };
-        let home_object = match frame.home_object.clone() {
+        let home_object = match frame.home_object {
             Some(ho) => ho,
             None => return BAILOUT_SENTINEL,
         };
-        let new_target_proto = frame
-            .new_target_proto
-            .clone()
-            .unwrap_or_else(|| home_object.clone());
+        let new_target_proto = frame.new_target_proto.unwrap_or(home_object);
         let argc = frame.argc as usize;
-        let callee_value = frame.callee_value.clone();
+        let callee_value = frame.callee_value;
         (home_object, new_target_proto, argc, callee_value)
     };
 
@@ -3833,10 +3806,10 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
             vm_ctx.set_pending_is_derived(true);
             vm_ctx.set_pending_new_target_proto(new_target_proto);
             let proto_key = PropertyKey::string("prototype");
-            if let Some(proto_val) = super_closure.object.get(&proto_key) {
-                if let Some(proto_obj) = proto_val.as_object() {
-                    vm_ctx.set_pending_home_object(proto_obj);
-                }
+            if let Some(proto_val) = super_closure.object.get(&proto_key)
+                && let Some(proto_obj) = proto_val.as_object()
+            {
+                vm_ctx.set_pending_home_object(proto_obj);
             }
         }
         match interpreter.call_function(
@@ -3857,26 +3830,18 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
     } else if super_ctor_val.as_native_function().is_some() {
         // Native built-in constructor
         let _mm = vm_ctx.memory_manager().clone();
-        let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(
-            new_target_proto.clone(),
-        )));
+        let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(new_target_proto)));
         let new_obj_value = crate::value::Value::object(new_obj);
-        match interpreter.call_function_construct(
-            vm_ctx,
-            &super_ctor_val,
-            new_obj_value.clone(),
-            &args,
-        ) {
+        match interpreter.call_function_construct(vm_ctx, &super_ctor_val, new_obj_value, &args) {
             Ok(result) => {
-                let this_obj = if result.is_object() {
+                if result.is_object() {
                     if let Some(obj) = result.as_object() {
                         obj.set_prototype(crate::value::Value::object(new_target_proto));
                     }
                     result
                 } else {
                     new_obj_value
-                };
-                this_obj
+                }
             }
             Err(_) => return BAILOUT_SENTINEL,
         }
@@ -3884,7 +3849,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
         let _mm = vm_ctx.memory_manager().clone();
         let new_obj = GcRef::new(JsObject::new(crate::value::Value::object(new_target_proto)));
         let new_obj_value = crate::value::Value::object(new_obj);
-        match interpreter.call_function(vm_ctx, &super_ctor_val, new_obj_value.clone(), &args) {
+        match interpreter.call_function(vm_ctx, &super_ctor_val, new_obj_value, &args) {
             Ok(result) => {
                 if result.is_object() {
                     result
@@ -3898,7 +3863,7 @@ extern "C" fn otter_rt_call_super_forward(ctx_raw: i64) -> i64 {
 
     // Update frame's this_value
     if let Some(frame) = vm_ctx.current_frame_mut() {
-        frame.this_value = this_value.clone();
+        frame.this_value = this_value;
         frame.flags.set_this_initialized(true);
     }
 
@@ -3983,7 +3948,7 @@ extern "C" fn otter_rt_async_closure(ctx_raw: i64, func_idx: i64) -> i64 {
         upvalues: captured,
         is_async: true,
         is_generator: false,
-        object: func_obj.clone(),
+        object: func_obj,
         home_object: None,
     });
     let func_value = crate::value::Value::function(closure);
@@ -4092,7 +4057,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
         upvalues: captured,
         is_async: false,
         is_generator: true,
-        object: func_obj.clone(),
+        object: func_obj,
         home_object: None,
     });
     let func_value = crate::value::Value::function(closure);
@@ -4101,7 +4066,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
     func_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::Data {
-            value: crate::value::Value::object(proto.clone()),
+            value: crate::value::Value::object(proto),
             attributes: crate::object::PropertyAttributes {
                 writable: true,
                 enumerable: false,
@@ -4109,7 +4074,7 @@ extern "C" fn otter_rt_generator_closure(ctx_raw: i64, func_idx: i64) -> i64 {
             },
         },
     );
-    let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
+    let _ = proto.set(PropertyKey::string("constructor"), func_value);
     func_obj.define_property(
         PropertyKey::string("__non_constructor"),
         PropertyDescriptor::Data {
@@ -4213,7 +4178,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
         upvalues: captured,
         is_async: true,
         is_generator: true,
-        object: func_obj.clone(),
+        object: func_obj,
         home_object: None,
     });
     let func_value = crate::value::Value::function(closure);
@@ -4222,7 +4187,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
     func_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::Data {
-            value: crate::value::Value::object(proto.clone()),
+            value: crate::value::Value::object(proto),
             attributes: crate::object::PropertyAttributes {
                 writable: true,
                 enumerable: false,
@@ -4230,7 +4195,7 @@ extern "C" fn otter_rt_async_generator_closure(ctx_raw: i64, func_idx: i64) -> i
             },
         },
     );
-    let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
+    let _ = proto.set(PropertyKey::string("constructor"), func_value);
     func_obj.define_property(
         PropertyKey::string("__non_constructor"),
         PropertyDescriptor::Data {
@@ -4257,7 +4222,7 @@ fn capture_upvalues_for_jit(
     for spec in upvalue_specs {
         let cell = match spec {
             UpvalueCapture::Local(idx) => vm_ctx.get_or_create_open_upvalue(idx.0)?,
-            UpvalueCapture::Upvalue(idx) => vm_ctx.get_upvalue_cell(idx.0)?.clone(),
+            UpvalueCapture::Upvalue(idx) => *vm_ctx.get_upvalue_cell(idx.0)?,
         };
         captured.push(cell);
     }
@@ -4621,7 +4586,8 @@ extern "C" fn otter_rt_call_ffi(
     if raw_ptr.is_null() {
         return BAILOUT_SENTINEL;
     }
-    let header_offset = std::mem::offset_of!(GcAllocation<crate::value::NativeFunctionObject>, value);
+    let header_offset =
+        std::mem::offset_of!(GcAllocation<crate::value::NativeFunctionObject>, value);
     let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
     let tag = unsafe { (*header_ptr).tag() };
     if tag != gc_tags::FUNCTION {
@@ -4643,14 +4609,7 @@ extern "C" fn otter_rt_call_ffi(
         std::ptr::null()
     };
 
-    unsafe {
-        (ffi_info.trampoline)(
-            ffi_info.opaque,
-            ffi_info.fn_ptr,
-            js_args,
-            argc as u16,
-        )
-    }
+    unsafe { (ffi_info.trampoline)(ffi_info.opaque, ffi_info.fn_ptr, js_args, argc as u16) }
 }
 
 /// Build a `RuntimeHelpers` table with all available helper functions.

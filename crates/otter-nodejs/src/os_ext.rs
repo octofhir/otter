@@ -43,12 +43,12 @@ dive_module!(
 );
 
 /// Helper: create a plain object (prototype = null).
-fn new_obj(ncx: &mut NativeContext) -> GcRef<JsObject> {
+fn new_obj(_ncx: &mut NativeContext) -> GcRef<JsObject> {
     GcRef::new(JsObject::new(Value::null()))
 }
 
 /// Helper: create an array.
-fn new_arr(ncx: &mut NativeContext, _capacity: usize) -> GcRef<JsObject> {
+fn new_arr(_ncx: &mut NativeContext, _capacity: usize) -> GcRef<JsObject> {
     GcRef::new(JsObject::array(0))
 }
 

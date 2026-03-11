@@ -111,7 +111,7 @@ impl FromValue for String {
 
 impl FromValue for Value {
     fn from_value(value: &Value) -> Result<Self, VmError> {
-        Ok(value.clone())
+        Ok(*value)
     }
 }
 
@@ -253,7 +253,10 @@ mod tests {
     #[test]
     fn test_i32_from_value() {
         assert_eq!(i32::from_value(&Value::int32(42)).unwrap(), 42);
-        assert_eq!(i32::from_value(&Value::number(3.14)).unwrap(), 3);
+        assert_eq!(
+            i32::from_value(&Value::number(std::f64::consts::PI)).unwrap(),
+            3
+        );
         assert_eq!(i32::from_value(&Value::undefined()).unwrap(), 0);
     }
 
@@ -284,7 +287,7 @@ mod tests {
     fn test_into_value() {
         assert_eq!(42.0_f64.into_value().as_number(), Some(42.0));
         assert_eq!(42_i32.into_value().as_int32(), Some(42));
-        assert_eq!(true.into_value().to_boolean(), true);
+        assert!(true.into_value().to_boolean());
         assert!(().into_value().is_undefined());
     }
 
@@ -293,13 +296,13 @@ mod tests {
         assert_eq!(to_int32(f64::NAN), 0);
         assert_eq!(to_int32(f64::INFINITY), 0);
         assert_eq!(to_int32(0.0), 0);
-        assert_eq!(to_int32(3.14), 3);
-        assert_eq!(to_int32(-3.14), -3);
+        assert_eq!(to_int32(std::f64::consts::PI), 3);
+        assert_eq!(to_int32(-std::f64::consts::PI), -3);
     }
 
     #[test]
     fn test_to_uint32() {
         assert_eq!(to_uint32(f64::NAN), 0);
-        assert_eq!(to_uint32(3.14), 3);
+        assert_eq!(to_uint32(std::f64::consts::PI), 3);
     }
 }

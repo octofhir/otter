@@ -150,7 +150,7 @@ fn path_resolve(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmErr
         }
     }
 
-    let result = dunce::canonicalize(&path).unwrap_or_else(|_| path);
+    let result = dunce::canonicalize(&path).unwrap_or(path);
     Ok(Value::string(JsString::new_gc(&result.to_string_lossy())))
 }
 
@@ -171,7 +171,7 @@ fn path_basename(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmEr
     let ext = args
         .get(1)
         .filter(|v| !v.is_undefined())
-        .map(|v| value_to_str(v))
+        .map(value_to_str)
         .transpose()?;
 
     let name = Path::new(&p)
@@ -215,7 +215,7 @@ fn path_is_absolute(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, V
 }
 
 #[dive(name = "parse", length = 1)]
-fn path_parse(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+fn path_parse(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     let p_str = arg_str(args, 0, "parse")?;
     let p = Path::new(&p_str);
 
@@ -391,7 +391,7 @@ fn normalize_path_string(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let is_absolute = path.starts_with('/') || path.starts_with('\\');
 
-    for part in path.split(|c| c == '/' || c == '\\') {
+    for part in path.split(['/', '\\']) {
         match part {
             "" | "." => continue,
             ".." => {
@@ -405,7 +405,7 @@ fn normalize_path_string(path: &str) -> String {
         }
     }
 
-    let result = parts.join(&MAIN_SEPARATOR.to_string());
+    let result = parts.join(std::path::MAIN_SEPARATOR_STR);
     if is_absolute {
         format!("{MAIN_SEPARATOR}{result}")
     } else if result.is_empty() {

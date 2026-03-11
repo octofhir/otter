@@ -746,7 +746,6 @@ impl AllocationRegistry {
     ///
     /// This is built once per GC cycle for O(1) lookup during mark phase,
     /// replacing the O(n) linear search from the old Vec<AllocationEntry>.
-
     /// Mark phase: trace from roots and mark all reachable objects.
     ///
     /// Uses tri-color mark bits (White/Gray/Black) on GcHeader instead of a
@@ -1454,7 +1453,7 @@ mod tests {
 
         for i in 0..5 {
             unsafe {
-                let _ = gc_alloc_in(&registry, i as i32);
+                let _ = gc_alloc_in(&registry, i);
             }
             registry.collect(&[]);
         }
@@ -1795,7 +1794,7 @@ mod tests {
     #[test]
     fn test_should_minor_gc_threshold() {
         // Create a small nursery to test threshold quickly
-        let mut registry = AllocationRegistry::new();
+        let registry = AllocationRegistry::new();
         // The nursery is 2MB — we need to fill 80% to trigger should_minor_gc()
 
         assert!(

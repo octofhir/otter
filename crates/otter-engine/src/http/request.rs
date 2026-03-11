@@ -81,6 +81,7 @@ pub fn remove_request(id: u64) -> Option<HttpRequest> {
 }
 
 /// Get the number of pending requests
+#[allow(dead_code)]
 pub fn pending_count() -> usize {
     get_storage().len()
 }

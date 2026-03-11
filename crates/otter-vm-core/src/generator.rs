@@ -455,10 +455,10 @@ impl JsGenerator {
 
     /// Take pending throw value
     pub fn take_pending_throw(&self) -> Option<Value> {
-        if let Some(frame) = self.frame.borrow_mut().as_mut() {
-            if let Some(error) = frame.pending_throw.take() {
-                return Some(error);
-            }
+        if let Some(frame) = self.frame.borrow_mut().as_mut()
+            && let Some(error) = frame.pending_throw.take()
+        {
+            return Some(error);
         }
         self.abrupt_throw.borrow_mut().take()
     }
@@ -529,7 +529,7 @@ impl JsGenerator {
 
     /// Get pending return value without taking it (peek)
     pub fn get_pending_return(&self) -> Option<Value> {
-        self.abrupt_return.borrow().clone()
+        *self.abrupt_return.borrow()
     }
 
     /// Get the yield destination register (if any)

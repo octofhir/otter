@@ -54,7 +54,7 @@ impl IntrinsicObject for NumberIntrinsic {
                     };
                     if let Some(obj) = this.as_object() {
                         let _ = obj.set(PropertyKey::string("__value__"), Value::number(n));
-                        Ok(this.clone())
+                        Ok(*this)
                     } else {
                         Ok(Value::number(n))
                     }
@@ -104,10 +104,10 @@ fn number_value_of(
     if let Some(i) = this_val.as_int32() {
         return Ok(Value::number(i as f64));
     }
-    if let Some(obj) = this_val.as_object() {
-        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
-            return Ok(val);
-        }
+    if let Some(obj) = this_val.as_object()
+        && let Some(val) = obj.get(&PropertyKey::string("__value__"))
+    {
+        return Ok(val);
     }
     Err(VmError::type_error(
         "Number.prototype.valueOf requires a number",
@@ -139,7 +139,7 @@ fn number_to_string(
     } else if n.fract() == 0.0 && n.is_finite() {
         let i = n as i64;
         let is_negative = i < 0;
-        let mut num = i.abs() as u64;
+        let mut num = i.unsigned_abs();
         let mut digits = Vec::new();
         let radix_u = radix as u64;
 

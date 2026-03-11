@@ -203,17 +203,17 @@ fn gc_mark_benchmark(c: &mut Criterion) {
             let mut total_duration = std::time::Duration::ZERO;
 
             for _ in 0..iters {
-                let (ctx, mm) = create_test_context();
+                let (ctx, _mm) = create_test_context();
 
                 // Create a tree with fanout 10 and depth 3 (1 + 10 + 100 + 1000 = 1111 objects)
-                fn create_tree(mm: &Arc<MemoryManager>, depth: i32) -> GcRef<JsObject> {
+                fn create_tree(depth: i32) -> GcRef<JsObject> {
                     let node = GcRef::new(JsObject::new(Value::null()));
                     node.set(PropertyKey::string("depth"), Value::int32(depth))
                         .ok();
 
                     if depth > 0 {
                         for i in 0..10 {
-                            let child = create_tree(mm, depth - 1);
+                            let child = create_tree(depth - 1);
                             let key = PropertyKey::string(&format!("child{}", i));
                             node.set(key, Value::object(child)).ok();
                         }
@@ -222,7 +222,7 @@ fn gc_mark_benchmark(c: &mut Criterion) {
                     node
                 }
 
-                let root = create_tree(&mm, 3);
+                let root = create_tree(3);
                 black_box(&root);
 
                 let start = std::time::Instant::now();

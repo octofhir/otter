@@ -12,7 +12,7 @@
 //! - **Identity elimination**: Remove Move r0, r0; double negation; etc.
 
 use otter_vm_bytecode::instruction::Instruction;
-use otter_vm_bytecode::operand::{JumpOffset, LocalIndex, Register};
+use otter_vm_bytecode::operand::{JumpOffset, Register};
 use std::collections::HashMap;
 
 /// Peephole optimizer that optimizes bytecode instructions
@@ -959,10 +959,8 @@ impl PeepholeOptimizer {
 
         // Superinstruction: Inc + SetLocal → IncLocal
         // Fuses increment with local variable store (common in loop counters: i++).
-        if let (
-            Instruction::Inc { dst, src },
-            Instruction::SetLocal { idx, src: set_src },
-        ) = (first, second)
+        if let (Instruction::Inc { dst, src }, Instruction::SetLocal { idx, src: set_src }) =
+            (first, second)
             && dst == set_src
         {
             return Some(WindowResult::Replace1(Instruction::IncLocal {

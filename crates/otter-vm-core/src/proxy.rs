@@ -84,7 +84,7 @@ impl JsProxy {
         if self.is_revoked() {
             None
         } else {
-            Some(self.target.clone())
+            Some(self.target)
         }
     }
 
@@ -100,7 +100,7 @@ impl JsProxy {
         if self.is_revoked() {
             None
         } else {
-            Some(self.handler.clone())
+            Some(self.handler)
         }
     }
 
@@ -147,7 +147,7 @@ impl JsProxy {
     /// Used for iterative destruction to prevent stack overflow.
     pub fn clear_and_extract_values(&self) -> Vec<Value> {
         self.revoke();
-        vec![self.target.clone(), self.handler.clone()]
+        vec![self.target, self.handler]
     }
 }
 

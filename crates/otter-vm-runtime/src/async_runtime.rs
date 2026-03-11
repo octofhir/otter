@@ -40,6 +40,7 @@ impl AsyncRuntime for TokioRuntime {
 }
 
 #[cfg(test)]
+/// Mock async runtime for testing.
 pub mod mock {
     use super::*;
     use std::sync::Mutex;
@@ -47,6 +48,12 @@ pub mod mock {
     /// Mock [`AsyncRuntime`] with controllable time for deterministic tests.
     pub struct MockRuntime {
         now: Mutex<Instant>,
+    }
+
+    impl Default for MockRuntime {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockRuntime {

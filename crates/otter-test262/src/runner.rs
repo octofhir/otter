@@ -209,6 +209,7 @@ pub enum TestOutcome {
 
 impl Test262Runner {
     /// Create a new test runner
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         test_dir: impl AsRef<Path>,
         dump_on_timeout: bool,
@@ -247,12 +248,11 @@ impl Test262Runner {
         if let Ok(entries) = fs::read_dir(&harness_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map(|e| e == "js").unwrap_or(false) {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            harness_cache.insert(name.to_string(), content);
-                        }
-                    }
+                if path.extension().map(|e| e == "js").unwrap_or(false)
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && let Ok(content) = fs::read_to_string(&path)
+                {
+                    harness_cache.insert(name.to_string(), content);
                 }
             }
         }
@@ -592,7 +592,7 @@ impl Test262Runner {
     ) -> (TestOutcome, Option<String>) {
         let is_async = metadata.is_async();
 
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
         let outcome = match self
             .run_with_timeout(source, timeout, test_name, source_url)
             .await
@@ -666,7 +666,7 @@ impl Test262Runner {
                     } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
                         // Dump snapshot on timeout if enabled
                         if self.dump_on_timeout {
-                            self.dump_timeout_info(&test_name, &msg);
+                            self.dump_timeout_info(test_name, &msg);
                         }
                         (TestOutcome::Timeout, None)
                     } else {
@@ -678,7 +678,7 @@ impl Test262Runner {
         };
 
         // Save trace if configured for failures/timeouts
-        self.save_conditional_trace(&test_name, outcome.0);
+        self.save_conditional_trace(test_name, outcome.0);
 
         outcome
     }

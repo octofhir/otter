@@ -83,7 +83,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     // ====================================================================
     // Temporal.Now (namespace object, not a constructor)
     // ====================================================================
-    let temporal_now = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+    let temporal_now = GcRef::new(JsObject::new(Value::object(obj_proto)));
     temporal_now.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::to_string_tag_symbol()),
         PropertyDescriptor::data_with_attrs(
@@ -98,7 +98,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     temporal_obj.define_property(
         PropertyKey::string("Now"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(temporal_now.clone()),
+            Value::object(temporal_now),
             PropertyAttributes::builtin_method(),
         ),
     );
@@ -106,17 +106,17 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     // ====================================================================
     // Temporal.PlainMonthDay
     // ====================================================================
-    let pmd_proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+    let pmd_proto = GcRef::new(JsObject::new(Value::object(obj_proto)));
 
-    install_plain_month_day_prototype(pmd_proto.clone(), fn_proto.clone(), mm);
+    install_plain_month_day_prototype(pmd_proto, fn_proto, mm);
 
-    let pmd_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let pmd_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
 
     // Wire constructor.prototype
     pmd_ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(pmd_proto.clone()),
+            Value::object(pmd_proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -125,21 +125,18 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
         ),
     );
 
-    let pmd_ctor_fn = create_plain_month_day_constructor(pmd_proto.clone());
+    let pmd_ctor_fn = create_plain_month_day_constructor(pmd_proto);
     let pmd_ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(pmd_ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        pmd_ctor_obj.clone(),
+        fn_proto,
+        pmd_ctor_obj,
     );
 
     // Wire prototype.constructor
     pmd_proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            pmd_ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(pmd_ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // Set name and length
@@ -153,11 +150,11 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     );
 
     // PlainMonthDay.from() static method
-    let pmd_ctor_for_from = pmd_ctor_value.clone();
+    let pmd_ctor_for_from = pmd_ctor_value;
     let from_fn = Value::native_function_with_proto_named(
-        move |this, args, ncx| plain_month_day_from(pmd_ctor_for_from.clone(), this, args, ncx),
+        move |this, args, ncx| plain_month_day_from(pmd_ctor_for_from, this, args, ncx),
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "from",
         1,
     );
@@ -181,15 +178,15 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     // Temporal.PlainDate
     // ====================================================================
     {
-        let pd_proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
+        let pd_proto = GcRef::new(JsObject::new(Value::object(obj_proto)));
 
-        install_plain_date_prototype(pd_proto.clone(), fn_proto.clone(), mm);
+        install_plain_date_prototype(pd_proto, fn_proto, mm);
 
-        let pd_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+        let pd_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
         pd_ctor_obj.define_property(
             PropertyKey::string("prototype"),
             PropertyDescriptor::data_with_attrs(
-                Value::object(pd_proto.clone()),
+                Value::object(pd_proto),
                 PropertyAttributes {
                     writable: false,
                     enumerable: false,
@@ -205,7 +202,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
             PropertyKey::string("length"),
             PropertyDescriptor::function_length(Value::number(3.0)),
         );
-        let pd_proto_for_ctor = pd_proto.clone();
+        let pd_proto_for_ctor = pd_proto;
         let pd_ctor_fn: Box<
             dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError>
                 + Send
@@ -215,7 +212,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
             let is_new_target = if let Some(obj) = this.as_object() {
                 obj.prototype()
                     .as_object()
-                    .map_or(false, |p| p.as_ptr() == pd_proto_for_ctor.as_ptr())
+                    .is_some_and(|p| p.as_ptr() == pd_proto_for_ctor.as_ptr())
             } else {
                 false
             };
@@ -262,13 +259,13 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
         let pd_ctor_value = Value::native_function_with_proto_and_object(
             Arc::from(pd_ctor_fn),
             mm.clone(),
-            fn_proto.clone(),
-            pd_ctor_obj.clone(),
+            fn_proto,
+            pd_ctor_obj,
         );
         pd_proto.define_property(
             PropertyKey::string("constructor"),
             PropertyDescriptor::data_with_attrs(
-                pd_ctor_value.clone(),
+                pd_ctor_value,
                 PropertyAttributes::constructor_link(),
             ),
         );
@@ -325,7 +322,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32)
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "from",
             1,
         );
@@ -348,7 +345,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 }
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "compare",
             2,
         );
@@ -370,14 +367,14 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     // Temporal.PlainDateTime
     // ====================================================================
     {
-        let pdt_proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-        install_plain_date_time_prototype(pdt_proto.clone(), fn_proto.clone(), mm);
+        let pdt_proto = GcRef::new(JsObject::new(Value::object(obj_proto)));
+        install_plain_date_time_prototype(pdt_proto, fn_proto, mm);
 
-        let pdt_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+        let pdt_ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
         pdt_ctor_obj.define_property(
             PropertyKey::string("prototype"),
             PropertyDescriptor::data_with_attrs(
-                Value::object(pdt_proto.clone()),
+                Value::object(pdt_proto),
                 PropertyAttributes {
                     writable: false,
                     enumerable: false,
@@ -394,7 +391,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
             PropertyDescriptor::function_length(Value::number(3.0)),
         );
 
-        let pdt_proto_for_ctor = pdt_proto.clone();
+        let pdt_proto_for_ctor = pdt_proto;
         let pdt_ctor_fn: Box<
             dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError>
                 + Send
@@ -404,7 +401,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
             let is_new_target = if let Some(obj) = this.as_object() {
                 obj.prototype()
                     .as_object()
-                    .map_or(false, |p| p.as_ptr() == pdt_proto_for_ctor.as_ptr())
+                    .is_some_and(|p| p.as_ptr() == pdt_proto_for_ctor.as_ptr())
             } else {
                 false
             };
@@ -477,20 +474,20 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
         let pdt_ctor_value = Value::native_function_with_proto_and_object(
             Arc::from(pdt_ctor_fn),
             mm.clone(),
-            fn_proto.clone(),
-            pdt_ctor_obj.clone(),
+            fn_proto,
+            pdt_ctor_obj,
         );
 
         pdt_proto.define_property(
             PropertyKey::string("constructor"),
             PropertyDescriptor::data_with_attrs(
-                pdt_ctor_value.clone(),
+                pdt_ctor_value,
                 PropertyAttributes::constructor_link(),
             ),
         );
 
         // PlainDateTime.from()
-        let pdt_ctor_for_from = pdt_ctor_value.clone();
+        let pdt_ctor_for_from = pdt_ctor_value;
         let pdt_from_fn = Value::native_function_with_proto_named(
             move |_this, args, ncx| {
                 let item = args.first().cloned().unwrap_or(Value::undefined());
@@ -562,25 +559,20 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                     }
 
                     // Helper for observable property get (supports both object and proxy)
-                    let get_field =
-                        |ncx: &mut NativeContext<'_>, name: &str| -> Result<Value, VmError> {
-                            if let Some(proxy) = item.as_proxy() {
-                                let key = PropertyKey::string(name);
-                                let key_value =
-                                    crate::proxy_operations::property_key_to_value_pub(&key);
-                                crate::proxy_operations::proxy_get(
-                                    ncx,
-                                    proxy,
-                                    &key,
-                                    key_value,
-                                    item.clone(),
-                                )
-                            } else if let Some(obj) = item.as_object() {
-                                ncx.get_property(&obj, &PropertyKey::string(name))
-                            } else {
-                                Ok(Value::undefined())
-                            }
-                        };
+                    let get_field = |ncx: &mut NativeContext<'_>,
+                                     name: &str|
+                     -> Result<Value, VmError> {
+                        if let Some(proxy) = item.as_proxy() {
+                            let key = PropertyKey::string(name);
+                            let key_value =
+                                crate::proxy_operations::property_key_to_value_pub(&key);
+                            crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, item)
+                        } else if let Some(obj) = item.as_object() {
+                            ncx.get_property(&obj, &PropertyKey::string(name))
+                        } else {
+                            Ok(Value::undefined())
+                        }
+                    };
 
                     // Validate calendar property if present
                     let calendar_val = get_field(ncx, "calendar")?;
@@ -677,7 +669,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                                 crate::interpreter::PreferredType::String,
                             )?
                         } else {
-                            month_code_val.clone()
+                            month_code_val
                         };
                         // RequireString: result must be a String
                         if !primitive.is_string() {
@@ -744,10 +736,10 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                     // (syntax already validated at read time; suitability validated here)
                     let m = if let Some(ref mc) = mc_str {
                         let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-                        if let Some(m_int) = month_num {
-                            if m_int != mc_month {
-                                return Err(VmError::range_error("month and monthCode must agree"));
-                            }
+                        if let Some(m_int) = month_num
+                            && m_int != mc_month
+                        {
+                            return Err(VmError::range_error("month and monthCode must agree"));
                         }
                         mc_month
                     } else {
@@ -756,10 +748,10 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
 
                     // Use temporal_rs for validation with overflow
                     let ov = overflow;
-                    if m < 0 || m > 255 {
+                    if !(0..=255).contains(&m) {
                         return Err(VmError::range_error(format!("month out of range: {}", m)));
                     }
-                    if d < 0 || d > 255 {
+                    if !(0..=255).contains(&d) {
                         return Err(VmError::range_error(format!("day out of range: {}", d)));
                     }
                     let pdt = temporal_rs::PlainDateTime::new_with_overflow(
@@ -797,7 +789,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 Err(VmError::type_error("PlainDateTime.from: invalid argument"))
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "from",
             1,
         );
@@ -820,7 +812,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 }
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "compare",
             2,
         );
@@ -876,7 +868,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 )
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "plainDateTimeISO",
             0,
         );
@@ -914,7 +906,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 )
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "plainDateISO",
             0,
         );
@@ -955,7 +947,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 )
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "plainTimeISO",
             0,
         );
@@ -993,7 +985,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 )
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "instant",
             0,
         );
@@ -1024,7 +1016,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 Ok(Value::string(JsString::intern(&tz_id)))
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "timeZoneId",
             0,
         );
@@ -1080,7 +1072,7 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
                 )
             },
             mm.clone(),
-            fn_proto.clone(),
+            fn_proto,
             "zonedDateTimeISO",
             0,
         );
@@ -1091,11 +1083,11 @@ pub fn install_temporal_namespace(global: GcRef<JsObject>, mm: &Arc<MemoryManage
     }
 
     // Install remaining Temporal types from their individual modules
-    instant::install_instant(&temporal_obj, &obj_proto, &fn_proto, &mm);
-    plain_time::install_plain_time(&temporal_obj, &obj_proto, &fn_proto, &mm);
-    plain_year_month::install_plain_year_month(&temporal_obj, &obj_proto, &fn_proto, &mm);
-    zoned_date_time::install_zoned_date_time(&temporal_obj, &obj_proto, &fn_proto, &mm);
-    duration::install_duration(&temporal_obj, &obj_proto, &fn_proto, &mm);
+    instant::install_instant(&temporal_obj, &obj_proto, &fn_proto, mm);
+    plain_time::install_plain_time(&temporal_obj, &obj_proto, &fn_proto, mm);
+    plain_year_month::install_plain_year_month(&temporal_obj, &obj_proto, &fn_proto, mm);
+    zoned_date_time::install_zoned_date_time(&temporal_obj, &obj_proto, &fn_proto, mm);
+    duration::install_duration(&temporal_obj, &obj_proto, &fn_proto, mm);
 
     // Install Temporal on global as non-enumerable
     global.define_property(

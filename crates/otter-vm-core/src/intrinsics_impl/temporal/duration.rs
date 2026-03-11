@@ -20,13 +20,13 @@ pub(super) fn install_duration(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let proto = GcRef::new(JsObject::new(Value::object(*obj_proto)));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(*fn_proto)));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(proto.clone()),
+            Value::object(proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -46,8 +46,8 @@ pub(super) fn install_duration(
     // ========================================================================
     // Constructor: new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)
     // ========================================================================
-    let ctor_proto = proto.clone();
-    let ctor_proto_check = proto.clone();
+    let ctor_proto = proto;
+    let ctor_proto_check = proto;
     let ctor_mm = mm.clone();
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
@@ -56,7 +56,7 @@ pub(super) fn install_duration(
         let is_new_target = if let Some(obj) = this.as_object() {
             obj.prototype()
                 .as_object()
-                .map_or(false, |p| p.as_ptr() == ctor_proto_check.as_ptr())
+                .is_some_and(|p| p.as_ptr() == ctor_proto_check.as_ptr())
         } else {
             false
         };
@@ -67,12 +67,12 @@ pub(super) fn install_duration(
         }
         // Parse each argument with ToIntegerIfIntegral (defaulting to 0)
         let mut vals = [0f64; 10];
-        for (i, field) in DURATION_FIELDS.iter().enumerate() {
-            if let Some(val) = args.get(i) {
-                if !val.is_undefined() {
-                    let n = to_integer_if_integral(ncx, val)?;
-                    vals[i] = n;
-                }
+        for (i, _field) in DURATION_FIELDS.iter().enumerate() {
+            if let Some(val) = args.get(i)
+                && !val.is_undefined()
+            {
+                let n = to_integer_if_integral(ncx, val)?;
+                vals[i] = n;
             }
         }
 
@@ -98,23 +98,20 @@ pub(super) fn install_duration(
     let ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        *fn_proto,
+        ctor_obj,
     );
 
     // prototype.constructor
     proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // ========================================================================
     // Duration.from()
     // ========================================================================
-    let from_proto = proto.clone();
+    let from_proto = proto;
     let from_mm = mm.clone();
     let from_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
@@ -186,7 +183,7 @@ pub(super) fn install_duration(
             Err(VmError::type_error("invalid argument for Duration.from"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "from",
         1,
     );
@@ -222,7 +219,7 @@ pub(super) fn install_duration(
             }
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "compare",
         2,
     );
@@ -262,7 +259,7 @@ pub(super) fn install_duration(
                 Ok(Value::number(val))
             },
             mm.clone(),
-            fn_proto.clone(),
+            *fn_proto,
         );
         proto.define_property(
             PropertyKey::string(field),
@@ -288,7 +285,7 @@ pub(super) fn install_duration(
             Ok(Value::int32(dur.sign() as i32))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
     );
     proto.define_property(
         PropertyKey::string("sign"),
@@ -313,7 +310,7 @@ pub(super) fn install_duration(
             Ok(Value::boolean(dur.is_zero()))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
     );
     proto.define_property(
         PropertyKey::string("blank"),
@@ -333,7 +330,7 @@ pub(super) fn install_duration(
     // ========================================================================
 
     // .negated()
-    let neg_proto = proto.clone();
+    let neg_proto = proto;
     let neg_mm = mm.clone();
     let negated_fn = Value::native_function_with_proto_named(
         move |this, _args, _ncx| {
@@ -347,7 +344,7 @@ pub(super) fn install_duration(
             )))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "negated",
         0,
     );
@@ -357,7 +354,7 @@ pub(super) fn install_duration(
     );
 
     // .abs()
-    let abs_proto = proto.clone();
+    let abs_proto = proto;
     let abs_mm = mm.clone();
     let abs_fn = Value::native_function_with_proto_named(
         move |this, _args, _ncx| {
@@ -371,7 +368,7 @@ pub(super) fn install_duration(
             )))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "abs",
         0,
     );
@@ -468,7 +465,7 @@ pub(super) fn install_duration(
             construct_duration_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "with",
         1,
     );
@@ -490,7 +487,7 @@ pub(super) fn install_duration(
             construct_duration_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "add",
         1,
     );
@@ -512,7 +509,7 @@ pub(super) fn install_duration(
             construct_duration_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "subtract",
         1,
     );
@@ -534,7 +531,7 @@ pub(super) fn install_duration(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toString",
         0,
     );
@@ -556,7 +553,7 @@ pub(super) fn install_duration(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toJSON",
         0,
     );
@@ -578,7 +575,7 @@ pub(super) fn install_duration(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toLocaleString",
         0,
     );
@@ -595,7 +592,7 @@ pub(super) fn install_duration(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "valueOf",
         0,
     );
@@ -652,7 +649,7 @@ pub(super) fn install_duration(
             Ok(Value::number(result.as_inner()))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "total",
         1,
     );
@@ -669,7 +666,7 @@ pub(super) fn install_duration(
                 .ok_or_else(|| VmError::type_error("round called on non-Duration"))?;
             let dur = extract_duration(&obj)?;
 
-            let arg = args.first().cloned().unwrap_or(Value::undefined());
+            let _arg = args.first().cloned().unwrap_or(Value::undefined());
             let (options, relative_to) =
                 parse_duration_rounding_options_with_relative(ncx, args.first())?;
             let result = dur
@@ -678,7 +675,7 @@ pub(super) fn install_duration(
             construct_duration_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "round",
         1,
     );
@@ -717,7 +714,7 @@ fn parse_duration_to_string_options(
     arg: Option<&Value>,
 ) -> Result<ToStringRoundingOptions, VmError> {
     let arg = match arg {
-        Some(v) if !v.is_undefined() => v.clone(),
+        Some(v) if !v.is_undefined() => *v,
         _ => return Ok(ToStringRoundingOptions::default()),
     };
 
@@ -746,7 +743,7 @@ fn parse_duration_to_string_options(
                 ));
             }
             let floored = n.floor();
-            if floored < 0.0 || floored > 9.0 {
+            if !(0.0..=9.0).contains(&floored) {
                 return Err(VmError::range_error(
                     "fractionalSecondDigits must be 'auto' or 0-9",
                 ));
@@ -799,7 +796,7 @@ fn parse_duration_rounding_options_with_relative(
     VmError,
 > {
     let arg = match arg {
-        Some(v) if !v.is_undefined() => v.clone(),
+        Some(v) if !v.is_undefined() => *v,
         _ => return Err(VmError::type_error("round requires options")),
     };
 

@@ -123,10 +123,18 @@ impl AllocationCategoryStats {
                 self.object_count.fetch_add(1, Ordering::Relaxed);
                 self.object_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
-            1 => { self.string_count.fetch_add(1, Ordering::Relaxed); }
-            2 => { self.array_count.fetch_add(1, Ordering::Relaxed); }
-            4 | 5 => { self.closure_count.fetch_add(1, Ordering::Relaxed); }
-            _ => { self.other_count.fetch_add(1, Ordering::Relaxed); }
+            1 => {
+                self.string_count.fetch_add(1, Ordering::Relaxed);
+            }
+            2 => {
+                self.array_count.fetch_add(1, Ordering::Relaxed);
+            }
+            4 | 5 => {
+                self.closure_count.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.other_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -364,10 +372,10 @@ impl MemoryManager {
     pub fn clear_thread_default_if(mm: &Arc<MemoryManager>) {
         THREAD_MEMORY_MANAGER.with(|cell| {
             let mut guard = cell.borrow_mut();
-            if let Some(current) = guard.as_ref() {
-                if Arc::ptr_eq(current, mm) {
-                    *guard = None;
-                }
+            if let Some(current) = guard.as_ref()
+                && Arc::ptr_eq(current, mm)
+            {
+                *guard = None;
             }
         });
     }

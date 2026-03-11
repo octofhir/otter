@@ -117,7 +117,7 @@ fn get_buffer_bytes(val: &Value) -> Option<Vec<u8>> {
 
 /// Create a Buffer (Uint8Array) value from raw bytes, using ncx to get prototypes.
 fn create_buffer_from_bytes(bytes: &[u8], ncx: &NativeContext) -> Value {
-    let mm = ncx.memory_manager().clone();
+    let _mm = ncx.memory_manager().clone();
 
     // Get Buffer.prototype from globalThis.Buffer.prototype
     // This gives us our custom methods (toString, write, etc.) AND
@@ -423,8 +423,8 @@ impl Buffer {
             .min(max_write)
             .min(buf_len.saturating_sub(offset));
 
-        for i in 0..write_len {
-            ta.set(offset + i, src_bytes[i] as f64);
+        for (i, &byte) in src_bytes[..write_len].iter().enumerate() {
+            ta.set(offset + i, byte as f64);
         }
 
         Ok(Value::number(write_len as f64))
@@ -487,10 +487,8 @@ impl Buffer {
                 let start = offset.unwrap_or(0.0) as usize;
                 let end_idx = end.map(|n| n as usize).unwrap_or(len);
                 let end_idx = end_idx.min(len);
-                let mut j = 0;
-                for i in start..end_idx {
+                for (j, i) in (start..end_idx).enumerate() {
                     ta.set(i, fill_bytes[j % fill_bytes.len()] as f64);
-                    j += 1;
                 }
             }
         }
@@ -707,7 +705,7 @@ impl Buffer {
         let bytes = get_buffer_bytes(this)
             .ok_or_else(|| VmError::type_error("Buffer.prototype.toJSON: not a Buffer"))?;
 
-        let mm = ncx.memory_manager().clone();
+        let _mm = ncx.memory_manager().clone();
         let result = GcRef::new(JsObject::new(Value::null()));
         let _ = result.set(
             PropertyKey::string("type"),

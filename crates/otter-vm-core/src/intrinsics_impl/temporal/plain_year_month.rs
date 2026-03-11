@@ -17,13 +17,13 @@ pub(super) fn install_plain_year_month(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let proto = GcRef::new(JsObject::new(Value::object(*obj_proto)));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(*fn_proto)));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(proto.clone()),
+            Value::object(proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -41,7 +41,7 @@ pub(super) fn install_plain_year_month(
     );
 
     // Constructor: new Temporal.PlainYearMonth(year, month [, calendar [, referenceISODay]])
-    let ctor_proto = proto.clone();
+    let ctor_proto = proto;
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
     > = Box::new(move |this, args, ncx| {
@@ -52,7 +52,7 @@ pub(super) fn install_plain_year_month(
         let is_new = obj
             .prototype()
             .as_object()
-            .map_or(false, |p| p.as_ptr() == ctor_proto.as_ptr());
+            .is_some_and(|p| p.as_ptr() == ctor_proto.as_ptr());
         if !is_new {
             return Err(VmError::type_error(
                 "Temporal.PlainYearMonth constructor requires 'new'",
@@ -92,8 +92,8 @@ pub(super) fn install_plain_year_month(
     let ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        *fn_proto,
+        ctor_obj,
     );
 
     // Prototype getters: year, month
@@ -109,7 +109,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::int32(pym.year()))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -131,7 +131,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::int32(pym.month() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -155,7 +155,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::string(JsString::intern(pym.month_code().as_str())))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -179,7 +179,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::string(JsString::intern(pym.calendar_id())))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -203,7 +203,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::int32(pym.days_in_year() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -225,7 +225,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::int32(pym.days_in_month() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -247,7 +247,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::int32(pym.months_in_year() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -269,7 +269,7 @@ pub(super) fn install_plain_year_month(
                     Ok(Value::boolean(pym.in_leap_year()))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                *fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -295,7 +295,7 @@ pub(super) fn install_plain_year_month(
                         Ok(Value::undefined())
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    *fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -349,7 +349,7 @@ pub(super) fn install_plain_year_month(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toString",
         0,
     );
@@ -372,7 +372,7 @@ pub(super) fn install_plain_year_month(
             Err(VmError::type_error("toJSON"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toJSON",
         0,
     );
@@ -394,7 +394,7 @@ pub(super) fn install_plain_year_month(
             Err(VmError::type_error("toLocaleString"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toLocaleString",
         0,
     );
@@ -411,7 +411,7 @@ pub(super) fn install_plain_year_month(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "valueOf",
         0,
     );
@@ -434,7 +434,7 @@ pub(super) fn install_plain_year_month(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "equals",
         1,
     );
@@ -451,7 +451,7 @@ pub(super) fn install_plain_year_month(
                 .ok_or_else(|| VmError::type_error("with"))?;
             let this_pym = extract_plain_year_month(&obj)?;
             let fields_val = args.first().cloned().unwrap_or(Value::undefined());
-            if !fields_val.as_object().is_some() && !fields_val.as_proxy().is_some() {
+            if fields_val.as_object().is_none() && fields_val.as_proxy().is_none() {
                 return Err(VmError::type_error("with requires an object argument"));
             }
 
@@ -551,10 +551,10 @@ pub(super) fn install_plain_year_month(
             // NOW validate monthCode suitability (after overflow is read)
             let month = if let Some(ref mc_str) = month_code_coerced {
                 let mc_month = validate_month_code_iso_suitability(mc_str)? as i32;
-                if let Some(m) = month_num_int {
-                    if m != mc_month {
-                        return Err(VmError::range_error("Mismatch between month and monthCode"));
-                    }
+                if let Some(m) = month_num_int
+                    && m != mc_month
+                {
+                    return Err(VmError::range_error("Mismatch between month and monthCode"));
                 }
                 mc_month
             } else if let Some(m_int) = month_num_int {
@@ -574,7 +574,7 @@ pub(super) fn install_plain_year_month(
             construct_plain_year_month_value(ncx, &pym)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "with",
         1,
     );
@@ -594,7 +594,7 @@ pub(super) fn install_plain_year_month(
             if fields_val.is_undefined() {
                 return Err(VmError::type_error("toPlainDate requires an argument"));
             }
-            if !fields_val.as_object().is_some() && !fields_val.as_proxy().is_some() {
+            if fields_val.as_object().is_none() && fields_val.as_proxy().is_none() {
                 return Err(VmError::type_error(
                     "toPlainDate argument must be an object",
                 ));
@@ -620,7 +620,7 @@ pub(super) fn install_plain_year_month(
             construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainDate",
         1,
     );
@@ -646,7 +646,7 @@ pub(super) fn install_plain_year_month(
             construct_plain_year_month_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "add",
         1,
     );
@@ -674,7 +674,7 @@ pub(super) fn install_plain_year_month(
             construct_plain_year_month_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "subtract",
         1,
     );
@@ -698,7 +698,7 @@ pub(super) fn install_plain_year_month(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "until",
         1,
     );
@@ -722,7 +722,7 @@ pub(super) fn install_plain_year_month(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "since",
         1,
     );
@@ -743,7 +743,7 @@ pub(super) fn install_plain_year_month(
             Err(VmError::type_error("getISOFields is not supported"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "getISOFields",
         0,
     );
@@ -768,10 +768,7 @@ pub(super) fn install_plain_year_month(
     // prototype.constructor
     proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // PlainYearMonth.from(item [, options])
@@ -909,12 +906,10 @@ pub(super) fn install_plain_year_month(
                 let month = if let Some(ref mc_str) = month_code_str {
                     let mc_month = validate_month_code_iso_suitability(mc_str)? as i32;
                     // If both month and monthCode provided, they must agree
-                    if let Some(m_num) = month_num {
-                        if m_num as i32 != mc_month {
-                            return Err(VmError::range_error(
-                                "Mismatch between month and monthCode",
-                            ));
-                        }
+                    if let Some(m_num) = month_num
+                        && m_num as i32 != mc_month
+                    {
+                        return Err(VmError::range_error("Mismatch between month and monthCode"));
                     }
                     mc_month
                 } else if let Some(m_num) = month_num {
@@ -923,7 +918,7 @@ pub(super) fn install_plain_year_month(
                     }
                     // Validate month range (negative and out-of-range)
                     let m_int = m_num as i32;
-                    if m_int < 1 || m_int > 12 {
+                    if !(1..=12).contains(&m_int) {
                         if overflow == temporal_rs::options::Overflow::Reject {
                             return Err(VmError::range_error(format!(
                                 "month {} is out of range (1-12)",
@@ -961,7 +956,7 @@ pub(super) fn install_plain_year_month(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "from",
         1,
     );
@@ -984,7 +979,7 @@ pub(super) fn install_plain_year_month(
             }
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "compare",
         2,
     );
@@ -1016,10 +1011,10 @@ fn to_temporal_year_month(
         ));
     }
     // Check for native PlainYearMonth object (not proxy)
-    if let Some(obj) = item.as_object() {
-        if let Ok(pym) = extract_plain_year_month(&obj) {
-            return Ok(pym);
-        }
+    if let Some(obj) = item.as_object()
+        && let Ok(pym) = extract_plain_year_month(&obj)
+    {
+        return Ok(pym);
     }
     // Property bag (object or proxy) — read and coerce fields in spec order
     // calendar — lenient validation (accepts ISO strings)
@@ -1066,10 +1061,10 @@ fn to_temporal_year_month(
     let month = if let Some(ref mc_str) = month_code_str {
         validate_month_code_syntax(mc_str)?;
         let mc_month = validate_month_code_iso_suitability(mc_str)? as i32;
-        if let Some(m) = month_num {
-            if m as i32 != mc_month {
-                return Err(VmError::range_error("Mismatch between month and monthCode"));
-            }
+        if let Some(m) = month_num
+            && m as i32 != mc_month
+        {
+            return Err(VmError::range_error("Mismatch between month and monthCode"));
         }
         mc_month
     } else if let Some(m) = month_num {

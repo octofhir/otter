@@ -37,7 +37,7 @@ const DEFAULT_MAX_LISTENERS: i32 = 10;
 // ---------------------------------------------------------------------------
 
 /// Get (or create) the `__ee_listeners` map object on an emitter instance.
-fn get_listeners_map(this: &Value, ncx: &NativeContext) -> Result<GcRef<JsObject>, VmError> {
+fn get_listeners_map(this: &Value, _ncx: &NativeContext) -> Result<GcRef<JsObject>, VmError> {
     let obj = this
         .as_object()
         .ok_or_else(|| VmError::type_error("EventEmitter method called on non-object"))?;
@@ -59,7 +59,7 @@ fn get_listeners_map(this: &Value, ncx: &NativeContext) -> Result<GcRef<JsObject
 fn get_or_create_listener_array(
     map: &GcRef<JsObject>,
     event: &PropertyKey,
-    ncx: &NativeContext,
+    _ncx: &NativeContext,
 ) -> GcRef<JsObject> {
     if let Some(arr_val) = map.get(event) {
         if let Some(arr) = arr_val.as_object() {
@@ -72,7 +72,7 @@ fn get_or_create_listener_array(
 }
 
 /// Create a listener entry object: `{ fn: callback, once: bool }`
-fn make_listener_entry(callback: Value, once: bool, ncx: &NativeContext) -> GcRef<JsObject> {
+fn make_listener_entry(callback: Value, once: bool, _ncx: &NativeContext) -> GcRef<JsObject> {
     let entry = GcRef::new(JsObject::new(Value::null()));
     let _ = entry.set(PropertyKey::string("fn"), callback);
     let _ = entry.set(PropertyKey::string("once"), Value::boolean(once));
@@ -659,7 +659,7 @@ fn events_once(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result
     // Create resolve callback: resolves promise with array of args
     let resolve_promise = promise_ref;
     let resolve_fn = Value::native_function(
-        move |_this, call_args, ncx| {
+        move |_this, call_args, _ncx| {
             let result = GcRef::new(JsObject::array(0));
             for arg in call_args {
                 result.array_push(arg.clone());
@@ -815,7 +815,7 @@ fn build_event_emitter_class(ctx: &RegistrationContext) -> Value {
     let static_methods: &[DeclFn] = &[EventEmitter::static_listener_count_decl];
 
     let mut builder = ctx.builtin_fresh("EventEmitter").constructor_fn(
-        |this, _args, ncx| {
+        |this, _args, _ncx| {
             // The interpreter already created `this` with EventEmitter.prototype.
             // We just initialize the internal state on it.
             if let Some(obj) = this.as_object() {

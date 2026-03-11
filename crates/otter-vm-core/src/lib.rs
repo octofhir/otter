@@ -9,7 +9,9 @@
 //! - **Register-based**: Matches the bytecode instruction format
 
 #![warn(clippy::all)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
 // Allow unsafe for NaN-boxing and GC operations
 // All unsafe code must have SAFETY comments
 
@@ -36,6 +38,7 @@ pub mod isolate;
 mod jit_helpers;
 mod jit_resume;
 mod jit_runtime;
+#[allow(dead_code)]
 mod jit_stubs;
 pub mod map_data;
 pub mod memory;

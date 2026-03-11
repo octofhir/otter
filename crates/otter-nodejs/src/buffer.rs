@@ -87,7 +87,7 @@ pub fn buffer_byte_length(args: &[JsonValue]) -> Result<JsonValue, String> {
 
 /// Decode hex string to bytes
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("Invalid hex string length".to_string());
     }
 

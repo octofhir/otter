@@ -16,13 +16,13 @@ pub(super) fn install_plain_time(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let proto = GcRef::new(JsObject::new(Value::object(*obj_proto)));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(*fn_proto)));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(proto.clone()),
+            Value::object(proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -40,7 +40,7 @@ pub(super) fn install_plain_time(
     );
 
     // Constructor: new Temporal.PlainTime(hour?, minute?, second?, ms?, us?, ns?)
-    let pt_proto_check = proto.clone();
+    let pt_proto_check = proto;
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
     > = Box::new(move |this, args, ncx| {
@@ -48,7 +48,7 @@ pub(super) fn install_plain_time(
         let is_new_target = if let Some(obj) = this.as_object() {
             obj.prototype()
                 .as_object()
-                .map_or(false, |p| p.as_ptr() == pt_proto_check.as_ptr())
+                .is_some_and(|p| p.as_ptr() == pt_proto_check.as_ptr())
         } else {
             false
         };
@@ -76,18 +76,12 @@ pub(super) fn install_plain_time(
         let ns = get_arg(ncx, 5)? as i32;
 
         // RejectTime: validate ranges (negative values would saturate to 0 with `as u8`)
-        if h < 0
-            || h > 23
-            || mi < 0
-            || mi > 59
-            || sec < 0
-            || sec > 59
-            || ms < 0
-            || ms > 999
-            || us < 0
-            || us > 999
-            || ns < 0
-            || ns > 999
+        if !(0..=23).contains(&h)
+            || !(0..=59).contains(&mi)
+            || !(0..=59).contains(&sec)
+            || !(0..=999).contains(&ms)
+            || !(0..=999).contains(&us)
+            || !(0..=999).contains(&ns)
         {
             return Err(VmError::range_error("time value out of range"));
         }
@@ -105,8 +99,8 @@ pub(super) fn install_plain_time(
     let ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        *fn_proto,
+        ctor_obj,
     );
 
     // Prototype accessor getters
@@ -149,7 +143,7 @@ pub(super) fn install_plain_time(
                         Ok(Value::int32(val))
                     },
                     mm.clone(),
-                    fn_proto.clone(),
+                    *fn_proto,
                 )),
                 set: None,
                 attributes: PropertyAttributes {
@@ -174,7 +168,7 @@ pub(super) fn install_plain_time(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toString",
         0,
     );
@@ -196,7 +190,7 @@ pub(super) fn install_plain_time(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toJSON",
         0,
     );
@@ -213,7 +207,7 @@ pub(super) fn install_plain_time(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "valueOf",
         0,
     );
@@ -240,12 +234,12 @@ pub(super) fn install_plain_time(
                 ));
             }
             if let Some(ts) = obj.get(&PropertyKey::string("toString")) {
-                return ncx.call_function(&ts, this.clone(), &[]);
+                return ncx.call_function(&ts, *this, &[]);
             }
             Err(VmError::type_error("toLocaleString"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toLocaleString",
         0,
     );
@@ -266,7 +260,7 @@ pub(super) fn install_plain_time(
             Ok(Value::boolean(pt_a == pt_b))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "equals",
         1,
     );
@@ -291,10 +285,7 @@ pub(super) fn install_plain_time(
     // prototype.constructor
     proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // ========================================================================
@@ -312,7 +303,7 @@ pub(super) fn install_plain_time(
             construct_plain_time_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "add",
         1,
     );
@@ -336,7 +327,7 @@ pub(super) fn install_plain_time(
             construct_plain_time_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "subtract",
         1,
     );
@@ -362,7 +353,7 @@ pub(super) fn install_plain_time(
             construct_duration_value(ncx, &duration)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "since",
         1,
     );
@@ -388,7 +379,7 @@ pub(super) fn install_plain_time(
             construct_duration_value(ncx, &duration)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "until",
         1,
     );
@@ -407,7 +398,7 @@ pub(super) fn install_plain_time(
                 .ok_or_else(|| VmError::type_error("with called on non-object"))?;
             let pt = extract_plain_time(&obj)?;
             let item = args.first().cloned().unwrap_or(Value::undefined());
-            if !item.as_object().is_some() && item.as_proxy().is_none() {
+            if item.as_object().is_none() && item.as_proxy().is_none() {
                 return Err(VmError::type_error("with argument must be an object"));
             }
             // Reject Temporal types
@@ -461,13 +452,13 @@ pub(super) fn install_plain_time(
             if overflow == temporal_rs::options::Overflow::Reject {
                 let check_range =
                     |v: Option<f64>, name: &str, min: f64, max: f64| -> Result<(), VmError> {
-                        if let Some(n) = v {
-                            if n < min || n > max {
-                                return Err(VmError::range_error(format!(
-                                    "{} value {} out of range",
-                                    name, n
-                                )));
-                            }
+                        if let Some(n) = v
+                            && (n < min || n > max)
+                        {
+                            return Err(VmError::range_error(format!(
+                                "{} value {} out of range",
+                                name, n
+                            )));
                         }
                         Ok(())
                     };
@@ -489,7 +480,7 @@ pub(super) fn install_plain_time(
             construct_plain_time_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "with",
         1,
     );
@@ -513,7 +504,7 @@ pub(super) fn install_plain_time(
             construct_plain_time_value(ncx, &result)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "round",
         1,
     );
@@ -537,7 +528,7 @@ pub(super) fn install_plain_time(
             construct_plain_date_time_value(ncx, &pdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainDateTime",
         1,
     );
@@ -590,7 +581,7 @@ pub(super) fn install_plain_time(
             Ok(Value::object(result))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "getISOFields",
         0,
     );
@@ -616,7 +607,7 @@ pub(super) fn install_plain_time(
             }))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "compare",
         2,
     );
@@ -626,8 +617,8 @@ pub(super) fn install_plain_time(
     );
 
     // PlainTime.from(item, options?)
-    let from_proto = proto.clone();
-    let from_mm = mm.clone();
+    let from_proto = proto;
+    let _from_mm = mm.clone();
     let from_fn = Value::native_function_with_proto_named(
         move |_this, args, ncx| {
             let item = args.first().cloned().unwrap_or(Value::undefined());
@@ -643,7 +634,7 @@ pub(super) fn install_plain_time(
                     // Read overflow option for observable side effects, then discard
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let pt = extract_plain_time(&obj)?;
-                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto)));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -656,7 +647,7 @@ pub(super) fn install_plain_time(
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let pdt = extract_plain_date_time(&obj)?;
                     let pt = temporal_rs::PlainTime::from(pdt);
-                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto)));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -669,7 +660,7 @@ pub(super) fn install_plain_time(
                     let _ = parse_overflow_option(ncx, &options_val)?;
                     let zdt = extract_zoned_date_time(&obj)?;
                     let pt = zdt.to_plain_time();
-                    let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
+                    let result = GcRef::new(JsObject::new(Value::object(from_proto)));
                     store_temporal_inner(
                         &result,
                         crate::temporal_value::TemporalValue::PlainTime(pt),
@@ -718,7 +709,7 @@ pub(super) fn install_plain_time(
                     .with_nanosecond(ns.map(|n| n as u16));
                 let pt = temporal_rs::PlainTime::from_partial(partial, Some(overflow))
                     .map_err(temporal_err)?;
-                let result = GcRef::new(JsObject::new(Value::object(from_proto.clone())));
+                let result = GcRef::new(JsObject::new(Value::object(from_proto)));
                 store_temporal_inner(&result, crate::temporal_value::TemporalValue::PlainTime(pt));
                 return Ok(Value::object(result));
             }
@@ -727,8 +718,7 @@ pub(super) fn install_plain_time(
             // Per spec: parse string first, then read (and discard) overflow option
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
-                let pt = temporal_rs::PlainTime::from_utf8(s.as_str().as_bytes())
-                    .map_err(temporal_err)?;
+                let pt = temporal_rs::PlainTime::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 // Read overflow after parsing for observable side effects, then discard
                 let _ = parse_overflow_option(ncx, &options_val)?;
                 return construct_plain_time_value(ncx, &pt);
@@ -737,7 +727,7 @@ pub(super) fn install_plain_time(
             Err(VmError::type_error("Cannot convert to PlainTime"))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "from",
         1,
     );

@@ -408,15 +408,15 @@ fn normalize_version_req(req: &str) -> String {
     while let Some(c) = chars.next() {
         if c == ' ' {
             // Check if next char starts a new comparator
-            if let Some(&next) = chars.peek() {
-                if next == '<' || next == '>' || next == '=' || next == '^' || next == '~' {
-                    // This space separates comparators, use comma
-                    if last_was_version {
-                        result.push_str(", ");
-                        last_was_version = false;
-                    }
-                    continue;
+            if let Some(&next) = chars.peek()
+                && (next == '<' || next == '>' || next == '=' || next == '^' || next == '~')
+            {
+                // This space separates comparators, use comma
+                if last_was_version {
+                    result.push_str(", ");
+                    last_was_version = false;
                 }
+                continue;
             }
             // Regular space, skip if after operator
             if !last_was_version {

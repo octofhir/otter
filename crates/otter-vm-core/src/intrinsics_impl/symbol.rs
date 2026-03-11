@@ -44,7 +44,7 @@ impl IntrinsicObject for SymbolIntrinsic {
             let install_sym = |name: &str, sym_val: &Value| {
                 ctor.define_property(
                     PropertyKey::string(name),
-                    PropertyDescriptor::data_with_attrs(sym_val.clone(), sym_attrs),
+                    PropertyDescriptor::data_with_attrs(*sym_val, sym_attrs),
                 );
             };
             let intrinsics = ctx.intrinsics();
@@ -76,15 +76,13 @@ fn symbol_from_value(value: &Value) -> Option<GcRef<Symbol>> {
     if let Some(sym) = value.as_symbol() {
         return Some(sym);
     }
-    if let Some(obj) = value.as_object() {
-        if let Some(prim) = obj
+    if let Some(obj) = value.as_object()
+        && let Some(prim) = obj
             .get(&PropertyKey::string("__primitiveValue__"))
             .or_else(|| obj.get(&PropertyKey::string("__value__")))
-        {
-            if let Some(sym) = prim.as_symbol() {
-                return Some(sym);
-            }
-        }
+        && let Some(sym) = prim.as_symbol()
+    {
+        return Some(sym);
     }
     None
 }

@@ -1,3 +1,11 @@
+#![allow(missing_docs)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::manual_unwrap_or_default)]
+
 //! Node.js API compatibility for Otter VM
 //!
 //! This crate provides Node.js-compatible APIs as native extensions for the Otter VM.

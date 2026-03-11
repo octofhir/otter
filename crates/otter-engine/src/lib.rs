@@ -307,21 +307,19 @@ impl EngineBuilder {
     pub fn build(self) -> Otter {
         // Build base runtime (without builtins)
         let mut runtime = self.inner.build();
-        if !self.env_configured {
-            if let Some(allowed_env) = runtime.capabilities().env.as_ref() {
-                let mut env_builder = EnvStoreBuilder::new();
-                if allowed_env.is_empty() {
-                    let host_env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
-                    let host_env_refs: Vec<&str> =
-                        host_env_keys.iter().map(String::as_str).collect();
-                    env_builder = env_builder.passthrough(&host_env_refs);
-                } else {
-                    let allowed_env_refs: Vec<&str> =
-                        allowed_env.iter().map(String::as_str).collect();
-                    env_builder = env_builder.passthrough(&allowed_env_refs);
-                }
-                runtime.set_env_store(std::sync::Arc::new(env_builder.build()));
+        if !self.env_configured
+            && let Some(allowed_env) = runtime.capabilities().env.as_ref()
+        {
+            let mut env_builder = EnvStoreBuilder::new();
+            if allowed_env.is_empty() {
+                let host_env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+                let host_env_refs: Vec<&str> = host_env_keys.iter().map(String::as_str).collect();
+                env_builder = env_builder.passthrough(&host_env_refs);
+            } else {
+                let allowed_env_refs: Vec<&str> = allowed_env.iter().map(String::as_str).collect();
+                env_builder = env_builder.passthrough(&allowed_env_refs);
             }
+            runtime.set_env_store(std::sync::Arc::new(env_builder.build()));
         }
         let loader = runtime.loader();
 

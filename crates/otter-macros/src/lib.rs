@@ -67,6 +67,7 @@ use syn::{
 // =============================================================================
 
 /// Arguments to the #[dive] attribute
+#[derive(Default)]
 struct DiveArgs {
     /// Custom JS name
     name: Option<String>,
@@ -76,17 +77,6 @@ struct DiveArgs {
     deep: bool,
     /// Whether this is an instance method
     method: bool,
-}
-
-impl Default for DiveArgs {
-    fn default() -> Self {
-        Self {
-            name: None,
-            length: None,
-            deep: false,
-            method: false,
-        }
-    }
 }
 
 impl Parse for DiveArgs {
@@ -163,16 +153,16 @@ fn detect_pattern(input: &ItemFn) -> ParamPattern {
     let params: Vec<_> = input.sig.inputs.iter().collect();
 
     // Check for reference types that indicate native patterns
-    if params.len() >= 3 {
-        if is_value_ref(&params[0]) && is_value_slice(&params[1]) && is_native_context(&params[2]) {
-            return ParamPattern::FullNative;
-        }
+    if params.len() >= 3
+        && is_value_ref(params[0])
+        && is_value_slice(params[1])
+        && is_native_context(params[2])
+    {
+        return ParamPattern::FullNative;
     }
 
-    if params.len() >= 2 {
-        if is_value_slice(&params[0]) && is_native_context(&params[1]) {
-            return ParamPattern::ArgsAndNcx;
-        }
+    if params.len() >= 2 && is_value_slice(params[0]) && is_native_context(params[1]) {
+        return ParamPattern::ArgsAndNcx;
     }
 
     if params.len() == 1 && is_native_context(params[0]) {
@@ -200,53 +190,51 @@ fn detect_pattern(input: &ItemFn) -> ParamPattern {
 
 /// Check if a FnArg is `&Value` (reference to Value)
 fn is_value_ref(arg: &FnArg) -> bool {
-    if let FnArg::Typed(pat_type) = arg {
-        let ty_str = quote!(#pat_type.ty).to_string();
-        // Check the actual type
-        if let Type::Reference(type_ref) = &*pat_type.ty
-            && let Type::Path(type_path) = &*type_ref.elem
-            && let Some(seg) = type_path.path.segments.last()
-            && seg.ident == "Value"
-        {
-            return true;
-        }
-        // Fallback: string match
-        return ty_str.contains("& Value") || ty_str.contains("&Value");
+    let FnArg::Typed(pat_type) = arg else {
+        return false;
+    };
+    // Check the actual type
+    if let Type::Reference(type_ref) = &*pat_type.ty
+        && let Type::Path(type_path) = &*type_ref.elem
+        && let Some(seg) = type_path.path.segments.last()
+        && seg.ident == "Value"
+    {
+        return true;
     }
-    false
+    // Fallback: string match
+    let ty_str = quote!(#pat_type.ty).to_string();
+    ty_str.contains("& Value") || ty_str.contains("&Value")
 }
 
 /// Check if a FnArg is `&[Value]` (slice of Value)
 fn is_value_slice(arg: &FnArg) -> bool {
-    if let FnArg::Typed(pat_type) = arg {
-        if let Type::Reference(type_ref) = &*pat_type.ty
-            && let Type::Slice(type_slice) = &*type_ref.elem
-            && let Type::Path(type_path) = &*type_slice.elem
-            && let Some(seg) = type_path.path.segments.last()
-        {
-            return seg.ident == "Value";
-        }
+    if let FnArg::Typed(pat_type) = arg
+        && let Type::Reference(type_ref) = &*pat_type.ty
+        && let Type::Slice(type_slice) = &*type_ref.elem
+        && let Type::Path(type_path) = &*type_slice.elem
+        && let Some(seg) = type_path.path.segments.last()
+    {
+        return seg.ident == "Value";
     }
     false
 }
 
 /// Check if a FnArg is `&mut NativeContext` or `&mut NativeContext<'_>`
 fn is_native_context(arg: &FnArg) -> bool {
-    if let FnArg::Typed(pat_type) = arg {
-        if let Type::Reference(type_ref) = &*pat_type.ty
-            && type_ref.mutability.is_some()
-            && let Type::Path(type_path) = &*type_ref.elem
-            && let Some(seg) = type_path.path.segments.last()
-        {
-            return seg.ident == "NativeContext";
-        }
+    if let FnArg::Typed(pat_type) = arg
+        && let Type::Reference(type_ref) = &*pat_type.ty
+        && type_ref.mutability.is_some()
+        && let Type::Path(type_path) = &*type_ref.elem
+        && let Some(seg) = type_path.path.segments.last()
+    {
+        return seg.ident == "NativeContext";
     }
     false
 }
 
 /// Check if the last param is `&mut NativeContext`
 fn has_trailing_ncx(input: &ItemFn) -> bool {
-    input.sig.inputs.last().map_or(false, is_native_context)
+    input.sig.inputs.last().is_some_and(is_native_context)
 }
 
 /// Marks a function as callable from JavaScript.

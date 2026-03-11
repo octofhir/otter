@@ -32,7 +32,7 @@ fn build_window_from_resume_state(
         );
     }
     for i in 0..reg_count {
-        window.push(ctx.get_register(i as u16).clone());
+        window.push(*ctx.get_register(i as u16));
     }
     for slot in &state.locals {
         if let Some(entry) = window.get_mut(slot.index as usize) {
@@ -73,7 +73,7 @@ pub(crate) fn try_materialize_generator_yield(
         .iter()
         .find(|slot| slot.index == src.0)
         .map(|slot| slot.value)
-        .unwrap_or_else(|| ctx.get_register(src.0).clone());
+        .unwrap_or_else(|| *ctx.get_register(src.0));
     let local_count = func.local_count as usize;
     let reg_count = func.register_count as usize;
     let window = build_window_from_resume_state(ctx, local_count, reg_count, state);
@@ -123,7 +123,8 @@ mod tests {
         let mut ctx = runtime.create_context();
         let module = build_test_module(vec![Instruction::Return { src: Register(0) }]);
         ctx.register_module(&module);
-        ctx.push_frame(0, module.module_id, 2, None, false, false, 0).unwrap();
+        ctx.push_frame(0, module.module_id, 2, None, false, false, 0)
+            .unwrap();
         ctx.set_local(0, Value::int32(1)).unwrap();
         ctx.set_local(1, Value::int32(2)).unwrap();
         ctx.set_register(0, Value::int32(10));

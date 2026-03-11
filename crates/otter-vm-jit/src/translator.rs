@@ -119,25 +119,23 @@ fn resolve_inline_candidates<'a>(
             }
             // Call: check if callee register has a known function index
             Instruction::Call { func, .. } => {
-                if let Some(&func_idx) = reg_func.get(&func.0) {
-                    if let Some(&callee) = func_by_index.get(&func_idx) {
-                        // Verify all callee instructions are JIT-translatable.
-                        // Must use baseline-only check because the inline code generator
-                        // only handles baseline opcodes (helper-based ops would silently
-                        // return undefined from the catch-all branch).
-                        let callee_instrs = callee.instructions.read();
-                        let all_translatable = callee_instrs
-                            .iter()
-                            .all(|inst| is_supported_baseline_opcode(inst));
-                        if all_translatable {
-                            result.insert(
-                                pc,
-                                InlineCandidate {
-                                    callee,
-                                    function_index: func_idx,
-                                },
-                            );
-                        }
+                if let Some(&func_idx) = reg_func.get(&func.0)
+                    && let Some(&callee) = func_by_index.get(&func_idx)
+                {
+                    // Verify all callee instructions are JIT-translatable.
+                    // Must use baseline-only check because the inline code generator
+                    // only handles baseline opcodes (helper-based ops would silently
+                    // return undefined from the catch-all branch).
+                    let callee_instrs = callee.instructions.read();
+                    let all_translatable = callee_instrs.iter().all(is_supported_baseline_opcode);
+                    if all_translatable {
+                        result.insert(
+                            pc,
+                            InlineCandidate {
+                                callee,
+                                function_index: func_idx,
+                            },
+                        );
                     }
                 }
             }
@@ -836,6 +834,7 @@ fn init_param_local(
 /// don't match the speculative fast path.
 ///
 /// If no generic helper is available, falls back to the standard bailout.
+#[allow(clippy::too_many_arguments)]
 fn lower_guarded_with_generic_fallback(
     builder: &mut FunctionBuilder<'_>,
     guarded: type_guards::GuardedResult,
@@ -886,6 +885,7 @@ fn lower_guarded_with_generic_fallback(
 ///
 /// This keeps hot fast paths fully native in JIT code and lets the interpreter
 /// handle uncommon megamorphic/spec-rare cases after deopt.
+#[allow(clippy::too_many_arguments)]
 fn lower_guarded_with_bailout(
     builder: &mut FunctionBuilder<'_>,
     guarded: type_guards::GuardedResult,
@@ -910,6 +910,7 @@ fn lower_guarded_with_bailout(
 /// 2. If BAILOUT → call full GetPropConst(ctx, obj, name_idx, ic_idx)
 /// 3. If still BAILOUT → bail out function
 /// 4. Merge results from either path
+#[allow(clippy::too_many_arguments)]
 fn emit_mono_prop_with_fallback(
     builder: &mut FunctionBuilder<'_>,
     mono_ref: cranelift_codegen::ir::FuncRef,
@@ -1082,7 +1083,12 @@ pub fn translate_function_with_constants(
 
     // Snapshot type feedback for speculative optimization.
     // Read the feedback vector once at compile time (not during IR emission).
-    let (feedback_snapshot, ic_snapshot, call_target_snapshot, ffi_call_info_snapshot): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
+    let (feedback_snapshot, ic_snapshot, call_target_snapshot, ffi_call_info_snapshot): (
+        Vec<_>,
+        Vec<_>,
+        Vec<_>,
+        Vec<_>,
+    ) = {
         let fv = function.feedback_vector.read();
         (
             fv.iter().map(|m| m.type_observations).collect(),
@@ -1110,17 +1116,17 @@ pub fn translate_function_with_constants(
     }
 
     // --- Loop analysis (needed before block creation for leader computation) ---
-    let versioned_loops = loop_analysis::detect_loops(&instructions_ref, &feedback_snapshot);
+    let versioned_loops = loop_analysis::detect_loops(instructions_ref, &feedback_snapshot);
     let osr_loop_headers_vec: Vec<usize> =
         versioned_loops.iter().map(|info| info.header_pc).collect();
 
     // --- Block merging: only create blocks at basic-block leaders ---
-    let leaders = compute_block_leaders(&instructions_ref, &osr_loop_headers_vec);
+    let leaders = compute_block_leaders(instructions_ref, &osr_loop_headers_vec);
     let mut blocks = Vec::with_capacity(instruction_count);
     let mut current_block = builder.create_block(); // PC 0 is always a leader
     blocks.push(current_block);
-    for pc in 1..instruction_count {
-        if leaders[pc] {
+    for &is_leader in &leaders[1..] {
+        if is_leader {
             current_block = builder.create_block();
         }
         blocks.push(current_block);
@@ -1137,17 +1143,17 @@ pub fn translate_function_with_constants(
     let args_ptr = entry_params[1];
     let argc = entry_params[2];
     let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-    for idx in 0..reg_count {
-        builder.def_var(reg_vars[idx], undef);
+    for reg_var in &reg_vars {
+        builder.def_var(*reg_var, undef);
     }
     let param_count = function.param_count as usize;
-    for idx in 0..local_count {
+    for (idx, &local_var) in local_vars.iter().enumerate() {
         let init = if idx < param_count {
             init_param_local(builder, args_ptr, argc, idx, undef)
         } else {
             undef
         };
-        builder.def_var(local_vars[idx], init);
+        builder.def_var(local_var, init);
     }
     // --- Loop versioning: create optimized blocks for qualified loops ---
     // (versioned_loops already computed above for leader analysis)
@@ -1209,7 +1215,7 @@ pub fn translate_function_with_constants(
     };
 
     // --- Function inlining: resolve static call targets ---
-    let inline_sites = resolve_inline_candidates(&instructions_ref, module_functions);
+    let inline_sites = resolve_inline_candidates(instructions_ref, module_functions);
 
     // --- OSR entry dispatch ---
     // osr_loop_headers_vec was computed above for leader analysis.
@@ -1260,12 +1266,12 @@ pub fn translate_function_with_constants(
             ctx_ptr,
             JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
         );
-        for i in 0..local_count {
+        for (i, &local_var) in local_vars.iter().enumerate() {
             let val =
                 builder
                     .ins()
                     .load(types::I64, MemFlags::trusted(), locals_ptr, (i * 8) as i32);
-            builder.def_var(local_vars[i], val);
+            builder.def_var(local_var, val);
         }
 
         // Load registers from deopt_regs buffer.
@@ -1275,11 +1281,11 @@ pub fn translate_function_with_constants(
             ctx_ptr,
             JIT_CTX_DEOPT_REGS_PTR_OFFSET,
         );
-        for i in 0..reg_count {
+        for (i, &reg_var) in reg_vars.iter().enumerate() {
             let val = builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), regs_ptr, (i * 8) as i32);
-            builder.def_var(reg_vars[i], val);
+            builder.def_var(reg_var, val);
         }
 
         // Dispatch to the correct loop header via comparisons.
@@ -1424,7 +1430,7 @@ pub fn translate_function_with_constants(
                 let right = read_reg(builder, &reg_vars, *rhs);
                 let hint = get_hint(*feedback_index);
                 let likely_string =
-                    add_likely_string_concat(&instructions_ref, constants, pc, *lhs, *rhs);
+                    add_likely_string_concat(instructions_ref, constants, pc, *lhs, *rhs);
                 let effective_hint = if likely_string {
                     SpecializationHint::Generic
                 } else {
@@ -2285,13 +2291,13 @@ pub fn translate_function_with_constants(
                         // Initialize callee registers to undefined
                         let undef_val =
                             builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
-                        for idx in 0..callee_reg_count {
-                            builder.def_var(callee_reg_vars[idx], undef_val);
+                        for &callee_reg_var in &callee_reg_vars {
+                            builder.def_var(callee_reg_var, undef_val);
                         }
 
                         // Map caller args → callee param locals
                         let callee_param_count = callee.param_count as usize;
-                        for idx in 0..callee_local_count {
+                        for (idx, &callee_local_var) in callee_local_vars.iter().enumerate() {
                             let init = if idx < callee_param_count && idx < (*argc as usize) {
                                 // Read argument from caller's register layout
                                 // Args are in registers func.0+1, func.0+2, ...
@@ -2299,7 +2305,7 @@ pub fn translate_function_with_constants(
                             } else {
                                 undef_val
                             };
-                            builder.def_var(callee_local_vars[idx], init);
+                            builder.def_var(callee_local_var, init);
                         }
 
                         // Create blocks for callee instructions + continuation
@@ -2980,7 +2986,11 @@ pub fn translate_function_with_constants(
                 builder.switch_to_block(continue_block);
                 write_reg(builder, &reg_vars, *dst, result);
             }
-            Instruction::NewArray { dst, len, packed: _ } => {
+            Instruction::NewArray {
+                dst,
+                len,
+                packed: _,
+            } => {
                 let helper_ref = helpers
                     .and_then(|h| h.get(HelperKind::NewArray))
                     .ok_or_else(|| unsupported(pc, instruction))?;
@@ -4048,7 +4058,12 @@ pub fn translate_function_with_constants(
                 write_reg(builder, &reg_vars, *dst, result);
             }
             // --- Superinstructions: handle natively when possible ---
-            Instruction::GetLocal2 { dst1, idx1, dst2, idx2 } => {
+            Instruction::GetLocal2 {
+                dst1,
+                idx1,
+                dst2,
+                idx2,
+            } => {
                 // Two GetLocals fused into one dispatch
                 let val1 = read_local(builder, &local_vars, *idx1);
                 write_reg(builder, &reg_vars, *dst1, val1);

@@ -802,10 +802,10 @@ fn canonicalize_locale_list(
 
     let wrapped;
     let locales_obj = if locales.as_object().is_some() || locales.as_proxy().is_some() {
-        locales.clone()
+        *locales
     } else {
         wrapped = crate::intrinsics_impl::object::to_object_for_builtin(ncx, locales)?;
-        Value::object(wrapped.0.clone())
+        Value::object(wrapped.0)
     };
 
     {
@@ -816,7 +816,7 @@ fn canonicalize_locale_list(
                     proxy,
                     &key,
                     crate::proxy_operations::property_key_to_value_pub(&key),
-                    locales_obj.clone(),
+                    locales_obj,
                 );
             }
             if let Some(obj) = locales_obj.as_object() {
@@ -825,7 +825,7 @@ fn canonicalize_locale_list(
                         PropertyDescriptor::Data { value, .. } => Ok(value),
                         PropertyDescriptor::Accessor { get, .. } => {
                             if let Some(getter) = get {
-                                ncx.call_function(&getter, locales_obj.clone(), &[])
+                                ncx.call_function(&getter, locales_obj, &[])
                             } else {
                                 Ok(Value::undefined())
                             }
@@ -956,6 +956,7 @@ fn unicode_keyword_from_locale(locale: &str, keyword: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn remove_unicode_keyword(locale: &str, keyword: &str) -> String {
     let parts: Vec<&str> = locale.split('-').collect();
     let mut out = Vec::with_capacity(parts.len());
@@ -1103,7 +1104,7 @@ fn get_option_string(
             proxy,
             &key,
             crate::proxy_operations::property_key_to_value_pub(&key),
-            options.clone(),
+            *options,
         )?
     } else {
         let wrapped;
@@ -1142,7 +1143,7 @@ fn get_option_bool(
             proxy,
             &key,
             crate::proxy_operations::property_key_to_value_pub(&key),
-            options.clone(),
+            *options,
         )?
     } else {
         let wrapped;
@@ -1204,7 +1205,7 @@ fn get_option_number(
             proxy,
             &key,
             crate::proxy_operations::property_key_to_value_pub(&key),
-            options.clone(),
+            *options,
         )?
     } else {
         let wrapped;
@@ -1240,7 +1241,7 @@ fn get_option_value(
             proxy,
             &key,
             crate::proxy_operations::property_key_to_value_pub(&key),
-            options.clone(),
+            *options,
         )?
     } else {
         let wrapped;
@@ -1415,7 +1416,7 @@ fn resolved_options(
                 v => v,
             }),
         );
-        obj.define_property(PropertyKey::string("notation"), data(notation.clone()));
+        obj.define_property(PropertyKey::string("notation"), data(notation));
         if notation
             .as_string()
             .map(|s| s.as_str().to_string())
@@ -1447,7 +1448,7 @@ fn resolved_options(
             PropertyKey::string("trailingZeroDisplay"),
             data(get_slot(INTL_NF_TRAILING_ZERO_DISPLAY_KEY)),
         );
-        return Ok(Value::object(obj.clone()));
+        return Ok(Value::object(obj));
     }
 
     let mapping = [
@@ -1482,7 +1483,7 @@ fn resolved_options(
         }
     }
 
-    Ok(Value::object(obj.clone()))
+    Ok(Value::object(obj))
 }
 
 #[derive(Clone)]
@@ -1494,6 +1495,7 @@ enum NfDecimalInput {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct WriteablePartCollector {
     text: String,
     parts: Vec<(usize, usize, Part)>,
@@ -2517,9 +2519,7 @@ fn nf_take_trailing_parenthesis(parts: &mut Vec<(String, String)>, has_trailing_
     }
 }
 
-fn nf_split_numeric_prefix_and_unit_suffix<'a>(
-    formatted: &'a str,
-) -> Option<(&'a str, &'a str, &'a str)> {
+fn nf_split_numeric_prefix_and_unit_suffix(formatted: &str) -> Option<(&str, &str, &str)> {
     let mut number_end = 0usize;
     for (idx, c) in formatted.char_indices() {
         if nf_is_numeric_or_separator_char(c) {
@@ -2672,19 +2672,17 @@ fn nf_format_to_parts(
                     suffix_parts.push(("literal".to_string(), " ".to_string()));
                     suffix_parts.push(("unit".to_string(), "公里".to_string()));
                 }
-            } else {
-                if let Some((number, literal, unit_token)) =
-                    nf_split_numeric_prefix_and_unit_suffix(&formatted)
-                {
-                    let number = number.to_string();
-                    let literal = literal.to_string();
-                    let unit_token = unit_token.to_string();
-                    formatted = number;
-                    if !literal.is_empty() {
-                        suffix_parts.push(("literal".to_string(), literal));
-                    }
-                    suffix_parts.push(("unit".to_string(), unit_token));
+            } else if let Some((number, literal, unit_token)) =
+                nf_split_numeric_prefix_and_unit_suffix(&formatted)
+            {
+                let number = number.to_string();
+                let literal = literal.to_string();
+                let unit_token = unit_token.to_string();
+                formatted = number;
+                if !literal.is_empty() {
+                    suffix_parts.push(("literal".to_string(), literal));
                 }
+                suffix_parts.push(("unit".to_string(), unit_token));
             }
         } else if let Some((number, literal, unit_token)) =
             nf_split_numeric_prefix_and_unit_suffix(&formatted)
@@ -2734,20 +2732,25 @@ fn validate_collator_options(
     options: Option<&Value>,
     ncx: &mut NativeContext<'_>,
 ) -> Result<(), VmError> {
-    if let Some(s) = get_option_string(options, "localeMatcher", ncx)? {
-        if s != "lookup" && s != "best fit" {
-            return Err(VmError::range_error("Invalid localeMatcher option"));
-        }
+    if let Some(s) = get_option_string(options, "localeMatcher", ncx)?
+        && s != "lookup"
+        && s != "best fit"
+    {
+        return Err(VmError::range_error("Invalid localeMatcher option"));
     }
-    if let Some(s) = get_option_string(options, "usage", ncx)? {
-        if s != "sort" && s != "search" {
-            return Err(VmError::range_error("Invalid usage option"));
-        }
+    if let Some(s) = get_option_string(options, "usage", ncx)?
+        && s != "sort"
+        && s != "search"
+    {
+        return Err(VmError::range_error("Invalid usage option"));
     }
-    if let Some(s) = get_option_string(options, "sensitivity", ncx)? {
-        if s != "base" && s != "accent" && s != "case" && s != "variant" {
-            return Err(VmError::range_error("Invalid sensitivity option"));
-        }
+    if let Some(s) = get_option_string(options, "sensitivity", ncx)?
+        && s != "base"
+        && s != "accent"
+        && s != "case"
+        && s != "variant"
+    {
+        return Err(VmError::range_error("Invalid sensitivity option"));
     }
     if let Some(s) = get_option_string(options, "caseFirst", ncx)?
         && s != "upper"
@@ -2862,17 +2865,16 @@ fn define_basic_intl_constructor(
     let proto_obj = GcRef::new(JsObject::new(Value::object(object_proto)));
     for (name, _length, value) in prototype_methods {
         proto_obj.define_property(
-            PropertyKey::string(*name),
-            PropertyDescriptor::builtin_method(value.clone()),
+            PropertyKey::string(name),
+            PropertyDescriptor::builtin_method(*value),
         );
     }
 
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto)));
     install_common_constructor_bits(&ctor_obj, ctor_name, ctor_len, proto_obj);
 
     let ctor = Value::native_function_with_proto_and_object(
         Arc::new({
-            let proto_obj = proto_obj;
             move |this, args, ncx| {
                 let mut locale =
                     normalize_locale_for_ops(first_requested_locale(args.first(), ncx)?);
@@ -3511,7 +3513,7 @@ fn define_basic_intl_constructor(
                     let fn_proto = ncx.ctx.function_prototype().ok_or_else(|| {
                         VmError::type_error("Function.prototype is not available")
                     })?;
-                    let target_for_format = target.clone();
+                    let target_for_format = target;
                     let format = Value::native_function_with_proto_named(
                         move |_this, args, ncx| {
                             let value = args.first().cloned().unwrap_or(Value::undefined());
@@ -3540,20 +3542,20 @@ fn define_basic_intl_constructor(
             }
         }),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        fn_proto,
+        ctor_obj,
     );
 
     proto_obj.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(ctor.clone(), PropertyAttributes::constructor_link()),
+        PropertyDescriptor::data_with_attrs(ctor, PropertyAttributes::constructor_link()),
     );
 
     install_supported_locales_of(&ctor_obj, mm, fn_proto);
 
     intl.define_property(
         PropertyKey::string(ctor_name),
-        PropertyDescriptor::data_with_attrs(ctor.clone(), PropertyAttributes::builtin_method()),
+        PropertyDescriptor::data_with_attrs(ctor, PropertyAttributes::builtin_method()),
     );
 
     ctor
@@ -3692,7 +3694,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
     let fn_proto = ctx.fn_proto();
     let object_proto = ctx.obj_proto();
     let intl = ctx.alloc_object(object_proto);
-    let intl_builder = NamespaceBuilder::new(mm.clone(), fn_proto.clone(), intl)
+    let intl_builder = NamespaceBuilder::new(mm.clone(), fn_proto, intl)
         .method(
             "getCanonicalLocales",
             |_this, args, ncx| {
@@ -3746,20 +3748,19 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             .as_object()
             .and_then(|obj| obj.get(&PropertyKey::string("prototype")))
             .and_then(|v| v.as_object())
+            && let Some(symbol) = to_string_tag_symbol
         {
-            if let Some(symbol) = to_string_tag_symbol.clone() {
-                proto.define_property(
-                    PropertyKey::Symbol(symbol),
-                    PropertyDescriptor::data_with_attrs(
-                        Value::string(JsString::intern(tag)),
-                        PropertyAttributes {
-                            writable: false,
-                            enumerable: false,
-                            configurable: true,
-                        },
-                    ),
-                );
-            }
+            proto.define_property(
+                PropertyKey::Symbol(symbol),
+                PropertyDescriptor::data_with_attrs(
+                    Value::string(JsString::intern(tag)),
+                    PropertyAttributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                ),
+            );
         }
     };
 
@@ -3797,7 +3798,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(compare)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "get compare",
         0,
     );
@@ -3867,10 +3868,10 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
                     PropertyDescriptor::data(case_first),
                 );
             }
-            Ok(Value::object(obj.clone()))
+            Ok(Value::object(obj))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -3882,7 +3883,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         &[("resolvedOptions", 0, collator_resolved_options)],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
     set_proto_to_string_tag(&collator_ctor, "Intl.Collator");
     if let Some(collator_ctor_obj) = collator_ctor.as_object()
@@ -3902,7 +3903,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "format",
         1,
     );
@@ -3916,7 +3917,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -3931,7 +3932,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
     set_proto_to_string_tag(&datetime_ctor, "Intl.DateTimeFormat");
 
@@ -3953,7 +3954,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&formatted)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "format",
         1,
     );
@@ -3990,7 +3991,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::array(arr))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatToParts",
         1,
     );
@@ -4032,7 +4033,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&format!("{start} - {end}"))))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatRange",
         2,
     );
@@ -4089,7 +4090,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::array(arr))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatRangeToParts",
         2,
     );
@@ -4103,7 +4104,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4121,7 +4122,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
     set_proto_to_string_tag(&number_ctor, "Intl.NumberFormat");
     let number_format_getter = Value::native_function_with_proto_named(
@@ -4141,7 +4142,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
                 .ctx
                 .function_prototype()
                 .ok_or_else(|| VmError::type_error("Function.prototype is not available"))?;
-            let bound_this = this_obj.clone();
+            let bound_this = this_obj;
             let format = Value::native_function_with_proto_named(
                 move |_ignored_this, args, ncx| {
                     let value = args.first().cloned().unwrap_or(Value::undefined());
@@ -4156,7 +4157,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(format)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "get format",
         0,
     );
@@ -4178,7 +4179,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(sel)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "select",
         1,
     );
@@ -4194,7 +4195,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(sel)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "selectRange",
         2,
     );
@@ -4208,7 +4209,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4224,7 +4225,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let rtf_format = Value::native_function_with_proto_named(
@@ -4239,7 +4240,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&format!("{v} {u}"))))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "format",
         2,
     );
@@ -4269,7 +4270,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::array(arr))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatToParts",
         2,
     );
@@ -4283,7 +4284,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4299,37 +4300,36 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let list_format = Value::native_function_with_proto_named(
         |_this, args, ncx| {
-            if let Some(v) = args.first() {
-                if let Some(obj) = v.as_object() {
-                    let length = obj
-                        .get(&PropertyKey::string("length"))
-                        .map(|v| {
-                            ncx.to_number_value(&v)
-                                .unwrap_or(0.0)
-                                .max(0.0)
-                                .min(64.0)
-                                .floor() as usize
-                        })
-                        .unwrap_or(0);
-                    let mut parts = Vec::new();
-                    for i in 0..length {
-                        if let Some(item) = obj.get(&PropertyKey::Index(i as u32)) {
-                            parts.push(ncx.to_string_value(&item)?);
-                        }
+            if let Some(v) = args.first()
+                && let Some(obj) = v.as_object()
+            {
+                let length = obj
+                    .get(&PropertyKey::string("length"))
+                    .map(|v| {
+                        ncx.to_number_value(&v)
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 64.0)
+                            .floor() as usize
+                    })
+                    .unwrap_or(0);
+                let mut parts = Vec::new();
+                for i in 0..length {
+                    if let Some(item) = obj.get(&PropertyKey::Index(i as u32)) {
+                        parts.push(ncx.to_string_value(&item)?);
                     }
-                    return Ok(Value::string(JsString::intern(&parts.join(", "))));
                 }
+                return Ok(Value::string(JsString::intern(&parts.join(", "))));
             }
             let s = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "format",
         1,
     );
@@ -4354,7 +4354,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::array(arr))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatToParts",
         1,
     );
@@ -4368,7 +4368,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4384,7 +4384,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let display_names_of = Value::native_function_with_proto_named(
@@ -4393,7 +4393,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&code)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "of",
         1,
     );
@@ -4407,7 +4407,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4422,7 +4422,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let segmenter_segment = Value::native_function_with_proto_named(
@@ -4447,7 +4447,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::object(result))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "segment",
         1,
     );
@@ -4461,7 +4461,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4476,7 +4476,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let duration_format = Value::native_function_with_proto_named(
@@ -4486,7 +4486,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "format",
         1,
     );
@@ -4507,7 +4507,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::array(arr))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "formatToParts",
         1,
     );
@@ -4521,7 +4521,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "resolvedOptions",
         0,
     );
@@ -4537,7 +4537,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
         ],
         &mm,
         object_proto,
-        fn_proto.clone(),
+        fn_proto,
     );
 
     let locale_to_string = Value::native_function_with_proto_named(
@@ -4550,7 +4550,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(Value::string(JsString::intern(&locale)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toString",
         0,
     );
@@ -4561,10 +4561,10 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
                 INTL_LOCALE_BRAND_KEY,
                 "Intl.Locale.prototype.maximize",
             )?;
-            Ok(this_val.clone())
+            Ok(*this_val)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "maximize",
         0,
     );
@@ -4575,10 +4575,10 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
                 INTL_LOCALE_BRAND_KEY,
                 "Intl.Locale.prototype.minimize",
             )?;
-            Ok(this_val.clone())
+            Ok(*this_val)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "minimize",
         0,
     );
@@ -4601,7 +4601,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(calendar)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "get calendar",
         0,
     );
@@ -4624,7 +4624,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(collation)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "get collation",
         0,
     );
@@ -4647,7 +4647,7 @@ fn init_intl_namespace(ctx: &IntrinsicContext) {
             Ok(numbering_system)
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "get numberingSystem",
         0,
     );

@@ -8,7 +8,9 @@
 //! - Environment store for secure env var access
 
 #![warn(clippy::all)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod async_runtime;
 pub mod builder;
@@ -55,10 +57,6 @@ pub use extension_state::ExtensionState;
 pub use extension_v2::{NativeExtensionRegistry, OtterExtension, Profile};
 pub use registration::{ModuleNamespaceBuilder, RegistrationContext};
 
-// Legacy alias for backwards compatibility
-/// Legacy alias for backwards compatibility. Use [`Otter`] instead.
-#[deprecated(since = "0.2.0", note = "Renamed to Otter")]
-pub type OtterRuntime = Otter;
 pub use promise::Promise;
 pub use timer::{Immediate, ImmediateId, Timer, TimerCallback, TimerHeapEntry, TimerId};
 pub use worker::{Worker, WorkerContext, WorkerError, WorkerMessage, WorkerPool};

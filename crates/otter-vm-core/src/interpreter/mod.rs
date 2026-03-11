@@ -284,7 +284,7 @@ impl Interpreter {
             use std::panic::{AssertUnwindSafe, catch_unwind};
             match catch_unwind(AssertUnwindSafe(|| self.run_loop(ctx))) {
                 Ok(result) => result,
-                Err(panic_payload) => Err(VmError::internal(&panic_message(&panic_payload))),
+                Err(panic_payload) => Err(VmError::internal(panic_message(&panic_payload))),
             }
         };
 
@@ -297,19 +297,17 @@ impl Interpreter {
                         otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
                             if let Some(idx) =
                                 entry_func.local_names.iter().position(|n| n == local)
+                                && let Ok(val) = ctx.get_local(idx as u16)
                             {
-                                if let Ok(val) = ctx.get_local(idx as u16) {
-                                    exports.insert(exported.clone(), val);
-                                }
+                                exports.insert(exported.clone(), val);
                             }
                         }
                         otter_vm_bytecode::module::ExportRecord::Default { local } => {
                             if let Some(idx) =
                                 entry_func.local_names.iter().position(|n| n == local)
+                                && let Ok(val) = ctx.get_local(idx as u16)
                             {
-                                if let Ok(val) = ctx.get_local(idx as u16) {
-                                    exports.insert("default".to_string(), val);
-                                }
+                                exports.insert("default".to_string(), val);
                             }
                         }
                         _ => {}
@@ -403,7 +401,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                    VmExecutionResult::Error(VmError::internal(panic_message(&panic_payload)))
                 }
             }
         }
@@ -440,7 +438,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                    VmExecutionResult::Error(VmError::internal(panic_message(&panic_payload)))
                 }
             }
         }
@@ -478,7 +476,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     ctx.set_running(false);
-                    VmExecutionResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                    VmExecutionResult::Error(VmError::internal(panic_message(&panic_payload)))
                 }
             }
         }
@@ -551,7 +549,7 @@ impl Interpreter {
                 realm_id,
                 gen_obj,
             );
-            generator.set_callee_value(func.clone());
+            generator.set_callee_value(*func);
             return Ok(Value::generator(generator));
         }
 
@@ -580,11 +578,11 @@ impl Interpreter {
             args.len() as u8,
         );
         if can_try_jit {
-            ctx.set_pending_this(this_value.clone());
+            ctx.set_pending_this(this_value);
             if let Some(ref home_obj) = closure.home_object {
-                ctx.set_pending_home_object(home_obj.clone());
+                ctx.set_pending_home_object(*home_obj);
             }
-            ctx.set_pending_callee_value(func.clone());
+            ctx.set_pending_callee_value(*func);
             let jit_interp: *const Self = self;
             let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
             match crate::jit_runtime::try_execute_jit(
@@ -628,13 +626,12 @@ impl Interpreter {
                 Vec::new()
             };
             let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(rest_args.len()));
-            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
-                if let Some(array_proto) = array_obj
+            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                && let Some(array_proto) = array_obj
                     .get(&crate::object::PropertyKey::string("prototype"))
                     .and_then(|v| v.as_object())
-                {
-                    rest_arr.set_prototype(Value::object(array_proto));
-                }
+            {
+                rest_arr.set_prototype(Value::object(array_proto));
             }
             for (i, arg) in rest_args.into_iter().enumerate() {
                 let _ = rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
@@ -648,13 +645,13 @@ impl Interpreter {
         ctx.set_pending_upvalues(closure.upvalues.clone());
         // Propagate home_object from closure to the new call frame
         if let Some(ref ho) = closure.home_object {
-            ctx.set_pending_home_object(ho.clone());
+            ctx.set_pending_home_object(*ho);
         }
 
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
         // Store callee value for arguments.callee
-        ctx.set_pending_callee_value(func.clone());
+        ctx.set_pending_callee_value(*func);
         ctx.register_module(&closure.module);
         ctx.push_frame(
             closure.function_index,
@@ -780,7 +777,7 @@ impl Interpreter {
                             (
                                 frame.return_register,
                                 frame.flags.is_construct(),
-                                frame.this_value.clone(),
+                                frame.this_value,
                                 frame.flags.is_async(),
                             )
                         };
@@ -1128,42 +1125,39 @@ impl Interpreter {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_add(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_add(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                 }
                 Instruction::SubInt32 { dst, lhs, rhs, .. } => {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_sub(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_sub(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                 }
                 Instruction::MulInt32 { dst, lhs, rhs, .. } => {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_mul(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_mul(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                 }
                 Instruction::Jump { offset } if offset.0 > 0 => {
@@ -1201,16 +1195,16 @@ impl Interpreter {
                 }
                 Instruction::IncLocal { local_idx, src } => {
                     let val = ctx.get_register(src.0);
-                    if let Some(i) = val.as_int32() {
-                        if let Some(result) = i.checked_add(1) {
-                            let v = Value::int32(result);
-                            ctx.set_register(src.0, v);
-                            ctx.store_register_into_local(local_idx.0, src.0);
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    if let Some(i) = val.as_int32()
+                        && let Some(result) = i.checked_add(1)
+                    {
+                        let v = Value::int32(result);
+                        ctx.set_register(src.0, v);
+                        ctx.store_register_into_local(local_idx.0, src.0);
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                 }
                 Instruction::Return { src } => {
@@ -1222,14 +1216,14 @@ impl Interpreter {
                             frame.flags.is_construct(),
                             frame.flags.is_async(),
                             if frame.flags.is_construct() {
-                                frame.this_value.clone()
+                                frame.this_value
                             } else {
                                 Value::undefined()
                             },
                         )
                     };
                     if !is_derived {
-                        let value = ctx.get_register(src.0).clone();
+                        let value = *ctx.get_register(src.0);
                         if ctx.stack_depth() == 1 {
                             return VmExecutionResult::Complete(value);
                         }
@@ -1260,7 +1254,7 @@ impl Interpreter {
                             frame.flags.is_construct(),
                             frame.flags.is_async(),
                             if frame.flags.is_construct() {
-                                frame.this_value.clone()
+                                frame.this_value
                             } else {
                                 Value::undefined()
                             },
@@ -1413,7 +1407,7 @@ impl Interpreter {
                             (
                                 frame.return_register,
                                 frame.flags.is_construct(),
-                                frame.this_value.clone(),
+                                frame.this_value,
                                 frame.flags.is_async(),
                             )
                         };
@@ -1828,14 +1822,13 @@ impl Interpreter {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_add(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_add(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                     // Fall through to execute_instruction for de-quicken path
                 }
@@ -1843,14 +1836,13 @@ impl Interpreter {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_sub(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_sub(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                     // Fall through to execute_instruction for de-quicken path
                 }
@@ -1858,14 +1850,13 @@ impl Interpreter {
                     if let (Some(l), Some(r)) = (
                         ctx.get_register(lhs.0).as_int32(),
                         ctx.get_register(rhs.0).as_int32(),
-                    ) {
-                        if let Some(result) = l.checked_mul(r) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    ) && let Some(result) = l.checked_mul(r)
+                    {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                     // Fall through to execute_instruction for de-quicken path
                 }
@@ -1905,16 +1896,16 @@ impl Interpreter {
                 }
                 Instruction::IncLocal { local_idx, src } => {
                     let val = ctx.get_register(src.0);
-                    if let Some(i) = val.as_int32() {
-                        if let Some(result) = i.checked_add(1) {
-                            let v = Value::int32(result);
-                            ctx.set_register(src.0, v);
-                            ctx.store_register_into_local(local_idx.0, src.0);
-                            if let Some(f) = ctx.call_stack.last_mut() {
-                                f.pc += 1;
-                            }
-                            continue;
+                    if let Some(i) = val.as_int32()
+                        && let Some(result) = i.checked_add(1)
+                    {
+                        let v = Value::int32(result);
+                        ctx.set_register(src.0, v);
+                        ctx.store_register_into_local(local_idx.0, src.0);
+                        if let Some(f) = ctx.call_stack.last_mut() {
+                            f.pc += 1;
                         }
+                        continue;
                     }
                     // Fall through for non-int32 or overflow
                 }
@@ -1930,14 +1921,14 @@ impl Interpreter {
                             frame.flags.is_construct(),
                             frame.flags.is_async(),
                             if frame.flags.is_construct() {
-                                frame.this_value.clone()
+                                frame.this_value
                             } else {
                                 Value::undefined()
                             },
                         )
                     };
                     if !is_derived {
-                        let value = ctx.get_register(src.0).clone();
+                        let value = *ctx.get_register(src.0);
                         if ctx.stack_depth() == 1 {
                             return Ok(value);
                         }
@@ -1969,7 +1960,7 @@ impl Interpreter {
                             frame.flags.is_construct(),
                             frame.flags.is_async(),
                             if frame.flags.is_construct() {
-                                frame.this_value.clone()
+                                frame.this_value
                             } else {
                                 Value::undefined()
                             },
@@ -2086,7 +2077,7 @@ impl Interpreter {
                             (
                                 frame.return_register,
                                 frame.flags.is_construct(),
-                                frame.this_value.clone(),
+                                frame.this_value,
                                 frame.flags.is_async(),
                             )
                         };
@@ -2149,7 +2140,7 @@ impl Interpreter {
                         // No handler: convert to an uncaught exception
                         return Err(VmError::Exception(Box::new(crate::error::ThrownValue {
                             message: self.to_string(&value),
-                            value: value.clone(),
+                            value,
                             stack: Vec::new(),
                         })));
                     }
@@ -2548,7 +2539,7 @@ impl Interpreter {
                             (
                                 frame.return_register,
                                 frame.flags.is_construct(),
-                                frame.this_value.clone(),
+                                frame.this_value,
                                 frame.flags.is_async(),
                             )
                         };
@@ -2594,7 +2585,7 @@ impl Interpreter {
                         }
                         return Err(VmError::Exception(Box::new(crate::error::ThrownValue {
                             message: self.to_string(&value),
-                            value: value.clone(),
+                            value,
                             stack: Vec::new(),
                         })));
                     }
@@ -2870,7 +2861,7 @@ impl Interpreter {
                             cached
                         } else {
                             let val = self.constant_to_value(ctx, constant)?;
-                            ctx.cache_regexp(module_id, idx.0, val.clone());
+                            ctx.cache_regexp(module_id, idx.0, val);
                             val
                         }
                     }
@@ -2906,16 +2897,16 @@ impl Interpreter {
 
             Instruction::IncLocal { local_idx, src } => {
                 // Fused Inc + SetLocal: increment src register and store to local
-                if let Some(value) = ctx.get_register(src.0).as_int32() {
-                    if let Some(result) = value.checked_add(1) {
-                        let v = Value::int32(result);
-                        ctx.set_register(src.0, v);
-                        ctx.store_register_into_local(local_idx.0, src.0);
-                        return Ok(());
-                    }
+                if let Some(value) = ctx.get_register(src.0).as_int32()
+                    && let Some(result) = value.checked_add(1)
+                {
+                    let v = Value::int32(result);
+                    ctx.set_register(src.0, v);
+                    ctx.store_register_into_local(local_idx.0, src.0);
+                    return Ok(());
                 }
 
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 if let Some(num) = value.as_number() {
                     let v = Value::number(num + 1.0);
                     ctx.set_register(src.0, v);
@@ -2948,7 +2939,7 @@ impl Interpreter {
 
             Instruction::SetUpvalue { idx, src } => {
                 // Set value in upvalue cell
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 ctx.set_upvalue(idx.0, value)?;
                 Ok(())
             }
@@ -3022,7 +3013,7 @@ impl Interpreter {
 
                 // Update IC
                 {
-                    let global_obj = ctx.global().clone();
+                    let global_obj = ctx.global();
                     if !global_obj.is_dictionary_mode() {
                         let key = Self::utf16_key(name_str);
                         if let Some(offset) = global_obj.shape_get_offset(&key) {
@@ -3030,20 +3021,20 @@ impl Interpreter {
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
                             let feedback = frame.feedback().write();
-                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                if matches!(
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize)
+                                && matches!(
                                     ic.ic_state,
                                     otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                                ) {
-                                    ic.ic_state =
-                                        otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                            shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
-                                                as u64,
-                                            proto_shape_id: 0,
-                                            depth: 0,
-                                            offset: offset as u32,
-                                        };
-                                }
+                                )
+                            {
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                            as u64,
+                                        proto_shape_id: 0,
+                                        depth: 0,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -3098,32 +3089,26 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
-                let val_val = ctx.get_register(src.0).clone();
+                let val_val = *ctx.get_register(src.0);
 
                 // IC Fast Path
                 {
-                    let global_obj = ctx.global().clone();
+                    let global_obj = ctx.global();
                     if !global_obj.is_dictionary_mode() {
                         let frame = ctx
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
                         let feedback = frame.feedback().read();
-                        if let Some(ic) = feedback.get(*ic_index as usize) {
-                            if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                        if let Some(ic) = feedback.get(*ic_index as usize)
+                            && let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
                                 shape_id: shape_addr,
                                 offset,
                                 ..
                             } = &ic.ic_state
-                            {
-                                if global_obj.shape_id() == *shape_addr {
-                                    if global_obj
-                                        .set_by_offset(*offset as usize, val_val.clone())
-                                        .is_ok()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                            }
+                            && global_obj.shape_id() == *shape_addr
+                            && global_obj.set_by_offset(*offset as usize, val_val).is_ok()
+                        {
+                            return Ok(());
                         }
                     }
                 }
@@ -3137,7 +3122,7 @@ impl Interpreter {
                         .unwrap_or(false);
 
                     if is_strict {
-                        let global_obj = ctx.global().clone();
+                        let global_obj = ctx.global();
                         let key = Self::utf16_key(name_str);
                         let property_exists = if global_obj.is_dictionary_mode() {
                             global_obj.has_own(&key)
@@ -3153,11 +3138,11 @@ impl Interpreter {
                     }
                 }
 
-                ctx.set_global_utf16(name_str, val_val.clone());
+                ctx.set_global_utf16(name_str, val_val);
 
                 // Update IC
                 {
-                    let global_obj = ctx.global().clone();
+                    let global_obj = ctx.global();
                     if !global_obj.is_dictionary_mode() {
                         let key = Self::utf16_key(name_str);
                         if let Some(offset) = global_obj.shape_get_offset(&key) {
@@ -3165,20 +3150,20 @@ impl Interpreter {
                                 .current_frame()
                                 .ok_or_else(|| VmError::internal("no frame"))?;
                             let feedback = frame.feedback().write();
-                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                if matches!(
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize)
+                                && matches!(
                                     ic.ic_state,
                                     otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                                ) {
-                                    ic.ic_state =
-                                        otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                            shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
-                                                as u64,
-                                            proto_shape_id: 0,
-                                            depth: 0,
-                                            offset: offset as u32,
-                                        };
-                                }
+                                )
+                            {
+                                ic.ic_state =
+                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                        shape_id: std::sync::Arc::as_ptr(&global_obj.shape())
+                                            as u64,
+                                        proto_shape_id: 0,
+                                        depth: 0,
+                                        offset: offset as u32,
+                                    };
                             }
                         }
                     }
@@ -3189,12 +3174,13 @@ impl Interpreter {
 
             Instruction::LoadThis { dst } => {
                 // In derived constructors, `this` is not available until super() is called
-                if let Some(frame) = ctx.current_frame() {
-                    if frame.flags.is_derived() && !frame.flags.this_initialized() {
-                        return Err(VmError::ReferenceError(
+                if let Some(frame) = ctx.current_frame()
+                    && frame.flags.is_derived()
+                    && !frame.flags.this_initialized()
+                {
+                    return Err(VmError::ReferenceError(
                             "Must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
                         ));
-                    }
                 }
                 let this_value = ctx.this_value();
                 ctx.set_register(dst.0, this_value);
@@ -3202,7 +3188,7 @@ impl Interpreter {
             }
 
             Instruction::ToNumber { dst, src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 let number = if value.is_object() {
                     let prim = self.to_primitive(ctx, &value, PreferredType::Number)?;
                     if prim.is_bigint() {
@@ -3226,34 +3212,34 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                if let Some(int_val) = value_ref.as_int32() {
-                    if (0..=9).contains(&int_val) {
-                        let cached_str = match int_val {
-                            0 => JsString::intern("0"),
-                            1 => JsString::intern("1"),
-                            2 => JsString::intern("2"),
-                            3 => JsString::intern("3"),
-                            4 => JsString::intern("4"),
-                            5 => JsString::intern("5"),
-                            6 => JsString::intern("6"),
-                            7 => JsString::intern("7"),
-                            8 => JsString::intern("8"),
-                            9 => JsString::intern("9"),
-                            _ => unreachable!(),
-                        };
-                        ctx.set_register(dst.0, Value::string(cached_str));
-                        return Ok(());
-                    }
+                if let Some(int_val) = value_ref.as_int32()
+                    && (0..=9).contains(&int_val)
+                {
+                    let cached_str = match int_val {
+                        0 => JsString::intern("0"),
+                        1 => JsString::intern("1"),
+                        2 => JsString::intern("2"),
+                        3 => JsString::intern("3"),
+                        4 => JsString::intern("4"),
+                        5 => JsString::intern("5"),
+                        6 => JsString::intern("6"),
+                        7 => JsString::intern("7"),
+                        8 => JsString::intern("8"),
+                        9 => JsString::intern("9"),
+                        _ => unreachable!(),
+                    };
+                    ctx.set_register(dst.0, Value::string(cached_str));
+                    return Ok(());
                 }
 
-                let value = value_ref.clone();
+                let value = *value_ref;
                 let s = self.to_string_value(ctx, &value)?;
                 ctx.set_register(dst.0, Value::string(JsString::intern(&s)));
                 Ok(())
             }
 
             Instruction::RequireCoercible { src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 if value.is_null() {
                     return Err(VmError::type_error("Cannot destructure 'null' value"));
                 }
@@ -3279,11 +3265,11 @@ impl Interpreter {
                                 let right = ctx.get_register(rhs.0);
                                 (left.as_int32(), right.as_int32())
                             };
-                            if let (Some(l), Some(r)) = fast_result {
-                                if let Some(result) = l.checked_add(r) {
-                                    ctx.set_register(dst.0, Value::int32(result));
-                                    return Ok(());
-                                }
+                            if let (Some(l), Some(r)) = fast_result
+                                && let Some(result) = l.checked_add(r)
+                            {
+                                ctx.set_register(dst.0, Value::int32(result));
+                                return Ok(());
                             }
                         }
                         ArithmeticType::Number => {
@@ -3304,8 +3290,8 @@ impl Interpreter {
                                 left.is_string() || right.is_string()
                             };
                             if uses_string {
-                                let left = ctx.get_register(lhs.0).clone();
-                                let right = ctx.get_register(rhs.0).clone();
+                                let left = *ctx.get_register(lhs.0);
+                                let right = *ctx.get_register(rhs.0);
                                 let result = self.op_add(ctx, &left, &right)?;
                                 ctx.set_register(dst.0, result);
                                 return Ok(());
@@ -3315,8 +3301,8 @@ impl Interpreter {
                 }
 
                 // Generic path
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
                 Self::update_arithmetic_ic(ctx, *feedback_index, &left, &right);
@@ -3338,11 +3324,11 @@ impl Interpreter {
                                 let right = ctx.get_register(rhs.0);
                                 (left.as_int32(), right.as_int32())
                             };
-                            if let (Some(l), Some(r)) = fast_result {
-                                if let Some(result) = l.checked_sub(r) {
-                                    ctx.set_register(dst.0, Value::int32(result));
-                                    return Ok(());
-                                }
+                            if let (Some(l), Some(r)) = fast_result
+                                && let Some(result) = l.checked_sub(r)
+                            {
+                                ctx.set_register(dst.0, Value::int32(result));
+                                return Ok(());
                             }
                         }
                         ArithmeticType::Number => {
@@ -3361,8 +3347,8 @@ impl Interpreter {
                 }
 
                 // Generic path (ToNumeric)
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
+                let left_value = *ctx.get_register(lhs.0);
+                let right_value = *ctx.get_register(rhs.0);
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3381,14 +3367,14 @@ impl Interpreter {
             }
 
             Instruction::Inc { dst, src } => {
-                if let Some(value) = ctx.get_register(src.0).as_int32() {
-                    if let Some(result) = value.checked_add(1) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(());
-                    }
+                if let Some(value) = ctx.get_register(src.0).as_int32()
+                    && let Some(result) = value.checked_add(1)
+                {
+                    ctx.set_register(dst.0, Value::int32(result));
+                    return Ok(());
                 }
 
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 if let Some(num) = value.as_number() {
                     ctx.set_register(dst.0, Value::number(num + 1.0));
                     return Ok(());
@@ -3408,14 +3394,14 @@ impl Interpreter {
             }
 
             Instruction::Dec { dst, src } => {
-                if let Some(value) = ctx.get_register(src.0).as_int32() {
-                    if let Some(result) = value.checked_sub(1) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(());
-                    }
+                if let Some(value) = ctx.get_register(src.0).as_int32()
+                    && let Some(result) = value.checked_sub(1)
+                {
+                    ctx.set_register(dst.0, Value::int32(result));
+                    return Ok(());
                 }
 
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 if let Some(num) = value.as_number() {
                     ctx.set_register(dst.0, Value::number(num - 1.0));
                     return Ok(());
@@ -3450,11 +3436,11 @@ impl Interpreter {
                                 let right = ctx.get_register(rhs.0);
                                 (left.as_int32(), right.as_int32())
                             };
-                            if let (Some(l), Some(r)) = fast_result {
-                                if let Some(result) = l.checked_mul(r) {
-                                    ctx.set_register(dst.0, Value::int32(result));
-                                    return Ok(());
-                                }
+                            if let (Some(l), Some(r)) = fast_result
+                                && let Some(result) = l.checked_mul(r)
+                            {
+                                ctx.set_register(dst.0, Value::int32(result));
+                                return Ok(());
                             }
                         }
                         ArithmeticType::Number => {
@@ -3481,8 +3467,8 @@ impl Interpreter {
                 );
 
                 // Generic path (ToNumeric)
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
+                let left_value = *ctx.get_register(lhs.0);
+                let right_value = *ctx.get_register(rhs.0);
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3515,14 +3501,13 @@ impl Interpreter {
                                 let right = ctx.get_register(rhs.0);
                                 (left.as_int32(), right.as_int32())
                             };
-                            if let (Some(l), Some(r)) = fast_result {
-                                if let Some(rem) = l.checked_rem(r)
-                                    && rem == 0
-                                    && let Some(quotient) = l.checked_div(r)
-                                {
-                                    ctx.set_register(dst.0, Value::int32(quotient));
-                                    return Ok(());
-                                }
+                            if let (Some(l), Some(r)) = fast_result
+                                && let Some(rem) = l.checked_rem(r)
+                                && rem == 0
+                                && let Some(quotient) = l.checked_div(r)
+                            {
+                                ctx.set_register(dst.0, Value::int32(quotient));
+                                return Ok(());
                             }
                         }
                         ArithmeticType::Number => {
@@ -3549,8 +3534,8 @@ impl Interpreter {
                 );
 
                 // Generic path (ToNumeric)
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
+                let left_value = *ctx.get_register(lhs.0);
+                let right_value = *ctx.get_register(rhs.0);
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3571,8 +3556,8 @@ impl Interpreter {
             }
 
             Instruction::Mod { dst, lhs, rhs } => {
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
+                let left_value = *ctx.get_register(lhs.0);
+                let right_value = *ctx.get_register(rhs.0);
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3593,8 +3578,8 @@ impl Interpreter {
             }
 
             Instruction::Pow { dst, lhs, rhs } => {
-                let left_value = ctx.get_register(lhs.0).clone();
-                let right_value = ctx.get_register(rhs.0).clone();
+                let left_value = *ctx.get_register(lhs.0);
+                let right_value = *ctx.get_register(rhs.0);
                 let left_num = self.to_numeric(ctx, &left_value)?;
                 let right_num = self.to_numeric(ctx, &right_value)?;
 
@@ -3620,7 +3605,7 @@ impl Interpreter {
             }
 
             Instruction::Neg { dst, src } => {
-                let val = ctx.get_register(src.0).clone();
+                let val = *ctx.get_register(src.0);
                 let numeric = self.to_numeric(ctx, &val)?;
                 match numeric {
                     Numeric::BigInt(bigint) => {
@@ -3636,8 +3621,8 @@ impl Interpreter {
 
             // ==================== Comparison ====================
             Instruction::Eq { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
 
                 let result = self.abstract_equal(ctx, &left, &right)?;
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -3645,8 +3630,8 @@ impl Interpreter {
             }
 
             Instruction::Ne { dst, lhs, rhs } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
 
                 let result = !self.abstract_equal(ctx, &left, &right)?;
                 ctx.set_register(dst.0, Value::boolean(result));
@@ -3691,8 +3676,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let left_val = ctx.get_register(lhs.0).clone();
-                let right_val = ctx.get_register(rhs.0).clone();
+                let left_val = *ctx.get_register(lhs.0);
+                let right_val = *ctx.get_register(rhs.0);
                 let left = self.to_numeric(ctx, &left_val)?;
                 let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Less));
@@ -3719,8 +3704,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let left_val = ctx.get_register(lhs.0).clone();
-                let right_val = ctx.get_register(rhs.0).clone();
+                let left_val = *ctx.get_register(lhs.0);
+                let right_val = *ctx.get_register(rhs.0);
                 let left = self.to_numeric(ctx, &left_val)?;
                 let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(
@@ -3750,8 +3735,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let left_val = ctx.get_register(lhs.0).clone();
-                let right_val = ctx.get_register(rhs.0).clone();
+                let left_val = *ctx.get_register(lhs.0);
+                let right_val = *ctx.get_register(rhs.0);
                 let left = self.to_numeric(ctx, &left_val)?;
                 let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(self.numeric_compare(left, right)?, Some(Ordering::Greater));
@@ -3778,8 +3763,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let left_val = ctx.get_register(lhs.0).clone();
-                let right_val = ctx.get_register(rhs.0).clone();
+                let left_val = *ctx.get_register(lhs.0);
+                let right_val = *ctx.get_register(rhs.0);
                 let left = self.to_numeric(ctx, &left_val)?;
                 let right = self.to_numeric(ctx, &right_val)?;
                 let result = matches!(
@@ -3816,7 +3801,7 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
-                let type_name = match ctx.get_global_utf16(&name_str) {
+                let type_name = match ctx.get_global_utf16(name_str) {
                     Some(value) => value.type_of(),
                     None => "undefined",
                 };
@@ -3831,8 +3816,8 @@ impl Interpreter {
                 rhs,
                 ic_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
 
                 // Step 1: If right is not an object, throw TypeError
                 let Some(right_obj) = right.as_object() else {
@@ -3854,8 +3839,7 @@ impl Interpreter {
                         return Err(VmError::type_error("@@hasInstance is not callable"));
                     }
                     // Step 2b: Call handler with this=right, args=[left]
-                    let result =
-                        self.call_function(ctx, &handler, right.clone(), &[left.clone()])?;
+                    let result = self.call_function(ctx, &handler, right, &[left])?;
                     // Step 2c: Return ToBoolean(result)
                     ctx.set_register(dst.0, Value::boolean(result.to_boolean()));
                     return Ok(());
@@ -3961,8 +3945,8 @@ impl Interpreter {
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
+                                        for entry in &entries[..(*count as usize)] {
+                                            if entry.0 == shape_ptr {
                                                 found = true;
                                                 break;
                                             }
@@ -4016,8 +4000,8 @@ impl Interpreter {
                 rhs,
                 ic_index: _ic_index,
             } => {
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
 
                 // Proxy check - must be first
                 if let Some(proxy) = right.as_proxy() {
@@ -4033,7 +4017,7 @@ impl Interpreter {
                     };
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
-                        crate::proxy_operations::proxy_has(&mut ncx, proxy, &key, left.clone())?
+                        crate::proxy_operations::proxy_has(&mut ncx, proxy, &key, left)?
                     };
                     ctx.set_register(dst.0, Value::boolean(result));
                     return Ok(());
@@ -4056,7 +4040,7 @@ impl Interpreter {
                     PropertyKey::string(&idx_str)
                 };
 
-                let result = self.has_with_proxy_chain(ctx, &right_obj, &key, left.clone())?;
+                let result = self.has_with_proxy_chain(ctx, &right_obj, &key, left)?;
                 ctx.set_register(dst.0, Value::boolean(result));
                 Ok(())
             }
@@ -4128,7 +4112,7 @@ impl Interpreter {
             }
 
             Instruction::Throw { src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 ctx.dispatch_action = Some(DispatchAction::Throw(value));
                 Ok(())
             }
@@ -4239,7 +4223,7 @@ impl Interpreter {
                             },
                         },
                     );
-                    let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
+                    let _ = proto.set(PropertyKey::string("constructor"), func_value);
                 }
                 ctx.set_register(dst.0, func_value);
                 Ok(())
@@ -4403,7 +4387,7 @@ impl Interpreter {
                         },
                     },
                 );
-                let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
+                let _ = proto.set(PropertyKey::string("constructor"), func_value);
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
                     PropertyDescriptor::Data {
@@ -4497,7 +4481,7 @@ impl Interpreter {
                         },
                     },
                 );
-                let _ = proto.set(PropertyKey::string("constructor"), func_value.clone());
+                let _ = proto.set(PropertyKey::string("constructor"), func_value);
                 func_obj.define_property(
                     PropertyKey::string("__non_constructor"),
                     PropertyDescriptor::Data {
@@ -4519,7 +4503,7 @@ impl Interpreter {
                 argc,
                 ic_index,
             } => {
-                let func_value = ctx.get_register(func.0).clone();
+                let func_value = *ctx.get_register(func.0);
 
                 // Fast path: direct closure call (non-generator) avoids generic call dispatch.
                 if let Some(closure) = func_value.as_function()
@@ -4528,26 +4512,26 @@ impl Interpreter {
                     // Record call target IC (callee_bits + func_index + module_id + is_async).
                     // Uses callee_bits to skip recording on monomorphic hit (same closure).
                     // JIT uses this data for monomorphic call specialization.
-                    if *ic_index > 0 {
-                        if let Some(frame) = ctx.current_frame() {
-                            let feedback = frame.feedback().write();
-                            if let Some(md) = feedback.get_mut(*ic_index as usize) {
-                                let bits = func_value.to_bits_raw();
-                                if md.callee_bits != bits {
-                                    // First call or callee changed — update IC
-                                    let func_idx = closure.function_index;
-                                    let mod_id = closure.module.module_id;
-                                    if md.call_target_func_index == 0 {
-                                        md.callee_bits = bits;
-                                        md.call_target_func_index = func_idx.wrapping_add(1);
-                                        md.call_target_module_id = mod_id;
-                                        md.call_target_is_async = closure.is_async;
-                                    } else {
-                                        md.call_target_func_index = u32::MAX; // megamorphic
-                                    }
+                    if *ic_index > 0
+                        && let Some(frame) = ctx.current_frame()
+                    {
+                        let feedback = frame.feedback().write();
+                        if let Some(md) = feedback.get_mut(*ic_index as usize) {
+                            let bits = func_value.to_bits_raw();
+                            if md.callee_bits != bits {
+                                // First call or callee changed — update IC
+                                let func_idx = closure.function_index;
+                                let mod_id = closure.module.module_id;
+                                if md.call_target_func_index == 0 {
+                                    md.callee_bits = bits;
+                                    md.call_target_func_index = func_idx.wrapping_add(1);
+                                    md.call_target_module_id = mod_id;
+                                    md.call_target_is_async = closure.is_async;
+                                } else {
+                                    md.call_target_func_index = u32::MAX; // megamorphic
                                 }
-                                // else: callee_bits match → monomorphic, skip recording
                             }
+                            // else: callee_bits match → monomorphic, skip recording
                         }
                     }
 
@@ -4556,9 +4540,9 @@ impl Interpreter {
                     ctx.set_pending_realm_id(realm_id);
                     ctx.set_pending_this(Value::undefined());
                     if let Some(ref home_object) = closure.home_object {
-                        ctx.set_pending_home_object(home_object.clone());
+                        ctx.set_pending_home_object(*home_object);
                     }
-                    ctx.set_pending_callee_value(func_value.clone());
+                    ctx.set_pending_callee_value(func_value);
 
                     ctx.dispatch_action = Some(DispatchAction::Call {
                         func_index: closure.function_index,
@@ -4575,7 +4559,7 @@ impl Interpreter {
                 // Collect arguments upfront (used by multiple paths)
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    let arg = *ctx.get_register(func.0 + 1 + i);
                     args.push(arg);
                 }
 
@@ -4618,22 +4602,21 @@ impl Interpreter {
                     }
 
                     // Record FFI call target IC for JIT fast path
-                    if *ic_index > 0 {
-                        if let Some(ffi_info_ptr) = func_value.ffi_call_info() {
-                            if let Some(frame) = ctx.current_frame() {
-                                let feedback = frame.feedback().write();
-                                if let Some(md) = feedback.get_mut(*ic_index as usize) {
-                                    let bits = func_value.to_bits_raw();
-                                    if md.callee_bits != bits {
-                                        if md.ffi_call_info_ptr == 0 {
-                                            md.callee_bits = bits;
-                                            md.ffi_call_info_ptr = ffi_info_ptr as u64;
-                                        } else {
-                                            // Multiple FFI targets → megamorphic
-                                            md.ffi_call_info_ptr = 0;
-                                            md.call_target_func_index = u32::MAX;
-                                        }
-                                    }
+                    if *ic_index > 0
+                        && let Some(ffi_info_ptr) = func_value.ffi_call_info()
+                        && let Some(frame) = ctx.current_frame()
+                    {
+                        let feedback = frame.feedback().write();
+                        if let Some(md) = feedback.get_mut(*ic_index as usize) {
+                            let bits = func_value.to_bits_raw();
+                            if md.callee_bits != bits {
+                                if md.ffi_call_info_ptr == 0 {
+                                    md.callee_bits = bits;
+                                    md.ffi_call_info_ptr = ffi_info_ptr as u64;
+                                } else {
+                                    // Multiple FFI targets → megamorphic
+                                    md.ffi_call_info_ptr = 0;
+                                    md.call_target_func_index = u32::MAX;
                                 }
                             }
                         }
@@ -4646,74 +4629,69 @@ impl Interpreter {
                 }
 
                 // Check if it's a bound function (object with __boundFunction__)
-                if let Some(obj) = func_value.as_object() {
-                    if let Some(bound_fn) = obj.get(&PropertyKey::string("__boundFunction__")) {
-                        // Get bound thisArg, converting null/undefined to globalThis (non-strict mode)
-                        let raw_this_arg = obj
-                            .get(&PropertyKey::string("__boundThis__"))
-                            .unwrap_or_else(Value::undefined);
-                        let this_arg = if raw_this_arg.is_null() || raw_this_arg.is_undefined() {
-                            Value::object(ctx.global())
-                        } else {
-                            raw_this_arg
-                        };
+                if let Some(obj) = func_value.as_object()
+                    && let Some(bound_fn) = obj.get(&PropertyKey::string("__boundFunction__"))
+                {
+                    // Get bound thisArg, converting null/undefined to globalThis (non-strict mode)
+                    let raw_this_arg = obj
+                        .get(&PropertyKey::string("__boundThis__"))
+                        .unwrap_or_else(Value::undefined);
+                    let this_arg = if raw_this_arg.is_null() || raw_this_arg.is_undefined() {
+                        Value::object(ctx.global())
+                    } else {
+                        raw_this_arg
+                    };
 
-                        // Collect bound arguments
-                        let mut all_args = Vec::new();
-                        if let Some(bound_args_val) = obj.get(&PropertyKey::string("__boundArgs__"))
-                        {
-                            if let Some(args_obj) = bound_args_val.as_object() {
-                                let len = if let Some(len_val) =
-                                    args_obj.get(&PropertyKey::string("length"))
-                                {
-                                    len_val.as_int32().unwrap_or(0) as usize
-                                } else {
-                                    0
-                                };
-                                for i in 0..len {
-                                    all_args.push(
-                                        args_obj
-                                            .get(&PropertyKey::Index(i as u32))
-                                            .unwrap_or_else(Value::undefined),
-                                    );
-                                }
-                            }
+                    // Collect bound arguments
+                    let mut all_args = Vec::new();
+                    if let Some(bound_args_val) = obj.get(&PropertyKey::string("__boundArgs__"))
+                        && let Some(args_obj) = bound_args_val.as_object()
+                    {
+                        let len =
+                            if let Some(len_val) = args_obj.get(&PropertyKey::string("length")) {
+                                len_val.as_int32().unwrap_or(0) as usize
+                            } else {
+                                0
+                            };
+                        for i in 0..len {
+                            all_args.push(
+                                args_obj
+                                    .get(&PropertyKey::Index(i as u32))
+                                    .unwrap_or_else(Value::undefined),
+                            );
                         }
+                    }
 
-                        // Add call-time arguments
-                        for i in 0..(*argc as u16) {
-                            all_args.push(ctx.get_register(func.0 + 1 + i).clone());
-                        }
+                    // Add call-time arguments
+                    for i in 0..(*argc as u16) {
+                        all_args.push(*ctx.get_register(func.0 + 1 + i));
+                    }
 
-                        // Call the bound function with the bound this and combined args
-                        if let Some(native_fn) = bound_fn.as_native_function() {
-                            // For native functions, we can't set 'this' directly
-                            // but most native functions don't use 'this'
-                            let result =
-                                self.call_native_fn(ctx, native_fn, &this_arg, &all_args)?;
-                            ctx.set_register(dst.0, result);
-                            return Ok(());
-                        } else if let Some(closure) = bound_fn.as_function() {
-                            // Set the bound this and args
-                            let argc = all_args.len() as u8;
-                            ctx.set_pending_this(this_arg);
-                            ctx.set_pending_args_from_vec(all_args);
+                    // Call the bound function with the bound this and combined args
+                    if let Some(native_fn) = bound_fn.as_native_function() {
+                        // For native functions, we can't set 'this' directly
+                        // but most native functions don't use 'this'
+                        let result = self.call_native_fn(ctx, native_fn, &this_arg, &all_args)?;
+                        ctx.set_register(dst.0, result);
+                        return Ok(());
+                    } else if let Some(closure) = bound_fn.as_function() {
+                        // Set the bound this and args
+                        let argc = all_args.len() as u8;
+                        ctx.set_pending_this(this_arg);
+                        ctx.set_pending_args_from_vec(all_args);
 
-                            ctx.dispatch_action = Some(DispatchAction::Call {
-                                func_index: closure.function_index,
-                                module_id: closure.module.module_id,
-                                argc,
-                                return_reg: dst.0,
-                                is_construct: false,
-                                is_async: closure.is_async,
-                                upvalues: closure.upvalues.clone(),
-                            });
-                            return Ok(());
-                        } else {
-                            return Err(VmError::type_error(
-                                "bound function target is not callable",
-                            ));
-                        }
+                        ctx.dispatch_action = Some(DispatchAction::Call {
+                            func_index: closure.function_index,
+                            module_id: closure.module.module_id,
+                            argc,
+                            return_reg: dst.0,
+                            is_construct: false,
+                            is_async: closure.is_async,
+                            upvalues: closure.upvalues.clone(),
+                        });
+                        return Ok(());
+                    } else {
+                        return Err(VmError::type_error("bound function target is not callable"));
                     }
                 }
 
@@ -4726,8 +4704,8 @@ impl Interpreter {
                 this,
                 argc,
             } => {
-                let func_value = ctx.get_register(func.0).clone();
-                let this_value = ctx.get_register(this.0).clone();
+                let func_value = *ctx.get_register(func.0);
+                let this_value = *ctx.get_register(this.0);
 
                 // Fast path: direct closure call (non-generator) with explicit receiver.
                 if let Some(closure) = func_value.as_function()
@@ -4738,9 +4716,9 @@ impl Interpreter {
                     ctx.set_pending_realm_id(realm_id);
                     ctx.set_pending_this(this_value);
                     if let Some(ref home_object) = closure.home_object {
-                        ctx.set_pending_home_object(home_object.clone());
+                        ctx.set_pending_home_object(*home_object);
                     }
-                    ctx.set_pending_callee_value(func_value.clone());
+                    ctx.set_pending_callee_value(func_value);
 
                     ctx.dispatch_action = Some(DispatchAction::Call {
                         func_index: closure.function_index,
@@ -4756,7 +4734,7 @@ impl Interpreter {
 
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    let arg = *ctx.get_register(func.0 + 1 + i);
                     args.push(arg);
                 }
 
@@ -4764,14 +4742,14 @@ impl Interpreter {
             }
 
             Instruction::TailCall { func, argc } => {
-                let func_value = ctx.get_register(func.0).clone();
+                let func_value = *ctx.get_register(func.0);
 
                 // Native functions don't benefit from tail call optimization
                 // (they execute immediately), so just call and return
                 if let Some(native_fn) = func_value.as_native_function() {
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        let arg = *ctx.get_register(func.0 + 1 + i);
                         args.push(arg);
                     }
                     let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
@@ -4805,44 +4783,37 @@ impl Interpreter {
             }
 
             Instruction::Construct { dst, func, argc } => {
-                let func_value = ctx.get_register(func.0).clone();
+                let func_value = *ctx.get_register(func.0);
 
                 // Check if it's a proxy with construct trap
                 if let Some(proxy) = func_value.as_proxy() {
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        let arg = *ctx.get_register(func.0 + 1 + i);
                         args.push(arg);
                     }
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_construct(
-                            &mut ncx,
-                            proxy,
-                            &args,
-                            func_value.clone(), // new.target
+                            &mut ncx, proxy, &args, func_value, // new.target
                         )?
                     };
                     ctx.set_register(dst.0, result);
                     return Ok(());
                 }
 
-                if let Some(func_obj) = func_value.as_object() {
-                    if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
-                        func_obj.get_own_property_descriptor(&PropertyKey::string(
-                            "__non_constructor",
-                        ))
-                    {
-                        if value.as_boolean() == Some(true) {
-                            return Err(VmError::type_error("not a constructor"));
-                        }
-                    }
+                if let Some(func_obj) = func_value.as_object()
+                    && let Some(crate::object::PropertyDescriptor::Data { value, .. }) = func_obj
+                        .get_own_property_descriptor(&PropertyKey::string("__non_constructor"))
+                    && value.as_boolean() == Some(true)
+                {
+                    return Err(VmError::type_error("not a constructor"));
                 }
 
                 if let Some(native_fn) = func_value.as_native_function() {
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        let arg = ctx.get_register(func.0 + 1 + i).clone();
+                        let arg = *ctx.get_register(func.0 + 1 + i);
                         args.push(arg);
                     }
 
@@ -4855,34 +4826,23 @@ impl Interpreter {
                             self.default_object_prototype_for_constructor(ctx, &func_value)
                         });
                     let new_obj = GcRef::new(JsObject::new(
-                        ctor_proto
-                            .clone()
-                            .map(Value::object)
-                            .unwrap_or_else(Value::null),
+                        ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                     ));
-                    let new_obj_value = Value::object(new_obj.clone());
+                    let new_obj_value = Value::object(new_obj);
 
                     // Capture stack trace for Error objects
-                    if let Some(proto) = ctor_proto {
-                        if proto
+                    if let Some(proto) = ctor_proto
+                        && proto
                             .get(&PropertyKey::string("__is_error__"))
                             .and_then(|v| v.as_boolean())
                             == Some(true)
-                        {
-                            Self::capture_error_stack_trace(new_obj.clone(), ctx);
-                        }
+                    {
+                        Self::capture_error_stack_trace(new_obj, ctx);
                     }
 
                     // Call native constructor with depth tracking
-                    let result = match self.call_native_fn_construct(
-                        ctx,
-                        native_fn,
-                        &new_obj_value,
-                        &args,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    };
+                    let result =
+                        self.call_native_fn_construct(ctx, native_fn, &new_obj_value, &args)?;
                     // Per spec, if the constructor returns an object, use it;
                     // otherwise use the newly created `this` object.
                     // DataView, ArrayBuffer, and TypedArray are object-like
@@ -4919,16 +4879,16 @@ impl Interpreter {
 
                         // Set callee_value so CallSuper can find the super constructor
                         // via Object.getPrototypeOf(callee) (static inheritance chain)
-                        ctx.set_pending_callee_value(func_value.clone());
+                        ctx.set_pending_callee_value(func_value);
 
                         // Set home_object = the constructor's .prototype
                         // (used by super() to find the parent constructor)
                         if let Some(ctor_obj) = func_value.as_object() {
                             let proto_key = PropertyKey::string("prototype");
-                            if let Some(proto_val) = ctor_obj.get(&proto_key) {
-                                if let Some(proto_obj) = proto_val.as_object() {
-                                    ctx.set_pending_home_object(proto_obj);
-                                }
+                            if let Some(proto_val) = ctor_obj.get(&proto_key)
+                                && let Some(proto_obj) = proto_val.as_object()
+                            {
+                                ctx.set_pending_home_object(proto_obj);
                             }
                         }
 
@@ -4944,26 +4904,22 @@ impl Interpreter {
                                 self.default_object_prototype_for_constructor(ctx, &func_value)
                             });
                         let new_obj = GcRef::new(JsObject::new(
-                            ctor_proto
-                                .clone()
-                                .map(Value::object)
-                                .unwrap_or_else(Value::null),
+                            ctor_proto.map(Value::object).unwrap_or_else(Value::null),
                         ));
-                        let new_obj_value = Value::object(new_obj.clone());
+                        let new_obj_value = Value::object(new_obj);
 
                         // Capture stack trace for Error objects
-                        if let Some(proto) = ctor_proto {
-                            if proto
+                        if let Some(proto) = ctor_proto
+                            && proto
                                 .get(&PropertyKey::string("__is_error__"))
                                 .and_then(|v| v.as_boolean())
                                 == Some(true)
-                            {
-                                Self::capture_error_stack_trace(new_obj.clone(), ctx);
-                            }
+                        {
+                            Self::capture_error_stack_trace(new_obj, ctx);
                         }
 
                         ctx.set_pending_args_from_register_range(func.0 + 1, *argc as u16);
-                        ctx.set_pending_this(new_obj_value.clone());
+                        ctx.set_pending_this(new_obj_value);
 
                         // Pre-set dst to the new object (will be returned if constructor returns undefined)
                         ctx.set_register(dst.0, new_obj_value);
@@ -4994,7 +4950,7 @@ impl Interpreter {
                 argc,
                 ic_index,
             } => {
-                let receiver = ctx.get_register(obj.0).clone();
+                let receiver = *ctx.get_register(obj.0);
                 let method_const = module
                     .constants
                     .get(method.0)
@@ -5054,25 +5010,25 @@ impl Interpreter {
                         ctx.set_pending_realm_id(realm_id);
                         ctx.set_pending_this(receiver);
                         if let Some(ref home_object) = closure.home_object {
-                            ctx.set_pending_home_object(home_object.clone());
+                            ctx.set_pending_home_object(*home_object);
                         }
-                        ctx.set_pending_callee_value(method_value.clone());
+                        ctx.set_pending_callee_value(method_value);
 
                         // Record call target IC for this method call site
-                        if let Some(frame) = ctx.current_frame() {
-                            if let Some(md) = frame.feedback().write().get_mut(*ic_index as usize) {
-                                let func_idx = closure.function_index;
-                                let mod_id = closure.module.module_id;
-                                if md.call_target_func_index == 0 {
-                                    md.callee_bits = method_value.to_bits_raw();
-                                    md.call_target_func_index = func_idx.wrapping_add(1);
-                                    md.call_target_module_id = mod_id;
-                                    md.call_target_is_async = closure.is_async;
-                                } else if md.call_target_func_index != func_idx.wrapping_add(1)
-                                    || md.call_target_module_id != mod_id
-                                {
-                                    md.call_target_func_index = u32::MAX;
-                                }
+                        if let Some(frame) = ctx.current_frame()
+                            && let Some(md) = frame.feedback().write().get_mut(*ic_index as usize)
+                        {
+                            let func_idx = closure.function_index;
+                            let mod_id = closure.module.module_id;
+                            if md.call_target_func_index == 0 {
+                                md.callee_bits = method_value.to_bits_raw();
+                                md.call_target_func_index = func_idx.wrapping_add(1);
+                                md.call_target_module_id = mod_id;
+                                md.call_target_is_async = closure.is_async;
+                            } else if md.call_target_func_index != func_idx.wrapping_add(1)
+                                || md.call_target_module_id != mod_id
+                            {
+                                md.call_target_func_index = u32::MAX;
                             }
                         }
 
@@ -5091,7 +5047,7 @@ impl Interpreter {
                     // Fallback: native functions, bound functions, generators
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        args.push(ctx.get_register(obj.0 + 1 + i).clone());
+                        args.push(*ctx.get_register(obj.0 + 1 + i));
                     }
                     return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
                 }
@@ -5103,13 +5059,7 @@ impl Interpreter {
                     let key = Self::utf16_key(method_name);
                     let key_value = Value::string(JsString::intern_utf16(method_name));
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                    crate::proxy_operations::proxy_get(
-                        &mut ncx,
-                        proxy,
-                        &key,
-                        key_value,
-                        receiver.clone(),
-                    )?
+                    crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, receiver)?
                 } else if receiver.is_function() || receiver.is_native_function() {
                     let function_global = ctx.get_global("Function");
                     let function_obj = function_global
@@ -5134,62 +5084,62 @@ impl Interpreter {
                 } else if let Some(obj_ref) = receiver.as_object() {
                     let key = Self::utf16_key(method_name);
 
-                    if !obj_ref.is_dictionary_mode() {
-                        if let Some(offset) = obj_ref.shape_get_offset(&key) {
-                            let frame = ctx
-                                .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let feedback = frame.feedback().write();
-                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = obj_ref.shape_id();
-                                let current_epoch = ctx.cached_proto_epoch;
+                    if !obj_ref.is_dictionary_mode()
+                        && let Some(offset) = obj_ref.shape_get_offset(&key)
+                    {
+                        let frame = ctx
+                            .current_frame()
+                            .ok_or_else(|| VmError::internal("no frame"))?;
+                        let feedback = frame.feedback().write();
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                            use otter_vm_bytecode::function::InlineCacheState;
+                            let shape_ptr = obj_ref.shape_id();
+                            let current_epoch = ctx.cached_proto_epoch;
 
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Uninitialized => {
-                                        ic.ic_state = InlineCacheState::Monomorphic {
-                                            shape_id: shape_ptr,
-                                            proto_shape_id: 0,
-                                            depth: 0,
-                                            offset: offset as u32,
-                                        };
+                            match &mut ic.ic_state {
+                                InlineCacheState::Uninitialized => {
+                                    ic.ic_state = InlineCacheState::Monomorphic {
+                                        shape_id: shape_ptr,
+                                        proto_shape_id: 0,
+                                        depth: 0,
+                                        offset: offset as u32,
+                                    };
+                                    ic.proto_epoch = current_epoch;
+                                }
+                                InlineCacheState::Monomorphic {
+                                    shape_id: old_shape,
+                                    offset: old_offset,
+                                    ..
+                                } => {
+                                    if *old_shape != shape_ptr {
+                                        let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                        entries[0] = (*old_shape, 0, 0, *old_offset);
+                                        entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                        ic.ic_state =
+                                            InlineCacheState::Polymorphic { count: 2, entries };
                                         ic.proto_epoch = current_epoch;
                                     }
-                                    InlineCacheState::Monomorphic {
-                                        shape_id: old_shape,
-                                        offset: old_offset,
-                                        ..
-                                    } => {
-                                        if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                            entries[0] = (*old_shape, 0, 0, *old_offset);
-                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                            ic.ic_state =
-                                                InlineCacheState::Polymorphic { count: 2, entries };
-                                            ic.proto_epoch = current_epoch;
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        if !found {
-                                            if (*count as usize) < 4 {
-                                                entries[*count as usize] =
-                                                    (shape_ptr, 0, 0, offset as u32);
-                                                *count += 1;
-                                                ic.proto_epoch = current_epoch;
-                                            } else {
-                                                ic.ic_state = InlineCacheState::Megamorphic;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                                InlineCacheState::Polymorphic { count, entries } => {
+                                    let mut found = false;
+                                    for entry in &entries[..(*count as usize)] {
+                                        if entry.0 == shape_ptr {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if !found {
+                                        if (*count as usize) < 4 {
+                                            entries[*count as usize] =
+                                                (shape_ptr, 0, 0, offset as u32);
+                                            *count += 1;
+                                            ic.proto_epoch = current_epoch;
+                                        } else {
+                                            ic.ic_state = InlineCacheState::Megamorphic;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -5213,7 +5163,7 @@ impl Interpreter {
 
                         // Get the sent value (first argument if present)
                         let sent_value = if *argc > 0 {
-                            Some(ctx.get_register(obj.0 + 1).clone())
+                            Some(*ctx.get_register(obj.0 + 1))
                         } else {
                             None
                         };
@@ -5249,7 +5199,7 @@ impl Interpreter {
                                     GeneratorResult::Error(VmError::exception(error_value))
                                 } else {
                                     // Set pending throw and resume
-                                    generator.set_pending_throw(error_value.clone());
+                                    generator.set_pending_throw(error_value);
                                     self.execute_generator(generator, ctx, None)
                                 }
                             }
@@ -5382,18 +5332,9 @@ impl Interpreter {
                     let key_val = Value::string(crate::string::JsString::intern(&key_str));
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
-                        crate::proxy_operations::proxy_get(
-                            &mut ncx,
-                            proxy,
-                            &key,
-                            key_val,
-                            receiver.clone(),
-                        )
+                        crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_val, receiver)
                     };
-                    match result {
-                        Ok(val) => val,
-                        Err(_) => Value::undefined(),
-                    }
+                    result.unwrap_or_default()
                 } else {
                     return Err(VmError::type_error("Cannot read property of non-object"));
                 };
@@ -5411,7 +5352,7 @@ impl Interpreter {
 
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    args.push(ctx.get_register(obj.0 + 1 + i).clone());
+                    args.push(*ctx.get_register(obj.0 + 1 + i));
                 }
 
                 // Update IC if method was found on the object itself
@@ -5422,19 +5363,19 @@ impl Interpreter {
                             .current_frame()
                             .ok_or_else(|| VmError::internal("no frame"))?;
                         let feedback = frame.feedback().write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            if matches!(
+                        if let Some(ic) = feedback.get_mut(*ic_index as usize)
+                            && matches!(
                                 ic.ic_state,
                                 otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                            ) {
-                                ic.ic_state =
-                                    otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                                        shape_id: obj_ref.shape_id(),
-                                        proto_shape_id: 0,
-                                        depth: 0,
-                                        offset: offset as u32,
-                                    };
-                            }
+                            )
+                        {
+                            ic.ic_state =
+                                otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: obj_ref.shape_id(),
+                                    proto_shape_id: 0,
+                                    depth: 0,
+                                    offset: offset as u32,
+                                };
                         }
                     }
                 }
@@ -5443,28 +5384,27 @@ impl Interpreter {
             }
 
             Instruction::Return { src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 // In derived constructors:
                 // - returning an object is OK
                 // - returning undefined after super() was called: return this
                 // - returning non-object or undefined without super(): error
-                if let Some(frame) = ctx.current_frame() {
-                    if frame.flags.is_derived() {
-                        if value.is_object() {
-                            // Explicit object return is fine
-                        } else if value.is_undefined() && frame.flags.this_initialized() {
-                            // Implicit/explicit undefined return → return this
-                            ctx.dispatch_action =
-                                Some(DispatchAction::Return(frame.this_value.clone()));
-                            return Ok(());
-                        } else if !frame.flags.this_initialized() {
-                            return Err(VmError::ReferenceError(
+                if let Some(frame) = ctx.current_frame()
+                    && frame.flags.is_derived()
+                {
+                    if value.is_object() {
+                        // Explicit object return is fine
+                    } else if value.is_undefined() && frame.flags.this_initialized() {
+                        // Implicit/explicit undefined return → return this
+                        ctx.dispatch_action = Some(DispatchAction::Return(frame.this_value));
+                        return Ok(());
+                    } else if !frame.flags.this_initialized() {
+                        return Err(VmError::ReferenceError(
                                 "Must call super constructor in derived class before returning from derived constructor".to_string(),
                             ));
-                        }
-                        // Non-object, non-undefined explicit return in derived: TypeError per spec
-                        // but for now treat as returning undefined → this
                     }
+                    // Non-object, non-undefined explicit return in derived: TypeError per spec
+                    // but for now treat as returning undefined → this
                 }
                 ctx.dispatch_action = Some(DispatchAction::Return(value));
                 Ok(())
@@ -5472,18 +5412,17 @@ impl Interpreter {
 
             Instruction::ReturnUndefined => {
                 // In derived constructors, implicit return should return `this`
-                if let Some(frame) = ctx.current_frame() {
-                    if frame.flags.is_derived() {
-                        if !frame.flags.this_initialized() {
-                            return Err(VmError::ReferenceError(
+                if let Some(frame) = ctx.current_frame()
+                    && frame.flags.is_derived()
+                {
+                    if !frame.flags.this_initialized() {
+                        return Err(VmError::ReferenceError(
                                 "Must call super constructor in derived class before returning from derived constructor".to_string(),
                             ));
-                        }
-                        // Return this_value (the object created by super())
-                        ctx.dispatch_action =
-                            Some(DispatchAction::Return(frame.this_value.clone()));
-                        return Ok(());
                     }
+                    // Return this_value (the object created by super())
+                    ctx.dispatch_action = Some(DispatchAction::Return(frame.this_value));
+                    return Ok(());
                 }
                 ctx.dispatch_action = Some(DispatchAction::Return(Value::undefined()));
                 Ok(())
@@ -5495,13 +5434,13 @@ impl Interpreter {
                 argc,
                 spread,
             } => {
-                let func_value = ctx.get_register(func.0).clone();
-                let spread_arr = ctx.get_register(spread.0).clone();
+                let func_value = *ctx.get_register(func.0);
+                let spread_arr = *ctx.get_register(spread.0);
 
                 // Collect regular arguments first
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    let arg = *ctx.get_register(func.0 + 1 + i);
                     args.push(arg);
                 }
 
@@ -5556,13 +5495,13 @@ impl Interpreter {
                 argc,
                 spread,
             } => {
-                let func_value = ctx.get_register(func.0).clone();
-                let spread_arr = ctx.get_register(spread.0).clone();
+                let func_value = *ctx.get_register(func.0);
+                let spread_arr = *ctx.get_register(spread.0);
 
                 // Collect regular arguments first
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    let arg = ctx.get_register(func.0 + 1 + i).clone();
+                    let arg = *ctx.get_register(func.0 + 1 + i);
                     args.push(arg);
                 }
 
@@ -5626,7 +5565,7 @@ impl Interpreter {
 
                 let argc_u8 = args.len() as u8;
                 ctx.set_pending_args_from_vec(args);
-                ctx.set_pending_this(new_obj_value.clone());
+                ctx.set_pending_this(new_obj_value);
                 ctx.set_register(dst.0, new_obj_value);
 
                 ctx.dispatch_action = Some(DispatchAction::Call {
@@ -5643,7 +5582,7 @@ impl Interpreter {
 
             // ==================== Async/Await ====================
             Instruction::Await { dst, src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
 
                 // Try to get a promise from the value
                 // 1. Check if it's a raw VM promise
@@ -5687,8 +5626,8 @@ impl Interpreter {
                         if then_fn.is_function() || then_fn.is_native_function() {
                             // Thenable: create a promise that resolves via .then()
                             let promise = JsPromise::new();
-                            let promise_ref = promise.clone();
-                            let promise_ref2 = promise.clone();
+                            let promise_ref = promise;
+                            let promise_ref2 = promise;
                             let mm = ctx.memory_manager().clone();
 
                             // Call obj.then(resolve, reject)
@@ -5759,7 +5698,7 @@ impl Interpreter {
             }
 
             Instruction::Yield { dst, src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
 
                 // Yield suspends the generator and returns the value
                 // The dst register will receive the value sent to next() on resumption
@@ -5803,7 +5742,7 @@ impl Interpreter {
                 let local_count = func.local_count as usize;
                 let is_strict = func.flags.is_strict;
                 let is_mapped = !is_strict && func.flags.has_simple_parameters;
-                let callee_val = frame.callee_value.clone();
+                let callee_val = frame.callee_value;
                 let mm = ctx.memory_manager().clone();
 
                 // Get Object.prototype for the arguments object
@@ -5876,7 +5815,7 @@ impl Interpreter {
                         args_obj.define_property(
                             PropertyKey::string("callee"),
                             PropertyDescriptor::Accessor {
-                                get: Some(thrower.clone()),
+                                get: Some(thrower),
                                 set: Some(thrower),
                                 attributes: PropertyAttributes {
                                     writable: false,
@@ -5904,18 +5843,15 @@ impl Interpreter {
                     .and_then(|v| v.as_object())
                     .and_then(|o| o.get(&PropertyKey::string("prototype")))
                     .and_then(|v| v.as_object())
+                    && let Some(iterator_fn) = array_proto.get(&PropertyKey::Symbol(iterator_sym))
                 {
-                    if let Some(iterator_fn) =
-                        array_proto.get(&PropertyKey::Symbol(iterator_sym.clone()))
-                    {
-                        args_obj.define_property(
-                            PropertyKey::Symbol(iterator_sym),
-                            PropertyDescriptor::data_with_attrs(
-                                iterator_fn,
-                                PropertyAttributes::builtin_method(),
-                            ),
-                        );
-                    }
+                    args_obj.define_property(
+                        PropertyKey::Symbol(iterator_sym),
+                        PropertyDescriptor::data_with_attrs(
+                            iterator_fn,
+                            PropertyAttributes::builtin_method(),
+                        ),
+                    );
                 }
 
                 // @@toStringTag = "Arguments" (non-enumerable, configurable)
@@ -5937,7 +5873,7 @@ impl Interpreter {
             }
 
             Instruction::CallEval { dst, code } => {
-                let code_value = ctx.get_register(code.0).clone();
+                let code_value = *ctx.get_register(code.0);
 
                 // Per spec §19.2.1.1: if argument is not a string, return it unchanged
                 if !code_value.is_string() {
@@ -6010,13 +5946,13 @@ impl Interpreter {
             }
 
             Instruction::Export { name, src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 ctx.host_export_from_constant_pool(&module.constants, name.0, value)?;
                 Ok(())
             }
 
             Instruction::ForInNext { dst, obj, offset } => {
-                let target = ctx.get_register(obj.0).clone();
+                let target = *ctx.get_register(obj.0);
                 match ctx.host_for_in_next(target)? {
                     Some(value) => {
                         ctx.set_register(dst.0, value);
@@ -6035,64 +5971,62 @@ impl Interpreter {
                 name,
                 ic_index,
             } => {
-                let object = ctx.get_register(obj.0).clone();
+                let object = *ctx.get_register(obj.0);
 
                 // Hot path: IC probe on regular object
-                if let Some(obj_ref) = object.as_object() {
-                    if !obj_ref.is_dictionary_mode() {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let feedback = frame.feedback().write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = obj_ref.shape_id();
+                if let Some(obj_ref) = object.as_object()
+                    && !obj_ref.is_dictionary_mode()
+                {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let feedback = frame.feedback().write();
+                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                        use otter_vm_bytecode::function::InlineCacheState;
+                        let obj_shape_ptr = obj_ref.shape_id();
 
-                            if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Monomorphic {
-                                        shape_id,
-                                        depth,
-                                        offset,
-                                        ..
-                                    } => {
-                                        if obj_shape_ptr == *shape_id {
-                                            let val = if *depth == 0 {
-                                                obj_ref.get_by_offset(*offset as usize)
+                        if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
+                            match &mut ic.ic_state {
+                                InlineCacheState::Monomorphic {
+                                    shape_id,
+                                    depth,
+                                    offset,
+                                    ..
+                                } => {
+                                    if obj_shape_ptr == *shape_id {
+                                        let val = if *depth == 0 {
+                                            obj_ref.get_by_offset(*offset as usize)
+                                        } else {
+                                            get_proto_value_at_depth(&obj_ref, *depth, *offset)
+                                        };
+                                        if let Some(val) = val {
+                                            ctx.set_register(dst.0, val);
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                InlineCacheState::Polymorphic { count, entries } => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
+                                            let depth = entries[i].2;
+                                            let offset = entries[i].3;
+                                            let val = if depth == 0 {
+                                                obj_ref.get_by_offset(offset as usize)
                                             } else {
-                                                get_proto_value_at_depth(&obj_ref, *depth, *offset)
+                                                get_proto_value_at_depth(&obj_ref, depth, offset)
                                             };
+                                            if i > 0 && val.is_some() {
+                                                entries.swap(0, i);
+                                            }
                                             if let Some(val) = val {
                                                 ctx.set_register(dst.0, val);
                                                 return Ok(());
                                             }
+                                            break;
                                         }
                                     }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        for i in 0..(*count as usize) {
-                                            if obj_shape_ptr == entries[i].0 {
-                                                let depth = entries[i].2;
-                                                let offset = entries[i].3;
-                                                let val = if depth == 0 {
-                                                    obj_ref.get_by_offset(offset as usize)
-                                                } else {
-                                                    get_proto_value_at_depth(
-                                                        &obj_ref, depth, offset,
-                                                    )
-                                                };
-                                                if i > 0 && val.is_some() {
-                                                    entries.swap(0, i);
-                                                }
-                                                if let Some(val) = val {
-                                                    ctx.set_register(dst.0, val);
-                                                    return Ok(());
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                                _ => {}
                             }
                         }
                     }
@@ -6109,7 +6043,7 @@ impl Interpreter {
                 ic_index,
             } => {
                 let obj_reg = *obj;
-                let object = ctx.get_register(obj.0).clone();
+                let object = *ctx.get_register(obj.0);
                 let is_strict = ctx
                     .current_frame()
                     .and_then(|frame| module.function(frame.function_index))
@@ -6122,13 +6056,13 @@ impl Interpreter {
                 let name_str = name_const
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
-                let val_val = ctx.get_register(val.0).clone();
+                let val_val = *ctx.get_register(val.0);
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
                     let key = Self::utf16_key(name_str);
                     let key_value = Value::string(JsString::intern_utf16(name_str));
-                    let receiver = object.clone();
+                    let receiver = object;
                     {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_set(
@@ -6158,9 +6092,7 @@ impl Interpreter {
                                         shape_id, offset, ..
                                     } => {
                                         if obj_shape_ptr == *shape_id {
-                                            match obj
-                                                .set_by_offset(*offset as usize, val_val.clone())
-                                            {
+                                            match obj.set_by_offset(*offset as usize, val_val) {
                                                 Ok(()) => cached = true,
                                                 // Accessor: fall through to slow path to call setter
                                                 Err(SetPropertyError::AccessorWithoutSetter) => {}
@@ -6174,10 +6106,9 @@ impl Interpreter {
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         for i in 0..(*count as usize) {
                                             if obj_shape_ptr == entries[i].0 {
-                                                match obj.set_by_offset(
-                                                    entries[i].3 as usize,
-                                                    val_val.clone(),
-                                                ) {
+                                                match obj
+                                                    .set_by_offset(entries[i].3 as usize, val_val)
+                                                {
                                                     Ok(()) => cached = true,
                                                     // Accessor: fall through to slow path to call setter
                                                     Err(
@@ -6224,7 +6155,7 @@ impl Interpreter {
                                 Ok(())
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args_one(val_val);
-                                ctx.set_pending_this(object.clone());
+                                ctx.set_pending_this(object);
                                 ctx.dispatch_action = Some(DispatchAction::Call {
                                     func_index: closure.function_index,
                                     module_id: closure.module.module_id,
@@ -6264,100 +6195,94 @@ impl Interpreter {
                                 }
                             }
                             // Skip IC for dictionary mode objects
-                            if !obj.is_dictionary_mode() {
-                                if let Some(offset) =
+                            if !obj.is_dictionary_mode()
+                                && let Some(offset) =
                                     obj.shape_get_offset(&Self::utf16_key(name_str))
-                                {
-                                    let frame = ctx
-                                        .current_frame()
-                                        .ok_or_else(|| VmError::internal("no frame"))?;
-                                    let feedback = frame.feedback().write();
-                                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                        use otter_vm_bytecode::function::InlineCacheState;
-                                        let shape_ptr = obj.shape_id();
-                                        let current_epoch = ctx.cached_proto_epoch;
+                            {
+                                let frame = ctx
+                                    .current_frame()
+                                    .ok_or_else(|| VmError::internal("no frame"))?;
+                                let feedback = frame.feedback().write();
+                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                    use otter_vm_bytecode::function::InlineCacheState;
+                                    let shape_ptr = obj.shape_id();
+                                    let current_epoch = ctx.cached_proto_epoch;
 
-                                        match &mut ic.ic_state {
-                                            InlineCacheState::Uninitialized => {
-                                                ic.ic_state = InlineCacheState::Monomorphic {
-                                                    shape_id: shape_ptr,
-                                                    proto_shape_id: 0,
-                                                    depth: 0,
-                                                    offset: offset as u32,
+                                    match &mut ic.ic_state {
+                                        InlineCacheState::Uninitialized => {
+                                            ic.ic_state = InlineCacheState::Monomorphic {
+                                                shape_id: shape_ptr,
+                                                proto_shape_id: 0,
+                                                depth: 0,
+                                                offset: offset as u32,
+                                            };
+                                            ic.proto_epoch = current_epoch;
+                                        }
+                                        InlineCacheState::Monomorphic {
+                                            shape_id: old_shape,
+                                            offset: old_offset,
+                                            ..
+                                        } => {
+                                            if *old_shape != shape_ptr {
+                                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                                entries[0] = (*old_shape, 0, 0, *old_offset);
+                                                entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                                ic.ic_state = InlineCacheState::Polymorphic {
+                                                    count: 2,
+                                                    entries,
                                                 };
                                                 ic.proto_epoch = current_epoch;
                                             }
-                                            InlineCacheState::Monomorphic {
-                                                shape_id: old_shape,
-                                                offset: old_offset,
-                                                ..
-                                            } => {
-                                                if *old_shape != shape_ptr {
-                                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                                    entries[0] = (*old_shape, 0, 0, *old_offset);
-                                                    entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                                    ic.ic_state = InlineCacheState::Polymorphic {
-                                                        count: 2,
-                                                        entries,
-                                                    };
+                                        }
+                                        InlineCacheState::Polymorphic { count, entries } => {
+                                            let mut found = false;
+                                            for entry in &entries[..(*count as usize)] {
+                                                if entry.0 == shape_ptr {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                if (*count as usize) < 4 {
+                                                    entries[*count as usize] =
+                                                        (shape_ptr, 0, 0, offset as u32);
+                                                    *count += 1;
                                                     ic.proto_epoch = current_epoch;
+                                                } else {
+                                                    ic.ic_state = InlineCacheState::Megamorphic;
                                                 }
                                             }
-                                            InlineCacheState::Polymorphic { count, entries } => {
-                                                let mut found = false;
-                                                for i in 0..(*count as usize) {
-                                                    if entries[i].0 == shape_ptr {
-                                                        found = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !found {
-                                                    if (*count as usize) < 4 {
-                                                        entries[*count as usize] =
-                                                            (shape_ptr, 0, 0, offset as u32);
-                                                        *count += 1;
-                                                        ic.proto_epoch = current_epoch;
-                                                    } else {
-                                                        ic.ic_state = InlineCacheState::Megamorphic;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
                                         }
+                                        _ => {}
+                                    }
 
-                                        // Quickening: when IC is monomorphic with enough hits,
-                                        // quicken to SetPropQuickened
-                                        ic.hit_count = ic.hit_count.saturating_add(1);
-                                        if ic.hit_count
-                                            >= otter_vm_bytecode::function::QUICKENING_WARMUP
-                                        {
-                                            if let InlineCacheState::Monomorphic {
-                                                shape_id,
-                                                offset,
-                                                ..
-                                            } = ic.ic_state
-                                            {
-                                                if let Some(func) =
-                                                    module.function(frame.function_index)
-                                                {
-                                                    let pc = frame.pc;
-                                                    Self::try_quicken_property_access(
-                                                        func,
-                                                        pc,
-                                                        &Instruction::SetPropConst {
-                                                            obj: obj_reg,
-                                                            name: *name,
-                                                            val: *val,
-                                                            ic_index: *ic_index,
-                                                        },
-                                                        shape_id,
-                                                        offset,
-                                                        0, // SetProp always operates on the receiver
-                                                        ic.proto_epoch,
-                                                    );
-                                                }
-                                            }
-                                        }
+                                    // Quickening: when IC is monomorphic with enough hits,
+                                    // quicken to SetPropQuickened
+                                    ic.hit_count = ic.hit_count.saturating_add(1);
+                                    if ic.hit_count
+                                        >= otter_vm_bytecode::function::QUICKENING_WARMUP
+                                        && let InlineCacheState::Monomorphic {
+                                            shape_id,
+                                            offset,
+                                            ..
+                                        } = ic.ic_state
+                                        && let Some(func) = module.function(frame.function_index)
+                                    {
+                                        let pc = frame.pc;
+                                        Self::try_quicken_property_access(
+                                            func,
+                                            pc,
+                                            &Instruction::SetPropConst {
+                                                obj: obj_reg,
+                                                name: *name,
+                                                val: *val,
+                                                ic_index: *ic_index,
+                                            },
+                                            shape_id,
+                                            offset,
+                                            0, // SetProp always operates on the receiver
+                                            ic.proto_epoch,
+                                        );
                                     }
                                 }
                             }
@@ -6373,8 +6298,8 @@ impl Interpreter {
             }
 
             Instruction::DeleteProp { dst, obj, key } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
 
                 // TypeError for null/undefined base
                 if object.is_null() || object.is_undefined() {
@@ -6458,8 +6383,8 @@ impl Interpreter {
                 key,
                 ic_index: _ic_index,
             } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
 
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
@@ -6473,15 +6398,11 @@ impl Interpreter {
                         let key_str = self.to_string(&key_value);
                         PropertyKey::string(&key_str)
                     };
-                    let receiver = object.clone();
+                    let receiver = object;
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
-                            &mut ncx,
-                            proxy,
-                            &prop_key,
-                            key_value.clone(),
-                            receiver,
+                            &mut ncx, proxy, &prop_key, key_value, receiver,
                         )?
                     };
                     ctx.set_register(dst.0, result);
@@ -6541,20 +6462,18 @@ impl Interpreter {
                             None
                         };
 
-                        if let Some(idx) = maybe_idx {
-                            if let Some(ta_val) =
+                        if let Some(idx) = maybe_idx
+                            && let Some(ta_val) =
                                 obj.get(&PropertyKey::string("__TypedArrayData__"))
-                            {
-                                if let Some(ta) = ta_val.as_typed_array() {
-                                    let val = ta.get_value(idx).unwrap_or(Value::undefined());
-                                    ctx.set_register(dst.0, val);
-                                    return Ok(());
-                                }
-                            }
+                            && let Some(ta) = ta_val.as_typed_array()
+                        {
+                            let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                            ctx.set_register(dst.0, val);
+                            return Ok(());
                         }
                     }
 
-                    let receiver = object.clone();
+                    let receiver = object;
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
@@ -6587,13 +6506,8 @@ impl Interpreter {
                             }
                         }
                         _ => {
-                            let value = self.get_with_proxy_chain(
-                                ctx,
-                                &obj,
-                                &key,
-                                key_value.clone(),
-                                &receiver,
-                            )?;
+                            let value =
+                                self.get_with_proxy_chain(ctx, &obj, &key, key_value, &receiver)?;
                             ctx.set_register(dst.0, value);
                             Ok(())
                         }
@@ -6601,15 +6515,14 @@ impl Interpreter {
                 } else if object.is_number() {
                     // Autobox number -> Number.prototype
                     let key = self.value_to_property_key(ctx, &key_value)?;
-                    if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
-                        if let Some(proto) = number_obj
+                    if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object())
+                        && let Some(proto) = number_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(());
-                        }
+                    {
+                        let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                        ctx.set_register(dst.0, value);
+                        return Ok(());
                     }
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(())
@@ -6617,30 +6530,27 @@ impl Interpreter {
                     // Autobox boolean -> Boolean.prototype
                     let key = self.value_to_property_key(ctx, &key_value)?;
                     if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
-                    {
-                        if let Some(proto) = boolean_obj
+                        && let Some(proto) = boolean_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
-                        {
-                            let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                            ctx.set_register(dst.0, value);
-                            return Ok(());
-                        }
+                    {
+                        let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                        ctx.set_register(dst.0, value);
+                        return Ok(());
                     }
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(())
                 } else if object.is_symbol() {
                     // Autobox symbol -> Symbol.prototype
                     let key = self.value_to_property_key(ctx, &key_value)?;
-                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
-                        if let Some(proto) = symbol_obj
+                    if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
+                        && let Some(proto) = symbol_obj
                             .get(&PropertyKey::string("prototype"))
                             .and_then(|v| v.as_object())
-                        {
-                            let value = self.get_property_value(ctx, &proto, &key, &object)?;
-                            ctx.set_register(dst.0, value);
-                            return Ok(());
-                        }
+                    {
+                        let value = self.get_property_value(ctx, &proto, &key, &object)?;
+                        ctx.set_register(dst.0, value);
+                        return Ok(());
                     }
                     ctx.set_register(dst.0, Value::undefined());
                     Ok(())
@@ -6656,9 +6566,9 @@ impl Interpreter {
                 val,
                 ic_index: _ic_index,
             } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let val_val = ctx.get_register(val.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let val_val = *ctx.get_register(val.0);
                 let is_strict = ctx
                     .current_frame()
                     .and_then(|frame| module.function(frame.function_index))
@@ -6668,16 +6578,11 @@ impl Interpreter {
                 // Proxy check - must be first
                 if let Some(proxy) = object.as_proxy() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
-                    let receiver = object.clone();
+                    let receiver = object;
                     {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_set(
-                            &mut ncx,
-                            proxy,
-                            &prop_key,
-                            key_value.clone(),
-                            val_val,
-                            receiver,
+                            &mut ncx, proxy, &prop_key, key_value, val_val, receiver,
                         )?;
                     }
                     return Ok(());
@@ -6699,15 +6604,13 @@ impl Interpreter {
                             None
                         };
 
-                        if let Some(idx) = maybe_idx {
-                            if let Some(ta_val) =
+                        if let Some(idx) = maybe_idx
+                            && let Some(ta_val) =
                                 obj.get(&PropertyKey::string("__TypedArrayData__"))
-                            {
-                                if let Some(ta) = ta_val.as_typed_array() {
-                                    ta.set_value(idx, &val_val);
-                                    return Ok(());
-                                }
-                            }
+                            && let Some(ta) = ta_val.as_typed_array()
+                        {
+                            ta.set_value(idx, &val_val);
+                            return Ok(());
                         }
                     }
 
@@ -6724,7 +6627,7 @@ impl Interpreter {
                                 Ok(())
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args_one(val_val);
-                                ctx.set_pending_this(object.clone());
+                                ctx.set_pending_this(object);
                                 ctx.dispatch_action = Some(DispatchAction::Call {
                                     func_index: closure.function_index,
                                     module_id: closure.module.module_id,
@@ -6741,7 +6644,7 @@ impl Interpreter {
                         }
                         _ => {
                             // Slow path
-                            if let Err(e) = obj.set(key.clone(), val_val) {
+                            if let Err(e) = obj.set(key, val_val) {
                                 if matches!(e, SetPropertyError::InvalidArrayLength) {
                                     return Err(VmError::range_error(e.to_string()));
                                 }
@@ -6761,9 +6664,9 @@ impl Interpreter {
             }
 
             Instruction::DefineGetter { obj, key, func } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let getter_fn = ctx.get_register(func.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let getter_fn = *ctx.get_register(func.0);
 
                 if let Some(obj) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
@@ -6788,9 +6691,9 @@ impl Interpreter {
             }
 
             Instruction::DefineSetter { obj, key, func } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let setter_fn = ctx.get_register(func.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let setter_fn = *ctx.get_register(func.0);
 
                 if let Some(obj) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
@@ -6815,9 +6718,9 @@ impl Interpreter {
             }
 
             Instruction::DefineProperty { obj, key, val } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let value = ctx.get_register(val.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let value = *ctx.get_register(val.0);
 
                 if let Some(obj) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
@@ -6828,9 +6731,9 @@ impl Interpreter {
             }
 
             Instruction::DefineMethod { obj, key, val } => {
-                let object = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let value = ctx.get_register(val.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let value = *ctx.get_register(val.0);
 
                 if let Some(obj) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
@@ -6857,25 +6760,24 @@ impl Interpreter {
             }
 
             Instruction::GetElemInt { dst, obj, index } => {
-                let object = ctx.get_register(obj.0).clone();
-                let idx_val = ctx.get_register(index.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let idx_val = *ctx.get_register(index.0);
 
-                if let Some(idx) = idx_val.as_int32() {
-                    if idx >= 0 {
-                        if let Some(obj_ref) = object.as_object() {
-                            if let Some(val) = obj_ref.get_index(idx as usize) {
-                                ctx.set_register(dst.0, val);
-                                return Ok(());
-                            }
-                        }
-                    }
+                if let Some(idx) = idx_val.as_int32()
+                    && idx >= 0
+                    && let Some(obj_ref) = object.as_object()
+                    && let Some(val) = obj_ref.get_index(idx as usize)
+                {
+                    ctx.set_register(dst.0, val);
+                    return Ok(());
                 }
-                
+
                 // Fallback to generic GetElem semantics if fast path fails
                 if let Some(obj_ref) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &idx_val)?;
                     let key_value = crate::proxy_operations::property_key_to_value_pub(&prop_key);
-                    let result = self.get_with_proxy_chain(ctx, &obj_ref, &prop_key, key_value, &object)?;
+                    let result =
+                        self.get_with_proxy_chain(ctx, &obj_ref, &prop_key, key_value, &object)?;
                     ctx.set_register(dst.0, result);
                 } else {
                     ctx.set_register(dst.0, Value::undefined());
@@ -6889,13 +6791,13 @@ impl Interpreter {
                 idx,
                 ic_index,
             } => {
-                let array = ctx.get_register(arr.0).clone();
-                let index = ctx.get_register(idx.0).clone();
+                let array = *ctx.get_register(arr.0);
+                let index = *ctx.get_register(idx.0);
 
                 // Proxy check - must be first
                 if let Some(proxy) = array.as_proxy() {
                     let prop_key = self.value_to_property_key(ctx, &index)?;
-                    let receiver = array.clone();
+                    let receiver = array;
                     let result = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
@@ -6908,15 +6810,13 @@ impl Interpreter {
 
                 if let Some(obj) = array.as_object() {
                     // Fast path for numeric index access on arrays
-                    if obj.is_array() {
-                        if let Some(n) = index.as_int32() {
-                            if n >= 0 {
-                                if let Some(val) = obj.get_index(n as usize) {
-                                    ctx.set_register(dst.0, val);
-                                    return Ok(());
-                                }
-                            }
-                        }
+                    if obj.is_array()
+                        && let Some(n) = index.as_int32()
+                        && n >= 0
+                        && let Some(val) = obj.get_index(n as usize)
+                    {
+                        ctx.set_register(dst.0, val);
+                        return Ok(());
                     }
 
                     // Convert index to property key
@@ -6968,71 +6868,69 @@ impl Interpreter {
                         }
 
                         // Slow path with IC update (skip for dictionary mode)
-                        if !obj.is_dictionary_mode() {
-                            if let Some(offset) = obj.shape_get_offset(&key) {
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let feedback = frame.feedback().write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = obj.shape_id();
-                                    let current_epoch = ctx.cached_proto_epoch;
+                        if !obj.is_dictionary_mode()
+                            && let Some(offset) = obj.shape_get_offset(&key)
+                        {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let feedback = frame.feedback().write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = obj.shape_id();
+                                let current_epoch = ctx.cached_proto_epoch;
 
-                                    match &mut ic.ic_state {
-                                        InlineCacheState::Uninitialized => {
-                                            ic.ic_state = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                proto_shape_id: 0,
-                                                depth: 0,
-                                                offset: offset as u32,
-                                            };
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                        ..
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
                                         }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                            ..
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                                entries[0] = (*old_shape, 0, 0, *old_offset);
-                                                entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                                ic.ic_state = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
-                                                };
-                                                ic.proto_epoch = current_epoch;
-                                            }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, 0, 0, offset as u32);
-                                                    *count += 1;
-                                                    ic.proto_epoch = current_epoch;
-                                                } else {
-                                                    ic.ic_state = InlineCacheState::Megamorphic;
-                                                }
-                                            }
-                                        }
-                                        _ => {}
                                     }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for entry in &entries[..(*count as usize)] {
+                                            if entry.0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, 0, 0, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
                     }
 
                     let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
-                    let receiver = array.clone();
+                    let receiver = array;
                     let value = self.get_with_proxy_chain(ctx, &obj, &key, key_value, &receiver)?;
                     ctx.set_register(dst.0, value);
                 } else {
@@ -7047,9 +6945,9 @@ impl Interpreter {
                 val,
                 ic_index,
             } => {
-                let array = ctx.get_register(arr.0).clone();
-                let index = ctx.get_register(idx.0).clone();
-                let val_val = ctx.get_register(val.0).clone();
+                let array = *ctx.get_register(arr.0);
+                let index = *ctx.get_register(idx.0);
+                let val_val = *ctx.get_register(val.0);
                 let is_strict = ctx
                     .current_frame()
                     .and_then(|frame| module.function(frame.function_index))
@@ -7059,7 +6957,7 @@ impl Interpreter {
                 // Proxy check - must be first
                 if let Some(proxy) = array.as_proxy() {
                     let prop_key = self.value_to_property_key(ctx, &index)?;
-                    let receiver = array.clone();
+                    let receiver = array;
                     {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_set(
@@ -7071,14 +6969,13 @@ impl Interpreter {
 
                 if let Some(obj) = array.as_object() {
                     // Fast path for numeric index access on arrays
-                    if obj.is_array() && !obj.is_dictionary_mode() {
-                        if let Some(n) = index.as_int32() {
-                            if n >= 0 {
-                                if obj.set_index(n as usize, val_val.clone()).is_ok() {
-                                    return Ok(());
-                                }
-                            }
-                        }
+                    if obj.is_array()
+                        && !obj.is_dictionary_mode()
+                        && let Some(n) = index.as_int32()
+                        && n >= 0
+                        && obj.set_index(n as usize, val_val).is_ok()
+                    {
+                        return Ok(());
                     }
 
                     // Convert index to property key
@@ -7102,10 +6999,7 @@ impl Interpreter {
                                             shape_id, offset, ..
                                         } => {
                                             if obj_shape_ptr == *shape_id {
-                                                match obj.set_by_offset(
-                                                    *offset as usize,
-                                                    val_val.clone(),
-                                                ) {
+                                                match obj.set_by_offset(*offset as usize, val_val) {
                                                     Ok(()) => cached = true,
                                                     // Accessor: fall through to slow path to call setter
                                                     Err(
@@ -7125,7 +7019,7 @@ impl Interpreter {
                                                 if obj_shape_ptr == entries[i].0 {
                                                     match obj.set_by_offset(
                                                         entries[i].3 as usize,
-                                                        val_val.clone(),
+                                                        val_val,
                                                     ) {
                                                         Ok(()) => cached = true,
                                                         // Accessor: fall through to slow path to call setter
@@ -7158,64 +7052,62 @@ impl Interpreter {
                         }
 
                         // Slow path with IC update (skip for dictionary mode)
-                        if !obj.is_dictionary_mode() {
-                            if let Some(offset) = obj.shape_get_offset(&key) {
-                                let frame = ctx
-                                    .current_frame()
-                                    .ok_or_else(|| VmError::internal("no frame"))?;
-                                let feedback = frame.feedback().write();
-                                if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                    use otter_vm_bytecode::function::InlineCacheState;
-                                    let shape_ptr = obj.shape_id();
-                                    let current_epoch = ctx.cached_proto_epoch;
+                        if !obj.is_dictionary_mode()
+                            && let Some(offset) = obj.shape_get_offset(&key)
+                        {
+                            let frame = ctx
+                                .current_frame()
+                                .ok_or_else(|| VmError::internal("no frame"))?;
+                            let feedback = frame.feedback().write();
+                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                                use otter_vm_bytecode::function::InlineCacheState;
+                                let shape_ptr = obj.shape_id();
+                                let current_epoch = ctx.cached_proto_epoch;
 
-                                    match &mut ic.ic_state {
-                                        InlineCacheState::Uninitialized => {
-                                            ic.ic_state = InlineCacheState::Monomorphic {
-                                                shape_id: shape_ptr,
-                                                proto_shape_id: 0,
-                                                depth: 0,
-                                                offset: offset as u32,
-                                            };
+                                match &mut ic.ic_state {
+                                    InlineCacheState::Uninitialized => {
+                                        ic.ic_state = InlineCacheState::Monomorphic {
+                                            shape_id: shape_ptr,
+                                            proto_shape_id: 0,
+                                            depth: 0,
+                                            offset: offset as u32,
+                                        };
+                                        ic.proto_epoch = current_epoch;
+                                    }
+                                    InlineCacheState::Monomorphic {
+                                        shape_id: old_shape,
+                                        offset: old_offset,
+                                        ..
+                                    } => {
+                                        if *old_shape != shape_ptr {
+                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                            entries[0] = (*old_shape, 0, 0, *old_offset);
+                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                            ic.ic_state =
+                                                InlineCacheState::Polymorphic { count: 2, entries };
                                             ic.proto_epoch = current_epoch;
                                         }
-                                        InlineCacheState::Monomorphic {
-                                            shape_id: old_shape,
-                                            offset: old_offset,
-                                            ..
-                                        } => {
-                                            if *old_shape != shape_ptr {
-                                                let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                                entries[0] = (*old_shape, 0, 0, *old_offset);
-                                                entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                                ic.ic_state = InlineCacheState::Polymorphic {
-                                                    count: 2,
-                                                    entries,
-                                                };
-                                                ic.proto_epoch = current_epoch;
-                                            }
-                                        }
-                                        InlineCacheState::Polymorphic { count, entries } => {
-                                            let mut found = false;
-                                            for i in 0..(*count as usize) {
-                                                if entries[i].0 == shape_ptr {
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !found {
-                                                if (*count as usize) < 4 {
-                                                    entries[*count as usize] =
-                                                        (shape_ptr, 0, 0, offset as u32);
-                                                    *count += 1;
-                                                    ic.proto_epoch = current_epoch;
-                                                } else {
-                                                    ic.ic_state = InlineCacheState::Megamorphic;
-                                                }
-                                            }
-                                        }
-                                        _ => {}
                                     }
+                                    InlineCacheState::Polymorphic { count, entries } => {
+                                        let mut found = false;
+                                        for entry in &entries[..(*count as usize)] {
+                                            if entry.0 == shape_ptr {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            if (*count as usize) < 4 {
+                                                entries[*count as usize] =
+                                                    (shape_ptr, 0, 0, offset as u32);
+                                                *count += 1;
+                                                ic.proto_epoch = current_epoch;
+                                            } else {
+                                                ic.ic_state = InlineCacheState::Megamorphic;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -7238,7 +7130,7 @@ impl Interpreter {
                                 return Ok(());
                             } else if let Some(closure) = setter.as_function() {
                                 ctx.set_pending_args_one(val_val);
-                                ctx.set_pending_this(array.clone());
+                                ctx.set_pending_this(array);
                                 ctx.dispatch_action = Some(DispatchAction::Call {
                                     func_index: closure.function_index,
                                     module_id: closure.module.module_id,
@@ -7277,8 +7169,8 @@ impl Interpreter {
                 argc,
                 ic_index,
             } => {
-                let receiver = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
+                let receiver = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
 
                 // IC Fast Path
                 // IC Fast Path
@@ -7324,7 +7216,7 @@ impl Interpreter {
                     // Collect arguments (args start at obj + 2)
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        args.push(ctx.get_register(obj.0 + 2 + i).clone());
+                        args.push(*ctx.get_register(obj.0 + 2 + i));
                     }
 
                     // Direct call handling
@@ -7336,11 +7228,7 @@ impl Interpreter {
                     let method_value = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
-                            &mut ncx,
-                            proxy,
-                            &prop_key,
-                            key_value.clone(),
-                            receiver.clone(),
+                            &mut ncx, proxy, &prop_key, key_value, receiver,
                         )?
                     };
                     if self.try_fast_path_array_method(
@@ -7356,7 +7244,7 @@ impl Interpreter {
 
                     let mut args = Vec::with_capacity(*argc as usize);
                     for i in 0..(*argc as u16) {
-                        args.push(ctx.get_register(obj.0 + 2 + i).clone());
+                        args.push(*ctx.get_register(obj.0 + 2 + i));
                     }
                     return self.handle_call_value(ctx, &method_value, receiver, args, dst.0);
                 }
@@ -7371,7 +7259,7 @@ impl Interpreter {
 
                         // Get the sent value (first argument if present)
                         let sent_value = if *argc > 0 {
-                            Some(ctx.get_register(key.0 + 1).clone())
+                            Some(*ctx.get_register(key.0 + 1))
                         } else {
                             None
                         };
@@ -7400,7 +7288,7 @@ impl Interpreter {
                                 if generator.is_completed() {
                                     GeneratorResult::Error(VmError::exception(error_value))
                                 } else {
-                                    generator.set_pending_throw(error_value.clone());
+                                    generator.set_pending_throw(error_value);
                                     self.execute_generator(generator, ctx, None)
                                 }
                             }
@@ -7504,64 +7392,62 @@ impl Interpreter {
                 };
 
                 // Update IC if method was found on the object itself
-                if let Some(obj) = receiver.as_object() {
-                    if !obj.is_dictionary_mode() {
-                        if let Some(offset) = obj.shape_get_offset(&key) {
-                            let frame = ctx
-                                .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let feedback = frame.feedback().write();
-                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = obj.shape_id();
-                                let current_epoch = ctx.cached_proto_epoch;
+                if let Some(obj) = receiver.as_object()
+                    && !obj.is_dictionary_mode()
+                    && let Some(offset) = obj.shape_get_offset(&key)
+                {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let feedback = frame.feedback().write();
+                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                        use otter_vm_bytecode::function::InlineCacheState;
+                        let shape_ptr = obj.shape_id();
+                        let current_epoch = ctx.cached_proto_epoch;
 
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Uninitialized => {
-                                        ic.ic_state = InlineCacheState::Monomorphic {
-                                            shape_id: shape_ptr,
-                                            proto_shape_id: 0,
-                                            depth: 0,
-                                            offset: offset as u32,
-                                        };
-                                        ic.proto_epoch = current_epoch;
-                                    }
-                                    InlineCacheState::Monomorphic {
-                                        shape_id: old_shape,
-                                        offset: old_offset,
-                                        ..
-                                    } => {
-                                        if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                            entries[0] = (*old_shape, 0, 0, *old_offset);
-                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                            ic.ic_state =
-                                                InlineCacheState::Polymorphic { count: 2, entries };
-                                            ic.proto_epoch = current_epoch;
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        if !found {
-                                            if (*count as usize) < 4 {
-                                                entries[*count as usize] =
-                                                    (shape_ptr, 0, 0, offset as u32);
-                                                *count += 1;
-                                                ic.proto_epoch = current_epoch;
-                                            } else {
-                                                ic.ic_state = InlineCacheState::Megamorphic;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                        match &mut ic.ic_state {
+                            InlineCacheState::Uninitialized => {
+                                ic.ic_state = InlineCacheState::Monomorphic {
+                                    shape_id: shape_ptr,
+                                    proto_shape_id: 0,
+                                    depth: 0,
+                                    offset: offset as u32,
+                                };
+                                ic.proto_epoch = current_epoch;
+                            }
+                            InlineCacheState::Monomorphic {
+                                shape_id: old_shape,
+                                offset: old_offset,
+                                ..
+                            } => {
+                                if *old_shape != shape_ptr {
+                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                    entries[0] = (*old_shape, 0, 0, *old_offset);
+                                    entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                    ic.ic_state =
+                                        InlineCacheState::Polymorphic { count: 2, entries };
+                                    ic.proto_epoch = current_epoch;
                                 }
                             }
+                            InlineCacheState::Polymorphic { count, entries } => {
+                                let mut found = false;
+                                for entry in &entries[..(*count as usize)] {
+                                    if entry.0 == shape_ptr {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    if (*count as usize) < 4 {
+                                        entries[*count as usize] = (shape_ptr, 0, 0, offset as u32);
+                                        *count += 1;
+                                        ic.proto_epoch = current_epoch;
+                                    } else {
+                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -7579,7 +7465,7 @@ impl Interpreter {
 
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    args.push(ctx.get_register(obj.0 + 2 + i).clone());
+                    args.push(*ctx.get_register(obj.0 + 2 + i));
                 }
 
                 self.handle_call_value(ctx, &method_value, receiver, args, dst.0)
@@ -7592,9 +7478,9 @@ impl Interpreter {
                 spread,
                 ic_index,
             } => {
-                let receiver = ctx.get_register(obj.0).clone();
-                let key_value = ctx.get_register(key.0).clone();
-                let spread_arr = ctx.get_register(spread.0).clone();
+                let receiver = *ctx.get_register(obj.0);
+                let key_value = *ctx.get_register(key.0);
+                let spread_arr = *ctx.get_register(spread.0);
 
                 // IC Fast Path
                 let cached_method = if let Some(obj) = receiver.as_object() {
@@ -7640,11 +7526,7 @@ impl Interpreter {
                     let method_value = {
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         crate::proxy_operations::proxy_get(
-                            &mut ncx,
-                            proxy,
-                            &prop_key,
-                            key_value.clone(),
-                            receiver.clone(),
+                            &mut ncx, proxy, &prop_key, key_value, receiver,
                         )?
                     };
                     return self.dispatch_method_spread(
@@ -7724,64 +7606,62 @@ impl Interpreter {
                 };
 
                 // Update IC if method was found on the object itself
-                if let Some(obj) = receiver.as_object() {
-                    if !obj.is_dictionary_mode() {
-                        if let Some(offset) = obj.shape_get_offset(&key) {
-                            let frame = ctx
-                                .current_frame()
-                                .ok_or_else(|| VmError::internal("no frame"))?;
-                            let feedback = frame.feedback().write();
-                            if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                                use otter_vm_bytecode::function::InlineCacheState;
-                                let shape_ptr = obj.shape_id();
-                                let current_epoch = ctx.cached_proto_epoch;
+                if let Some(obj) = receiver.as_object()
+                    && !obj.is_dictionary_mode()
+                    && let Some(offset) = obj.shape_get_offset(&key)
+                {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let feedback = frame.feedback().write();
+                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                        use otter_vm_bytecode::function::InlineCacheState;
+                        let shape_ptr = obj.shape_id();
+                        let current_epoch = ctx.cached_proto_epoch;
 
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Uninitialized => {
-                                        ic.ic_state = InlineCacheState::Monomorphic {
-                                            shape_id: shape_ptr,
-                                            proto_shape_id: 0,
-                                            depth: 0,
-                                            offset: offset as u32,
-                                        };
-                                        ic.proto_epoch = current_epoch;
-                                    }
-                                    InlineCacheState::Monomorphic {
-                                        shape_id: old_shape,
-                                        offset: old_offset,
-                                        ..
-                                    } => {
-                                        if *old_shape != shape_ptr {
-                                            let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
-                                            entries[0] = (*old_shape, 0, 0, *old_offset);
-                                            entries[1] = (shape_ptr, 0, 0, offset as u32);
-                                            ic.ic_state =
-                                                InlineCacheState::Polymorphic { count: 2, entries };
-                                            ic.proto_epoch = current_epoch;
-                                        }
-                                    }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        if !found {
-                                            if (*count as usize) < 4 {
-                                                entries[*count as usize] =
-                                                    (shape_ptr, 0, 0, offset as u32);
-                                                *count += 1;
-                                                ic.proto_epoch = current_epoch;
-                                            } else {
-                                                ic.ic_state = InlineCacheState::Megamorphic;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                        match &mut ic.ic_state {
+                            InlineCacheState::Uninitialized => {
+                                ic.ic_state = InlineCacheState::Monomorphic {
+                                    shape_id: shape_ptr,
+                                    proto_shape_id: 0,
+                                    depth: 0,
+                                    offset: offset as u32,
+                                };
+                                ic.proto_epoch = current_epoch;
+                            }
+                            InlineCacheState::Monomorphic {
+                                shape_id: old_shape,
+                                offset: old_offset,
+                                ..
+                            } => {
+                                if *old_shape != shape_ptr {
+                                    let mut entries = [(0u64, 0u64, 0u8, 0u32); 4];
+                                    entries[0] = (*old_shape, 0, 0, *old_offset);
+                                    entries[1] = (shape_ptr, 0, 0, offset as u32);
+                                    ic.ic_state =
+                                        InlineCacheState::Polymorphic { count: 2, entries };
+                                    ic.proto_epoch = current_epoch;
                                 }
                             }
+                            InlineCacheState::Polymorphic { count, entries } => {
+                                let mut found = false;
+                                for entry in &entries[..(*count as usize)] {
+                                    if entry.0 == shape_ptr {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    if (*count as usize) < 4 {
+                                        entries[*count as usize] = (shape_ptr, 0, 0, offset as u32);
+                                        *count += 1;
+                                        ic.proto_epoch = current_epoch;
+                                    } else {
+                                        ic.ic_state = InlineCacheState::Megamorphic;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -7791,8 +7671,8 @@ impl Interpreter {
 
             Instruction::Spread { dst, src } => {
                 // Spread elements from src array into dst array
-                let dst_arr = ctx.get_register(dst.0).clone();
-                let src_arr = ctx.get_register(src.0).clone();
+                let dst_arr = *ctx.get_register(dst.0);
+                let src_arr = *ctx.get_register(src.0);
 
                 if let (Some(dst_obj), Some(src_obj)) = (dst_arr.as_object(), src_arr.as_object()) {
                     // Get current length of dst array
@@ -7862,7 +7742,7 @@ impl Interpreter {
 
             // ==================== Misc ====================
             Instruction::Move { dst, src } => {
-                let value = ctx.get_register(src.0).clone();
+                let value = *ctx.get_register(src.0);
                 ctx.set_register(dst.0, value);
                 Ok(())
             }
@@ -7886,27 +7766,26 @@ impl Interpreter {
                 if let (Some(l), Some(r)) = (
                     ctx.get_register(lhs.0).as_int32(),
                     ctx.get_register(rhs.0).as_int32(),
-                ) {
-                    if let Some(result) = l.checked_add(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(());
-                    }
+                ) && let Some(result) = l.checked_add(r)
+                {
+                    ctx.set_register(dst.0, Value::int32(result));
+                    return Ok(());
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Add and execute generic path
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Add {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Add {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
@@ -7923,27 +7802,26 @@ impl Interpreter {
                 if let (Some(l), Some(r)) = (
                     ctx.get_register(lhs.0).as_int32(),
                     ctx.get_register(rhs.0).as_int32(),
-                ) {
-                    if let Some(result) = l.checked_sub(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(());
-                    }
+                ) && let Some(result) = l.checked_sub(r)
+                {
+                    ctx.set_register(dst.0, Value::int32(result));
+                    return Ok(());
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Sub
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Sub {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Sub {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
                 let right_num = self.to_numeric(ctx, &right)?;
@@ -7969,27 +7847,26 @@ impl Interpreter {
                 if let (Some(l), Some(r)) = (
                     ctx.get_register(lhs.0).as_int32(),
                     ctx.get_register(rhs.0).as_int32(),
-                ) {
-                    if let Some(result) = l.checked_mul(r) {
-                        ctx.set_register(dst.0, Value::int32(result));
-                        return Ok(());
-                    }
+                ) && let Some(result) = l.checked_mul(r)
+                {
+                    ctx.set_register(dst.0, Value::int32(result));
+                    return Ok(());
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Mul
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Mul {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Mul {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
                 let right_num = self.to_numeric(ctx, &right)?;
@@ -8015,32 +7892,31 @@ impl Interpreter {
                 if let (Some(l), Some(r)) = (
                     ctx.get_register(lhs.0).as_int32(),
                     ctx.get_register(rhs.0).as_int32(),
-                ) {
-                    if r != 0 {
-                        let (result, rem) = (l / r, l % r);
-                        // Only use int32 fast path if division is exact (no remainder)
-                        // and result doesn't lose precision (e.g., -2147483648 / -1)
-                        if rem == 0 && !(l == i32::MIN && r == -1) {
-                            ctx.set_register(dst.0, Value::int32(result));
-                            return Ok(());
-                        }
+                ) && r != 0
+                {
+                    let (result, rem) = (l / r, l % r);
+                    // Only use int32 fast path if division is exact (no remainder)
+                    // and result doesn't lose precision (e.g., -2147483648 / -1)
+                    if rem == 0 && !(l == i32::MIN && r == -1) {
+                        ctx.set_register(dst.0, Value::int32(result));
+                        return Ok(());
                     }
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Div
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Div {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Div {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
                 let right_num = self.to_numeric(ctx, &right)?;
@@ -8073,21 +7949,21 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::number(l + r));
                     return Ok(());
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Add
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Add {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Add {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let result = self.op_add(ctx, &left, &right)?;
                 ctx.set_register(dst.0, result);
@@ -8108,21 +7984,21 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::number(l - r));
                     return Ok(());
                 }
-                let left = ctx.get_register(lhs.0).clone();
-                let right = ctx.get_register(rhs.0).clone();
+                let left = *ctx.get_register(lhs.0);
+                let right = *ctx.get_register(rhs.0);
                 // De-quicken: revert to generic Sub
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::Sub {
-                                dst: *dst,
-                                lhs: *lhs,
-                                rhs: *rhs,
-                                feedback_index: *feedback_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::Sub {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            feedback_index: *feedback_index,
+                        },
+                    );
                 }
                 let left_num = self.to_numeric(ctx, &left)?;
                 let right_num = self.to_numeric(ctx, &right)?;
@@ -8174,18 +8050,18 @@ impl Interpreter {
                 }
 
                 // Shape miss or epoch mismatch: de-quicken back to GetPropConst.
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::GetPropConst {
-                                dst: *dst,
-                                obj: *obj,
-                                name: *name,
-                                ic_index: *ic_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::GetPropConst {
+                            dst: *dst,
+                            obj: *obj,
+                            name: *name,
+                            ic_index: *ic_index,
+                        },
+                    );
                 }
                 // Fall through to generic GetPropConst execution.
                 let fallback = Instruction::GetPropConst {
@@ -8194,7 +8070,7 @@ impl Interpreter {
                     name: *name,
                     ic_index: *ic_index,
                 };
-                return self.execute_instruction(&fallback, module, ctx);
+                self.execute_instruction(&fallback, module, ctx)
             }
 
             // Quickened: property access on a string primitive
@@ -8204,7 +8080,7 @@ impl Interpreter {
                 name,
                 ic_index,
             } => {
-                let object = ctx.get_register(obj.0).clone();
+                let object = *ctx.get_register(obj.0);
                 if object.as_string().is_some() {
                     let name_const = module
                         .constants
@@ -8216,18 +8092,18 @@ impl Interpreter {
                     return self.handle_string_prop_access(ctx, &object, name_str, *dst);
                 }
                 // Type changed — de-quicken back to GetPropConst
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::GetPropConst {
-                                dst: *dst,
-                                obj: *obj,
-                                name: *name,
-                                ic_index: *ic_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::GetPropConst {
+                            dst: *dst,
+                            obj: *obj,
+                            name: *name,
+                            ic_index: *ic_index,
+                        },
+                    );
                 }
                 let fallback = Instruction::GetPropConst {
                     dst: *dst,
@@ -8235,7 +8111,7 @@ impl Interpreter {
                     name: *name,
                     ic_index: *ic_index,
                 };
-                return self.execute_instruction(&fallback, module, ctx);
+                self.execute_instruction(&fallback, module, ctx)
             }
 
             // Quickened: array .length fast access
@@ -8246,25 +8122,25 @@ impl Interpreter {
                 ic_index,
             } => {
                 let object = ctx.get_register(obj.0);
-                if let Some(obj_ref) = object.as_object() {
-                    if obj_ref.is_array() {
-                        ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
-                        return Ok(());
-                    }
+                if let Some(obj_ref) = object.as_object()
+                    && obj_ref.is_array()
+                {
+                    ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
+                    return Ok(());
                 }
                 // Type changed — de-quicken back to GetPropConst
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::GetPropConst {
-                                dst: *dst,
-                                obj: *obj,
-                                name: *name,
-                                ic_index: *ic_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::GetPropConst {
+                            dst: *dst,
+                            obj: *obj,
+                            name: *name,
+                            ic_index: *ic_index,
+                        },
+                    );
                 }
                 let fallback = Instruction::GetPropConst {
                     dst: *dst,
@@ -8272,7 +8148,7 @@ impl Interpreter {
                     name: *name,
                     ic_index: *ic_index,
                 };
-                return self.execute_instruction(&fallback, module, ctx);
+                self.execute_instruction(&fallback, module, ctx)
             }
 
             // Superinstruction: fused GetLocal + GetPropConst
@@ -8285,48 +8161,46 @@ impl Interpreter {
                 let object = ctx.get_local(local_idx.0)?;
 
                 // Fast path: IC check on regular object (same as GetPropQuickened)
-                if let Some(obj_ref) = object.as_object() {
-                    if !obj_ref.is_dictionary_mode() {
-                        let frame = ctx
-                            .current_frame()
-                            .ok_or_else(|| VmError::internal("no frame"))?;
-                        let feedback = frame.feedback().write();
-                        if let Some(ic) = feedback.get_mut(*ic_index as usize) {
-                            use otter_vm_bytecode::function::InlineCacheState;
-                            let obj_shape_ptr = obj_ref.shape_id();
-                            if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
-                                match &mut ic.ic_state {
-                                    InlineCacheState::Monomorphic {
-                                        shape_id, offset, ..
-                                    } => {
-                                        if obj_shape_ptr == *shape_id {
+                if let Some(obj_ref) = object.as_object()
+                    && !obj_ref.is_dictionary_mode()
+                {
+                    let frame = ctx
+                        .current_frame()
+                        .ok_or_else(|| VmError::internal("no frame"))?;
+                    let feedback = frame.feedback().write();
+                    if let Some(ic) = feedback.get_mut(*ic_index as usize) {
+                        use otter_vm_bytecode::function::InlineCacheState;
+                        let obj_shape_ptr = obj_ref.shape_id();
+                        if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
+                            match &mut ic.ic_state {
+                                InlineCacheState::Monomorphic {
+                                    shape_id, offset, ..
+                                } => {
+                                    if obj_shape_ptr == *shape_id
+                                        && let Some(val) = obj_ref.get_by_offset(*offset as usize)
+                                    {
+                                        ctx.set_register(dst.0, val);
+                                        return Ok(());
+                                    }
+                                }
+                                InlineCacheState::Polymorphic { count, entries } => {
+                                    for i in 0..(*count as usize) {
+                                        if obj_shape_ptr == entries[i].0 {
                                             if let Some(val) =
-                                                obj_ref.get_by_offset(*offset as usize)
+                                                obj_ref.get_by_offset(entries[i].3 as usize)
                                             {
+                                                // MRU: promote to front
+                                                if i > 0 {
+                                                    entries.swap(0, i);
+                                                }
                                                 ctx.set_register(dst.0, val);
                                                 return Ok(());
                                             }
+                                            break;
                                         }
                                     }
-                                    InlineCacheState::Polymorphic { count, entries } => {
-                                        for i in 0..(*count as usize) {
-                                            if obj_shape_ptr == entries[i].0 {
-                                                if let Some(val) =
-                                                    obj_ref.get_by_offset(entries[i].3 as usize)
-                                                {
-                                                    // MRU: promote to front
-                                                    if i > 0 {
-                                                        entries.swap(0, i);
-                                                    }
-                                                    ctx.set_register(dst.0, val);
-                                                    return Ok(());
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                                _ => {}
                             }
                         }
                     }
@@ -8340,7 +8214,7 @@ impl Interpreter {
                     name: *name,
                     ic_index: *ic_index,
                 };
-                return self.execute_instruction(&generic, module, ctx);
+                self.execute_instruction(&generic, module, ctx)
             }
 
             Instruction::SetPropQuickened {
@@ -8351,32 +8225,32 @@ impl Interpreter {
                 name,
                 ic_index,
             } => {
-                let object = ctx.get_register(obj.0).clone();
-                let value = ctx.get_register(val.0).clone();
+                let object = *ctx.get_register(obj.0);
+                let value = *ctx.get_register(val.0);
 
                 // Fast path: direct shape verify and store
                 if let Some(obj_ref) = object.as_object() {
                     let obj_shape_ptr = obj_ref.shape_id();
-                    if obj_shape_ptr == *shape_id {
-                        if obj_ref.set_by_offset(*offset as usize, value).is_ok() {
-                            return Ok(());
-                        }
+                    if obj_shape_ptr == *shape_id
+                        && obj_ref.set_by_offset(*offset as usize, value).is_ok()
+                    {
+                        return Ok(());
                     }
                 }
 
                 // Shape miss: de-quicken back to SetPropConst and execute the generic path.
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::SetPropConst {
-                                obj: *obj,
-                                name: *name,
-                                val: *val,
-                                ic_index: *ic_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::SetPropConst {
+                            obj: *obj,
+                            name: *name,
+                            val: *val,
+                            ic_index: *ic_index,
+                        },
+                    );
                 }
                 let fallback = Instruction::SetPropConst {
                     obj: *obj,
@@ -8384,12 +8258,12 @@ impl Interpreter {
                     val: *val,
                     ic_index: *ic_index,
                 };
-                return self.execute_instruction(&fallback, module, ctx);
+                self.execute_instruction(&fallback, module, ctx)
             }
 
             // ==================== Iteration ====================
             Instruction::GetIterator { dst, src } => {
-                let obj = ctx.get_register(src.0).clone();
+                let obj = *ctx.get_register(src.0);
 
                 // Get Symbol.iterator method
                 let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
@@ -8398,11 +8272,7 @@ impl Interpreter {
                     let key_value = Value::symbol(iterator_sym);
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
                     Some(crate::proxy_operations::proxy_get(
-                        &mut ncx,
-                        proxy,
-                        &key,
-                        key_value,
-                        obj.clone(),
+                        &mut ncx, proxy, &key, key_value, obj,
                     )?)
                 } else if obj.is_string() {
                     // String primitives: look up Symbol.iterator on String.prototype
@@ -8444,7 +8314,7 @@ impl Interpreter {
             }
 
             Instruction::GetAsyncIterator { dst, src } => {
-                let obj = ctx.get_register(src.0).clone();
+                let obj = *ctx.get_register(src.0);
 
                 // 1. Try Symbol.asyncIterator
                 let async_iterator_sym = crate::intrinsics::well_known::async_iterator_symbol();
@@ -8455,11 +8325,7 @@ impl Interpreter {
                     let key_value = Value::symbol(async_iterator_sym);
                     let mut ncx = crate::context::NativeContext::new(ctx, self);
                     Some(crate::proxy_operations::proxy_get(
-                        &mut ncx,
-                        proxy,
-                        &key,
-                        key_value,
-                        obj.clone(),
+                        &mut ncx, proxy, &key, key_value, obj,
                     )?)
                 } else {
                     obj.as_object()
@@ -8473,11 +8339,7 @@ impl Interpreter {
                         let key_value = Value::symbol(iterator_sym);
                         let mut ncx = crate::context::NativeContext::new(ctx, self);
                         iterator_method = Some(crate::proxy_operations::proxy_get(
-                            &mut ncx,
-                            proxy,
-                            &key,
-                            key_value,
-                            obj.clone(),
+                            &mut ncx, proxy, &key, key_value, obj,
                         )?);
                     } else {
                         iterator_method = obj
@@ -8521,7 +8383,7 @@ impl Interpreter {
             }
 
             Instruction::IteratorNext { dst, done, iter } => {
-                let iterator = ctx.get_register(iter.0).clone();
+                let iterator = *ctx.get_register(iter.0);
 
                 // Fast path for generator iterators: resume execution directly.
                 if let Some(generator) = iterator.as_generator() {
@@ -8578,7 +8440,7 @@ impl Interpreter {
 
             Instruction::IteratorClose { iter } => {
                 // Spec 7.4.6 IteratorClose
-                let iterator = ctx.get_register(iter.0).clone();
+                let iterator = *ctx.get_register(iter.0);
 
                 // 1. GetMethod(iterator, "return")
                 let return_method = if let Some(obj) = iterator.as_object() {
@@ -8633,12 +8495,12 @@ impl Interpreter {
                 ctor,
                 super_class,
             } => {
-                let ctor_value = ctx.get_register(ctor.0).clone();
+                let ctor_value = *ctx.get_register(ctor.0);
                 let _mm = ctx.memory_manager().clone();
 
                 if let Some(super_reg) = super_class {
                     // Derived class: set up prototype chain
-                    let super_value = ctx.get_register(super_reg.0).clone();
+                    let super_value = *ctx.get_register(super_reg.0);
 
                     // Validate superclass per spec 15.7.14 ClassDefinitionEvaluation:
                     // Step 5.e: if superclass === null (strict equality, NOT abstract)
@@ -8649,9 +8511,9 @@ impl Interpreter {
 
                         let proto_key = PropertyKey::string("prototype");
                         if let Some(ctor_obj) = ctor_value.as_object() {
-                            let _ = ctor_obj.set(proto_key, Value::object(derived_proto.clone()));
+                            let _ = ctor_obj.set(proto_key, Value::object(derived_proto));
                             let ctor_key = PropertyKey::string("constructor");
-                            let _ = derived_proto.set(ctor_key, ctor_value.clone());
+                            let _ = derived_proto.set(ctor_key, ctor_value);
                         }
                     } else {
                         // Step 5.f: IsConstructor check.
@@ -8667,11 +8529,11 @@ impl Interpreter {
                         } else if super_value.as_native_function().is_some() {
                             // Native functions can be constructors unless marked non-constructor
                             if let Some(obj) = super_value.as_object() {
-                                if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
-                                    obj.get_own_property_descriptor(&PropertyKey::string(
-                                        "__non_constructor",
-                                    ))
-                                {
+                                if let Some(crate::object::PropertyDescriptor::Data {
+                                    value, ..
+                                }) = obj.get_own_property_descriptor(&PropertyKey::string(
+                                    "__non_constructor",
+                                )) {
                                     value.as_boolean() != Some(true)
                                 } else {
                                     true
@@ -8726,13 +8588,13 @@ impl Interpreter {
                         if let Some(ctor_obj) = ctor_value.as_object() {
                             let _ = ctor_obj.set(
                                 PropertyKey::string("prototype"),
-                                Value::object(derived_proto.clone()),
+                                Value::object(derived_proto),
                             );
-                            let _ = derived_proto
-                                .set(PropertyKey::string("constructor"), ctor_value.clone());
+                            let _ =
+                                derived_proto.set(PropertyKey::string("constructor"), ctor_value);
                             // Static inheritance: ctor.__proto__ = super
                             // Preserve original HeapRef variant
-                            ctor_obj.set_prototype(super_value.clone());
+                            ctor_obj.set_prototype(super_value);
                         }
                     }
                 } else {
@@ -8740,11 +8602,10 @@ impl Interpreter {
                     // Just ensure ctor.prototype.constructor = ctor
                     if let Some(ctor_obj) = ctor_value.as_object() {
                         let proto_key = PropertyKey::string("prototype");
-                        if let Some(proto_val) = ctor_obj.get(&proto_key) {
-                            if let Some(proto_obj) = proto_val.as_object() {
-                                let _ = proto_obj
-                                    .set(PropertyKey::string("constructor"), ctor_value.clone());
-                            }
+                        if let Some(proto_val) = ctor_obj.get(&proto_key)
+                            && let Some(proto_obj) = proto_val.as_object()
+                        {
+                            let _ = proto_obj.set(PropertyKey::string("constructor"), ctor_value);
                         }
                     }
                 }
@@ -8763,24 +8624,21 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for CallSuper"))?;
 
-                let home_object = frame.home_object.clone().ok_or_else(|| {
+                let home_object = frame.home_object.ok_or_else(|| {
                     VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
                 // new_target_proto is the prototype for the object being created.
                 // In the outermost derived constructor, this is home_object (e.g., C.prototype).
                 // In deeper levels (multi-level), it was propagated from above.
-                let new_target_proto = frame
-                    .new_target_proto
-                    .clone()
-                    .unwrap_or_else(|| home_object.clone());
+                let new_target_proto = frame.new_target_proto.unwrap_or(home_object);
 
                 // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
                 // The super constructor is found via the static inheritance chain of the
                 // constructor function itself, NOT via the prototype chain of instances.
                 // Use callee_value.__proto__ (set during Construct), falling back to the
                 // old approach of home_object.__proto__.constructor for compatibility.
-                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                let super_ctor_val = if let Some(callee) = frame.callee_value {
                     // Correct per spec: Object.getPrototypeOf(callee)
                     if let Some(callee_obj) = callee.as_object() {
                         callee_obj.prototype()
@@ -8799,7 +8657,7 @@ impl Interpreter {
                 // Collect arguments from registers
                 let mut args = Vec::with_capacity(*argc as usize);
                 for i in 0..(*argc as u16) {
-                    args.push(ctx.get_register(args_base.0 + i).clone());
+                    args.push(*ctx.get_register(args_base.0 + i));
                 }
                 let _mm = ctx.memory_manager().clone();
 
@@ -8822,10 +8680,10 @@ impl Interpreter {
                         // Propagate new_target_proto for the eventual object creation
                         ctx.set_pending_new_target_proto(new_target_proto);
                         let proto_key = PropertyKey::string("prototype");
-                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
-                            if let Some(proto_obj) = proto_val.as_object() {
-                                ctx.set_pending_home_object(proto_obj);
-                            }
+                        if let Some(proto_val) = super_closure.object.get(&proto_key)
+                            && let Some(proto_obj) = proto_val.as_object()
+                        {
+                            ctx.set_pending_home_object(proto_obj);
                         }
                     }
 
@@ -8840,35 +8698,29 @@ impl Interpreter {
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Base case: super constructor is a native built-in (Array, RegExp, etc.)
                     // Create object with correct prototype, then call as constructor.
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result = self.call_function_construct(
-                        ctx,
-                        &super_ctor_val,
-                        new_obj_value.clone(),
-                        &args,
-                    )?;
+                    let result =
+                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value, &args)?;
 
                     // Native constructors may return a different object (e.g., Array creates a new array).
                     // Fix its prototype to new_target_proto for proper subclassing.
-                    let this_obj = if result.is_object() {
+
+                    if result.is_object() {
                         if let Some(obj) = result.as_object() {
                             obj.set_prototype(Value::object(new_target_proto));
                         }
                         result
                     } else {
                         new_obj_value
-                    };
-                    this_obj
+                    }
                 } else {
                     // Base case: super constructor is a regular (non-derived) closure.
                     let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
 
-                    let result =
-                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    let result = self.call_function(ctx, &super_ctor_val, new_obj_value, &args)?;
 
                     if result.is_object() {
                         result
@@ -8879,7 +8731,7 @@ impl Interpreter {
 
                 // Set this_initialized and update this_value on current frame
                 if let Some(frame) = ctx.current_frame_mut() {
-                    frame.this_value = this_value.clone();
+                    frame.this_value = this_value;
                     frame.flags.set_this_initialized(true);
                 }
 
@@ -8897,13 +8749,10 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for CallSuperForward"))?;
 
-                let home_object = frame.home_object.clone().ok_or_else(|| {
+                let home_object = frame.home_object.ok_or_else(|| {
                     VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
-                let new_target_proto = frame
-                    .new_target_proto
-                    .clone()
-                    .unwrap_or_else(|| home_object.clone());
+                let new_target_proto = frame.new_target_proto.unwrap_or(home_object);
                 let argc = frame.argc as usize;
 
                 // Collect arguments from locals (for empty default constructor, all args are extras at locals[0..argc])
@@ -8913,7 +8762,7 @@ impl Interpreter {
                 }
 
                 // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
-                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                let super_ctor_val = if let Some(callee) = frame.callee_value {
                     if let Some(callee_obj) = callee.as_object() {
                         callee_obj.prototype()
                     } else {
@@ -8942,10 +8791,10 @@ impl Interpreter {
                         ctx.set_pending_is_derived(true);
                         ctx.set_pending_new_target_proto(new_target_proto);
                         let proto_key = PropertyKey::string("prototype");
-                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
-                            if let Some(proto_obj) = proto_val.as_object() {
-                                ctx.set_pending_home_object(proto_obj);
-                            }
+                        if let Some(proto_val) = super_closure.object.get(&proto_key)
+                            && let Some(proto_obj) = proto_val.as_object()
+                        {
+                            ctx.set_pending_home_object(proto_obj);
                         }
                     }
                     let result =
@@ -8957,30 +8806,24 @@ impl Interpreter {
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
                     // Native built-in constructor (Array, RegExp, etc.)
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
-                    let result = self.call_function_construct(
-                        ctx,
-                        &super_ctor_val,
-                        new_obj_value.clone(),
-                        &args,
-                    )?;
+                    let result =
+                        self.call_function_construct(ctx, &super_ctor_val, new_obj_value, &args)?;
                     // Fix prototype for proper subclassing
-                    let this_obj = if result.is_object() {
+
+                    if result.is_object() {
                         if let Some(obj) = result.as_object() {
                             obj.set_prototype(Value::object(new_target_proto));
                         }
                         result
                     } else {
                         new_obj_value
-                    };
-                    this_obj
+                    }
                 } else {
                     let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
-                    let result =
-                        self.call_function(ctx, &super_ctor_val, new_obj_value.clone(), &args)?;
+                    let result = self.call_function(ctx, &super_ctor_val, new_obj_value, &args)?;
                     if result.is_object() {
                         result
                     } else {
@@ -8989,7 +8832,7 @@ impl Interpreter {
                 };
 
                 if let Some(frame) = ctx.current_frame_mut() {
-                    frame.this_value = this_value.clone();
+                    frame.this_value = this_value;
                     frame.flags.set_this_initialized(true);
                 }
 
@@ -9002,7 +8845,7 @@ impl Interpreter {
 
             Instruction::CallSuperSpread { dst, args } => {
                 // Like CallSuper but arguments come from a spread array
-                let spread_arr = ctx.get_register(args.0).clone();
+                let spread_arr = *ctx.get_register(args.0);
 
                 // Extract args from the array
                 let mut call_args = Vec::new();
@@ -9024,16 +8867,13 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for CallSuperSpread"))?;
 
-                let home_object = frame.home_object.clone().ok_or_else(|| {
+                let home_object = frame.home_object.ok_or_else(|| {
                     VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
-                let new_target_proto = frame
-                    .new_target_proto
-                    .clone()
-                    .unwrap_or_else(|| home_object.clone());
+                let new_target_proto = frame.new_target_proto.unwrap_or(home_object);
 
                 // Per spec: GetSuperConstructor() = Object.getPrototypeOf(activeFunction)
-                let super_ctor_val = if let Some(callee) = frame.callee_value.clone() {
+                let super_ctor_val = if let Some(callee) = frame.callee_value {
                     if let Some(callee_obj) = callee.as_object() {
                         callee_obj.prototype()
                     } else {
@@ -9062,10 +8902,10 @@ impl Interpreter {
                         ctx.set_pending_is_derived(true);
                         ctx.set_pending_new_target_proto(new_target_proto);
                         let proto_key = PropertyKey::string("prototype");
-                        if let Some(proto_val) = super_closure.object.get(&proto_key) {
-                            if let Some(proto_obj) = proto_val.as_object() {
-                                ctx.set_pending_home_object(proto_obj);
-                            }
+                        if let Some(proto_val) = super_closure.object.get(&proto_key)
+                            && let Some(proto_obj) = proto_val.as_object()
+                        {
+                            ctx.set_pending_home_object(proto_obj);
                         }
                     }
                     let result =
@@ -9076,13 +8916,12 @@ impl Interpreter {
                         Value::undefined()
                     }
                 } else if super_ctor_val.as_native_function().is_some() {
-                    let new_obj =
-                        GcRef::new(JsObject::new(Value::object(new_target_proto.clone())));
+                    let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
                     let result = self.call_function_construct(
                         ctx,
                         &super_ctor_val,
-                        new_obj_value.clone(),
+                        new_obj_value,
                         &call_args,
                     )?;
                     if result.is_object() {
@@ -9096,12 +8935,8 @@ impl Interpreter {
                 } else {
                     let new_obj = GcRef::new(JsObject::new(Value::object(new_target_proto)));
                     let new_obj_value = Value::object(new_obj);
-                    let result = self.call_function(
-                        ctx,
-                        &super_ctor_val,
-                        new_obj_value.clone(),
-                        &call_args,
-                    )?;
+                    let result =
+                        self.call_function(ctx, &super_ctor_val, new_obj_value, &call_args)?;
                     if result.is_object() {
                         result
                     } else {
@@ -9110,7 +8945,7 @@ impl Interpreter {
                 };
 
                 if let Some(frame) = ctx.current_frame_mut() {
-                    frame.this_value = this_value.clone();
+                    frame.this_value = this_value;
                     frame.flags.set_this_initialized(true);
                 }
 
@@ -9126,7 +8961,7 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for GetSuper"))?;
 
-                let home_object = frame.home_object.clone().ok_or_else(|| {
+                let home_object = frame.home_object.ok_or_else(|| {
                     VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
@@ -9142,7 +8977,7 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame for GetSuperProp"))?;
 
-                let home_object = frame.home_object.clone().ok_or_else(|| {
+                let home_object = frame.home_object.ok_or_else(|| {
                     VmError::ReferenceError("'super' keyword unexpected here".to_string())
                 })?;
 
@@ -9162,7 +8997,7 @@ impl Interpreter {
                 // Get the current this value (super property access uses current this, not prototype)
                 let this_value = ctx
                     .current_frame()
-                    .map(|f| f.this_value.clone())
+                    .map(|f| f.this_value)
                     .unwrap_or_else(Value::undefined);
 
                 let value = if let Some(proto) = super_proto.as_object() {
@@ -9190,22 +9025,22 @@ impl Interpreter {
             }
 
             Instruction::SetHomeObject { func, obj } => {
-                let func_val = ctx.get_register(func.0).clone();
-                let obj_val = ctx.get_register(obj.0).clone();
-                if let Some(closure) = func_val.as_function() {
-                    if let Some(obj_ref) = obj_val.as_object() {
-                        // Create a new closure with home_object set
-                        let new_closure = Closure {
-                            function_index: closure.function_index,
-                            module: Arc::clone(&closure.module),
-                            upvalues: closure.upvalues.clone(),
-                            is_async: closure.is_async,
-                            is_generator: closure.is_generator,
-                            object: closure.object.clone(),
-                            home_object: Some(obj_ref),
-                        };
-                        ctx.set_register(func.0, Value::function(GcRef::new(new_closure)));
-                    }
+                let func_val = *ctx.get_register(func.0);
+                let obj_val = *ctx.get_register(obj.0);
+                if let Some(closure) = func_val.as_function()
+                    && let Some(obj_ref) = obj_val.as_object()
+                {
+                    // Create a new closure with home_object set
+                    let new_closure = Closure {
+                        function_index: closure.function_index,
+                        module: Arc::clone(&closure.module),
+                        upvalues: closure.upvalues.clone(),
+                        is_async: closure.is_async,
+                        is_generator: closure.is_generator,
+                        object: closure.object,
+                        home_object: Some(obj_ref),
+                    };
+                    ctx.set_register(func.0, Value::function(GcRef::new(new_closure)));
                 }
                 Ok(())
             }
@@ -9219,8 +9054,8 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::int32(l & r));
                     return Ok(());
                 }
-                let l_val = ctx.get_register(lhs.0).clone();
-                let r_val = ctx.get_register(rhs.0).clone();
+                let l_val = *ctx.get_register(lhs.0);
+                let r_val = *ctx.get_register(rhs.0);
 
                 let l_numeric = self.to_numeric(ctx, &l_val)?;
                 let r_numeric = self.to_numeric(ctx, &r_val)?;
@@ -9245,8 +9080,8 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::int32(l | r));
                     return Ok(());
                 }
-                let l_val = ctx.get_register(lhs.0).clone();
-                let r_val = ctx.get_register(rhs.0).clone();
+                let l_val = *ctx.get_register(lhs.0);
+                let r_val = *ctx.get_register(rhs.0);
 
                 let l_numeric = self.to_numeric(ctx, &l_val)?;
                 let r_numeric = self.to_numeric(ctx, &r_val)?;
@@ -9271,8 +9106,8 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::int32(l ^ r));
                     return Ok(());
                 }
-                let l_val = ctx.get_register(lhs.0).clone();
-                let r_val = ctx.get_register(rhs.0).clone();
+                let l_val = *ctx.get_register(lhs.0);
+                let r_val = *ctx.get_register(rhs.0);
 
                 let l_numeric = self.to_numeric(ctx, &l_val)?;
                 let r_numeric = self.to_numeric(ctx, &r_val)?;
@@ -9294,7 +9129,7 @@ impl Interpreter {
                     ctx.set_register(dst.0, Value::int32(!v));
                     return Ok(());
                 }
-                let v_val = ctx.get_register(src.0).clone();
+                let v_val = *ctx.get_register(src.0);
 
                 let numeric = self.to_numeric(ctx, &v_val)?;
                 match numeric {
@@ -9319,8 +9154,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
+                let l_val_cloned = *l_val;
+                let r_val_cloned = *r_val;
                 let l = self.to_int32_from(self.coerce_number(ctx, l_val_cloned)?);
                 let r = self.to_uint32_from(self.coerce_number(ctx, r_val_cloned)?);
                 let shift = r & 0x1f;
@@ -9337,8 +9172,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
+                let l_val_cloned = *l_val;
+                let r_val_cloned = *r_val;
                 let l = self.to_int32_from(self.coerce_number(ctx, l_val_cloned)?);
                 let r = self.to_uint32_from(self.coerce_number(ctx, r_val_cloned)?);
                 let shift = r & 0x1f;
@@ -9358,8 +9193,8 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                let l_val_cloned = l_val.clone();
-                let r_val_cloned = r_val.clone();
+                let l_val_cloned = *l_val;
+                let r_val_cloned = *r_val;
                 let l = self.to_uint32_from(self.coerce_number(ctx, l_val_cloned)?);
                 let r = self.to_uint32_from(self.coerce_number(ctx, r_val_cloned)?);
                 let shift = r & 0x1f;
@@ -9485,7 +9320,7 @@ impl Interpreter {
         }
 
         for (index, value) in values.iter().enumerate() {
-            arr.set(PropertyKey::Index(index as u32), value.clone())
+            arr.set(PropertyKey::Index(index as u32), *value)
                 .map_err(|e| VmError::internal(format!("failed to build template array: {e}")))?;
         }
 
@@ -9494,20 +9329,19 @@ impl Interpreter {
 
     /// Determine the realm id for a constructor function (best-effort).
     pub(crate) fn realm_id_for_function(&self, ctx: &VmContext, value: &Value) -> RealmId {
-        let mut current = value.clone();
-        if let Some(proxy) = current.as_proxy() {
-            if let Some(target) = proxy.target() {
-                current = target;
-            }
+        let mut current = *value;
+        if let Some(proxy) = current.as_proxy()
+            && let Some(target) = proxy.target()
+        {
+            current = target;
         }
 
-        if let Some(obj) = current.as_object() {
-            if let Some(id) = obj
+        if let Some(obj) = current.as_object()
+            && let Some(id) = obj
                 .get(&PropertyKey::string("__realm_id__"))
                 .and_then(|v| v.as_int32())
-            {
-                return id as RealmId;
-            }
+        {
+            return id as RealmId;
         }
         ctx.realm_id()
     }
@@ -9520,20 +9354,19 @@ impl Interpreter {
     ) -> Option<GcRef<JsObject>> {
         let realm_id = self.realm_id_for_function(ctx, ctor);
         if let Some(intrinsics) = ctx.realm_intrinsics(realm_id) {
-            let mut current = ctor.clone();
-            if let Some(proxy) = current.as_proxy() {
-                if let Some(target) = proxy.target() {
-                    current = target;
-                }
+            let mut current = *ctor;
+            if let Some(proxy) = current.as_proxy()
+                && let Some(target) = proxy.target()
+            {
+                current = target;
             }
             if let Some(tag) = current
                 .as_object()
                 .and_then(|o| o.get(&PropertyKey::string("__builtin_tag__")))
                 .and_then(|v| v.as_string())
+                && let Some(proto) = intrinsics.prototype_for_builtin_tag(tag.as_str())
             {
-                if let Some(proto) = intrinsics.prototype_for_builtin_tag(tag.as_str()) {
-                    return Some(proto);
-                }
+                return Some(proto);
             }
             return Some(intrinsics.object_prototype);
         }
@@ -9562,7 +9395,7 @@ impl Interpreter {
                 }
                 UpvalueCapture::Upvalue(idx) => {
                     // The parent's upvalue is already a cell, just clone the Rc.
-                    ctx.get_upvalue_cell(idx.0)?.clone()
+                    *ctx.get_upvalue_cell(idx.0)?
                 }
             };
             captured.push(cell);
@@ -9612,7 +9445,7 @@ impl Interpreter {
             });
 
             let func_val = Value::function(closure);
-            self.call_function(ctx, &func_val, this_value.clone(), &[])?;
+            self.call_function(ctx, &func_val, *this_value, &[])?;
         }
 
         Ok(())

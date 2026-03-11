@@ -22,7 +22,7 @@ impl Interpreter {
                 if !getter.is_callable() {
                     return Err(VmError::type_error("getter is not a function"));
                 }
-                self.call_function(ctx, &getter, receiver.clone(), &[])
+                self.call_function(ctx, &getter, *receiver, &[])
             }
             Some(PropertyDescriptor::Data { value, .. }) => Ok(value),
             _ => Ok(Value::undefined()),
@@ -56,7 +56,7 @@ impl Interpreter {
         if let Some(proxy) = object.as_proxy() {
             let key = Self::utf16_key(name_str);
             let key_value = Value::string(JsString::intern_utf16(name_str));
-            let receiver = object.clone();
+            let receiver = object;
             let result = {
                 let mut ncx = crate::context::NativeContext::new(ctx, self);
                 crate::proxy_operations::proxy_get(&mut ncx, proxy, &key, key_value, receiver)?
@@ -67,18 +67,18 @@ impl Interpreter {
 
         // 2. String — quicken to GetPropString for future hits
         if object.as_string().is_some() {
-            if let Some(frame) = ctx.current_frame() {
-                if let Some(func) = module.function(frame.function_index) {
-                    func.quicken_instruction(
-                        frame.pc,
-                        Instruction::GetPropString {
-                            dst,
-                            obj,
-                            name,
-                            ic_index,
-                        },
-                    );
-                }
+            if let Some(frame) = ctx.current_frame()
+                && let Some(func) = module.function(frame.function_index)
+            {
+                func.quicken_instruction(
+                    frame.pc,
+                    Instruction::GetPropString {
+                        dst,
+                        obj,
+                        name,
+                        ic_index,
+                    },
+                );
             }
             return self.handle_string_prop_access(ctx, &object, name_str, dst);
         }
@@ -87,24 +87,24 @@ impl Interpreter {
         if let Some(obj_ref) = object.as_object() {
             // Array .length — quicken to GetArrayLength
             if obj_ref.is_array() && Self::utf16_eq_ascii(name_str, "length") {
-                if let Some(frame) = ctx.current_frame() {
-                    if let Some(func) = module.function(frame.function_index) {
-                        func.quicken_instruction(
-                            frame.pc,
-                            Instruction::GetArrayLength {
-                                dst,
-                                obj,
-                                name,
-                                ic_index,
-                            },
-                        );
-                    }
+                if let Some(frame) = ctx.current_frame()
+                    && let Some(func) = module.function(frame.function_index)
+                {
+                    func.quicken_instruction(
+                        frame.pc,
+                        Instruction::GetArrayLength {
+                            dst,
+                            obj,
+                            name,
+                            ic_index,
+                        },
+                    );
                 }
                 ctx.set_register(dst.0, Value::int32(obj_ref.array_length() as i32));
                 return Ok(());
             }
 
-            let receiver = object.clone();
+            let receiver = object;
             let key = Self::utf16_key(name_str);
 
             match obj_ref.lookup_property_descriptor(&key) {
@@ -138,7 +138,7 @@ impl Interpreter {
                 _ => {
                     // IC miss: full proto walk + IC state update
                     if !obj_ref.is_dictionary_mode() {
-                        let mut current_obj = Some(obj_ref.clone());
+                        let mut current_obj = Some(obj_ref);
                         let mut depth = 0;
                         let mut found_offset = None;
                         let mut found_shape = 0;
@@ -153,7 +153,7 @@ impl Interpreter {
                                 break;
                             }
                             if let Some(proto) = cur.prototype().as_object() {
-                                current_obj = Some(proto.clone());
+                                current_obj = Some(proto);
                                 depth += 1;
                             }
                         }
@@ -202,8 +202,8 @@ impl Interpreter {
                                     }
                                     InlineCacheState::Polymorphic { count, entries } => {
                                         let mut found = false;
-                                        for i in 0..(*count as usize) {
-                                            if entries[i].0 == shape_ptr {
+                                        for entry in &entries[..(*count as usize)] {
+                                            if entry.0 == shape_ptr {
                                                 found = true;
                                                 break;
                                             }
@@ -228,32 +228,30 @@ impl Interpreter {
 
                                 // Quickening
                                 ic.hit_count = ic.hit_count.saturating_add(1);
-                                if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
-                                    if let InlineCacheState::Monomorphic {
+                                if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP
+                                    && let InlineCacheState::Monomorphic {
                                         shape_id,
                                         offset,
                                         depth: ic_depth,
                                         ..
                                     } = ic.ic_state
-                                    {
-                                        if let Some(func) = module.function(frame.function_index) {
-                                            let pc = frame.pc;
-                                            Self::try_quicken_property_access(
-                                                func,
-                                                pc,
-                                                &Instruction::GetPropConst {
-                                                    dst,
-                                                    obj,
-                                                    name,
-                                                    ic_index,
-                                                },
-                                                shape_id,
-                                                offset,
-                                                ic_depth,
-                                                ic.proto_epoch,
-                                            );
-                                        }
-                                    }
+                                    && let Some(func) = module.function(frame.function_index)
+                                {
+                                    let pc = frame.pc;
+                                    Self::try_quicken_property_access(
+                                        func,
+                                        pc,
+                                        &Instruction::GetPropConst {
+                                            dst,
+                                            obj,
+                                            name,
+                                            ic_index,
+                                        },
+                                        shape_id,
+                                        offset,
+                                        ic_depth,
+                                        ic.proto_epoch,
+                                    );
                                 }
                             }
                         }
@@ -270,38 +268,34 @@ impl Interpreter {
         // 4. Primitive autoboxing (number, boolean, symbol)
         let key = Self::utf16_key(name_str);
         if object.is_number() {
-            if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object()) {
-                if let Some(proto) = number_obj
+            if let Some(number_obj) = ctx.get_global("Number").and_then(|v| v.as_object())
+                && let Some(proto) = number_obj
                     .get(&PropertyKey::string("prototype"))
                     .and_then(|v| v.as_object())
-                {
-                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                    ctx.set_register(dst.0, value);
-                    return Ok(());
-                }
+            {
+                let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                ctx.set_register(dst.0, value);
+                return Ok(());
             }
         } else if object.is_boolean() {
-            if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object()) {
-                if let Some(proto) = boolean_obj
+            if let Some(boolean_obj) = ctx.get_global("Boolean").and_then(|v| v.as_object())
+                && let Some(proto) = boolean_obj
                     .get(&PropertyKey::string("prototype"))
                     .and_then(|v| v.as_object())
-                {
-                    let value = proto.get(&key).unwrap_or_else(Value::undefined);
-                    ctx.set_register(dst.0, value);
-                    return Ok(());
-                }
+            {
+                let value = proto.get(&key).unwrap_or_else(Value::undefined);
+                ctx.set_register(dst.0, value);
+                return Ok(());
             }
-        } else if object.is_symbol() {
-            if let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object()) {
-                if let Some(proto) = symbol_obj
-                    .get(&PropertyKey::string("prototype"))
-                    .and_then(|v| v.as_object())
-                {
-                    let value = self.get_property_value(ctx, &proto, &key, &object)?;
-                    ctx.set_register(dst.0, value);
-                    return Ok(());
-                }
-            }
+        } else if object.is_symbol()
+            && let Some(symbol_obj) = ctx.get_global("Symbol").and_then(|v| v.as_object())
+            && let Some(proto) = symbol_obj
+                .get(&PropertyKey::string("prototype"))
+                .and_then(|v| v.as_object())
+        {
+            let value = self.get_property_value(ctx, &proto, &key, &object)?;
+            ctx.set_register(dst.0, value);
+            return Ok(());
         }
 
         ctx.set_register(dst.0, Value::undefined());
@@ -362,13 +356,13 @@ impl Interpreter {
             return Ok(value);
         }
         // Check for accessor descriptors separately (getters need to be called)
-        if let Some(desc) = obj.get_own_property_descriptor(key) {
-            if let PropertyDescriptor::Accessor { get, .. } = desc {
-                if let Some(getter) = get {
-                    return self.call_function(ctx, &getter, receiver.clone(), &[]);
-                }
-                return Ok(Value::undefined());
+        if let Some(desc) = obj.get_own_property_descriptor(key)
+            && let PropertyDescriptor::Accessor { get, .. } = desc
+        {
+            if let Some(getter) = get {
+                return self.call_function(ctx, &getter, *receiver, &[]);
             }
+            return Ok(Value::undefined());
         }
         // 2. Walk prototype chain with proxy support
         let mut current = obj.prototype();
@@ -385,24 +379,20 @@ impl Interpreter {
             if let Some(proxy) = current.as_proxy() {
                 let mut ncx = crate::context::NativeContext::new(ctx, self);
                 return crate::proxy_operations::proxy_get(
-                    &mut ncx,
-                    proxy,
-                    key,
-                    key_value,
-                    receiver.clone(),
+                    &mut ncx, proxy, key, key_value, *receiver,
                 );
             }
             if let Some(proto_obj) = current.as_object() {
                 if let Some(value) = Self::get_own_value(&proto_obj, key) {
                     return Ok(value);
                 }
-                if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
-                    if let PropertyDescriptor::Accessor { get, .. } = desc {
-                        if let Some(getter) = get {
-                            return self.call_function(ctx, &getter, receiver.clone(), &[]);
-                        }
-                        return Ok(Value::undefined());
+                if let Some(desc) = proto_obj.get_own_property_descriptor(key)
+                    && let PropertyDescriptor::Accessor { get, .. } = desc
+                {
+                    if let Some(getter) = get {
+                        return self.call_function(ctx, &getter, *receiver, &[]);
                     }
+                    return Ok(Value::undefined());
                 }
                 current = proto_obj.prototype();
             } else {
@@ -427,10 +417,10 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if let Some(v) = elements.get(idx) {
-                if !v.is_hole() {
-                    return Some(v);
-                }
+            if let Some(v) = elements.get(idx)
+                && !v.is_hole()
+            {
+                return Some(v);
             }
         }
         None
@@ -482,10 +472,10 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if let Some(v) = elements.get(idx) {
-                if !v.is_hole() {
-                    return true;
-                }
+            if let Some(v) = elements.get(idx)
+                && !v.is_hole()
+            {
+                return true;
             }
         }
         false
@@ -510,7 +500,7 @@ impl Interpreter {
             match desc {
                 crate::object::PropertyDescriptor::Accessor { set, .. } => {
                     if let Some(setter) = set {
-                        self.call_function(ctx, &setter, receiver.clone(), &[value])?;
+                        self.call_function(ctx, &setter, *receiver, &[value])?;
                         return Ok(true);
                     }
                     return Ok(false);
@@ -528,14 +518,14 @@ impl Interpreter {
         if let PropertyKey::Index(i) = key {
             let elements = obj.get_elements_storage().borrow();
             let idx = *i as usize;
-            if let Some(v) = elements.get(idx) {
-                if !v.is_hole() {
-                    drop(elements);
-                    if let Some(recv_obj) = receiver.as_object() {
-                        return Ok(recv_obj.set(*key, value).is_ok());
-                    }
-                    return Ok(false);
+            if let Some(v) = elements.get(idx)
+                && !v.is_hole()
+            {
+                drop(elements);
+                if let Some(recv_obj) = receiver.as_object() {
+                    return Ok(recv_obj.set(*key, value).is_ok());
                 }
+                return Ok(false);
             }
         }
         // 2. Walk prototype chain looking for proxy or accessor
@@ -556,12 +546,7 @@ impl Interpreter {
             if let Some(proxy) = current.as_proxy() {
                 let mut ncx = crate::context::NativeContext::new(ctx, self);
                 return crate::proxy_operations::proxy_set(
-                    &mut ncx,
-                    proxy,
-                    key,
-                    key_value,
-                    value,
-                    receiver.clone(),
+                    &mut ncx, proxy, key, key_value, value, *receiver,
                 );
             }
             if let Some(proto_obj) = current.as_object() {
@@ -569,7 +554,7 @@ impl Interpreter {
                     match desc {
                         crate::object::PropertyDescriptor::Accessor { set, .. } => {
                             if let Some(setter) = set {
-                                self.call_function(ctx, &setter, receiver.clone(), &[value])?;
+                                self.call_function(ctx, &setter, *receiver, &[value])?;
                                 return Ok(true);
                             }
                             return Ok(false);

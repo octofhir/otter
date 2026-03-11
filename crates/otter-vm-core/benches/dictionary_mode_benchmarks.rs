@@ -16,7 +16,7 @@ fn bench_shape_based_access(c: &mut Criterion) {
             let obj = GcRef::new(JsObject::new(Value::null()));
             for i in 0..20 {
                 let key = PropertyKey::string(&format!("prop{}", i));
-                let _ = obj.set(key, Value::int32(i as i32));
+                let _ = obj.set(key, Value::int32(i));
             }
             black_box(obj)
         });
@@ -26,7 +26,7 @@ fn bench_shape_based_access(c: &mut Criterion) {
         let obj = GcRef::new(JsObject::new(Value::null()));
         for i in 0..20 {
             let key = PropertyKey::string(&format!("prop{}", i));
-            obj.set(key, Value::int32(i as i32)).ok();
+            obj.set(key, Value::int32(i)).ok();
         }
 
         b.iter(|| {
@@ -51,7 +51,7 @@ fn bench_dictionary_mode_access(c: &mut Criterion) {
             let obj = GcRef::new(JsObject::new(Value::null()));
             for i in 0..50 {
                 let key = PropertyKey::string(&format!("prop{}", i));
-                let _ = obj.set(key, Value::int32(i as i32));
+                let _ = obj.set(key, Value::int32(i));
             }
             black_box(obj)
         });
@@ -62,7 +62,7 @@ fn bench_dictionary_mode_access(c: &mut Criterion) {
         // Create 50 properties to trigger dictionary mode
         for i in 0..50 {
             let key = PropertyKey::string(&format!("prop{}", i));
-            obj.set(key, Value::int32(i as i32)).ok();
+            obj.set(key, Value::int32(i)).ok();
         }
 
         // Verify it's in dictionary mode
@@ -93,7 +93,7 @@ fn bench_delete_triggered_dictionary(c: &mut Criterion) {
         // Create 10 properties
         for i in 0..10 {
             let key = PropertyKey::string(&format!("prop{}", i));
-            obj.set(key, Value::int32(i as i32)).ok();
+            obj.set(key, Value::int32(i)).ok();
         }
         // Delete one to trigger dictionary mode
         obj.delete(&PropertyKey::string("prop5"));
@@ -128,7 +128,7 @@ fn bench_compare_storage_modes(c: &mut Criterion) {
         let obj = GcRef::new(JsObject::new(Value::null()));
         for i in 0..25 {
             let key = PropertyKey::string(&format!("p{}", i));
-            obj.set(key, Value::int32(i as i32)).ok();
+            obj.set(key, Value::int32(i)).ok();
         }
         assert!(!obj.is_dictionary_mode());
 
@@ -149,7 +149,7 @@ fn bench_compare_storage_modes(c: &mut Criterion) {
         let obj = GcRef::new(JsObject::new(Value::null()));
         for i in 0..26 {
             let key = PropertyKey::string(&format!("p{}", i));
-            obj.set(key, Value::int32(i as i32)).ok();
+            obj.set(key, Value::int32(i)).ok();
         }
         // Delete one to trigger dictionary and keep 25 props
         obj.delete(&PropertyKey::string("p25"));

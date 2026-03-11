@@ -40,10 +40,11 @@ pub const DEOPT_THRESHOLD: u32 = 10;
 ///
 /// Values are persisted in JIT runtime telemetry and therefore must remain
 /// stable once released.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i64)]
 pub enum BailoutReason {
     /// Bailout happened but no specific reason was recorded.
+    #[default]
     Unknown = 0,
     /// A runtime helper returned `BAILOUT_SENTINEL`.
     HelperReturnedSentinel = 1,
@@ -66,12 +67,6 @@ impl BailoutReason {
             2 => Self::TypeGuardFailure,
             _ => Self::Unknown,
         }
-    }
-}
-
-impl Default for BailoutReason {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 

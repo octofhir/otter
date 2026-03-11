@@ -144,7 +144,7 @@ fn weakref_constructor(
 
     let target_header = target.gc_header().unwrap();
     let cell = GcRef::new(otter_vm_gc::WeakRefCell::new(target_header));
-    let mm = ncx.memory_manager().clone();
+    let _mm = ncx.memory_manager().clone();
 
     let weak_ref_proto = ncx
         .global()
@@ -211,7 +211,7 @@ fn finreg_constructor(
     }
 
     let data = GcRef::new(otter_vm_gc::FinalizationRegistryData::new());
-    let mm = ncx.memory_manager().clone();
+    let _mm = ncx.memory_manager().clone();
 
     let finreg_proto = ncx
         .global()

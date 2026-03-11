@@ -316,7 +316,11 @@ impl Assert {
             });
 
         let matches = if let Some(test_fn) = test_method {
-            let result = ncx.call_function(&test_fn, regexp_val.clone(), &[string_val.clone()])?;
+            let result = ncx.call_function(
+                &test_fn,
+                regexp_val.clone(),
+                std::slice::from_ref(&string_val),
+            )?;
             result.to_boolean()
         } else {
             // Direct exec fallback
@@ -374,7 +378,11 @@ impl Assert {
             });
 
         let matches = if let Some(test_fn) = test_method {
-            let result = ncx.call_function(&test_fn, regexp_val.clone(), &[string_val.clone()])?;
+            let result = ncx.call_function(
+                &test_fn,
+                regexp_val.clone(),
+                std::slice::from_ref(&string_val),
+            )?;
             result.to_boolean()
         } else {
             let regexp = regexp_val.as_regex().unwrap();

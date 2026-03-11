@@ -163,6 +163,7 @@ pub(super) fn extract_zoned_date_time(
 }
 
 /// Extract a `temporal_rs::PlainDate` from a JsObject that is either a PlainDate or PlainDateTime.
+#[allow(dead_code)]
 pub(super) fn extract_date_like(obj: &GcRef<JsObject>) -> Result<temporal_rs::PlainDate, VmError> {
     let inner = extract_temporal_inner(obj)?;
     match &*inner {
@@ -278,9 +279,9 @@ pub(super) fn extract_duration_from_slots(
 pub(super) fn construct_duration_object(
     dur: &temporal_rs::Duration,
     proto: &GcRef<JsObject>,
-    mm: &Arc<MemoryManager>,
+    _mm: &Arc<MemoryManager>,
 ) -> GcRef<JsObject> {
-    let obj = GcRef::new(JsObject::new(Value::object(proto.clone())));
+    let obj = GcRef::new(JsObject::new(Value::object(*proto)));
     store_temporal_inner(&obj, TemporalValue::Duration(*dur));
     obj
 }
@@ -299,7 +300,7 @@ pub(super) fn is_leap_year(year: i32) -> bool {
 pub(super) fn days_in_month(month: u32, year: i32) -> u32 {
     if month == 2 && is_leap_year(year) {
         29
-    } else if month >= 1 && month <= 12 {
+    } else if (1..=12).contains(&month) {
         DAYS_IN_MONTH[month as usize]
     } else {
         31
@@ -307,6 +308,7 @@ pub(super) fn days_in_month(month: u32, year: i32) -> u32 {
 }
 
 /// Convert ISO date to days from Unix epoch (1970-01-01)
+#[allow(dead_code)]
 pub(super) fn iso_date_to_epoch_days(year: i32, month: i32, day: i32) -> i64 {
     // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     let y = if month <= 2 {
@@ -324,6 +326,7 @@ pub(super) fn iso_date_to_epoch_days(year: i32, month: i32, day: i32) -> i64 {
 
 /// Parse timezone offset string to nanoseconds
 /// Supports: "UTC", "+HH:MM", "-HH:MM", "+HH:MM:SS", "+HHMM", "+HH"
+#[allow(dead_code)]
 pub(super) fn parse_tz_offset_ns(tz_id: &str) -> Result<i128, VmError> {
     let upper = tz_id.to_ascii_uppercase();
     if upper == "UTC" || upper == "Z" {
@@ -335,8 +338,8 @@ pub(super) fn parse_tz_offset_ns(tz_id: &str) -> Result<i128, VmError> {
         } else {
             1
         };
-        let offset_part = if tz_id.starts_with('\u{2212}') {
-            &tz_id[3..]
+        let offset_part = if let Some(stripped) = tz_id.strip_prefix('\u{2212}') {
+            stripped
         } else {
             &tz_id[1..]
         };
@@ -425,7 +428,7 @@ fn require_string_impl(
     let primitive = if val.as_object().is_some() || val.as_proxy().is_some() {
         ncx.to_primitive(val, crate::interpreter::PreferredType::String)?
     } else {
-        val.clone()
+        *val
     };
     // RequireString: result must be a String
     if !primitive.is_string() {
@@ -435,7 +438,7 @@ fn require_string_impl(
             primitive.type_of()
         )));
     }
-    Ok(primitive.as_string().unwrap().clone())
+    Ok(primitive.as_string().unwrap())
 }
 
 /// Convert a ToIntegerWithTruncation per Temporal spec (like ToIntegerIfIntegral but truncates)
@@ -466,7 +469,7 @@ pub(super) fn validate_iso_month_day(
     day: i32,
     reference_year: i32,
 ) -> Result<(u32, u32, i32), VmError> {
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(VmError::range_error(format!(
             "month must be between 1 and 12, got {}",
             month
@@ -483,13 +486,14 @@ pub(super) fn validate_iso_month_day(
 }
 
 /// Parse a monthCode string like "M01" through "M12" (lenient)
+#[allow(dead_code)]
 pub(super) fn parse_month_code(s: &str) -> Option<u32> {
     let mc = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).ok()?;
     if mc.is_leap_month() {
         return None;
     }
     let m = mc.to_month_integer() as u32;
-    if m >= 1 && m <= 12 { Some(m) } else { None }
+    if (1..=12).contains(&m) { Some(m) } else { None }
 }
 
 /// Validate monthCode SYNTAX — delegates to temporal_rs::MonthCode
@@ -510,7 +514,7 @@ pub(super) fn validate_month_code_iso_suitability(s: &str) -> Result<u32, VmErro
         )));
     }
     let month = mc.to_month_integer() as u32;
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(VmError::range_error(format!(
             "monthCode {} is not valid for ISO 8601 calendar",
             s
@@ -724,6 +728,7 @@ pub(super) fn extract_iso_date_from_slots(
 
 /// Extract ISO date fields from an object with PlainDate OR PlainDateTime branding.
 /// Tries TemporalValue first, falls back to legacy slots.
+#[allow(dead_code)]
 pub(super) fn extract_iso_date_from_date_like_slots(
     obj: &GcRef<JsObject>,
 ) -> Result<temporal_rs::PlainDate, VmError> {
@@ -1052,6 +1057,7 @@ pub(super) fn find_time_separator(s: &str) -> Option<usize> {
 
 /// Check if a bare date string (without time) has a standalone UTC offset
 /// that isn't a date separator. E.g., "09-15+01:00" has an offset, "09-15" doesn't.
+#[allow(dead_code)]
 pub(super) fn has_standalone_utc_offset(s: &str) -> bool {
     // Look for +/-HH:MM pattern after date portion
     // MM-DD is 5 chars, --MM-DD is 7 chars, YYYY-MM-DD is 10 chars
@@ -1092,6 +1098,7 @@ pub(super) fn has_standalone_utc_offset(s: &str) -> bool {
 }
 
 /// Check if a string has a UTC offset (Z, +HH:MM, -HH:MM, +HH, -HH)
+#[allow(dead_code)]
 pub(super) fn has_utc_offset(s: &str) -> bool {
     if s.ends_with('Z') || s.ends_with('z') {
         return true;
@@ -1153,8 +1160,8 @@ pub(super) fn validate_annotations(s: &str) -> Result<(), VmError> {
         remaining = &remaining[close + 1..];
 
         // Check for critical flag
-        let (is_critical, content) = if inner.starts_with('!') {
-            (true, &inner[1..])
+        let (is_critical, content) = if let Some(stripped) = inner.strip_prefix('!') {
+            (true, stripped)
         } else {
             (false, inner)
         };
@@ -1229,7 +1236,7 @@ pub(super) fn proxy_get_property(
 ) -> Result<Value, VmError> {
     let pk = PropertyKey::string(key);
     let kv = crate::proxy_operations::property_key_to_value_pub(&pk);
-    crate::proxy_operations::proxy_get(ncx, proxy.clone(), &pk, kv, receiver.clone())
+    crate::proxy_operations::proxy_get(ncx, proxy, &pk, kv, *receiver)
 }
 
 pub(super) fn parse_overflow_option(
@@ -1290,7 +1297,7 @@ pub(super) fn parse_overflow_option(
         let key = PropertyKey::string("overflow");
         let key_value = crate::proxy_operations::property_key_to_value_pub(&key);
         let overflow_val =
-            crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, options_val.clone())?;
+            crate::proxy_operations::proxy_get(ncx, proxy, &key, key_value, *options_val)?;
         if overflow_val.is_undefined() {
             return Ok(Overflow::Constrain);
         }
@@ -1317,6 +1324,7 @@ pub(super) fn parse_overflow_option(
 
 /// Parse a timezone identifier string into an offset in nanoseconds.
 /// Handles fixed-offset timezones like "+05:30", "-00:02", "UTC".
+#[allow(dead_code)]
 pub(super) fn parse_timezone_offset_ns(tz_id: &str) -> i128 {
     if tz_id == "UTC" || tz_id.eq_ignore_ascii_case("utc") {
         return 0;
@@ -1382,9 +1390,7 @@ pub(super) fn reject_fractional_hours_minutes(s: &str) -> Result<(), VmError> {
         // Parse time components looking for decimal point
         // Valid: HH:MM:SS.sss or HHMMSS.sss
         // Invalid: HH.xxx or HH:MM.xxx
-        let parts: Vec<&str> = time_clean
-            .splitn(2, |c: char| c == '.' || c == ',')
-            .collect();
+        let parts: Vec<&str> = time_clean.splitn(2, ['.', ',']).collect();
         if parts.len() == 2 {
             // There's a fractional part — check what it's attached to
             let before_dot = parts[0];
@@ -1398,7 +1404,7 @@ pub(super) fn reject_fractional_hours_minutes(s: &str) -> Result<(), VmError> {
                     "Fractional hours are not allowed in time strings",
                 ));
             }
-            if (colon_count == 1 && digit_count == 4) || (colon_count == 0 && digit_count == 4) {
+            if digit_count == 4 && (colon_count == 0 || colon_count == 1) {
                 // HH:MM or HHMM before dot: fractional minutes
                 return Err(VmError::range_error(
                     "Fractional minutes are not allowed in time strings",
@@ -1581,10 +1587,10 @@ pub(super) fn to_temporal_plain_date(
         // Resolve month from monthCode (values already coerced above)
         let month = if let Some(ref mc) = mc_str {
             let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-            if let Some(mn) = m {
-                if mn != mc_month {
-                    return Err(VmError::range_error("month and monthCode must agree"));
-                }
+            if let Some(mn) = m
+                && mn != mc_month
+            {
+                return Err(VmError::range_error("month and monthCode must agree"));
             }
             mc_month
         } else {
@@ -1708,6 +1714,7 @@ pub(super) fn to_temporal_plain_time(
 
 /// Read optional time fields (hour, minute, second, ...) from a property bag object.
 /// Returns `Some(PlainTime)` if any time field is present, `None` if none are present.
+#[allow(dead_code)]
 pub(super) fn read_time_fields_from_bag(
     ncx: &mut NativeContext<'_>,
     obj: &GcRef<JsObject>,
@@ -1766,6 +1773,7 @@ pub(super) fn read_time_fields_from_bag(
 
 /// Read time fields from a property bag, accepting leap seconds (second:60 → 59).
 /// Used by ToRelativeTemporalObject to validate and read all time fields.
+#[allow(dead_code)]
 pub(super) fn read_time_fields_from_bag_with_leap_second(
     ncx: &mut NativeContext<'_>,
     obj: &GcRef<JsObject>,
@@ -1831,6 +1839,7 @@ pub(super) fn read_time_fields_from_bag_with_leap_second(
 /// Read time fields from a Value (object or Proxy), accepting leap seconds (second:60 → 59).
 /// Uses get_property_of_value for Proxy support.
 /// Fields are read in ALPHABETICAL order with interleaved coercion via ToIntegerWithTruncation.
+#[allow(dead_code)]
 pub(super) fn read_time_fields_from_bag_value(
     ncx: &mut NativeContext<'_>,
     val: &Value,
@@ -2120,10 +2129,10 @@ pub(super) fn to_temporal_duration(
     }
     if item.as_object().is_some() || item.as_proxy().is_some() {
         // Check if it's a real Duration object via TemporalValue
-        if let Some(obj) = item.as_object() {
-            if let Ok(dur) = extract_duration(&obj) {
-                return Ok(dur);
-            }
+        if let Some(obj) = item.as_object()
+            && let Ok(dur) = extract_duration(&obj)
+        {
+            return Ok(dur);
         }
 
         // Helper for property access (supports both object and proxy)
@@ -2560,7 +2569,7 @@ pub(super) fn parse_to_string_rounding_options(
             ));
         }
         let d = n.floor();
-        if d < 0.0 || d > 9.0 || !d.is_finite() {
+        if !(0.0..=9.0).contains(&d) || !d.is_finite() {
             return Err(VmError::range_error(
                 "fractionalSecondDigits must be 0-9 or 'auto'",
             ));
@@ -2635,7 +2644,7 @@ pub(super) fn parse_relative_to_value(
     // - UTC designator distinction
     // - Offset validation, match-minutes behavior, etc.
     if rt_val.is_string() {
-        let s = ncx.to_string_value(&rt_val)?;
+        let s = ncx.to_string_value(rt_val)?;
         let rt =
             temporal_rs::options::RelativeTo::try_from_str(s.as_str()).map_err(temporal_err)?;
         return Ok(Some(rt));
@@ -2832,10 +2841,10 @@ pub(super) fn parse_relative_to_value(
         let d = d.ok_or_else(|| VmError::type_error("day is required"))?;
         let month = if let Some(ref mc) = mc_str {
             let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-            if let Some(mn) = m {
-                if mn != mc_month {
-                    return Err(VmError::range_error("month and monthCode must agree"));
-                }
+            if let Some(mn) = m
+                && mn != mc_month
+            {
+                return Err(VmError::range_error("month and monthCode must agree"));
             }
             mc_month
         } else {

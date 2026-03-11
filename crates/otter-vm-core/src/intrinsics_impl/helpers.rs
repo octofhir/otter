@@ -87,18 +87,31 @@ impl MapKey {
 }
 
 // Type discriminant tags for hashing
+#[allow(dead_code)]
 const HASH_TAG_UNDEFINED: u8 = 0;
+#[allow(dead_code)]
 const HASH_TAG_NULL: u8 = 1;
+#[allow(dead_code)]
 const HASH_TAG_BOOL: u8 = 2;
+#[allow(dead_code)]
 const HASH_TAG_FLOAT64: u8 = 4;
+#[allow(dead_code)]
 const HASH_TAG_STRING: u8 = 5;
+#[allow(dead_code)]
 const HASH_TAG_SYMBOL: u8 = 6;
+#[allow(dead_code)]
 const HASH_TAG_OBJECT: u8 = 7;
+#[allow(dead_code)]
 const HASH_TAG_FUNCTION: u8 = 8;
+#[allow(dead_code)]
 const HASH_TAG_BIGINT: u8 = 9;
+#[allow(dead_code)]
 const HASH_TAG_NATIVE_FN: u8 = 10;
+#[allow(dead_code)]
 const HASH_TAG_PROXY: u8 = 11;
+#[allow(dead_code)]
 const HASH_TAG_PROMISE: u8 = 12;
+#[allow(dead_code)]
 const HASH_TAG_ARRAY: u8 = 13;
 
 /// Normalize a float for SameValueZero hashing: -0 → +0, NaN → canonical NaN bits.
@@ -181,7 +194,7 @@ fn species_getter(
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    Ok(this_val.clone())
+    Ok(*this_val)
 }
 
 /// Define the standard @@species getter on a constructor.

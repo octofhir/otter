@@ -80,7 +80,7 @@ impl IntrinsicObject for StringIntrinsic {
                     };
                     let str_val = Value::string(JsString::intern(&s));
                     if let Some(obj) = this.as_object() {
-                        let _ = obj.set(PropertyKey::string("__primitiveValue__"), str_val.clone());
+                        let _ = obj.set(PropertyKey::string("__primitiveValue__"), str_val);
                         obj.setup_string_exotic(&s);
                     }
                     Ok(str_val)
@@ -112,13 +112,13 @@ impl IntrinsicObject for StringIntrinsic {
                     for arg in args {
                         let n = ncx.to_number_value(arg)?;
                         if n != n.trunc() || n < 0.0 || n > 0x10FFFF as f64 || n.is_infinite() {
-                            return Err(VmError::range_error(&format!("Invalid code point {}", n)));
+                            return Err(VmError::range_error(format!("Invalid code point {}", n)));
                         }
                         let code = n as u32;
                         if let Some(ch) = char::from_u32(code) {
                             result.push(ch);
                         } else {
-                            return Err(VmError::range_error(&format!(
+                            return Err(VmError::range_error(format!(
                                 "Invalid code point {}",
                                 code
                             )));
@@ -144,7 +144,7 @@ impl IntrinsicObject for StringIntrinsic {
                                     if let Some(getter) = get
                                         && !getter.is_undefined()
                                     {
-                                        return ncx.call_function(&getter, obj_val.clone(), &[]);
+                                        return ncx.call_function(&getter, *obj_val, &[]);
                                     }
                                     Ok(Value::undefined())
                                 }
@@ -154,9 +154,7 @@ impl IntrinsicObject for StringIntrinsic {
                             if let PropertyKey::Index(i) = key {
                                 let elements = obj.elements.borrow();
                                 if (*i as usize) < elements.len() {
-                                    return Ok(elements
-                                        .get(*i as usize)
-                                        .unwrap_or(Value::undefined()));
+                                    return Ok(elements.get(*i as usize).unwrap_or_default());
                                 }
                             }
                             Ok(Value::undefined())
@@ -224,6 +222,7 @@ impl IntrinsicObject for StringIntrinsic {
 ///   a `__primitiveValue__` property).
 /// - If `this` is any other object, calls `toString()` on it as a fallback.
 /// - Otherwise, returns an error (null/undefined).
+#[allow(dead_code)]
 fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
     // Fast path: string primitive
     if let Some(s) = this_val.as_string() {
@@ -232,21 +231,21 @@ fn this_string_value(this_val: &Value) -> Result<GcRef<JsString>, String> {
     // Object path: String wrapper or generic object
     if let Some(obj) = this_val.as_object() {
         // Check for __primitiveValue__ (internal slot for String wrapper objects)
-        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-            if let Some(s) = prim.as_string() {
-                return Ok(s);
-            }
+        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__"))
+            && let Some(s) = prim.as_string()
+        {
+            return Ok(s);
         }
         // Fallback: try valueOf then toString
-        if let Some(val) = obj.get(&PropertyKey::string("valueOf")) {
-            if let Some(s) = val.as_string() {
-                return Ok(s);
-            }
+        if let Some(val) = obj.get(&PropertyKey::string("valueOf"))
+            && let Some(s) = val.as_string()
+        {
+            return Ok(s);
         }
-        if let Some(val) = obj.get(&PropertyKey::string("toString")) {
-            if let Some(s) = val.as_string() {
-                return Ok(s);
-            }
+        if let Some(val) = obj.get(&PropertyKey::string("toString"))
+            && let Some(s) = val.as_string()
+        {
+            return Ok(s);
         }
         // Last resort: coerce via number-like or use "[object Object]"
         return Ok(JsString::intern("[object Object]"));
@@ -281,12 +280,11 @@ fn require_object_coercible_to_string(
         return Ok(s);
     }
     // 3. String wrapper object fast path
-    if let Some(obj) = this_val.as_object() {
-        if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-            if let Some(s) = prim.as_string() {
-                return Ok(s);
-            }
-        }
+    if let Some(obj) = this_val.as_object()
+        && let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__"))
+        && let Some(s) = prim.as_string()
+    {
+        return Ok(s);
     }
     // 4. ToString via NativeContext (handles numbers, booleans, objects with toString/valueOf)
     let str_result = ncx.to_string_value(this_val)?;
@@ -375,10 +373,10 @@ fn es_trim_end(s: &str) -> &str {
 fn create_array(ncx: &mut NativeContext, length: usize) -> GcRef<JsObject> {
     let arr = GcRef::new(JsObject::array(length));
     // Set Array.prototype as prototype
-    if let Some(array_ctor) = ncx.ctx.get_global("Array").and_then(|v| v.as_object()) {
-        if let Some(proto) = array_ctor.get(&PropertyKey::string("prototype")) {
-            arr.set_prototype(proto);
-        }
+    if let Some(array_ctor) = ncx.ctx.get_global("Array").and_then(|v| v.as_object())
+        && let Some(proto) = array_ctor.get(&PropertyKey::string("prototype"))
+    {
+        arr.set_prototype(proto);
     }
     arr
 }
@@ -391,19 +389,16 @@ fn get_property_of(
     key: &PropertyKey,
     ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let obj = val
-        .as_regex()
-        .map(|r| r.object.clone())
-        .or_else(|| val.as_object());
+    let obj = val.as_regex().map(|r| r.object).or_else(|| val.as_object());
     if let Some(obj) = obj {
         if let Some(desc) = obj.lookup_property_descriptor(key) {
             match desc {
                 PropertyDescriptor::Data { value, .. } => Ok(value),
                 PropertyDescriptor::Accessor { get, .. } => {
-                    if let Some(getter) = get {
-                        if !getter.is_undefined() {
-                            return ncx.call_function(&getter, val.clone(), &[]);
-                        }
+                    if let Some(getter) = get
+                        && !getter.is_undefined()
+                    {
+                        return ncx.call_function(&getter, *val, &[]);
                     }
                     Ok(Value::undefined())
                 }
@@ -504,18 +499,18 @@ fn apply_replacement_pattern(
 
 /// Helper to check if a UTF-16 code unit is a high surrogate
 pub fn is_high_surrogate(unit: u16) -> bool {
-    unit >= 0xD800 && unit <= 0xDBFF
+    (0xD800..=0xDBFF).contains(&unit)
 }
 
 /// Helper to check if a UTF-16 code unit is a low surrogate
 pub fn is_low_surrogate(unit: u16) -> bool {
-    unit >= 0xDC00 && unit <= 0xDFFF
+    (0xDC00..=0xDFFF).contains(&unit)
 }
 
 /// Create a String iterator object that handles UTF-16 surrogate pairs correctly.
 fn make_string_iterator(
     this_val: &Value,
-    mm: Arc<MemoryManager>,
+    _mm: Arc<MemoryManager>,
     _fn_proto: GcRef<JsObject>,
     string_iter_proto: GcRef<JsObject>,
     ncx: &mut NativeContext<'_>,
@@ -679,12 +674,11 @@ pub fn init_string_prototype(
                     return Ok(Value::string(s));
                 }
                 // String wrapper object
-                if let Some(obj) = this_val.as_object() {
-                    if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-                        if let Some(s) = prim.as_string() {
-                            return Ok(Value::string(s));
-                        }
-                    }
+                if let Some(obj) = this_val.as_object()
+                    && let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__"))
+                    && let Some(s) = prim.as_string()
+                {
+                    return Ok(Value::string(s));
                 }
                 Err(VmError::type_error(
                     "String.prototype.toString requires that 'this' be a String",
@@ -703,12 +697,11 @@ pub fn init_string_prototype(
                     return Ok(Value::string(s));
                 }
                 // String wrapper object
-                if let Some(obj) = this_val.as_object() {
-                    if let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__")) {
-                        if let Some(s) = prim.as_string() {
-                            return Ok(Value::string(s));
-                        }
-                    }
+                if let Some(obj) = this_val.as_object()
+                    && let Some(prim) = obj.get(&PropertyKey::string("__primitiveValue__"))
+                    && let Some(s) = prim.as_string()
+                {
+                    return Ok(Value::string(s));
                 }
                 Err(VmError::type_error(
                     "String.prototype.valueOf requires that 'this' be a String",
@@ -751,7 +744,7 @@ pub fn init_string_prototype(
             let idx = pos as usize;
             Ok(Value::string(JsString::intern_utf16(&utf16[idx..idx + 1])))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -770,7 +763,7 @@ pub fn init_string_prototype(
             }
             Ok(Value::number(utf16[pos as usize] as f64))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -785,7 +778,7 @@ pub fn init_string_prototype(
             let len = utf16.len() as f64;
             let int_start =
                 to_integer_or_infinity(&args.first().cloned().unwrap_or(Value::undefined()), ncx)?;
-            let int_end = if args.get(1).map_or(true, |v| v.is_undefined()) {
+            let int_end = if args.get(1).is_none_or(|v| v.is_undefined()) {
                 len
             } else {
                 to_integer_or_infinity(&args[1], ncx)?
@@ -806,7 +799,7 @@ pub fn init_string_prototype(
                 Ok(Value::string(JsString::intern("")))
             }
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -821,7 +814,7 @@ pub fn init_string_prototype(
             let len = utf16.len() as f64;
             let int_start =
                 to_integer_or_infinity(&args.first().cloned().unwrap_or(Value::undefined()), ncx)?;
-            let int_end = if args.get(1).map_or(true, |v| v.is_undefined()) {
+            let int_end = if args.get(1).is_none_or(|v| v.is_undefined()) {
                 len
             } else {
                 to_integer_or_infinity(&args[1], ncx)?
@@ -832,7 +825,7 @@ pub fn init_string_prototype(
             let to = final_start.max(final_end);
             Ok(Value::string(JsString::intern_utf16(&utf16[from..to])))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -845,7 +838,7 @@ pub fn init_string_prototype(
             let s = require_object_coercible_to_string(this_val, ncx)?;
             Ok(Value::string(JsString::intern(&s.as_str().to_lowercase())))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -859,7 +852,7 @@ pub fn init_string_prototype(
             let lowered = crate::web_api::intl::to_locale_lowercase(s.as_str(), args.first(), ncx)?;
             Ok(Value::string(JsString::intern(&lowered)))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -872,7 +865,7 @@ pub fn init_string_prototype(
             let s = require_object_coercible_to_string(this_val, ncx)?;
             Ok(Value::string(JsString::intern(&s.as_str().to_uppercase())))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -886,7 +879,7 @@ pub fn init_string_prototype(
             let uppered = crate::web_api::intl::to_locale_uppercase(s.as_str(), args.first(), ncx)?;
             Ok(Value::string(JsString::intern(&uppered)))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -905,7 +898,7 @@ pub fn init_string_prototype(
                 crate::web_api::intl::locale_compare(s.as_str(), &that, locales, options, ncx)?;
             Ok(Value::number(out))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -918,7 +911,7 @@ pub fn init_string_prototype(
             let s = require_object_coercible_to_string(this_val, ncx)?;
             Ok(Value::string(JsString::intern(es_trim(s.as_str()))))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -944,7 +937,7 @@ pub fn init_string_prototype(
     }
     string_proto.define_property(
         PropertyKey::string("trimStart"),
-        PropertyDescriptor::builtin_method(trim_start_fn.clone()),
+        PropertyDescriptor::builtin_method(trim_start_fn),
     );
     // AnnexB §B.2.3.16: trimLeft must be the same function object as trimStart
     string_proto.define_property(
@@ -974,7 +967,7 @@ pub fn init_string_prototype(
     }
     string_proto.define_property(
         PropertyKey::string("trimEnd"),
-        PropertyDescriptor::builtin_method(trim_end_fn.clone()),
+        PropertyDescriptor::builtin_method(trim_end_fn),
     );
     // AnnexB §B.2.3.17: trimRight must be the same function object as trimEnd
     string_proto.define_property(
@@ -989,8 +982,8 @@ pub fn init_string_prototype(
             |this_val, args, ncx| {
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 // Per spec IsRegExp: ALWAYS call Get(@@match) first, even for RegExp
-                if let Some(sv) = args.first() {
-                    if !sv.is_null() && !sv.is_undefined() {
+                if let Some(sv) = args.first()
+                    && !sv.is_null() && !sv.is_undefined() {
                         let is_regexp = is_regexp_check(sv, ncx)?;
                         if is_regexp {
                             return Err(VmError::type_error(
@@ -998,12 +991,11 @@ pub fn init_string_prototype(
                             ));
                         }
                     }
-                }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
                 let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
-                let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let pos = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     0.0
                 } else {
                     to_integer_or_infinity(&args[1], ncx)?.clamp(0.0, len)
@@ -1027,18 +1019,17 @@ pub fn init_string_prototype(
             |this_val, args, ncx| {
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 // Per spec IsRegExp: ALWAYS call Get(@@match) first, even for RegExp
-                if let Some(sv) = args.first() {
-                    if is_regexp_check(sv, ncx)? {
+                if let Some(sv) = args.first()
+                    && is_regexp_check(sv, ncx)? {
                         return Err(VmError::type_error(
                             "First argument to String.prototype.endsWith must not be a regular expression",
                         ));
                     }
-                }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
                 let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
-                let end_pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let end_pos = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     len
                 } else {
                     to_integer_or_infinity(&args[1], ncx)?.clamp(0.0, len)
@@ -1063,18 +1054,17 @@ pub fn init_string_prototype(
             |this_val, args, ncx| {
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 // Per spec IsRegExp: ALWAYS call Get(@@match) first, even for RegExp
-                if let Some(sv) = args.first() {
-                    if is_regexp_check(sv, ncx)? {
+                if let Some(sv) = args.first()
+                    && is_regexp_check(sv, ncx)? {
                         return Err(VmError::type_error(
                             "First argument to String.prototype.includes must not be a regular expression",
                         ));
                     }
-                }
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let search = arg_to_string(&search_val, ncx)?;
                 let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
-                let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let pos = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     0.0
                 } else {
                     to_integer_or_infinity(&args[1], ncx)?.clamp(0.0, len)
@@ -1112,7 +1102,7 @@ pub fn init_string_prototype(
             let n = count as usize;
             Ok(Value::string(JsString::intern(&s.as_str().repeat(n))))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -1132,7 +1122,7 @@ pub fn init_string_prototype(
                 if max_length <= str_utf16_len as f64 {
                     return Ok(Value::string(s));
                 }
-                let fill_str = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let fill_str = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     " ".to_string()
                 } else {
                     arg_to_string(&args[1], ncx)?
@@ -1175,7 +1165,7 @@ pub fn init_string_prototype(
                 if max_length <= str_utf16_len as f64 {
                     return Ok(Value::string(s));
                 }
-                let fill_str = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let fill_str = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     " ".to_string()
                 } else {
                     arg_to_string(&args[1], ncx)?
@@ -1239,7 +1229,7 @@ pub fn init_string_prototype(
                 let search = arg_to_string(&search_val, ncx)?;
                 let utf16 = s.as_utf16();
                 let len = utf16.len() as f64;
-                let pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let pos = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     0.0
                 } else {
                     to_integer_or_infinity(&args[1], ncx)?.clamp(0.0, len)
@@ -1274,7 +1264,7 @@ pub fn init_string_prototype(
                 let search = arg_to_string(&search_val, ncx)?;
                 let utf16 = s.as_utf16();
                 let len = utf16.len();
-                let num_pos = if args.get(1).map_or(true, |v| v.is_undefined()) {
+                let num_pos = if args.get(1).is_none_or(|v| v.is_undefined()) {
                     f64::NAN
                 } else {
                     ncx.to_number_value(&args[1])?
@@ -1336,23 +1326,23 @@ pub fn init_string_prototype(
                 }
 
                 // 2. Check for @@split on separator (any object, not just RegExp)
-                if let Some(sep) = args.first() {
-                    if !sep.is_null() && !sep.is_undefined() {
-                        if sep.as_regex().is_some() || sep.as_object().is_some() {
-                            let method = get_property_of(
-                                sep,
-                                &PropertyKey::Symbol(crate::intrinsics::well_known::split_symbol()),
-                                ncx,
-                            )?;
-                            if method.is_callable() {
-                                // Per spec: pass raw O (RequireObjectCoercible), NOT ToString(O)
-                                let mut sym_args = vec![this_val.clone()];
-                                if let Some(limit) = args.get(1) {
-                                    sym_args.push(limit.clone());
-                                }
-                                return ncx.call_function(&method, sep.clone(), &sym_args);
-                            }
+                if let Some(sep) = args.first()
+                    && !sep.is_null()
+                    && !sep.is_undefined()
+                    && (sep.as_regex().is_some() || sep.as_object().is_some())
+                {
+                    let method = get_property_of(
+                        sep,
+                        &PropertyKey::Symbol(crate::intrinsics::well_known::split_symbol()),
+                        ncx,
+                    )?;
+                    if method.is_callable() {
+                        // Per spec: pass raw O (RequireObjectCoercible), NOT ToString(O)
+                        let mut sym_args = vec![*this_val];
+                        if let Some(limit) = args.get(1) {
+                            sym_args.push(*limit);
                         }
+                        return ncx.call_function(&method, *sep, &sym_args);
                     }
                 }
 
@@ -1441,26 +1431,24 @@ pub fn init_string_prototype(
                 }
 
                 // 2. Check for @@replace on any object (RegExp or custom)
-                if let Some(search_val) = args.first() {
-                    if !search_val.is_null() && !search_val.is_undefined() {
-                        if search_val.as_regex().is_some() || search_val.as_object().is_some() {
-                            let method = get_property_of(
-                                search_val,
-                                &PropertyKey::Symbol(
-                                    crate::intrinsics::well_known::replace_symbol(),
-                                ),
-                                ncx,
-                            )?;
-                            if method.is_callable() {
-                                // Per spec: Call(replacer, searchValue, « O, replaceValue »)
-                                // O is the raw this value, not ToString'd
-                                let mut sym_args = vec![this_val.clone()];
-                                if let Some(replacement) = args.get(1) {
-                                    sym_args.push(replacement.clone());
-                                }
-                                return ncx.call_function(&method, search_val.clone(), &sym_args);
-                            }
+                if let Some(search_val) = args.first()
+                    && !search_val.is_null()
+                    && !search_val.is_undefined()
+                    && (search_val.as_regex().is_some() || search_val.as_object().is_some())
+                {
+                    let method = get_property_of(
+                        search_val,
+                        &PropertyKey::Symbol(crate::intrinsics::well_known::replace_symbol()),
+                        ncx,
+                    )?;
+                    if method.is_callable() {
+                        // Per spec: Call(replacer, searchValue, « O, replaceValue »)
+                        // O is the raw this value, not ToString'd
+                        let mut sym_args = vec![*this_val];
+                        if let Some(replacement) = args.get(1) {
+                            sym_args.push(*replacement);
                         }
+                        return ncx.call_function(&method, *search_val, &sym_args);
                     }
                 }
 
@@ -1477,7 +1465,7 @@ pub fn init_string_prototype(
                         let call_args = [
                             Value::string(JsString::intern(&search)),
                             Value::number(pos as f64),
-                            Value::string(s.clone()),
+                            Value::string(s),
                         ];
                         let result =
                             ncx.call_function(&replace_val, Value::undefined(), &call_args)?;
@@ -1528,8 +1516,8 @@ pub fn init_string_prototype(
                     }
 
                     // 2. If searchValue is not null/undefined, check for IsRegExp and @@replace
-                    if let Some(search_val) = args.first() {
-                        if !search_val.is_null() && !search_val.is_undefined() {
+                    if let Some(search_val) = args.first()
+                        && !search_val.is_null() && !search_val.is_undefined() {
                             // Per spec IsRegExp: ALWAYS call Get(@@match) first
                             let is_regexp = is_regexp_check(search_val, ncx)?;
                             if is_regexp {
@@ -1565,14 +1553,13 @@ pub fn init_string_prototype(
                                     ));
                                 }
                                 // Per spec: Call(replacer, searchValue, « O, replaceValue »)
-                                let mut sym_args = vec![this_val.clone()];
+                                let mut sym_args = vec![*this_val];
                                 if let Some(replacement) = args.get(1) {
-                                    sym_args.push(replacement.clone());
+                                    sym_args.push(*replacement);
                                 }
-                                return ncx.call_function(&method, search_val.clone(), &sym_args);
+                                return ncx.call_function(&method, *search_val, &sym_args);
                             }
                         }
-                    }
 
                     // 3. String-based replaceAll
                     let s = require_object_coercible_to_string(this_val, ncx)?;
@@ -1591,7 +1578,7 @@ pub fn init_string_prototype(
                             let call_args = [
                                 Value::string(JsString::intern(&search)),
                                 Value::number(abs_pos as f64),
-                                Value::string(s.clone()),
+                                Value::string(s),
                             ];
                             let rep = ncx.call_function(&replace_val, Value::undefined(), &call_args)?;
                             let rep_str = ncx.to_string_value(&rep)?;
@@ -1653,19 +1640,19 @@ pub fn init_string_prototype(
                 }
 
                 // 2. If regexp is not null/undefined, check for @@search on any object
-                if let Some(search_val) = args.first() {
-                    if !search_val.is_null() && !search_val.is_undefined() {
-                        if search_val.as_regex().is_some() || search_val.as_object().is_some() {
-                            let method = get_property_of(
-                                search_val,
-                                &PropertyKey::Symbol(crate::intrinsics::well_known::search_symbol()),
-                                ncx,
-                            )?;
-                            if method.is_callable() {
-                                let s = require_object_coercible_to_string(this_val, ncx)?;
-                                return ncx.call_function(&method, search_val.clone(), &[Value::string(s)]);
-                            }
-                        }
+                if let Some(search_val) = args.first()
+                    && !search_val.is_null()
+                    && !search_val.is_undefined()
+                    && (search_val.as_regex().is_some() || search_val.as_object().is_some())
+                {
+                    let method = get_property_of(
+                        search_val,
+                        &PropertyKey::Symbol(crate::intrinsics::well_known::search_symbol()),
+                        ncx,
+                    )?;
+                    if method.is_callable() {
+                        let s = require_object_coercible_to_string(this_val, ncx)?;
+                        return ncx.call_function(&method, *search_val, &[Value::string(s)]);
                     }
                 }
 
@@ -1677,16 +1664,21 @@ pub fn init_string_prototype(
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let regexp_ctor = ncx.ctx.get_global("RegExp");
                 if let Some(ctor) = regexp_ctor {
-                    let ctor_args = [search_val.clone()];
-                    let regex_val = ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
-                    let rx_obj = regex_val.as_regex().map(|r| r.object.clone())
+                    let ctor_args = [search_val];
+                    let regex_val =
+                        ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
+                    let rx_obj = regex_val
+                        .as_regex()
+                        .map(|r| r.object)
                         .or_else(|| regex_val.as_object());
                     if let Some(obj) = rx_obj {
                         let method = obj
-                            .get(&PropertyKey::Symbol(crate::intrinsics::well_known::search_symbol()))
+                            .get(&PropertyKey::Symbol(
+                                crate::intrinsics::well_known::search_symbol(),
+                            ))
                             .unwrap_or_else(Value::undefined);
                         if method.is_callable() {
-                            return ncx.call_function(&method, regex_val, &[Value::string(s.clone())]);
+                            return ncx.call_function(&method, regex_val, &[Value::string(s)]);
                         }
                     }
                 }
@@ -1716,23 +1708,19 @@ pub fn init_string_prototype(
                 }
 
                 // 2. If regexp is not null/undefined, check for @@match on any object
-                if let Some(search_val) = args.first() {
-                    if !search_val.is_null() && !search_val.is_undefined() {
-                        if search_val.as_regex().is_some() || search_val.as_object().is_some() {
-                            let method = get_property_of(
-                                search_val,
-                                &PropertyKey::Symbol(crate::intrinsics::well_known::match_symbol()),
-                                ncx,
-                            )?;
-                            if method.is_callable() {
-                                let s = require_object_coercible_to_string(this_val, ncx)?;
-                                return ncx.call_function(
-                                    &method,
-                                    search_val.clone(),
-                                    &[Value::string(s)],
-                                );
-                            }
-                        }
+                if let Some(search_val) = args.first()
+                    && !search_val.is_null()
+                    && !search_val.is_undefined()
+                    && (search_val.as_regex().is_some() || search_val.as_object().is_some())
+                {
+                    let method = get_property_of(
+                        search_val,
+                        &PropertyKey::Symbol(crate::intrinsics::well_known::match_symbol()),
+                        ncx,
+                    )?;
+                    if method.is_callable() {
+                        let s = require_object_coercible_to_string(this_val, ncx)?;
+                        return ncx.call_function(&method, *search_val, &[Value::string(s)]);
                     }
                 }
 
@@ -1743,12 +1731,12 @@ pub fn init_string_prototype(
                 let search_val = args.first().cloned().unwrap_or(Value::undefined());
                 let regexp_ctor = ncx.ctx.get_global("RegExp");
                 if let Some(ctor) = regexp_ctor {
-                    let ctor_args = [search_val.clone()];
+                    let ctor_args = [search_val];
                     let regex_val =
                         ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
                     let rx_obj = regex_val
                         .as_regex()
-                        .map(|r| r.object.clone())
+                        .map(|r| r.object)
                         .or_else(|| regex_val.as_object());
                     if let Some(obj) = rx_obj {
                         let method = obj
@@ -1757,11 +1745,7 @@ pub fn init_string_prototype(
                             ))
                             .unwrap_or_else(Value::undefined);
                         if method.is_callable() {
-                            return ncx.call_function(
-                                &method,
-                                regex_val,
-                                &[Value::string(s.clone())],
-                            );
+                            return ncx.call_function(&method, regex_val, &[Value::string(s)]);
                         }
                     }
                 }
@@ -1776,7 +1760,7 @@ pub fn init_string_prototype(
                             Value::string(JsString::intern(&fallback_str)),
                         );
                         let _ = arr.set(PropertyKey::string("index"), Value::number(pos as f64));
-                        let _ = arr.set(PropertyKey::string("input"), Value::string(s.clone()));
+                        let _ = arr.set(PropertyKey::string("input"), Value::string(s));
                         let _ = arr.set(PropertyKey::string("groups"), Value::undefined());
                         Ok(Value::array(arr))
                     }
@@ -1801,9 +1785,9 @@ pub fn init_string_prototype(
                     }
 
                     // 2. If regexp is not null/undefined, check IsRegExp and @@matchAll
-                    if let Some(search_val) = args.first() {
-                        if !search_val.is_null() && !search_val.is_undefined() {
-                            if search_val.as_regex().is_some() || search_val.as_object().is_some() {
+                    if let Some(search_val) = args.first()
+                        && !search_val.is_null() && !search_val.is_undefined()
+                            && (search_val.as_regex().is_some() || search_val.as_object().is_some()) {
                                 // Check IsRegExp via Symbol.match (using getter-aware access)
                                 let is_regexp = search_val.as_regex().is_some() || {
                                     let match_val = get_property_of(
@@ -1841,7 +1825,7 @@ pub fn init_string_prototype(
                                 )?;
                                 if method.is_callable() {
                                     let s = require_object_coercible_to_string(this_val, ncx)?;
-                                    return ncx.call_function(&method, search_val.clone(), &[Value::string(s)]);
+                                    return ncx.call_function(&method, *search_val, &[Value::string(s)]);
                                 }
                                 // Per spec: if @@matchAll is not callable and not undefined, throw TypeError
                                 if !method.is_undefined() && !method.is_null() {
@@ -1850,8 +1834,6 @@ pub fn init_string_prototype(
                                     ));
                                 }
                             }
-                        }
-                    }
 
                     // 3. ToString(this), then create RegExp and delegate
                     let s = require_object_coercible_to_string(this_val, ncx)?;
@@ -1871,7 +1853,7 @@ pub fn init_string_prototype(
                             ncx,
                         )?;
                         if method.is_callable() {
-                            return ncx.call_function(&method, regex_val, &[Value::string(s.clone())]);
+                            return ncx.call_function(&method, regex_val, &[Value::string(s)]);
                         }
                         // Per spec Invoke: if method is not callable, throw TypeError
                         return Err(VmError::type_error("Symbol.matchAll is not a function"));
@@ -1924,7 +1906,7 @@ pub fn init_string_prototype(
                 use unicode_normalization::UnicodeNormalization;
                 let s = require_object_coercible_to_string(this_val, ncx)?;
                 let str_val = s.as_str();
-                let f_str = if args.first().map_or(true, |v| v.is_undefined()) {
+                let f_str = if args.first().is_none_or(|v| v.is_undefined()) {
                     "NFC".to_string()
                 } else {
                     arg_to_string(&args[0], ncx)?
@@ -1942,7 +1924,7 @@ pub fn init_string_prototype(
                     "NFKD" => Ok(Value::string(JsString::intern(
                         &str_val.nfkd().collect::<String>(),
                     ))),
-                    _ => Err(VmError::range_error(&format!(
+                    _ => Err(VmError::range_error(format!(
                         "The normalization form should be one of NFC, NFD, NFKC, NFKD. Got: {}",
                         f_str
                     ))),
@@ -1977,7 +1959,7 @@ pub fn init_string_prototype(
             }
             Ok(Value::boolean(true))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -2012,7 +1994,7 @@ pub fn init_string_prototype(
             }
             Ok(Value::string(JsString::intern_utf16(&result)))
         },
-        &mm,
+        mm,
         fn_proto,
     );
 
@@ -2589,34 +2571,34 @@ pub fn init_string_prototype(
         ("localeCompare", 1),
     ];
     for (name, length) in method_lengths {
-        if let Some(func_val) = string_proto.get(&PropertyKey::string(name)) {
-            if let Some(func_obj) = func_val.native_function_object() {
-                func_obj.define_property(
-                    PropertyKey::string("name"),
-                    PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
-                );
-                func_obj.define_property(
-                    PropertyKey::string("length"),
-                    PropertyDescriptor::function_length(Value::number(*length as f64)),
-                );
-            }
+        if let Some(func_val) = string_proto.get(&PropertyKey::string(name))
+            && let Some(func_obj) = func_val.native_function_object()
+        {
+            func_obj.define_property(
+                PropertyKey::string("name"),
+                PropertyDescriptor::function_length(Value::string(JsString::intern(name))),
+            );
+            func_obj.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::number(*length as f64)),
+            );
         }
     }
 
     // Fix name/length for Symbol.iterator method
     let iter_sym = crate::intrinsics::well_known::iterator_symbol();
-    if let Some(func_val) = string_proto.get(&PropertyKey::Symbol(iter_sym)) {
-        if let Some(func_obj) = func_val.native_function_object() {
-            func_obj.define_property(
-                PropertyKey::string("name"),
-                PropertyDescriptor::function_length(Value::string(JsString::intern(
-                    "[Symbol.iterator]",
-                ))),
-            );
-            func_obj.define_property(
-                PropertyKey::string("length"),
-                PropertyDescriptor::function_length(Value::number(0.0)),
-            );
-        }
+    if let Some(func_val) = string_proto.get(&PropertyKey::Symbol(iter_sym))
+        && let Some(func_obj) = func_val.native_function_object()
+    {
+        func_obj.define_property(
+            PropertyKey::string("name"),
+            PropertyDescriptor::function_length(Value::string(JsString::intern(
+                "[Symbol.iterator]",
+            ))),
+        );
+        func_obj.define_property(
+            PropertyKey::string("length"),
+            PropertyDescriptor::function_length(Value::number(0.0)),
+        );
     }
 }

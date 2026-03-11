@@ -141,9 +141,7 @@ impl Util {
                             chars.next();
                             if arg_idx < args.len() {
                                 let n = args[arg_idx].as_number().unwrap_or(f64::NAN);
-                                if spec == 'i' {
-                                    result.push_str(&(n as i64).to_string());
-                                } else if n.fract() == 0.0 && n.is_finite() {
+                                if spec == 'i' || (n.fract() == 0.0 && n.is_finite()) {
                                     result.push_str(&(n as i64).to_string());
                                 } else {
                                     result.push_str(&n.to_string());
@@ -266,7 +264,7 @@ impl Util {
     pub fn get_call_sites(
         _this: &Value,
         _args: &[Value],
-        ncx: &mut NativeContext,
+        _ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         // Stub: return empty array
         Ok(Value::object(GcRef::new(JsObject::array(0))))

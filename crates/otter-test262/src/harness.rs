@@ -232,14 +232,13 @@ pub fn create_harness_extension_with_state() -> (Extension, TestHarnessState) {
             },
             // $262.detachArrayBuffer() - detaches an ArrayBuffer
             otter_engine::op_native("__test262_detach_array_buffer", |args| {
-                if let Some(buffer) = args.first() {
-                    if buffer.is_array_buffer() {
-                        if let Some(array_buffer) = buffer.as_array_buffer() {
-                            // Use the proper ArrayBuffer detach API
-                            array_buffer.detach();
-                            return Ok(Value::undefined());
-                        }
-                    }
+                if let Some(buffer) = args.first()
+                    && buffer.is_array_buffer()
+                    && let Some(array_buffer) = buffer.as_array_buffer()
+                {
+                    // Use the proper ArrayBuffer detach API
+                    array_buffer.detach();
+                    return Ok(Value::undefined());
                 }
                 Err(VmError::type_error(
                     "detachArrayBuffer requires an ArrayBuffer",

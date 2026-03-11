@@ -468,7 +468,7 @@ fn signal_is_aborted_value(signal: &Value) -> bool {
         .is_some_and(|v| v.to_boolean())
 }
 
-fn iteration_result(mm: &Arc<MemoryManager>, value: Value, done: bool) -> Value {
+fn iteration_result(_mm: &Arc<MemoryManager>, value: Value, done: bool) -> Value {
     let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set(PropertyKey::string("value"), value);
     let _ = result.set(PropertyKey::string("done"), Value::boolean(done));

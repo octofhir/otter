@@ -238,7 +238,7 @@ fn effective_process_argv() -> Vec<String> {
 }
 
 fn build_argv_array(
-    mm: &std::sync::Arc<otter_vm_core::memory::MemoryManager>,
+    _mm: &std::sync::Arc<otter_vm_core::memory::MemoryManager>,
     array_prototype: GcRef<JsObject>,
     args: &[String],
 ) -> GcRef<JsObject> {
@@ -398,14 +398,14 @@ fn call_env_bridge(
 }
 
 fn env_bridge_has(ncx: &mut NativeContext, key: &Value) -> Result<bool, VmError> {
-    Ok(call_env_bridge(ncx, "__env_has", &[key.clone()])?.to_boolean())
+    Ok(call_env_bridge(ncx, "__env_has", std::slice::from_ref(key))?.to_boolean())
 }
 
 fn env_bridge_get(ncx: &mut NativeContext, key: &Value) -> Result<Value, VmError> {
-    call_env_bridge(ncx, "__env_get", &[key.clone()])
+    call_env_bridge(ncx, "__env_get", std::slice::from_ref(key))
 }
 
-fn descriptor_to_object_value(desc: &PropertyDescriptor, ncx: &NativeContext) -> Value {
+fn descriptor_to_object_value(desc: &PropertyDescriptor, _ncx: &NativeContext) -> Value {
     let out = GcRef::new(JsObject::new(Value::null()));
 
     match desc {
@@ -653,7 +653,7 @@ fn process_exit(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmErr
 }
 
 #[dive(name = "hrtime", length = 1)]
-fn process_hrtime(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+fn process_hrtime(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     crate::security::require_hrtime("process.hrtime").map_err(security_err)?;
 
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -713,7 +713,7 @@ fn process_uptime(_ncx: &mut NativeContext) -> Result<Value, VmError> {
 
 #[dive(name = "memoryUsage", length = 0)]
 fn process_memory_usage(ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let mm = ncx.memory_manager();
+    let _mm = ncx.memory_manager();
     let obj = GcRef::new(JsObject::new(Value::null()));
     // Best-effort: return stub values; heapUsed could track mm.allocated() later
     let _ = obj.set(PropertyKey::string("rss"), Value::int32(0));
@@ -725,7 +725,7 @@ fn process_memory_usage(ncx: &mut NativeContext) -> Result<Value, VmError> {
 }
 
 #[dive(name = "cpuUsage", length = 1)]
-fn process_cpu_usage(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+fn process_cpu_usage(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
     // Stub: return { user: 0, system: 0 } or delta from previous value
     let obj = GcRef::new(JsObject::new(Value::null()));
 

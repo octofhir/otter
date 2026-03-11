@@ -128,9 +128,10 @@ fn pk(s: &str) -> PropertyKey {
 
 /// Create a native function Value with proper `name`, `length`, and `__non_constructor` properties.
 /// Per ES2023 §10.2.8, built-in function objects have:
-///   - `length`: { [[Value]]: argCount, [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
-///   - `name`: { [[Value]]: name, [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
-/// Per ES2023 §17, built-in prototype methods do not have a [[Construct]] internal method.
+///   - `length`: { \[\[Value\]\]: argCount, \[\[Writable\]\]: false, \[\[Enumerable\]\]: false, \[\[Configurable\]\]: true }
+///   - `name`: { \[\[Value\]\]: name, \[\[Writable\]\]: false, \[\[Enumerable\]\]: false, \[\[Configurable\]\]: true }
+///
+/// Per ES2023 §17, built-in prototype methods do not have a \[\[Construct\]\] internal method.
 fn make_builtin<F>(
     name: &str,
     length: i32,
@@ -200,6 +201,7 @@ fn is_valid_weak_key(
 }
 
 /// Get a stable pointer key for WeakMap/WeakSet (object identity).
+#[allow(dead_code)]
 fn weak_key_id(value: &Value) -> Option<usize> {
     if let Some(obj) = value.as_object() {
         Some(obj.as_ptr() as usize)
@@ -240,6 +242,7 @@ unsafe fn bytes_to_value(bytes: &[u8]) -> Value {
 
 /// JavaScript-style property Get that triggers accessor getters.
 /// Unlike `obj.get()`, this properly calls getter functions.
+#[allow(dead_code)]
 fn js_get(
     obj: &GcRef<JsObject>,
     key: &PropertyKey,
@@ -252,7 +255,7 @@ fn js_get(
             PropertyDescriptor::Accessor { get, .. } => {
                 if let Some(getter) = get {
                     if getter.is_callable() {
-                        ncx.call_function(&getter, this_val.clone(), &[])
+                        ncx.call_function(&getter, *this_val, &[])
                     } else {
                         Ok(Value::undefined())
                     }
@@ -281,7 +284,7 @@ fn js_get_value(
             PropertyDescriptor::Accessor { get, .. } => {
                 if let Some(getter) = get {
                     if getter.is_callable() {
-                        ncx.call_function(&getter, receiver.clone(), &[])
+                        ncx.call_function(&getter, *receiver, &[])
                     } else {
                         Ok(Value::undefined())
                     }
@@ -303,10 +306,10 @@ fn iterator_close(
     iterator_obj: &GcRef<JsObject>,
     ncx: &mut crate::context::NativeContext<'_>,
 ) {
-    if let Some(ret_fn) = iterator_obj.get(&pk("return")) {
-        if ret_fn.is_callable() {
-            let _ = ncx.call_function(&ret_fn, iterator.clone(), &[]);
-        }
+    if let Some(ret_fn) = iterator_obj.get(&pk("return"))
+        && ret_fn.is_callable()
+    {
+        let _ = ncx.call_function(&ret_fn, *iterator, &[]);
     }
 }
 
@@ -333,7 +336,7 @@ fn iterate_with_protocol(
             .and_then(|c| c.get(&pk("prototype")))
             .and_then(|v| v.as_object())
             .and_then(|proto| proto.get(&iter_key))
-            .unwrap_or(Value::undefined())
+            .unwrap_or_default()
     } else {
         Value::undefined()
     };
@@ -343,7 +346,7 @@ fn iterate_with_protocol(
     }
 
     // Call @@iterator to get the iterator
-    let iterator = ncx.call_function(&iter_fn, iterable.clone(), &[])?;
+    let iterator = ncx.call_function(&iter_fn, *iterable, &[])?;
     let iterator_obj = iterator
         .as_object()
         .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
@@ -356,7 +359,7 @@ fn iterate_with_protocol(
 
     // Iterate
     loop {
-        let result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+        let result = ncx.call_function(&next_fn, iterator, &[])?;
         let result_obj = result
             .as_object()
             .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
@@ -462,7 +465,7 @@ fn make_map_iterator(
         PropertyDescriptor::builtin_method(make_builtin(
             "next",
             0,
-            |this_val, _args, ncx| {
+            |this_val, _args, _ncx| {
                 let iter_obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("not an iterator object"))?;
@@ -574,7 +577,7 @@ pub fn init_map_prototype(
                     key
                 };
                 let _ = data.set(MapKey(normalized_key), value);
-                Ok(this_val.clone())
+                Ok(*this_val)
             },
             mm.clone(),
             fn_proto,
@@ -746,11 +749,7 @@ pub fn init_map_prototype(
                         break;
                     }
                     if let Some((key, value)) = data.entry_at(pos) {
-                        ncx.call_function(
-                            &callback,
-                            this_arg.clone(),
-                            &[value, key, this_val.clone()],
-                        )?;
+                        ncx.call_function(&callback, this_arg, &[value, key, *this_val])?;
                     }
                     pos += 1;
                 }
@@ -806,13 +805,13 @@ pub fn init_map_prototype(
                     ));
                 }
                 // Check if key exists first
-                let mk = MapKey(key.clone());
+                let mk = MapKey(key);
                 if let Some(existing) = data.get(&mk) {
                     return Ok(existing);
                 }
                 // Key not found: Call(callbackfn, undefined, « key »)
-                let value = ncx.call_function(&callback, Value::undefined(), &[key.clone()])?;
-                let _ = data.set(MapKey(key), value.clone());
+                let value = ncx.call_function(&callback, Value::undefined(), &[key])?;
+                let _ = data.set(MapKey(key), value);
                 Ok(value)
             },
             mm.clone(),
@@ -882,7 +881,7 @@ fn make_set_iterator(
         PropertyDescriptor::builtin_method(make_builtin(
             "next",
             0,
-            |this_val, _args, ncx| {
+            |this_val, _args, _ncx| {
                 let iter_obj = this_val
                     .as_object()
                     .ok_or_else(|| VmError::type_error("not an iterator object"))?;
@@ -918,7 +917,7 @@ fn make_set_iterator(
                         match kind.as_str() {
                             "entry" => {
                                 let entry = GcRef::new(JsObject::array(2));
-                                let _ = entry.set(PropertyKey::Index(0), value.clone());
+                                let _ = entry.set(PropertyKey::Index(0), value);
                                 let _ = entry.set(PropertyKey::Index(1), value);
                                 let _ = result.set(pk("value"), Value::array(entry));
                             }
@@ -971,7 +970,7 @@ pub fn init_set_prototype(
                     value
                 };
                 data.add(MapKey(normalized));
-                Ok(this_val.clone())
+                Ok(*this_val)
             },
             mm.clone(),
             fn_proto,
@@ -1143,11 +1142,7 @@ pub fn init_set_prototype(
                         break;
                     }
                     if let Some(value) = data.entry_at(pos) {
-                        ncx.call_function(
-                            &callback,
-                            this_arg.clone(),
-                            &[value.clone(), value, this_val.clone()],
-                        )?;
+                        ncx.call_function(&callback, this_arg, &[value, value, *this_val])?;
                     }
                     pos += 1;
                 }
@@ -1168,7 +1163,7 @@ pub fn init_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "union",
             1,
-            |this_val, args, ncx| {
+            |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "union")?;
                 let other = args
                     .first()
@@ -1207,7 +1202,7 @@ pub fn init_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "intersection",
             1,
-            |this_val, args, ncx| {
+            |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "intersection")?;
                 let other = args.first().ok_or_else(|| {
                     VmError::type_error("Set.prototype.intersection requires argument")
@@ -1228,7 +1223,7 @@ pub fn init_set_prototype(
                 let result_data = get_set_data(&result).unwrap();
 
                 for val in this_data.for_each_entries() {
-                    if other_data.has(&MapKey(val.clone())) {
+                    if other_data.has(&MapKey(val)) {
                         result_data.add(MapKey(val));
                     }
                 }
@@ -1245,7 +1240,7 @@ pub fn init_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "difference",
             1,
-            |this_val, args, ncx| {
+            |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "difference")?;
                 let other = args.first().ok_or_else(|| {
                     VmError::type_error("Set.prototype.difference requires argument")
@@ -1266,7 +1261,7 @@ pub fn init_set_prototype(
                 let result_data = get_set_data(&result).unwrap();
 
                 for val in this_data.for_each_entries() {
-                    if !other_data.has(&MapKey(val.clone())) {
+                    if !other_data.has(&MapKey(val)) {
                         result_data.add(MapKey(val));
                     }
                 }
@@ -1283,7 +1278,7 @@ pub fn init_set_prototype(
         PropertyDescriptor::builtin_method(make_builtin(
             "symmetricDifference",
             1,
-            |this_val, args, ncx| {
+            |this_val, args, _ncx| {
                 let (_, this_data) = require_set(this_val, "symmetricDifference")?;
                 let other = args.first().ok_or_else(|| {
                     VmError::type_error("Set.prototype.symmetricDifference requires argument")
@@ -1307,13 +1302,13 @@ pub fn init_set_prototype(
 
                 // In this but not other
                 for val in this_data.for_each_entries() {
-                    if !other_data.has(&MapKey(val.clone())) {
+                    if !other_data.has(&MapKey(val)) {
                         result_data.add(MapKey(val));
                     }
                 }
                 // In other but not this
                 for val in other_data.for_each_entries() {
-                    if !this_data.has(&MapKey(val.clone())) {
+                    if !this_data.has(&MapKey(val)) {
                         result_data.add(MapKey(val));
                     }
                 }
@@ -1551,7 +1546,7 @@ pub fn init_weak_map_prototype(
                 unsafe {
                     entries.set_raw(key_header, value_bytes, None);
                 }
-                Ok(this_val.clone())
+                Ok(*this_val)
             },
             mm.clone(),
             fn_proto,
@@ -1701,7 +1696,7 @@ pub fn init_weak_map_prototype(
                         return Ok(bytes_to_value(&value_bytes));
                     }
                     // Otherwise compute, insert, and return
-                    let computed = ncx.call_function(&callback, Value::undefined(), &[key.clone()])?;
+                    let computed = ncx.call_function(&callback, Value::undefined(), &[key])?;
                     // Re-get entries in case callback triggered GC
                     let entries = get_weakmap_entries(&obj).ok_or("Internal error: missing entries")?;
                     let Some(key_header) = weak_key_header(&key) else {
@@ -1777,7 +1772,7 @@ pub fn init_weak_set_prototype(
                 unsafe {
                     entries.set_raw(key_header, value_bytes, None);
                 }
-                Ok(this_val.clone())
+                Ok(*this_val)
             },
             mm.clone(),
             fn_proto,
@@ -1910,7 +1905,7 @@ pub fn create_map_constructor() -> Box<
                 }
             }
 
-            Ok(this_val.clone())
+            Ok(*this_val)
         } else {
             Err(VmError::type_error("Constructor Map requires 'new'"))
         }
@@ -1948,7 +1943,7 @@ pub fn create_set_constructor() -> Box<
                 }
             }
 
-            Ok(this_val.clone())
+            Ok(*this_val)
         } else {
             Err(VmError::type_error("Constructor Set requires 'new'"))
         }
@@ -1986,7 +1981,7 @@ pub fn create_weak_map_constructor() -> Box<
                 }
 
                 // Use proper iterator protocol (spec step 7: AddEntriesFromIterable)
-                let this_clone = this_val.clone();
+                let this_clone = *this_val;
                 iterate_with_protocol(&iterable, ncx, |entry, ncx| {
                     // Each entry must be an object [key, value] (spec step 9.f)
                     let entry_obj =
@@ -1998,17 +1993,17 @@ pub fn create_weak_map_constructor() -> Box<
                             })?;
 
                     // Use js_get_value to trigger accessor getters (spec: Get(nextItem, "0") / Get(nextItem, "1"))
-                    let entry_val = entry.clone();
+                    let entry_val = entry;
                     let key = js_get_value(&entry_obj, &PropertyKey::Index(0), &entry_val, ncx)?;
                     let value = js_get_value(&entry_obj, &PropertyKey::Index(1), &entry_val, ncx)?;
 
                     // Call adder (this.set(key, value))
-                    ncx.call_function(&adder, this_clone.clone(), &[key, value])?;
+                    ncx.call_function(&adder, this_clone, &[key, value])?;
                     Ok(())
                 })?;
             }
 
-            Ok(this_val.clone())
+            Ok(*this_val)
         } else {
             Err(VmError::type_error("Constructor WeakMap requires 'new'"))
         }
@@ -2046,15 +2041,15 @@ pub fn create_weak_set_constructor() -> Box<
                 }
 
                 // Use proper iterator protocol
-                let this_clone = this_val.clone();
+                let this_clone = *this_val;
                 iterate_with_protocol(&iterable, ncx, |value, ncx| {
                     // Call adder (this.add(value))
-                    ncx.call_function(&adder, this_clone.clone(), &[value])?;
+                    ncx.call_function(&adder, this_clone, &[value])?;
                     Ok(())
                 })?;
             }
 
-            Ok(this_val.clone())
+            Ok(*this_val)
         } else {
             Err(VmError::type_error("Constructor WeakSet requires 'new'"))
         }
@@ -2084,7 +2079,7 @@ pub fn install_map_statics(
                 }
 
                 // Create a new Map
-                let mm = ncx.ctx.memory_manager().clone();
+                let _mm = ncx.ctx.memory_manager().clone();
                 let map_obj = GcRef::new(JsObject::new(Value::null()));
                 // Root map_obj across call_function GC points
                 ncx.ctx.push_root_slot(Value::object(map_obj));
@@ -2107,12 +2102,12 @@ pub fn install_map_statics(
                     let key = ncx.call_function(
                         &callback,
                         Value::undefined(),
-                        &[value.clone(), Value::number(k as f64)],
+                        &[value, Value::number(k as f64)],
                     )?;
                     k += 1;
 
                     // If key already exists in map, push to existing array; else create new array
-                    let map_key = MapKey(key.clone());
+                    let map_key = MapKey(key);
                     if let Some(existing) = map_data.get(&map_key) {
                         // Push to existing array
                         if let Some(arr) = existing.as_array().or_else(|| existing.as_object()) {

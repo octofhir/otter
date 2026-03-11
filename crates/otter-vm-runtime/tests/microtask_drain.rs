@@ -64,7 +64,7 @@ fn test_multiple_promise_chains() {
 #[test]
 fn test_microtask_in_eval_in_context() {
     // eval_in_context should also drain microtasks
-    let mut otter = Otter::new();
+    let otter = Otter::new();
     let mut ctx = otter
         .create_test_context()
         .expect("Failed to create context");

@@ -305,22 +305,22 @@ fn load_harness(harness_dir: &Path) -> String {
 
     // Load common.js shim
     let common_path = harness_dir.join("common.js");
-    if common_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&common_path) {
-            source.push_str("// --- harness: common.js ---\n");
-            source.push_str(&content);
-            source.push('\n');
-        }
+    if common_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&common_path)
+    {
+        source.push_str("// --- harness: common.js ---\n");
+        source.push_str(&content);
+        source.push('\n');
     }
 
     // Load any additional harness files
     let extras_path = harness_dir.join("extras.js");
-    if extras_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&extras_path) {
-            source.push_str("// --- harness: extras.js ---\n");
-            source.push_str(&content);
-            source.push('\n');
-        }
+    if extras_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&extras_path)
+    {
+        source.push_str("// --- harness: extras.js ---\n");
+        source.push_str(&content);
+        source.push('\n');
     }
 
     source

@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// SQLite database connection
 pub struct SqliteAdapter {
     conn: Arc<Mutex<Connection>>,
-    path: String,
+    _path: String,
 }
 
 impl SqliteAdapter {
@@ -50,7 +50,7 @@ impl SqliteAdapter {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            path: normalized_path,
+            _path: normalized_path,
         })
     }
 

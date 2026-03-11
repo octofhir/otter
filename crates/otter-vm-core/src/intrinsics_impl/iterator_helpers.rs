@@ -39,7 +39,7 @@ impl IntrinsicObject for IteratorIntrinsic {
             intrinsics.iterator_prototype.define_property(
                 PropertyKey::Symbol(sym),
                 PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                    |this_val, _args, _ncx| std::result::Result::Ok(this_val.clone()),
+                    |this_val, _args, _ncx| std::result::Result::Ok(*this_val),
                     mm.clone(),
                     ctx.fn_proto(),
                 )),
@@ -130,10 +130,10 @@ fn create_iter_result(value: Value, done: bool, ncx: &mut NativeContext<'_>) -> 
 
 /// Get the `next` method from an iterator object.
 fn get_iterator_next(iter: &Value, ncx: &mut NativeContext<'_>) -> Result<Value, VmError> {
-    if let Some(obj) = iter.as_object().or_else(|| iter.native_function_object()) {
-        if let Some(next) = obj.get(&pk("next")) {
-            return Ok(next);
-        }
+    if let Some(obj) = iter.as_object().or_else(|| iter.native_function_object())
+        && let Some(next) = obj.get(&pk("next"))
+    {
+        return Ok(next);
     }
     // Try property access via proxy/getter chain
     if let Some(obj) = iter.as_object() {
@@ -151,7 +151,7 @@ fn iter_step(
     next_method: &Value,
     ncx: &mut NativeContext<'_>,
 ) -> Result<(Value, bool), VmError> {
-    let result = ncx.call_function(next_method, iter.clone(), &[])?;
+    let result = ncx.call_function(next_method, *iter, &[])?;
     let done = result
         .as_object()
         .or_else(|| result.native_function_object())
@@ -168,13 +168,12 @@ fn iter_step(
 
 /// Call the return() method on the underlying iterator if it exists.
 fn iter_close(iter: &Value, ncx: &mut NativeContext<'_>) -> Result<Value, VmError> {
-    if let Some(obj) = iter.as_object().or_else(|| iter.native_function_object()) {
-        if let Some(return_fn) = obj.get(&pk("return")) {
-            if return_fn.is_function() || return_fn.is_native_function() {
-                let result = ncx.call_function(&return_fn, Value::object(obj), &[])?;
-                return Ok(result);
-            }
-        }
+    if let Some(obj) = iter.as_object().or_else(|| iter.native_function_object())
+        && let Some(return_fn) = obj.get(&pk("return"))
+        && (return_fn.is_function() || return_fn.is_native_function())
+    {
+        let result = ncx.call_function(&return_fn, Value::object(obj), &[])?;
+        return Ok(result);
     }
     Ok(Value::undefined())
 }
@@ -210,11 +209,11 @@ fn make_iterator_helper(
     kind: &str,
     callback: Option<Value>,
     remaining: Option<f64>,
-    mm: Arc<MemoryManager>,
+    _mm: Arc<MemoryManager>,
     iter_helper_proto: GcRef<JsObject>,
 ) -> Value {
     let helper = GcRef::new(JsObject::new(Value::object(iter_helper_proto)));
-    let _ = helper.set(pk(UNDERLYING_ITER), underlying.clone());
+    let _ = helper.set(pk(UNDERLYING_ITER), *underlying);
     let _ = helper.set(pk(UNDERLYING_NEXT), next_method);
     let _ = helper.set(pk(HELPER_KIND), Value::string(JsString::intern(kind)));
     let _ = helper.set(pk(ITER_DONE), Value::boolean(false));
@@ -312,11 +311,8 @@ fn helper_next_filter(
         let idx = counter;
         counter += 1.0;
         let _ = obj.set(pk(COUNTER), Value::number(counter));
-        let selected = ncx.call_function(
-            &callback,
-            Value::undefined(),
-            &[value.clone(), Value::number(idx)],
-        )?;
+        let selected =
+            ncx.call_function(&callback, Value::undefined(), &[value, Value::number(idx)])?;
         if selected.to_boolean() {
             return Ok(create_iter_result(value, false, ncx));
         }
@@ -396,18 +392,18 @@ fn helper_next_flat_map(
 
     loop {
         // If we have an active inner iterator, try to get from it
-        if let Some(inner_iter) = obj.get(&pk(INNER_ITER)) {
-            if !inner_iter.is_undefined() && !inner_iter.is_null() {
-                if let Some(inner_next) = obj.get(&pk(INNER_NEXT)) {
-                    let (value, done) = iter_step(&inner_iter, &inner_next, ncx)?;
-                    if !done {
-                        return Ok(create_iter_result(value, false, ncx));
-                    }
-                    // Inner iterator exhausted, clear it
-                    let _ = obj.set(pk(INNER_ITER), Value::undefined());
-                    let _ = obj.set(pk(INNER_NEXT), Value::undefined());
-                }
+        if let Some(inner_iter) = obj.get(&pk(INNER_ITER))
+            && !inner_iter.is_undefined()
+            && !inner_iter.is_null()
+            && let Some(inner_next) = obj.get(&pk(INNER_NEXT))
+        {
+            let (value, done) = iter_step(&inner_iter, &inner_next, ncx)?;
+            if !done {
+                return Ok(create_iter_result(value, false, ncx));
             }
+            // Inner iterator exhausted, clear it
+            let _ = obj.set(pk(INNER_ITER), Value::undefined());
+            let _ = obj.set(pk(INNER_NEXT), Value::undefined());
         }
 
         // Get next from outer iterator
@@ -436,8 +432,8 @@ fn helper_next_flat_map(
         let inner_next_val = get_iterator_next(&inner_iter_val, ncx)?;
 
         // Store inner iterator
-        let _ = obj.set(pk(INNER_ITER), inner_iter_val.clone());
-        let _ = obj.set(pk(INNER_NEXT), inner_next_val.clone());
+        let _ = obj.set(pk(INNER_ITER), inner_iter_val);
+        let _ = obj.set(pk(INNER_NEXT), inner_next_val);
 
         // Try to get the first value from the inner iterator
         let (inner_value, inner_done) = iter_step(&inner_iter_val, &inner_next_val, ncx)?;
@@ -467,11 +463,12 @@ fn iterator_helper_return(
     let _ = obj.set(pk(ALIVE), Value::boolean(false));
 
     // Close inner iterator if present (flatMap)
-    if let Some(inner) = obj.get(&pk(INNER_ITER)) {
-        if !inner.is_undefined() && !inner.is_null() {
-            let _ = iter_close(&inner, ncx);
-            let _ = obj.set(pk(INNER_ITER), Value::undefined());
-        }
+    if let Some(inner) = obj.get(&pk(INNER_ITER))
+        && !inner.is_undefined()
+        && !inner.is_null()
+    {
+        let _ = iter_close(&inner, ncx);
+        let _ = obj.set(pk(INNER_ITER), Value::undefined());
     }
 
     // Close underlying iterator
@@ -490,13 +487,12 @@ fn get_iterator(value: &Value, ncx: &mut NativeContext<'_>) -> Result<Value, VmE
     // If it's already an iterator (has next method), return as-is
     // Try Symbol.iterator first
     let sym_iter = crate::intrinsics::well_known::iterator_symbol();
-    if let Some(obj) = value.as_object().or_else(|| value.native_function_object()) {
-        if let Some(method) = obj.get(&PropertyKey::Symbol(sym_iter)) {
-            if method.is_function() || method.is_native_function() {
-                let iter_val = ncx.call_function(&method, value.clone(), &[])?;
-                return Ok(iter_val);
-            }
-        }
+    if let Some(obj) = value.as_object().or_else(|| value.native_function_object())
+        && let Some(method) = obj.get(&PropertyKey::Symbol(sym_iter))
+        && (method.is_function() || method.is_native_function())
+    {
+        let iter_val = ncx.call_function(&method, *value, &[])?;
+        return Ok(iter_val);
     }
     Err(VmError::type_error("value is not iterable"))
 }
@@ -516,7 +512,7 @@ fn get_iterator_direct(
         .or_else(|| this.native_function_object())
         .ok_or_else(|| VmError::type_error("Iterator.prototype method called on non-object"))?;
     let next = ncx.get_property(&obj, &pk("next"))?;
-    Ok((this.clone(), next))
+    Ok((*this, next))
 }
 
 // ============================================================================
@@ -586,7 +582,7 @@ fn iterator_reduce(
     let mut counter = 0.0f64;
 
     let mut accumulator = if args.len() >= 2 {
-        args[1].clone()
+        args[1]
     } else {
         // Use first element as initial value
         let (value, done) = iter_step(&iter, &next, ncx)?;
@@ -697,7 +693,7 @@ fn iterator_find(
         let result = ncx.call_function(
             &callback,
             Value::undefined(),
-            &[value.clone(), Value::number(counter)],
+            &[value, Value::number(counter)],
         )?;
         counter += 1.0;
         if result.to_boolean() {
@@ -857,22 +853,21 @@ fn iterator_from(
 
     // If value has Symbol.iterator, get an iterator from it
     let sym_iter = crate::intrinsics::well_known::iterator_symbol();
-    if let Some(obj) = value.as_object().or_else(|| value.native_function_object()) {
-        if let Some(method) = obj.get(&PropertyKey::Symbol(sym_iter)) {
-            if method.is_function() || method.is_native_function() {
-                let iter_result = ncx.call_function(&method, value.clone(), &[])?;
-                // Check if the result already has Iterator.prototype in its chain
-                // For simplicity, if it has a `next` method, wrap it
-                return Ok(wrap_for_valid_iterator(&iter_result, ncx, wrap_proto)?);
-            }
-        }
+    if let Some(obj) = value.as_object().or_else(|| value.native_function_object())
+        && let Some(method) = obj.get(&PropertyKey::Symbol(sym_iter))
+        && (method.is_function() || method.is_native_function())
+    {
+        let iter_result = ncx.call_function(&method, value, &[])?;
+        // Check if the result already has Iterator.prototype in its chain
+        // For simplicity, if it has a `next` method, wrap it
+        return wrap_for_valid_iterator(&iter_result, ncx, wrap_proto);
     }
 
     // Object with a `next` method — wrap it
-    if let Some(obj) = value.as_object().or_else(|| value.native_function_object()) {
-        if obj.get(&pk("next")).is_some() {
-            return Ok(wrap_for_valid_iterator(&value, ncx, wrap_proto)?);
-        }
+    if let Some(obj) = value.as_object().or_else(|| value.native_function_object())
+        && obj.get(&pk("next")).is_some()
+    {
+        return wrap_for_valid_iterator(&value, ncx, wrap_proto);
     }
 
     Err(VmError::type_error(
@@ -888,7 +883,7 @@ fn wrap_for_valid_iterator(
 ) -> Result<Value, VmError> {
     let next_method = get_iterator_next(iter, ncx)?;
     let wrapper = GcRef::new(JsObject::new(Value::object(wrap_proto)));
-    let _ = wrapper.set(pk(UNDERLYING_ITER), iter.clone());
+    let _ = wrapper.set(pk(UNDERLYING_ITER), *iter);
     let _ = wrapper.set(pk(UNDERLYING_NEXT), next_method);
     Ok(Value::object(wrapper))
 }

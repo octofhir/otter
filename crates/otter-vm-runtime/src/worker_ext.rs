@@ -252,7 +252,7 @@ fn worker_thread_main(wctx: WorkerContext, script_src: &str) {
     while !wctx.is_terminated() {
         match wctx.recv() {
             Some(WorkerMessage::Data(value)) => {
-                let handler = on_message_handler.lock().clone();
+                let handler = *on_message_handler.lock();
                 if let Some(handler_fn) = handler {
                     dispatch_message(&mut engine, &handler_fn, value);
                 }
@@ -316,7 +316,7 @@ fn install_worker_globals(
     );
 
     let getter = Value::native_function_with_proto(
-        move |_this, _args, _ncx| Ok(handler_for_get.lock().clone().unwrap_or(Value::null())),
+        move |_this, _args, _ncx| Ok((*handler_for_get.lock()).unwrap_or(Value::null())),
         mm.clone(),
         fn_proto,
     );
@@ -334,7 +334,7 @@ fn install_worker_globals(
 /// Dispatch an incoming message to the worker's onmessage handler.
 fn dispatch_message(engine: &mut crate::otter_runtime::Otter, handler: &Value, data: Value) {
     let runtime = engine.isolate.runtime();
-    let mm = runtime.memory_manager().clone();
+    let _mm = runtime.memory_manager().clone();
 
     // Create event-like object: { data: value }
     let event = GcRef::new(JsObject::new(Value::null()));

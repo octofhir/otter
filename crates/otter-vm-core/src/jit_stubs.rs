@@ -325,14 +325,14 @@ pub(crate) extern "C" fn otter_rt_call_mono_stub(
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        return dispatch_call_mono_asm(
+        dispatch_call_mono_asm(
             target,
             ctx_raw,
             callee_raw,
             argc_raw,
             argv_ptr_raw,
             expected_func_index_raw,
-        );
+        )
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -359,7 +359,7 @@ pub(crate) extern "C" fn otter_rt_get_prop_mono_stub(
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        return dispatch_get_prop_mono_asm(target, obj_raw, expected_shape, offset);
+        dispatch_get_prop_mono_asm(target, obj_raw, expected_shape, offset)
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -641,7 +641,7 @@ mod tests {
                 &mut ctx,
                 std::ptr::null(),
                 0,
-                inspect_reentry_context as usize,
+                inspect_reentry_context as *const () as usize,
                 &state,
             )
         };
@@ -695,7 +695,7 @@ mod tests {
                 &mut ctx,
                 args.as_ptr(),
                 args.len() as u32,
-                inspect_reentry_state_and_args as usize,
+                inspect_reentry_state_and_args as *const () as usize,
                 &state,
             )
         };

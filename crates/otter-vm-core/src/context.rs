@@ -37,6 +37,12 @@ pub struct ModuleTable {
     modules: Vec<Option<Arc<Module>>>,
 }
 
+impl Default for ModuleTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModuleTable {
     pub fn new() -> Self {
         Self {
@@ -125,7 +131,7 @@ impl<'a> NativeContext<'a> {
         this_value: crate::value::Value,
         args: &[crate::value::Value],
     ) -> crate::error::VmResult<crate::value::Value> {
-        let mut current_func = func.clone();
+        let mut current_func = *func;
         let mut current_this = this_value;
         let mut current_args: std::borrow::Cow<'_, [crate::value::Value]> =
             std::borrow::Cow::Borrowed(args);
@@ -146,23 +152,22 @@ impl<'a> NativeContext<'a> {
 
                 if let Some(bound_args_val) =
                     obj.get(&crate::object::PropertyKey::string("__boundArgs__"))
+                    && let Some(args_obj) = bound_args_val.as_object()
                 {
-                    if let Some(args_obj) = bound_args_val.as_object() {
-                        let len = args_obj
-                            .get(&crate::object::PropertyKey::string("length"))
-                            .and_then(|v| v.as_int32())
-                            .unwrap_or(0) as usize;
-                        let mut new_args = Vec::with_capacity(len + current_args.len());
-                        for i in 0..len {
-                            new_args.push(
-                                args_obj
-                                    .get(&crate::object::PropertyKey::Index(i as u32))
-                                    .unwrap_or_else(crate::value::Value::undefined),
-                            );
-                        }
-                        new_args.extend(current_args.iter().cloned());
-                        current_args = std::borrow::Cow::Owned(new_args);
+                    let len = args_obj
+                        .get(&crate::object::PropertyKey::string("length"))
+                        .and_then(|v| v.as_int32())
+                        .unwrap_or(0) as usize;
+                    let mut new_args = Vec::with_capacity(len + current_args.len());
+                    for i in 0..len {
+                        new_args.push(
+                            args_obj
+                                .get(&crate::object::PropertyKey::Index(i as u32))
+                                .unwrap_or_else(crate::value::Value::undefined),
+                        );
                     }
+                    new_args.extend(current_args.iter().cloned());
+                    current_args = std::borrow::Cow::Owned(new_args);
                 }
                 current_func = bound_fn;
             } else {
@@ -189,14 +194,17 @@ impl<'a> NativeContext<'a> {
             .call_function_construct(self.ctx, func, this_value, args)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_primitive(&mut self, value: &Value, hint: PreferredType) -> VmResult<Value> {
         self.interpreter.to_primitive(self.ctx, value, hint)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_string_value(&mut self, value: &Value) -> VmResult<String> {
         self.interpreter.to_string_value(self.ctx, value)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_number_value(&mut self, value: &Value) -> VmResult<f64> {
         self.interpreter.to_number_value(self.ctx, value)
     }
@@ -205,6 +213,7 @@ impl<'a> NativeContext<'a> {
         self.interpreter.parse_bigint_str(value)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn default_object_prototype_for_constructor(
         &self,
         ctor: &Value,
@@ -213,6 +222,7 @@ impl<'a> NativeContext<'a> {
             .default_object_prototype_for_constructor(self.ctx, ctor)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_prototype_from_constructor(&self, ctor: &Value) -> Option<GcRef<JsObject>> {
         ctor.as_object()
             .and_then(|o| o.get(&crate::object::PropertyKey::string("prototype")))
@@ -220,6 +230,7 @@ impl<'a> NativeContext<'a> {
             .or_else(|| self.default_object_prototype_for_constructor(ctor))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_prototype_from_constructor_with_default(
         &self,
         ctor: &Value,
@@ -294,7 +305,7 @@ impl<'a> NativeContext<'a> {
         key: &crate::object::PropertyKey,
     ) -> crate::error::VmResult<Value> {
         let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-        let receiver = Value::object(obj.clone());
+        let receiver = Value::object(*obj);
         self.interpreter
             .get_with_proxy_chain(self.ctx, obj, key, key_value, &receiver)
     }
@@ -311,7 +322,7 @@ impl<'a> NativeContext<'a> {
         }
         if let Some(proxy) = val.as_proxy() {
             let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-            let receiver = val.clone();
+            let receiver = *val;
             return crate::proxy_operations::proxy_get(self, proxy, key, key_value, receiver);
         }
         Ok(Value::undefined())
@@ -359,13 +370,12 @@ impl<'a> NativeContext<'a> {
             // Configurable properties (e.g. from eval-created var bindings) are NOT restricted.
             if let Some(desc) =
                 global.get_own_property_descriptor(&crate::object::PropertyKey::string(lex_name))
+                && !desc.is_configurable()
             {
-                if !desc.is_configurable() {
-                    return Err(VmError::SyntaxError(format!(
-                        "Identifier '{}' has already been declared",
-                        lex_name
-                    )));
-                }
+                return Err(VmError::SyntaxError(format!(
+                    "Identifier '{}' has already been declared",
+                    lex_name
+                )));
             }
         }
         // Record lex names so subsequent scripts see them as declared
@@ -590,7 +600,7 @@ impl CallFrame {
 /// a `DispatchAction` on `VmContext` before returning `Ok(())`, and the loop
 /// picks it up via `take_dispatch_action()`.
 #[derive(Debug, Clone)]
-pub(crate) enum DispatchAction {
+pub enum DispatchAction {
     Jump(i32),
     Return(Value),
     Call {
@@ -816,7 +826,7 @@ struct TryHandler {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TemplateCacheKey {
+pub struct TemplateCacheKey {
     pub realm_id: RealmId,
     pub module_ptr: usize,
     pub site_id: u32,
@@ -1211,10 +1221,10 @@ impl VmContext {
         trace_state.ring_buffer.push(entry.clone());
 
         // Write to trace file if in FullTrace mode
-        if trace_state.config.mode == crate::trace::TraceMode::FullTrace {
-            if let Some(ref mut writer) = trace_state.trace_writer {
-                let _ = writer.write_entry(&entry);
-            }
+        if trace_state.config.mode == crate::trace::TraceMode::FullTrace
+            && let Some(ref mut writer) = trace_state.trace_writer
+        {
+            let _ = writer.write_entry(&entry);
         }
 
         trace_state.instruction_counter += 1;
@@ -1365,6 +1375,7 @@ impl VmContext {
         self.interrupt_flag.store(false, Ordering::Relaxed);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn update_debug_snapshot(&self) {
         let Some(target) = &self.debug_snapshot else {
             return;
@@ -1564,10 +1575,10 @@ impl VmContext {
         let abs = frame.register_base + index as usize;
 
         // If this local has been captured and is still open, use the cell value.
-        if frame.open_upvalue_count != 0 {
-            if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index)) {
-                return Ok(cell.get());
-            }
+        if frame.open_upvalue_count != 0
+            && let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index))
+        {
+            return Ok(cell.get());
         }
 
         self.registers
@@ -1602,10 +1613,10 @@ impl VmContext {
                 .expect("read_local_unchecked requires an active call frame");
             debug_assert!(index < frame.local_count);
 
-            if frame.open_upvalue_count != 0 {
-                if let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index)) {
-                    return cell.get();
-                }
+            if frame.open_upvalue_count != 0
+                && let Some(cell) = self.open_upvalues.get(&(frame.frame_id, index))
+            {
+                return cell.get();
             }
 
             self.registers[frame.register_base + index as usize]
@@ -1629,10 +1640,8 @@ impl VmContext {
         };
         if abs < self.registers.len() {
             self.registers[abs] = value;
-            if has_open {
-                if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
-                    let _ = cell.set(self.registers[abs]);
-                }
+            if has_open && let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+                cell.set(self.registers[abs]);
             }
             Ok(())
         } else {
@@ -1703,10 +1712,8 @@ impl VmContext {
             let has_open = frame.open_upvalue_count != 0;
 
             self.registers[abs] = value;
-            if has_open {
-                if let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
-                    let _ = cell.set(self.registers[abs]);
-                }
+            if has_open && let Some(cell) = self.open_upvalues.get(&(frame_id, index)) {
+                cell.set(self.registers[abs]);
             }
         }
     }
@@ -1772,7 +1779,7 @@ impl VmContext {
 
         #[cfg(debug_assertions)]
         {
-            let value = self.get_register(src).clone();
+            let value = *self.get_register(src);
             self.write_local_unchecked(local_index, value);
         }
     }
@@ -2222,11 +2229,7 @@ impl VmContext {
         if let Some((src_start, src_count)) = self.pending_args_register_source.take() {
             // Fast path: args are still in the caller's register window.
             // Copy directly register-to-register (no Vec intermediary).
-            let extra_args_count = if src_count > effective_param_count {
-                src_count - effective_param_count
-            } else {
-                0
-            };
+            let extra_args_count = src_count.saturating_sub(effective_param_count);
 
             if extra_args_count == 0 {
                 let copy_count = src_count.min(local_count);
@@ -2262,11 +2265,7 @@ impl VmContext {
         } else {
             // Slow path: args are in the pending_args SmallVec.
             let pending_arg_len = self.pending_args.len();
-            let extra_args_count = if pending_arg_len > effective_param_count {
-                pending_arg_len - effective_param_count
-            } else {
-                0
-            };
+            let extra_args_count = pending_arg_len.saturating_sub(effective_param_count);
 
             if extra_args_count == 0 {
                 for (i, arg) in self.pending_args.drain(..).enumerate() {
@@ -2302,18 +2301,18 @@ impl VmContext {
         }
 
         static TRACE_ASSERT_ARGS: OnceLock<bool> = OnceLock::new();
-        if *TRACE_ASSERT_ARGS.get_or_init(|| std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok()) {
-            if func_name_is_assert {
-                let arg_types: Vec<_> = self.registers
-                    [register_base..register_base + param_count.min(local_count)]
-                    .iter()
-                    .map(|v| v.type_of())
-                    .collect();
-                eprintln!(
-                    "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
-                    param_count, arg_types
-                );
-            }
+        if *TRACE_ASSERT_ARGS.get_or_init(|| std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok())
+            && func_name_is_assert
+        {
+            let arg_types: Vec<_> = self.registers
+                [register_base..register_base + param_count.min(local_count)]
+                .iter()
+                .map(|v| v.type_of())
+                .collect();
+            eprintln!(
+                "[OTTER_TRACE_ASSERT_ARGS] params={} types={:?}",
+                param_count, arg_types
+            );
         }
 
         let frame_realm_id = self.pending_realm_id.take().unwrap_or(self.realm_id);
@@ -2692,7 +2691,7 @@ impl VmContext {
             .upvalues
             .get(index as usize)
             .ok_or_else(|| VmError::internal(format!("upvalue index {} out of bounds", index)))?;
-        let _ = cell.set(value);
+        cell.set(value);
         Ok(())
     }
 
@@ -2706,13 +2705,13 @@ impl VmContext {
         let key = (frame_id, local_idx);
 
         if let Some(cell) = self.open_upvalues.get(&key) {
-            return Ok(cell.clone());
+            return Ok(*cell);
         }
 
         // Create a new cell with the current local value
         let value = self.get_local(local_idx)?;
         let cell = UpvalueCell::new(value);
-        self.open_upvalues.insert(key, cell.clone());
+        self.open_upvalues.insert(key, cell);
         if let Some(frame) = self.current_frame_mut() {
             debug_assert_eq!(frame.frame_id, frame_id);
             frame.open_upvalue_count += 1;
@@ -2733,14 +2732,14 @@ impl VmContext {
         if let Some(cell) = self.open_upvalues.get(&key) {
             // Sync the current local value into the cell
             let value = self.get_local(local_idx)?;
-            let _ = cell.set(value);
+            cell.set(value);
         }
         // Remove from open upvalues (the closures keep their own clones of the cell)
-        if self.open_upvalues.remove(&key).is_some() {
-            if let Some(frame) = self.current_frame_mut() {
-                debug_assert_eq!(frame.frame_id, frame_id);
-                frame.open_upvalue_count = frame.open_upvalue_count.saturating_sub(1);
-            }
+        if self.open_upvalues.remove(&key).is_some()
+            && let Some(frame) = self.current_frame_mut()
+        {
+            debug_assert_eq!(frame.frame_id, frame_id);
+            frame.open_upvalue_count = frame.open_upvalue_count.saturating_sub(1);
         }
         Ok(())
     }
@@ -2748,17 +2747,17 @@ impl VmContext {
     /// Clean up all open upvalues for a frame that's being popped
     pub fn close_all_upvalues_for_frame(&mut self, frame_id: u32) {
         self.open_upvalues.retain(|(fid, _), _| *fid != frame_id);
-        if let Some(frame) = self.current_frame_mut() {
-            if frame.frame_id == frame_id {
-                frame.open_upvalue_count = 0;
-            }
+        if let Some(frame) = self.current_frame_mut()
+            && frame.frame_id == frame_id
+        {
+            frame.open_upvalue_count = 0;
         }
     }
 
     /// Get the `this` value of the current call frame
     pub fn this_value(&self) -> Value {
         self.current_frame()
-            .map(|f| f.this_value.clone())
+            .map(|f| f.this_value)
             .unwrap_or_else(Value::undefined)
     }
 
@@ -3002,23 +3001,21 @@ impl VmContext {
                 // Check for __weakmap_entries__
                 if let Some(entries_value) =
                     obj.get(&crate::object::PropertyKey::string("__weakmap_entries__"))
+                    && let Some(table) = entries_value.as_ephemeron_table()
                 {
-                    if let Some(table) = entries_value.as_ephemeron_table() {
-                        let ptr = table.as_ptr() as usize;
-                        if visited.insert(ptr) {
-                            tables.push(table);
-                        }
+                    let ptr = table.as_ptr() as usize;
+                    if visited.insert(ptr) {
+                        tables.push(table);
                     }
                 }
                 // Check for __weakset_entries__
                 if let Some(entries_value) =
                     obj.get(&crate::object::PropertyKey::string("__weakset_entries__"))
+                    && let Some(table) = entries_value.as_ephemeron_table()
                 {
-                    if let Some(table) = entries_value.as_ephemeron_table() {
-                        let ptr = table.as_ptr() as usize;
-                        if visited.insert(ptr) {
-                            tables.push(table);
-                        }
+                    let ptr = table.as_ptr() as usize;
+                    if visited.insert(ptr) {
+                        tables.push(table);
                     }
                 }
             }
@@ -3613,7 +3610,7 @@ mod tests {
         let idx = constants.add(Constant::string_from_str("answer"));
         let exported = Value::int32(42);
 
-        ctx.host_export_from_constant_pool(&constants, idx, exported.clone())
+        ctx.host_export_from_constant_pool(&constants, idx, exported)
             .expect("export via pool should succeed");
 
         let expected_name = "answer".encode_utf16().collect::<Vec<u16>>();

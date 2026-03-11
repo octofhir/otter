@@ -154,6 +154,7 @@ const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004; // Array hole sentinel (not user-vi
 const TAG_NAN: u64 = 0x7FFA_0000_0000_0000; // Canonical NaN (distinct from undefined)
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+#[allow(dead_code)]
 const TAG_POINTER: u64 = 0x7FFC_0000_0000_0000;
 
 // Pointer sub-tags (Phase 1.1): encode the 3 hottest heap types in the NaN-box
@@ -300,10 +301,10 @@ impl Clone for FfiCallInfo {
 
 impl Drop for FfiCallInfo {
     fn drop(&mut self) {
-        if let Some(drop_fn) = self.opaque_drop {
-            if !self.opaque.is_null() {
-                unsafe { drop_fn(self.opaque) };
-            }
+        if let Some(drop_fn) = self.opaque_drop
+            && !self.opaque.is_null()
+        {
+            unsafe { drop_fn(self.opaque) };
         }
     }
 }
@@ -477,6 +478,7 @@ impl Value {
     /// - The raw pointer in `bits` must point to a live GC object
     /// - No GC must occur while the returned Value is in use
     /// - Intended for JIT runtime helpers during no-GC JIT execution scope
+    ///
     /// Reconstruct a Value from raw NaN-boxed bits.
     ///
     /// With `#[repr(transparent)]`, Value is just a u64, so this is trivial.
@@ -495,6 +497,7 @@ impl Value {
 
     /// Return raw NaN-box bits for JIT argument passing.
     #[inline]
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_jit_bits(&self) -> i64 {
         self.bits as i64
     }
@@ -697,7 +700,11 @@ impl Value {
     {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Value::null()));
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -713,7 +720,11 @@ impl Value {
         _memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         let object = GcRef::new(JsObject::new(Value::null()));
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -746,7 +757,11 @@ impl Value {
             crate::object::PropertyKey::string("__non_constructor"),
             Value::boolean(true),
         );
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -801,7 +816,11 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -829,7 +848,7 @@ impl Value {
             + 'static,
     {
         let func: NativeFn = Arc::new(f);
-        let object = GcRef::new(JsObject::new(Value::object(prototype.clone())));
+        let object = GcRef::new(JsObject::new(Value::object(prototype)));
         object.define_property(
             crate::object::PropertyKey::string("length"),
             crate::object::PropertyDescriptor::function_length(Value::int32(length as i32)),
@@ -854,7 +873,11 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -878,7 +901,11 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
+        let native = GcRef::new(NativeFunctionObject {
+            func,
+            object,
+            ffi_info: None,
+        });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -936,7 +963,7 @@ impl Value {
     /// Check if value has [[IsHTMLDDA]] internal slot (Annex B)
     #[inline]
     pub fn is_htmldda(&self) -> bool {
-        self.as_object().map_or(false, |o| o.is_htmldda())
+        self.as_object().is_some_and(|o| o.is_htmldda())
     }
 
     /// Check if value is an object (includes functions, arrays, regexps, etc.)
@@ -1048,13 +1075,12 @@ impl Value {
             return proxy.target_raw().is_callable();
         }
         // Bound functions are plain objects with __boundFunction__ property
-        if let Some(obj) = self.as_object() {
-            if obj
+        if let Some(obj) = self.as_object()
+            && obj
                 .get(&crate::object::PropertyKey::string("__boundFunction__"))
                 .is_some()
-            {
-                return true;
-            }
+        {
+            return true;
         }
         false
     }
@@ -1536,7 +1562,10 @@ impl Value {
         if self.is_native_function() {
             let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
             let nfo_ref = unsafe { &*nfo.as_ptr() };
-            nfo_ref.ffi_info.as_ref().map(|b| &**b as *const FfiCallInfo)
+            nfo_ref
+                .ffi_info
+                .as_ref()
+                .map(|b| &**b as *const FfiCallInfo)
         } else {
             None
         }
@@ -1549,10 +1578,12 @@ impl Value {
     #[inline]
     #[allow(unsafe_code)]
     pub unsafe fn set_ffi_call_info(&self, info: FfiCallInfo) {
-        if self.is_native_function() {
-            let nfo: GcRef<NativeFunctionObject> = self.extract_gcref();
-            let nfo_mut = &mut *(nfo.as_ptr() as *mut NativeFunctionObject);
-            nfo_mut.ffi_info = Some(Box::new(info));
+        unsafe {
+            if self.is_native_function() {
+                let nfo: GcRef<NativeFunctionObject> = self.extract_gcref();
+                let nfo_mut = &mut *(nfo.as_ptr() as *mut NativeFunctionObject);
+                nfo_mut.ffi_info = Some(Box::new(info));
+            }
         }
     }
 
@@ -1805,6 +1836,105 @@ impl PartialEq for Value {
     }
 }
 
+// ============================================================================
+// GC Tracing Implementation
+// ============================================================================
+
+impl Value {
+    /// Trace GC references in this value.
+    ///
+    /// Uses sub-tag + GcHeader tag for type discrimination, then traces
+    /// the appropriate GC roots for each type.
+    #[allow(unsafe_code)]
+    pub fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
+        let tag16 = self.bits & TAG_MASK;
+        match tag16 {
+            TAG_PTR_STRING => {
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
+                }
+            }
+            TAG_PTR_OBJECT => {
+                // Plain objects and arrays — trace the JsObject header
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
+                }
+            }
+            TAG_PTR_FUNCTION => {
+                // Closure or NativeFunction — trace the wrapper's header (not the inner object)
+                if let Some(hdr) = self.gc_header() {
+                    tracer(hdr);
+                }
+            }
+            TAG_PTR_OTHER => {
+                let gc_tag = unsafe { self.gc_header_tag_from_bits() };
+                use otter_vm_gc::object::tags as gc_tags;
+                match gc_tag {
+                    gc_tags::PROMISE => {
+                        // Promise needs special trace_roots for reaction chains
+                        if let Some(p) = self.as_promise() {
+                            p.trace_roots(tracer);
+                        }
+                    }
+                    gc_tags::TYPED_ARRAY => {
+                        // TypedArray: trace both the object and its buffer
+                        if let Some(ta) = self.as_typed_array() {
+                            tracer(ta.object.header() as *const _);
+                            tracer(ta.buffer().object.header() as *const _);
+                        }
+                    }
+                    gc_tags::DATA_VIEW => {
+                        // DataView: trace the buffer
+                        if let Some(dv) = self.as_data_view() {
+                            tracer(dv.buffer().object.header() as *const _);
+                        }
+                    }
+                    gc_tags::REGEXP => {
+                        // RegExp: trace inner object
+                        if let Some(r) = self.as_regex() {
+                            tracer(r.object.header() as *const _);
+                        }
+                    }
+                    gc_tags::ARRAY_BUFFER => {
+                        // ArrayBuffer: trace inner object
+                        if let Some(ab) = self.as_array_buffer() {
+                            tracer(ab.object.header() as *const _);
+                        }
+                    }
+                    gc_tags::MAP_DATA => {
+                        // MapData: trace all key/value pairs
+                        if let Some(m) = self.as_map_data() {
+                            otter_vm_gc::GcTraceable::trace(&*m, tracer);
+                        }
+                    }
+                    gc_tags::SET_DATA => {
+                        // SetData: trace all entries
+                        if let Some(s) = self.as_set_data() {
+                            otter_vm_gc::GcTraceable::trace(&*s, tracer);
+                        }
+                    }
+                    gc_tags::FINALIZATION_REGISTRY => {
+                        // FinalizationRegistry: trace callback + held values
+                        if let Some(r) = self.as_finalization_registry() {
+                            otter_vm_gc::GcTraceable::trace(&*r, tracer);
+                        }
+                    }
+                    _ => {
+                        // Symbol, BigInt, Generator, Proxy, SharedArrayBuffer,
+                        // EphemeronTable, WeakRef, Temporal — trace just the header
+                        if let Some(hdr) = self.gc_header() {
+                            tracer(hdr);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Not a pointer type (int32, f64, bool, null, undefined) — nothing to trace
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1922,104 +2052,5 @@ mod tests {
         let boxed_int = Value::int32(7).bits;
         let restored = Value::from_jit_bits(boxed_int).expect("int32 bits should be accepted");
         assert_eq!(restored.as_int32(), Some(7));
-    }
-}
-
-// ============================================================================
-// GC Tracing Implementation
-// ============================================================================
-
-impl Value {
-    /// Trace GC references in this value.
-    ///
-    /// Uses sub-tag + GcHeader tag for type discrimination, then traces
-    /// the appropriate GC roots for each type.
-    #[allow(unsafe_code)]
-    pub fn trace(&self, tracer: &mut dyn FnMut(*const otter_vm_gc::GcHeader)) {
-        let tag16 = self.bits & TAG_MASK;
-        match tag16 {
-            TAG_PTR_STRING => {
-                if let Some(hdr) = self.gc_header() {
-                    tracer(hdr);
-                }
-            }
-            TAG_PTR_OBJECT => {
-                // Plain objects and arrays — trace the JsObject header
-                if let Some(hdr) = self.gc_header() {
-                    tracer(hdr);
-                }
-            }
-            TAG_PTR_FUNCTION => {
-                // Closure or NativeFunction — trace the wrapper's header (not the inner object)
-                if let Some(hdr) = self.gc_header() {
-                    tracer(hdr);
-                }
-            }
-            TAG_PTR_OTHER => {
-                let gc_tag = unsafe { self.gc_header_tag_from_bits() };
-                use otter_vm_gc::object::tags as gc_tags;
-                match gc_tag {
-                    gc_tags::PROMISE => {
-                        // Promise needs special trace_roots for reaction chains
-                        if let Some(p) = self.as_promise() {
-                            p.trace_roots(tracer);
-                        }
-                    }
-                    gc_tags::TYPED_ARRAY => {
-                        // TypedArray: trace both the object and its buffer
-                        if let Some(ta) = self.as_typed_array() {
-                            tracer(ta.object.header() as *const _);
-                            tracer(ta.buffer().object.header() as *const _);
-                        }
-                    }
-                    gc_tags::DATA_VIEW => {
-                        // DataView: trace the buffer
-                        if let Some(dv) = self.as_data_view() {
-                            tracer(dv.buffer().object.header() as *const _);
-                        }
-                    }
-                    gc_tags::REGEXP => {
-                        // RegExp: trace inner object
-                        if let Some(r) = self.as_regex() {
-                            tracer(r.object.header() as *const _);
-                        }
-                    }
-                    gc_tags::ARRAY_BUFFER => {
-                        // ArrayBuffer: trace inner object
-                        if let Some(ab) = self.as_array_buffer() {
-                            tracer(ab.object.header() as *const _);
-                        }
-                    }
-                    gc_tags::MAP_DATA => {
-                        // MapData: trace all key/value pairs
-                        if let Some(m) = self.as_map_data() {
-                            otter_vm_gc::GcTraceable::trace(&*m, tracer);
-                        }
-                    }
-                    gc_tags::SET_DATA => {
-                        // SetData: trace all entries
-                        if let Some(s) = self.as_set_data() {
-                            otter_vm_gc::GcTraceable::trace(&*s, tracer);
-                        }
-                    }
-                    gc_tags::FINALIZATION_REGISTRY => {
-                        // FinalizationRegistry: trace callback + held values
-                        if let Some(r) = self.as_finalization_registry() {
-                            otter_vm_gc::GcTraceable::trace(&*r, tracer);
-                        }
-                    }
-                    _ => {
-                        // Symbol, BigInt, Generator, Proxy, SharedArrayBuffer,
-                        // EphemeronTable, WeakRef, Temporal — trace just the header
-                        if let Some(hdr) = self.gc_header() {
-                            tracer(hdr);
-                        }
-                    }
-                }
-            }
-            _ => {
-                // Not a pointer type (int32, f64, bool, null, undefined) — nothing to trace
-            }
-        }
     }
 }

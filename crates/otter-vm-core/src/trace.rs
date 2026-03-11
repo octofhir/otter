@@ -188,8 +188,8 @@ impl TraceWriter {
                 writeln!(writer.file)?;
                 writeln!(
                     writer.file,
-                    "{:>8}  {:>6}  {:>4}  {:<25}  {:<15}  {}",
-                    "INST#", "PC", "FN", "MODULE", "OPCODE", "OPERANDS"
+                    "{:>8}  {:>6}  {:>4}  {:<25}  {:<15}  OPERANDS",
+                    "INST#", "PC", "FN", "MODULE", "OPCODE"
                 )?;
                 writeln!(
                     writer.file,
@@ -276,7 +276,7 @@ impl TraceWriter {
         }
 
         // Flush every 100 entries to avoid losing data on crash
-        if entry.instruction_number % 100 == 0 {
+        if entry.instruction_number.is_multiple_of(100) {
             self.file.flush()?;
         }
 
@@ -381,10 +381,10 @@ impl TraceState {
     pub fn matches_filter(&self, entry: &TraceEntry) -> bool {
         if let Some(ref regex) = self.filter_regex {
             // Match against module URL or function name
-            if let Some(ref fname) = entry.function_name {
-                if regex.is_match(fname) {
-                    return true;
-                }
+            if let Some(ref fname) = entry.function_name
+                && regex.is_match(fname)
+            {
+                return true;
             }
             regex.is_match(&entry.module_url)
         } else {

@@ -55,7 +55,7 @@ pub fn register_weak_ref_target(cell: GcRef<WeakRefCell>, target: Value) {
 /// Returns `Some(target)` if the cell is registered and alive, `None` otherwise.
 pub fn get_weak_ref_target(cell: &GcRef<WeakRefCell>) -> Option<Value> {
     let key = cell.as_ptr() as usize;
-    WEAK_REF_TARGETS.with(|m| m.borrow().get(&key).map(|(_, v)| v.clone()))
+    WEAK_REF_TARGETS.with(|m| m.borrow().get(&key).map(|(_, v)| *v))
 }
 
 // ============================================================================
@@ -157,7 +157,7 @@ unsafe fn pre_sweep_weak_refs() {
                         .and_then(|arr| arr.get(&PropertyKey::Index(idx)))
                         .unwrap_or_else(Value::undefined);
 
-                    PENDING_CLEANUPS.with(|c| c.borrow_mut().push((callback.clone(), held_value)));
+                    PENDING_CLEANUPS.with(|c| c.borrow_mut().push((callback, held_value)));
                 }
             }
 

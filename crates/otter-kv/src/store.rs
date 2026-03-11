@@ -47,7 +47,7 @@ impl KvStore {
     ///
     /// # Arguments
     /// * `path` - Database path. Use `:memory:` for in-memory database,
-    ///           or a file path for persistent storage
+    ///   or a file path for persistent storage
     pub fn open(path: &str) -> KvResult<Self> {
         let is_memory = path == ":memory:";
 
@@ -59,11 +59,10 @@ impl KvStore {
             Database::create(&temp_path).map_err(|e| KvError::Database(e.to_string()))?
         } else {
             let path = Path::new(path);
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| KvError::InvalidPath(e.to_string()))?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| KvError::InvalidPath(e.to_string()))?;
             }
             Database::create(path).map_err(|e| KvError::Database(e.to_string()))?
         };

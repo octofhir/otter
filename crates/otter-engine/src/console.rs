@@ -164,6 +164,7 @@ impl ConsoleAdapter for StdConsole {
 // ============================================================================
 
 /// Create console ops with default StdConsole (println!/eprintln!)
+#[allow(dead_code)]
 pub fn console_ops() -> Vec<Op> {
     console_ops_with_adapter(StdConsole::default())
 }

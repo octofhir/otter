@@ -503,7 +503,7 @@ mod tests {
     fn test_create_dataview() {
         let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
-        let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
+        let dv = JsDataView::new(buf, 0, None).unwrap();
         assert_eq!(dv.byte_length(), 16);
         assert_eq!(dv.byte_offset(), 0);
     }
@@ -512,7 +512,7 @@ mod tests {
     fn test_create_with_offset() {
         let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
-        let dv = JsDataView::new(buf.clone(), 4, Some(8)).unwrap();
+        let dv = JsDataView::new(buf, 4, Some(8)).unwrap();
         assert_eq!(dv.byte_length(), 8);
         assert_eq!(dv.byte_offset(), 4);
     }
@@ -581,9 +581,9 @@ mod tests {
         let buf = GcRef::new(JsArrayBuffer::new(8, None));
         let dv = JsDataView::new(buf, 0, None).unwrap();
 
-        dv.set_float32(0, 3.14, true).unwrap();
+        dv.set_float32(0, std::f32::consts::PI, true).unwrap();
         let val = dv.get_float32(0, true).unwrap();
-        assert!((val - 3.14).abs() < 0.001);
+        assert!((val - std::f32::consts::PI).abs() < 0.001);
 
         dv.set_float32(4, 2.71, false).unwrap();
         let val = dv.get_float32(4, false).unwrap();
@@ -632,7 +632,7 @@ mod tests {
     fn test_detached_buffer() {
         let (_mm, _rt) = make_test_env();
         let buf = GcRef::new(JsArrayBuffer::new(16, None));
-        let dv = JsDataView::new(buf.clone(), 0, None).unwrap();
+        let dv = JsDataView::new(buf, 0, None).unwrap();
 
         dv.set_int32(0, 42, true).unwrap();
         assert_eq!(dv.get_int32(0, true).unwrap(), 42);
@@ -650,10 +650,10 @@ mod tests {
         let buf = GcRef::new(JsArrayBuffer::new(8, None));
 
         // Offset past end
-        assert!(JsDataView::new(buf.clone(), 10, None).is_err());
+        assert!(JsDataView::new(buf, 10, None).is_err());
 
         // Length extends past end
-        assert!(JsDataView::new(buf.clone(), 4, Some(10)).is_err());
+        assert!(JsDataView::new(buf, 4, Some(10)).is_err());
 
         // Detached buffer
         buf.detach();

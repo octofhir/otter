@@ -217,7 +217,7 @@ pub fn ops(
         }),
         // __http_ws_upgrade(serverId, reqId, headers, data) -> boolean
         op_sync("__http_ws_upgrade", move |args| {
-            let server_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let server_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let req_id = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
             let headers = args
                 .get(2)
@@ -231,7 +231,7 @@ pub fn ops(
         }),
         // __http_ws_send(socketId, data, isText) -> status
         op_sync("__http_ws_send", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let data = args.get(1).and_then(json_to_bytes).unwrap_or_default();
             let is_text = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
             let status = manager_ws_send.ws_send(socket_id, data, is_text);
@@ -239,7 +239,7 @@ pub fn ops(
         }),
         // __http_ws_close(socketId, code, reason) -> boolean
         op_sync("__http_ws_close", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let code = args.get(1).and_then(|v| v.as_u64()).map(|v| v as u16);
             let reason = args.get(2).and_then(|v| v.as_str()).map(|s| s.to_string());
             let success = manager_ws_close.ws_close(socket_id, code, reason);
@@ -247,41 +247,41 @@ pub fn ops(
         }),
         // __http_ws_terminate(socketId) -> boolean
         op_sync("__http_ws_terminate", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let success = manager_ws_terminate.ws_terminate(socket_id);
             Ok(json!(success))
         }),
         // __http_ws_ping(socketId, data) -> status
         op_sync("__http_ws_ping", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let data = args.get(1).and_then(json_to_bytes).unwrap_or_default();
             let status = manager_ws_ping.ws_ping(socket_id, data);
             Ok(json!(status))
         }),
         // __http_ws_pong(socketId, data) -> status
         op_sync("__http_ws_pong", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let data = args.get(1).and_then(json_to_bytes).unwrap_or_default();
             let status = manager_ws_pong.ws_pong(socket_id, data);
             Ok(json!(status))
         }),
         // __http_ws_subscribe(socketId, topic) -> boolean
         op_sync("__http_ws_subscribe", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let topic = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let success = manager_ws_subscribe.ws_subscribe(socket_id, topic);
             Ok(json!(success))
         }),
         // __http_ws_unsubscribe(socketId, topic) -> boolean
         op_sync("__http_ws_unsubscribe", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let topic = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let success = manager_ws_unsubscribe.ws_unsubscribe(socket_id, topic);
             Ok(json!(success))
         }),
         // __http_ws_publish(serverId, topic, data, isText, senderId) -> status
         op_sync("__http_ws_publish", move |args| {
-            let server_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let server_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let topic = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let data = args.get(2).and_then(json_to_bytes).unwrap_or_default();
             let is_text = args.get(3).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -291,20 +291,20 @@ pub fn ops(
         }),
         // __http_ws_subscriber_count(serverId, topic) -> number
         op_sync("__http_ws_subscriber_count", move |args| {
-            let server_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let server_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let topic = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let count = manager_ws_subscriber_count.ws_subscriber_count(server_id, topic);
             Ok(json!(count))
         }),
         // __http_ws_buffered_amount(socketId) -> number
         op_sync("__http_ws_buffered_amount", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let amount = manager_ws_buffered.ws_buffered_amount(socket_id);
             Ok(json!(amount))
         }),
         // __http_ws_ready_state(socketId) -> number
         op_sync("__http_ws_ready_state", move |args| {
-            let socket_id = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let socket_id = args.first().and_then(|v| v.as_u64()).unwrap_or(0);
             let state = manager_ws_ready.ws_ready_state(socket_id);
             Ok(json!(state))
         }),
@@ -351,7 +351,7 @@ fn parse_server_options(args: &[JsonValue]) -> Result<ServerOptions, String> {
             h2c,
             reuse_port,
             ipv6_only,
-            idle_timeout,
+            _idle_timeout: idle_timeout,
             ws_config,
             ws_enabled,
         });
@@ -373,7 +373,7 @@ fn parse_server_options(args: &[JsonValue]) -> Result<ServerOptions, String> {
         h2c: false,
         reuse_port: false,
         ipv6_only: false,
-        idle_timeout: None,
+        _idle_timeout: None,
         ws_config: WebSocketServerConfig::default(),
         ws_enabled: false,
     })

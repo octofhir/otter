@@ -57,11 +57,10 @@ impl RealmRegistry {
     /// Remove a realm record by id, dropping GcRef roots so GC can collect old objects.
     pub fn remove(&self, id: RealmId) -> Option<RealmRecord> {
         let mut realms = self.realms.write();
-        if let Some(pos) = realms.iter().position(|r| r.id == id) {
-            Some(realms.swap_remove(pos))
-        } else {
-            None
-        }
+        realms
+            .iter()
+            .position(|r| r.id == id)
+            .map(|pos| realms.swap_remove(pos))
     }
 
     /// Trace all GC roots held by all realm records.

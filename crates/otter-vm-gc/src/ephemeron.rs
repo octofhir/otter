@@ -368,7 +368,7 @@ mod tests {
         for i in 0..10 {
             let key_header = GcHeader::new(i);
             let key_ptr = Box::leak(Box::new(key_header)) as *const GcHeader;
-            let value_bytes = vec![i as u8];
+            let value_bytes = vec![i];
 
             unsafe {
                 table.set_raw(key_ptr, value_bytes, None);

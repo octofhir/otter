@@ -67,7 +67,7 @@ fn get_options_object(val: &Value) -> Result<Value, VmError> {
             "options must be an object or undefined",
         ));
     }
-    Ok(val.clone())
+    Ok(*val)
 }
 
 /// Get a property from options (handles proxy).
@@ -167,10 +167,10 @@ fn resolve_timezone(
     // Objects: only ZonedDateTime is allowed (extracts its timezone).
     // All other objects throw TypeError per ToTemporalTimeZoneIdentifier.
     if tz_val.as_object().is_some() || tz_val.as_proxy().is_some() {
-        if let Some(obj) = tz_val.as_object() {
-            if let Ok(zdt) = extract_zoned_date_time(&obj) {
-                return Ok(zdt.time_zone().clone());
-            }
+        if let Some(obj) = tz_val.as_object()
+            && let Ok(zdt) = extract_zoned_date_time(&obj)
+        {
+            return Ok(*zdt.time_zone());
         }
         return Err(VmError::type_error(format!(
             "{} is not a valid time zone",
@@ -252,13 +252,13 @@ pub(super) fn install_zoned_date_time(
     fn_proto: &GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
-    let proto = GcRef::new(JsObject::new(Value::object(obj_proto.clone())));
-    let ctor_obj = GcRef::new(JsObject::new(Value::object(fn_proto.clone())));
+    let proto = GcRef::new(JsObject::new(Value::object(*obj_proto)));
+    let ctor_obj = GcRef::new(JsObject::new(Value::object(*fn_proto)));
 
     ctor_obj.define_property(
         PropertyKey::string("prototype"),
         PropertyDescriptor::data_with_attrs(
-            Value::object(proto.clone()),
+            Value::object(proto),
             PropertyAttributes {
                 writable: false,
                 enumerable: false,
@@ -277,7 +277,7 @@ pub(super) fn install_zoned_date_time(
     );
 
     // Constructor: new Temporal.ZonedDateTime(epochNanoseconds, timeZone [, calendar])
-    let proto_for_ctor = proto.clone();
+    let proto_for_ctor = proto;
     let ctor_fn: Box<
         dyn Fn(&Value, &[Value], &mut NativeContext<'_>) -> Result<Value, VmError> + Send + Sync,
     > = Box::new(move |this, args, ncx| {
@@ -333,17 +333,14 @@ pub(super) fn install_zoned_date_time(
     let ctor_value = Value::native_function_with_proto_and_object(
         Arc::from(ctor_fn),
         mm.clone(),
-        fn_proto.clone(),
-        ctor_obj.clone(),
+        *fn_proto,
+        ctor_obj,
     );
 
     // prototype.constructor
     proto.define_property(
         PropertyKey::string("constructor"),
-        PropertyDescriptor::data_with_attrs(
-            ctor_value.clone(),
-            PropertyAttributes::constructor_link(),
-        ),
+        PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
     );
 
     // ========================================================================
@@ -397,12 +394,12 @@ pub(super) fn install_zoned_date_time(
             let is_proxy = item.as_proxy().is_some();
             if item.as_object().is_some() || is_proxy {
                 // Check if it's an existing ZonedDateTime
-                if let Some(obj) = item.as_object() {
-                    if let Ok(zdt) = extract_zoned_date_time(&obj) {
-                        let (_disambiguation, _offset_option, _overflow) =
-                            parse_zdt_from_options(ncx, &options_val)?;
-                        return construct_zdt_value(ncx, &zdt);
-                    }
+                if let Some(obj) = item.as_object()
+                    && let Ok(zdt) = extract_zoned_date_time(&obj)
+                {
+                    let (_disambiguation, _offset_option, _overflow) =
+                        parse_zdt_from_options(ncx, &options_val)?;
+                    return construct_zdt_value(ncx, &zdt);
                 }
 
                 // Property bag — spec order: calendar, then fields alphabetically,
@@ -559,13 +556,13 @@ pub(super) fn install_zoned_date_time(
                 let day = day.ok_or_else(|| VmError::type_error("day is required"))?;
 
                 // Validate non-negative (PrepareTemporalFields uses ToPositiveInteger)
-                if let Some(m) = month_num {
-                    if m < 1 {
-                        return Err(VmError::range_error(format!(
-                            "month must be >= 1, got {}",
-                            m
-                        )));
-                    }
+                if let Some(m) = month_num
+                    && m < 1
+                {
+                    return Err(VmError::range_error(format!(
+                        "month must be >= 1, got {}",
+                        m
+                    )));
                 }
                 if day < 1 {
                     return Err(VmError::range_error(format!(
@@ -577,10 +574,10 @@ pub(super) fn install_zoned_date_time(
                 // Resolve month — monthCode suitability validated AFTER options reading
                 let month = if let Some(ref mc) = mc_str {
                     let mc_month = validate_month_code_iso_suitability(mc)? as i32;
-                    if let Some(m) = month_num {
-                        if m != mc_month {
-                            return Err(VmError::range_error("month and monthCode must agree"));
-                        }
+                    if let Some(m) = month_num
+                        && m != mc_month
+                    {
+                        return Err(VmError::range_error("month and monthCode must agree"));
                     }
                     mc_month
                 } else {
@@ -660,7 +657,7 @@ pub(super) fn install_zoned_date_time(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "from",
         1,
     );
@@ -685,7 +682,7 @@ pub(super) fn install_zoned_date_time(
             }
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "compare",
         2,
     );
@@ -847,7 +844,7 @@ pub(super) fn install_zoned_date_time(
                 Ok(Value::bigint(ns_str))
             },
             mm.clone(),
-            fn_proto.clone(),
+            *fn_proto,
             "get epochNanoseconds",
             0,
         );
@@ -995,7 +992,7 @@ pub(super) fn install_zoned_date_time(
                 Ok(Value::number(hours))
             },
             mm.clone(),
-            fn_proto.clone(),
+            *fn_proto,
             "get hoursInDay",
             0,
         );
@@ -1033,7 +1030,7 @@ pub(super) fn install_zoned_date_time(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toString",
         0,
     );
@@ -1055,7 +1052,7 @@ pub(super) fn install_zoned_date_time(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toJSON",
         0,
     );
@@ -1077,7 +1074,7 @@ pub(super) fn install_zoned_date_time(
             Ok(Value::string(JsString::intern(&s)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toLocaleString",
         0,
     );
@@ -1097,7 +1094,7 @@ pub(super) fn install_zoned_date_time(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "valueOf",
         0,
     );
@@ -1119,7 +1116,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &sod)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "startOfDay",
         0,
     );
@@ -1151,7 +1148,7 @@ pub(super) fn install_zoned_date_time(
             ncx.call_function_construct(&ctor, Value::undefined(), &[epoch_bigint])
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toInstant",
         0,
     );
@@ -1171,7 +1168,7 @@ pub(super) fn install_zoned_date_time(
             construct_plain_date_value(ncx, pd.year(), pd.month() as i32, pd.day() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainDate",
         0,
     );
@@ -1212,7 +1209,7 @@ pub(super) fn install_zoned_date_time(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainTime",
         0,
     );
@@ -1256,7 +1253,7 @@ pub(super) fn install_zoned_date_time(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainDateTime",
         0,
     );
@@ -1283,7 +1280,7 @@ pub(super) fn install_zoned_date_time(
             Ok(Value::boolean(eq))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "equals",
         1,
     );
@@ -1309,7 +1306,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "withCalendar",
         1,
     );
@@ -1333,7 +1330,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "withTimeZone",
         1,
     );
@@ -1364,7 +1361,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "withPlainTime",
         0,
     );
@@ -1397,7 +1394,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "add",
         1,
     );
@@ -1427,7 +1424,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "subtract",
         1,
     );
@@ -1453,7 +1450,7 @@ pub(super) fn install_zoned_date_time(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "until",
         1,
     );
@@ -1479,7 +1476,7 @@ pub(super) fn install_zoned_date_time(
             construct_duration_value(ncx, &dur)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "since",
         1,
     );
@@ -1501,12 +1498,12 @@ pub(super) fn install_zoned_date_time(
             }
             // RejectTemporalLikeObject:
             // 1. Check for Temporal internal slots (any Temporal type)
-            if let Some(fobj) = fields_val.as_object() {
-                if extract_temporal_inner(&fobj).is_ok() {
-                    return Err(VmError::type_error(
-                        "with() does not accept a Temporal object",
-                    ));
-                }
+            if let Some(fobj) = fields_val.as_object()
+                && extract_temporal_inner(&fobj).is_ok()
+            {
+                return Err(VmError::type_error(
+                    "with() does not accept a Temporal object",
+                ));
             }
             // 2. Check calendar property on plain objects
             let calendar_check =
@@ -1541,7 +1538,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "with",
         1,
     );
@@ -1565,7 +1562,7 @@ pub(super) fn install_zoned_date_time(
             construct_zdt_value(ncx, &new_zdt)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "round",
         1,
     );
@@ -1592,7 +1589,7 @@ pub(super) fn install_zoned_date_time(
             }
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "getTimeZoneTransition",
         1,
     );
@@ -1614,7 +1611,7 @@ pub(super) fn install_zoned_date_time(
             construct_plain_year_month_value(ncx, zdt.year(), zdt.month() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainYearMonth",
         0,
     );
@@ -1636,7 +1633,7 @@ pub(super) fn install_zoned_date_time(
             construct_plain_month_day_value(ncx, zdt.month() as i32, zdt.day() as i32)
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toPlainMonthDay",
         0,
     );
@@ -1673,7 +1670,7 @@ pub(super) fn install_zoned_date_time(
             ncx.call_function_construct(&instant_ctor, Value::undefined(), &[epoch_bigint])
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "toInstant",
         0,
     );
@@ -1684,7 +1681,7 @@ pub(super) fn install_zoned_date_time(
 
     // getISOFields()
     let get_iso_fields_fn = Value::native_function_with_proto_named(
-        |this, _args, ncx| {
+        |this, _args, _ncx| {
             let obj = this
                 .as_object()
                 .ok_or_else(|| VmError::type_error("not a ZonedDateTime"))?;
@@ -1748,7 +1745,7 @@ pub(super) fn install_zoned_date_time(
             Ok(Value::object(result))
         },
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
         "getISOFields",
         0,
     );
@@ -1789,10 +1786,10 @@ fn to_temporal_zdt(
     val: &Value,
 ) -> Result<temporal_rs::ZonedDateTime, VmError> {
     // 1. If object with ZonedDateTime internal slot, extract directly
-    if let Some(obj) = val.as_object() {
-        if let Ok(zdt) = extract_zoned_date_time(&obj) {
-            return Ok(zdt);
-        }
+    if let Some(obj) = val.as_object()
+        && let Ok(zdt) = extract_zoned_date_time(&obj)
+    {
+        return Ok(zdt);
     }
 
     // 2. If object (not ZDT), treat as property bag
@@ -1900,14 +1897,14 @@ fn to_temporal_zdt(
         // Resolve month
         let month = if let Some(ref mc) = mc_str {
             let mc_month = validate_month_code_iso_suitability(mc)? as i32;
-            if let Some(m) = month_num {
-                if m != mc_month {
-                    return Err(VmError::range_error("month and monthCode must agree"));
-                }
+            if let Some(m) = month_num
+                && m != mc_month
+            {
+                return Err(VmError::range_error("month and monthCode must agree"));
             }
             mc_month as u8
         } else if let Some(m) = month_num {
-            if m < 1 || m > 12 {
+            if !(1..=12).contains(&m) {
                 return Err(VmError::range_error(format!("month out of range: {}", m)));
             }
             m as u8
@@ -1967,7 +1964,7 @@ fn to_temporal_zdt(
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
         let zdt = temporal_rs::ZonedDateTime::from_utf8_with_provider(
-            s.as_str().as_bytes(),
+            s.as_bytes(),
             temporal_rs::options::Disambiguation::Compatible,
             temporal_rs::options::OffsetDisambiguation::Reject,
             tz_provider(),
@@ -2027,7 +2024,7 @@ fn to_temporal_plain_time(
 
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
-        return temporal_rs::PlainTime::from_utf8(s.as_str().as_bytes()).map_err(temporal_err);
+        return temporal_rs::PlainTime::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
 
     Err(VmError::type_error("Cannot convert to PlainTime"))
@@ -2227,7 +2224,7 @@ fn parse_zdt_to_string_options(
             ));
         }
         let d = n.floor();
-        if d < 0.0 || d > 9.0 || !d.is_finite() {
+        if !(0.0..=9.0).contains(&d) || !d.is_finite() {
             return Err(VmError::range_error(
                 "fractionalSecondDigits must be 0-9 or 'auto'",
             ));
@@ -2424,7 +2421,7 @@ fn parse_zdt_fields(
     let month_code = if !month_code_val.is_undefined() {
         let s = ncx.to_string_value(&month_code_val)?;
         Some(
-            temporal_rs::MonthCode::try_from_utf8(s.as_str().as_bytes())
+            temporal_rs::MonthCode::try_from_utf8(s.as_bytes())
                 .map_err(|e| VmError::range_error(format!("{e}")))?,
         )
     } else {

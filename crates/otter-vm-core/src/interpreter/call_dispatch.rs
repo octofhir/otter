@@ -28,10 +28,10 @@ impl Interpreter {
         as_construct: bool,
     ) -> VmResult<Value> {
         let previous_realm = ctx.realm_id();
-        if let Some(realm_id) = target_realm {
-            if realm_id != previous_realm {
-                ctx.switch_realm(realm_id);
-            }
+        if let Some(realm_id) = target_realm
+            && realm_id != previous_realm
+        {
+            ctx.switch_realm(realm_id);
         }
 
         ctx.enter_native_call()?;
@@ -88,16 +88,14 @@ impl Interpreter {
         args: &[Value],
     ) -> VmResult<Value> {
         // Check __non_constructor flag (ES2023 §17: built-in methods are not constructors)
-        if let Some(func_obj) = func.as_object() {
-            if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
-                func_obj.get_own_property_descriptor(&crate::object::PropertyKey::string(
+        if let Some(func_obj) = func.as_object()
+            && let Some(crate::object::PropertyDescriptor::Data { value, .. }) = func_obj
+                .get_own_property_descriptor(&crate::object::PropertyKey::string(
                     "__non_constructor",
                 ))
-            {
-                if value.as_boolean() == Some(true) {
-                    return Err(VmError::type_error("not a constructor"));
-                }
-            }
+            && value.as_boolean() == Some(true)
+        {
+            return Err(VmError::type_error("not a constructor"));
         }
 
         // Check if it's a native function
@@ -160,13 +158,12 @@ impl Interpreter {
                 Vec::new()
             };
             let rest_arr = crate::gc::GcRef::new(crate::object::JsObject::array(rest_args.len()));
-            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object()) {
-                if let Some(array_proto) = array_obj
+            if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
+                && let Some(array_proto) = array_obj
                     .get(&crate::object::PropertyKey::string("prototype"))
                     .and_then(|v| v.as_object())
-                {
-                    rest_arr.set_prototype(Value::object(array_proto));
-                }
+            {
+                rest_arr.set_prototype(Value::object(array_proto));
             }
             for (i, arg) in rest_args.into_iter().enumerate() {
                 let _ = rest_arr.set(crate::object::PropertyKey::Index(i as u32), arg);
@@ -180,13 +177,13 @@ impl Interpreter {
         ctx.set_pending_upvalues(closure.upvalues.clone());
         // Propagate home_object from closure to the new call frame
         if let Some(ref ho) = closure.home_object {
-            ctx.set_pending_home_object(ho.clone());
+            ctx.set_pending_home_object(*ho);
         }
 
         let realm_id = self.realm_id_for_function(ctx, func);
         ctx.set_pending_realm_id(realm_id);
         // Store callee value for arguments.callee
-        ctx.set_pending_callee_value(func.clone());
+        ctx.set_pending_callee_value(*func);
         ctx.register_module(&closure.module);
         ctx.push_frame(
             closure.function_index,
@@ -241,8 +238,10 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let newly_hot = func
-                                .record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
+                            let newly_hot =
+                                func.record_back_edge_with_threshold(
+                                    otter_vm_exec::jit_hot_threshold(),
+                                );
                             if newly_hot {
                                 func.mark_hot();
                                 if otter_vm_exec::is_jit_enabled() {
@@ -268,7 +267,7 @@ impl Interpreter {
                             (
                                 frame.return_register,
                                 frame.flags.is_construct(),
-                                frame.this_value.clone(),
+                                frame.this_value,
                                 frame.flags.is_async(),
                             )
                         };
@@ -308,7 +307,8 @@ impl Interpreter {
                             let f = m
                                 .function(func_index)
                                 .ok_or_else(|| VmError::internal("function not found"))?;
-                            let hot = f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
+                            let hot =
+                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                             let jit = Self::can_jit(f, is_construct, is_async, argc);
                             (f.local_count, hot, jit)
                         };
@@ -457,25 +457,26 @@ impl Interpreter {
         if let Some(fn_obj) = method_value.native_function_object() {
             let flags = fn_obj.flags.borrow();
             if flags.is_array_push {
-                if let Some(receiver_obj) = receiver.as_object() {
-                    if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() {
-                        let mut last_len = receiver_obj.array_length();
-                        for i in 0..argc {
-                            let arg = ctx.get_register(args_start_reg + i).clone();
-                            last_len = receiver_obj.array_push(arg);
-                        }
-                        ctx.set_register(dst_reg, Value::number(last_len as f64));
-                        return Ok(true);
+                if let Some(receiver_obj) = receiver.as_object()
+                    && receiver_obj.is_array()
+                    && !receiver_obj.is_dictionary_mode()
+                {
+                    let mut last_len = receiver_obj.array_length();
+                    for i in 0..argc {
+                        let arg = *ctx.get_register(args_start_reg + i);
+                        last_len = receiver_obj.array_push(arg);
                     }
+                    ctx.set_register(dst_reg, Value::number(last_len as f64));
+                    return Ok(true);
                 }
-            } else if flags.is_array_pop {
-                if let Some(receiver_obj) = receiver.as_object() {
-                    if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() {
-                        let val = receiver_obj.array_pop();
-                        ctx.set_register(dst_reg, val);
-                        return Ok(true);
-                    }
-                }
+            } else if flags.is_array_pop
+                && let Some(receiver_obj) = receiver.as_object()
+                && receiver_obj.is_array()
+                && !receiver_obj.is_dictionary_mode()
+            {
+                let val = receiver_obj.array_pop();
+                ctx.set_register(dst_reg, val);
+                return Ok(true);
             }
         }
         Ok(false)
@@ -489,7 +490,7 @@ impl Interpreter {
         args: Vec<Value>,
         return_reg: u16,
     ) -> VmResult<()> {
-        let mut current_func = func_value.clone();
+        let mut current_func = *func_value;
         let mut current_this = this_value;
         let mut current_args = args;
 
@@ -505,25 +506,24 @@ impl Interpreter {
                     current_this = raw_this_arg;
                 };
 
-                if let Some(bound_args_val) = obj.get(&PropertyKey::string("__boundArgs__")) {
-                    if let Some(args_obj) = bound_args_val.as_object() {
-                        let len =
-                            if let Some(len_val) = args_obj.get(&PropertyKey::string("length")) {
-                                len_val.as_int32().unwrap_or(0) as usize
-                            } else {
-                                0
-                            };
-                        let mut new_args = Vec::with_capacity(len + current_args.len());
-                        for i in 0..len {
-                            new_args.push(
-                                args_obj
-                                    .get(&PropertyKey::Index(i as u32))
-                                    .unwrap_or_else(Value::undefined),
-                            );
-                        }
-                        new_args.extend(current_args);
-                        current_args = new_args;
+                if let Some(bound_args_val) = obj.get(&PropertyKey::string("__boundArgs__"))
+                    && let Some(args_obj) = bound_args_val.as_object()
+                {
+                    let len = if let Some(len_val) = args_obj.get(&PropertyKey::string("length")) {
+                        len_val.as_int32().unwrap_or(0) as usize
+                    } else {
+                        0
+                    };
+                    let mut new_args = Vec::with_capacity(len + current_args.len());
+                    for i in 0..len {
+                        new_args.push(
+                            args_obj
+                                .get(&PropertyKey::Index(i as u32))
+                                .unwrap_or_else(Value::undefined),
+                        );
                     }
+                    new_args.extend(current_args);
+                    current_args = new_args;
                 }
                 current_func = bound_fn;
             } else {
@@ -595,7 +595,7 @@ impl Interpreter {
                     gen_obj,
                 );
                 // Store callee value for arguments.callee in sloppy mode generators
-                generator.set_callee_value(current_func.clone());
+                generator.set_callee_value(current_func);
                 ctx.set_register(return_reg, Value::generator(generator));
                 return Ok(());
             }
@@ -607,10 +607,10 @@ impl Interpreter {
             ctx.set_pending_args_from_vec(current_args);
             // Propagate home_object from closure to the new call frame
             if let Some(ref ho) = closure.home_object {
-                ctx.set_pending_home_object(ho.clone());
+                ctx.set_pending_home_object(*ho);
             }
             // Store callee value for arguments.callee
-            ctx.set_pending_callee_value(current_func.clone());
+            ctx.set_pending_callee_value(current_func);
             ctx.dispatch_action = Some(DispatchAction::Call {
                 func_index: closure.function_index,
                 module_id: closure.module.module_id,
@@ -649,7 +649,12 @@ impl Interpreter {
     }
 
     /// Add operation (handles string concatenation)
-    pub(super) fn op_add(&self, ctx: &mut VmContext, left: &Value, right: &Value) -> VmResult<Value> {
+    pub(super) fn op_add(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+    ) -> VmResult<Value> {
         let left_prim = self.to_primitive(ctx, left, PreferredType::Default)?;
         let right_prim = self.to_primitive(ctx, right, PreferredType::Default)?;
 

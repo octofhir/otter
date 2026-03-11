@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Test262 runner configuration loaded from TOML file
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Test262Config {
     /// Path to the test262 directory
@@ -27,20 +27,6 @@ pub struct Test262Config {
 
     /// Directory for saving results
     pub results_dir: Option<PathBuf>,
-}
-
-impl Default for Test262Config {
-    fn default() -> Self {
-        Self {
-            test262_path: None,
-            test262_commit: None,
-            skip_features: Vec::new(),
-            ignored_tests: Vec::new(),
-            known_panics: Vec::new(),
-            timeout_secs: None,
-            results_dir: None,
-        }
-    }
 }
 
 impl Test262Config {

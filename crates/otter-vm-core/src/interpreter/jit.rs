@@ -14,19 +14,23 @@ impl Interpreter {
     ) -> Option<otter_vm_bytecode::function::ArithmeticType> {
         if let Some(frame) = ctx.current_frame() {
             let feedback = frame.feedback().read();
-            if let Some(ic) = feedback.get(feedback_index as usize) {
-                if let otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty) =
+            if let Some(ic) = feedback.get(feedback_index as usize)
+                && let otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty) =
                     ic.ic_state
-                {
-                    return Some(ty);
-                }
+            {
+                return Some(ty);
             }
         }
         None
     }
 
     #[inline]
-    pub(super) fn update_arithmetic_ic(ctx: &VmContext, feedback_index: u16, left: &Value, right: &Value) {
+    pub(super) fn update_arithmetic_ic(
+        ctx: &VmContext,
+        feedback_index: u16,
+        left: &Value,
+        right: &Value,
+    ) {
         if let Some(frame) = ctx.current_frame() {
             let feedback = frame.feedback().write();
             if let Some(ic) = feedback.get_mut(feedback_index as usize) {
@@ -331,8 +335,8 @@ impl Interpreter {
             return BackEdgeOsrOutcome::ContinueWithJump;
         }
         let func_index = frame.function_index;
-        let this_value = frame.this_value.clone();
-        let home_object = frame.home_object.clone();
+        let this_value = frame.this_value;
+        let home_object = frame.home_object;
         let upvalues = frame.upvalues.clone();
         // frame borrow ends here
 
@@ -352,7 +356,7 @@ impl Interpreter {
             })
             .collect();
         let registers: Vec<Value> = (0..reg_count)
-            .map(|i| ctx.get_register(i as u16).clone())
+            .map(|i| *ctx.get_register(i as u16))
             .collect();
 
         // Build args from parameter locals (for JIT context argv, though OSR
@@ -423,11 +427,11 @@ impl Interpreter {
             let mut enqueued = 0usize;
             for idx in 0..module.function_count() {
                 let function_index = idx as u32;
-                if let Some(function) = module.function(function_index) {
-                    if otter_vm_exec::enqueue_hot_function(module, function_index, function) {
-                        function.mark_hot();
-                        enqueued += 1;
-                    }
+                if let Some(function) = module.function(function_index)
+                    && otter_vm_exec::enqueue_hot_function(module, function_index, function)
+                {
+                    function.mark_hot();
+                    enqueued += 1;
                 }
             }
             for _ in 0..enqueued {

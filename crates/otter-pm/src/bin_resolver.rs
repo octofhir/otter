@@ -59,10 +59,10 @@ impl BinResolver {
 
             // Check for script (Unix: no extension, Windows: .cmd)
             let script_path = bin_dir.join(name);
-            if script_path.exists() {
-                if let Some(resolved) = self.resolve_bin_from_shim(&script_path, name) {
-                    return Some(resolved);
-                }
+            if script_path.exists()
+                && let Some(resolved) = self.resolve_bin_from_shim(&script_path, name)
+            {
+                return Some(resolved);
             }
 
             // Check for .cmd on Windows
@@ -137,15 +137,15 @@ impl BinResolver {
             let pkg_dir = node_modules.join(package_name);
             if pkg_dir.exists() {
                 let pkg_json_path = pkg_dir.join("package.json");
-                if let Ok(pkg_content) = std::fs::read_to_string(&pkg_json_path) {
-                    if let Ok(pkg) = serde_json::from_str::<PackageJson>(&pkg_content) {
-                        return Some(ResolvedBin {
-                            name: name.to_string(),
-                            path: shim_path.to_path_buf(),
-                            package_name: pkg.name.unwrap_or_else(|| package_name.to_string()),
-                            package_version: pkg.version.unwrap_or_else(|| "0.0.0".to_string()),
-                        });
-                    }
+                if let Ok(pkg_content) = std::fs::read_to_string(&pkg_json_path)
+                    && let Ok(pkg) = serde_json::from_str::<PackageJson>(&pkg_content)
+                {
+                    return Some(ResolvedBin {
+                        name: name.to_string(),
+                        path: shim_path.to_path_buf(),
+                        package_name: pkg.name.unwrap_or_else(|| package_name.to_string()),
+                        package_version: pkg.version.unwrap_or_else(|| "0.0.0".to_string()),
+                    });
                 }
             }
         }

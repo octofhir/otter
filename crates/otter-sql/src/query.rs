@@ -55,45 +55,45 @@ impl QueryBuilder {
     /// Add a value as a parameter
     fn add_value(&mut self, value: &JsonValue) {
         // Check if this is a special sql() helper call
-        if let Some(obj) = value.as_object() {
-            if let Some(type_field) = obj.get("__sql_type") {
-                match type_field.as_str() {
-                    Some("identifier") => {
-                        // sql("table_name") - escape and inline identifier
-                        if let Some(name) = obj.get("value").and_then(|v| v.as_str()) {
-                            self.sql.push_str(&escape_identifier(name));
-                        }
-                        return;
+        if let Some(obj) = value.as_object()
+            && let Some(type_field) = obj.get("__sql_type")
+        {
+            match type_field.as_str() {
+                Some("identifier") => {
+                    // sql("table_name") - escape and inline identifier
+                    if let Some(name) = obj.get("value").and_then(|v| v.as_str()) {
+                        self.sql.push_str(&escape_identifier(name));
                     }
-                    Some("object_insert") => {
-                        // sql(object) or sql(object, ...columns) - expand for INSERT
-                        self.expand_object_insert(obj);
-                        return;
-                    }
-                    Some("object_update") => {
-                        // sql(object, ...columns) for UPDATE SET
-                        self.expand_object_update(obj);
-                        return;
-                    }
-                    Some("array_in") => {
-                        // sql([1, 2, 3]) for IN clause
-                        self.expand_array_in(obj);
-                        return;
-                    }
-                    Some("array_values") => {
-                        // sql.array([...]) for PostgreSQL array
-                        self.expand_pg_array(obj);
-                        return;
-                    }
-                    Some("raw") => {
-                        // sql.raw("...") - inline raw SQL (dangerous!)
-                        if let Some(raw) = obj.get("value").and_then(|v| v.as_str()) {
-                            self.sql.push_str(raw);
-                        }
-                        return;
-                    }
-                    _ => {}
+                    return;
                 }
+                Some("object_insert") => {
+                    // sql(object) or sql(object, ...columns) - expand for INSERT
+                    self.expand_object_insert(obj);
+                    return;
+                }
+                Some("object_update") => {
+                    // sql(object, ...columns) for UPDATE SET
+                    self.expand_object_update(obj);
+                    return;
+                }
+                Some("array_in") => {
+                    // sql([1, 2, 3]) for IN clause
+                    self.expand_array_in(obj);
+                    return;
+                }
+                Some("array_values") => {
+                    // sql.array([...]) for PostgreSQL array
+                    self.expand_pg_array(obj);
+                    return;
+                }
+                Some("raw") => {
+                    // sql.raw("...") - inline raw SQL (dangerous!)
+                    if let Some(raw) = obj.get("value").and_then(|v| v.as_str()) {
+                        self.sql.push_str(raw);
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
 

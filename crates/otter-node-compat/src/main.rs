@@ -180,16 +180,16 @@ fn run_status(cli: &Cli) {
 
     // Show latest report if available
     let report_path = PathBuf::from("tests/node-compat/reports/latest.json");
-    if report_path.exists() {
-        if let Ok(report) = PersistedReport::load(&report_path) {
-            println!();
-            println!("{}", "=== Latest Results ===".bold().cyan());
-            println!(
-                "  Pass rate: {:.1}% ({}/{})",
-                report.summary.pass_rate, report.summary.passed, report.summary.total,
-            );
-            println!("  Run at: {}", report.timestamp);
-        }
+    if report_path.exists()
+        && let Ok(report) = PersistedReport::load(&report_path)
+    {
+        println!();
+        println!("{}", "=== Latest Results ===".bold().cyan());
+        println!(
+            "  Pass rate: {:.1}% ({}/{})",
+            report.summary.pass_rate, report.summary.passed, report.summary.total,
+        );
+        println!("  Run at: {}", report.timestamp);
     }
 }
 

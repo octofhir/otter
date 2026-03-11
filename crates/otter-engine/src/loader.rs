@@ -166,15 +166,16 @@ impl SourceCache {
 
     /// Insert an entry.  If `url` already exists the entry is refreshed in-place.
     /// If the cache is at capacity the oldest entry is evicted first.
+    #[allow(clippy::map_entry)]
     fn insert(&mut self, url: String, module: ResolvedModule) {
         if self.map.contains_key(&url) {
             self.map.insert(url, module);
             return;
         }
-        if self.map.len() >= MAX_SOURCE_CACHE_SIZE {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        if self.map.len() >= MAX_SOURCE_CACHE_SIZE
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
         }
         self.order.push_back(url.clone());
         self.map.insert(url, module);
@@ -580,12 +581,11 @@ impl ModuleLoader {
         loop {
             let pkg_path = current.join("package.json");
             if pkg_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&pkg_path) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(type_field) = json.get("type").and_then(|v| v.as_str()) {
-                            return Some(type_field.to_string());
-                        }
-                    }
+                if let Ok(content) = std::fs::read_to_string(&pkg_path)
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                    && let Some(type_field) = json.get("type").and_then(|v| v.as_str())
+                {
+                    return Some(type_field.to_string());
                 }
                 // Found package.json but no "type" field - Node.js defaults to CommonJS
                 return Some("commonjs".to_string());

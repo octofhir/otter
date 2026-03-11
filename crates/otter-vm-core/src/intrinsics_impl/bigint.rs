@@ -44,17 +44,15 @@ impl IntrinsicObject for BigIntIntrinsic {
 
 fn bigint_value_from(this_val: &Value) -> Option<Value> {
     if this_val.is_bigint() {
-        return Some(this_val.clone());
+        return Some(*this_val);
     }
-    if let Some(obj) = this_val.as_object() {
-        if let Some(prim) = obj
+    if let Some(obj) = this_val.as_object()
+        && let Some(prim) = obj
             .get(&PropertyKey::string("__value__"))
             .or_else(|| obj.get(&PropertyKey::string("__primitiveValue__")))
-        {
-            if prim.is_bigint() {
-                return Some(prim);
-            }
-        }
+        && prim.is_bigint()
+    {
+        return Some(prim);
     }
     None
 }
@@ -75,7 +73,7 @@ fn to_bigint(ncx: &mut NativeContext<'_>, value: &Value) -> Result<NumBigInt, Vm
     let prim = if value.is_object() {
         ncx.to_primitive(value, PreferredType::Number)?
     } else {
-        value.clone()
+        *value
     };
 
     if let Some(b) = prim.as_bigint() {
@@ -118,7 +116,7 @@ fn to_index(ncx: &mut NativeContext<'_>, value: &Value) -> Result<usize, VmError
     let prim = if value.is_object() {
         ncx.to_primitive(value, PreferredType::Number)?
     } else {
-        value.clone()
+        *value
     };
     if prim.is_bigint() {
         return Err(VmError::type_error("Invalid index"));

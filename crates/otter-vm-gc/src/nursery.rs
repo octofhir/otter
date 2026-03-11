@@ -84,8 +84,8 @@ impl Nursery {
 
     /// Create a new nursery with a custom size.
     pub fn with_size(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, MIN_ALIGN)
-            .expect("nursery layout should be valid");
+        let layout =
+            Layout::from_size_align(size, MIN_ALIGN).expect("nursery layout should be valid");
         // SAFETY: layout is valid and non-zero.
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         if base.is_null() {
@@ -499,7 +499,7 @@ mod tests {
             if tenured > 0 {
                 // Object was tenured
                 unsafe {
-                    assert!(!(*( ptr as *const GcHeader)).is_young());
+                    assert!(!(*(ptr as *const GcHeader)).is_young());
                 }
                 return;
             }

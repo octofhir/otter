@@ -173,7 +173,11 @@ fn raw_to_nanbox(raw: u64, return_type: FFIType) -> i64 {
     match return_type {
         FFIType::Void => NANBOX_TAG_UNDEFINED as i64,
         FFIType::Bool => {
-            if raw != 0 { NANBOX_TAG_TRUE as i64 } else { 0x7FF8_0003_0000_0000_u64 as i64 }
+            if raw != 0 {
+                NANBOX_TAG_TRUE as i64
+            } else {
+                0x7FF8_0003_0000_0000_u64 as i64
+            }
         }
         FFIType::I8 | FFIType::Char => {
             let n = raw as i8 as f64;
@@ -276,7 +280,11 @@ pub unsafe extern "C" fn ffi_jit_trampoline(
             FFIType::F32 => (nanbox_to_f64(js_val) as f32).to_bits() as u64,
             FFIType::F64 => nanbox_to_f64(js_val).to_bits(),
             FFIType::Ptr | FFIType::Function => {
-                if nanbox_is_nullish(js_val) { 0 } else { nanbox_to_f64(js_val) as u64 }
+                if nanbox_is_nullish(js_val) {
+                    0
+                } else {
+                    nanbox_to_f64(js_val) as u64
+                }
             }
             FFIType::CString | FFIType::Void => {
                 // CString args and void need the slow path (string interning)
@@ -293,53 +301,55 @@ pub unsafe extern "C" fn ffi_jit_trampoline(
     let code_ptr = libffi::middle::CodePtr::from_ptr(fn_ptr as *const _);
 
     // Call through pre-built CIF
-    let raw_result: u64 = unsafe { match data.return_type {
-        FFIType::Void => {
-            data.cif.call::<()>(code_ptr, &args);
-            0
+    let raw_result: u64 = unsafe {
+        match data.return_type {
+            FFIType::Void => {
+                data.cif.call::<()>(code_ptr, &args);
+                0
+            }
+            FFIType::Char | FFIType::I8 => {
+                let r: i8 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::U8 | FFIType::Bool => {
+                let r: u8 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::I16 => {
+                let r: i16 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::U16 => {
+                let r: u16 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::I32 => {
+                let r: i32 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::U32 => {
+                let r: u32 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::I64 | FFIType::I64Fast => {
+                let r: i64 = data.cif.call(code_ptr, &args);
+                r as u64
+            }
+            FFIType::U64 | FFIType::U64Fast => data.cif.call(code_ptr, &args),
+            FFIType::F32 => {
+                let r: f32 = data.cif.call(code_ptr, &args);
+                r.to_bits() as u64
+            }
+            FFIType::F64 => {
+                let r: f64 = data.cif.call(code_ptr, &args);
+                r.to_bits()
+            }
+            FFIType::Ptr | FFIType::CString | FFIType::Function => {
+                let r: usize = data.cif.call(code_ptr, &args);
+                r as u64
+            }
         }
-        FFIType::Char | FFIType::I8 => {
-            let r: i8 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::U8 | FFIType::Bool => {
-            let r: u8 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::I16 => {
-            let r: i16 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::U16 => {
-            let r: u16 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::I32 => {
-            let r: i32 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::U32 => {
-            let r: u32 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::I64 | FFIType::I64Fast => {
-            let r: i64 = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-        FFIType::U64 | FFIType::U64Fast => data.cif.call(code_ptr, &args),
-        FFIType::F32 => {
-            let r: f32 = data.cif.call(code_ptr, &args);
-            r.to_bits() as u64
-        }
-        FFIType::F64 => {
-            let r: f64 = data.cif.call(code_ptr, &args);
-            r.to_bits()
-        }
-        FFIType::Ptr | FFIType::CString | FFIType::Function => {
-            let r: usize = data.cif.call(code_ptr, &args);
-            r as u64
-        }
-    } };
+    };
 
     raw_to_nanbox(raw_result, data.return_type)
 }

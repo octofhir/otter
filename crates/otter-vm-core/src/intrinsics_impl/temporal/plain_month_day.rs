@@ -93,11 +93,11 @@ fn resolve_plain_month_day_fields(
             return Ok((month as i32, day as i32, ref_year));
         }
         // Try PlainDate
-        if let Ok(pd) = temporal_rs::PlainDate::from_utf8(s.as_str().as_bytes()) {
+        if let Ok(pd) = temporal_rs::PlainDate::from_utf8(s.as_bytes()) {
             return Ok((pd.month() as i32, pd.day() as i32, pd.year()));
         }
         // Try PlainDateTime (handles leap seconds — second:60 is clamped)
-        if let Ok(pdt) = temporal_rs::PlainDateTime::from_utf8(s.as_str().as_bytes()) {
+        if let Ok(pdt) = temporal_rs::PlainDateTime::from_utf8(s.as_bytes()) {
             return Ok((pdt.month() as i32, pdt.day() as i32, pdt.year()));
         }
         // If none parse, fall through to generic error
@@ -124,7 +124,7 @@ pub(super) fn create_plain_month_day_constructor(
             // Check if this was created by `new` by verifying prototype chain
             obj.prototype()
                 .as_object()
-                .map_or(false, |p| p.as_ptr() == prototype.as_ptr())
+                .is_some_and(|p| p.as_ptr() == prototype.as_ptr())
         } else {
             false
         };
@@ -279,13 +279,13 @@ fn plain_month_day_from_proxy(
     // (per spec PrepareTemporalFields: get + convert each field in order)
 
     // 1. get calendar (string, no valueOf)
-    let calendar_val = proxy_get_property(ncx, proxy.clone(), receiver, "calendar")?;
+    let calendar_val = proxy_get_property(ncx, proxy, receiver, "calendar")?;
     if !calendar_val.is_undefined() {
         resolve_calendar_from_property(ncx, &calendar_val)?;
     }
 
     // 2. get day + convert to number
-    let day_val = proxy_get_property(ncx, proxy.clone(), receiver, "day")?;
+    let day_val = proxy_get_property(ncx, proxy, receiver, "day")?;
     let day_raw = if !day_val.is_undefined() {
         let n = ncx.to_number_value(&day_val)?;
         if n.is_infinite() {
@@ -297,7 +297,7 @@ fn plain_month_day_from_proxy(
     };
 
     // 3. get month + convert to number
-    let month_val = proxy_get_property(ncx, proxy.clone(), receiver, "month")?;
+    let month_val = proxy_get_property(ncx, proxy, receiver, "month")?;
     let month_num = if !month_val.is_undefined() {
         let n = ncx.to_number_value(&month_val)?;
         if n.is_infinite() {
@@ -309,7 +309,7 @@ fn plain_month_day_from_proxy(
     };
 
     // 4. get monthCode + convert to string
-    let month_code_val = proxy_get_property(ncx, proxy.clone(), receiver, "monthCode")?;
+    let month_code_val = proxy_get_property(ncx, proxy, receiver, "monthCode")?;
     let mc_str = if !month_code_val.is_undefined() {
         let mc = ncx.to_string_value(&month_code_val)?;
         validate_month_code_syntax(mc.as_str())?;
@@ -319,7 +319,7 @@ fn plain_month_day_from_proxy(
     };
 
     // 5. get year + convert to number
-    let year_val = proxy_get_property(ncx, proxy.clone(), receiver, "year")?;
+    let year_val = proxy_get_property(ncx, proxy, receiver, "year")?;
     let validation_year = if !year_val.is_undefined() {
         let n = ncx.to_number_value(&year_val)?;
         if n.is_infinite() {
@@ -340,13 +340,13 @@ fn plain_month_day_from_proxy(
 
     let month = if let Some(ref mc) = mc_str {
         let mc_month = validate_month_code_iso_suitability(mc.as_str())?;
-        if let Some(m_int) = month_num {
-            if m_int != mc_month as i32 {
-                return Err(VmError::range_error(format!(
-                    "monthCode {} and month {} conflict",
-                    mc, m_int
-                )));
-            }
+        if let Some(m_int) = month_num
+            && m_int != mc_month as i32
+        {
+            return Err(VmError::range_error(format!(
+                "monthCode {} and month {} conflict",
+                mc, m_int
+            )));
         }
         mc_month as i32
     } else {
@@ -358,7 +358,7 @@ fn plain_month_day_from_proxy(
 
     match overflow {
         Overflow::Reject => {
-            if month < 1 || month > 12 {
+            if !(1..=12).contains(&month) {
                 return Err(VmError::range_error(format!(
                     "month must be between 1 and 12, got {}",
                     month
@@ -420,10 +420,10 @@ fn plain_month_day_from_fields(
 ) -> Result<Value, VmError> {
     // Get calendar first (per spec order)
     let calendar_val = fields.get(&PropertyKey::string("calendar"));
-    if let Some(ref cv) = calendar_val {
-        if !cv.is_undefined() {
-            resolve_calendar_from_property(ncx, cv)?;
-        }
+    if let Some(ref cv) = calendar_val
+        && !cv.is_undefined()
+    {
+        resolve_calendar_from_property(ncx, cv)?;
     }
 
     // Get month/monthCode, day, year
@@ -450,8 +450,8 @@ fn plain_month_day_from_fields(
     };
 
     // Need either month or monthCode
-    let has_month = month_val.as_ref().map_or(false, |v| !v.is_undefined());
-    let has_month_code = month_code_val.as_ref().map_or(false, |v| !v.is_undefined());
+    let has_month = month_val.as_ref().is_some_and(|v| !v.is_undefined());
+    let has_month_code = month_code_val.as_ref().is_some_and(|v| !v.is_undefined());
 
     if !has_month && !has_month_code {
         return Err(VmError::type_error("either month or monthCode is required"));
@@ -459,7 +459,7 @@ fn plain_month_day_from_fields(
 
     // Step 1: Validate monthCode SYNTAX (before year type validation)
     let mc_str = if has_month_code {
-        let mc = ncx.to_string_value(&month_code_val.clone().unwrap())?;
+        let mc = ncx.to_string_value(&month_code_val.unwrap())?;
         validate_month_code_syntax(mc.as_str())?;
         Some(mc)
     } else {
@@ -494,7 +494,7 @@ fn plain_month_day_from_fields(
 
         // Check for month/monthCode conflict
         if has_month {
-            let m_num = ncx.to_number_value(&month_val.clone().unwrap())?;
+            let m_num = ncx.to_number_value(&month_val.unwrap())?;
             if m_num.is_infinite() {
                 return Err(VmError::range_error("month property cannot be Infinity"));
             }
@@ -509,7 +509,7 @@ fn plain_month_day_from_fields(
         mc_month as i32
     } else {
         // has_month only
-        let n = ncx.to_number_value(&month_val.clone().unwrap())?;
+        let n = ncx.to_number_value(&month_val.unwrap())?;
         if n.is_infinite() {
             return Err(VmError::range_error("month property cannot be Infinity"));
         }
@@ -529,7 +529,7 @@ fn plain_month_day_from_fields(
     // Validate/constrain
     match overflow {
         Overflow::Reject => {
-            if month < 1 || month > 12 {
+            if !(1..=12).contains(&month) {
                 return Err(VmError::range_error(format!(
                     "month must be between 1 and 12, got {}",
                     month
@@ -615,7 +615,7 @@ pub(super) fn install_plain_month_day_prototype(
                     Ok(Value::string(JsString::intern(pmd.month_code().as_str())))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -642,7 +642,7 @@ pub(super) fn install_plain_month_day_prototype(
                     Ok(Value::int32(pmd.day() as i32))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -666,7 +666,7 @@ pub(super) fn install_plain_month_day_prototype(
                     Ok(Value::string(JsString::intern(pmd.calendar_id())))
                 },
                 mm.clone(),
-                fn_proto.clone(),
+                fn_proto,
             )),
             set: None,
             attributes: PropertyAttributes {
@@ -712,7 +712,7 @@ pub(super) fn install_plain_month_day_prototype(
                         proxy,
                         &key,
                         key_value,
-                        options_val.clone(),
+                        options_val,
                     )?;
                     if cn_val.is_undefined() {
                         "auto".to_string()
@@ -753,7 +753,7 @@ pub(super) fn install_plain_month_day_prototype(
             Ok(Value::string(JsString::intern(&result)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toString",
         0,
     );
@@ -775,7 +775,7 @@ pub(super) fn install_plain_month_day_prototype(
             Ok(Value::string(JsString::intern(&result)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toJSON",
         0,
     );
@@ -792,7 +792,7 @@ pub(super) fn install_plain_month_day_prototype(
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "valueOf",
         0,
     );
@@ -822,7 +822,7 @@ pub(super) fn install_plain_month_day_prototype(
             Ok(Value::boolean(m1 == m2 && d1 == d2 && y1 == y2))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "equals",
         1,
     );
@@ -869,17 +869,15 @@ pub(super) fn install_plain_month_day_prototype(
                 };
 
             // Reject if item is a Temporal type (PlainDate, PlainMonthDay, etc.)
-            if let Some(item_obj) = item.as_object() {
-                if let Some(item_ty) = item_obj
+            if let Some(item_obj) = item.as_object()
+                && let Some(item_ty) = item_obj
                     .get(&PropertyKey::string(SLOT_TEMPORAL_TYPE))
                     .and_then(|v| v.as_string().map(|s| s.as_str().to_string()))
-                {
-                    if !item_ty.is_empty() {
-                        return Err(VmError::type_error(
-                            "with argument must be a partial object, not a Temporal type",
-                        ));
-                    }
-                }
+                && !item_ty.is_empty()
+            {
+                return Err(VmError::type_error(
+                    "with argument must be a partial object, not a Temporal type",
+                ));
             }
 
             // Step 1: RejectObjectWithCalendarOrTimeZone — BEFORE field reads
@@ -959,13 +957,13 @@ pub(super) fn install_plain_month_day_prototype(
                     day
                 )));
             }
-            if let Some(m) = month_num {
-                if m < 1 {
-                    return Err(VmError::range_error(format!(
-                        "month must be >= 1, got {}",
-                        m
-                    )));
-                }
+            if let Some(m) = month_num
+                && m < 1
+            {
+                return Err(VmError::range_error(format!(
+                    "month must be >= 1, got {}",
+                    m
+                )));
             }
 
             // Step 3: Read overflow from options — AFTER fields and basic below-min validation
@@ -976,13 +974,13 @@ pub(super) fn install_plain_month_day_prototype(
             let month = if let Some(ref mc) = mc_str {
                 validate_month_code_syntax(mc.as_str())?;
                 let mc_month = validate_month_code_iso_suitability(mc.as_str())? as i32;
-                if let Some(m) = month_num {
-                    if m != mc_month {
-                        return Err(VmError::range_error(format!(
-                            "monthCode {} and month {} conflict",
-                            mc, m
-                        )));
-                    }
+                if let Some(m) = month_num
+                    && m != mc_month
+                {
+                    return Err(VmError::range_error(format!(
+                        "monthCode {} and month {} conflict",
+                        mc, m
+                    )));
                 }
                 mc_month
             } else if let Some(m) = month_num {
@@ -995,13 +993,13 @@ pub(super) fn install_plain_month_day_prototype(
 
             // Build result using temporal_rs for validation with the user's year
             let ov = overflow;
-            if month < 0 || month > 255 {
+            if !(0..=255).contains(&month) {
                 return Err(VmError::range_error(format!(
                     "month out of range: {}",
                     month
                 )));
             }
-            if day < 0 || day > 255 {
+            if !(0..=255).contains(&day) {
                 return Err(VmError::range_error(format!("day out of range: {}", day)));
             }
             // Validate with user's year to check day validity
@@ -1037,7 +1035,7 @@ pub(super) fn install_plain_month_day_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "with",
         1,
     );
@@ -1122,7 +1120,7 @@ pub(super) fn install_plain_month_day_prototype(
             )
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toPlainDate",
         1,
     );
@@ -1142,7 +1140,7 @@ pub(super) fn install_plain_month_day_prototype(
             Ok(Value::string(JsString::intern(&result)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
         "toLocaleString",
         0,
     );

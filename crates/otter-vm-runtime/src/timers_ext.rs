@@ -32,7 +32,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                 if args.is_empty() {
                     return Err(VmError::type_error("Callback required"));
                 }
-                let callback = args[0].clone();
+                let callback = args[0];
                 if !callback.is_function() {
                     return Err(VmError::type_error("Callback must be a function"));
                 }
@@ -43,7 +43,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                 };
 
                 // Clone for GC root registration; the original is moved into the closure.
-                let callback_for_roots = callback.clone();
+                let callback_for_roots = callback;
                 let extra_args_for_roots = extra_args.clone();
 
                 // Slot to communicate the immediate_id back into the firing closure
@@ -101,7 +101,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                 if args.is_empty() {
                     return Err(VmError::type_error("Callback required"));
                 }
-                let callback = args[0].clone();
+                let callback = args[0];
                 if !callback.is_function() {
                     return Err(VmError::type_error("Callback must be a function"));
                 }
@@ -116,7 +116,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                     Vec::new()
                 };
 
-                let callback_for_roots = callback.clone();
+                let callback_for_roots = callback;
                 let extra_args_for_roots = extra_args.clone();
 
                 let id_slot: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -168,7 +168,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                 if args.is_empty() {
                     return Err(VmError::type_error("Callback required"));
                 }
-                let callback = args[0].clone();
+                let callback = args[0];
                 if !callback.is_function() {
                     return Err(VmError::type_error("Callback must be a function"));
                 }
@@ -183,17 +183,17 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                     Vec::new()
                 };
 
-                let callback_for_roots = callback.clone();
+                let callback_for_roots = callback;
                 let extra_args_for_roots = extra_args.clone();
 
                 let event_loop_inner = event_loop.clone();
                 let extra_args_clone = extra_args.clone();
-                let callback_clone = callback.clone();
+                let callback_clone = callback;
                 let timer_id = event_loop.set_interval(
                     move || {
                         // Interval fires repeatedly — do NOT remove from roots here.
                         // Removal happens in clearInterval.
-                        let job = create_job(callback_clone.clone());
+                        let job = create_job(callback_clone);
                         event_loop_inner
                             .js_job_queue()
                             .enqueue(job, extra_args_clone.clone());
@@ -234,7 +234,7 @@ pub fn create_timers_extension(otter: &Otter) -> Extension {
                 if args.is_empty() {
                     return Err(VmError::type_error("Callback required"));
                 }
-                let callback = args[0].clone();
+                let callback = args[0];
                 if !callback.is_function() {
                     return Err(VmError::type_error("Callback must be a function"));
                 }

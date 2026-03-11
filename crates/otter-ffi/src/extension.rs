@@ -11,9 +11,9 @@ use otter_macros::dive;
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
+use otter_vm_core::globals::to_number;
 use otter_vm_core::object::{JsObject, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
-use otter_vm_core::globals::to_number;
 use otter_vm_core::value::Value;
 use otter_vm_runtime::capabilities_context;
 use otter_vm_runtime::extension_v2::{OtterExtension, Profile};
@@ -144,7 +144,11 @@ impl OtterExtension for OtterFfiExtension {
 /// Build the `read` namespace object with direct memory read functions.
 fn build_read_namespace(ctx: &mut RegistrationContext) -> GcRef<JsObject> {
     let mut ns = ctx.module_namespace();
-    let read_fns: &[fn() -> (&'static str, Arc<dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync>, u32)] = &[
+    let read_fns: &[fn() -> (
+        &'static str,
+        Arc<dyn Fn(&Value, &[Value], &mut NativeContext) -> Result<Value, VmError> + Send + Sync>,
+        u32,
+    )] = &[
         ffi_read_u8_decl,
         ffi_read_i8_decl,
         ffi_read_u16_decl,
@@ -216,13 +220,11 @@ fn require_ffi() -> Result<(), VmError> {
 
 fn parse_ffi_type_value(val: &Value) -> Result<FFIType, VmError> {
     if let Some(s) = val.as_string() {
-        FFIType::from_name(s.as_str()).ok_or_else(|| {
-            VmError::type_error(format!("Invalid FFI type: '{}'", s.as_str()))
-        })
+        FFIType::from_name(s.as_str())
+            .ok_or_else(|| VmError::type_error(format!("Invalid FFI type: '{}'", s.as_str())))
     } else if let Some(n) = val.as_number() {
-        FFIType::from_u8(n as u8).ok_or_else(|| {
-            VmError::type_error(format!("Invalid FFI type number: {}", n))
-        })
+        FFIType::from_u8(n as u8)
+            .ok_or_else(|| VmError::type_error(format!("Invalid FFI type number: {}", n)))
     } else {
         Err(VmError::type_error("FFI type must be a string or number"))
     }
@@ -243,7 +245,9 @@ fn parse_ffi_args(val: &Value) -> Result<Vec<FFIType>, VmError> {
 
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
-        let elem = obj.get(&PropertyKey::index(i as u32)).unwrap_or(Value::undefined());
+        let elem = obj
+            .get(&PropertyKey::index(i as u32))
+            .unwrap_or(Value::undefined());
         result.push(parse_ffi_type_value(&elem)?);
     }
     Ok(result)
@@ -257,16 +261,14 @@ fn parse_ffi_args(val: &Value) -> Result<Vec<FFIType>, VmError> {
 fn ffi_dlopen(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     require_ffi()?;
 
-    let path = args
-        .first()
-        .and_then(|v| v.as_string())
-        .ok_or_else(|| VmError::type_error("dlopen: first argument must be a string (library path)"))?;
+    let path = args.first().and_then(|v| v.as_string()).ok_or_else(|| {
+        VmError::type_error("dlopen: first argument must be a string (library path)")
+    })?;
     let path_str = path.as_str();
 
-    let symbols_obj = args
-        .get(1)
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| VmError::type_error("dlopen: second argument must be an object (symbol declarations)"))?;
+    let symbols_obj = args.get(1).and_then(|v| v.as_object()).ok_or_else(|| {
+        VmError::type_error("dlopen: second argument must be an object (symbol declarations)")
+    })?;
 
     // Parse symbol declarations
     let mut signatures = HashMap::new();
@@ -277,12 +279,13 @@ fn ffi_dlopen(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
             PropertyKey::Index(i) => i.to_string(),
             _ => continue,
         };
-        let decl = symbols_obj
-            .get(key)
-            .unwrap_or(Value::undefined());
-        let decl_obj = decl
-            .as_object()
-            .ok_or_else(|| VmError::type_error(format!("Symbol '{}' declaration must be an object", key_str)))?;
+        let decl = symbols_obj.get(key).unwrap_or(Value::undefined());
+        let decl_obj = decl.as_object().ok_or_else(|| {
+            VmError::type_error(format!(
+                "Symbol '{}' declaration must be an object",
+                key_str
+            ))
+        })?;
 
         let args_val = decl_obj
             .get(&PropertyKey::string("args"))
@@ -308,9 +311,8 @@ fn ffi_dlopen(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>
     }
 
     // Open the library
-    let lib = FfiLibrary::open(path_str, &signatures).map_err(|e| {
-        VmError::type_error(e.to_string())
-    })?;
+    let lib =
+        FfiLibrary::open(path_str, &signatures).map_err(|e| VmError::type_error(e.to_string()))?;
 
     // Create the library JS object
     let lib_obj = create_library_object(lib, ncx)?;
@@ -349,9 +351,9 @@ fn create_library_object(
                     + Sync,
             > = Arc::new(move |_this, args, ncx| {
                 let lib_guard = lib_clone.lock().unwrap();
-                let lib_inner = lib_guard.as_ref().ok_or_else(|| {
-                    VmError::type_error("FFI library has been closed")
-                })?;
+                let lib_inner = lib_guard
+                    .as_ref()
+                    .ok_or_else(|| VmError::type_error("FFI library has been closed"))?;
 
                 // Marshal JS values to raw u64 args
                 let mut raw_args = Vec::with_capacity(arg_types.len());
@@ -366,9 +368,7 @@ fn create_library_object(
                 let raw_result = lib_inner.call_raw(&name_clone, &raw_args);
                 clear_ffi_ncx();
 
-                let raw_result = raw_result.map_err(|e| {
-                    VmError::type_error(e.to_string())
-                })?;
+                let raw_result = raw_result.map_err(|e| VmError::type_error(e.to_string()))?;
 
                 marshal_raw_to_value(raw_result, return_type)
             });
@@ -555,9 +555,7 @@ fn marshal_raw_to_value(raw: u64, ty: FFIType) -> Result<Value, VmError> {
             let n = raw as i64;
             Ok(Value::number(n as f64))
         }
-        FFIType::U64 | FFIType::U64Fast => {
-            Ok(Value::number(raw as f64))
-        }
+        FFIType::U64 | FFIType::U64Fast => Ok(Value::number(raw as f64)),
         FFIType::F32 => {
             let f = f32::from_bits(raw as u32);
             Ok(Value::number(f as f64))
@@ -598,10 +596,7 @@ fn ffi_ptr(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         return Ok(Value::null());
     }
 
-    let byte_offset = args
-        .get(1)
-        .map(|v| to_number(v) as usize)
-        .unwrap_or(0);
+    let byte_offset = args.get(1).map(|v| to_number(v) as usize).unwrap_or(0);
 
     // Try direct TypedArray value (TAG_PTR_OTHER)
     let ta_opt = val.as_typed_array().or_else(|| {
@@ -650,10 +645,7 @@ fn ffi_ptr(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
 #[dive(name = "toArrayBuffer", length = 1)]
 fn ffi_to_array_buffer(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     require_ffi()?;
-    let raw_ptr = args
-        .first()
-        .map(|v| to_number(v) as usize)
-        .unwrap_or(0);
+    let raw_ptr = args.first().map(|v| to_number(v) as usize).unwrap_or(0);
     if raw_ptr == 0 {
         return Err(VmError::type_error("toArrayBuffer(): null pointer"));
     }
@@ -669,7 +661,8 @@ fn ffi_to_array_buffer(args: &[Value], ncx: &mut NativeContext) -> Result<Value,
 
     // Copy the data from the raw pointer into a new ArrayBuffer
     let data = unsafe { std::slice::from_raw_parts(addr as *const u8, byte_length) };
-    let ab_proto = ncx.global()
+    let ab_proto = ncx
+        .global()
         .get(&PropertyKey::string("ArrayBuffer"))
         .and_then(|v| v.as_object())
         .and_then(|c| c.get(&PropertyKey::string("prototype")))
@@ -700,10 +693,9 @@ fn ffi_to_buffer(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmErr
 #[dive(name = "CFunction", length = 1)]
 fn ffi_cfunction(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     require_ffi()?;
-    let def = args
-        .first()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| VmError::type_error("CFunction: argument must be an object with ptr, args, returns"))?;
+    let def = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
+        VmError::type_error("CFunction: argument must be an object with ptr, args, returns")
+    })?;
 
     let ptr_val = def
         .get(&PropertyKey::string("ptr"))
@@ -713,8 +705,12 @@ fn ffi_cfunction(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmErr
         return Err(VmError::type_error("CFunction: ptr must be non-null"));
     }
 
-    let args_val = def.get(&PropertyKey::string("args")).unwrap_or(Value::undefined());
-    let returns_val = def.get(&PropertyKey::string("returns")).unwrap_or(Value::undefined());
+    let args_val = def
+        .get(&PropertyKey::string("args"))
+        .unwrap_or(Value::undefined());
+    let returns_val = def
+        .get(&PropertyKey::string("returns"))
+        .unwrap_or(Value::undefined());
 
     let arg_types = parse_ffi_args(&args_val)?;
     let arg_count = arg_types.len();
@@ -738,9 +734,7 @@ fn ffi_cfunction(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmErr
             raw_args.push(marshal_value_to_raw(val, *ty)?);
         }
         set_ffi_ncx(ncx);
-        let raw_result = unsafe {
-            crate::call::ffi_call(fn_ptr as *const (), &sig, &raw_args)
-        };
+        let raw_result = unsafe { crate::call::ffi_call(fn_ptr as *const (), &sig, &raw_args) };
         clear_ffi_ncx();
         let raw_result = raw_result.map_err(|e| VmError::type_error(e.to_string()))?;
         marshal_raw_to_value(raw_result, return_type)
@@ -752,7 +746,8 @@ fn ffi_cfunction(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmErr
         PropertyDescriptor::function_length(Value::number(arg_count as f64)),
     );
 
-    let fn_proto = ncx.global()
+    let fn_proto = ncx
+        .global()
         .get(&PropertyKey::string("Function"))
         .and_then(|v| v.as_object())
         .and_then(|c| c.get(&PropertyKey::string("prototype")))
@@ -784,7 +779,8 @@ fn ffi_link_symbols(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
     let symbols_obj = GcRef::new(JsObject::new(Value::null()));
     let keys = symbols_decl.own_keys();
 
-    let fn_proto = ncx.global()
+    let fn_proto = ncx
+        .global()
         .get(&PropertyKey::string("Function"))
         .and_then(|v| v.as_object())
         .and_then(|c| c.get(&PropertyKey::string("prototype")))
@@ -800,7 +796,10 @@ fn ffi_link_symbols(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
 
         let decl = symbols_decl.get(key).unwrap_or(Value::undefined());
         let decl_obj = decl.as_object().ok_or_else(|| {
-            VmError::type_error(format!("linkSymbols: '{}' declaration must be an object", key_str))
+            VmError::type_error(format!(
+                "linkSymbols: '{}' declaration must be an object",
+                key_str
+            ))
         })?;
 
         let ptr_val = decl_obj.get(&PropertyKey::string("ptr")).ok_or_else(|| {
@@ -809,12 +808,17 @@ fn ffi_link_symbols(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
         let fn_ptr = to_number(&ptr_val) as usize;
         if fn_ptr == 0 {
             return Err(VmError::type_error(format!(
-                "linkSymbols: '{}' ptr must be non-null", key_str
+                "linkSymbols: '{}' ptr must be non-null",
+                key_str
             )));
         }
 
-        let args_val = decl_obj.get(&PropertyKey::string("args")).unwrap_or(Value::undefined());
-        let returns_val = decl_obj.get(&PropertyKey::string("returns")).unwrap_or(Value::undefined());
+        let args_val = decl_obj
+            .get(&PropertyKey::string("args"))
+            .unwrap_or(Value::undefined());
+        let returns_val = decl_obj
+            .get(&PropertyKey::string("returns"))
+            .unwrap_or(Value::undefined());
 
         let arg_types = parse_ffi_args(&args_val)?;
         let arg_count = arg_types.len();
@@ -838,9 +842,7 @@ fn ffi_link_symbols(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
                 raw_args.push(marshal_value_to_raw(val, *ty)?);
             }
             set_ffi_ncx(ncx);
-            let raw_result = unsafe {
-                crate::call::ffi_call(fn_ptr as *const (), &sig, &raw_args)
-            };
+            let raw_result = unsafe { crate::call::ffi_call(fn_ptr as *const (), &sig, &raw_args) };
             clear_ffi_ncx();
             let raw_result = raw_result.map_err(|e| VmError::type_error(e.to_string()))?;
             marshal_raw_to_value(raw_result, return_type)
@@ -895,16 +897,10 @@ macro_rules! read_fn {
         #[dive(name = $dive_name, length = 2)]
         fn $fn_name(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
             require_ffi()?;
-            let ptr = args
-                .first()
-                .map(|v| to_number(v) as usize)
-                .unwrap_or(0);
-            let offset = args
-                .get(1)
-                .map(|v| to_number(v) as usize)
-                .unwrap_or(0);
-            let val = unsafe { $read_fn(ptr, offset) }
-                .map_err(|e| VmError::type_error(e.to_string()))?;
+            let ptr = args.first().map(|v| to_number(v) as usize).unwrap_or(0);
+            let offset = args.get(1).map(|v| to_number(v) as usize).unwrap_or(0);
+            let val =
+                unsafe { $read_fn(ptr, offset) }.map_err(|e| VmError::type_error(e.to_string()))?;
             Ok(Value::number(val as f64))
         }
     };
@@ -988,9 +984,9 @@ unsafe extern "C" fn js_callback_trampoline(
                 let f = unsafe { *(arg_ptr as *const f64) };
                 f.to_bits()
             }
-            FFIType::Ptr | FFIType::Function | FFIType::CString => {
-                unsafe { *(arg_ptr as *const usize) as u64 }
-            }
+            FFIType::Ptr | FFIType::Function | FFIType::CString => unsafe {
+                *(arg_ptr as *const usize) as u64
+            },
             FFIType::Void => 0,
         };
         match marshal_raw_to_value(raw, *ty) {
@@ -1024,8 +1020,8 @@ struct JsCallbackClosure {
     _cif: Box<libffi::middle::Cif>,
     /// Leaked Box pointer for cleanup
     userdata_ptr: *mut JsCallbackData,
-    /// The callable code pointer address
-    code_ptr: usize,
+    /// The callable code pointer address (kept for potential future use in JIT path)
+    _code_ptr: usize,
 }
 
 impl Drop for JsCallbackClosure {
@@ -1064,12 +1060,9 @@ fn ffi_js_callback(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmE
         ));
     }
 
-    let def = args
-        .get(1)
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            VmError::type_error("JSCallback: second argument must be { args, returns }")
-        })?;
+    let def = args.get(1).and_then(|v| v.as_object()).ok_or_else(|| {
+        VmError::type_error("JSCallback: second argument must be { args, returns }")
+    })?;
 
     let args_val = def
         .get(&PropertyKey::string("args"))
@@ -1120,19 +1113,13 @@ fn ffi_js_callback(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmE
         _closure_code: code,
         _cif: cif,
         userdata_ptr,
-        code_ptr: code_addr,
+        _code_ptr: code_addr,
     })));
 
     // Build the JS object: { ptr, threadsafe, close() }
     let cb_obj = GcRef::new(JsObject::new(Value::null()));
-    let _ = cb_obj.set(
-        PropertyKey::string("ptr"),
-        Value::number(code_addr as f64),
-    );
-    let _ = cb_obj.set(
-        PropertyKey::string("threadsafe"),
-        Value::boolean(false),
-    );
+    let _ = cb_obj.set(PropertyKey::string("ptr"), Value::number(code_addr as f64));
+    let _ = cb_obj.set(PropertyKey::string("threadsafe"), Value::boolean(false));
 
     // .close() frees the closure
     let closure_for_close = Arc::clone(&closure);

@@ -377,6 +377,7 @@ impl FsOpError {
         }
     }
 
+    #[allow(dead_code)]
     fn unsupported(syscall: &'static str, path: &str, detail: impl Into<String>) -> Self {
         Self {
             code: "ENOSYS",
@@ -1199,6 +1200,7 @@ pub fn precheck_capabilities(op: &FsOp) -> Result<(), FsOpError> {
 }
 
 /// Execute an fs operation asynchronously.
+#[allow(dead_code)]
 pub async fn execute_async(op: FsOp) -> Result<FsOpResult, FsOpError> {
     precheck_capabilities(&op)?;
     execute_async_unchecked(op).await
@@ -1764,11 +1766,8 @@ mod tests {
         let handle_id = store_dir_handle(&root.to_string_lossy(), reader).expect("store handle");
 
         let mut names = Vec::new();
-        loop {
-            match read_dir_handle_next_sync(handle_id).expect("read") {
-                Some(entry) => names.push(entry.name),
-                None => break,
-            }
+        while let Some(entry) = read_dir_handle_next_sync(handle_id).expect("read") {
+            names.push(entry.name);
         }
 
         close_dir_handle(handle_id).expect("close");

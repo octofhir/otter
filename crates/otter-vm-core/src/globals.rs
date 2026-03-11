@@ -634,20 +634,21 @@ fn global_unescape(
     while i < len {
         if units[i] == b'%' as u16 {
             // Try %uXXXX first (6 code units total)
-            if i + 5 < len && units[i + 1] == b'u' as u16 {
-                if let Some(code) = parse_hex4_u16(&units[i + 2..i + 6]) {
-                    result_units.push(code);
-                    i += 6;
-                    continue;
-                }
+            if i + 5 < len
+                && units[i + 1] == b'u' as u16
+                && let Some(code) = parse_hex4_u16(&units[i + 2..i + 6])
+            {
+                result_units.push(code);
+                i += 6;
+                continue;
             }
             // Try %XX (3 code units total)
-            if i + 2 < len {
-                if let Some(code) = parse_hex2_u16(&units[i + 1..i + 3]) {
-                    result_units.push(code);
-                    i += 3;
-                    continue;
-                }
+            if i + 2 < len
+                && let Some(code) = parse_hex2_u16(&units[i + 1..i + 3])
+            {
+                result_units.push(code);
+                i += 3;
+                continue;
             }
         }
         result_units.push(units[i]);
@@ -657,6 +658,7 @@ fn global_unescape(
     Ok(Value::string(JsString::intern(&decoded)))
 }
 
+#[allow(dead_code)]
 fn parse_hex2(bytes: &[u8]) -> Option<u16> {
     if bytes.len() < 2 {
         return None;
@@ -666,6 +668,7 @@ fn parse_hex2(bytes: &[u8]) -> Option<u16> {
     Some((high as u16) * 16 + low as u16)
 }
 
+#[allow(dead_code)]
 fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     if bytes.len() < 4 {
         return None;
@@ -677,6 +680,7 @@ fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     Some(a * 4096 + b * 256 + c * 16 + d)
 }
 
+#[allow(dead_code)]
 fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -787,6 +791,7 @@ pub fn to_number(value: &Value) -> f64 {
 }
 
 /// Convert a Value to a string (ToString abstract operation)
+#[allow(dead_code)]
 fn to_boolean(value: &Value) -> bool {
     if let Some(b) = value.as_boolean() {
         return b;
@@ -832,24 +837,22 @@ pub fn js_number_to_string(n: f64) -> String {
     // Only use `as u64` for values within safe integer range (2^53) where
     // the f64→u64 conversion is exact. Larger values go through ryu to get
     // the shortest representation that round-trips correctly.
-    if abs_n.fract() == 0.0 && abs_n < 1e21 {
-        if abs_n <= 9007199254740992.0 {
-            // Safe integer range (≤ 2^53): exact conversion
-            let int_val = abs_n as u64;
-            let mut buf = itoa::Buffer::new();
-            let s = buf.format(int_val);
-            return if negative {
-                let mut result = String::with_capacity(s.len() + 1);
-                result.push('-');
-                result.push_str(s);
-                result
-            } else {
-                s.to_string()
-            };
-        }
-        // Large integers (> 2^53 but < 1e21): fall through to ryu path
-        // for shortest representation
+    if abs_n.fract() == 0.0 && abs_n < 1e21 && abs_n <= 9007199254740992.0 {
+        // Safe integer range (≤ 2^53): exact conversion
+        let int_val = abs_n as u64;
+        let mut buf = itoa::Buffer::new();
+        let s = buf.format(int_val);
+        return if negative {
+            let mut result = String::with_capacity(s.len() + 1);
+            result.push('-');
+            result.push_str(s);
+            result
+        } else {
+            s.to_string()
+        };
     }
+    // Large integers (> 2^53 but < 1e21): fall through to ryu path
+    // for shortest representation
 
     // Float path: use ryu for shortest representation, then apply JS rules.
     // ryu::Buffer::format_finite() returns the shortest decimal &str.
@@ -1017,6 +1020,7 @@ pub fn to_string(value: &Value) -> String {
     "[object Object]".to_string()
 }
 
+#[allow(dead_code)]
 fn to_js_string(value: &Value) -> GcRef<JsString> {
     if let Some(s) = value.as_string() {
         return s;
@@ -1045,7 +1049,7 @@ mod tests {
     #[test]
     fn test_global_this_setup() {
         let runtime = crate::runtime::VmRuntime::new();
-        let memory_manager = runtime.memory_manager().clone();
+        let _memory_manager = runtime.memory_manager().clone();
         let global = GcRef::new(JsObject::new(Value::null()));
         let fn_proto = GcRef::new(JsObject::new(Value::null()));
         setup_global_object(global, fn_proto, None);

@@ -106,42 +106,42 @@ pub(super) fn async_generator_result_to_promise_value(
                 let reject_callback =
                     make_async_generator_resume_callback(generator, true, memory_manager.clone());
 
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 let queue_on_fulfill = queue.clone();
                 awaited_promise.then(move |resolved_value| {
                     queue_on_fulfill.enqueue(
                         JsPromiseJob {
                             kind: JsPromiseJobKind::Fulfill,
-                            callback: fulfill_callback.clone(),
+                            callback: fulfill_callback,
                             this_arg: Value::undefined(),
-                            result_promise: Some(result_promise.clone()),
+                            result_promise: Some(result_promise),
                         },
                         vec![resolved_value],
                     );
                 });
 
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 let queue_on_reject = queue.clone();
                 awaited_promise.catch(move |reason| {
                     queue_on_reject.enqueue(
                         JsPromiseJob {
                             kind: JsPromiseJobKind::Reject,
-                            callback: reject_callback.clone(),
+                            callback: reject_callback,
                             this_arg: Value::undefined(),
-                            result_promise: Some(result_promise.clone()),
+                            result_promise: Some(result_promise),
                         },
                         vec![reason],
                     );
                 });
             } else {
                 // Fallback for contexts without JS job queue: preserve old best-effort behavior.
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 let mm = memory_manager.clone();
                 awaited_promise.then(move |resolved_value| {
                     let iter_result = make_iterator_result_object(mm, resolved_value, false);
                     result_promise.resolve(iter_result);
                 });
-                let result_promise = promise.clone();
+                let result_promise = promise;
                 awaited_promise.catch(move |reason| {
                     result_promise.reject(reason);
                 });
@@ -235,7 +235,7 @@ impl Interpreter {
             let jit_interp: *const Self = self;
             let jit_ctx_ptr: *mut VmContext = ctx;
             let upvalues = generator.upvalues.clone();
-            ctx.set_pending_this(this_value.clone());
+            ctx.set_pending_this(this_value);
             match crate::jit_runtime::try_execute_jit(
                 generator.module.module_id,
                 generator.function_index,
@@ -266,7 +266,7 @@ impl Interpreter {
                         Arc::clone(&generator.module),
                         upvalues,
                         try_stack,
-                        this_value.clone(),
+                        this_value,
                         generator.is_construct(),
                         argc,
                     ) {
@@ -325,7 +325,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     generator.complete();
-                    GeneratorResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                    GeneratorResult::Error(VmError::internal(panic_message(&panic_payload)))
                 }
             }
         }
@@ -349,7 +349,7 @@ impl Interpreter {
 
         // Capture yield_dst and pending throw from frame
         let yield_dst = frame.yield_dst;
-        let pending_throw = frame.pending_throw.clone();
+        let pending_throw = frame.pending_throw;
 
         // Check for pending return (set on the generator, not the frame)
         // This is set by generator.return() and persists across take_frame()
@@ -376,7 +376,7 @@ impl Interpreter {
                     }
                     ctx.set_pc(catch_pc);
                     // Put error in register 0 for catch block (standard convention)
-                    ctx.set_register(0, error.clone());
+                    ctx.set_register(0, error);
                     ctx.set_exception(error);
                 } else {
                     generator.complete();
@@ -390,18 +390,18 @@ impl Interpreter {
             // Handle pending return (for generator.return())
             // We need to run finally blocks. Trigger the exception path with a dummy value.
             let mut internal_handler = false;
-            if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try() {
-                if frame_depth > initial_depth {
-                    internal_handler = true;
-                    ctx.take_nearest_try(); // Actually pop it
-                    while ctx.stack_depth() > frame_depth {
-                        ctx.pop_frame_discard();
-                    }
-                    ctx.set_pc(catch_pc);
-                    // Use pending return value as the exception object so it propagates
-                    let pending_val = generator.get_pending_return().unwrap_or(Value::undefined());
-                    ctx.set_exception(pending_val);
+            if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try()
+                && frame_depth > initial_depth
+            {
+                internal_handler = true;
+                ctx.take_nearest_try(); // Actually pop it
+                while ctx.stack_depth() > frame_depth {
+                    ctx.pop_frame_discard();
                 }
+                ctx.set_pc(catch_pc);
+                // Use pending return value as the exception object so it propagates
+                let pending_val = generator.get_pending_return().unwrap_or_default();
+                ctx.set_exception(pending_val);
             }
 
             if !internal_handler {
@@ -429,7 +429,7 @@ impl Interpreter {
                 Ok(result) => result,
                 Err(panic_payload) => {
                     generator.complete();
-                    GeneratorResult::Error(VmError::internal(&panic_message(&panic_payload)))
+                    GeneratorResult::Error(VmError::internal(panic_message(&panic_payload)))
                 }
             }
         }
@@ -439,7 +439,7 @@ impl Interpreter {
     fn restore_generator_frame(&self, ctx: &mut VmContext, frame: &GeneratorFrame) -> VmResult<()> {
         // Push a new frame with the saved state (no pending_args — we overwrite the window directly)
         ctx.set_pending_upvalues(frame.upvalues.clone());
-        ctx.set_pending_this(frame.this_value.clone());
+        ctx.set_pending_this(frame.this_value);
 
         // Get function info
         let func = frame
@@ -504,7 +504,7 @@ impl Interpreter {
             window,
             current_frame.upvalues.clone(),
             try_stack,
-            current_frame.this_value.clone(),
+            current_frame.this_value,
             current_frame.flags.is_construct(),
             current_frame.frame_id,
             current_frame.argc,
@@ -583,8 +583,8 @@ impl Interpreter {
             return None;
         }
         let func_index = frame.function_index;
-        let this_value = frame.this_value.clone();
-        let home_object = frame.home_object.clone();
+        let this_value = frame.this_value;
+        let home_object = frame.home_object;
         let upvalues = frame.upvalues.clone();
         let argc = frame.argc;
 
@@ -597,7 +597,7 @@ impl Interpreter {
             })
             .collect();
         let registers: Vec<Value> = (0..reg_count)
-            .map(|i| ctx.get_register(i as u16).clone())
+            .map(|i| *ctx.get_register(i as u16))
             .collect();
 
         let param_count = func.param_count as usize;
@@ -609,7 +609,7 @@ impl Interpreter {
             })
             .collect();
 
-        ctx.set_pending_this(this_value.clone());
+        ctx.set_pending_this(this_value);
         if let Some(home_obj) = home_object {
             ctx.set_pending_home_object(home_obj);
         }
@@ -651,7 +651,7 @@ impl Interpreter {
                     Arc::clone(module),
                     upvalues,
                     try_stack,
-                    this_value.clone(),
+                    this_value,
                     generator.is_construct(),
                     argc,
                 ) {
@@ -782,19 +782,37 @@ impl Interpreter {
                 Ok(()) => {}
                 Err(err) => match err {
                     VmError::TypeError(message) => {
-                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(ctx, "TypeError", &message)));
+                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(
+                            ctx,
+                            "TypeError",
+                            &message,
+                        )));
                     }
                     VmError::RangeError(message) => {
-                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(ctx, "RangeError", &message)));
+                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(
+                            ctx,
+                            "RangeError",
+                            &message,
+                        )));
                     }
                     VmError::ReferenceError(message) => {
-                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(ctx, "ReferenceError", &message)));
+                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(
+                            ctx,
+                            "ReferenceError",
+                            &message,
+                        )));
                     }
                     VmError::SyntaxError(message) => {
-                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(ctx, "SyntaxError", &message)));
+                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(
+                            ctx,
+                            "SyntaxError",
+                            &message,
+                        )));
                     }
                     VmError::URIError(message) => {
-                        ctx.dispatch_action = Some(DispatchAction::Throw(self.make_error(ctx, "URIError", &message)));
+                        ctx.dispatch_action = Some(DispatchAction::Throw(
+                            self.make_error(ctx, "URIError", &message),
+                        ));
                     }
                     other => {
                         generator.complete();
@@ -820,280 +838,91 @@ impl Interpreter {
 
             if let Some(action) = ctx.take_dispatch_action() {
                 match action {
-                DispatchAction::Jump(offset) => {
-                    if offset < 0 {
-                        let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
-                            + offset as i64) as usize;
-                        let is_generator_frame = ctx.stack_depth() == initial_depth + 1;
-                        if is_generator_frame {
-                            if let Some(result) = self.try_generator_osr(
-                                ctx,
-                                &generator,
-                                module_ref,
-                                func,
-                                target_pc,
-                                initial_depth,
-                            ) {
-                                match result {
-                                    GeneratorResult::Returned(v) => {
-                                        generator.complete();
-                                        while ctx.stack_depth() > initial_depth {
-                                            ctx.pop_frame_discard();
+                    DispatchAction::Jump(offset) => {
+                        if offset < 0 {
+                            let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
+                                + offset as i64)
+                                as usize;
+                            let is_generator_frame = ctx.stack_depth() == initial_depth + 1;
+                            if is_generator_frame {
+                                if let Some(result) = self.try_generator_osr(
+                                    ctx,
+                                    &generator,
+                                    module_ref,
+                                    func,
+                                    target_pc,
+                                    initial_depth,
+                                ) {
+                                    match result {
+                                        GeneratorResult::Returned(v) => {
+                                            generator.complete();
+                                            while ctx.stack_depth() > initial_depth {
+                                                ctx.pop_frame_discard();
+                                            }
+                                            return GeneratorResult::Returned(v);
                                         }
-                                        return GeneratorResult::Returned(v);
+                                        GeneratorResult::Yielded(v) => {
+                                            // Frame already popped by try_generator_osr
+                                            return GeneratorResult::Yielded(v);
+                                        }
+                                        other => return other,
                                     }
-                                    GeneratorResult::Yielded(v) => {
-                                        // Frame already popped by try_generator_osr
-                                        return GeneratorResult::Yielded(v);
+                                }
+                            } else {
+                                match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                                    BackEdgeOsrOutcome::Returned(osr_value) => {
+                                        // Inner function call completed via OSR — treat as return
+                                        let return_reg = ctx
+                                            .current_frame()
+                                            .map(|f| f.return_register)
+                                            .unwrap_or(None);
+                                        ctx.pop_frame_discard();
+                                        if ctx.stack_depth() <= initial_depth {
+                                            generator.complete();
+                                            return GeneratorResult::Returned(osr_value);
+                                        }
+                                        if let Some(reg) = return_reg {
+                                            ctx.set_register(reg, osr_value);
+                                        }
+                                        cached_frame_id = u32::MAX;
+                                        continue;
                                     }
-                                    other => return other,
+                                    BackEdgeOsrOutcome::ContinueAtDeoptPc => continue,
+                                    BackEdgeOsrOutcome::ContinueWithJump => {}
                                 }
                             }
-                        } else {
-                            match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
-                                BackEdgeOsrOutcome::Returned(osr_value) => {
-                                    // Inner function call completed via OSR — treat as return
-                                    let return_reg = ctx
-                                        .current_frame()
-                                        .map(|f| f.return_register)
-                                        .unwrap_or(None);
-                                    ctx.pop_frame_discard();
-                                    if ctx.stack_depth() <= initial_depth {
-                                        generator.complete();
-                                        return GeneratorResult::Returned(osr_value);
-                                    }
-                                    if let Some(reg) = return_reg {
-                                        ctx.set_register(reg, osr_value);
-                                    }
-                                    cached_frame_id = u32::MAX;
-                                    continue;
-                                }
-                                BackEdgeOsrOutcome::ContinueAtDeoptPc => continue,
-                                BackEdgeOsrOutcome::ContinueWithJump => {}
-                            }
                         }
+                        ctx.jump(offset);
                     }
-                    ctx.jump(offset);
-                }
-                DispatchAction::Return(value) => {
-                    // Pop the current frame
-                    let frame = ctx.pop_frame().unwrap();
+                    DispatchAction::Return(value) => {
+                        // Pop the current frame
+                        let frame = ctx.pop_frame().unwrap();
 
-                    // Check if we're back to the initial depth (generator is returning)
-                    if ctx.stack_depth() <= initial_depth {
-                        generator.complete();
-                        // If we have a pending return from generator.return(), use it
-                        if let Some(pending) = generator.take_pending_return() {
-                            return GeneratorResult::Returned(pending);
-                        }
-                        return GeneratorResult::Returned(value);
-                    }
-
-                    // There's a caller frame within the generator - pass return value
-                    if let Some(ret_reg) = frame.return_register {
-                        ctx.set_register(ret_reg, value);
-                    }
-                    cached_frame_id = u32::MAX;
-                }
-                DispatchAction::Yield { value, yield_dst } => {
-                    // Save frame state before advancing PC
-                    ctx.advance_pc(); // Move past the yield instruction
-
-                    match self.save_generator_frame(ctx, module_ref) {
-                        Ok(mut frame) => {
-                            // Store the yield destination register so we know where
-                            // to put the sent value when resuming
-                            frame.yield_dst = Some(yield_dst);
-                            generator.suspend_with_frame(frame);
-                        }
-                        Err(e) => {
+                        // Check if we're back to the initial depth (generator is returning)
+                        if ctx.stack_depth() <= initial_depth {
                             generator.complete();
-                            return GeneratorResult::Error(e);
-                        }
-                    }
-
-                    // Pop the generator's frame from context
-                    ctx.pop_frame_discard();
-
-                    return GeneratorResult::Yielded(value);
-                }
-                DispatchAction::Throw(error) => {
-                    // Try to find a catch handler inside the generator
-                    if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try() {
-                        if frame_depth > initial_depth {
-                            ctx.take_nearest_try(); // Actually pop it
-                            // Unwind to the handler frame
-                            while ctx.stack_depth() > frame_depth {
-                                ctx.pop_frame_discard();
+                            // If we have a pending return from generator.return(), use it
+                            if let Some(pending) = generator.take_pending_return() {
+                                return GeneratorResult::Returned(pending);
                             }
-                            ctx.set_pc(catch_pc);
-                            ctx.set_exception(error.clone());
-                            // Put error in register 0 for catch block
-                            ctx.set_register(0, error);
-                            cached_frame_id = u32::MAX;
-                            continue;
+                            return GeneratorResult::Returned(value);
                         }
+
+                        // There's a caller frame within the generator - pass return value
+                        if let Some(ret_reg) = frame.return_register {
+                            ctx.set_register(ret_reg, value);
+                        }
+                        cached_frame_id = u32::MAX;
                     }
-
-                    // No internal handler - check pending return from generator.return()
-                    if let Some(return_value) = generator.take_pending_return() {
-                        generator.complete();
-                        while ctx.stack_depth() > initial_depth {
-                            ctx.pop_frame_discard();
-                        }
-                        return GeneratorResult::Returned(return_value);
-                    }
-
-                    // No internal handler - completion will buble out
-                    generator.complete();
-                    // Pop all frames down to initial_depth
-                    while ctx.stack_depth() > initial_depth {
-                        ctx.pop_frame_discard();
-                    }
-                    return GeneratorResult::Error(VmError::exception(error));
-                }
-                DispatchAction::Call {
-                    func_index,
-                    module_id,
-                    argc,
-                    return_reg,
-                    is_construct,
-                    is_async,
-                    upvalues,
-                } => {
-                    ctx.advance_pc();
-                    // Extract func info with scoped borrow (no Arc clone)
-                    let (local_count, has_rest, param_count) = {
-                        let m = ctx.module_table.get(module_id);
-                        match m.function(func_index) {
-                            Some(f) => (f.local_count, f.flags.has_rest, f.param_count as usize),
-                            None => {
-                                generator.complete();
-                                return GeneratorResult::Error(VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                )));
-                            }
-                        }
-                    };
-
-                    if has_rest {
-                        let mut args = ctx.take_pending_args();
-                        let rest_args: Vec<Value> = if args.len() > param_count {
-                            args.drain(param_count..).collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
-                            && let Some(array_proto) = array_obj
-                                .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object())
-                        {
-                            rest_arr.set_prototype(Value::object(array_proto));
-                        }
-                        for (i, arg) in rest_args.into_iter().enumerate() {
-                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                        }
-
-                        args.push(Value::object(rest_arr));
-                        ctx.set_pending_args(args);
-                    }
-
-                    ctx.set_pending_upvalues(upvalues);
-
-                    if let Err(e) = ctx.push_frame(
-                        func_index,
-                        module_id,
-                        local_count,
-                        Some(return_reg),
-                        is_construct,
-                        is_async,
-                        argc as u16,
-                    ) {
-                        generator.complete();
-                        return GeneratorResult::Error(e);
-                    }
-                }
-                DispatchAction::TailCall {
-                    func_index,
-                    module_id,
-                    argc,
-                    return_reg,
-                    is_async,
-                    upvalues,
-                } => {
-                    ctx.pop_frame_discard();
-                    cached_frame_id = u32::MAX;
-
-                    let (local_count, has_rest, param_count) = {
-                        let m = ctx.module_table.get(module_id);
-                        match m.function(func_index) {
-                            Some(f) => (f.local_count, f.flags.has_rest, f.param_count as usize),
-                            None => {
-                                generator.complete();
-                                return GeneratorResult::Error(VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                )));
-                            }
-                        }
-                    };
-
-                    if has_rest {
-                        let mut args = ctx.take_pending_args();
-                        let rest_args: Vec<Value> = if args.len() > param_count {
-                            args.drain(param_count..).collect()
-                        } else {
-                            Vec::new()
-                        };
-                        let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                        if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
-                            && let Some(array_proto) = array_obj
-                                .get(&PropertyKey::string("prototype"))
-                                .and_then(|v| v.as_object())
-                        {
-                            rest_arr.set_prototype(Value::object(array_proto));
-                        }
-                        for (i, arg) in rest_args.into_iter().enumerate() {
-                            let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                        }
-                        args.push(Value::object(rest_arr));
-                        ctx.set_pending_args(args);
-                    }
-
-                    ctx.set_pending_upvalues(upvalues);
-
-                    if let Err(e) = ctx.push_frame(
-                        func_index,
-                        module_id,
-                        local_count,
-                        Some(return_reg),
-                        false,
-                        is_async,
-                        argc as u16,
-                    ) {
-                        generator.complete();
-                        return GeneratorResult::Error(e);
-                    }
-                }
-                DispatchAction::Suspend {
-                    promise,
-                    resume_reg,
-                } => {
-                    // Await in async generator - suspend and return the promise
-                    if generator.is_async() {
+                    DispatchAction::Yield { value, yield_dst } => {
                         // Save frame state before advancing PC
-                        ctx.advance_pc(); // Move past the await instruction
+                        ctx.advance_pc(); // Move past the yield instruction
 
                         match self.save_generator_frame(ctx, module_ref) {
                             Ok(mut frame) => {
-                                // Store the await resume register so we know where
-                                // to put the resolved value when resuming
-                                frame.yield_dst = Some(resume_reg);
+                                // Store the yield destination register so we know where
+                                // to put the sent value when resuming
+                                frame.yield_dst = Some(yield_dst);
                                 generator.suspend_with_frame(frame);
                             }
                             Err(e) => {
@@ -1105,19 +934,215 @@ impl Interpreter {
                         // Pop the generator's frame from context
                         ctx.pop_frame_discard();
 
-                        return GeneratorResult::Suspended {
-                            promise,
-                            resume_reg,
-                            generator,
-                        };
-                    } else {
-                        // Sync generators cannot await
-                        generator.complete();
-                        return GeneratorResult::Error(VmError::internal(
-                            "Sync generator cannot use await",
-                        ));
+                        return GeneratorResult::Yielded(value);
                     }
-                }
+                    DispatchAction::Throw(error) => {
+                        // Try to find a catch handler inside the generator
+                        if let Some((frame_depth, catch_pc)) = ctx.peek_nearest_try()
+                            && frame_depth > initial_depth
+                        {
+                            ctx.take_nearest_try(); // Actually pop it
+                            // Unwind to the handler frame
+                            while ctx.stack_depth() > frame_depth {
+                                ctx.pop_frame_discard();
+                            }
+                            ctx.set_pc(catch_pc);
+                            ctx.set_exception(error);
+                            // Put error in register 0 for catch block
+                            ctx.set_register(0, error);
+                            cached_frame_id = u32::MAX;
+                            continue;
+                        }
+
+                        // No internal handler - check pending return from generator.return()
+                        if let Some(return_value) = generator.take_pending_return() {
+                            generator.complete();
+                            while ctx.stack_depth() > initial_depth {
+                                ctx.pop_frame_discard();
+                            }
+                            return GeneratorResult::Returned(return_value);
+                        }
+
+                        // No internal handler - completion will buble out
+                        generator.complete();
+                        // Pop all frames down to initial_depth
+                        while ctx.stack_depth() > initial_depth {
+                            ctx.pop_frame_discard();
+                        }
+                        return GeneratorResult::Error(VmError::exception(error));
+                    }
+                    DispatchAction::Call {
+                        func_index,
+                        module_id,
+                        argc,
+                        return_reg,
+                        is_construct,
+                        is_async,
+                        upvalues,
+                    } => {
+                        ctx.advance_pc();
+                        // Extract func info with scoped borrow (no Arc clone)
+                        let (local_count, has_rest, param_count) = {
+                            let m = ctx.module_table.get(module_id);
+                            match m.function(func_index) {
+                                Some(f) => {
+                                    (f.local_count, f.flags.has_rest, f.param_count as usize)
+                                }
+                                None => {
+                                    generator.complete();
+                                    return GeneratorResult::Error(VmError::internal(format!(
+                                        "callee not found (func_index={}, function_count={})",
+                                        func_index,
+                                        m.function_count()
+                                    )));
+                                }
+                            }
+                        };
+
+                        if has_rest {
+                            let mut args = ctx.take_pending_args();
+                            let rest_args: Vec<Value> = if args.len() > param_count {
+                                args.drain(param_count..).collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
+                            if let Some(array_obj) =
+                                ctx.get_global("Array").and_then(|v| v.as_object())
+                                && let Some(array_proto) = array_obj
+                                    .get(&PropertyKey::string("prototype"))
+                                    .and_then(|v| v.as_object())
+                            {
+                                rest_arr.set_prototype(Value::object(array_proto));
+                            }
+                            for (i, arg) in rest_args.into_iter().enumerate() {
+                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            }
+
+                            args.push(Value::object(rest_arr));
+                            ctx.set_pending_args(args);
+                        }
+
+                        ctx.set_pending_upvalues(upvalues);
+
+                        if let Err(e) = ctx.push_frame(
+                            func_index,
+                            module_id,
+                            local_count,
+                            Some(return_reg),
+                            is_construct,
+                            is_async,
+                            argc as u16,
+                        ) {
+                            generator.complete();
+                            return GeneratorResult::Error(e);
+                        }
+                    }
+                    DispatchAction::TailCall {
+                        func_index,
+                        module_id,
+                        argc,
+                        return_reg,
+                        is_async,
+                        upvalues,
+                    } => {
+                        ctx.pop_frame_discard();
+                        cached_frame_id = u32::MAX;
+
+                        let (local_count, has_rest, param_count) = {
+                            let m = ctx.module_table.get(module_id);
+                            match m.function(func_index) {
+                                Some(f) => {
+                                    (f.local_count, f.flags.has_rest, f.param_count as usize)
+                                }
+                                None => {
+                                    generator.complete();
+                                    return GeneratorResult::Error(VmError::internal(format!(
+                                        "callee not found (func_index={}, function_count={})",
+                                        func_index,
+                                        m.function_count()
+                                    )));
+                                }
+                            }
+                        };
+
+                        if has_rest {
+                            let mut args = ctx.take_pending_args();
+                            let rest_args: Vec<Value> = if args.len() > param_count {
+                                args.drain(param_count..).collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
+                            if let Some(array_obj) =
+                                ctx.get_global("Array").and_then(|v| v.as_object())
+                                && let Some(array_proto) = array_obj
+                                    .get(&PropertyKey::string("prototype"))
+                                    .and_then(|v| v.as_object())
+                            {
+                                rest_arr.set_prototype(Value::object(array_proto));
+                            }
+                            for (i, arg) in rest_args.into_iter().enumerate() {
+                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            }
+                            args.push(Value::object(rest_arr));
+                            ctx.set_pending_args(args);
+                        }
+
+                        ctx.set_pending_upvalues(upvalues);
+
+                        if let Err(e) = ctx.push_frame(
+                            func_index,
+                            module_id,
+                            local_count,
+                            Some(return_reg),
+                            false,
+                            is_async,
+                            argc as u16,
+                        ) {
+                            generator.complete();
+                            return GeneratorResult::Error(e);
+                        }
+                    }
+                    DispatchAction::Suspend {
+                        promise,
+                        resume_reg,
+                    } => {
+                        // Await in async generator - suspend and return the promise
+                        if generator.is_async() {
+                            // Save frame state before advancing PC
+                            ctx.advance_pc(); // Move past the await instruction
+
+                            match self.save_generator_frame(ctx, module_ref) {
+                                Ok(mut frame) => {
+                                    // Store the await resume register so we know where
+                                    // to put the resolved value when resuming
+                                    frame.yield_dst = Some(resume_reg);
+                                    generator.suspend_with_frame(frame);
+                                }
+                                Err(e) => {
+                                    generator.complete();
+                                    return GeneratorResult::Error(e);
+                                }
+                            }
+
+                            // Pop the generator's frame from context
+                            ctx.pop_frame_discard();
+
+                            return GeneratorResult::Suspended {
+                                promise,
+                                resume_reg,
+                                generator,
+                            };
+                        } else {
+                            // Sync generators cannot await
+                            generator.complete();
+                            return GeneratorResult::Error(VmError::internal(
+                                "Sync generator cannot use await",
+                            ));
+                        }
+                    }
                 } // match action
             } else {
                 ctx.advance_pc();

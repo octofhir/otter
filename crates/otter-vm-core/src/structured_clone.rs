@@ -50,6 +50,7 @@ impl std::error::Error for StructuredCloneError {}
 pub struct StructuredCloner {
     /// Map from source pointer to cloned value (for circular reference handling)
     memory: FxHashMap<usize, Value>,
+    #[allow(dead_code)]
     memory_manager: Arc<crate::memory::MemoryManager>,
 }
 
@@ -147,7 +148,7 @@ impl StructuredCloner {
 
         // Check for circular reference
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         // Detect special object types via marker properties.
@@ -165,13 +166,11 @@ impl StructuredCloner {
             .get(&PropertyKey::string("__is_map__"))
             .and_then(|v| v.as_boolean())
             == Some(true)
-        {
-            if let Some(map_data) = obj
+            && let Some(map_data) = obj
                 .get(&PropertyKey::string("__map_data__"))
                 .and_then(|v| v.as_map_data())
-            {
-                return self.clone_map(obj, ptr, map_data);
-            }
+        {
+            return self.clone_map(obj, ptr, map_data);
         }
 
         // Set: has __is_set__ and __set_data__
@@ -179,13 +178,11 @@ impl StructuredCloner {
             .get(&PropertyKey::string("__is_set__"))
             .and_then(|v| v.as_boolean())
             == Some(true)
-        {
-            if let Some(set_data) = obj
+            && let Some(set_data) = obj
                 .get(&PropertyKey::string("__set_data__"))
                 .and_then(|v| v.as_set_data())
-            {
-                return self.clone_set(obj, ptr, set_data);
-            }
+        {
+            return self.clone_set(obj, ptr, set_data);
         }
 
         // Error: has __is_error__
@@ -200,7 +197,7 @@ impl StructuredCloner {
         // Generic object: clone all own properties
         let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let new_value = Value::object(new_obj);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         for key in obj.own_keys() {
             if let Some(val) = obj.get(&key) {
@@ -222,7 +219,7 @@ impl StructuredCloner {
         let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__timestamp__"), timestamp);
         let new_value = Value::object(new_obj);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
         Ok(new_value)
     }
 
@@ -241,7 +238,7 @@ impl StructuredCloner {
             Value::map_data(new_data),
         );
         let new_value = Value::object(new_obj);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         // Iterate source entries and clone each key-value pair
         let entries = source_data.for_each_entries();
@@ -269,7 +266,7 @@ impl StructuredCloner {
             Value::set_data(new_data),
         );
         let new_value = Value::object(new_obj);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         // Iterate source entries and clone each value
         let entries = source_data.for_each_entries();
@@ -290,7 +287,7 @@ impl StructuredCloner {
         let new_obj = GcRef::new(JsObject::new(obj.prototype()));
         let _ = new_obj.set(PropertyKey::string("__is_error__"), Value::boolean(true));
         let new_value = Value::object(new_obj);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         // Copy standard Error properties
         if let Some(name) = obj.get(&PropertyKey::string("name")) {
@@ -324,12 +321,12 @@ impl StructuredCloner {
     fn clone_map_data(&mut self, source: GcRef<MapData>) -> Result<Value, StructuredCloneError> {
         let ptr = source.as_ptr() as usize;
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         let new_data = GcRef::new(MapData::new());
         let new_value = Value::map_data(new_data);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         let entries = source.for_each_entries();
         for (key, value) in entries {
@@ -345,12 +342,12 @@ impl StructuredCloner {
     fn clone_set_data(&mut self, source: GcRef<SetData>) -> Result<Value, StructuredCloneError> {
         let ptr = source.as_ptr() as usize;
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         let new_data = GcRef::new(SetData::new());
         let new_value = Value::set_data(new_data);
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         let entries = source.for_each_entries();
         for value in entries {
@@ -366,7 +363,7 @@ impl StructuredCloner {
 
         // Check for circular reference
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         // Create new array
@@ -375,7 +372,7 @@ impl StructuredCloner {
         let new_value = Value::array(new_arr);
 
         // Register before cloning elements
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
 
         // Clone all elements
         for i in 0..len {
@@ -395,7 +392,7 @@ impl StructuredCloner {
     ) -> Result<Value, StructuredCloneError> {
         let ptr = ta.as_ptr() as usize;
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         if ta.is_detached() {
@@ -424,14 +421,14 @@ impl StructuredCloner {
         )
         .map_err(StructuredCloneError::DataCloneError)?;
         let new_value = Value::typed_array(GcRef::new(new_ta));
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
         Ok(new_value)
     }
 
     fn clone_data_view(&mut self, dv: GcRef<JsDataView>) -> Result<Value, StructuredCloneError> {
         let ptr = dv.as_ptr() as usize;
         if let Some(cloned) = self.memory.get(&ptr) {
-            return Ok(cloned.clone());
+            return Ok(*cloned);
         }
 
         if dv.is_detached() {
@@ -453,7 +450,7 @@ impl StructuredCloner {
         let new_dv = JsDataView::new(new_buffer, dv.byte_offset(), Some(dv.byte_length()))
             .map_err(StructuredCloneError::DataCloneError)?;
         let new_value = Value::data_view(GcRef::new(new_dv));
-        self.memory.insert(ptr, new_value.clone());
+        self.memory.insert(ptr, new_value);
         Ok(new_value)
     }
 }

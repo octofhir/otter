@@ -309,16 +309,15 @@ impl ModuleGraph {
         // Then update the wrapping flags
         if let Some(node) = self.nodes.get_mut(&resolved_url) {
             for record in &mut node.import_records {
-                if let Some(ref dep_url) = record.resolved_url {
-                    if let Some(&imported_type) = dep_types.get(dep_url) {
-                        // ESM importing CJS -> needs __toESM
-                        record.wrap_with_to_esm =
-                            importer_type.is_esm() && imported_type.is_commonjs();
+                if let Some(ref dep_url) = record.resolved_url
+                    && let Some(&imported_type) = dep_types.get(dep_url)
+                {
+                    // ESM importing CJS -> needs __toESM
+                    record.wrap_with_to_esm = importer_type.is_esm() && imported_type.is_commonjs();
 
-                        // CJS requiring ESM -> needs __toCommonJS
-                        record.wrap_with_to_commonjs =
-                            importer_type.is_commonjs() && imported_type.is_esm();
-                    }
+                    // CJS requiring ESM -> needs __toCommonJS
+                    record.wrap_with_to_commonjs =
+                        importer_type.is_commonjs() && imported_type.is_esm();
                 }
             }
         }

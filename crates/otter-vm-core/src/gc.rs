@@ -349,7 +349,7 @@ impl<T> std::ops::Deref for GcRef<T> {
 
 impl<T> Clone for GcRef<T> {
     fn clone(&self) -> Self {
-        Self { gc: self.gc }
+        *self
     }
 }
 
@@ -634,7 +634,7 @@ impl Trace for crate::generator::JsGenerator {
         for val in self.initial_args.borrow().iter() {
             tracer.mark_value(val);
         }
-        tracer.mark_value(&*self.initial_this.borrow());
+        tracer.mark_value(&self.initial_this.borrow());
 
         // Trace abrupt return/throw
         if let Some(val) = self.abrupt_return.borrow().as_ref() {
@@ -1015,7 +1015,7 @@ mod tests {
         {
             let scope = HandleScope::new(&mut ctx);
             let obj = GcRef::new(JsObject::new(Value::null()));
-            let _handle = scope.root_value(Value::object(obj.clone()));
+            let _handle = scope.root_value(Value::object(obj));
 
             // Verify the object is rooted
             assert_eq!(scope.context().root_count(), 1);
@@ -1051,7 +1051,7 @@ mod tests {
         let _ = obj1.set("value".into(), Value::int32(99));
 
         // Clone the reference
-        let obj2 = obj1.clone();
+        let obj2 = obj1;
 
         // Both references should point to the same object
         assert_eq!(obj2.get(&"value".into()), Some(Value::int32(99)));
@@ -1072,7 +1072,7 @@ mod tests {
         assert_ne!(obj1.as_ptr(), obj2.as_ptr());
 
         // Same object cloned should be equal
-        let obj1_clone = obj1.clone();
+        let obj1_clone = obj1;
         assert_eq!(obj1.as_ptr(), obj1_clone.as_ptr());
     }
 
@@ -1083,8 +1083,8 @@ mod tests {
         let obj = GcRef::new(JsObject::new(Value::null()));
 
         // Clone and verify pointer identity
-        let clone1 = obj.clone();
-        let clone2 = obj.clone();
+        let clone1 = obj;
+        let clone2 = obj;
 
         // All should have the same pointer
         assert_eq!(obj.as_ptr(), clone1.as_ptr());
@@ -1175,7 +1175,7 @@ mod tests {
         let obj = GcRef::new(JsObject::new(Value::null()));
         let _ = obj.set("important".into(), Value::int32(999));
 
-        let handle = scope.root_value(Value::object(obj.clone()));
+        let handle = scope.root_value(Value::object(obj));
 
         // Simulate a GC safepoint (in a real scenario, GC would run here)
         // The handle ensures the object stays alive

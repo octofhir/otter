@@ -74,12 +74,12 @@ fn math_floor(x: f64) -> f64 {
 /// Spec: <https://tc39.es/ecma262/#sec-math.round>
 #[dive(name = "round", length = 1)]
 fn math_round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let x = to_number(args.first().unwrap_or(&Value::undefined()));
     if x.is_nan() || x.is_infinite() || x == 0.0 {
         return Ok(Value::number(x));
     }
     // If x is in [-0.5, 0), result is -0
-    if x >= -0.5 && x < 0.0 {
+    if (-0.5..0.0).contains(&x) {
         return Ok(Value::number(-0.0));
     }
     // Use floor + comparison to avoid precision loss from adding 0.5
@@ -221,7 +221,7 @@ fn math_atanh(x: f64) -> f64 {
 /// Spec: <https://tc39.es/ecma262/#sec-math.pow>
 #[dive(name = "pow", length = 2)]
 fn math_pow(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let base = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let base = to_number(args.first().unwrap_or(&Value::undefined()));
     let exp = to_number(args.get(1).unwrap_or(&Value::undefined()));
     let result = js_pow(base, exp);
     Ok(Value::number(result))
@@ -323,7 +323,7 @@ fn math_atan2(y: f64, x: f64) -> f64 {
 /// Spec: <https://tc39.es/ecma262/#sec-math.imul>
 #[dive(name = "imul", length = 2)]
 fn math_imul(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let a = to_int32(to_number(args.get(0).unwrap_or(&Value::undefined())));
+    let a = to_int32(to_number(args.first().unwrap_or(&Value::undefined())));
     let b = to_int32(to_number(args.get(1).unwrap_or(&Value::undefined())));
     Ok(Value::number(a.wrapping_mul(b) as f64))
 }
@@ -335,7 +335,7 @@ fn math_imul(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError>
 /// Spec: <https://tc39.es/ecma262/#sec-math.sign>
 #[dive(name = "sign", length = 1)]
 fn math_sign(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let x = to_number(args.first().unwrap_or(&Value::undefined()));
     let result = if x.is_nan() {
         f64::NAN
     } else if x == 0.0 || x == -0.0 {
@@ -351,7 +351,7 @@ fn math_sign(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError>
 /// Spec: <https://tc39.es/ecma262/#sec-math.clz32>
 #[dive(name = "clz32", length = 1)]
 fn math_clz32(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let x = to_number(args.first().unwrap_or(&Value::undefined()));
     let val = to_uint32(x);
     Ok(Value::number(val.leading_zeros() as f64))
 }
@@ -359,14 +359,14 @@ fn math_clz32(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError
 /// Spec: <https://tc39.es/ecma262/#sec-math.fround>
 #[dive(name = "fround", length = 1)]
 fn math_fround(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let x = to_number(args.first().unwrap_or(&Value::undefined()));
     Ok(Value::number((x as f32) as f64))
 }
 
 /// Spec: <https://tc39.es/proposal-float16array/#sec-math.f16round>
 #[dive(name = "f16round", length = 1)]
 fn math_f16round(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
-    let x = to_number(args.get(0).unwrap_or(&Value::undefined()));
+    let x = to_number(args.first().unwrap_or(&Value::undefined()));
     let f16_val = half::f16::from_f64(x);
     Ok(Value::number(f16_val.to_f64()))
 }
@@ -477,7 +477,7 @@ fn math_random(_args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmErr
 #[dive(name = "sumPrecise", length = 1)]
 fn math_sum_precise(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
     let undefined = Value::undefined();
-    let iterable = args.get(0).unwrap_or(&undefined);
+    let iterable = args.first().unwrap_or(&undefined);
 
     // Per spec: TypeError if not iterable
     let iter_sym = crate::intrinsics::well_known::iterator_symbol();
@@ -493,7 +493,7 @@ fn math_sum_precise(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
     }
 
     // Call @@iterator to get iterator
-    let iterator = ncx.call_function(&iter_fn, iterable.clone(), &[])?;
+    let iterator = ncx.call_function(&iter_fn, *iterable, &[])?;
     let iterator_obj = iterator
         .as_object()
         .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
@@ -504,7 +504,7 @@ fn math_sum_precise(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
     // Collect all values (per spec, iterate fully before computing)
     let mut values: Vec<f64> = Vec::new();
     loop {
-        let result = ncx.call_function(&next_fn, iterator.clone(), &[])?;
+        let result = ncx.call_function(&next_fn, iterator, &[])?;
         let result_obj = result
             .as_object()
             .ok_or_else(|| VmError::type_error("Iterator result is not an object"))?;
@@ -525,10 +525,10 @@ fn math_sum_precise(args: &[Value], ncx: &mut NativeContext) -> Result<Value, Vm
             n as f64
         } else {
             // IteratorClose: call iterator.return() if it exists
-            if let Some(return_fn) = iterator_obj.get(&PropertyKey::string("return")) {
-                if return_fn.is_callable() || return_fn.is_native_function() {
-                    let _ = ncx.call_function(&return_fn, iterator.clone(), &[]);
-                }
+            if let Some(return_fn) = iterator_obj.get(&PropertyKey::string("return"))
+                && (return_fn.is_callable() || return_fn.is_native_function())
+            {
+                let _ = ncx.call_function(&return_fn, iterator, &[]);
             }
             return Err(VmError::type_error(
                 "Math.sumPrecise: values must be numbers",

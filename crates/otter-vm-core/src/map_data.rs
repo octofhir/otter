@@ -67,7 +67,7 @@ impl MapData {
         if let Some(&idx) = inner.index.get(key)
             && let Some(Some((_, v))) = inner.entries.get(idx)
         {
-            return Some(v.clone());
+            return Some(*v);
         }
         None
     }
@@ -76,17 +76,17 @@ impl MapData {
     /// and return `default_value`. Used by `Map.prototype.getOrInsert`.
     pub fn get_or_insert(&self, key: MapKey, default_value: Value) -> Value {
         let mut inner = self.inner.borrow_mut();
-        if let Some(&idx) = inner.index.get(&key) {
-            if let Some(Some((_, v))) = inner.entries.get(idx) {
-                return v.clone();
-            }
+        if let Some(&idx) = inner.index.get(&key)
+            && let Some(Some((_, v))) = inner.entries.get(idx)
+        {
+            return *v;
         }
         // Key not found — insert (barrier for generational GC)
         crate::object::gc_write_barrier(key.value());
         crate::object::gc_write_barrier(&default_value);
         let idx = inner.entries.len();
         inner.index.insert(key.clone(), idx);
-        inner.entries.push(Some((key, default_value.clone())));
+        inner.entries.push(Some((key, default_value)));
         inner.size += 1;
         default_value
     }
@@ -142,7 +142,7 @@ impl MapData {
     pub fn entry_at(&self, position: usize) -> Option<(Value, Value)> {
         let inner = self.inner.borrow();
         match inner.entries.get(position) {
-            Some(Some((k, v))) => Some((k.value().clone(), v.clone())),
+            Some(Some((k, v))) => Some((*k.value(), *v)),
             _ => None,
         }
     }
@@ -159,7 +159,7 @@ impl MapData {
         let inner = self.inner.borrow();
         let mut result = Vec::with_capacity(inner.size);
         for (k, v) in inner.entries.iter().flatten() {
-            result.push((k.value().clone(), v.clone()));
+            result.push((*k.value(), *v));
         }
         result
     }
@@ -278,7 +278,7 @@ impl SetData {
     pub fn entry_at(&self, position: usize) -> Option<Value> {
         let inner = self.inner.borrow();
         match inner.entries.get(position) {
-            Some(Some(k)) => Some(k.value().clone()),
+            Some(Some(k)) => Some(*k.value()),
             _ => None,
         }
     }
@@ -293,7 +293,7 @@ impl SetData {
         let inner = self.inner.borrow();
         let mut result = Vec::with_capacity(inner.size);
         for k in inner.entries.iter().flatten() {
-            result.push(k.value().clone());
+            result.push(*k.value());
         }
         result
     }

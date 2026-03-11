@@ -188,6 +188,7 @@ struct BackgroundCompileWorker {
     result_rx: Mutex<Receiver<BackgroundCompileResult>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BackgroundCompileResult {
     Compiled {
         module_id: u64,
@@ -601,6 +602,12 @@ pub enum JitExecResult {
 ///
 /// `ctx_ptr` must point to the caller-defined JIT context struct matching
 /// helper ABI expected by generated code.
+///
+/// # Safety
+///
+/// - `ctx_ptr` must point to a valid JIT context struct for the duration of the call.
+/// - `args_ptr` must point to `argc` valid NaN-boxed i64 values.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn try_execute_jit_raw(
     module_id: u64,
     function_index: u32,

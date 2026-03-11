@@ -123,10 +123,10 @@ pub fn run_parallel(
     for results in &result_rx {
         for result in &results {
             // JSONL log
-            if let Some(ref mut writer) = log_writer {
-                if let Ok(line) = serde_json::to_string(result) {
-                    let _ = writeln!(writer, "{}", line);
-                }
+            if let Some(ref mut writer) = log_writer
+                && let Ok(line) = serde_json::to_string(result)
+            {
+                let _ = writeln!(writer, "{}", line);
             }
 
             // Verbose per-result output

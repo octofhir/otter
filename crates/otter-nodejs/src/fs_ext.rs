@@ -478,7 +478,7 @@ fn data_to_bytes(value: &Value) -> Result<Vec<u8>, VmError> {
                     .ok_or_else(|| {
                         VmError::type_error(&format!("Byte at index {i} must be a number"))
                     })?;
-                if n < 0.0 || n > 255.0 {
+                if !(0.0..=255.0).contains(&n) {
                     return Err(VmError::type_error(&format!(
                         "Byte at index {i} must be in range 0..=255"
                     )));
@@ -590,7 +590,7 @@ fn current_array_prototype(ncx: &NativeContext) -> Option<GcRef<JsObject>> {
 }
 
 fn create_array(
-    mm: &Arc<MemoryManager>,
+    _mm: &Arc<MemoryManager>,
     array_proto: Option<GcRef<JsObject>>,
     len: usize,
 ) -> GcRef<JsObject> {
@@ -837,7 +837,7 @@ fn create_file_handle_object(ncx: &mut NativeContext, handle_id: u64) -> Value {
                     bytes,
                     position,
                 }),
-                move |result, callback_ncx| {
+                move |result, _callback_ncx| {
                     let written = match result {
                         FsOpResult::Count(count) => count,
                         _ => {
@@ -1193,7 +1193,7 @@ fn construct_error_object(ncx: &mut NativeContext, ctor_name: &str, message: &st
 
     if let Some(ctor) = ncx.global().get(&PropertyKey::string(ctor_name))
         && ctor.is_callable()
-        && let Ok(value) = ncx.call_function(&ctor, Value::undefined(), &[msg.clone()])
+        && let Ok(value) = ncx.call_function(&ctor, Value::undefined(), std::slice::from_ref(&msg))
         && value.is_object()
     {
         return value;

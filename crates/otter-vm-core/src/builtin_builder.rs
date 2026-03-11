@@ -586,10 +586,7 @@ impl BuiltInBuilder {
 
         prototype.define_property(
             PropertyKey::string("constructor"),
-            PropertyDescriptor::data_with_attrs(
-                ctor_value.clone(),
-                PropertyAttributes::constructor_link(),
-            ),
+            PropertyDescriptor::data_with_attrs(ctor_value, PropertyAttributes::constructor_link()),
         );
 
         // 5. Set constructor.name and constructor.length

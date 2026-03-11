@@ -75,14 +75,13 @@ impl IntrinsicObject for PromiseIntrinsic {
 /// Handles both raw `Value::promise` and JS wrapper objects `{ _internal: <promise> }`.
 fn get_promise_from_this(this_val: &Value) -> Result<GcRef<JsPromise>, VmError> {
     if let Some(p) = this_val.as_promise() {
-        return Ok(p.clone());
+        return Ok(p);
     }
-    if let Some(obj) = this_val.as_object() {
-        if let Some(internal) = obj.get(&PropertyKey::string("_internal")) {
-            if let Some(p) = internal.as_promise() {
-                return Ok(p.clone());
-            }
-        }
+    if let Some(obj) = this_val.as_object()
+        && let Some(internal) = obj.get(&PropertyKey::string("_internal"))
+        && let Some(p) = internal.as_promise()
+    {
+        return Ok(p);
     }
     Err(VmError::type_error("Promise method called on non-promise"))
 }
@@ -92,22 +91,21 @@ fn extract_internal_promise(value: &Value) -> Option<GcRef<JsPromise>> {
     if let Some(promise) = value.as_promise() {
         return Some(promise);
     }
-    if let Some(obj) = value.as_object() {
-        if let Some(internal) = obj.get(&PropertyKey::string("_internal")) {
-            if let Some(promise) = internal.as_promise() {
-                return Some(promise);
-            }
-        }
+    if let Some(obj) = value.as_object()
+        && let Some(internal) = obj.get(&PropertyKey::string("_internal"))
+        && let Some(promise) = internal.as_promise()
+    {
+        return Some(promise);
     }
     None
 }
 
 /// Check if a value is already a wrapped promise object.
 fn is_wrapped_promise(value: &Value) -> bool {
-    if let Some(obj) = value.as_object() {
-        if let Some(internal) = obj.get(&PropertyKey::string("_internal")) {
-            return internal.is_promise();
-        }
+    if let Some(obj) = value.as_object()
+        && let Some(internal) = obj.get(&PropertyKey::string("_internal"))
+    {
+        return internal.is_promise();
     }
     false
 }
@@ -115,20 +113,20 @@ fn is_wrapped_promise(value: &Value) -> bool {
 /// Extract array items from an iterable value.
 fn extract_array_items(value: Option<&Value>) -> Result<Vec<Value>, VmError> {
     let value = value.ok_or_else(|| VmError::type_error("Expected an iterable"))?;
-    if let Some(obj) = value.as_object() {
-        if obj.is_array() {
-            let len = obj.array_length();
-            let mut items = Vec::with_capacity(len);
-            for i in 0..len {
-                items.push(
-                    obj.get(&PropertyKey::Index(i as u32))
-                        .unwrap_or(Value::undefined()),
-                );
-            }
-            return Ok(items);
+    if let Some(obj) = value.as_object()
+        && obj.is_array()
+    {
+        let len = obj.array_length();
+        let mut items = Vec::with_capacity(len);
+        for i in 0..len {
+            items.push(
+                obj.get(&PropertyKey::Index(i as u32))
+                    .unwrap_or(Value::undefined()),
+            );
         }
+        return Ok(items);
     }
-    Ok(vec![value.clone()])
+    Ok(vec![*value])
 }
 
 /// Create a JavaScript Promise wrapper object from an internal promise.
@@ -291,7 +289,7 @@ pub fn init_promise_prototype(
                         (
                             JsPromiseJobKind::FinallyFulfill,
                             JsPromiseJobKind::FinallyReject,
-                            on_finally.clone(),
+                            on_finally,
                             on_finally,
                         )
                     } else {
@@ -501,22 +499,20 @@ pub fn install_promise_statics(
                 let result_promise = JsPromise::new();
 
                 // Check if value is a thenable (has callable .then)
-                if value.is_object() {
-                    if let Some(obj) = value.as_object() {
-                        if let Some(then_val) = obj.get(&PropertyKey::string("then")) {
-                            if then_val.is_callable() {
-                                // Schedule thenable resolution
-                                let job = JsPromiseJob {
-                                    kind: JsPromiseJobKind::ResolveThenable,
-                                    callback: then_val,
-                                    this_arg: value,
-                                    result_promise: Some(result_promise),
-                                };
-                                ncx.enqueue_js_job(job, Vec::new());
-                                return Ok(create_js_promise_wrapper(ncx, result_promise));
-                            }
-                        }
-                    }
+                if value.is_object()
+                    && let Some(obj) = value.as_object()
+                    && let Some(then_val) = obj.get(&PropertyKey::string("then"))
+                    && then_val.is_callable()
+                {
+                    // Schedule thenable resolution
+                    let job = JsPromiseJob {
+                        kind: JsPromiseJobKind::ResolveThenable,
+                        callback: then_val,
+                        this_arg: value,
+                        result_promise: Some(result_promise),
+                    };
+                    ncx.enqueue_js_job(job, Vec::new());
+                    return Ok(create_js_promise_wrapper(ncx, result_promise));
                 }
 
                 // Resolve with the value directly
@@ -597,7 +593,7 @@ pub fn install_promise_statics(
                         p
                     };
 
-                    let result_p_reject = result_p.clone();
+                    let result_p_reject = result_p;
                     let rejected_check = rejected.clone();
 
                     source_promise.then(move |value| {
@@ -612,7 +608,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), *val);
                                     }
                                 }
                             }
@@ -765,7 +761,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), *val);
                                     }
                                 }
                             }
@@ -789,7 +785,7 @@ pub fn install_promise_statics(
                             if let Ok(locked) = results2.lock() {
                                 for (i, v) in locked.iter().enumerate() {
                                     if let Some(val) = v {
-                                        let _ = arr.set(PropertyKey::Index(i as u32), val.clone());
+                                        let _ = arr.set(PropertyKey::Index(i as u32), *val);
                                     }
                                 }
                             }
@@ -861,7 +857,7 @@ pub fn install_promise_statics(
                     let fulfilled2 = fulfilled.clone();
                     let remaining = remaining.clone();
                     let errors = errors.clone();
-                    let mm_err = mm_any.clone();
+                    let _mm_err = mm_any.clone();
                     let agg_proto = aggregate_error_proto;
                     let enqueue_fulfill = enqueue.clone();
                     let enqueue_reject = enqueue.clone();
@@ -892,13 +888,13 @@ pub fn install_promise_statics(
                         }
                         if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                             let errs: Vec<Value> = if let Ok(locked) = errors.lock() {
-                                locked.iter().filter_map(|e| e.clone()).collect()
+                                locked.iter().filter_map(|e| *e).collect()
                             } else {
                                 vec![]
                             };
                             let arr = GcRef::new(JsObject::array(errs.len()));
                             for (i, e) in errs.iter().enumerate() {
-                                let _ = arr.set(PropertyKey::Index(i as u32), e.clone());
+                                let _ = arr.set(PropertyKey::Index(i as u32), *e);
                             }
                             let agg = GcRef::new(JsObject::new(Value::object(agg_proto)));
                             let _ = agg.set(

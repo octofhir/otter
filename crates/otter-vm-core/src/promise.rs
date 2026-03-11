@@ -204,7 +204,7 @@ impl JsPromise {
         // these closures.  The typical `await expr` pattern satisfies this because the
         // `AsyncContext` holds a `GcRef<JsPromise>` that is traced by `collect_gc_roots`.
         let resolve = {
-            let p = promise.clone();
+            let p = promise;
             let enqueue = Arc::clone(&enqueue);
             Arc::new(move |v: Value| {
                 let enqueue = Arc::clone(&enqueue);
@@ -215,7 +215,7 @@ impl JsPromise {
         };
 
         let reject = {
-            let p = promise.clone();
+            let p = promise;
             let enqueue = Arc::clone(&enqueue);
             Arc::new(move |e: Value| {
                 let enqueue = Arc::clone(&enqueue);
@@ -264,7 +264,7 @@ impl JsPromise {
     pub fn resolve(&self, value: Value) {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
-            *state = PromiseState::Fulfilled(value.clone());
+            *state = PromiseState::Fulfilled(value);
             // Take callbacks while holding state lock (prevents TOCTOU races)
             let callbacks = std::mem::take(&mut *self.on_fulfilled.borrow_mut());
             let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
@@ -272,7 +272,7 @@ impl JsPromise {
 
             // Run fulfillment callbacks
             for callback in callbacks {
-                callback(value.clone());
+                callback(value);
             }
 
             // Run finally callbacks
@@ -291,14 +291,14 @@ impl JsPromise {
     {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
-            *state = PromiseState::Fulfilled(value.clone());
+            *state = PromiseState::Fulfilled(value);
             let callbacks = std::mem::take(&mut *self.on_fulfilled.borrow_mut());
             let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Enqueue fulfillment callbacks as microtasks
             for callback in callbacks {
-                let v = value.clone();
+                let v = value;
                 enqueue(Box::new(move || callback(v)));
             }
 
@@ -317,14 +317,14 @@ impl JsPromise {
     pub fn reject(&self, error: Value) {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
-            *state = PromiseState::Rejected(error.clone());
+            *state = PromiseState::Rejected(error);
             let callbacks = std::mem::take(&mut *self.on_rejected.borrow_mut());
             let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Run rejection callbacks
             for callback in callbacks {
-                callback(error.clone());
+                callback(error);
             }
 
             // Run finally callbacks
@@ -343,14 +343,14 @@ impl JsPromise {
     {
         let mut state = self.state.lock();
         if matches!(*state, PromiseState::Pending) {
-            *state = PromiseState::Rejected(error.clone());
+            *state = PromiseState::Rejected(error);
             let callbacks = std::mem::take(&mut *self.on_rejected.borrow_mut());
             let finally_callbacks = std::mem::take(&mut *self.on_finally.borrow_mut());
             drop(state);
 
             // Enqueue rejection callbacks as microtasks
             for callback in callbacks {
-                let e = error.clone();
+                let e = error;
                 enqueue(Box::new(move || callback(e)));
             }
 
@@ -371,7 +371,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Fulfilled(value) => {
-                let value = value.clone();
+                let value = *value;
                 drop(state);
                 callback(value);
             }
@@ -393,7 +393,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Fulfilled(value) => {
-                let value = value.clone();
+                let value = *value;
                 drop(state);
                 enqueue(Box::new(move || callback(value)));
             }
@@ -414,7 +414,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Rejected(error) => {
-                let error = error.clone();
+                let error = *error;
                 drop(state);
                 callback(error);
             }
@@ -436,7 +436,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Rejected(error) => {
-                let error = error.clone();
+                let error = *error;
                 drop(state);
                 enqueue(Box::new(move || callback(error)));
             }
@@ -559,7 +559,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Fulfilled(value) => {
-                let value = value.clone();
+                let value = *value;
                 drop(state);
                 enqueue(job, vec![value]);
             }
@@ -584,7 +584,7 @@ impl JsPromise {
         let state = self.state.lock();
         match &*state {
             PromiseState::Rejected(error) => {
-                let error = error.clone();
+                let error = *error;
                 drop(state);
                 enqueue(job, vec![error]);
             }
@@ -652,7 +652,7 @@ impl JsPromise {
                 }
             }
 
-            *state = PromiseState::PendingThenable(value.clone());
+            *state = PromiseState::PendingThenable(value);
             drop(state);
             let job = JsPromiseJob {
                 kind: JsPromiseJobKind::ResolveThenableLookup,
@@ -664,7 +664,7 @@ impl JsPromise {
             return;
         }
 
-        *state = PromiseState::Fulfilled(value.clone());
+        *state = PromiseState::Fulfilled(value);
         // Take all callbacks while holding state lock (prevents TOCTOU)
         let js_jobs = std::mem::take(&mut *promise.js_fulfill_jobs.borrow_mut());
         let callbacks = std::mem::take(&mut *promise.on_fulfilled.borrow_mut());
@@ -673,12 +673,12 @@ impl JsPromise {
 
         // Enqueue JS callback jobs
         for job in js_jobs {
-            enqueue(job, vec![value.clone()]);
+            enqueue(job, vec![value]);
         }
 
         // Run Rust closure callbacks
         for callback in callbacks {
-            callback(value.clone());
+            callback(value);
         }
 
         // Run finally callbacks
@@ -720,7 +720,7 @@ impl JsPromise {
             _ => return,
         }
 
-        *state = PromiseState::Rejected(error.clone());
+        *state = PromiseState::Rejected(error);
         // Take all callbacks while holding state lock (prevents TOCTOU)
         let js_jobs = std::mem::take(&mut *promise.js_reject_jobs.borrow_mut());
         let callbacks = std::mem::take(&mut *promise.on_rejected.borrow_mut());
@@ -729,12 +729,12 @@ impl JsPromise {
 
         // Enqueue JS callback jobs
         for job in js_jobs {
-            enqueue(job, vec![error.clone()]);
+            enqueue(job, vec![error]);
         }
 
         // Run Rust closure callbacks
         for callback in callbacks {
-            callback(error.clone());
+            callback(error);
         }
 
         // Run finally callbacks

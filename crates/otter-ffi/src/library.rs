@@ -47,10 +47,11 @@ impl FfiLibrary {
         for (name, sig) in signatures {
             let ptr: *const () = unsafe {
                 let sym: libloading::Symbol<*const ()> =
-                    lib.get(name.as_bytes()).map_err(|e| FfiError::SymbolNotFound {
-                        name: name.clone(),
-                        reason: e.to_string(),
-                    })?;
+                    lib.get(name.as_bytes())
+                        .map_err(|e| FfiError::SymbolNotFound {
+                            name: name.clone(),
+                            reason: e.to_string(),
+                        })?;
                 *sym
             };
             symbols.insert(
@@ -62,10 +63,7 @@ impl FfiLibrary {
             );
         }
 
-        Ok(FfiLibrary {
-            _lib: lib,
-            symbols,
-        })
+        Ok(FfiLibrary { _lib: lib, symbols })
     }
 
     /// Get a bound symbol by name.
@@ -82,11 +80,7 @@ impl FfiLibrary {
     ///
     /// `args` must be pre-marshaled to the correct C types as raw bytes.
     /// Returns the raw return value as bytes.
-    pub fn call_raw(
-        &self,
-        name: &str,
-        arg_values: &[u64],
-    ) -> Result<u64, FfiError> {
+    pub fn call_raw(&self, name: &str, arg_values: &[u64]) -> Result<u64, FfiError> {
         let sym = self
             .symbols
             .get(name)

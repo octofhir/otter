@@ -67,10 +67,10 @@ fn boolean_value_of(
     if let Some(b) = this_val.as_boolean() {
         Ok(Value::boolean(b))
     } else if let Some(obj) = this_val.as_object() {
-        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
-            if let Some(b) = val.as_boolean() {
-                return Ok(Value::boolean(b));
-            }
+        if let Some(val) = obj.get(&PropertyKey::string("__value__"))
+            && let Some(b) = val.as_boolean()
+        {
+            return Ok(Value::boolean(b));
         }
         Ok(Value::boolean(to_boolean(this_val)))
     } else {
@@ -167,7 +167,7 @@ pub fn create_boolean_constructor() -> Box<
             // Construct form: new Boolean(value) → Boolean object
             // Store primitive value in internal [[BooleanData]] slot
             let _ = obj.set(PropertyKey::string("__value__"), bool_val);
-            Ok(this_val.clone())
+            Ok(*this_val)
         } else {
             // Call form fallback
             Ok(bool_val)

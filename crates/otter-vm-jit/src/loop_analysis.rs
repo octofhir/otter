@@ -71,9 +71,7 @@ pub(crate) fn detect_loops(
         let mut qualifies = true;
         let mut check_registers = Vec::new();
 
-        for body_pc in header_pc..=pc {
-            let inst = &instructions[body_pc];
-
+        for inst in &instructions[header_pc..=pc] {
             // Disqualify: calls can change types via side effects
             if is_call_instruction(inst) {
                 qualifies = false;
@@ -96,7 +94,7 @@ pub(crate) fn detect_loops(
             if let Some((feedback_idx, input_regs)) = arith_feedback_info(inst) {
                 let is_int32 = feedback_snapshot
                     .get(feedback_idx as usize)
-                    .map_or(false, |tf| tf.is_int32_only());
+                    .is_some_and(|tf| tf.is_int32_only());
                 if !is_int32 {
                     qualifies = false;
                     break;
@@ -109,10 +107,10 @@ pub(crate) fn detect_loops(
             }
 
             // Inc/Dec don't have feedback_index but are always int32-guarded
-            if let Some(reg) = inc_dec_input_reg(inst) {
-                if !check_registers.contains(&reg) {
-                    check_registers.push(reg);
-                }
+            if let Some(reg) = inc_dec_input_reg(inst)
+                && !check_registers.contains(&reg)
+            {
+                check_registers.push(reg);
             }
         }
 
@@ -259,16 +257,18 @@ mod tests {
     use otter_vm_bytecode::operand::{JumpOffset, Register};
 
     fn make_int32_feedback() -> TypeFlags {
-        let mut tf = TypeFlags::default();
-        tf.seen_int32 = true;
-        tf
+        TypeFlags {
+            seen_int32: true,
+            ..TypeFlags::default()
+        }
     }
 
     fn make_mixed_feedback() -> TypeFlags {
-        let mut tf = TypeFlags::default();
-        tf.seen_int32 = true;
-        tf.seen_string = true;
-        tf
+        TypeFlags {
+            seen_int32: true,
+            seen_string: true,
+            ..TypeFlags::default()
+        }
     }
 
     #[test]

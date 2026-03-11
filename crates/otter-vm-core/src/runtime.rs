@@ -94,7 +94,7 @@ impl VmRuntime {
         register_all_types(&mut gc_registry);
         // SAFETY: pointer remains valid as long as this VmRuntime is alive.
         // VmRuntime::drop() clears the thread-local before freeing the Box.
-        unsafe { otter_vm_gc::set_thread_registry(&*gc_registry) };
+        unsafe { otter_vm_gc::set_thread_registry(&gc_registry) };
 
         let memory_manager = Arc::new(crate::memory::MemoryManager::new(config.max_heap_size));
         // Set thread-local MM so allocations during construction are tracked.
@@ -104,7 +104,7 @@ impl VmRuntime {
         // Set as thread-local so all JsString::intern() calls during intrinsics
         // creation use this table. The heap address survives struct moves.
         let string_table = Box::new(StringTable::new());
-        StringTable::set_thread_default(&*string_table);
+        StringTable::set_thread_default(&string_table);
 
         let realm_registry = RealmRegistry::new();
         let default_realm_id = realm_registry.allocate_id();
@@ -313,7 +313,7 @@ impl VmRuntime {
 
     /// Get the per-runtime string interning table.
     pub fn string_table(&self) -> &StringTable {
-        &*self.string_table
+        &self.string_table
     }
 
     /// Replace the default realm with a freshly created one.
@@ -362,7 +362,7 @@ impl Drop for VmRuntime {
         // Ensure registry thread-local is set so dealloc_all can use
         // GC_DEALLOC_IN_PROGRESS flag (which is thread-local).
         let our_ptr = &*self.gc_registry as *const otter_vm_gc::AllocationRegistry;
-        unsafe { otter_vm_gc::set_thread_registry(&*self.gc_registry) };
+        unsafe { otter_vm_gc::set_thread_registry(&self.gc_registry) };
 
         // Free all GC-allocated objects.
         self.gc_registry.dealloc_all();
@@ -372,7 +372,7 @@ impl Drop for VmRuntime {
         self.string_table.clear();
 
         // Clear thread-local string table pointer only if it's ours
-        StringTable::clear_thread_default_if(&*self.string_table);
+        StringTable::clear_thread_default_if(&self.string_table);
 
         // Clear thread-local GC registry. MUST happen before Box drops.
         otter_vm_gc::clear_thread_registry_if(our_ptr);

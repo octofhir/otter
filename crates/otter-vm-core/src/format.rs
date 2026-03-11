@@ -74,12 +74,12 @@ pub fn format_snapshot(
     }
 
     // Recent Instructions Section
-    if let Some(buffer) = trace_buffer {
-        if !buffer.is_empty() {
-            writeln!(&mut output, "Recent Instructions (last {}):", buffer.len()).unwrap();
-            write!(&mut output, "{}", format_trace_buffer(buffer)).unwrap();
-            writeln!(&mut output).unwrap();
-        }
+    if let Some(buffer) = trace_buffer
+        && !buffer.is_empty()
+    {
+        writeln!(&mut output, "Recent Instructions (last {}):", buffer.len()).unwrap();
+        write!(&mut output, "{}", format_trace_buffer(buffer)).unwrap();
+        writeln!(&mut output).unwrap();
     }
 
     output
@@ -199,8 +199,7 @@ fn count_consecutive_repeats(entries: &[&TraceEntry], start: usize) -> usize {
     let first = entries[start];
     let mut count = 1;
 
-    for i in (start + 1)..entries.len() {
-        let entry = entries[i];
+    for entry in &entries[(start + 1)..] {
         // Check if opcode and operands match (ignore instruction_number and pc)
         if entry.opcode == first.opcode && entry.operands == first.operands {
             count += 1;

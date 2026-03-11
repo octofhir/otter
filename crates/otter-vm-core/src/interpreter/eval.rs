@@ -96,8 +96,10 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let newly_hot = func
-                                .record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
+                            let newly_hot =
+                                func.record_back_edge_with_threshold(
+                                    otter_vm_exec::jit_hot_threshold(),
+                                );
                             if newly_hot {
                                 func.mark_hot();
                                 if otter_vm_exec::is_jit_enabled() {
@@ -142,7 +144,9 @@ impl Interpreter {
                         let local_count = {
                             let m = ctx.module_table.get(module_id);
                             m.function(func_index)
-                                .ok_or_else(|| VmError::internal("eval: called function not found"))?
+                                .ok_or_else(|| {
+                                    VmError::internal("eval: called function not found")
+                                })?
                                 .local_count
                         };
                         ctx.push_frame(
@@ -155,27 +159,27 @@ impl Interpreter {
                             argc as u16,
                         )?;
                         // Set upvalues on the new frame
-                        if !upvalues.is_empty() {
-                            if let Some(frame) = ctx.current_frame_mut() {
-                                frame.upvalues = upvalues;
-                            }
+                        if !upvalues.is_empty()
+                            && let Some(frame) = ctx.current_frame_mut()
+                        {
+                            frame.upvalues = upvalues;
                         }
                     }
                     DispatchAction::Throw(value) => {
                         // Check if there's a try handler within the eval scope
-                        if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try() {
-                            if target_depth > prev_stack_depth {
-                                // Handler is within eval scope — use it
-                                ctx.take_nearest_try();
-                                while ctx.stack_depth() > target_depth {
-                                    ctx.pop_frame_discard();
-                                }
-                                if let Some(frame) = ctx.current_frame_mut() {
-                                    frame.pc = catch_pc;
-                                }
-                                ctx.set_exception(value);
-                                continue;
+                        if let Some((target_depth, catch_pc)) = ctx.peek_nearest_try()
+                            && target_depth > prev_stack_depth
+                        {
+                            // Handler is within eval scope — use it
+                            ctx.take_nearest_try();
+                            while ctx.stack_depth() > target_depth {
+                                ctx.pop_frame_discard();
                             }
+                            if let Some(frame) = ctx.current_frame_mut() {
+                                frame.pc = catch_pc;
+                            }
+                            ctx.set_exception(value);
+                            continue;
                         }
                         // No handler in eval scope — unwind and propagate to outer
                         while ctx.stack_depth() > prev_stack_depth {
@@ -213,17 +217,17 @@ impl Interpreter {
         for export in &module.exports {
             match export {
                 otter_vm_bytecode::module::ExportRecord::Named { local, exported } => {
-                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
-                        if let Ok(val) = ctx.get_local(idx as u16) {
-                            exports.insert(exported.clone(), val);
-                        }
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local)
+                        && let Ok(val) = ctx.get_local(idx as u16)
+                    {
+                        exports.insert(exported.clone(), val);
                     }
                 }
                 otter_vm_bytecode::module::ExportRecord::Default { local } => {
-                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local) {
-                        if let Ok(val) = ctx.get_local(idx as u16) {
-                            exports.insert("default".to_string(), val);
-                        }
+                    if let Some(idx) = entry_func.local_names.iter().position(|n| n == local)
+                        && let Ok(val) = ctx.get_local(idx as u16)
+                    {
+                        exports.insert("default".to_string(), val);
                     }
                 }
                 _ => {}

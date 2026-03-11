@@ -17,6 +17,9 @@
 //!
 //! Requires `--allow-ffi` permission flag.
 
+#![allow(clippy::type_complexity)]
+#![allow(clippy::missing_safety_doc)]
+
 pub mod call;
 pub mod error;
 pub mod extension;

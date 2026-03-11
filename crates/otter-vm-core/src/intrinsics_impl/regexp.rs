@@ -81,7 +81,7 @@ fn get_regex(this_val: &Value) -> Result<GcRef<JsRegExp>, VmError> {
 /// Get `this` as an object (works for regex values too via their object field).
 fn get_this_object(this_val: &Value) -> Result<GcRef<JsObject>, VmError> {
     if let Some(regex) = this_val.as_regex() {
-        return Ok(regex.object.clone());
+        return Ok(regex.object);
     }
     this_val
         .as_object()
@@ -111,10 +111,10 @@ fn obj_get_with_receiver(
         match desc {
             PropertyDescriptor::Data { value, .. } => Ok(value),
             PropertyDescriptor::Accessor { get, .. } => {
-                if let Some(getter) = get {
-                    if !getter.is_undefined() {
-                        return ncx.call_function(&getter, receiver, &[]);
-                    }
+                if let Some(getter) = get
+                    && !getter.is_undefined()
+                {
+                    return ncx.call_function(&getter, receiver, &[]);
                 }
                 Ok(Value::undefined())
             }
@@ -136,6 +136,7 @@ fn obj_set(
 }
 
 /// Set with custom receiver for setter calls.
+#[allow(dead_code)]
 fn obj_set_with_receiver(
     obj: &GcRef<JsObject>,
     key: &str,
@@ -147,11 +148,11 @@ fn obj_set_with_receiver(
     if let Some(desc) = obj.lookup_property_descriptor(&pk) {
         match desc {
             PropertyDescriptor::Accessor { set, .. } => {
-                if let Some(setter) = set {
-                    if !setter.is_undefined() {
-                        ncx.call_function(&setter, receiver, &[value])?;
-                        return Ok(());
-                    }
+                if let Some(setter) = set
+                    && !setter.is_undefined()
+                {
+                    ncx.call_function(&setter, receiver, &[value])?;
+                    return Ok(());
                 }
                 return Err(VmError::type_error(
                     "Cannot set property which has only a getter",
@@ -211,7 +212,7 @@ fn get_species_constructor(
             PropertyDescriptor::Accessor { get, .. } => {
                 if let Some(getter) = get {
                     if !getter.is_undefined() {
-                        ncx.call_function(&getter, c.clone(), &[])?
+                        ncx.call_function(&getter, c, &[])?
                     } else {
                         Value::undefined()
                     }
@@ -447,7 +448,7 @@ fn build_exec_result(
     has_indices: bool,
     ncx: &NativeContext<'_>,
 ) -> Value {
-    let mm = ncx.memory_manager();
+    let _mm = ncx.memory_manager();
     let num_groups = mat.captures.len();
     let mut out = Vec::with_capacity(num_groups + 1);
 
@@ -458,7 +459,7 @@ fn build_exec_result(
                 let slice = &input.as_utf16()[range.start..range.end];
                 Value::string(JsString::intern_utf16(slice))
             })
-            .unwrap_or(Value::undefined());
+            .unwrap_or_default();
         out.push(val);
     }
 
@@ -501,7 +502,7 @@ fn build_exec_result(
             }
         }
         for name in order {
-            let value = values.remove(&name).unwrap_or(Value::undefined());
+            let value = values.remove(&name).unwrap_or_default();
             let _ = groups.set(PropertyKey::string(&name), value);
         }
         let _ = arr.set(PropertyKey::string("groups"), Value::object(groups));
@@ -513,7 +514,7 @@ fn build_exec_result(
     if has_indices {
         let indices_arr = JsObject::array(num_groups + 1);
         if let Some(array_proto) = get_array_proto(ncx) {
-            indices_arr.set_prototype(Value::object(array_proto.clone()));
+            indices_arr.set_prototype(Value::object(array_proto));
         }
         for idx in 0..=num_groups {
             let index_pair = match mat.group(idx) {
@@ -556,7 +557,7 @@ fn build_exec_result(
                 }
             }
             for name in order {
-                let value = values.remove(&name).unwrap_or(Value::undefined());
+                let value = values.remove(&name).unwrap_or_default();
                 let _ = groups_indices.set(PropertyKey::string(&name), value);
             }
             let _ = indices_arr.set(PropertyKey::string("groups"), Value::object(groups_indices));
@@ -630,12 +631,11 @@ fn set_last_index(regex: &JsRegExp, idx: f64) -> Result<(), VmError> {
     if let Some(desc) = regex
         .object
         .get_own_property_descriptor(&PropertyKey::string("lastIndex"))
+        && !desc.is_writable()
     {
-        if !desc.is_writable() {
-            return Err(VmError::type_error(
-                "Cannot set property lastIndex of regex with non-writable lastIndex",
-            ));
-        }
+        return Err(VmError::type_error(
+            "Cannot set property lastIndex of regex with non-writable lastIndex",
+        ));
     }
     let _ = regex
         .object
@@ -645,12 +645,12 @@ fn set_last_index(regex: &JsRegExp, idx: f64) -> Result<(), VmError> {
 
 /// Set lastIndex on a generic object
 fn set_last_index_obj(obj: &GcRef<JsObject>, idx: f64) -> Result<(), VmError> {
-    if let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::string("lastIndex")) {
-        if !desc.is_writable() {
-            return Err(VmError::type_error(
-                "Cannot set property lastIndex of regex with non-writable lastIndex",
-            ));
-        }
+    if let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::string("lastIndex"))
+        && !desc.is_writable()
+    {
+        return Err(VmError::type_error(
+            "Cannot set property lastIndex of regex with non-writable lastIndex",
+        ));
     }
     let _ = obj.set(PropertyKey::string("lastIndex"), Value::number(idx));
     Ok(())
@@ -790,7 +790,7 @@ fn get_legacy_prop(
     let re_ctor = intrinsics.regexp_constructor;
 
     // Annex B §B.2.4.1: If SameValue(receiver, constructor) is false, throw TypeError
-    if !same_value(this_val, &Value::object(re_ctor.clone())) {
+    if !same_value(this_val, &Value::object(re_ctor)) {
         return Err(VmError::type_error(
             "Legacy RegExp property accessed on illegal receiver",
         ));
@@ -835,7 +835,7 @@ fn set_legacy_prop(
     }
 
     if name == "input" || name == "$_" {
-        let val = args.get(0).cloned().unwrap_or(Value::undefined());
+        let val = args.first().cloned().unwrap_or(Value::undefined());
         let s = ncx.to_string_value(&val)?;
         let _ = re_ctor.set(
             PropertyKey::string("__legacy_input__"),
@@ -855,7 +855,7 @@ pub fn init_regexp_constructor(
     let define_legacy = |name: &str, has_setter: bool| {
         let name_owned = name.to_owned();
         let getter_mm = mm.clone();
-        let getter_fn_proto = fn_proto.clone();
+        let getter_fn_proto = fn_proto;
         let name_owned_for_get = name_owned.clone();
         let getter = Value::native_function_with_proto(
             move |this_val, _args, ncx| get_legacy_prop(ncx, this_val, &name_owned_for_get),
@@ -865,7 +865,7 @@ pub fn init_regexp_constructor(
 
         let setter = if has_setter {
             let setter_mm = mm.clone();
-            let setter_fn_proto = fn_proto.clone();
+            let setter_fn_proto = fn_proto;
             let name_owned_for_set = name_owned.clone();
             Some(Value::native_function_with_proto(
                 move |this_val, args, ncx| {
@@ -934,10 +934,10 @@ fn regexp_exec(
     // overridden exec on this instance. We can skip the expensive property lookup
     // + JS function call and directly invoke the builtin.
     let exec_key = PropertyKey::string("exec");
-    if !obj.has_own(&exec_key) {
-        if let Some(regex) = this_val.as_regex() {
-            return regexp_builtin_exec(&*regex, input, ncx);
-        }
+    if !obj.has_own(&exec_key)
+        && let Some(regex) = this_val.as_regex()
+    {
+        return regexp_builtin_exec(&regex, input, ncx);
     }
 
     // 1. Let exec be ? Get(R, "exec")
@@ -946,7 +946,7 @@ fn regexp_exec(
     // 2. If IsCallable(exec), then
     if exec.is_callable() {
         let input_val = Value::string(JsString::intern(input.as_str()));
-        let result = ncx.call_function(&exec, this_val.clone(), &[input_val])?;
+        let result = ncx.call_function(&exec, *this_val, &[input_val])?;
         if !result.is_null() && !result.is_object() && result.as_array().is_none() {
             return Err(VmError::type_error(
                 "RegExp exec method returned non-object, non-null value",
@@ -957,7 +957,7 @@ fn regexp_exec(
 
     // 3. If R does not have [[RegExpMatcher]], throw TypeError
     let regex = get_regex(this_val)?;
-    regexp_builtin_exec(&*regex, input, ncx)
+    regexp_builtin_exec(&regex, input, ncx)
 }
 
 /// Apply replacement patterns ($&, $1..$99, $$, $`, $', $<name>) on a single match.
@@ -1121,7 +1121,7 @@ fn create_regexp_string_iterator(
     fn_proto: &GcRef<JsObject>,
 ) -> Result<Value, VmError> {
     // Create the iterator object with %IteratorPrototype% as [[Prototype]]
-    let iter = GcRef::new(JsObject::new(Value::object(iterator_prototype.clone())));
+    let iter = GcRef::new(JsObject::new(Value::object(*iterator_prototype)));
 
     // Store internal slots as properties
     let _ = iter.set(PropertyKey::string("__regexp_matcher__"), matcher);
@@ -1144,7 +1144,7 @@ fn create_regexp_string_iterator(
 
     // Define next() method
     let next_mm = mm.clone();
-    let next_fn_proto = fn_proto.clone();
+    let next_fn_proto = *fn_proto;
     let next_fn = Value::native_function_with_proto(
         move |this_val: &Value, _args: &[Value], ncx: &mut NativeContext<'_>| {
             let iter_obj = this_val
@@ -1202,7 +1202,7 @@ fn create_regexp_string_iterator(
             if match_str.is_empty() {
                 let matcher_obj = matcher_val
                     .as_regex()
-                    .map(|r| r.object.clone())
+                    .map(|r| r.object)
                     .or_else(|| matcher_val.as_object())
                     .ok_or_else(|| VmError::type_error("matcher is not an object"))?;
                 let this_index = get_last_index_obj(&matcher_obj, ncx)? as usize;
@@ -1237,9 +1237,9 @@ fn create_regexp_string_iterator(
 
     // Define [Symbol.iterator]() { return this; }
     let self_iter_fn = Value::native_function_with_proto(
-        |this_val: &Value, _args: &[Value], _ncx: &mut NativeContext<'_>| Ok(this_val.clone()),
+        |this_val: &Value, _args: &[Value], _ncx: &mut NativeContext<'_>| Ok(*this_val),
         mm.clone(),
-        fn_proto.clone(),
+        *fn_proto,
     );
     iter.define_property(
         PropertyKey::Symbol(crate::intrinsics::well_known::iterator_symbol()),
@@ -1259,7 +1259,7 @@ fn create_regexp_string_iterator(
 fn make_iter_result(
     value: Value,
     done: bool,
-    ncx: &mut NativeContext<'_>,
+    _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
     let result = GcRef::new(JsObject::new(Value::null()));
     let _ = result.set(PropertyKey::string("value"), value);
@@ -1331,7 +1331,7 @@ pub fn init_regexp_prototype(
         "test",
         1,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             let input_str = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
             let input = JsString::intern(&input_str);
@@ -1349,7 +1349,7 @@ pub fn init_regexp_prototype(
         "exec",
         1,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             let regex = get_regex(this_val)?;
             let input_str = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
@@ -1366,12 +1366,12 @@ pub fn init_regexp_prototype(
         "toString",
         0,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, _args, ncx| {
             let obj = get_this_object(this_val)?;
-            let source_val = obj_get_with_receiver(&obj, "source", this_val.clone(), ncx)?;
+            let source_val = obj_get_with_receiver(&obj, "source", *this_val, ncx)?;
             let source = ncx.to_string_value(&source_val)?;
-            let flags_val = obj_get_with_receiver(&obj, "flags", this_val.clone(), ncx)?;
+            let flags_val = obj_get_with_receiver(&obj, "flags", *this_val, ncx)?;
             let flags = ncx.to_string_value(&flags_val)?;
             Ok(Value::string(intern(&format!("/{}/{}", source, flags))))
         },
@@ -1385,7 +1385,7 @@ pub fn init_regexp_prototype(
         "compile",
         2,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             // Step 1: Let O be the this value.
             let regex = get_regex(this_val)?;
@@ -1434,14 +1434,14 @@ pub fn init_regexp_prototype(
             // Validate flags
             for c in flags.chars() {
                 if !"dgimsuyv".contains(c) {
-                    return Err(VmError::syntax_error(&format!("Invalid flag: {}", c)));
+                    return Err(VmError::syntax_error(format!("Invalid flag: {}", c)));
                 }
             }
             // Check duplicate flags
             let mut seen = std::collections::HashSet::new();
             for c in flags.chars() {
                 if !seen.insert(c) {
-                    return Err(VmError::syntax_error(&format!("Duplicate flag: {}", c)));
+                    return Err(VmError::syntax_error(format!("Duplicate flag: {}", c)));
                 }
             }
 
@@ -1451,7 +1451,7 @@ pub fn init_regexp_prototype(
             let native_regex = match regress::Regex::with_flags(&engine_pattern, parsed_flags) {
                 Ok(re) => Some(re),
                 Err(_e) => {
-                    return Err(VmError::syntax_error(&format!(
+                    return Err(VmError::syntax_error(format!(
                         "Invalid regular expression: /{}/: Invalid pattern",
                         pattern
                     )));
@@ -1476,19 +1476,18 @@ pub fn init_regexp_prototype(
             if let Some(desc) = regex
                 .object
                 .get_own_property_descriptor(&PropertyKey::string("lastIndex"))
+                && !desc.is_writable()
             {
-                if !desc.is_writable() {
-                    return Err(VmError::type_error(
-                        "Cannot set property lastIndex of regex with non-writable lastIndex",
-                    ));
-                }
+                return Err(VmError::type_error(
+                    "Cannot set property lastIndex of regex with non-writable lastIndex",
+                ));
             }
             let _ = regex
                 .object
                 .set(PropertyKey::string("lastIndex"), Value::int32(0));
 
             // Return this (the same regex object)
-            Ok(this_val.clone())
+            Ok(*this_val)
         },
     );
 
@@ -1501,7 +1500,7 @@ pub fn init_regexp_prototype(
         "[Symbol.match]",
         1,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             // 1. Let rx be the this value.
             let rx = get_this_object(this_val)?;
@@ -1509,7 +1508,7 @@ pub fn init_regexp_prototype(
             let input_str = ncx.to_string_value(args.first().unwrap_or(&Value::undefined()))?;
             let input = JsString::intern(&input_str);
             // 3. Let flags be ? ToString(? Get(rx, "flags"))
-            let flags_val = obj_get_with_receiver(&rx, "flags", this_val.clone(), ncx)?;
+            let flags_val = obj_get_with_receiver(&rx, "flags", *this_val, ncx)?;
             let flags = ncx.to_string_value(&flags_val)?;
             let is_global = flags.contains('g');
 
@@ -1573,16 +1572,16 @@ pub fn init_regexp_prototype(
     // RegExp.prototype[Symbol.matchAll](string) §22.2.5.7
     // Returns a %RegExpStringIteratorPrototype% that lazily yields exec results.
     // ====================================================================
-    let iter_proto_for_matchall = iterator_prototype.clone();
+    let iter_proto_for_matchall = iterator_prototype;
     let mm_for_matchall = mm.clone();
-    let fn_proto_for_matchall = fn_proto.clone();
+    let fn_proto_for_matchall = fn_proto;
     define_symbol_method(
         &regexp_proto,
         crate::intrinsics::well_known::match_all_symbol(),
         "[Symbol.matchAll]",
         1,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         move |this_val, args, ncx| {
             // 1. Let R be the this value.
             let rx = get_this_object(this_val)?;
@@ -1591,14 +1590,14 @@ pub fn init_regexp_prototype(
             let input = JsString::intern(&input_str);
 
             // 3. Let flags be ? ToString(? Get(R, "flags"))
-            let flags_val = obj_get_with_receiver(&rx, "flags", this_val.clone(), ncx)?;
+            let flags_val = obj_get_with_receiver(&rx, "flags", *this_val, ncx)?;
             let flags = ncx.to_string_value(&flags_val)?;
 
             // 4. Let C be ? SpeciesConstructor(R, %RegExp%)
             // 5. Let matcher be ? Construct(C, « R, flags »)
             let species_ctor = get_species_constructor(&rx, ncx)?;
             let (matcher_val, matcher_obj) = if let Some(ctor) = species_ctor {
-                let ctor_args = [this_val.clone(), Value::string(intern(&flags))];
+                let ctor_args = [*this_val, Value::string(intern(&flags))];
                 let result = ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
                 let obj = get_this_object(&result)?;
                 (result, obj)
@@ -1610,20 +1609,20 @@ pub fn init_regexp_prototype(
                     flags.clone(),
                     proto_obj,
                 ));
-                let val = Value::regex(new_regex.clone());
-                let obj = new_regex.object.clone();
+                let val = Value::regex(new_regex);
+                let obj = new_regex.object;
                 (val, obj)
             } else {
                 // Generic object with no species — use default RegExp constructor
                 let regexp_ctor = ncx.ctx.get_global("RegExp");
                 if let Some(ctor) = regexp_ctor {
-                    let ctor_args = [this_val.clone(), Value::string(intern(&flags))];
+                    let ctor_args = [*this_val, Value::string(intern(&flags))];
                     let result =
                         ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
                     let obj = get_this_object(&result)?;
                     (result, obj)
                 } else {
-                    (this_val.clone(), rx.clone())
+                    (*this_val, rx)
                 }
             };
 
@@ -1657,7 +1656,7 @@ pub fn init_regexp_prototype(
         "[Symbol.replace]",
         2,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             // 1. Let rx be the this value.
             let rx = get_this_object(this_val)?;
@@ -1668,7 +1667,7 @@ pub fn init_regexp_prototype(
             let input_len = input.len_utf16();
 
             // 4. Let flags be ? ToString(? Get(rx, "flags"))
-            let flags_val = obj_get_with_receiver(&rx, "flags", this_val.clone(), ncx)?;
+            let flags_val = obj_get_with_receiver(&rx, "flags", *this_val, ncx)?;
             let flags = ncx.to_string_value(&flags_val)?;
             let is_global = flags.contains('g');
             let full_unicode = flags.contains('u') || flags.contains('v');
@@ -1692,7 +1691,7 @@ pub fn init_regexp_prototype(
                 if result.is_null() {
                     break;
                 }
-                results.push(result.clone());
+                results.push(result);
                 if !is_global {
                     break;
                 }
@@ -1760,13 +1759,13 @@ pub fn init_regexp_prototype(
                     let mut call_args = Vec::new();
                     call_args.push(Value::string(intern(&matched)));
                     for cap in &captures {
-                        call_args.push(cap.clone());
+                        call_args.push(*cap);
                     }
                     call_args.push(Value::number(position as f64));
-                    call_args.push(Value::string(input.clone()));
+                    call_args.push(Value::string(input));
                     // Per spec: if namedCaptures is not undefined, append it
                     if !named_captures_val.is_undefined() {
-                        call_args.push(named_captures_val.clone());
+                        call_args.push(named_captures_val);
                     }
                     let replace_result =
                         ncx.call_function(&replace_val, Value::undefined(), &call_args)?;
@@ -1843,7 +1842,7 @@ pub fn init_regexp_prototype(
         "[Symbol.search]",
         1,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             // 1. Let rx be the this value.
             let rx = get_this_object(this_val)?;
@@ -1894,7 +1893,7 @@ pub fn init_regexp_prototype(
         "[Symbol.split]",
         2,
         mm,
-        fn_proto.clone(),
+        fn_proto,
         |this_val, args, ncx| {
             // 1. Let rx be the this value
             let rx = get_this_object(this_val)?;
@@ -1904,7 +1903,7 @@ pub fn init_regexp_prototype(
             let limit_val = args.get(1).cloned().unwrap_or(Value::undefined());
 
             // 3. Let flags be ? ToString(? Get(rx, "flags"))
-            let flags_val = obj_get_with_receiver(&rx, "flags", this_val.clone(), ncx)?;
+            let flags_val = obj_get_with_receiver(&rx, "flags", *this_val, ncx)?;
             let flags = ncx.to_string_value(&flags_val)?;
             let unicode = flags.contains('u') || flags.contains('v');
 
@@ -1918,7 +1917,7 @@ pub fn init_regexp_prototype(
             let species_ctor = get_species_constructor(&rx, ncx)?;
             let (splitter_val, splitter_obj) = if let Some(ctor) = species_ctor {
                 // Construct(C, [R, newFlags])
-                let ctor_args = [this_val.clone(), Value::string(intern(&new_flags))];
+                let ctor_args = [*this_val, Value::string(intern(&new_flags))];
                 let result = ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
                 let obj = get_this_object(&result)?;
                 (result, obj)
@@ -1928,20 +1927,20 @@ pub fn init_regexp_prototype(
                 let proto_obj = proto.as_object();
                 let new_regex =
                     GcRef::new(JsRegExp::new(regex.pattern.clone(), new_flags, proto_obj));
-                let val = Value::regex(new_regex.clone());
-                let obj = new_regex.object.clone();
+                let val = Value::regex(new_regex);
+                let obj = new_regex.object;
                 (val, obj)
             } else {
                 // Generic object with no species — use default RegExp constructor
                 let regexp_ctor = ncx.ctx.get_global("RegExp");
                 if let Some(ctor) = regexp_ctor {
-                    let ctor_args = [this_val.clone(), Value::string(intern(&new_flags))];
+                    let ctor_args = [*this_val, Value::string(intern(&new_flags))];
                     let result =
                         ncx.call_function_construct(&ctor, Value::undefined(), &ctor_args)?;
                     let obj = get_this_object(&result)?;
                     (result, obj)
                 } else {
-                    (this_val.clone(), rx.clone())
+                    (*this_val, rx)
                 }
             };
 
@@ -2070,7 +2069,7 @@ pub fn init_regexp_prototype(
             // Per spec, flags getter always uses Get() to read each flag property.
             // This ensures custom getters on the instance or prototype are invoked.
             let obj = if let Some(regex) = this_val.as_regex() {
-                regex.object.clone()
+                regex.object
             } else if let Some(obj) = this_val.as_object() {
                 obj
             } else {
@@ -2090,7 +2089,7 @@ pub fn init_regexp_prototype(
                 ("sticky", 'y'),
             ];
             for (prop, ch) in flag_checks {
-                let val = obj_get_with_receiver(&obj, prop, this_val.clone(), ncx)?;
+                let val = obj_get_with_receiver(&obj, prop, *this_val, ncx)?;
                 if val.to_boolean() {
                     flags.push(ch);
                 }
@@ -2098,7 +2097,7 @@ pub fn init_regexp_prototype(
             Ok(Value::string(intern(&flags)))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     set_function_props(&flags_getter, "get flags", 0);
     regexp_proto.define_property(
@@ -2111,7 +2110,7 @@ pub fn init_regexp_prototype(
     );
 
     // RegExp.prototype.source §22.2.5.12 (accessor getter)
-    let source_proto = regexp_proto.clone();
+    let source_proto = regexp_proto;
     let source_getter = Value::native_function_with_proto(
         move |this_val, _args, _ncx| {
             if let Some(regex) = this_val.as_regex() {
@@ -2123,17 +2122,17 @@ pub fn init_regexp_prototype(
                 return Ok(Value::string(intern(&source)));
             }
             // Per spec: if SameValue(R, %RegExpPrototype%), return "(?:)"
-            if let Some(obj) = this_val.as_object() {
-                if std::ptr::eq(obj.as_ptr(), source_proto.as_ptr()) {
-                    return Ok(Value::string(intern("(?:)")));
-                }
+            if let Some(obj) = this_val.as_object()
+                && std::ptr::eq(obj.as_ptr(), source_proto.as_ptr())
+            {
+                return Ok(Value::string(intern("(?:)")));
             }
             Err(VmError::type_error(
                 "RegExp.prototype.source requires a RegExp receiver",
             ))
         },
         mm.clone(),
-        fn_proto.clone(),
+        fn_proto,
     );
     set_function_props(&source_getter, "get source", 0);
     regexp_proto.define_property(
@@ -2154,7 +2153,7 @@ pub fn init_regexp_prototype(
     // This is slightly more permissive but passes tests.
     {
         let mm = mm.clone();
-        let fn_proto_clone = fn_proto.clone();
+        let fn_proto_clone = fn_proto;
         let define_flag_getter =
             |proto: &GcRef<JsObject>,
              name: &'static str,
@@ -2168,12 +2167,12 @@ pub fn init_regexp_prototype(
                             return Ok(Value::boolean(regex.flags.contains(flag_char)));
                         }
                         // Per spec: if SameValue(R, %RegExpPrototype%), return undefined
-                        if let Some(obj) = this_val.as_object() {
-                            if std::ptr::eq(obj.as_ptr(), regexp_proto_ref.as_ptr()) {
-                                return Ok(Value::undefined());
-                            }
+                        if let Some(obj) = this_val.as_object()
+                            && std::ptr::eq(obj.as_ptr(), regexp_proto_ref.as_ptr())
+                        {
+                            return Ok(Value::undefined());
                         }
-                        Err(VmError::type_error(&format!(
+                        Err(VmError::type_error(format!(
                             "RegExp.prototype.{} requires a RegExp receiver",
                             name
                         )))
@@ -2198,56 +2197,56 @@ pub fn init_regexp_prototype(
             "global",
             'g',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "ignoreCase",
             'i',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "multiline",
             'm',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "dotAll",
             's',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "sticky",
             'y',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "unicode",
             'u',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
             "unicodeSets",
             'v',
             &mm,
-            fn_proto_clone.clone(),
-            regexp_proto.clone(),
+            fn_proto_clone,
+            regexp_proto,
         );
         define_flag_getter(
             &regexp_proto,
@@ -2255,7 +2254,7 @@ pub fn init_regexp_prototype(
             'd',
             &mm,
             fn_proto_clone,
-            regexp_proto.clone(),
+            regexp_proto,
         );
     }
 }
@@ -2283,7 +2282,7 @@ pub fn create_regexp_constructor(
                 // i. Let patternConstructor be ? Get(pattern, "constructor").
                 let pattern_obj = pattern_arg
                     .as_object()
-                    .or_else(|| pattern_arg.as_regex().map(|r| r.object.clone()));
+                    .or_else(|| pattern_arg.as_regex().map(|r| r.object));
                 if let Some(obj) = pattern_obj {
                     let pattern_constructor = crate::object::get_value_full(
                         &obj,
@@ -2295,7 +2294,7 @@ pub fn create_regexp_constructor(
                         &pattern_constructor,
                         &regexp_ctor,
                     ) {
-                        return Ok(pattern_arg.clone());
+                        return Ok(pattern_arg);
                     }
                 }
             }
@@ -2312,7 +2311,7 @@ pub fn create_regexp_constructor(
         } else if pattern_is_regexp {
             let obj = pattern_arg
                 .as_object()
-                .or_else(|| pattern_arg.as_regex().map(|r| r.object.clone()))
+                .or_else(|| pattern_arg.as_regex().map(|r| r.object))
                 .unwrap();
             let p_val = obj_get(&obj, "source", ncx)?;
             let p = if p_val.is_undefined() {
@@ -2324,7 +2323,7 @@ pub fn create_regexp_constructor(
             let f_val = if flags_arg.is_undefined() {
                 obj_get(&obj, "flags", ncx)?
             } else {
-                flags_arg.clone()
+                flags_arg
             };
             let f = if f_val.is_undefined() {
                 String::new()
@@ -2349,13 +2348,13 @@ pub fn create_regexp_constructor(
         // Validate flags
         for c in flags_str.chars() {
             if !"dgimsuyv".contains(c) {
-                return Err(VmError::syntax_error(&format!("Invalid flag: {}", c)));
+                return Err(VmError::syntax_error(format!("Invalid flag: {}", c)));
             }
         }
         let mut seen = std::collections::HashSet::new();
         for c in flags_str.chars() {
             if !seen.insert(c) {
-                return Err(VmError::syntax_error(&format!("Duplicate flag: {}", c)));
+                return Err(VmError::syntax_error(format!("Duplicate flag: {}", c)));
             }
         }
 
@@ -2369,9 +2368,9 @@ pub fn create_regexp_constructor(
             this_val
                 .as_object()
                 .and_then(|o| o.prototype().as_object())
-                .unwrap_or_else(|| regexp_proto.clone())
+                .unwrap_or(regexp_proto)
         } else {
-            regexp_proto.clone()
+            regexp_proto
         };
 
         let regex = GcRef::new(JsRegExp::new(pattern_str, flags_str, Some(proto)));

@@ -35,7 +35,7 @@ pub enum MediaType {
 /// Resolution result from a module provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleResolution {
-    /// Canonical URL for the module (e.g., "builtin://node:fs")
+    /// Canonical URL for the module (e.g., "node:fs", "otter:ffi")
     pub url: String,
     /// Module type (ESM, CommonJS, JSON)
     pub module_type: ModuleType,
@@ -66,7 +66,7 @@ pub struct ModuleSource {
 ///     fn resolve(&self, specifier: &str, _referrer: &str) -> Option<ModuleResolution> {
 ///         if specifier.starts_with("my:") {
 ///             Some(ModuleResolution {
-///                 url: format!("builtin://{}", specifier),
+///                 url: specifier.to_string(),  // Use specifier as canonical URL
 ///                 module_type: ModuleType::ESM,
 ///             })
 ///         } else { None }
@@ -103,7 +103,7 @@ pub trait ModuleProvider: Send + Sync {
     /// Returns `None` to delegate to the next provider in the chain.
     ///
     /// # Arguments
-    /// * `url` - The resolved canonical URL (e.g., "builtin://node:fs")
+    /// * `url` - The resolved canonical URL (e.g., "node:fs")
     fn load(&self, url: &str) -> Option<ModuleSource>;
 }
 

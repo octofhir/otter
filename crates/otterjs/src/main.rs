@@ -77,6 +77,10 @@ struct Cli {
     #[arg(long = "allow-run", global = true)]
     allow_run: bool,
 
+    /// Allow FFI (foreign function interface) access
+    #[arg(long = "allow-ffi", global = true)]
+    allow_ffi: bool,
+
     /// Node.js API profile (`none`, `safe-core`, `full`)
     #[arg(long = "node-api", value_enum, global = true, default_value_t = NodeApiMode::Full)]
     node_api: NodeApiMode,
@@ -336,6 +340,7 @@ fn build_capabilities(cli: &Cli) -> otter_engine::Capabilities {
             .allow_read_all()
             .allow_write_all()
             .allow_env_all()
+            .allow_ffi()
             .build()
     } else {
         let mut builder = CapabilitiesBuilder::new();
@@ -350,6 +355,9 @@ fn build_capabilities(cli: &Cli) -> otter_engine::Capabilities {
         }
         if cli.allow_env {
             builder = builder.allow_env_all();
+        }
+        if cli.allow_ffi {
+            builder = builder.allow_ffi();
         }
         builder.build()
     }

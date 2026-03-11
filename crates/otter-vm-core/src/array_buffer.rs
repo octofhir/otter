@@ -49,6 +49,15 @@ impl JsArrayBuffer {
         }
     }
 
+    /// Create an ArrayBuffer from existing data
+    pub fn from_data(data: Vec<u8>, prototype: GcRef<JsObject>) -> Self {
+        Self {
+            object: GcRef::new(JsObject::new(Value::object(prototype))),
+            data: RefCell::new(Some(data)),
+            max_byte_length: None,
+        }
+    }
+
     /// Create a new resizable ArrayBuffer (ES2024)
     pub fn new_resizable(
         byte_length: usize,
@@ -193,6 +202,17 @@ impl JsArrayBuffer {
             }
         }
         false
+    }
+
+    /// Get the raw pointer to the underlying data.
+    /// Returns 0 if detached. The pointer is valid as long as the buffer
+    /// is not detached, resized, or garbage-collected.
+    pub fn data_ptr(&self) -> usize {
+        let guard = self.data.borrow();
+        match guard.as_ref() {
+            Some(d) => d.as_ptr() as usize,
+            None => 0,
+        }
     }
 
     /// Get raw access to the data (for TypedArray views)

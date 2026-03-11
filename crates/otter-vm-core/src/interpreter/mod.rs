@@ -4617,6 +4617,28 @@ impl Interpreter {
                         );
                     }
 
+                    // Record FFI call target IC for JIT fast path
+                    if *ic_index > 0 {
+                        if let Some(ffi_info_ptr) = func_value.ffi_call_info() {
+                            if let Some(frame) = ctx.current_frame() {
+                                let feedback = frame.feedback().write();
+                                if let Some(md) = feedback.get_mut(*ic_index as usize) {
+                                    let bits = func_value.to_bits_raw();
+                                    if md.callee_bits != bits {
+                                        if md.ffi_call_info_ptr == 0 {
+                                            md.callee_bits = bits;
+                                            md.ffi_call_info_ptr = ffi_info_ptr as u64;
+                                        } else {
+                                            // Multiple FFI targets → megamorphic
+                                            md.ffi_call_info_ptr = 0;
+                                            md.call_target_func_index = u32::MAX;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Call the native function with depth tracking
                     let result = self.call_native_fn(ctx, native_fn, &Value::undefined(), &args)?;
                     ctx.set_register(dst.0, result);

@@ -2,7 +2,7 @@
  * Otter FFI (Foreign Function Interface)
  *
  * Load and call native C/C++ shared libraries directly from JavaScript/TypeScript.
- * API is source-compatible with bun:ffi.
+ * API follows common runtime FFI conventions.
  *
  * Requires --allow-ffi permission flag.
  *

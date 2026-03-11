@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::instruction::Instruction;
 use crate::operand::LocalIndex;
 
-/// Threshold for marking a function as "hot" (candidate for JIT compilation)
-pub const HOT_FUNCTION_THRESHOLD: u32 = 1000;
+/// Threshold for marking a function as "hot" (candidate for JIT compilation).
+/// Lowered from 1000 to 100 for faster JIT warmup; the back-edge counter
+/// separately triggers loop-hot compilation regardless of this value.
+pub const HOT_FUNCTION_THRESHOLD: u32 = 100;
 
 /// Number of IC hits before quickening an instruction.
 /// After this many consistent type observations, the generic instruction
@@ -272,6 +274,10 @@ pub struct InstructionMetadata {
     pub call_target_module_id: u64,
     /// Call target IC: cached is_async flag.
     pub call_target_is_async: bool,
+    /// FFI call info pointer for JIT fast path.
+    /// When non-zero, the call target is a native FFI function and this points
+    /// to a `FfiCallInfo` struct for direct C call dispatch.
+    pub ffi_call_info_ptr: u64,
 
     // --- Profiling counters (only active with `profiling` feature) ---
     /// Number of IC cache hits (monomorphic or polymorphic)

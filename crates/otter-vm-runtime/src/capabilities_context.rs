@@ -86,6 +86,11 @@ pub fn can_write(path: &str) -> bool {
     with_capabilities(|caps| caps.can_write(path))
 }
 
+/// Check if FFI is allowed
+pub fn can_ffi() -> bool {
+    with_capabilities(|caps| caps.can_ffi())
+}
+
 /// RAII guard for capabilities - clears when dropped
 pub struct CapabilitiesGuard {
     _private: (),

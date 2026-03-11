@@ -571,7 +571,7 @@ impl Interpreter {
                 return Ok(PropertyKey::Index(n));
             }
         }
-        Ok(PropertyKey::string(&key_str))
+        Ok(PropertyKey::string_transient(&key_str))
     }
 
     /// Abstract equality comparison (==) per ES2023 §7.2.14 IsLooselyEqual

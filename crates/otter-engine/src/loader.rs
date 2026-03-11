@@ -295,10 +295,10 @@ impl ModuleLoader {
             return Ok(format!("otter:{}", specifier));
         }
 
-        // Node built-ins (prefixed and bare) are canonicalized to builtin://node:*
+        // Node built-ins (prefixed and bare) are canonicalized to node:*
         if is_builtin_for_profile(specifier, self.config.node_api_profile) {
             let name = specifier.strip_prefix("node:").unwrap_or(specifier);
-            return Ok(format!("builtin://node:{}", name));
+            return Ok(format!("node:{}", name));
         }
 
         // npm namespace support (initial Bun-style path): `npm:pkg` -> resolve as `pkg`.
@@ -365,7 +365,7 @@ impl ModuleLoader {
 
     /// Load module from URL
     async fn load_url(&self, url: &str) -> EngineResult<ResolvedModule> {
-        if let Some(name) = url.strip_prefix("builtin://node:") {
+        if let Some(name) = url.strip_prefix("node:") {
             return self.load_node_builtin(name);
         }
 
@@ -495,7 +495,7 @@ impl ModuleLoader {
 
         Ok(ResolvedModule {
             specifier: format!("node:{}", name),
-            url: format!("builtin://node:{}", name),
+            url: format!("node:{}", name),
             source: String::new(),
             source_type: SourceType::JavaScript,
             module_type: ModuleType::ESM,
@@ -692,14 +692,14 @@ mod tests {
     fn test_resolve_node_imports_prefixed() {
         let loader = loader_for_profile(NodeApiProfile::Full);
         let result = loader.resolve("node:fs", None).unwrap();
-        assert_eq!(result, "builtin://node:fs");
+        assert_eq!(result, "node:fs");
     }
 
     #[test]
     fn test_resolve_node_imports_bare() {
         let loader = loader_for_profile(NodeApiProfile::Full);
         let result = loader.resolve("path", None).unwrap();
-        assert_eq!(result, "builtin://node:path");
+        assert_eq!(result, "node:path");
     }
 
     #[test]
@@ -713,7 +713,7 @@ mod tests {
     fn test_resolve_node_imports_safe_profile() {
         let loader = loader_for_profile(NodeApiProfile::SafeCore);
         let path = loader.resolve("path", None).unwrap();
-        assert_eq!(path, "builtin://node:path");
+        assert_eq!(path, "node:path");
         assert!(loader.resolve("process", None).is_err());
     }
 

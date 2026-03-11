@@ -213,10 +213,12 @@ pub enum HelperKind {
     CallMono = 84,
     /// `(ctx, obj, idx) -> value`
     GetElemInt = 85,
+    /// `(ctx, callee, argc, argv_ptr, ffi_call_info_ptr) -> value` — FFI direct call
+    CallFfi = 86,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 86;
+pub const HELPER_COUNT: usize = 87;
 
 /// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
 /// Used by IteratorNext to return both value and done flag.
@@ -342,6 +344,7 @@ impl HelperKind {
             Self::GetPropMono => "otter_rt_get_prop_mono",
             Self::CallMono => "otter_rt_call_mono",
             Self::GetElemInt => "otter_rt_get_elem_int",
+            Self::CallFfi => "otter_rt_call_ffi",
         }
     }
 
@@ -428,7 +431,8 @@ impl HelperKind {
             | Self::CallSpread
             | Self::ConstructSpread
             | Self::CallMethodComputedSpread
-            | Self::CallMono => 5,
+            | Self::CallMono
+            | Self::CallFfi => 5,
             Self::CallMethod | Self::CallMethodComputed => 6,
             Self::ImportOp | Self::ForInNext => 2,
             Self::ExportOp => 3,

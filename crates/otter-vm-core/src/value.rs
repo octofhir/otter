@@ -257,6 +257,57 @@ impl otter_vm_gc::GcTraceable for Closure {
     }
 }
 
+/// Opaque FFI call metadata for JIT fast path.
+///
+/// Created by `otter-ffi` when binding FFI symbols. The trampoline function
+/// performs the actual C call (marshaling JS values to C types and back)
+/// without requiring `otter-vm-core` to depend on `libffi`.
+pub struct FfiCallInfo {
+    /// Trampoline: `(opaque, fn_ptr, js_args_ptr, js_argc) -> NaN-boxed i64`
+    ///
+    /// - `opaque`: pointer to pre-built libffi state (CIF, arg types, return type)
+    /// - `fn_ptr`: raw C function pointer from dlsym
+    /// - `js_args_ptr`: pointer to array of NaN-boxed i64 JS argument values
+    /// - `js_argc`: number of JS arguments
+    pub trampoline: unsafe extern "C" fn(*const (), usize, *const i64, u16) -> i64,
+    /// Raw C function pointer (from dlsym)
+    pub fn_ptr: usize,
+    /// Opaque data pointer (owned by creator, e.g. pre-built CIF + type info)
+    pub opaque: *const (),
+    /// Drop function for the opaque data
+    pub opaque_drop: Option<unsafe fn(*const ())>,
+    /// Expected argument count for quick validation
+    pub arg_count: u16,
+}
+
+// SAFETY: FfiCallInfo is confined to a single-threaded VM isolate.
+// The fn_ptr and opaque pointers are stable for the lifetime of the FFI library.
+unsafe impl Send for FfiCallInfo {}
+unsafe impl Sync for FfiCallInfo {}
+
+impl Clone for FfiCallInfo {
+    fn clone(&self) -> Self {
+        // Shallow clone — opaque pointer is shared (the underlying CIF/type data is stable)
+        Self {
+            trampoline: self.trampoline,
+            fn_ptr: self.fn_ptr,
+            opaque: self.opaque,
+            opaque_drop: None, // only the original owns the opaque data
+            arg_count: self.arg_count,
+        }
+    }
+}
+
+impl Drop for FfiCallInfo {
+    fn drop(&mut self) {
+        if let Some(drop_fn) = self.opaque_drop {
+            if !self.opaque.is_null() {
+                unsafe { drop_fn(self.opaque) };
+            }
+        }
+    }
+}
+
 /// A native function with an attached object for properties.
 #[derive(Clone)]
 pub struct NativeFunctionObject {
@@ -264,6 +315,10 @@ pub struct NativeFunctionObject {
     pub func: NativeFn,
     /// Attached object for properties (GC-managed)
     pub object: GcRef<JsObject>,
+    /// Optional FFI call info for JIT fast path.
+    /// When set, the JIT can bypass the NativeFn dispatch and call
+    /// the C function directly through the trampoline.
+    pub ffi_info: Option<Box<FfiCallInfo>>,
 }
 
 impl otter_vm_gc::GcTraceable for NativeFunctionObject {
@@ -642,7 +697,7 @@ impl Value {
     {
         let func: NativeFn = Arc::new(f);
         let object = GcRef::new(JsObject::new(Value::null()));
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -658,7 +713,7 @@ impl Value {
         _memory_manager: Arc<crate::memory::MemoryManager>,
     ) -> Self {
         let object = GcRef::new(JsObject::new(Value::null()));
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -691,7 +746,7 @@ impl Value {
             crate::object::PropertyKey::string("__non_constructor"),
             Value::boolean(true),
         );
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         let ptr = native.as_ptr() as u64;
         Self {
             bits: TAG_PTR_FUNCTION | (ptr & PAYLOAD_MASK),
@@ -746,7 +801,7 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -799,7 +854,7 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -823,7 +878,7 @@ impl Value {
                 crate::object::PropertyDescriptor::builtin_data(Value::int32(realm_id)),
             );
         }
-        let native = GcRef::new(NativeFunctionObject { func, object });
+        let native = GcRef::new(NativeFunctionObject { func, object, ffi_info: None });
         Self {
             bits: TAG_PTR_FUNCTION | (native.as_ptr() as u64 & PAYLOAD_MASK),
         }
@@ -1473,6 +1528,34 @@ impl Value {
         }
     }
 
+    /// Get the FFI call info pointer from a native function, if it has one.
+    /// Returns a raw pointer that's valid as long as the NativeFunctionObject is alive.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn ffi_call_info(&self) -> Option<*const FfiCallInfo> {
+        if self.is_native_function() {
+            let nfo: GcRef<NativeFunctionObject> = unsafe { self.extract_gcref() };
+            let nfo_ref = unsafe { &*nfo.as_ptr() };
+            nfo_ref.ffi_info.as_ref().map(|b| &**b as *const FfiCallInfo)
+        } else {
+            None
+        }
+    }
+
+    /// Set FFI call info on a native function for JIT fast path.
+    ///
+    /// # Safety
+    /// Must only be called on a Value that is a native function.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub unsafe fn set_ffi_call_info(&self, info: FfiCallInfo) {
+        if self.is_native_function() {
+            let nfo: GcRef<NativeFunctionObject> = self.extract_gcref();
+            let nfo_mut = &mut *(nfo.as_ptr() as *mut NativeFunctionObject);
+            nfo_mut.ffi_info = Some(Box::new(info));
+        }
+    }
+
     /// Get as closure (GC-managed Closure).
     /// Note: `as_function()` returns the same thing; this is an alias for clarity.
     pub fn as_closure(&self) -> Option<GcRef<Closure>> {
@@ -1494,6 +1577,15 @@ impl Value {
     #[inline(always)]
     pub fn to_bits_raw(&self) -> u64 {
         self.bits
+    }
+
+    /// Reconstruct a Value from raw NaN-boxed bits.
+    ///
+    /// # Safety
+    /// The caller must ensure `bits` is a valid NaN-boxed value encoding.
+    #[inline(always)]
+    pub unsafe fn from_bits_raw(bits: u64) -> Self {
+        Self { bits }
     }
 
     /// Get the GC header pointer for this value (if it's a GC-managed type)

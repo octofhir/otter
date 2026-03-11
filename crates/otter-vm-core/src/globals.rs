@@ -828,124 +828,168 @@ pub fn js_number_to_string(n: f64) -> String {
     let negative = n < 0.0 || (n == 0.0 && n.is_sign_negative());
     let abs_n = n.abs();
 
-    // Integer check: if no fractional part AND magnitude < 10^21
+    // Integer fast path: use itoa for zero-alloc integer formatting.
+    // Only use `as u64` for values within safe integer range (2^53) where
+    // the f64→u64 conversion is exact. Larger values go through ryu to get
+    // the shortest representation that round-trips correctly.
     if abs_n.fract() == 0.0 && abs_n < 1e21 {
-        // For values that fit in u64, use integer formatting directly
-        if abs_n <= u64::MAX as f64 {
+        if abs_n <= 9007199254740992.0 {
+            // Safe integer range (≤ 2^53): exact conversion
             let int_val = abs_n as u64;
+            let mut buf = itoa::Buffer::new();
+            let s = buf.format(int_val);
             return if negative {
-                format!("-{}", int_val)
+                let mut result = String::with_capacity(s.len() + 1);
+                result.push('-');
+                result.push_str(s);
+                result
             } else {
-                format!("{}", int_val)
+                s.to_string()
             };
         }
-        // For large integers (> u64::MAX but < 1e21), format as fixed-point
-        // and strip the trailing ".0" that Rust adds
-        let s = format!("{:.0}", abs_n);
-        return if negative { format!("-{}", s) } else { s };
+        // Large integers (> 2^53 but < 1e21): fall through to ryu path
+        // for shortest representation
     }
 
-    // For all other numbers, use shortest representation matching JS semantics.
-    // Rust's {:e} gives scientific notation; we reformat to match JS output.
-    //
-    // Strategy: get the significant digits via ryu-like formatting, then
-    // apply JS exponent rules.
-    //
-    // JS rules for non-integer or large numbers:
-    // - If 1 significant digit: "Ne+X" format
-    // - If multiple significant digits: "N.DDDe+X" format
-    // - Small exponents (0..20): use plain decimal notation
-    // - Negative exponents (-6..0): use "0.000...N" notation — NO, JS uses plain for these too up to a point
-    //
-    // Actually: JS uses plain notation when the number can be written without
-    // too many zeros. The exact rule from the spec (7.1.12.1):
-    // - Let n, k, s be such that s × 10^(n-k) = abs(value), k is minimal
-    // - If k ≤ n ≤ 21: output digits + (n-k) zeros (integer-like)
-    // - If 0 < n ≤ 0 (impossible) ...
-    // - If 0 < n ≤ k: digits with decimal point after n digits (e.g. "1.5")
-    // - If -6 < n ≤ 0: "0." + |n| zeros + digits (e.g. "0.001")
-    // - Otherwise: scientific notation
+    // Float path: use ryu for shortest representation, then apply JS rules.
+    // ryu::Buffer::format_finite() returns the shortest decimal &str.
+    let mut ryu_buf = ryu::Buffer::new();
+    let repr = ryu_buf.format_finite(abs_n);
 
-    // Get shortest decimal representation
-    let repr = format!("{:e}", abs_n);
-    // Parse mantissa and exponent from Rust's scientific notation
-    let (mantissa_str, exp) = if let Some(pos) = repr.find('e') {
-        let m = &repr[..pos];
-        let e: i32 = repr[pos + 1..].parse().unwrap_or(0);
-        (m.to_string(), e)
+    // Parse mantissa digits and exponent from ryu output.
+    // ryu format: "1.23E5", "1.5", "0.001", "100.0", etc.
+    let (digits, n) = parse_ryu_output(repr);
+    let k = digits.len() as i32;
+
+    // Apply ECMA-262 §7.1.12.1 Number::toString formatting rules.
+    let result = format_js_number_parts(&digits, k, n);
+
+    if negative {
+        let mut s = String::with_capacity(result.len() + 1);
+        s.push('-');
+        s.push_str(&result);
+        s
     } else {
-        (repr.clone(), 0)
-    };
+        result
+    }
+}
 
-    // Extract significant digits (remove the decimal point from mantissa)
-    let digits: String = mantissa_str.chars().filter(|c| *c != '.').collect();
-    let k = digits.len() as i32; // number of significant digits
-    // n = exponent of most significant digit + 1
-    // In Rust's {:e}, "1.23e5" means 1.23 × 10^5, so n = exp + 1
-    let n = exp + 1;
+/// Parse ryu output into (significant_digits, n) where n = exponent+1
+/// per ECMA-262 §7.1.12.1 (s × 10^(n−k) = |value|, k minimal).
+///
+/// ryu format examples: "1.5" → ("15", 1), "1.23E5" → ("123", 6),
+/// "0.001" → ("1", -2), "100.0" → ("1", 3)
+fn parse_ryu_output(repr: &str) -> (String, i32) {
+    // Scientific format: "1.23E5" or "1E-20"
+    let e_pos = repr.find('E').or_else(|| repr.find('e'));
+    if let Some(pos) = e_pos {
+        let mantissa_part = &repr[..pos];
+        let exp: i32 = repr[pos + 1..].parse().unwrap_or(0);
 
-    let result = if k <= n && n <= 21 {
+        // Extract digits from mantissa (skip dot and minus)
+        let mut digits = String::with_capacity(mantissa_part.len());
+        for c in mantissa_part.chars() {
+            if c.is_ascii_digit() {
+                digits.push(c);
+            }
+        }
+        // Strip trailing zeros
+        while digits.len() > 1 && digits.ends_with('0') {
+            digits.pop();
+        }
+        // n = exp + 1 (mantissa is D.DDD form, so MSD is at 10^exp)
+        return (digits, exp + 1);
+    }
+
+    // Plain format: "1.5", "0.1", "100.0", "0.001"
+    if let Some(dot_pos) = repr.find('.') {
+        let before_dot = &repr[..dot_pos];
+        let after_dot = &repr[dot_pos + 1..];
+
+        if before_dot == "0" || before_dot == "-0" {
+            // "0.xxx" format: significant digits start after leading zeros
+            let leading_zeros = after_dot.chars().take_while(|c| *c == '0').count();
+            let mut digits: String = after_dot[leading_zeros..].to_string();
+            // Strip trailing zeros
+            while digits.len() > 1 && digits.ends_with('0') {
+                digits.pop();
+            }
+            if digits.is_empty() {
+                digits.push('0');
+            }
+            let n = -(leading_zeros as i32);
+            return (digits, n);
+        }
+
+        // "DDD.DDD" format (e.g. "1.5", "100.0")
+        let mut all_digits = String::with_capacity(before_dot.len() + after_dot.len());
+        all_digits.push_str(before_dot);
+        all_digits.push_str(after_dot);
+        // Strip trailing zeros
+        while all_digits.len() > 1 && all_digits.ends_with('0') {
+            all_digits.pop();
+        }
+        let n = before_dot.len() as i32;
+        return (all_digits, n);
+    }
+
+    // No dot, no exponent (shouldn't happen with ryu for valid f64)
+    let n = repr.len() as i32;
+    (repr.to_string(), n)
+}
+
+/// Format number parts per ECMA-262 §7.1.12.1 rules.
+fn format_js_number_parts(digits: &str, k: i32, n: i32) -> String {
+    if k <= n && n <= 21 {
         // Case: integer-like, append zeros
-        let mut s = digits.clone();
+        let mut s = String::with_capacity(n as usize);
+        s.push_str(digits);
         for _ in 0..(n - k) {
             s.push('0');
         }
         s
     } else if 0 < n && n <= k {
         // Case: decimal point within the digits
-        let mut s = String::new();
-        s.push_str(&digits[..n as usize]);
+        let n_usize = n as usize;
+        let mut s = String::with_capacity(k as usize + 1);
+        s.push_str(&digits[..n_usize]);
         s.push('.');
-        s.push_str(&digits[n as usize..]);
-        // Trim trailing zeros after decimal
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
+        s.push_str(&digits[n_usize..]);
         s
     } else if -6 < n && n <= 0 {
         // Case: "0.000...digits"
-        let mut s = String::from("0.");
-        for _ in 0..(-n) {
+        let zeros = (-n) as usize;
+        let mut s = String::with_capacity(2 + zeros + digits.len());
+        s.push_str("0.");
+        for _ in 0..zeros {
             s.push('0');
         }
-        s.push_str(&digits);
-        // Trim trailing zeros
-        while s.ends_with('0') {
-            s.pop();
-        }
+        s.push_str(digits);
         s
     } else {
         // Scientific notation
+        let exp_val = n - 1;
+        let sign_char = if exp_val >= 0 { "+" } else { "" };
         if k == 1 {
-            format!(
-                "{}e{}{}",
-                &digits[..1],
-                if n - 1 >= 0 { "+" } else { "" },
-                n - 1
-            )
+            let mut s = String::with_capacity(6);
+            s.push_str(&digits[..1]);
+            s.push('e');
+            s.push_str(sign_char);
+            // Use itoa for exponent
+            let mut ebuf = itoa::Buffer::new();
+            s.push_str(ebuf.format(exp_val));
+            s
         } else {
-            let mut sig = String::new();
-            sig.push_str(&digits[..1]);
-            sig.push('.');
-            sig.push_str(&digits[1..]);
-            // Trim trailing zeros in significand
-            while sig.ends_with('0') {
-                sig.pop();
-            }
-            if sig.ends_with('.') {
-                sig.pop();
-            }
-            format!("{}e{}{}", sig, if n - 1 >= 0 { "+" } else { "" }, n - 1)
+            let mut s = String::with_capacity(k as usize + 6);
+            s.push_str(&digits[..1]);
+            s.push('.');
+            s.push_str(&digits[1..]);
+            s.push('e');
+            s.push_str(sign_char);
+            let mut ebuf = itoa::Buffer::new();
+            s.push_str(ebuf.format(exp_val));
+            s
         }
-    };
-
-    if negative {
-        format!("-{}", result)
-    } else {
-        result
     }
 }
 

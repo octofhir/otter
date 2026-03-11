@@ -1871,19 +1871,20 @@ fn test_hot_function_detection_call_count() {
     assert_eq!(func.get_call_count(), 0);
     assert!(!func.is_hot_function());
 
-    // Execute the function multiple times
-    for _ in 0..100 {
+    // Execute the function multiple times (but stay below threshold)
+    let warmup = (HOT_FUNCTION_THRESHOLD / 2).max(1);
+    for _ in 0..warmup {
         let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let _ = interpreter.execute_arc(module.clone(), &mut ctx);
     }
 
-    // Call count should be 100
-    assert_eq!(func.get_call_count(), 100);
+    // Call count should be warmup
+    assert_eq!(func.get_call_count(), warmup);
     assert!(!func.is_hot_function()); // Not yet hot
 
     // Execute until we cross the threshold
-    for _ in 0..(HOT_FUNCTION_THRESHOLD - 100) {
+    for _ in 0..(HOT_FUNCTION_THRESHOLD - warmup) {
         let (mut ctx, _rt) = create_test_context_with_runtime();
         let interpreter = Interpreter::new();
         let _ = interpreter.execute_arc(module.clone(), &mut ctx);

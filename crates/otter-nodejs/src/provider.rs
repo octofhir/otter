@@ -31,7 +31,7 @@ impl ModuleProvider for NodeModuleProvider {
 
         if is_builtin_for_profile(name, self.profile) {
             return Some(ModuleResolution {
-                url: format!("builtin://node:{}", name),
+                url: format!("node:{}", name),
                 module_type: ModuleType::ESM,
             });
         }
@@ -71,7 +71,7 @@ mod tests {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
         let res = provider.resolve("node:fs", "");
         assert!(res.is_some());
-        assert_eq!(res.unwrap().url, "builtin://node:fs");
+        assert_eq!(res.unwrap().url, "node:fs");
     }
 
     #[test]
@@ -79,7 +79,7 @@ mod tests {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
         let res = provider.resolve("path", "");
         assert!(res.is_some());
-        assert_eq!(res.unwrap().url, "builtin://node:path");
+        assert_eq!(res.unwrap().url, "node:path");
     }
 
     #[test]
@@ -97,8 +97,8 @@ mod tests {
     fn test_load_returns_none_for_native_modules() {
         let provider = NodeModuleProvider::new(NodeApiProfile::Full);
         // All modules are native now — load always returns None
-        assert!(provider.load("builtin://node:path").is_none());
-        assert!(provider.load("builtin://node:fs").is_none());
+        assert!(provider.load("node:path").is_none());
+        assert!(provider.load("node:fs").is_none());
     }
 
     #[test]

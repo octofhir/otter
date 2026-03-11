@@ -129,9 +129,7 @@ impl BuildCommand {
 
             for url in &execution_order {
                 // Skip built-in modules
-                if url.starts_with("node:")
-                    || url.starts_with("builtin://node:")
-                    || url.starts_with("otter:")
+                if url.starts_with("node:") || url.starts_with("otter:")
                 {
                     continue;
                 }

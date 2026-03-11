@@ -1445,11 +1445,9 @@ impl Otter {
                 &mut self.extension_state,
             );
             if let Some(namespace_obj) = ext.load_module(specifier, &mut load_ctx) {
-                // Register with the loader using the builtin:// URL format
-                // that NodeModuleProvider produces: "builtin://node:path"
-                let builtin_url = format!("builtin://{}", specifier);
+                // Both otter: and node: specifiers use their canonical URL directly
                 self.loader
-                    .register_native_module(&builtin_url, namespace_obj);
+                    .register_native_module(specifier, namespace_obj);
             }
         }
 

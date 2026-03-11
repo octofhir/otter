@@ -749,7 +749,7 @@ impl ModuleLoader {
             return Ok(module);
         }
 
-        // 1. Try to load from providers (handles builtin://, custom protocols)
+        // 1. Try to load from providers (handles node:, otter:, custom protocols)
         if let Ok(providers) = self.providers.read() {
             for provider in providers.iter() {
                 if let Some(source) = provider.load(&normalized_url) {
@@ -1201,7 +1201,7 @@ try {{
     }
 
     fn normalize_url_key(&self, url: &str) -> String {
-        if url.starts_with("builtin://")
+        if url.starts_with("node:")
             || url.starts_with("otter:")
             || url.starts_with("http://")
             || url.starts_with("https://")

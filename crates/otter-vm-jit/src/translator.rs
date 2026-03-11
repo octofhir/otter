@@ -122,7 +122,9 @@ fn resolve_inline_candidates<'a>(
                 if let Some(&func_idx) = reg_func.get(&func.0) {
                     if let Some(&callee) = func_by_index.get(&func_idx) {
                         // Verify all callee instructions are JIT-translatable.
-                        // Verify all callee instructions are JIT-translatable
+                        // Must use baseline-only check because the inline code generator
+                        // only handles baseline opcodes (helper-based ops would silently
+                        // return undefined from the catch-all branch).
                         let callee_instrs = callee.instructions.read();
                         let all_translatable = callee_instrs
                             .iter()
@@ -1080,7 +1082,7 @@ pub fn translate_function_with_constants(
 
     // Snapshot type feedback for speculative optimization.
     // Read the feedback vector once at compile time (not during IR emission).
-    let (feedback_snapshot, ic_snapshot, call_target_snapshot): (Vec<_>, Vec<_>, Vec<_>) = {
+    let (feedback_snapshot, ic_snapshot, call_target_snapshot, ffi_call_info_snapshot): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
         let fv = function.feedback_vector.read();
         (
             fv.iter().map(|m| m.type_observations).collect(),
@@ -1088,6 +1090,7 @@ pub fn translate_function_with_constants(
             fv.iter()
                 .map(|m| (m.call_target_func_index, m.call_target_module_id))
                 .collect(),
+            fv.iter().map(|m| m.ffi_call_info_ptr).collect(),
         )
     };
     let deopt_metadata = build_deopt_metadata(function);
@@ -2861,8 +2864,18 @@ pub fn translate_function_with_constants(
                     }
                 } else {
                     // No inline candidate → use runtime helper.
-                    // Check call target feedback for monomorphic dispatch.
-                    let mono_func_index: Option<u32> = if *ic_index > 0 {
+                    // Check FFI call info first (takes priority over JS monomorphic).
+                    let ffi_info_ptr: Option<u64> = if *ic_index > 0 {
+                        ffi_call_info_snapshot
+                            .get(*ic_index as usize)
+                            .copied()
+                            .filter(|&p| p != 0)
+                    } else {
+                        None
+                    };
+
+                    // Check call target feedback for monomorphic JS dispatch.
+                    let mono_func_index: Option<u32> = if ffi_info_ptr.is_none() && *ic_index > 0 {
                         call_target_snapshot.get(*ic_index as usize).and_then(
                             |(func_idx_plus1, _mod_id)| {
                                 if *func_idx_plus1 == 0 || *func_idx_plus1 == u32::MAX {
@@ -2895,7 +2908,19 @@ pub fn translate_function_with_constants(
                         builder.ins().iconst(types::I64, 0) // null pointer
                     };
 
-                    let (_call, result) = if let Some(expected_idx) = mono_func_index {
+                    let (_call, result) = if let Some(ffi_ptr) = ffi_info_ptr {
+                        // FFI fast path: use CallFfi with cached FfiCallInfo pointer
+                        let helper_ref = helpers
+                            .and_then(|h| h.get(HelperKind::CallFfi))
+                            .or_else(|| helpers.and_then(|h| h.get(HelperKind::CallFunction)));
+                        let helper_ref = helper_ref.ok_or_else(|| unsupported(pc, instruction))?;
+                        let ffi_info_val = builder.ins().iconst(types::I64, ffi_ptr as i64);
+                        let call = builder.ins().call(
+                            helper_ref,
+                            &[ctx_ptr, callee_val, argc_val, argv_ptr, ffi_info_val],
+                        );
+                        (call, builder.inst_results(call)[0])
+                    } else if let Some(expected_idx) = mono_func_index {
                         // Monomorphic: use CallMono with expected function_index hint
                         let helper_ref = helpers
                             .and_then(|h| h.get(HelperKind::CallMono))

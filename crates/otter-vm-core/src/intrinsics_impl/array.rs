@@ -658,6 +658,24 @@ pub fn init_array_prototype(
                 } else {
                     from as usize
                 };
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for i in start..v.len() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            let val = &v[i];
+                            if val.is_hole() {
+                                continue;
+                            }
+                            if strict_equal(val, &search) {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                }
                 for i in start..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -701,6 +719,24 @@ pub fn init_array_prototype(
                 } else {
                     from.min((len as i64) - 1) as usize
                 };
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for i in (0..=start).rev() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            let val = &v[i];
+                            if val.is_hole() {
+                                continue;
+                            }
+                            if strict_equal(val, &search) {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                }
                 for i in (0..=start).rev() {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -741,6 +777,26 @@ pub fn init_array_prototype(
                 } else {
                     from as usize
                 };
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for i in start..v.len() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            let val = &v[i];
+                            let matches = if val.is_hole() {
+                                same_value_zero(&Value::undefined(), &search)
+                            } else {
+                                same_value_zero(val, &search)
+                            };
+                            if matches {
+                                return Ok(Value::boolean(true));
+                            }
+                        }
+                        return Ok(Value::boolean(false));
+                    }
+                }
                 for i in start..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -2134,11 +2190,20 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        if obj.has(&PropertyKey::Index(i as u32)) {
-                            accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                            end = i;
-                            found = true;
-                            break;
+                        if obj.is_packed() {
+                            accumulator = obj.get_elements_storage().borrow().get(i).unwrap_or(Value::undefined());
+                            if !accumulator.is_hole() {
+                                end = i;
+                                found = true;
+                                break;
+                            }
+                        } else {
+                            if obj.has(&PropertyKey::Index(i as u32)) {
+                                accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                                end = i;
+                                found = true;
+                                break;
+                            }
                         }
                     }
                     if !found {
@@ -2147,11 +2212,37 @@ pub fn init_array_prototype(
                         ));
                     }
                 }
+
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for i in (0..end).rev() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            let val = &v[i];
+                            if val.is_hole() {
+                                continue;
+                            }
+                            accumulator = ncx.call_function(
+                                &callback,
+                                Value::undefined(),
+                                &[
+                                    accumulator.clone(),
+                                    val.clone(),
+                                    Value::number(i as f64),
+                                    Value::object(obj.clone()),
+                                ],
+                            )?;
+                        }
+                        return Ok(accumulator);
+                    }
+                }
+
                 for i in (0..end).rev() {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    // Per spec, skip holes
                     if !obj.has(&PropertyKey::Index(i as u32)) {
                         continue;
                     }
@@ -2160,7 +2251,7 @@ pub fn init_array_prototype(
                         &callback,
                         Value::undefined(),
                         &[
-                            accumulator,
+                            accumulator.clone(),
                             val,
                             Value::number(i as f64),
                             Value::object(obj.clone()),
@@ -2202,6 +2293,49 @@ pub fn init_array_prototype(
                 };
                 ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        let loop_result: Result<(), VmError> = (|| {
+                            for (i, val) in v.iter().enumerate() {
+                                if i & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                if val.is_hole() {
+                                    continue;
+                                }
+                                let mapped = ncx.call_function(
+                                    &callback,
+                                    this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                                )?;
+                                // Flatten one level
+                                if let Some(inner) = mapped.as_object() {
+                                    if inner.get(&PropertyKey::string("length")).is_some() {
+                                        let inner_len = get_len(&inner);
+                                        for j in 0..inner_len {
+                                            let item = js_get(&inner, &PropertyKey::Index(j as u32), ncx)?;
+                                            let _ = result.set(PropertyKey::Index(out_idx), item);
+                                            out_idx += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                let _ = result.set(PropertyKey::Index(out_idx), mapped);
+                                out_idx += 1;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = loop_result {
+                            ncx.ctx.pop_root_slots(1);
+                            return Err(e);
+                        }
+                        ncx.ctx.pop_root_slots(1);
+                        set_len(&result, out_idx as usize);
+                        return Ok(result_val);
+                    }
+                }
+
                 let loop_result: Result<(), VmError> = (|| {
                     for i in 0..len {
                         if i & 0x3FF == 0 {

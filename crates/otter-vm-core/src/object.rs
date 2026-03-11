@@ -298,7 +298,9 @@ impl PropertyKey {
     /// The value 2^32 - 1 (4294967295) is NOT a valid array index.
     pub const MAX_ARRAY_INDEX: u32 = u32::MAX - 1; // 4294967294
 
-    /// Create a string property key (canonicalizes numeric strings to Index)
+    /// Create a string property key (canonicalizes numeric strings to Index).
+    /// Uses interned strings for deduplication (best for known property names
+    /// and IC-cached keys).
     pub fn string(s: &str) -> Self {
         // Canonicalize numeric strings to Index for consistent lookup.
         // Only values 0..=MAX_ARRAY_INDEX are valid array indices per spec.
@@ -306,6 +308,20 @@ impl PropertyKey {
             return Self::Index(n);
         }
         let js_str = JsString::intern(s);
+        Self::String(js_str)
+    }
+
+    /// Create a string property key without interning (for dynamic/computed
+    /// property access where the key is typically used once and discarded).
+    /// Avoids the hash-table lookup + insertion overhead of `intern()`.
+    /// Property lookup still works correctly because `GcRef<JsString>`
+    /// comparison falls back to content-based equality.
+    #[inline]
+    pub fn string_transient(s: &str) -> Self {
+        if let Some(n) = Self::parse_canonical_array_index_bytes(s.as_bytes()) {
+            return Self::Index(n);
+        }
+        let js_str = JsString::new_gc(s);
         Self::String(js_str)
     }
 
@@ -2277,7 +2293,7 @@ impl JsObject {
                 }
                 // For Index keys, also try as String (e.g., Index(2) -> String("2"))
                 if let PropertyKey::Index(i) = key {
-                    let str_key = PropertyKey::string(&i.to_string());
+                    let str_key = PropertyKey::string_transient(&i.to_string());
                     if let Some(desc) = dict.get(&str_key) {
                         return Some(desc.clone());
                     }
@@ -2782,7 +2798,7 @@ impl JsObject {
                 }
                 // For Index keys, also try as String
                 if let PropertyKey::Index(i) = key {
-                    let str_key = PropertyKey::string(&i.to_string());
+                    let str_key = PropertyKey::string_transient(&i.to_string());
                     if dict.contains_key(&str_key) {
                         return true;
                     }

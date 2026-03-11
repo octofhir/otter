@@ -1338,7 +1338,7 @@ fn value_to_property_key_simple(value: &crate::value::Value) -> Option<PropertyK
                 return Some(PropertyKey::Index(idx));
             }
         }
-        return Some(PropertyKey::string(&s));
+        return Some(PropertyKey::string_transient(&s));
     }
     None // bail for objects/complex types that need ToPrimitive
 }
@@ -4582,6 +4582,77 @@ extern "C" fn otter_rt_generic_not(_ctx_raw: i64, val_raw: i64) -> i64 {
     crate::value::Value::boolean(!val.to_boolean()).to_jit_bits()
 }
 
+// ---------------------------------------------------------------------------
+// CallFfi — direct FFI call from JIT code
+// ---------------------------------------------------------------------------
+
+/// Runtime helper: CallFfi — call an FFI function directly via trampoline.
+///
+/// Signature: `(ctx: i64, callee: i64, argc: i64, argv_ptr: i64, ffi_call_info_ptr: i64) -> i64`
+///
+/// The `ffi_call_info_ptr` is a pointer to `FfiCallInfo` that was cached in the
+/// feedback vector when the interpreter first saw this FFI call site.
+///
+/// Guards: verifies callee identity (NaN-boxed bits match). On mismatch, bails out.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_call_ffi(
+    _ctx_raw: i64,
+    callee_raw: i64,
+    argc: i64,
+    argv_ptr_raw: i64,
+    ffi_call_info_ptr: i64,
+) -> i64 {
+    if ffi_call_info_ptr == 0 {
+        return BAILOUT_SENTINEL;
+    }
+
+    let ffi_info = unsafe { &*(ffi_call_info_ptr as *const crate::value::FfiCallInfo) };
+
+    // Verify callee identity: if the callee has changed since we cached
+    // the FFI info, bail out to let the interpreter handle it.
+    let callee_bits = callee_raw as u64;
+    if (callee_bits & TAG_MASK) != TAG_PTR_FUNCTION {
+        return BAILOUT_SENTINEL;
+    }
+
+    // Check that callee is a native function with matching ffi_info pointer.
+    // The callee Value is on the stack, so it's rooted and the NativeFunctionObject is alive.
+    let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+    if raw_ptr.is_null() {
+        return BAILOUT_SENTINEL;
+    }
+    let header_offset = std::mem::offset_of!(GcAllocation<crate::value::NativeFunctionObject>, value);
+    let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const GcHeader };
+    let tag = unsafe { (*header_ptr).tag() };
+    if tag != gc_tags::FUNCTION {
+        return BAILOUT_SENTINEL;
+    }
+    let nfo = unsafe { &*(raw_ptr as *const crate::value::NativeFunctionObject) };
+    let current_ffi_ptr = match &nfo.ffi_info {
+        Some(info) => &**info as *const crate::value::FfiCallInfo,
+        None => return BAILOUT_SENTINEL,
+    };
+    if current_ffi_ptr != ffi_call_info_ptr as *const crate::value::FfiCallInfo {
+        return BAILOUT_SENTINEL;
+    }
+
+    // Call through the trampoline
+    let js_args = if argc > 0 && argv_ptr_raw != 0 {
+        argv_ptr_raw as *const i64
+    } else {
+        std::ptr::null()
+    };
+
+    unsafe {
+        (ffi_info.trampoline)(
+            ffi_info.opaque,
+            ffi_info.fn_ptr,
+            js_args,
+            argc as u16,
+        )
+    }
+}
+
 /// Build a `RuntimeHelpers` table with all available helper functions.
 pub fn build_runtime_helpers() -> RuntimeHelpers {
     let mut helpers = RuntimeHelpers::new();
@@ -4761,6 +4832,7 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
             HelperKind::GetPropMono,
             otter_rt_get_prop_mono_stub as *const u8,
         );
+        helpers.set(HelperKind::CallFfi, otter_rt_call_ffi as *const u8);
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
         let stub = otter_rt_bailout_stub as *const u8;

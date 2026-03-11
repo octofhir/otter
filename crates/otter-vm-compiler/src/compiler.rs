@@ -2373,10 +2373,7 @@ impl Compiler {
                 if let Some(rest) = &obj_pattern.rest {
                     // Build excluded keys array
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray {
-                        dst: excluded_array,
-                        len: excluded_keys.len() as u16,
-                    });
+                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
                         self.codegen.emit(Instruction::LoadInt32 {
@@ -3224,10 +3221,7 @@ impl Compiler {
 
                 if let Some(rest) = &obj_pat.rest {
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray {
-                        dst: excluded_array,
-                        len: excluded_keys.len() as u16,
-                    });
+                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
 
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
@@ -3711,10 +3705,7 @@ impl Compiler {
 
                 if let Some(rest) = &obj_target.rest {
                     let excluded_array = self.codegen.alloc_reg();
-                    self.codegen.emit(Instruction::NewArray {
-                        dst: excluded_array,
-                        len: excluded_keys.len() as u16,
-                    });
+                    self.codegen.emit(Instruction::NewArray { dst: excluded_array, len: excluded_keys.len() as u16, packed: false });
 
                     for (i, key_reg) in excluded_keys.iter().enumerate() {
                         let idx_reg = self.codegen.alloc_reg();
@@ -5485,10 +5476,7 @@ impl Compiler {
 
         if has_spread {
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray {
-                dst: args_arr,
-                len: 0,
-            });
+            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
             for arg in &intrinsic.arguments {
                 match arg {
@@ -6745,22 +6733,30 @@ impl Compiler {
                 let mut val = rhs_val;
                 if is_compound {
                     let prev_val = self.codegen.alloc_reg();
-                    let ic_index = self.codegen.alloc_ic();
-                    self.codegen.emit(Instruction::GetProp {
-                        dst: prev_val,
-                        obj,
-                        key,
-                        ic_index,
-                    });
+                    if Self::is_likely_integer_index(&member.expression) {
+                        self.codegen.emit(Instruction::GetElemInt {
+                            dst: prev_val,
+                            obj,
+                            index: key,
+                        });
+                    } else {
+                        let ic_index = self.codegen.alloc_ic();
+                        self.codegen.emit(Instruction::GetElem {
+                            dst: prev_val,
+                            arr: obj,
+                            idx: key,
+                            ic_index,
+                        });
+                    }
                     val = self.compile_compound_assignment_op(op, prev_val, rhs_val)?;
                     self.codegen.free_reg(prev_val);
                     self.codegen.free_reg(rhs_val);
                 }
 
                 let ic_index = self.codegen.alloc_ic();
-                self.codegen.emit(Instruction::SetProp {
-                    obj,
-                    key,
+                self.codegen.emit(Instruction::SetElem {
+                    arr: obj,
+                    idx: key,
                     val,
                     ic_index,
                 });
@@ -7447,10 +7443,7 @@ impl Compiler {
             // Build a spread array from arguments, then use CallSuperForward-style handling
             // For now, build the array and use CallSuper with the expanded args
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray {
-                dst: args_arr,
-                len: 0,
-            });
+            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
             for arg in &call.arguments {
                 match arg {
@@ -7560,10 +7553,7 @@ impl Compiler {
             // For super method calls with spread, use func.apply(this, argsArray)
             // 1. Build the spread array
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray {
-                dst: args_arr,
-                len: 0,
-            });
+            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
             for arg in &call.arguments {
                 match arg {
@@ -7805,10 +7795,7 @@ impl Compiler {
         if has_spread {
             // Build spread array
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray {
-                dst: args_arr,
-                len: 0,
-            });
+            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
             for arg in &call.arguments {
                 match arg {
@@ -7948,10 +7935,7 @@ impl Compiler {
             // For spread with computed method call, use CallMethodComputedSpread
             // Build spread array first
             let args_arr = self.codegen.alloc_reg();
-            self.codegen.emit(Instruction::NewArray {
-                dst: args_arr,
-                len: 0,
-            });
+            self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
             for arg in &call.arguments {
                 match arg {
@@ -8066,10 +8050,7 @@ impl Compiler {
     ) -> CompileResult<Register> {
         // Create an array to hold all arguments (including spread)
         let args_arr = self.codegen.alloc_reg();
-        self.codegen.emit(Instruction::NewArray {
-            dst: args_arr,
-            len: 0,
-        });
+        self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
         // Process each argument
         for arg in &call.arguments {
@@ -8147,10 +8128,7 @@ impl Compiler {
                 // Generic spread path for forms like:
                 // `new Ctor(...a, b)` or `new Ctor(...a, ...b, c)`.
                 let args_arr = self.codegen.alloc_reg();
-                self.codegen.emit(Instruction::NewArray {
-                    dst: args_arr,
-                    len: 0,
-                });
+                self.codegen.emit(Instruction::NewArray { dst: args_arr, len: 0, packed: false });
 
                 for arg in &new_expr.arguments {
                     match arg {
@@ -8482,13 +8460,21 @@ impl Compiler {
         let key = self.compile_expression(&expr.expression)?;
 
         let old_val = self.codegen.alloc_reg();
-        let ic_index_get = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetProp {
-            dst: old_val,
-            obj,
-            key,
-            ic_index: ic_index_get,
-        });
+        if Self::is_likely_integer_index(&expr.expression) {
+            self.codegen.emit(Instruction::GetElemInt {
+                dst: old_val,
+                obj,
+                index: key,
+            });
+        } else {
+            let ic_index_get = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::GetElem {
+                dst: old_val,
+                arr: obj,
+                idx: key,
+                ic_index: ic_index_get,
+            });
+        }
 
         let num_val = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::ToNumber {
@@ -8513,9 +8499,9 @@ impl Compiler {
         }
 
         let ic_index_set = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::SetProp {
-            obj,
-            key,
+        self.codegen.emit(Instruction::SetElem {
+            arr: obj,
+            idx: key,
             val: new_val,
             ic_index: ic_index_set,
         });
@@ -8769,16 +8755,37 @@ impl Compiler {
         let obj = self.compile_expression(&member.object)?;
         let dst = self.codegen.alloc_reg();
         let key = self.compile_expression(&member.expression)?;
-        let ic_index = self.codegen.alloc_ic();
-        self.codegen.emit(Instruction::GetProp {
-            dst,
-            obj,
-            key,
-            ic_index,
-        });
+
+        if Self::is_likely_integer_index(&member.expression) {
+            self.codegen.emit(Instruction::GetElemInt {
+                dst,
+                obj,
+                index: key,
+            });
+        } else {
+            let ic_index = self.codegen.alloc_ic();
+            self.codegen.emit(Instruction::GetProp {
+                dst,
+                obj,
+                key,
+                ic_index,
+            });
+        }
+
         self.codegen.free_reg(key);
         self.codegen.free_reg(obj);
         Ok(dst)
+    }
+
+    /// Check if an expression is likely to evaluate to an integer index
+    fn is_likely_integer_index(expr: &Expression) -> bool {
+        match expr {
+            Expression::NumericLiteral(n) => n.value.fract() == 0.0,
+            Expression::Identifier(_) => true, // Common in for loops: a[i]
+            Expression::UpdateExpression(_) => true, // a[i++]
+            Expression::BinaryExpression(_) => true, // a[i + 1]
+            _ => false,
+        }
     }
 
     /// Compile an object expression
@@ -9029,11 +9036,16 @@ impl Compiler {
             .iter()
             .any(|e| matches!(e, ArrayExpressionElement::SpreadElement(_)));
 
+        let has_elision = arr
+            .elements
+            .iter()
+            .any(|e| matches!(e, ArrayExpressionElement::Elision(_)));
+
         let dst = self.codegen.alloc_reg();
 
         if !has_spread {
             let len = arr.elements.len() as u16;
-            self.codegen.emit(Instruction::NewArray { dst, len });
+            self.codegen.emit(Instruction::NewArray { dst, len, packed: !has_elision });
 
             for (i, elem) in arr.elements.iter().enumerate() {
                 match elem {
@@ -9064,7 +9076,7 @@ impl Compiler {
         }
 
         // With spread: build dynamically using `length` and `Spread` instruction.
-        self.codegen.emit(Instruction::NewArray { dst, len: 0 });
+        self.codegen.emit(Instruction::NewArray { dst, len: 0, packed: false });
         let length_key = self.codegen.add_string("length");
 
         for elem in &arr.elements {

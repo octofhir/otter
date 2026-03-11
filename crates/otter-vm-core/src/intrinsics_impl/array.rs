@@ -14,7 +14,7 @@ use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::intrinsics_impl::helpers::{same_value_zero, strict_equal};
 use crate::memory::MemoryManager;
-use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
+use crate::object::{ElementsKind, JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
 use std::sync::Arc;
@@ -1395,15 +1395,33 @@ pub fn init_array_prototype(
                         "Array.prototype.forEach: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                        }
+                        return Ok(Value::undefined());
+                    }
+                }
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    // Per spec, skip holes (absent elements)
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
+                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if val.is_hole() {
                         continue;
                     }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     ncx.call_function(
                         &callback,
                         this_arg.clone(),
@@ -1442,16 +1460,45 @@ pub fn init_array_prototype(
                     Value::object(result)
                 };
                 ncx.ctx.push_root_slot(result_val.clone());
+
                 let loop_result: Result<(), VmError> = (|| {
+                    if obj.is_packed() {
+                        let elements_kind = obj.get_elements_storage().borrow().clone();
+                        if let ElementsKind::Object(v) = elements_kind {
+                            for (i, val) in v.iter().enumerate() {
+                                if i & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                if val.is_hole() {
+                                    // Hole stays in result
+                                    continue;
+                                }
+                                let mapped = ncx.call_function(
+                                    &callback,
+                                    this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                                )?;
+                                let _ = result.set(PropertyKey::Index(i as u32), mapped);
+                            }
+                            return Ok(());
+                        }
+                    }
                     for i in 0..len {
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        // Per spec, skip holes (absent elements) — hole stays in result
-                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                        let val = if obj.is_packed() {
+                            obj.get_elements_storage().borrow().get(i).unwrap_or(Value::undefined())
+                        } else {
+                            if !obj.has(&PropertyKey::Index(i as u32)) {
+                                // Hole stays in result
+                                continue;
+                            }
+                            js_get(&obj, &PropertyKey::Index(i as u32), ncx)?
+                        };
+                        if val.is_hole() {
                             continue;
                         }
-                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let mapped = ncx.call_function(
                             &callback,
                             this_arg.clone(),
@@ -1497,15 +1544,37 @@ pub fn init_array_prototype(
                 ncx.ctx.push_root_slot(result_val.clone());
                 let mut out_idx = 0u32;
                 let loop_result: Result<(), VmError> = (|| {
+                    if obj.is_packed() {
+                        let elements_kind = obj.get_elements_storage().borrow().clone();
+                        if let ElementsKind::Object(v) = elements_kind {
+                            for (i, val) in v.iter().enumerate() {
+                                if i & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                if val.is_hole() {
+                                    continue;
+                                }
+                                let keep = ncx.call_function(
+                                    &callback,
+                                    this_arg.clone(),
+                                    &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                                )?;
+                                if keep.to_boolean() {
+                                    let _ = result.set(PropertyKey::Index(out_idx), val.clone());
+                                    out_idx += 1;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
                     for i in 0..len {
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        // Per spec, skip holes
-                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                        if val.is_hole() {
                             continue;
                         }
-                        let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                         let keep = ncx.call_function(
                             &callback,
                             this_arg.clone(),
@@ -1549,6 +1618,28 @@ pub fn init_array_prototype(
                         "Array.prototype.find: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if test.to_boolean() {
+                                return Ok(val.clone());
+                            }
+                        }
+                        return Ok(Value::undefined());
+                    }
+                }
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1591,6 +1682,28 @@ pub fn init_array_prototype(
                         "Array.prototype.findIndex: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if test.to_boolean() {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                }
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1628,6 +1741,28 @@ pub fn init_array_prototype(
                     return Err(VmError::type_error(
                         "Array.prototype.findLast: callback is not a function",
                     ));
+                }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate().rev() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if test.to_boolean() {
+                                return Ok(val.clone());
+                            }
+                        }
+                        return Ok(Value::undefined());
+                    }
                 }
                 for i in (0..len).rev() {
                     if i & 0x3FF == 0 {
@@ -1671,6 +1806,28 @@ pub fn init_array_prototype(
                         "Array.prototype.findLastIndex: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate().rev() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if test.to_boolean() {
+                                return Ok(Value::number(i as f64));
+                            }
+                        }
+                        return Ok(Value::number(-1.0));
+                    }
+                }
                 for i in (0..len).rev() {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
@@ -1709,15 +1866,36 @@ pub fn init_array_prototype(
                         "Array.prototype.every: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if !test.to_boolean() {
+                                return Ok(Value::boolean(false));
+                            }
+                        }
+                        return Ok(Value::boolean(true));
+                    }
+                }
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    // Per spec, skip holes
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
+                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if val.is_hole() {
                         continue;
                     }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
@@ -1751,15 +1929,36 @@ pub fn init_array_prototype(
                         "Array.prototype.some: callback is not a function",
                     ));
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        for (i, val) in v.iter().enumerate() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            if val.is_hole() {
+                                continue;
+                            }
+                            let test = ncx.call_function(
+                                &callback,
+                                this_arg.clone(),
+                                &[val.clone(), Value::number(i as f64), Value::object(obj.clone())],
+                            )?;
+                            if test.to_boolean() {
+                                return Ok(Value::boolean(true));
+                            }
+                        }
+                        return Ok(Value::boolean(false));
+                    }
+                }
                 for i in 0..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    // Per spec, skip holes
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
+                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                    if val.is_hole() {
                         continue;
                     }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     let test = ncx.call_function(
                         &callback,
                         this_arg.clone(),
@@ -1807,11 +2006,20 @@ pub fn init_array_prototype(
                         if i & 0x3FF == 0 {
                             ncx.check_for_interrupt()?;
                         }
-                        if obj.has(&PropertyKey::Index(i as u32)) {
-                            accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
-                            start = i + 1;
-                            found = true;
-                            break;
+                        if obj.is_packed() {
+                            accumulator = obj.get_elements_storage().borrow().get(i).unwrap_or(Value::undefined());
+                            if !accumulator.is_hole() {
+                                start = i + 1;
+                                found = true;
+                                break;
+                            }
+                        } else {
+                            if obj.has(&PropertyKey::Index(i as u32)) {
+                                accumulator = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
+                                start = i + 1;
+                                found = true;
+                                break;
+                            }
                         }
                     }
                     if !found {
@@ -1820,20 +2028,68 @@ pub fn init_array_prototype(
                         ));
                     }
                 }
+                if obj.is_packed() {
+                    let elements_kind = obj.get_elements_storage().borrow().clone();
+                    if let ElementsKind::Object(v) = elements_kind {
+                        if !has_initial {
+                            let mut found = false;
+                            for (i, val) in v.iter().enumerate() {
+                                if i & 0x3FF == 0 {
+                                    ncx.check_for_interrupt()?;
+                                }
+                                if !val.is_hole() {
+                                    accumulator = val.clone();
+                                    start = i + 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                return Err(VmError::type_error("Reduce of empty array with no initial value"));
+                            }
+                        }
+                        for i in start..v.len() {
+                            if i & 0x3FF == 0 {
+                                ncx.check_for_interrupt()?;
+                            }
+                            let val = &v[i];
+                            if val.is_hole() {
+                                continue;
+                            }
+                            accumulator = ncx.call_function(
+                                &callback,
+                                Value::undefined(),
+                                &[
+                                    accumulator.clone(),
+                                    val.clone(),
+                                    Value::number(i as f64),
+                                    Value::object(obj.clone()),
+                                ],
+                            )?;
+                        }
+                        return Ok(accumulator);
+                    }
+                }
                 for i in start..len {
                     if i & 0x3FF == 0 {
                         ncx.check_for_interrupt()?;
                     }
-                    // Per spec, skip holes
-                    if !obj.has(&PropertyKey::Index(i as u32)) {
+                    let val = if obj.is_packed() {
+                        obj.get_elements_storage().borrow().get(i).unwrap_or(Value::undefined())
+                    } else {
+                        if !obj.has(&PropertyKey::Index(i as u32)) {
+                            continue;
+                        }
+                        js_get(&obj, &PropertyKey::Index(i as u32), ncx)?
+                    };
+                    if val.is_hole() {
                         continue;
                     }
-                    let val = js_get(&obj, &PropertyKey::Index(i as u32), ncx)?;
                     accumulator = ncx.call_function(
                         &callback,
                         Value::undefined(),
                         &[
-                            accumulator,
+                            accumulator.clone(),
                             val,
                             Value::number(i as f64),
                             Value::object(obj.clone()),
@@ -2015,13 +2271,11 @@ pub fn init_array_prototype(
                 let mut _num_holes: usize = 0;
 
                 let mut handled = false;
-                if obj.is_array() && !obj.is_dictionary_mode() && !obj.is_sparse() {
+                if obj.is_array() && obj.flags.borrow().is_packed {
                     let elements = obj.elements.borrow();
                     for i in 0..elements.len() {
-                        let val = elements.get(i).unwrap_or(Value::hole());
-                        if val.is_hole() {
-                            _num_holes += 1;
-                        } else if val.is_undefined() {
+                        let val = elements.get(i).unwrap_or(Value::undefined());
+                        if val.is_undefined() {
                             num_undefineds += 1;
                         } else {
                             concrete.push(val);
@@ -2093,7 +2347,7 @@ pub fn init_array_prototype(
                 // Write back: sorted values, then undefineds, then delete holes
                 let mut idx = 0usize;
                 let mut written = false;
-                if obj.is_array() && !obj.is_dictionary_mode() && !obj.is_sparse() {
+                if obj.is_array() && obj.flags.borrow().is_packed {
                     let mut elements = obj.elements.borrow_mut();
                     for val in &concrete {
                         elements.set(idx, val.clone());
@@ -2725,6 +2979,7 @@ pub fn install_array_statics(
         PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
             |_this, args, _ncx| {
                 let result = GcRef::new(JsObject::array(args.len()));
+                result.flags.borrow_mut().is_packed = true;
                 for (i, arg) in args.iter().enumerate() {
                     let _ = result.set(PropertyKey::Index(i as u32), arg.clone());
                 }

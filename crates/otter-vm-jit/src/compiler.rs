@@ -374,6 +374,9 @@ fn apply_instruction_uses(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::DeleteProp { obj, key, .. }
         | Instruction::GetElem {
             arr: obj, idx: key, ..
+        }
+        | Instruction::GetElemInt {
+            obj, index: key, ..
         } => {
             state.mark_register(obj.0);
             state.mark_register(key.0);
@@ -572,6 +575,7 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::NewObject { dst }
         | Instruction::NewArray { dst, .. }
         | Instruction::GetElem { dst, .. }
+        | Instruction::GetElemInt { dst, .. }
         | Instruction::Spread { dst, .. }
         | Instruction::Closure { dst, .. }
         | Instruction::Call { dst, .. }

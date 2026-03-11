@@ -154,6 +154,8 @@ pub enum Opcode {
     SetElem = 0x72,
     /// Array spread: ...arr
     Spread = 0x73,
+    /// Fast integer-indexed element access: dst = arr\[idx\]
+    GetElemInt = 0x74,
 
     // ==================== Functions ====================
     /// Create closure: dst = closure(func_idx)
@@ -337,6 +339,7 @@ impl Opcode {
             0x71 => Some(Self::GetElem),
             0x72 => Some(Self::SetElem),
             0x73 => Some(Self::Spread),
+            0x74 => Some(Self::GetElemInt),
 
             0x80 => Some(Self::Closure),
             0x81 => Some(Self::Call),
@@ -475,6 +478,7 @@ impl Opcode {
             Self::GetElem => "GetElem",
             Self::SetElem => "SetElem",
             Self::Spread => "Spread",
+            Self::GetElemInt => "GetElemInt",
             // Functions
             Self::Closure => "Closure",
             Self::Call => "Call",
@@ -849,6 +853,7 @@ pub enum Instruction {
     NewArray {
         dst: Register,
         len: u16,
+        packed: bool,
     },
     GetElem {
         dst: Register,
@@ -856,6 +861,11 @@ pub enum Instruction {
         idx: Register,
         /// Index into the feedback vector for Inline Cache
         ic_index: u16,
+    },
+    GetElemInt {
+        dst: Register,
+        obj: Register,
+        index: Register,
     },
     SetElem {
         arr: Register,

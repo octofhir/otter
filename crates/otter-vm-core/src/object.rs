@@ -949,6 +949,8 @@ impl ElementsKind {
         self.len() == 0
     }
 
+
+
     /// Clear the elements
     pub fn clear(&mut self) {
         match self {
@@ -1426,6 +1428,8 @@ pub struct ObjectFlags {
     /// Number of named property deletions performed on this object.
     /// Used to defer dictionary mode transition (slot-clearing is cheaper for 1-2 deletes).
     pub delete_count: u8,
+    /// Value representing whether array is packed without holes
+    pub is_packed: bool,
 }
 
 impl JsObject {
@@ -1469,6 +1473,49 @@ impl JsObject {
 
         for (i, val) in values.iter().enumerate() {
             gc_write_barrier(val);
+            if i < INLINE_PROPERTY_COUNT {
+                inline_slots[i] = *val;
+                inline_meta[i] = SlotMeta::DEFAULT_DATA;
+            } else {
+                overflow_slots.push(*val);
+                overflow_meta.push(SlotMeta::DEFAULT_DATA);
+            }
+        }
+
+        Self {
+            shape: ObjectCell::new(shape),
+            inline_slots: ObjectCell::new(inline_slots),
+            inline_meta: ObjectCell::new(inline_meta),
+            overflow_slots: ObjectCell::new(overflow_slots),
+            overflow_meta: ObjectCell::new(overflow_meta),
+            dictionary_properties: ObjectCell::new(None),
+            prototype: ObjectCell::new(prototype),
+            elements: ObjectCell::new(ElementsKind::new()),
+            flags: ObjectCell::new(ObjectFlags {
+                extensible: true,
+                ..Default::default()
+            }),
+            argument_mapping: ObjectCell::new(None),
+        }
+    }
+
+    /// Fast variant for JSON.parse: skips GC write barriers because all values
+    /// are freshly allocated in the current nursery generation (no old→young refs).
+    ///
+    /// SAFETY: Caller must guarantee all values were created in the current
+    /// allocation cycle (no prior GC could have tenured any of them).
+    pub(crate) fn with_shape_and_values_no_barrier(
+        prototype: Value,
+        shape: Arc<Shape>,
+        values: &[Value],
+    ) -> Self {
+        let mut inline_slots = [Value::undefined(); INLINE_PROPERTY_COUNT];
+        let mut inline_meta = [SlotMeta::EMPTY; INLINE_PROPERTY_COUNT];
+        let overflow_count = values.len().saturating_sub(INLINE_PROPERTY_COUNT);
+        let mut overflow_slots = Vec::with_capacity(overflow_count);
+        let mut overflow_meta = Vec::with_capacity(overflow_count);
+
+        for (i, val) in values.iter().enumerate() {
             if i < INLINE_PROPERTY_COUNT {
                 inline_slots[i] = *val;
                 inline_meta[i] = SlotMeta::DEFAULT_DATA;
@@ -1569,6 +1616,7 @@ impl JsObject {
         let mut flags = obj.flags.borrow_mut();
         flags.is_array = true;
         flags.dense_array_length_hint = 0;
+        flags.is_packed = length == 0;
         if length <= MAX_DENSE_PREALLOC {
             flags.dense_array_length_hint = length as u32;
             drop(flags);
@@ -2604,6 +2652,7 @@ impl JsObject {
             // correct.
             let mut elements = self.elements.borrow_mut();
             if idx < elements.len() {
+                self.flags.borrow_mut().is_packed = false;
                 let original_len = elements.len();
                 elements.set(idx, Value::hole());
                 // Trim trailing holes to keep elements vec compact
@@ -3831,6 +3880,11 @@ impl JsObject {
         self.flags.borrow().is_htmldda
     }
 
+    /// Check if array is packed (no holes)
+    pub fn is_packed(&self) -> bool {
+        self.flags.borrow().is_packed
+    }
+
     /// Mark this object as an array exotic object
     /// Used for Array.prototype per ES2026 §23.1.3
     pub fn mark_as_array(&self) {
@@ -4053,6 +4107,7 @@ impl JsObject {
             }
         } else {
             // Extend with holes
+            self.flags.borrow_mut().is_packed = false;
             let new = new_len as usize;
             if new <= MAX_DENSE_PREALLOC {
                 self.elements.borrow_mut().resize(new, Value::hole());
@@ -4144,6 +4199,9 @@ impl JsObject {
             const MAX_DENSE_LENGTH: usize = 1 << 24; // 16M elements
             if index < MAX_DENSE_LENGTH {
                 gc_write_barrier(&value);
+                if index > elements.len() {
+                    self.flags.borrow_mut().is_packed = false;
+                }
                 elements.resize(index + 1, Value::hole());
                 elements.set(index, value);
                 self.flags.borrow_mut().dense_array_length_hint = elements.len() as u32;

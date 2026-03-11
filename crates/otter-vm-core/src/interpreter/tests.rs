@@ -349,10 +349,7 @@ fn test_array_elem() {
         .name("main")
         .feedback_vector_size(2)
         // NewArray r0, 3
-        .instruction(Instruction::NewArray {
-            dst: Register(0),
-            len: 3,
-        })
+        .instruction(Instruction::NewArray { dst: Register(0), len: 3, packed: false })
         // LoadInt32 r1, 10
         .instruction(Instruction::LoadInt32 {
             dst: Register(1),
@@ -1065,10 +1062,7 @@ fn test_ic_coverage_array_integer_access() {
         .name("main")
         .feedback_vector_size(2)
         // Create array with 3 elements
-        .instruction(Instruction::NewArray {
-            dst: Register(0),
-            len: 3,
-        })
+        .instruction(Instruction::NewArray { dst: Register(0), len: 3, packed: false })
         // Set arr[1] = 42
         .instruction(Instruction::LoadInt32 {
             dst: Register(1),

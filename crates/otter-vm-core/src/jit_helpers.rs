@@ -1463,6 +1463,41 @@ extern "C" fn otter_rt_close_upvalue(ctx_raw: i64, local_idx: i64) -> i64 {
 /// Fast paths: array integer index, IC shape match.
 /// Bails on: proxy, string indexing, prototype chain walk.
 #[allow(unsafe_code)]
+extern "C" fn otter_rt_get_elem_int(_ctx_raw: i64, obj_raw: i64, idx_raw: i64) -> i64 {
+    let obj_bits = obj_raw as u64;
+    let idx_val = match unsafe { crate::value::Value::from_raw_bits_unchecked(idx_raw as u64) } {
+        Some(v) => v,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    // Only handle heap objects
+    let Some(obj_ref) = (unsafe { extract_js_object(obj_bits) }) else {
+        return BAILOUT_SENTINEL;
+    };
+
+    if obj_ref.is_array() {
+        if let Some(n) = idx_val.as_int32() {
+            if n >= 0 {
+                let elements = obj_ref.get_elements_storage().borrow();
+                if let Some(v) = elements.get(n as usize) {
+                    if !v.is_hole() {
+                        return v.to_jit_bits();
+                    }
+                }
+            }
+        }
+    }
+
+    BAILOUT_SENTINEL
+}
+
+/// Runtime helper: GetElem — dynamic property access.
+///
+/// Signature: `(ctx: i64, obj: i64, idx: i64, ic_idx: i64) -> i64`
+///
+/// Fast paths: array integer index, IC shape match.
+/// Bails on: proxy, string indexing, prototype chain walk.
+#[allow(unsafe_code)]
 extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx: i64) -> i64 {
     let ctx = unsafe { &*(ctx_raw as *const JitContext) };
     let obj_bits = obj_raw as u64;
@@ -1482,7 +1517,9 @@ extern "C" fn otter_rt_get_elem(ctx_raw: i64, obj_raw: i64, idx_raw: i64, ic_idx
             if n >= 0 {
                 let elements = obj_ref.get_elements_storage().borrow();
                 if let Some(v) = elements.get(n as usize) {
-                    return v.to_jit_bits();
+                    if !v.is_hole() {
+                        return v.to_jit_bits();
+                    }
                 }
             }
         }
@@ -2038,6 +2075,37 @@ extern "C" fn otter_rt_call_method(
     }
     let method = method.unwrap_or_else(crate::value::Value::undefined);
 
+    // Array push/pop fast path for JIT
+    if let Some(fn_obj) = method.native_function_object() {
+        let flags = fn_obj.flags.borrow();
+        if flags.is_array_push || flags.is_array_pop {
+            if let Some(receiver_obj) = receiver.as_object() {
+                if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() && receiver_obj.array_length_writable() && !receiver_obj.is_frozen() {
+                    if flags.is_array_push {
+                        return match unsafe {
+                            with_collected_args(argc, argv_ptr_raw, |args| {
+                                let mut last_len = receiver_obj.array_length();
+                                for arg in args {
+                                    last_len = receiver_obj.array_push(arg.clone());
+                                }
+                                if args.is_empty() {
+                                    last_len = receiver_obj.array_length();
+                                }
+                                crate::value::Value::number(last_len as f64)
+                            })
+                        } {
+                            Some(result) => result.to_jit_bits(),
+                            _ => BAILOUT_SENTINEL,
+                        };
+                    } else if flags.is_array_pop {
+                        let val = receiver_obj.array_pop();
+                        return val.to_jit_bits();
+                    }
+                }
+            }
+        }
+    }
+
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
 
@@ -2193,6 +2261,37 @@ extern "C" fn otter_rt_call_method_computed(
     };
 
     let argc = argc_raw as usize;
+
+    // Array push/pop fast path for JIT
+    if let Some(fn_obj) = method.native_function_object() {
+        let flags = fn_obj.flags.borrow();
+        if flags.is_array_push || flags.is_array_pop {
+            if let Some(receiver_obj) = receiver.as_object() {
+                if receiver_obj.is_array() && !receiver_obj.is_dictionary_mode() && receiver_obj.array_length_writable() && !receiver_obj.is_frozen() {
+                    if flags.is_array_push {
+                        return match unsafe {
+                            with_collected_args(argc, argv_ptr_raw, |args| {
+                                let mut last_len = receiver_obj.array_length();
+                                for arg in args {
+                                    last_len = receiver_obj.array_push(arg.clone());
+                                }
+                                if args.is_empty() {
+                                    last_len = receiver_obj.array_length();
+                                }
+                                crate::value::Value::number(last_len as f64)
+                            })
+                        } {
+                            Some(result) => result.to_jit_bits(),
+                            _ => BAILOUT_SENTINEL,
+                        };
+                    } else if flags.is_array_pop {
+                        let val = receiver_obj.array_pop();
+                        return val.to_jit_bits();
+                    }
+                }
+            }
+        }
+    }
 
     let interpreter = unsafe { &*ctx.interpreter };
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
@@ -4517,6 +4616,7 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
             otter_rt_close_upvalue as *const u8,
         );
         helpers.set(HelperKind::GetElem, otter_rt_get_elem as *const u8);
+        helpers.set(HelperKind::GetElemInt, otter_rt_get_elem_int as *const u8);
         helpers.set(HelperKind::SetElem, otter_rt_set_elem as *const u8);
         helpers.set(HelperKind::GetProp, otter_rt_get_prop as *const u8);
         helpers.set(HelperKind::SetProp, otter_rt_set_prop as *const u8);

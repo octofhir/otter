@@ -163,6 +163,9 @@ struct JsonParser<'a, 'ctx> {
     node_count: usize,
     /// Shape template for current array scope
     array_shape_template: Option<ShapeTemplate>,
+    /// Global shape cache: maps key fingerprint to (keys, shape) for reuse
+    /// across ALL objects with the same property set (not just array siblings).
+    shape_cache: FxHashMap<u64, (Vec<GcRef<JsString>>, Arc<crate::shape::Shape>)>,
     /// Temp buffer for building escaped strings (reused to avoid alloc)
     str_buf: String,
 }
@@ -184,6 +187,7 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             val_cache: FxHashMap::default(),
             node_count: 0,
             array_shape_template: None,
+            shape_cache: FxHashMap::default(),
             str_buf: String::with_capacity(128),
         }
     }
@@ -618,7 +622,7 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             // Perfect match — reuse cached shape
             let shape = Arc::clone(&tmpl.shape);
             self.array_shape_template = Some(tmpl);
-            let obj = GcRef::new(JsObject::with_shape_and_values(
+            let obj = GcRef::new(JsObject::with_shape_and_values_no_barrier(
                 self.object_proto.clone(),
                 shape,
                 &values,
@@ -664,6 +668,18 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
         Ok(Value::object(obj))
     }
 
+    /// Compute a fast fingerprint for a key sequence (for shape cache lookup).
+    #[inline]
+    fn key_fingerprint(keys: &[GcRef<JsString>]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        keys.len().hash(&mut h);
+        for k in keys {
+            k.as_ptr().hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// Cold path: no template. Buffer all properties, build shape, cache template.
     fn parse_object_cold(&mut self) -> Result<Value, VmError> {
         let mut keys: SmallVec<[GcRef<JsString>; 8]> = SmallVec::new();
@@ -702,12 +718,32 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
 
         // Build object with shape
         if keys.len() <= crate::object::DICTIONARY_THRESHOLD {
-            let root = crate::shape::Shape::root();
-            let prop_keys: SmallVec<[PropertyKey; 8]> =
-                keys.iter().map(|k| PropertyKey::String(*k)).collect();
-            let shape = crate::shape::Shape::from_keys(&root, &prop_keys);
+            // Check global shape cache first — reuses shapes for ALL objects
+            // with the same key set (metadata, preferences, etc.), not just array siblings.
+            let fp = Self::key_fingerprint(&keys);
+            let shape = if let Some((cached_keys, cached_shape)) = self.shape_cache.get(&fp) {
+                // Verify keys match (collision check)
+                if cached_keys.len() == keys.len()
+                    && cached_keys.iter().zip(keys.iter()).all(|(a, b)| a.as_ptr() == b.as_ptr())
+                {
+                    Arc::clone(cached_shape)
+                } else {
+                    let root = crate::shape::Shape::root();
+                    let prop_keys: SmallVec<[PropertyKey; 8]> =
+                        keys.iter().map(|k| PropertyKey::String(*k)).collect();
+                    crate::shape::Shape::from_keys(&root, &prop_keys)
+                }
+            } else {
+                let root = crate::shape::Shape::root();
+                let prop_keys: SmallVec<[PropertyKey; 8]> =
+                    keys.iter().map(|k| PropertyKey::String(*k)).collect();
+                let shape = crate::shape::Shape::from_keys(&root, &prop_keys);
+                self.shape_cache
+                    .insert(fp, (keys.to_vec(), Arc::clone(&shape)));
+                shape
+            };
 
-            let obj = GcRef::new(JsObject::with_shape_and_values(
+            let obj = GcRef::new(JsObject::with_shape_and_values_no_barrier(
                 self.object_proto.clone(),
                 Arc::clone(&shape),
                 &values,
@@ -731,24 +767,26 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
     }
 
     /// Parse a JSON array.
+    /// Collects all elements first, then creates the array with pre-sized elements.
     fn parse_array(&mut self) -> Result<Value, VmError> {
         self.advance(); // skip '['
         self.skip_whitespace();
 
-        let arr = GcRef::new(JsObject::array(0));
-        arr.set_prototype(self.array_proto.clone());
-
         if self.peek() == Some(b']') {
             self.advance();
+            let arr = GcRef::new(JsObject::array(0));
+            arr.set_prototype(self.array_proto.clone());
             return Ok(Value::array(arr));
         }
 
         // Save parent array's shape template
         let saved_template = self.array_shape_template.take();
 
+        // Collect all elements first
+        let mut elements: Vec<Value> = Vec::with_capacity(16);
         loop {
             let value = self.parse_value()?;
-            arr.array_push(value);
+            elements.push(value);
 
             self.skip_whitespace();
             match self.peek() {
@@ -763,6 +801,15 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
                 _ => return Err(self.error("expected ',' or ']'")),
             }
         }
+
+        // Create array with pre-sized elements (single borrow, no per-element barriers)
+        let arr = GcRef::new(JsObject::array(elements.len()));
+        arr.set_prototype(self.array_proto.clone());
+        {
+            let mut elems = arr.elements.borrow_mut();
+            *elems = crate::object::ElementsKind::Object(elements);
+        }
+        arr.flags.borrow_mut().dense_array_length_hint = arr.elements.borrow().len() as u32;
 
         // Restore parent scope's template
         self.array_shape_template = saved_template;
@@ -791,7 +838,6 @@ fn parse_json_to_value_direct(
     parser.parse()
 }
 
-use std::fmt::Write; // Needed for write! on String
 
 /// JSON string escaping with SWAR fast scan + DoNotEscape table.
 /// Processes 8 bytes at a time when safe, falls back to per-byte table lookup.
@@ -1993,7 +2039,8 @@ fn stringify_object_fast_inner(
     }
     drop(flags);
 
-    // Check for toJSON (Date.prototype.toJSON, custom toJSON, etc.)
+    // Check for toJSON: first check own shape (fast — no intern/prototype walk),
+    // then fall back to full property lookup (handles Date.prototype.toJSON etc.)
     if obj
         .get(&PropertyKey::string("toJSON"))
         .map_or(false, |v| v.is_callable())

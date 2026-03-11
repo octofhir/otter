@@ -114,6 +114,7 @@ fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
         | Instruction::NewObject { dst }
         | Instruction::NewArray { dst, .. }
         | Instruction::GetElem { dst, .. }
+        | Instruction::GetElemInt { dst, .. }
         | Instruction::Spread { dst, .. }
         | Instruction::Closure { dst, .. }
         | Instruction::Call { dst, .. }
@@ -4805,12 +4806,14 @@ impl Interpreter {
                 }
 
                 if let Some(func_obj) = func_value.as_object() {
-                    if func_obj
-                        .get(&PropertyKey::string("__non_constructor"))
-                        .and_then(|v| v.as_boolean())
-                        == Some(true)
+                    if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
+                        func_obj.get_own_property_descriptor(&PropertyKey::string(
+                            "__non_constructor",
+                        ))
                     {
-                        return Err(VmError::type_error("not a constructor"));
+                        if value.as_boolean() == Some(true) {
+                            return Err(VmError::type_error("not a constructor"));
+                        }
                     }
                 }
 
@@ -6816,8 +6819,9 @@ impl Interpreter {
             }
 
             // ==================== Arrays ====================
-            Instruction::NewArray { dst, len } => {
+            Instruction::NewArray { dst, len, packed } => {
                 let arr = GcRef::new(JsObject::array(*len as usize));
+                arr.flags.borrow_mut().is_packed = *packed;
                 // Attach `Array.prototype` if present so arrays are iterable and have methods.
                 if let Some(array_obj) = ctx.get_global("Array").and_then(|v| v.as_object())
                     && let Some(array_proto) = array_obj
@@ -6827,6 +6831,33 @@ impl Interpreter {
                     arr.set_prototype(Value::object(array_proto));
                 }
                 ctx.set_register(dst.0, Value::array(arr));
+                Ok(())
+            }
+
+            Instruction::GetElemInt { dst, obj, index } => {
+                let object = ctx.get_register(obj.0).clone();
+                let idx_val = ctx.get_register(index.0).clone();
+
+                if let Some(idx) = idx_val.as_int32() {
+                    if idx >= 0 {
+                        if let Some(obj_ref) = object.as_object() {
+                            if let Some(val) = obj_ref.get_index(idx as usize) {
+                                ctx.set_register(dst.0, val);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                
+                // Fallback to generic GetElem semantics if fast path fails
+                if let Some(obj_ref) = object.as_object() {
+                    let prop_key = self.value_to_property_key(ctx, &idx_val)?;
+                    let key_value = crate::proxy_operations::property_key_to_value_pub(&prop_key);
+                    let result = self.get_with_proxy_chain(ctx, &obj_ref, &prop_key, key_value, &object)?;
+                    ctx.set_register(dst.0, result);
+                } else {
+                    ctx.set_register(dst.0, Value::undefined());
+                }
                 Ok(())
             }
 
@@ -8614,8 +8645,15 @@ impl Interpreter {
                         } else if super_value.as_native_function().is_some() {
                             // Native functions can be constructors unless marked non-constructor
                             if let Some(obj) = super_value.as_object() {
-                                !obj.get(&PropertyKey::string("__non_constructor"))
-                                    .map_or(false, |v| v.is_boolean() && v == Value::boolean(true))
+                                if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
+                                    obj.get_own_property_descriptor(&PropertyKey::string(
+                                        "__non_constructor",
+                                    ))
+                                {
+                                    value.as_boolean() != Some(true)
+                                } else {
+                                    true
+                                }
                             } else {
                                 true
                             }

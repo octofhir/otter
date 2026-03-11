@@ -193,6 +193,7 @@ fn instruction_dst_register(instruction: &Instruction) -> Option<u16> {
         | Instruction::GetPropConst { dst, .. }
         | Instruction::GetProp { dst, .. }
         | Instruction::GetElem { dst, .. }
+        | Instruction::GetElemInt { dst, .. }
         | Instruction::GetLocalProp { dst, .. }
         | Instruction::Call { dst, .. }
         | Instruction::CallMethod { dst, .. }
@@ -397,6 +398,7 @@ fn is_supported_with_helpers(instruction: &Instruction) -> bool {
                 | Instruction::GetProp { .. }
                 | Instruction::SetProp { .. }
                 | Instruction::GetElem { .. }
+                | Instruction::GetElemInt { .. }
                 | Instruction::SetElem { .. }
                 | Instruction::DeleteProp { .. }
                 | Instruction::DefineProperty { .. }
@@ -2953,7 +2955,7 @@ pub fn translate_function_with_constants(
                 builder.switch_to_block(continue_block);
                 write_reg(builder, &reg_vars, *dst, result);
             }
-            Instruction::NewArray { dst, len } => {
+            Instruction::NewArray { dst, len, packed: _ } => {
                 let helper_ref = helpers
                     .and_then(|h| h.get(HelperKind::NewArray))
                     .ok_or_else(|| unsupported(pc, instruction))?;
@@ -3262,6 +3264,20 @@ pub fn translate_function_with_constants(
                     helper_ref,
                     &[ctx_ptr, obj_val, key_val, value, ic_idx],
                 );
+            }
+            Instruction::GetElemInt { dst, obj, index } => {
+                let helper_ref = helpers
+                    .and_then(|h| h.get(HelperKind::GetElem))
+                    .ok_or_else(|| unsupported(pc, instruction))?;
+                let obj_val = read_reg(builder, &reg_vars, *obj);
+                let idx_val = read_reg(builder, &reg_vars, *index);
+                let ic_idx = builder.ins().iconst(types::I64, 0); // GetElemInt has no IC
+                let result = emit_helper_call_with_bailout(
+                    builder,
+                    helper_ref,
+                    &[ctx_ptr, obj_val, idx_val, ic_idx],
+                );
+                write_reg(builder, &reg_vars, *dst, result);
             }
             // --- GetElem / SetElem ---
             Instruction::GetElem {

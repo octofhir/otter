@@ -89,12 +89,14 @@ impl Interpreter {
     ) -> VmResult<Value> {
         // Check __non_constructor flag (ES2023 §17: built-in methods are not constructors)
         if let Some(func_obj) = func.as_object() {
-            if func_obj
-                .get(&crate::object::PropertyKey::string("__non_constructor"))
-                .and_then(|v| v.as_boolean())
-                == Some(true)
+            if let Some(crate::object::PropertyDescriptor::Data { value, .. }) =
+                func_obj.get_own_property_descriptor(&crate::object::PropertyKey::string(
+                    "__non_constructor",
+                ))
             {
-                return Err(VmError::type_error("not a constructor"));
+                if value.as_boolean() == Some(true) {
+                    return Err(VmError::type_error("not a constructor"));
+                }
             }
         }
 

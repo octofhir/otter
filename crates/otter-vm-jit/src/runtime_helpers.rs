@@ -211,10 +211,12 @@ pub enum HelperKind {
     GetPropMono = 83,
     /// `(ctx, callee, argc, argv_ptr, expected_func_ptr) -> value` — monomorphic call
     CallMono = 84,
+    /// `(ctx, obj, idx) -> value`
+    GetElemInt = 85,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 85;
+pub const HELPER_COUNT: usize = 86;
 
 /// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
 /// Used by IteratorNext to return both value and done flag.
@@ -339,6 +341,7 @@ impl HelperKind {
             Self::ForInNext => "otter_rt_for_in_next",
             Self::GetPropMono => "otter_rt_get_prop_mono",
             Self::CallMono => "otter_rt_call_mono",
+            Self::GetElemInt => "otter_rt_get_elem_int",
         }
     }
 
@@ -354,8 +357,6 @@ impl HelperKind {
             | Self::CallSuperForward
             | Self::YieldOp
             | Self::AwaitOp => 1,
-            Self::ImportOp | Self::ForInNext => 2,
-            Self::ExportOp => 3,
             Self::LoadConst
             | Self::NewArray
             | Self::ThrowValue
@@ -403,17 +404,18 @@ impl HelperKind {
             | Self::SpreadArray
             | Self::SetHomeObject
             | Self::CallSuper
-            | Self::GetPropMono => 3,
+            | Self::GetPropMono
+            | Self::GetElemInt => 3,
             Self::GetPropConst
             | Self::GetProp
-            | Self::CallFunction
             | Self::GetElem
+            | Self::CallFunction
+            | Self::Construct
             | Self::DefineProperty
             | Self::DefineGetter
             | Self::DefineSetter
             | Self::DefineMethod
             | Self::GenericBitOp
-            | Self::Construct
             | Self::InstanceOf
             | Self::InOp
             | Self::TailCallHelper
@@ -428,6 +430,8 @@ impl HelperKind {
             | Self::CallMethodComputedSpread
             | Self::CallMono => 5,
             Self::CallMethod | Self::CallMethodComputed => 6,
+            Self::ImportOp | Self::ForInNext => 2,
+            Self::ExportOp => 3,
         }
     }
 

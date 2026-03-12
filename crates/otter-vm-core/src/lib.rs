@@ -81,7 +81,7 @@ pub use intrinsics::Intrinsics;
 pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
-pub use otter_vm_exec::JitRuntimeStats;
+pub use otter_vm_exec::{JitHelperCallStat, JitRuntimeStats};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;

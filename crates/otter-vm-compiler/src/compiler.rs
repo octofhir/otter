@@ -8831,15 +8831,25 @@ impl Compiler {
                 ObjectPropertyKind::ObjectProperty(prop) => {
                     match prop.kind {
                         PropertyKind::Init => {
-                            let key_reg = self.compile_property_key(&prop.key)?;
                             let value = self.compile_expression(&prop.value)?;
-                            self.codegen.emit(Instruction::DefineProperty {
-                                obj: dst,
-                                key: key_reg,
-                                val: value,
-                            });
+                            if !prop.computed
+                                && Self::non_computed_property_key_name(&prop.key).as_deref()
+                                    == Some("__proto__")
+                            {
+                                self.codegen.emit(Instruction::SetPrototype {
+                                    obj: dst,
+                                    proto: value,
+                                });
+                            } else {
+                                let key_reg = self.compile_property_key(&prop.key)?;
+                                self.codegen.emit(Instruction::DefineProperty {
+                                    obj: dst,
+                                    key: key_reg,
+                                    val: value,
+                                });
+                                self.codegen.free_reg(key_reg);
+                            }
                             self.codegen.free_reg(value);
-                            self.codegen.free_reg(key_reg);
                         }
                         PropertyKind::Get => {
                             // Use native DefineGetter instruction

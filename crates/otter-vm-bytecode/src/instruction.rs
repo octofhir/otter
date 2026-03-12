@@ -144,6 +144,8 @@ pub enum Opcode {
     DefineSetter = 0x68,
     /// Define method on object (non-enumerable, writable, configurable)
     DefineMethod = 0x69,
+    /// Set object [[Prototype]] during object literal construction
+    SetPrototype = 0x6A,
 
     // ==================== Arrays ====================
     /// Create empty array: dst = \[\]
@@ -334,6 +336,7 @@ impl Opcode {
             0x67 => Some(Self::DefineGetter),
             0x68 => Some(Self::DefineSetter),
             0x69 => Some(Self::DefineMethod),
+            0x6A => Some(Self::SetPrototype),
 
             0x70 => Some(Self::NewArray),
             0x71 => Some(Self::GetElem),
@@ -473,6 +476,7 @@ impl Opcode {
             Self::DefineGetter => "DefineGetter",
             Self::DefineSetter => "DefineSetter",
             Self::DefineMethod => "DefineMethod",
+            Self::SetPrototype => "SetPrototype",
             // Arrays
             Self::NewArray => "NewArray",
             Self::GetElem => "GetElem",
@@ -847,6 +851,11 @@ pub enum Instruction {
         obj: Register,
         key: Register,
         val: Register,
+    },
+    /// Set object [[Prototype]] directly
+    SetPrototype {
+        obj: Register,
+        proto: Register,
     },
 
     // Arrays

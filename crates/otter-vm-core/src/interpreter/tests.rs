@@ -2077,3 +2077,76 @@ fn test_hot_function_nested_calls() {
         inner_func.is_hot_function()
     );
 }
+
+#[test]
+fn test_backward_conditional_jump_records_loop_heat() {
+    let loop_func = Function::builder()
+        .name("loop_conditional")
+        .register_count(4)
+        .local_count(1)
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(0),
+            value: 0,
+        })
+        .instruction(Instruction::SetLocal {
+            idx: otter_vm_bytecode::LocalIndex(0),
+            src: Register(0),
+        })
+        .instruction(Instruction::GetLocal {
+            dst: Register(0),
+            idx: otter_vm_bytecode::LocalIndex(0),
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(1),
+            value: 100,
+        })
+        .instruction(Instruction::Lt {
+            dst: Register(2),
+            lhs: Register(0),
+            rhs: Register(1),
+        })
+        .instruction(Instruction::JumpIfFalse {
+            cond: Register(2),
+            offset: otter_vm_bytecode::JumpOffset(5),
+        })
+        .instruction(Instruction::LoadInt32 {
+            dst: Register(3),
+            value: 1,
+        })
+        .instruction(Instruction::Add {
+            dst: Register(0),
+            lhs: Register(0),
+            rhs: Register(3),
+            feedback_index: 0,
+        })
+        .instruction(Instruction::SetLocal {
+            idx: otter_vm_bytecode::LocalIndex(0),
+            src: Register(0),
+        })
+        .instruction(Instruction::JumpIfTrue {
+            cond: Register(2),
+            offset: otter_vm_bytecode::JumpOffset(-7),
+        })
+        .instruction(Instruction::Return { src: Register(0) })
+        .feedback_vector_size(1)
+        .build();
+
+    let mut builder = Module::builder("conditional-loop-heat.js");
+    builder.add_function(loop_func);
+    let module = Arc::new(builder.build());
+
+    let (mut ctx, _rt) = create_test_context_with_runtime();
+    let interpreter = Interpreter::new();
+    let result = interpreter.execute_arc(module.clone(), &mut ctx).unwrap();
+
+    assert_eq!(result.as_int32(), Some(100));
+
+    let func = module.function(0).expect("entry function should exist");
+    assert!(
+        func.get_back_edge_count() >= otter_vm_bytecode::function::HOT_FUNCTION_THRESHOLD
+            || func.is_hot_function(),
+        "conditional backward jump should contribute to loop heat (back_edges={}, is_hot={})",
+        func.get_back_edge_count(),
+        func.is_hot_function()
+    );
+}

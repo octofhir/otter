@@ -20,6 +20,9 @@ libc = "0.2"
 notify = "6.1"
 parking_lot = "0.12"
 regex = "1"
+percent-encoding = "2"
+idna = "1"
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

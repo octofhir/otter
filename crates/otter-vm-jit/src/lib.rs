@@ -14,4 +14,4 @@ mod type_guards;
 
 pub use bailout::{BAILOUT_SENTINEL, BailoutReason, DEOPT_THRESHOLD, is_bailout};
 pub use compiler::{DeoptMetadata, DeoptResumeSite, JitCompileArtifact, JitCompiler, JitError};
-pub use runtime_helpers::{HelperKind, RuntimeHelpers};
+pub use runtime_helpers::{HelperKind, HelperSafetyClass, RuntimeHelpers};

@@ -193,6 +193,7 @@ pub type GcBox<T> = otter_vm_gc::object::GcAllocation<T>;
 /// ...is undefined behavior, as the pointer may become dangling.
 ///
 /// To keep a value alive across GC points, root it using [`HandleScope::root`].
+#[repr(transparent)]
 #[derive(Debug)]
 pub struct Gc<T> {
     ptr: NonNull<GcBox<T>>,
@@ -271,6 +272,7 @@ impl<T> Copy for Gc<T> {}
 /// `GcRef<T>` is `Send + Sync` when `T` is `Send + Sync`, matching `Arc<T>`
 /// behavior. The underlying `GcBox<T>` uses interior mutability (RwLock)
 /// for thread-safe access where needed.
+#[repr(transparent)]
 #[derive(Debug)]
 pub struct GcRef<T> {
     gc: Gc<T>,

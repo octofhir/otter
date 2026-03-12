@@ -27,6 +27,10 @@
 //! All helper functions take `*mut u8` (ctx) as first argument, followed by
 //! i64 operands, and return i64.
 
+#[cfg(not(test))]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use cranelift_codegen::ir::{self, AbiParam, types};
 use cranelift_jit::JITBuilder;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -220,6 +224,196 @@ pub enum HelperKind {
 /// Total number of helper kinds.
 pub const HELPER_COUNT: usize = 87;
 
+/// Number of helper telemetry families.
+pub const HELPER_FAMILY_COUNT: usize = 10;
+
+const HELPER_FAMILY_NAMES: [&str; HELPER_FAMILY_COUNT] = [
+    "globals_scope",
+    "property_element",
+    "call_construct",
+    "allocation_closure",
+    "generic_op",
+    "type_conversion",
+    "iteration_spread",
+    "exception_control",
+    "class_super",
+    "module_eval",
+];
+
+/// Primary helper safety taxonomy used by the JIT gap plan.
+///
+/// This is intentionally conservative: if a helper can allocate, re-enter VM
+/// execution, or cross a host boundary on any path, it is classified into the
+/// higher-risk bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperSafetyClass {
+    /// Leaf helper operating on already-materialized values without VM/host re-entry.
+    LeafNoGc,
+    /// Touches VM frame/exception state but does not intentionally re-enter execution.
+    VmStateOnly,
+    /// Leaf helper that may allocate, intern strings, or grow object/array storage.
+    AllocatingLeaf,
+    /// Re-enters interpreter/JIT execution or other VM coercion/call paths.
+    VmReentry,
+    /// Crosses into host hooks or FFI and therefore escapes JIT-side invariants.
+    HostBoundary,
+    /// Never completes normally; intentionally returns `BAILOUT_SENTINEL`.
+    AlwaysBailout,
+}
+
+impl HelperSafetyClass {
+    /// Relative severity used when collapsing multiple helper classes into a
+    /// single function-level boundary summary.
+    pub const fn severity_rank(self) -> u8 {
+        match self {
+            Self::LeafNoGc => 0,
+            Self::VmStateOnly => 1,
+            Self::AllocatingLeaf => 2,
+            Self::VmReentry => 3,
+            Self::HostBoundary => 4,
+            Self::AlwaysBailout => 5,
+        }
+    }
+
+    /// Stable user-facing label for dashboards and audit docs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeafNoGc => "leaf_no_gc",
+            Self::VmStateOnly => "vm_state_only",
+            Self::AllocatingLeaf => "allocating_leaf",
+            Self::VmReentry => "vm_reentry",
+            Self::HostBoundary => "host_boundary",
+            Self::AlwaysBailout => "always_bailout",
+        }
+    }
+
+    /// Whether helpers in this class may allocate or mutate heap storage.
+    pub const fn may_allocate(self) -> bool {
+        matches!(
+            self,
+            Self::AllocatingLeaf | Self::VmReentry | Self::HostBoundary
+        )
+    }
+
+    /// Whether helpers in this class may re-enter interpreter/JIT execution.
+    pub const fn may_reenter_vm(self) -> bool {
+        matches!(self, Self::VmReentry | Self::HostBoundary)
+    }
+
+    /// Whether helpers in this class may cross host/FFI boundaries.
+    pub const fn crosses_host_boundary(self) -> bool {
+        matches!(self, Self::HostBoundary)
+    }
+
+    /// Whether helpers in this class can invalidate the historical no-GC assumption.
+    pub const fn violates_no_gc_contract(self) -> bool {
+        self.may_allocate() || self.may_reenter_vm()
+    }
+
+    /// Whether helpers in this class always force interpreter fallback.
+    pub const fn always_bails_out(self) -> bool {
+        matches!(self, Self::AlwaysBailout)
+    }
+
+    /// Return the more severe of two helper classes.
+    pub const fn max(self, other: Self) -> Self {
+        if self.severity_rank() >= other.severity_rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+static HELPER_CALL_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HELPER_CALL_COUNTS: [AtomicU64; HELPER_COUNT] = [const { AtomicU64::new(0) }; HELPER_COUNT];
+static HELPER_FAMILY_CALL_COUNTS: [AtomicU64; HELPER_FAMILY_COUNT] =
+    [const { AtomicU64::new(0) }; HELPER_FAMILY_COUNT];
+#[cfg(not(test))]
+static HELPER_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Snapshot of JIT helper runtime telemetry.
+#[derive(Debug, Clone)]
+pub struct HelperCallStatsSnapshot {
+    /// Total helper calls observed across all helper kinds.
+    pub total_calls: u64,
+    /// Per-helper call counters, indexed by [`HelperKind as usize`].
+    pub per_helper: [u64; HELPER_COUNT],
+    /// Per-family call counters, indexed via [`helper_family_name`].
+    pub per_family: [u64; HELPER_FAMILY_COUNT],
+}
+
+#[cfg(not(test))]
+fn parse_env_truthy(value: &str) -> bool {
+    !matches!(value.trim(), "" | "0")
+        && !value.trim().eq_ignore_ascii_case("false")
+        && !value.trim().eq_ignore_ascii_case("off")
+        && !value.trim().eq_ignore_ascii_case("no")
+}
+
+fn helper_stats_enabled() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+
+    #[cfg(not(test))]
+    {
+        *HELPER_STATS_ENABLED.get_or_init(|| {
+            std::env::var("OTTER_JIT_STATS")
+                .ok()
+                .is_some_and(|value| parse_env_truthy(&value))
+        })
+    }
+}
+
+/// Human-readable helper family name for the provided index.
+pub fn helper_family_name(index: usize) -> &'static str {
+    HELPER_FAMILY_NAMES.get(index).copied().unwrap_or("unknown")
+}
+
+/// Record one runtime helper invocation.
+pub fn record_helper_call(kind: HelperKind) {
+    if !helper_stats_enabled() {
+        return;
+    }
+
+    HELPER_CALL_TOTAL.fetch_add(1, Ordering::Relaxed);
+    HELPER_CALL_COUNTS[kind as usize].fetch_add(1, Ordering::Relaxed);
+    HELPER_FAMILY_CALL_COUNTS[kind.family_index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Take a snapshot of current helper call telemetry.
+pub fn helper_call_stats_snapshot() -> HelperCallStatsSnapshot {
+    let mut per_helper = [0_u64; HELPER_COUNT];
+    for (index, slot) in HELPER_CALL_COUNTS.iter().enumerate() {
+        per_helper[index] = slot.load(Ordering::Relaxed);
+    }
+
+    let mut per_family = [0_u64; HELPER_FAMILY_COUNT];
+    for (index, slot) in HELPER_FAMILY_CALL_COUNTS.iter().enumerate() {
+        per_family[index] = slot.load(Ordering::Relaxed);
+    }
+
+    HelperCallStatsSnapshot {
+        total_calls: HELPER_CALL_TOTAL.load(Ordering::Relaxed),
+        per_helper,
+        per_family,
+    }
+}
+
+/// Clear helper call counters between tests.
+#[doc(hidden)]
+pub fn clear_helper_call_stats_for_tests() {
+    HELPER_CALL_TOTAL.store(0, Ordering::Relaxed);
+    for slot in &HELPER_CALL_COUNTS {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in &HELPER_FAMILY_CALL_COUNTS {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Byte offset of `secondary_result` field in JitContext (`#[repr(C)]`).
 /// Used by IteratorNext to return both value and done flag.
 /// MUST match JitContext layout in otter-vm-core/src/jit_helpers.rs.
@@ -230,6 +424,24 @@ pub const HELPER_COUNT: usize = 87;
 ///         deopt_locals_ptr(104) deopt_locals_count:u32(112) pad(116)
 ///         deopt_regs_ptr(120) deopt_regs_count:u32(128) pad(132)
 ///         osr_entry_pc(136)
+pub const JIT_CTX_UPVALUES_PTR_OFFSET: i32 = 40;
+
+/// Byte offset of `upvalue_count` in JitContext (`#[repr(C)]`).
+pub const JIT_CTX_UPVALUE_COUNT_OFFSET: i32 = 48;
+
+/// Size of one `UpvalueCell` entry in the upvalue slice.
+pub const JIT_UPVALUE_CELL_SIZE: i32 = 8;
+
+/// Byte offset of the raw `GcBox<UpvalueData>` pointer inside `UpvalueCell`.
+pub const JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET: i32 = 0;
+
+/// Byte offset of the `value` field inside `GcBox<UpvalueData>`.
+pub const JIT_UPVALUE_GCBOX_VALUE_OFFSET: i32 = 8;
+
+/// Byte offset of the raw `Value` payload inside `UpvalueData`.
+pub const JIT_UPVALUE_DATA_VALUE_OFFSET: i32 = 0;
+
+/// Byte offset of `secondary_result` in JitContext (`#[repr(C)]`).
 pub const JIT_CTX_SECONDARY_RESULT_OFFSET: i32 = 80;
 
 /// Byte offset of `bailout_reason` in JitContext (`#[repr(C)]`).
@@ -348,6 +560,232 @@ impl HelperKind {
         }
     }
 
+    /// Telemetry family index used for aggregated helper counters.
+    pub const fn family_index(self) -> usize {
+        match self {
+            Self::LoadConst
+            | Self::GetGlobal
+            | Self::SetGlobal
+            | Self::GetUpvalue
+            | Self::SetUpvalue
+            | Self::LoadThis
+            | Self::CloseUpvalue
+            | Self::DeclareGlobalVar
+            | Self::CreateArguments => 0,
+
+            Self::GetPropConst
+            | Self::SetPropConst
+            | Self::GetProp
+            | Self::SetProp
+            | Self::GetElem
+            | Self::SetElem
+            | Self::DefineProperty
+            | Self::DeleteProp
+            | Self::GetPropMono
+            | Self::GetElemInt => 1,
+
+            Self::CallFunction
+            | Self::Construct
+            | Self::CallMethod
+            | Self::CallWithReceiver
+            | Self::CallMethodComputed
+            | Self::CallSpread
+            | Self::ConstructSpread
+            | Self::CallMethodComputedSpread
+            | Self::TailCallHelper
+            | Self::CallMono
+            | Self::CallFfi => 2,
+
+            Self::CreateClosure
+            | Self::NewObject
+            | Self::NewArray
+            | Self::ClosureCreate
+            | Self::AsyncClosure
+            | Self::GeneratorClosure
+            | Self::AsyncGeneratorClosure => 3,
+
+            Self::GenericAdd
+            | Self::GenericSub
+            | Self::GenericMul
+            | Self::GenericDiv
+            | Self::GenericMod
+            | Self::GenericNeg
+            | Self::GenericInc
+            | Self::GenericDec
+            | Self::GenericLt
+            | Self::GenericLe
+            | Self::GenericGt
+            | Self::GenericGe
+            | Self::GenericEq
+            | Self::GenericNeq
+            | Self::GenericBitOp
+            | Self::GenericBitNot
+            | Self::GenericNot
+            | Self::Pow => 4,
+
+            Self::TypeOf
+            | Self::TypeOfName
+            | Self::ToNumber
+            | Self::JsToString
+            | Self::RequireCoercible
+            | Self::InstanceOf
+            | Self::InOp => 5,
+
+            Self::SpreadArray
+            | Self::GetIterator
+            | Self::IteratorNext
+            | Self::IteratorClose
+            | Self::GetAsyncIterator
+            | Self::ForInNext => 6,
+
+            Self::ThrowValue
+            | Self::TryStart
+            | Self::TryEnd
+            | Self::CatchOp
+            | Self::YieldOp
+            | Self::AwaitOp => 7,
+
+            Self::DefineGetter
+            | Self::DefineSetter
+            | Self::DefineMethod
+            | Self::DefineClass
+            | Self::GetSuper
+            | Self::CallSuper
+            | Self::GetSuperProp
+            | Self::SetHomeObject
+            | Self::CallSuperForward
+            | Self::CallSuperSpread => 8,
+
+            Self::CallEval | Self::ImportOp | Self::ExportOp => 9,
+        }
+    }
+
+    /// Human-readable helper family name.
+    pub fn family_name(self) -> &'static str {
+        helper_family_name(self.family_index())
+    }
+
+    /// Conservative safety classification used for helper audits and future
+    /// tiering/safepoint policy.
+    pub const fn safety_class(self) -> HelperSafetyClass {
+        match self {
+            Self::LoadThis
+            | Self::GetUpvalue
+            | Self::SetUpvalue
+            | Self::Pow
+            | Self::GetElemInt
+            | Self::GetPropMono
+            | Self::GenericSub
+            | Self::GenericMul
+            | Self::GenericDiv
+            | Self::GenericMod
+            | Self::GenericNeg
+            | Self::GenericInc
+            | Self::GenericDec
+            | Self::GenericLt
+            | Self::GenericLe
+            | Self::GenericGt
+            | Self::GenericGe
+            | Self::GenericEq
+            | Self::GenericNeq
+            | Self::GenericBitOp
+            | Self::GenericBitNot
+            | Self::GenericNot
+            | Self::RequireCoercible => HelperSafetyClass::LeafNoGc,
+
+            Self::CloseUpvalue | Self::TryStart | Self::TryEnd | Self::CatchOp => {
+                HelperSafetyClass::VmStateOnly
+            }
+
+            Self::LoadConst
+            | Self::GetGlobal
+            | Self::SetGlobal
+            | Self::GetPropConst
+            | Self::SetPropConst
+            | Self::GetProp
+            | Self::SetProp
+            | Self::NewObject
+            | Self::NewArray
+            | Self::GetElem
+            | Self::SetElem
+            | Self::DefineProperty
+            | Self::DeleteProp
+            | Self::GenericAdd
+            | Self::TypeOf
+            | Self::TypeOfName
+            | Self::InstanceOf
+            | Self::InOp
+            | Self::DeclareGlobalVar
+            | Self::DefineGetter
+            | Self::DefineSetter
+            | Self::DefineMethod
+            | Self::SpreadArray
+            | Self::CreateClosure
+            | Self::ClosureCreate
+            | Self::DefineClass
+            | Self::GetSuper
+            | Self::GetSuperProp
+            | Self::SetHomeObject
+            | Self::AsyncClosure
+            | Self::GeneratorClosure
+            | Self::AsyncGeneratorClosure => HelperSafetyClass::AllocatingLeaf,
+
+            Self::CallFunction
+            | Self::Construct
+            | Self::CallMethod
+            | Self::CallWithReceiver
+            | Self::CallMethodComputed
+            | Self::ToNumber
+            | Self::JsToString
+            | Self::GetIterator
+            | Self::IteratorNext
+            | Self::IteratorClose
+            | Self::CallSpread
+            | Self::ConstructSpread
+            | Self::CallMethodComputedSpread
+            | Self::TailCallHelper
+            | Self::CallSuper
+            | Self::CallSuperForward
+            | Self::CallSuperSpread
+            | Self::GetAsyncIterator
+            | Self::CallMono
+            | Self::CallEval => HelperSafetyClass::VmReentry,
+
+            Self::ImportOp | Self::ExportOp | Self::ForInNext | Self::CallFfi => {
+                HelperSafetyClass::HostBoundary
+            }
+
+            Self::ThrowValue | Self::CreateArguments | Self::YieldOp | Self::AwaitOp => {
+                HelperSafetyClass::AlwaysBailout
+            }
+        }
+    }
+
+    /// Whether this helper can allocate or otherwise force a GC-relevant heap mutation.
+    pub const fn may_allocate(self) -> bool {
+        self.safety_class().may_allocate()
+    }
+
+    /// Whether this helper may re-enter interpreter/JIT execution.
+    pub const fn may_reenter_vm(self) -> bool {
+        self.safety_class().may_reenter_vm()
+    }
+
+    /// Whether this helper crosses host hooks or FFI.
+    pub const fn crosses_host_boundary(self) -> bool {
+        self.safety_class().crosses_host_boundary()
+    }
+
+    /// Whether this helper violates the historical "no GC during JIT" assumption.
+    pub const fn violates_no_gc_contract(self) -> bool {
+        self.safety_class().violates_no_gc_contract()
+    }
+
+    /// Whether this helper intentionally always bails out.
+    pub const fn always_bails_out(self) -> bool {
+        self.safety_class().always_bails_out()
+    }
+
     /// Number of parameters (INCLUDING the ctx pointer).
     pub fn param_count(self) -> usize {
         match self {
@@ -462,6 +900,81 @@ impl HelperKind {
     /// Build the Cranelift IR signature for this helper (SystemV fallback).
     pub fn make_signature(self) -> ir::Signature {
         self.make_signature_with_call_conv(cranelift_codegen::isa::CallConv::SystemV)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_call_snapshot_tracks_totals_and_families() {
+        clear_helper_call_stats_for_tests();
+
+        record_helper_call(HelperKind::GetPropConst);
+        record_helper_call(HelperKind::CallFunction);
+        record_helper_call(HelperKind::CallFunction);
+
+        let snapshot = helper_call_stats_snapshot();
+        assert_eq!(snapshot.total_calls, 3);
+        assert_eq!(snapshot.per_helper[HelperKind::GetPropConst as usize], 1);
+        assert_eq!(snapshot.per_helper[HelperKind::CallFunction as usize], 2);
+        assert_eq!(
+            snapshot.per_family[HelperKind::GetPropConst.family_index()],
+            1
+        );
+        assert_eq!(
+            snapshot.per_family[HelperKind::CallFunction.family_index()],
+            2
+        );
+    }
+
+    #[test]
+    fn helper_safety_classes_mark_gc_and_reentry_boundaries() {
+        assert_eq!(
+            HelperKind::GetPropMono.safety_class(),
+            HelperSafetyClass::LeafNoGc
+        );
+        assert!(!HelperKind::GetPropMono.violates_no_gc_contract());
+
+        assert_eq!(
+            HelperKind::CloseUpvalue.safety_class(),
+            HelperSafetyClass::VmStateOnly
+        );
+        assert!(!HelperKind::CloseUpvalue.violates_no_gc_contract());
+
+        assert_eq!(
+            HelperKind::NewObject.safety_class(),
+            HelperSafetyClass::AllocatingLeaf
+        );
+        assert!(HelperKind::NewObject.may_allocate());
+        assert!(HelperKind::NewObject.violates_no_gc_contract());
+        assert_eq!(
+            HelperKind::ClosureCreate.safety_class(),
+            HelperSafetyClass::AllocatingLeaf
+        );
+        assert!(HelperKind::ClosureCreate.may_allocate());
+        assert!(!HelperKind::ClosureCreate.always_bails_out());
+
+        assert_eq!(
+            HelperKind::CallFunction.safety_class(),
+            HelperSafetyClass::VmReentry
+        );
+        assert!(HelperKind::CallFunction.may_reenter_vm());
+        assert!(HelperKind::CallFunction.violates_no_gc_contract());
+
+        assert_eq!(
+            HelperKind::ImportOp.safety_class(),
+            HelperSafetyClass::HostBoundary
+        );
+        assert!(HelperKind::ImportOp.crosses_host_boundary());
+        assert!(HelperKind::ImportOp.violates_no_gc_contract());
+
+        assert_eq!(
+            HelperKind::YieldOp.safety_class(),
+            HelperSafetyClass::AlwaysBailout
+        );
+        assert!(HelperKind::YieldOp.always_bails_out());
     }
 }
 

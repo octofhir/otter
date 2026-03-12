@@ -47,8 +47,9 @@ use std::sync::Arc;
 /// Holds a single mutable `Value` via `Cell` (safe because the VM is
 /// single-threaded within an Isolate).  The GC traces through this to
 /// keep the captured value alive.
+#[repr(C)]
 pub struct UpvalueData {
-    value: Cell<Value>,
+    pub(crate) value: Cell<Value>,
 }
 
 // SAFETY: UpvalueData is only accessed from the single VM thread.
@@ -111,6 +112,7 @@ impl std::fmt::Debug for UpvalueData {
 ///
 /// `UpvalueCell` is `Copy` (8 bytes — just a GcRef pointer).
 /// The actual mutable value lives in the GC-managed `UpvalueData`.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct UpvalueCell(pub(crate) GcRef<UpvalueData>);
 

@@ -45,7 +45,12 @@ impl OtterExtension for NodeTimersExtension {
         &SPECIFIERS
     }
 
-    fn install(&self, _ctx: &mut RegistrationContext) -> Result<(), VmError> {
+    fn install(&self, ctx: &mut RegistrationContext) -> Result<(), VmError> {
+        // Node's common test harness uses structuredClone during bootstrap.
+        // A JSON-based clone is sufficient to unblock the compat runner until
+        // the engine grows a spec-accurate structured clone implementation.
+        ctx.global_fn("structuredClone", Arc::new(structured_clone_shim), 1);
+        ctx.global_fn("fetch", Arc::new(fetch_stub), 2);
         Ok(())
     }
 
@@ -66,6 +71,47 @@ impl OtterExtension for NodeTimersExtension {
 /// Create a boxed extension instance for registration.
 pub fn node_timers_extension() -> Box<dyn OtterExtension> {
     Box::new(NodeTimersExtension)
+}
+
+fn structured_clone_shim(
+    _this: &Value,
+    args: &[Value],
+    ncx: &mut NativeContext,
+) -> Result<Value, VmError> {
+    let value = args.first().cloned().unwrap_or(Value::undefined());
+    if value.is_undefined() {
+        return Ok(Value::undefined());
+    }
+
+    let json = ncx
+        .global()
+        .get(&PropertyKey::string("JSON"))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| VmError::type_error("structuredClone: JSON is not available"))?;
+    let stringify = json
+        .get(&PropertyKey::string("stringify"))
+        .ok_or_else(|| VmError::type_error("structuredClone: JSON.stringify is not available"))?;
+    let parse = json
+        .get(&PropertyKey::string("parse"))
+        .ok_or_else(|| VmError::type_error("structuredClone: JSON.parse is not available"))?;
+
+    let serialized = ncx.call_function(&stringify, Value::object(json), &[value])?;
+    ncx.call_function(&parse, Value::object(json), &[serialized])
+}
+
+fn fetch_stub(_this: &Value, _args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+    let message = Value::string(JsString::intern(
+        "fetch is not yet implemented in node-compat mode",
+    ));
+    let reason = if let Some(error_ctor) = ncx.global().get(&PropertyKey::string("Error"))
+        && error_ctor.is_callable()
+    {
+        ncx.call_function_construct(&error_ctor, Value::undefined(), &[message])
+            .unwrap_or(message)
+    } else {
+        message
+    };
+    rejected_promise(ncx, reason)
 }
 
 fn build_timers_module(ctx: &mut RegistrationContext) -> GcRef<JsObject> {

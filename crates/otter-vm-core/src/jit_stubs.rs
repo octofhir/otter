@@ -9,12 +9,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::jit_helpers::JitContext;
 use crate::value::UpvalueCell;
+use crate::value::{Closure, Value};
 use otter_vm_bytecode::{ConstantPool, Function};
+use otter_vm_gc::object::{GcHeader, tags as gc_tags};
 use otter_vm_jit::{BAILOUT_SENTINEL, BailoutReason};
 
 type JitEntry = extern "C" fn(*mut u8, *const i64, u32) -> i64;
+type CallFunctionHelper = extern "C" fn(i64, i64, i64, i64) -> i64;
 type CallMonoHelper = extern "C" fn(i64, i64, i64, i64, i64) -> i64;
 type GetPropMonoHelper = extern "C" fn(i64, i64, i64) -> i64;
+
+const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+const TAG_PTR_FUNCTION: u64 = 0x7FFE_0000_0000_0000;
 
 const FUNCTION_PTR_OFFSET: usize = std::mem::offset_of!(JitContext, function_ptr);
 const CONSTANTS_OFFSET: usize = std::mem::offset_of!(JitContext, constants);
@@ -26,12 +33,18 @@ const HOME_OBJECT_RAW_OFFSET: usize = std::mem::offset_of!(JitContext, home_obje
 const BAILOUT_REASON_OFFSET: usize = std::mem::offset_of!(JitContext, bailout_reason);
 const BAILOUT_PC_OFFSET: usize = std::mem::offset_of!(JitContext, bailout_pc);
 
+static CALL_FUNCTION_IC_TARGET: AtomicUsize = AtomicUsize::new(0);
 static CALL_MONO_IC_TARGET: AtomicUsize = AtomicUsize::new(0);
 static GET_PROP_MONO_IC_TARGET: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
+fn default_call_function_ic_target() -> usize {
+    otter_rt_call_function_ic_fast_target as *const () as usize
+}
+
+#[inline]
 fn default_call_mono_ic_target() -> usize {
-    crate::jit_helpers::otter_rt_call_mono_impl as *const () as usize
+    otter_rt_call_mono_ic_fast_target as *const () as usize
 }
 
 #[inline]
@@ -51,6 +64,11 @@ fn load_patchable_target(slot: &AtomicUsize, default_target: usize) -> usize {
 }
 
 #[inline]
+fn load_call_function_ic_target() -> usize {
+    load_patchable_target(&CALL_FUNCTION_IC_TARGET, default_call_function_ic_target())
+}
+
+#[inline]
 fn load_call_mono_ic_target() -> usize {
     load_patchable_target(&CALL_MONO_IC_TARGET, default_call_mono_ic_target())
 }
@@ -58,6 +76,13 @@ fn load_call_mono_ic_target() -> usize {
 #[inline]
 fn load_get_prop_mono_ic_target() -> usize {
     load_patchable_target(&GET_PROP_MONO_IC_TARGET, default_get_prop_mono_ic_target())
+}
+
+#[cfg(test)]
+fn swap_call_function_ic_target_for_tests(new_target: usize) -> usize {
+    let old_target = load_call_function_ic_target();
+    CALL_FUNCTION_IC_TARGET.store(new_target, Ordering::Release);
+    old_target
 }
 
 #[cfg(test)]
@@ -88,6 +113,31 @@ fn decode_bailout_pc(raw: i64) -> Option<u32> {
     } else {
         None
     }
+}
+
+#[inline]
+unsafe fn decode_closure_from_callee_bits(callee_bits: u64) -> Option<crate::gc::GcRef<Closure>> {
+    if (callee_bits & TAG_MASK) != TAG_PTR_FUNCTION {
+        return None;
+    }
+
+    let raw_ptr = (callee_bits & PAYLOAD_MASK) as *const u8;
+    if raw_ptr.is_null() {
+        return None;
+    }
+
+    let offset = std::mem::offset_of!(crate::gc::GcBox<Closure>, value);
+    let header = unsafe { &*(raw_ptr.sub(offset) as *const GcHeader) };
+    if header.tag() != gc_tags::CLOSURE {
+        return None;
+    }
+
+    let box_ptr = unsafe { raw_ptr.sub(offset) } as *mut crate::gc::GcBox<Closure>;
+    Some(unsafe {
+        crate::gc::GcRef::from_gc(crate::gc::Gc::from_raw(std::ptr::NonNull::new_unchecked(
+            box_ptr,
+        )))
+    })
 }
 
 #[inline]
@@ -233,6 +283,171 @@ pub(crate) unsafe fn call_jit_entry(
 }
 
 #[inline]
+unsafe fn try_call_closure_jit_fast_path(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+    expected_func_index: Option<u32>,
+) -> Option<i64> {
+    let closure = unsafe { decode_closure_from_callee_bits(callee_raw as u64) }?;
+    let mono_hit = if let Some(expected_func_index) = expected_func_index {
+        if expected_func_index == 0 || closure.function_index.wrapping_add(1) != expected_func_index
+        {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+
+    let func_info = closure.module.function(closure.function_index)?;
+    if !mono_hit && (closure.is_generator || closure.is_async || func_info.flags.has_rest) {
+        return None;
+    }
+    let args_ptr = if argc_raw <= 0 || argv_ptr_raw == 0 {
+        std::ptr::null()
+    } else {
+        argv_ptr_raw as *const i64
+    };
+
+    let this_raw = if func_info.flags.is_strict {
+        Value::undefined().to_jit_bits()
+    } else {
+        let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+        let vm_ctx = unsafe { ctx.vm_ctx.as_mut()? };
+        Value::object(vm_ctx.global()).to_jit_bits()
+    };
+
+    let home_object_raw = closure
+        .home_object
+        .map(Value::object)
+        .unwrap_or_else(Value::null)
+        .to_jit_bits();
+
+    let jit_ptr = func_info.jit_entry_ptr();
+    if jit_ptr != 0 {
+        let reentry = JitCallReentryState::new(
+            func_info as *const Function,
+            &closure.module.constants as *const _,
+            if closure.upvalues.is_empty() {
+                std::ptr::null()
+            } else {
+                closure.upvalues.as_ptr()
+            },
+            closure.upvalues.len() as u32,
+            this_raw,
+            callee_raw,
+            home_object_raw,
+        );
+
+        let result = unsafe {
+            call_with_reentry_state(
+                ctx_raw as *mut JitContext,
+                args_ptr,
+                argc_raw.max(0) as u32,
+                jit_ptr,
+                &reentry,
+            )
+        };
+        if result != BAILOUT_SENTINEL {
+            return Some(result);
+        }
+        return None;
+    }
+
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    if ctx.interpreter.is_null() || ctx.vm_ctx.is_null() {
+        return None;
+    }
+
+    match crate::jit_runtime::try_execute_jit_from_raw_args(
+        closure.module.module_id,
+        closure.function_index,
+        func_info,
+        argc_raw.max(0) as u32,
+        args_ptr,
+        this_raw,
+        callee_raw,
+        home_object_raw,
+        unsafe { &*ctx.vm_ctx }.cached_proto_epoch,
+        ctx.interpreter,
+        ctx.vm_ctx,
+        &closure.module.constants as *const _,
+        &closure.upvalues,
+    ) {
+        crate::jit_runtime::JitCallResult::Ok(value) => Some(value.to_jit_bits()),
+        _ => None,
+    }
+}
+
+#[inline]
+unsafe fn try_call_function_jit_fast_path(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+) -> Option<i64> {
+    unsafe { try_call_closure_jit_fast_path(ctx_raw, callee_raw, argc_raw, argv_ptr_raw, None) }
+}
+
+#[inline]
+unsafe fn try_call_mono_jit_fast_path(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+    expected_func_index_raw: i64,
+) -> Option<i64> {
+    unsafe {
+        try_call_closure_jit_fast_path(
+            ctx_raw,
+            callee_raw,
+            argc_raw,
+            argv_ptr_raw,
+            Some(expected_func_index_raw as u32),
+        )
+    }
+}
+
+#[inline]
+unsafe fn dispatch_call_function_rust(
+    target: usize,
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+) -> i64 {
+    let helper: CallFunctionHelper = unsafe { std::mem::transmute(target) };
+    helper(ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dispatch_call_function_asm(
+    target: usize,
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+) -> i64 {
+    let mut result: i64;
+    unsafe {
+        std::arch::asm!(
+            "blr x9",
+            in("x0") ctx_raw,
+            in("x1") callee_raw,
+            in("x2") argc_raw,
+            in("x3") argv_ptr_raw,
+            in("x9") target,
+            lateout("x0") result,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[inline]
 unsafe fn dispatch_call_mono_rust(
     target: usize,
     ctx_raw: i64,
@@ -312,6 +527,27 @@ unsafe fn dispatch_get_prop_mono_asm(
     result
 }
 
+/// Patchable stub entry for generic function calls.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_call_function_stub(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+) -> i64 {
+    let target = load_call_function_ic_target();
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        dispatch_call_function_asm(target, ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        dispatch_call_function_rust(target, ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
+    }
+}
+
 /// Patchable IC stub entry for monomorphic calls.
 #[allow(unsafe_code)]
 pub(crate) extern "C" fn otter_rt_call_mono_stub(
@@ -346,6 +582,55 @@ pub(crate) extern "C" fn otter_rt_call_mono_stub(
             expected_func_index_raw,
         )
     }
+}
+
+/// Default CallFunction IC target.
+///
+/// The first contraction step for helper-bound call execution keeps the
+/// monomorphic JIT->JIT closure path in stub glue and falls back to the
+/// generic runtime helper only for misses or unsupported cases.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_call_function_ic_fast_target(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+) -> i64 {
+    if let Some(result) =
+        unsafe { try_call_function_jit_fast_path(ctx_raw, callee_raw, argc_raw, argv_ptr_raw) }
+    {
+        return result;
+    }
+
+    crate::jit_helpers::otter_rt_call_function(ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
+}
+
+/// Default CallMono IC target.
+///
+/// The first contraction step for helper-bound call execution keeps the
+/// monomorphic JIT->JIT closure path in stub glue and falls back to the
+/// generic runtime helper only for misses or unsupported cases.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_call_mono_ic_fast_target(
+    ctx_raw: i64,
+    callee_raw: i64,
+    argc_raw: i64,
+    argv_ptr_raw: i64,
+    expected_func_index_raw: i64,
+) -> i64 {
+    if let Some(result) = unsafe {
+        try_call_mono_jit_fast_path(
+            ctx_raw,
+            callee_raw,
+            argc_raw,
+            argv_ptr_raw,
+            expected_func_index_raw,
+        )
+    } {
+        return result;
+    }
+
+    crate::jit_helpers::otter_rt_call_function(ctx_raw, callee_raw, argc_raw, argv_ptr_raw)
 }
 
 /// Patchable IC stub entry for monomorphic property reads.
@@ -548,6 +833,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use otter_vm_bytecode::function::{FunctionBuilder, FunctionFlags};
+
     static IC_STUB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     extern "C" fn inspect_reentry_context(ctx_raw: *mut u8, _args: *const i64, _argc: u32) -> i64 {
@@ -559,6 +846,15 @@ mod tests {
         let ctx = unsafe { &*(args_ctx as *const JitContext) };
         let args = unsafe { std::slice::from_raw_parts(args, argc as usize) };
         ctx.this_raw + args.iter().sum::<i64>()
+    }
+
+    extern "C" fn inspect_direct_call_args_only(
+        _ctx_raw: *mut u8,
+        args: *const i64,
+        argc: u32,
+    ) -> i64 {
+        let args = unsafe { std::slice::from_raw_parts(args, argc as usize) };
+        args.iter().sum::<i64>()
     }
 
     extern "C" fn trigger_direct_bailout(ctx_raw: *mut u8, _args: *const i64, _argc: u32) -> i64 {
@@ -593,6 +889,17 @@ mod tests {
         let args =
             unsafe { std::slice::from_raw_parts(argv_ptr_raw as *const i64, argc_raw as usize) };
         ctx_raw + callee_raw + expected_func_index_raw + args.iter().sum::<i64>()
+    }
+
+    extern "C" fn patched_call_function_target(
+        ctx_raw: i64,
+        callee_raw: i64,
+        argc_raw: i64,
+        argv_ptr_raw: i64,
+    ) -> i64 {
+        let args =
+            unsafe { std::slice::from_raw_parts(argv_ptr_raw as *const i64, argc_raw as usize) };
+        ctx_raw + callee_raw + args.iter().sum::<i64>()
     }
 
     extern "C" fn patched_get_prop_mono_target(
@@ -795,6 +1102,18 @@ mod tests {
     }
 
     #[test]
+    fn call_function_ic_stub_dispatches_via_patchable_target() {
+        let _guard = IC_STUB_TEST_LOCK.lock().unwrap();
+        let patched = patched_call_function_target as *const () as usize;
+        let original = swap_call_function_ic_target_for_tests(patched);
+        let args = [5_i64, 7_i64];
+        let result = otter_rt_call_function_stub(11, 13, 2, args.as_ptr() as i64);
+        CALL_FUNCTION_IC_TARGET.store(original, Ordering::Release);
+
+        assert_eq!(result, 11 + 13 + 5 + 7);
+    }
+
+    #[test]
     fn get_prop_mono_ic_stub_dispatches_via_patchable_target() {
         let _guard = IC_STUB_TEST_LOCK.lock().unwrap();
         let patched = patched_get_prop_mono_target as *const () as usize;
@@ -803,5 +1122,120 @@ mod tests {
         GET_PROP_MONO_IC_TARGET.store(original, Ordering::Release);
 
         assert_eq!(result, 0x10 ^ 0x22 ^ 0x34);
+    }
+
+    #[test]
+    fn call_mono_ic_fast_target_executes_matching_jit_closure_without_helper_fallback() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mut builder = otter_vm_bytecode::Module::builder("jit-stub-fast-call.js");
+        let mut flags = FunctionFlags::default();
+        flags.is_strict = true;
+        let function = FunctionBuilder::new().flags(flags).param_count(2).build();
+        builder.add_function(function);
+        let module = std::sync::Arc::new(builder.build());
+        let func = module.function(0).unwrap();
+        func.set_jit_entry_ptr(inspect_direct_call_args_only as *const () as usize);
+
+        let closure = crate::gc::GcRef::new(Closure {
+            function_index: 0,
+            module,
+            upvalues: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            object: crate::gc::GcRef::new(crate::object::JsObject::new(Value::null())),
+            home_object: None,
+        });
+        let callee = Value::function(closure);
+        let args = [7_i64, 11_i64];
+        let mut ctx = JitContext {
+            function_ptr: std::ptr::null(),
+            proto_epoch: 0,
+            interpreter: std::ptr::null(),
+            vm_ctx: std::ptr::null_mut(),
+            constants: std::ptr::null(),
+            upvalues_ptr: std::ptr::null(),
+            upvalue_count: 0,
+            this_raw: 1,
+            callee_raw: 2,
+            home_object_raw: 3,
+            secondary_result: 0,
+            bailout_reason: 0,
+            bailout_pc: 0,
+            deopt_locals_ptr: std::ptr::null_mut(),
+            deopt_locals_count: 0,
+            deopt_regs_ptr: std::ptr::null_mut(),
+            deopt_regs_count: 0,
+            osr_entry_pc: -1,
+        };
+
+        let result = otter_rt_call_mono_ic_fast_target(
+            (&mut ctx as *mut JitContext) as i64,
+            callee.to_jit_bits(),
+            args.len() as i64,
+            args.as_ptr() as i64,
+            1,
+        );
+
+        assert_eq!(result, 18);
+        assert_eq!(ctx.this_raw, 1);
+        assert_eq!(ctx.callee_raw, 2);
+        assert_eq!(ctx.home_object_raw, 3);
+    }
+
+    #[test]
+    fn call_function_ic_fast_target_executes_plain_jit_closure_without_helper_fallback() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let mut builder = otter_vm_bytecode::Module::builder("jit-stub-fast-call-generic.js");
+        let mut flags = FunctionFlags::default();
+        flags.is_strict = true;
+        let function = FunctionBuilder::new().flags(flags).param_count(2).build();
+        builder.add_function(function);
+        let module = std::sync::Arc::new(builder.build());
+        let func = module.function(0).unwrap();
+        func.set_jit_entry_ptr(inspect_direct_call_args_only as *const () as usize);
+
+        let closure = crate::gc::GcRef::new(Closure {
+            function_index: 0,
+            module,
+            upvalues: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            object: crate::gc::GcRef::new(crate::object::JsObject::new(Value::null())),
+            home_object: None,
+        });
+        let callee = Value::function(closure);
+        let args = [17_i64, 19_i64];
+        let mut ctx = JitContext {
+            function_ptr: std::ptr::null(),
+            proto_epoch: 0,
+            interpreter: std::ptr::null(),
+            vm_ctx: std::ptr::null_mut(),
+            constants: std::ptr::null(),
+            upvalues_ptr: std::ptr::null(),
+            upvalue_count: 0,
+            this_raw: 4,
+            callee_raw: 5,
+            home_object_raw: 6,
+            secondary_result: 0,
+            bailout_reason: 0,
+            bailout_pc: 0,
+            deopt_locals_ptr: std::ptr::null_mut(),
+            deopt_locals_count: 0,
+            deopt_regs_ptr: std::ptr::null_mut(),
+            deopt_regs_count: 0,
+            osr_entry_pc: -1,
+        };
+
+        let result = otter_rt_call_function_ic_fast_target(
+            (&mut ctx as *mut JitContext) as i64,
+            callee.to_jit_bits(),
+            args.len() as i64,
+            args.as_ptr() as i64,
+        );
+
+        assert_eq!(result, 36);
+        assert_eq!(ctx.this_raw, 4);
+        assert_eq!(ctx.callee_raw, 5);
+        assert_eq!(ctx.home_object_raw, 6);
     }
 }

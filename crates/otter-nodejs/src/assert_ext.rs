@@ -13,7 +13,7 @@ use otter_macros::{js_class, js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
-use otter_vm_core::intrinsics_impl::helpers::strict_equal;
+use otter_vm_core::intrinsics_impl::helpers::{same_value, strict_equal};
 use otter_vm_core::object::{JsObject, PropertyDescriptor, PropertyKey};
 use otter_vm_core::string::JsString;
 use otter_vm_core::value::Value;
@@ -135,7 +135,7 @@ impl Assert {
     ) -> Result<Value, VmError> {
         let actual = args.first().cloned().unwrap_or(Value::undefined());
         let expected = args.get(1).cloned().unwrap_or(Value::undefined());
-        if !strict_equal(&actual, &expected) {
+        if !same_value(&actual, &expected) {
             let msg = get_message(args, 2);
             return Err(assertion_error(msg.as_deref(), &actual, &expected, "==="));
         }
@@ -150,7 +150,7 @@ impl Assert {
     ) -> Result<Value, VmError> {
         let actual = args.first().cloned().unwrap_or(Value::undefined());
         let expected = args.get(1).cloned().unwrap_or(Value::undefined());
-        if strict_equal(&actual, &expected) {
+        if same_value(&actual, &expected) {
             let msg = get_message(args, 2);
             return Err(assertion_error(msg.as_deref(), &actual, &expected, "!=="));
         }

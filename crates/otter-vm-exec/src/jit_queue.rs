@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use otter_vm_bytecode::function::InlineCacheState;
+use otter_vm_bytecode::function::UpvalueCapture;
 use otter_vm_bytecode::{Constant, Function, Module};
 use otter_vm_jit::translator::can_translate_function_with_helpers;
 
@@ -14,6 +15,8 @@ const MAX_EMPTY_FEEDBACK_DEFERRALS: u8 = 16;
 pub(crate) struct JitCompileRequest {
     pub(crate) module_id: u64,
     pub(crate) function_index: u32,
+    pub(crate) module_source_url: String,
+    pub(crate) function_name: Option<String>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) function: Function,
     /// Small eligible functions from the same module available for inlining.
@@ -53,6 +56,26 @@ fn has_feedback_observations(function: &Function) -> bool {
         metadata.hit_count > 0
             || metadata.type_observations != Default::default()
             || !matches!(metadata.ic_state, InlineCacheState::Uninitialized)
+    })
+}
+
+#[inline]
+fn inlineable_local_upvalues(function: &Function) -> bool {
+    function
+        .upvalues
+        .iter()
+        .all(|capture| matches!(capture, UpvalueCapture::Local(_)))
+}
+
+#[inline]
+fn has_inline_unsupported_upvalue_ops(function: &Function) -> bool {
+    function.instructions.read().iter().any(|inst| {
+        matches!(
+            inst,
+            otter_vm_bytecode::Instruction::SetUpvalue { .. }
+                | otter_vm_bytecode::Instruction::CloseUpvalue { .. }
+                | otter_vm_bytecode::Instruction::LoadThis { .. }
+        )
     })
 }
 
@@ -137,15 +160,9 @@ pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
                 || func.flags.has_rest
                 || func.flags.uses_eval
                 || func.flags.uses_arguments
-                || !func.upvalues.is_empty()
+                || !inlineable_local_upvalues(func)
+                || has_inline_unsupported_upvalue_ops(func)
             {
-                continue;
-            }
-            // Check that the callee doesn't use LoadThis (this-binding differs when inlined)
-            let has_load_this = instrs
-                .iter()
-                .any(|inst| matches!(inst, otter_vm_bytecode::Instruction::LoadThis { .. }));
-            if has_load_this {
                 continue;
             }
             module_functions.push((idx, func.clone()));
@@ -154,6 +171,8 @@ pub(crate) fn pop_next_request() -> Option<JitCompileRequest> {
         return Some(JitCompileRequest {
             module_id: pending.module_id,
             function_index: pending.function_index,
+            module_source_url: pending.module.source_url.clone(),
+            function_name: function.name.clone(),
             constants,
             function: function.clone(),
             module_functions,
@@ -186,6 +205,8 @@ pub fn clear_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_vm_bytecode::function::UpvalueCapture;
+    use otter_vm_bytecode::{FunctionIndex, LocalIndex};
     use otter_vm_bytecode::{Instruction, Module, Register};
 
     fn build_test_module() -> Arc<Module> {
@@ -322,6 +343,132 @@ mod tests {
         );
 
         assert_eq!(pending_count(), 1);
+        clear_for_tests();
+    }
+
+    #[test]
+    fn snapshots_inline_candidates_with_local_upvalues_only() {
+        let _guard = crate::test_lock();
+        clear_for_tests();
+
+        let outer = Function::builder()
+            .name("outer")
+            .register_count(8)
+            .local_count(4)
+            .instruction(Instruction::Closure {
+                dst: Register(0),
+                func: FunctionIndex(1),
+            })
+            .instruction(Instruction::SetLocal {
+                idx: LocalIndex(2),
+                src: Register(0),
+            })
+            .instruction(Instruction::Closure {
+                dst: Register(1),
+                func: FunctionIndex(2),
+            })
+            .instruction(Instruction::SetLocal {
+                idx: LocalIndex(3),
+                src: Register(1),
+            })
+            .instruction(Instruction::Closure {
+                dst: Register(2),
+                func: FunctionIndex(3),
+            })
+            .instruction(Instruction::SetLocal {
+                idx: LocalIndex(0),
+                src: Register(2),
+            })
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+
+        let add = Function::builder()
+            .name("add")
+            .register_count(3)
+            .local_count(2)
+            .instruction(Instruction::GetLocal {
+                dst: Register(0),
+                idx: LocalIndex(0),
+            })
+            .instruction(Instruction::GetLocal {
+                dst: Register(1),
+                idx: LocalIndex(1),
+            })
+            .instruction(Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .feedback_vector_size(1)
+            .build();
+
+        let call_chain = Function::builder()
+            .name("call_chain")
+            .register_count(6)
+            .local_count(2)
+            .upvalues(vec![
+                UpvalueCapture::Local(LocalIndex(2)),
+                UpvalueCapture::Local(LocalIndex(3)),
+            ])
+            .instruction(Instruction::GetUpvalue {
+                dst: Register(0),
+                idx: LocalIndex(0),
+            })
+            .instruction(Instruction::GetLocal {
+                dst: Register(1),
+                idx: LocalIndex(0),
+            })
+            .instruction(Instruction::GetLocal {
+                dst: Register(2),
+                idx: LocalIndex(1),
+            })
+            .instruction(Instruction::Call {
+                dst: Register(3),
+                func: Register(0),
+                argc: 2,
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(3) })
+            .build();
+
+        let transitive_capture = Function::builder()
+            .name("transitive_capture")
+            .register_count(1)
+            .local_count(0)
+            .upvalues(vec![UpvalueCapture::Upvalue(LocalIndex(0))])
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+
+        let mut builder = Module::builder("jit-queue-inline-upvalues.js");
+        let outer_idx = builder.add_function(outer);
+        builder.add_function(add);
+        builder.add_function(call_chain);
+        builder.add_function(transitive_capture);
+        let module = Arc::new(builder.entry_point(outer_idx).build());
+
+        let outer = module
+            .function(outer_idx)
+            .expect("test module should expose entry function");
+        assert!(enqueue_hot_function(&module, outer_idx, outer));
+
+        let request = pop_next_request().expect("request should be available");
+        let module_function_indices: Vec<u32> = request
+            .module_functions
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
+        assert!(
+            module_function_indices.contains(&2),
+            "small local-upvalue closure should stay inline-eligible"
+        );
+        assert!(
+            !module_function_indices.contains(&3),
+            "transitively captured closure must stay out of inline candidates"
+        );
+
+        mark_request_finished(module.module_id, outer_idx);
         clear_for_tests();
     }
 

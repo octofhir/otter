@@ -1164,7 +1164,7 @@ impl Interpreter {
                     ctx.jump(offset.0);
                     continue;
                 }
-                Instruction::JumpIfTrue { cond, offset } => {
+                Instruction::JumpIfTrue { cond, offset } if offset.0 >= 0 => {
                     if ctx.get_register(cond.0).to_boolean() {
                         ctx.jump(offset.0);
                     } else if let Some(f) = ctx.call_stack.last_mut() {
@@ -1172,7 +1172,7 @@ impl Interpreter {
                     }
                     continue;
                 }
-                Instruction::JumpIfFalse { cond, offset } => {
+                Instruction::JumpIfFalse { cond, offset } if offset.0 >= 0 => {
                     if !ctx.get_register(cond.0).to_boolean() {
                         ctx.jump(offset.0);
                     } else if let Some(f) = ctx.call_stack.last_mut() {
@@ -1865,7 +1865,7 @@ impl Interpreter {
                     ctx.jump(offset.0);
                     continue;
                 }
-                Instruction::JumpIfTrue { cond, offset } => {
+                Instruction::JumpIfTrue { cond, offset } if offset.0 >= 0 => {
                     if ctx.get_register(cond.0).to_boolean() {
                         ctx.jump(offset.0);
                     } else if let Some(f) = ctx.call_stack.last_mut() {
@@ -1873,7 +1873,7 @@ impl Interpreter {
                     }
                     continue;
                 }
-                Instruction::JumpIfFalse { cond, offset } => {
+                Instruction::JumpIfFalse { cond, offset } if offset.0 >= 0 => {
                     if !ctx.get_register(cond.0).to_boolean() {
                         ctx.jump(offset.0);
                     } else if let Some(f) = ctx.call_stack.last_mut() {
@@ -6738,6 +6738,19 @@ impl Interpreter {
                 if let Some(obj) = object.as_object() {
                     let prop_key = self.value_to_property_key(ctx, &key_value)?;
                     obj.define_property(prop_key, PropertyDescriptor::builtin_method(value));
+                }
+
+                Ok(())
+            }
+
+            Instruction::SetPrototype { obj, proto } => {
+                let object = *ctx.get_register(obj.0);
+                let proto_value = *ctx.get_register(proto.0);
+
+                if let Some(obj) = object.as_object()
+                    && (proto_value.is_null() || proto_value.as_object().is_some())
+                {
+                    obj.set_prototype(proto_value);
                 }
 
                 Ok(())

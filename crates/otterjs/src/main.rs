@@ -506,15 +506,57 @@ fn maybe_print_jit_stats() {
         stats.osr_attempts,
     );
 
+    eprintln!(
+        "JIT compile profile: time_total_ns={} time_last_ns={} | code_total_bytes={} code_last_bytes={} code_max_bytes={} | helper_calls_total={}",
+        stats.compile_time_total_ns,
+        stats.compile_time_last_ns,
+        stats.compiled_code_size_total_bytes,
+        stats.compiled_code_size_last_bytes,
+        stats.compiled_code_size_max_bytes,
+        stats.helper_calls_total,
+    );
+
+    for (rank, helper) in [
+        stats.top_helper_call_1,
+        stats.top_helper_call_2,
+        stats.top_helper_call_3,
+    ]
+    .into_iter()
+    .flatten()
+    .enumerate()
+    {
+        eprintln!(
+            "JIT helper top{}: helper={} family={} count={}",
+            rank + 1,
+            helper.helper,
+            helper.family,
+            helper.count
+        );
+    }
+
     if let (Some(module_id), Some(function_index), Some(pc)) = (
         stats.last_bailout_module_id,
         stats.last_bailout_function_index,
         stats.last_bailout_pc,
     ) {
         let opcode = stats.last_bailout_opcode.unwrap_or("unknown");
+        let function_name = stats
+            .last_bailout_function_name
+            .as_deref()
+            .unwrap_or("<anonymous>");
+        let module_source_url = stats
+            .last_bailout_module_source_url
+            .as_deref()
+            .unwrap_or("<unknown>");
         eprintln!(
-            "JIT last bailout: module={} function={} pc={} opcode={} reason={:?}",
-            module_id, function_index, pc, opcode, stats.last_bailout_reason
+            "JIT last bailout: module={} source={} function={} name={} pc={} opcode={} reason={:?}",
+            module_id,
+            module_source_url,
+            function_index,
+            function_name,
+            pc,
+            opcode,
+            stats.last_bailout_reason
         );
     }
 

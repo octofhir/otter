@@ -7,7 +7,10 @@
 //!
 //! All helpers receive a `*mut u8` context pointer that is actually a `*const JitContext`.
 //! The context is constructed by `try_execute_jit` and is valid for the duration of
-//! JIT execution. No GC can occur during JIT execution (helpers don't allocate).
+//! JIT execution. The historical "helpers don't allocate" assumption is false:
+//! some helpers allocate, re-enter interpreter/JIT execution, or cross host
+//! boundaries. See `otter_vm_jit::runtime_helpers::HelperKind::safety_class()`
+//! and `JIT_HELPER_SAFETY_AUDIT.md` for the current conservative taxonomy.
 
 use otter_vm_bytecode::Function;
 use otter_vm_bytecode::function::InlineCacheState;
@@ -20,12 +23,12 @@ use otter_vm_jit::runtime_helpers::{
 
 use crate::gc::GcRef;
 use crate::jit_stubs::{
-    JitCallReentryState, call_with_reentry_state, otter_rt_call_mono_stub,
-    otter_rt_get_prop_mono_stub,
+    JitCallReentryState, call_with_reentry_state, otter_rt_call_function_stub,
+    otter_rt_call_mono_stub, otter_rt_get_prop_mono_stub,
 };
 use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
 use crate::string::JsString;
-use crate::value::UpvalueCell;
+use crate::value::{UpvalueCell, UpvalueData};
 
 // NaN-boxing constants (must match value.rs)
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
@@ -96,8 +99,18 @@ pub struct JitContext {
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
     JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
+    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
+    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 const _: () = {
+    assert!(
+        std::mem::offset_of!(JitContext, upvalues_ptr) as i32 == JIT_CTX_UPVALUES_PTR_OFFSET,
+        "JitContext::upvalues_ptr offset changed — update JIT_CTX_UPVALUES_PTR_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, upvalue_count) as i32 == JIT_CTX_UPVALUE_COUNT_OFFSET,
+        "JitContext::upvalue_count offset changed — update JIT_CTX_UPVALUE_COUNT_OFFSET in runtime_helpers.rs"
+    );
     assert!(
         std::mem::offset_of!(JitContext, secondary_result) as i32
             == JIT_CTX_SECONDARY_RESULT_OFFSET,
@@ -133,6 +146,33 @@ const _: () = {
     assert!(
         std::mem::offset_of!(JitContext, osr_entry_pc) as i32 == JIT_CTX_OSR_ENTRY_PC_OFFSET,
         "JitContext::osr_entry_pc offset changed — update JIT_CTX_OSR_ENTRY_PC_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::size_of::<UpvalueCell>() as i32 == JIT_UPVALUE_CELL_SIZE,
+        "UpvalueCell size changed — update JIT_UPVALUE_CELL_SIZE in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(UpvalueCell, 0) as i32 == JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
+        "UpvalueCell pointer layout changed — update JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(crate::gc::GcBox<UpvalueData>, value) as i32
+            == JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+        "GcBox<UpvalueData>::value offset changed — update JIT_UPVALUE_GCBOX_VALUE_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(UpvalueData, value) as i32 == JIT_UPVALUE_DATA_VALUE_OFFSET,
+        "UpvalueData::value offset changed — update JIT_UPVALUE_DATA_VALUE_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::size_of::<std::cell::Cell<crate::value::Value>>()
+            == std::mem::size_of::<crate::value::Value>(),
+        "Cell<Value> layout changed — raw JIT upvalue load assumptions must be revisited"
+    );
+    assert!(
+        std::mem::align_of::<std::cell::Cell<crate::value::Value>>()
+            == std::mem::align_of::<crate::value::Value>(),
+        "Cell<Value> alignment changed — raw JIT upvalue load assumptions must be revisited"
     );
 };
 
@@ -500,10 +540,6 @@ extern "C" fn otter_rt_set_prop_const(
         return BAILOUT_SENTINEL;
     };
 
-    if !ic.proto_epoch_matches(ctx.proto_epoch) {
-        return BAILOUT_SENTINEL;
-    }
-
     // Reconstruct the Value to write.
     // SAFETY: We are in the JIT execution scope — no GC has occurred.
     // Pointer-tagged values (objects, strings, arrays) are still live.
@@ -522,43 +558,45 @@ extern "C" fn otter_rt_set_prop_const(
 
     // IC fast path — extract offset, then write.
     // Shape match implies object is not in dictionary mode.
-    let cached_offset: Option<u32> = match &ic.ic_state {
-        InlineCacheState::Monomorphic {
-            shape_id, offset, ..
-        } => {
-            if obj_shape_ptr == *shape_id {
-                Some(*offset)
-            } else {
-                None
-            }
-        }
-        InlineCacheState::Polymorphic { count, entries } => {
-            let mut found = None;
-            for entry in &entries[..(*count as usize)] {
-                if obj_shape_ptr == entry.0 {
-                    found = Some(entry.3);
-                    break;
+    if ic.proto_epoch_matches(ctx.proto_epoch) {
+        let cached_offset: Option<u32> = match &ic.ic_state {
+            InlineCacheState::Monomorphic {
+                shape_id, offset, ..
+            } => {
+                if obj_shape_ptr == *shape_id {
+                    Some(*offset)
+                } else {
+                    None
                 }
             }
-            found
-        }
-        _ => None,
-    };
+            InlineCacheState::Polymorphic { count, entries } => {
+                let mut found = None;
+                for entry in &entries[..(*count as usize)] {
+                    if obj_shape_ptr == entry.0 {
+                        found = Some(entry.3);
+                        break;
+                    }
+                }
+                found
+            }
+            _ => None,
+        };
 
-    if let Some(offset) = cached_offset
-        && obj_ref.set_by_offset(offset as usize, write_value).is_ok()
-    {
-        ic.record_hit();
-        // MRU reordering for polymorphic
-        if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
-            for i in 1..(*count as usize) {
-                if obj_shape_ptr == entries[i].0 {
-                    entries.swap(0, i);
-                    break;
+        if let Some(offset) = cached_offset
+            && obj_ref.set_by_offset(offset as usize, write_value).is_ok()
+        {
+            ic.record_hit();
+            // MRU reordering for polymorphic
+            if let InlineCacheState::Polymorphic { count, entries } = &mut ic.ic_state {
+                for i in 1..(*count as usize) {
+                    if obj_shape_ptr == entries[i].0 {
+                        entries.swap(0, i);
+                        break;
+                    }
                 }
             }
+            return 0;
         }
-        return 0;
     }
 
     let Some(name_str) = (unsafe { resolve_constant_string(ctx, name_idx) }) else {
@@ -642,7 +680,7 @@ extern "C" fn otter_rt_set_prop_const(
 /// - `argv_ptr` must point to `argc` contiguous i64 values
 /// - No GC must occur during this call
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_call_function(
+pub(crate) extern "C" fn otter_rt_call_function(
     ctx_raw: i64,
     callee_raw: i64,
     argc_raw: i64,
@@ -786,6 +824,7 @@ extern "C" fn otter_rt_call_function(
 ///
 /// `expected_func_index` encodes `(function_index + 1)` so 0 = no hint.
 #[allow(unsafe_code)]
+#[allow(dead_code)]
 pub(crate) extern "C" fn otter_rt_call_mono_impl(
     ctx_raw: i64,
     callee_raw: i64,
@@ -1434,6 +1473,13 @@ extern "C" fn otter_rt_close_upvalue(ctx_raw: i64, local_idx: i64) -> i64 {
         return BAILOUT_SENTINEL;
     }
     let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    if vm_ctx
+        .current_frame()
+        .map(|frame| frame.open_upvalue_count == 0)
+        .unwrap_or(true)
+    {
+        return 0;
+    }
     match vm_ctx.close_upvalue(local_idx as u16) {
         Ok(()) => 0,
         Err(_) => BAILOUT_SENTINEL,
@@ -2716,10 +2762,116 @@ extern "C" fn otter_rt_spread_array(_ctx_raw: i64, dst_raw: i64, src_raw: i64) -
 ///
 /// Signature: `(ctx: i64, func_idx: i64) -> i64`
 ///
-/// Needs interpreter frame locals for upvalue capture. Always bails out.
+/// Creates a sync/arrow closure with interpreter-equivalent constructor/prototype
+/// semantics so JIT does not have to bail on ordinary nested closure creation.
 #[allow(unsafe_code)]
-extern "C" fn otter_rt_closure_create(_ctx_raw: i64, _func_idx: i64) -> i64 {
-    BAILOUT_SENTINEL
+extern "C" fn otter_rt_closure_create(ctx_raw: i64, func_idx: i64) -> i64 {
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    if ctx.vm_ctx.is_null() {
+        return BAILOUT_SENTINEL;
+    }
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+
+    let module = match vm_ctx.current_frame() {
+        Some(frame) => std::sync::Arc::clone(vm_ctx.module_table.get(frame.module_id)),
+        None => return BAILOUT_SENTINEL,
+    };
+
+    let func_def = match module.function(func_idx as u32) {
+        Some(f) => f,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    let captured = match capture_upvalues_for_jit(vm_ctx, &func_def.upvalues) {
+        Ok(c) => c,
+        Err(_) => return BAILOUT_SENTINEL,
+    };
+
+    let func_obj = GcRef::new(JsObject::new(crate::value::Value::null()));
+
+    let obj_proto = vm_ctx
+        .global()
+        .get(&PropertyKey::string("Object"))
+        .and_then(|obj_ctor| {
+            obj_ctor
+                .as_object()
+                .and_then(|o| o.get(&PropertyKey::string("prototype")))
+        })
+        .and_then(|proto_val| proto_val.as_object());
+    let proto = GcRef::new(JsObject::new(
+        obj_proto
+            .map(crate::value::Value::object)
+            .unwrap_or_else(crate::value::Value::null),
+    ));
+
+    if let Some(fn_proto) = vm_ctx.function_prototype() {
+        func_obj.set_prototype(crate::value::Value::object(fn_proto));
+    }
+    func_obj.define_property(
+        PropertyKey::string("__realm_id__"),
+        PropertyDescriptor::builtin_data(crate::value::Value::int32(vm_ctx.realm_id() as i32)),
+    );
+
+    let fn_attrs = crate::object::PropertyAttributes {
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    };
+    func_obj.define_property(
+        PropertyKey::string("length"),
+        crate::object::PropertyDescriptor::Data {
+            value: crate::value::Value::int32(func_def.param_count as i32),
+            attributes: fn_attrs,
+        },
+    );
+    let fn_name = func_def.name.as_deref().unwrap_or("");
+    func_obj.define_property(
+        PropertyKey::string("name"),
+        crate::object::PropertyDescriptor::Data {
+            value: crate::value::Value::string(JsString::intern(fn_name)),
+            attributes: fn_attrs,
+        },
+    );
+
+    let closure = GcRef::new(crate::value::Closure {
+        function_index: func_idx as u32,
+        module: std::sync::Arc::clone(&module),
+        upvalues: captured,
+        is_async: func_def.is_async(),
+        is_generator: false,
+        object: func_obj,
+        home_object: None,
+    });
+    let func_value = crate::value::Value::function(closure);
+
+    if func_def.is_arrow() || func_def.is_async() {
+        func_obj.define_property(
+            PropertyKey::string("__non_constructor"),
+            PropertyDescriptor::Data {
+                value: crate::value::Value::boolean(true),
+                attributes: crate::object::PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            },
+        );
+    } else {
+        func_obj.define_property(
+            PropertyKey::string("prototype"),
+            PropertyDescriptor::Data {
+                value: crate::value::Value::object(proto),
+                attributes: crate::object::PropertyAttributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            },
+        );
+        let _ = proto.set(PropertyKey::string("constructor"), func_value);
+    }
+
+    func_value.to_jit_bits()
 }
 
 // ---------------------------------------------------------------------------
@@ -4615,188 +4767,246 @@ extern "C" fn otter_rt_call_ffi(
 /// Build a `RuntimeHelpers` table with all available helper functions.
 pub fn build_runtime_helpers() -> RuntimeHelpers {
     let mut helpers = RuntimeHelpers::new();
+
+    macro_rules! register_helper_1 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
+    macro_rules! register_helper_2 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64, a1: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0, a1)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
+    macro_rules! register_helper_3 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64, a1: i64, a2: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0, a1, a2)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
+    macro_rules! register_helper_4 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0, a1, a2, a3)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
+    macro_rules! register_helper_5 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0, a1, a2, a3, a4)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
+    macro_rules! register_helper_6 {
+        ($kind:expr, $inner:path) => {{
+            extern "C" fn wrapper(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64) -> i64 {
+                otter_vm_jit::runtime_helpers::record_helper_call($kind);
+                $inner(a0, a1, a2, a3, a4, a5)
+            }
+            helpers.set($kind, wrapper as *const u8);
+        }};
+    }
+
     // SAFETY: Function signatures match HelperKind conventions.
     unsafe {
-        helpers.set(HelperKind::LoadConst, otter_rt_load_const as *const u8);
-        helpers.set(
-            HelperKind::GetPropConst,
-            otter_rt_get_prop_const as *const u8,
-        );
-        helpers.set(
-            HelperKind::SetPropConst,
-            otter_rt_set_prop_const as *const u8,
-        );
-        helpers.set(
-            HelperKind::CallFunction,
-            otter_rt_call_function as *const u8,
-        );
-        helpers.set(HelperKind::CallMono, otter_rt_call_mono_stub as *const u8);
-        helpers.set(HelperKind::NewObject, otter_rt_new_object as *const u8);
-        helpers.set(HelperKind::NewArray, otter_rt_new_array as *const u8);
-        helpers.set(HelperKind::GetGlobal, otter_rt_get_global as *const u8);
-        helpers.set(HelperKind::SetGlobal, otter_rt_set_global as *const u8);
-        helpers.set(HelperKind::GetUpvalue, otter_rt_get_upvalue as *const u8);
-        helpers.set(HelperKind::SetUpvalue, otter_rt_set_upvalue as *const u8);
-        helpers.set(HelperKind::LoadThis, otter_rt_load_this as *const u8);
-        helpers.set(HelperKind::TypeOf, otter_rt_typeof as *const u8);
-        helpers.set(HelperKind::TypeOfName, otter_rt_typeof_name as *const u8);
-        helpers.set(HelperKind::Pow, otter_rt_pow as *const u8);
-        helpers.set(
-            HelperKind::CloseUpvalue,
-            otter_rt_close_upvalue as *const u8,
-        );
-        helpers.set(HelperKind::GetElem, otter_rt_get_elem as *const u8);
-        helpers.set(HelperKind::GetElemInt, otter_rt_get_elem_int as *const u8);
-        helpers.set(HelperKind::SetElem, otter_rt_set_elem as *const u8);
-        helpers.set(HelperKind::GetProp, otter_rt_get_prop as *const u8);
-        helpers.set(HelperKind::SetProp, otter_rt_set_prop as *const u8);
-        helpers.set(HelperKind::DeleteProp, otter_rt_delete_prop as *const u8);
-        helpers.set(
-            HelperKind::DefineProperty,
-            otter_rt_define_property as *const u8,
-        );
-        helpers.set(HelperKind::ThrowValue, otter_rt_throw_value as *const u8);
-        helpers.set(HelperKind::Construct, otter_rt_construct as *const u8);
-        helpers.set(HelperKind::CallMethod, otter_rt_call_method as *const u8);
-        helpers.set(
-            HelperKind::CallWithReceiver,
-            otter_rt_call_with_receiver as *const u8,
-        );
-        helpers.set(
+        register_helper_2!(HelperKind::LoadConst, otter_rt_load_const);
+        register_helper_4!(HelperKind::GetPropConst, otter_rt_get_prop_const);
+        register_helper_5!(HelperKind::SetPropConst, otter_rt_set_prop_const);
+        register_helper_4!(HelperKind::CallFunction, otter_rt_call_function_stub);
+        register_helper_5!(HelperKind::CallMono, otter_rt_call_mono_stub);
+        register_helper_1!(HelperKind::NewObject, otter_rt_new_object);
+        register_helper_2!(HelperKind::NewArray, otter_rt_new_array);
+        register_helper_3!(HelperKind::GetGlobal, otter_rt_get_global);
+        register_helper_5!(HelperKind::SetGlobal, otter_rt_set_global);
+        register_helper_2!(HelperKind::GetUpvalue, otter_rt_get_upvalue);
+        register_helper_3!(HelperKind::SetUpvalue, otter_rt_set_upvalue);
+        register_helper_1!(HelperKind::LoadThis, otter_rt_load_this);
+        register_helper_2!(HelperKind::TypeOf, otter_rt_typeof);
+        register_helper_2!(HelperKind::TypeOfName, otter_rt_typeof_name);
+        register_helper_3!(HelperKind::Pow, otter_rt_pow);
+        register_helper_2!(HelperKind::CloseUpvalue, otter_rt_close_upvalue);
+        register_helper_4!(HelperKind::GetElem, otter_rt_get_elem);
+        register_helper_3!(HelperKind::GetElemInt, otter_rt_get_elem_int);
+        register_helper_5!(HelperKind::SetElem, otter_rt_set_elem);
+        register_helper_4!(HelperKind::GetProp, otter_rt_get_prop);
+        register_helper_5!(HelperKind::SetProp, otter_rt_set_prop);
+        register_helper_3!(HelperKind::DeleteProp, otter_rt_delete_prop);
+        register_helper_4!(HelperKind::DefineProperty, otter_rt_define_property);
+        register_helper_2!(HelperKind::ThrowValue, otter_rt_throw_value);
+        register_helper_4!(HelperKind::Construct, otter_rt_construct);
+        register_helper_6!(HelperKind::CallMethod, otter_rt_call_method);
+        register_helper_5!(HelperKind::CallWithReceiver, otter_rt_call_with_receiver);
+        register_helper_6!(
             HelperKind::CallMethodComputed,
-            otter_rt_call_method_computed as *const u8,
+            otter_rt_call_method_computed
         );
-        helpers.set(HelperKind::ToNumber, otter_rt_to_number as *const u8);
-        helpers.set(HelperKind::JsToString, otter_rt_to_string as *const u8);
-        helpers.set(
-            HelperKind::RequireCoercible,
-            otter_rt_require_coercible as *const u8,
-        );
-        helpers.set(HelperKind::InstanceOf, otter_rt_instanceof as *const u8);
-        helpers.set(HelperKind::InOp, otter_rt_in as *const u8);
-        helpers.set(
-            HelperKind::DeclareGlobalVar,
-            otter_rt_declare_global_var as *const u8,
-        );
-        helpers.set(
-            HelperKind::DefineGetter,
-            otter_rt_define_getter as *const u8,
-        );
-        helpers.set(
-            HelperKind::DefineSetter,
-            otter_rt_define_setter as *const u8,
-        );
-        helpers.set(
-            HelperKind::DefineMethod,
-            otter_rt_define_method as *const u8,
-        );
-        helpers.set(HelperKind::SpreadArray, otter_rt_spread_array as *const u8);
-        helpers.set(
-            HelperKind::ClosureCreate,
-            otter_rt_closure_create as *const u8,
-        );
-        helpers.set(
-            HelperKind::CreateArguments,
-            otter_rt_create_arguments as *const u8,
-        );
-        helpers.set(HelperKind::GetIterator, otter_rt_get_iterator as *const u8);
-        helpers.set(
-            HelperKind::IteratorNext,
-            otter_rt_iterator_next as *const u8,
-        );
-        helpers.set(
-            HelperKind::IteratorClose,
-            otter_rt_iterator_close as *const u8,
-        );
-        helpers.set(HelperKind::CallSpread, otter_rt_call_spread as *const u8);
-        helpers.set(
-            HelperKind::ConstructSpread,
-            otter_rt_construct_spread as *const u8,
-        );
-        helpers.set(
+        register_helper_2!(HelperKind::ToNumber, otter_rt_to_number);
+        register_helper_2!(HelperKind::JsToString, otter_rt_to_string);
+        register_helper_2!(HelperKind::RequireCoercible, otter_rt_require_coercible);
+        register_helper_4!(HelperKind::InstanceOf, otter_rt_instanceof);
+        register_helper_4!(HelperKind::InOp, otter_rt_in);
+        register_helper_3!(HelperKind::DeclareGlobalVar, otter_rt_declare_global_var);
+        register_helper_4!(HelperKind::DefineGetter, otter_rt_define_getter);
+        register_helper_4!(HelperKind::DefineSetter, otter_rt_define_setter);
+        register_helper_4!(HelperKind::DefineMethod, otter_rt_define_method);
+        register_helper_3!(HelperKind::SpreadArray, otter_rt_spread_array);
+        register_helper_2!(HelperKind::ClosureCreate, otter_rt_closure_create);
+        register_helper_1!(HelperKind::CreateArguments, otter_rt_create_arguments);
+        register_helper_2!(HelperKind::GetIterator, otter_rt_get_iterator);
+        register_helper_2!(HelperKind::IteratorNext, otter_rt_iterator_next);
+        register_helper_2!(HelperKind::IteratorClose, otter_rt_iterator_close);
+        register_helper_5!(HelperKind::CallSpread, otter_rt_call_spread);
+        register_helper_5!(HelperKind::ConstructSpread, otter_rt_construct_spread);
+        register_helper_5!(
             HelperKind::CallMethodComputedSpread,
-            otter_rt_call_method_computed_spread as *const u8,
+            otter_rt_call_method_computed_spread
         );
-        helpers.set(HelperKind::TailCallHelper, otter_rt_tail_call as *const u8);
+        register_helper_4!(HelperKind::TailCallHelper, otter_rt_tail_call);
         // Real implementations for class/iterator/eval opcodes
-        helpers.set(HelperKind::GetSuper, otter_rt_get_super as *const u8);
-        helpers.set(
-            HelperKind::SetHomeObject,
-            otter_rt_set_home_object as *const u8,
-        );
-        helpers.set(
-            HelperKind::GetSuperProp,
-            otter_rt_get_super_prop as *const u8,
-        );
-        helpers.set(HelperKind::DefineClass, otter_rt_define_class as *const u8);
-        helpers.set(HelperKind::CallSuper, otter_rt_call_super as *const u8);
-        helpers.set(
-            HelperKind::CallSuperSpread,
-            otter_rt_call_super_spread as *const u8,
-        );
-        helpers.set(
-            HelperKind::GetAsyncIterator,
-            otter_rt_get_async_iterator as *const u8,
-        );
-        helpers.set(HelperKind::CallEval, otter_rt_call_eval as *const u8);
+        register_helper_1!(HelperKind::GetSuper, otter_rt_get_super);
+        register_helper_3!(HelperKind::SetHomeObject, otter_rt_set_home_object);
+        register_helper_2!(HelperKind::GetSuperProp, otter_rt_get_super_prop);
+        register_helper_4!(HelperKind::DefineClass, otter_rt_define_class);
+        register_helper_3!(HelperKind::CallSuper, otter_rt_call_super);
+        register_helper_2!(HelperKind::CallSuperSpread, otter_rt_call_super_spread);
+        register_helper_2!(HelperKind::GetAsyncIterator, otter_rt_get_async_iterator);
+        register_helper_2!(HelperKind::CallEval, otter_rt_call_eval);
         // Real implementations for try/catch, closure variants, and CallSuperForward
-        helpers.set(HelperKind::TryStart, otter_rt_try_start as *const u8);
-        helpers.set(HelperKind::TryEnd, otter_rt_try_end as *const u8);
-        helpers.set(HelperKind::CatchOp, otter_rt_catch as *const u8);
-        helpers.set(
-            HelperKind::CallSuperForward,
-            otter_rt_call_super_forward as *const u8,
-        );
-        helpers.set(
-            HelperKind::AsyncClosure,
-            otter_rt_async_closure as *const u8,
-        );
-        helpers.set(
-            HelperKind::GeneratorClosure,
-            otter_rt_generator_closure as *const u8,
-        );
-        helpers.set(
+        register_helper_2!(HelperKind::TryStart, otter_rt_try_start);
+        register_helper_1!(HelperKind::TryEnd, otter_rt_try_end);
+        register_helper_1!(HelperKind::CatchOp, otter_rt_catch);
+        register_helper_1!(HelperKind::CallSuperForward, otter_rt_call_super_forward);
+        register_helper_2!(HelperKind::AsyncClosure, otter_rt_async_closure);
+        register_helper_2!(HelperKind::GeneratorClosure, otter_rt_generator_closure);
+        register_helper_2!(
             HelperKind::AsyncGeneratorClosure,
-            otter_rt_async_generator_closure as *const u8,
+            otter_rt_async_generator_closure
         );
-        helpers.set(HelperKind::ImportOp, otter_rt_import as *const u8);
-        helpers.set(HelperKind::ExportOp, otter_rt_export as *const u8);
-        helpers.set(HelperKind::ForInNext, otter_rt_for_in_next as *const u8);
+        register_helper_2!(HelperKind::ImportOp, otter_rt_import);
+        register_helper_3!(HelperKind::ExportOp, otter_rt_export);
+        register_helper_2!(HelperKind::ForInNext, otter_rt_for_in_next);
 
         // Generic arithmetic / comparison helpers (slow path for type guard failure)
-        helpers.set(HelperKind::GenericAdd, otter_rt_generic_add as *const u8);
-        helpers.set(HelperKind::GenericSub, otter_rt_generic_sub as *const u8);
-        helpers.set(HelperKind::GenericMul, otter_rt_generic_mul as *const u8);
-        helpers.set(HelperKind::GenericDiv, otter_rt_generic_div as *const u8);
-        helpers.set(HelperKind::GenericMod, otter_rt_generic_mod as *const u8);
-        helpers.set(HelperKind::GenericNeg, otter_rt_generic_neg as *const u8);
-        helpers.set(HelperKind::GenericInc, otter_rt_generic_inc as *const u8);
-        helpers.set(HelperKind::GenericDec, otter_rt_generic_dec as *const u8);
-        helpers.set(HelperKind::GenericLt, otter_rt_generic_lt as *const u8);
-        helpers.set(HelperKind::GenericLe, otter_rt_generic_le as *const u8);
-        helpers.set(HelperKind::GenericGt, otter_rt_generic_gt as *const u8);
-        helpers.set(HelperKind::GenericGe, otter_rt_generic_ge as *const u8);
-        helpers.set(HelperKind::GenericEq, otter_rt_generic_eq as *const u8);
-        helpers.set(HelperKind::GenericNeq, otter_rt_generic_neq as *const u8);
-        helpers.set(
-            HelperKind::GenericBitOp,
-            otter_rt_generic_bitop as *const u8,
-        );
-        helpers.set(
-            HelperKind::GenericBitNot,
-            otter_rt_generic_bitnot as *const u8,
-        );
-        helpers.set(HelperKind::GenericNot, otter_rt_generic_not as *const u8);
-        helpers.set(
-            HelperKind::GetPropMono,
-            otter_rt_get_prop_mono_stub as *const u8,
-        );
-        helpers.set(HelperKind::CallFfi, otter_rt_call_ffi as *const u8);
+        register_helper_3!(HelperKind::GenericAdd, otter_rt_generic_add);
+        register_helper_3!(HelperKind::GenericSub, otter_rt_generic_sub);
+        register_helper_3!(HelperKind::GenericMul, otter_rt_generic_mul);
+        register_helper_3!(HelperKind::GenericDiv, otter_rt_generic_div);
+        register_helper_3!(HelperKind::GenericMod, otter_rt_generic_mod);
+        register_helper_2!(HelperKind::GenericNeg, otter_rt_generic_neg);
+        register_helper_2!(HelperKind::GenericInc, otter_rt_generic_inc);
+        register_helper_2!(HelperKind::GenericDec, otter_rt_generic_dec);
+        register_helper_3!(HelperKind::GenericLt, otter_rt_generic_lt);
+        register_helper_3!(HelperKind::GenericLe, otter_rt_generic_le);
+        register_helper_3!(HelperKind::GenericGt, otter_rt_generic_gt);
+        register_helper_3!(HelperKind::GenericGe, otter_rt_generic_ge);
+        register_helper_3!(HelperKind::GenericEq, otter_rt_generic_eq);
+        register_helper_3!(HelperKind::GenericNeq, otter_rt_generic_neq);
+        register_helper_4!(HelperKind::GenericBitOp, otter_rt_generic_bitop);
+        register_helper_2!(HelperKind::GenericBitNot, otter_rt_generic_bitnot);
+        register_helper_2!(HelperKind::GenericNot, otter_rt_generic_not);
+        register_helper_3!(HelperKind::GetPropMono, otter_rt_get_prop_mono_stub);
+        register_helper_5!(HelperKind::CallFfi, otter_rt_call_ffi);
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
-        let stub = otter_rt_bailout_stub as *const u8;
-        helpers.set(HelperKind::YieldOp, stub);
-        helpers.set(HelperKind::AwaitOp, stub);
+        register_helper_1!(HelperKind::YieldOp, otter_rt_bailout_stub);
+        register_helper_1!(HelperKind::AwaitOp, otter_rt_bailout_stub);
     }
     helpers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_vm_bytecode::{ConstantIndex, Instruction, Module, Register};
+
+    #[test]
+    fn set_prop_const_helper_slow_path_survives_proto_epoch_mismatch() {
+        let runtime = crate::runtime::VmRuntime::new();
+        let _ctx_guard = runtime.create_context();
+
+        let mut builder = Module::builder("jit-set-prop-const-helper.js");
+        builder.constants_mut().add_string("x");
+
+        let function = Function::builder()
+            .name("main")
+            .feedback_vector_size(1)
+            .instruction(Instruction::SetPropConst {
+                obj: Register(0),
+                name: ConstantIndex(0),
+                val: Register(1),
+                ic_index: 0,
+            })
+            .instruction(Instruction::ReturnUndefined)
+            .build();
+        builder.add_function(function);
+        let module = builder.build();
+        let function = &module.functions[0];
+
+        let obj = GcRef::new(JsObject::new(crate::value::Value::null()));
+        obj.set(PropertyKey::string("x"), crate::value::Value::int32(1))
+            .expect("object should accept property initialization");
+
+        let mut ctx = JitContext {
+            function_ptr: function as *const Function,
+            proto_epoch: 1,
+            interpreter: std::ptr::null(),
+            vm_ctx: std::ptr::null_mut(),
+            constants: &module.constants as *const _,
+            upvalues_ptr: std::ptr::null(),
+            upvalue_count: 0,
+            this_raw: crate::value::Value::undefined().to_jit_bits(),
+            callee_raw: crate::value::Value::undefined().to_jit_bits(),
+            home_object_raw: crate::value::Value::undefined().to_jit_bits(),
+            secondary_result: 0,
+            bailout_reason: 0,
+            bailout_pc: -1,
+            deopt_locals_ptr: std::ptr::null_mut(),
+            deopt_locals_count: 0,
+            deopt_regs_ptr: std::ptr::null_mut(),
+            deopt_regs_count: 0,
+            osr_entry_pc: -1,
+        };
+
+        let result = otter_rt_set_prop_const(
+            (&mut ctx as *mut JitContext) as i64,
+            crate::value::Value::object(obj).to_jit_bits() as i64,
+            0,
+            crate::value::Value::int32(42).to_jit_bits() as i64,
+            0,
+        );
+
+        assert_eq!(
+            result, 0,
+            "helper should refresh IC via slow path, not bail"
+        );
+        assert_eq!(
+            obj.get(&PropertyKey::string("x")),
+            Some(crate::value::Value::int32(42))
+        );
+        assert!(matches!(
+            function.feedback_vector.read()[0].ic_state,
+            InlineCacheState::Monomorphic { .. } | InlineCacheState::Polymorphic { .. }
+        ));
+    }
 }

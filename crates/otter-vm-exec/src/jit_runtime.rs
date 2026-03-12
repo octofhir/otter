@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use otter_vm_bytecode::Function;
 use otter_vm_bytecode::function::HOT_FUNCTION_THRESHOLD;
 use otter_vm_jit::runtime_helpers::{
-    JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET, RuntimeHelpers,
+    HELPER_FAMILY_COUNT, HelperKind, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
+    RuntimeHelpers, helper_call_stats_snapshot, helper_family_name,
 };
 use otter_vm_jit::{
     BAILOUT_SENTINEL, BailoutReason, DEOPT_THRESHOLD, DeoptMetadata, JitCompileArtifact,
@@ -16,7 +18,7 @@ use otter_vm_jit::{
 use crate::entry_stub::call_jit_entry;
 use crate::jit_queue::{self, JitCompileRequest};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 /// Snapshot of runtime JIT counters for diagnostics.
 pub struct JitRuntimeStats {
     /// Number of dequeued compilation requests.
@@ -47,6 +49,10 @@ pub struct JitRuntimeStats {
     pub last_bailout_module_id: Option<u64>,
     /// Last bailout function index seen by runtime telemetry.
     pub last_bailout_function_index: Option<u32>,
+    /// Last bailout function name seen by runtime telemetry.
+    pub last_bailout_function_name: Option<String>,
+    /// Last bailout module source URL seen by runtime telemetry.
+    pub last_bailout_module_source_url: Option<String>,
     /// Last bailout bytecode pc seen by runtime telemetry.
     pub last_bailout_pc: Option<u32>,
     /// Last bailout opcode name seen by runtime telemetry.
@@ -67,6 +73,27 @@ pub struct JitRuntimeStats {
     pub osr_attempts: u64,
     /// Number of successful OSR restarts.
     pub osr_successes: u64,
+    /// Total wall-clock time spent compiling JIT code, in nanoseconds.
+    pub compile_time_total_ns: u64,
+    /// Wall-clock duration of the most recent JIT compile attempt, in nanoseconds.
+    pub compile_time_last_ns: u64,
+    /// Total finalized native code size emitted by successful JIT compilations, in bytes.
+    pub compiled_code_size_total_bytes: u64,
+    /// Finalized native code size from the most recent successful JIT compilation, in bytes.
+    pub compiled_code_size_last_bytes: u64,
+    /// Largest finalized native code size observed across successful JIT compilations, in bytes.
+    pub compiled_code_size_max_bytes: u64,
+    /// Total runtime helper calls observed across JIT execution.
+    pub helper_calls_total: u64,
+    /// Per-helper-family call counts. Resolve indices via
+    /// `otter_vm_jit::runtime_helpers::helper_family_name(index)`.
+    pub helper_call_counts_by_family: [u64; HELPER_FAMILY_COUNT],
+    /// Hottest runtime helper call.
+    pub top_helper_call_1: Option<JitHelperCallStat>,
+    /// Second hottest runtime helper call.
+    pub top_helper_call_2: Option<JitHelperCallStat>,
+    /// Third hottest runtime helper call.
+    pub top_helper_call_3: Option<JitHelperCallStat>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -81,6 +108,17 @@ pub struct JitBailoutSiteStat {
     /// Opcode at this bytecode site.
     pub opcode: &'static str,
     /// Number of bailouts observed for this site.
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+/// Aggregated counter for a specific runtime helper call target.
+pub struct JitHelperCallStat {
+    /// Helper symbol name.
+    pub helper: &'static str,
+    /// Aggregated helper family.
+    pub family: &'static str,
+    /// Number of times the helper was invoked from JIT code.
     pub count: u64,
 }
 
@@ -146,6 +184,8 @@ struct BailoutSiteCounter {
 struct CompiledFunctionEntry {
     artifact: JitCompileArtifact,
     deopt_metadata: DeoptMetadata,
+    function_name: Option<String>,
+    module_source_url: String,
 }
 
 #[derive(Default)]
@@ -156,6 +196,11 @@ struct JitRuntimeState {
     compile_errors: u64,
     compile_requests: u64,
     compile_successes: u64,
+    compile_time_total_ns: u64,
+    compile_time_last_ns: u64,
+    compiled_code_size_total_bytes: u64,
+    compiled_code_size_last_bytes: u64,
+    compiled_code_size_max_bytes: u64,
     execute_attempts: u64,
     execute_hits: u64,
     execute_not_compiled: u64,
@@ -167,6 +212,8 @@ struct JitRuntimeState {
     bailout_site_counts: HashMap<(u64, u32, u32), BailoutSiteCounter>,
     last_bailout_module_id: Option<u64>,
     last_bailout_function_index: Option<u32>,
+    last_bailout_function_name: Option<String>,
+    last_bailout_module_source_url: Option<String>,
     last_bailout_opcode: Option<&'static str>,
     last_bailout: BailoutTelemetry,
     back_edge_compilations: u64,
@@ -193,12 +240,16 @@ enum BackgroundCompileResult {
     Compiled {
         module_id: u64,
         function_index: u32,
+        function_name: Option<String>,
+        module_source_url: String,
+        duration_ns: u64,
         artifact: JitCompileArtifact,
         deopt_metadata: DeoptMetadata,
     },
     Error {
         module_id: u64,
         function_index: u32,
+        duration_ns: u64,
     },
 }
 
@@ -292,13 +343,28 @@ fn opcode_name_from_instruction(instruction: &otter_vm_bytecode::Instruction) ->
         otter_vm_bytecode::Instruction::LoadInt32 { .. } => "LoadInt32",
         otter_vm_bytecode::Instruction::LoadConst { .. } => "LoadConst",
         otter_vm_bytecode::Instruction::GetLocal { .. } => "GetLocal",
+        otter_vm_bytecode::Instruction::GetLocal2 { .. } => "GetLocal2",
         otter_vm_bytecode::Instruction::SetLocal { .. } => "SetLocal",
+        otter_vm_bytecode::Instruction::IncLocal { .. } => "IncLocal",
         otter_vm_bytecode::Instruction::Move { .. } => "Move",
+        otter_vm_bytecode::Instruction::GetUpvalue { .. } => "GetUpvalue",
+        otter_vm_bytecode::Instruction::SetUpvalue { .. } => "SetUpvalue",
+        otter_vm_bytecode::Instruction::CloseUpvalue { .. } => "CloseUpvalue",
+        otter_vm_bytecode::Instruction::GetGlobal { .. } => "GetGlobal",
+        otter_vm_bytecode::Instruction::SetGlobal { .. } => "SetGlobal",
+        otter_vm_bytecode::Instruction::LoadThis { .. } => "LoadThis",
         otter_vm_bytecode::Instruction::Add { .. } => "Add",
+        otter_vm_bytecode::Instruction::AddInt32 { .. } => "AddInt32",
+        otter_vm_bytecode::Instruction::AddNumber { .. } => "AddNumber",
         otter_vm_bytecode::Instruction::Sub { .. } => "Sub",
+        otter_vm_bytecode::Instruction::SubInt32 { .. } => "SubInt32",
+        otter_vm_bytecode::Instruction::SubNumber { .. } => "SubNumber",
         otter_vm_bytecode::Instruction::Mul { .. } => "Mul",
+        otter_vm_bytecode::Instruction::MulInt32 { .. } => "MulInt32",
         otter_vm_bytecode::Instruction::Div { .. } => "Div",
+        otter_vm_bytecode::Instruction::DivInt32 { .. } => "DivInt32",
         otter_vm_bytecode::Instruction::Mod { .. } => "Mod",
+        otter_vm_bytecode::Instruction::Pow { .. } => "Pow",
         otter_vm_bytecode::Instruction::Neg { .. } => "Neg",
         otter_vm_bytecode::Instruction::Inc { .. } => "Inc",
         otter_vm_bytecode::Instruction::Dec { .. } => "Dec",
@@ -318,11 +384,102 @@ fn opcode_name_from_instruction(instruction: &otter_vm_bytecode::Instruction) ->
         otter_vm_bytecode::Instruction::Gt { .. } => "Gt",
         otter_vm_bytecode::Instruction::Ge { .. } => "Ge",
         otter_vm_bytecode::Instruction::Not { .. } => "Not",
-        _ => "Other",
+        otter_vm_bytecode::Instruction::TypeOf { .. } => "TypeOf",
+        otter_vm_bytecode::Instruction::TypeOfName { .. } => "TypeOfName",
+        otter_vm_bytecode::Instruction::GetPropConst { .. } => "GetPropConst",
+        otter_vm_bytecode::Instruction::SetPropConst { .. } => "SetPropConst",
+        otter_vm_bytecode::Instruction::GetPropQuickened { .. } => "GetPropQuickened",
+        otter_vm_bytecode::Instruction::SetPropQuickened { .. } => "SetPropQuickened",
+        otter_vm_bytecode::Instruction::GetLocalProp { .. } => "GetLocalProp",
+        otter_vm_bytecode::Instruction::GetPropString { .. } => "GetPropString",
+        otter_vm_bytecode::Instruction::GetArrayLength { .. } => "GetArrayLength",
+        otter_vm_bytecode::Instruction::GetProp { .. } => "GetProp",
+        otter_vm_bytecode::Instruction::SetProp { .. } => "SetProp",
+        otter_vm_bytecode::Instruction::GetElem { .. } => "GetElem",
+        otter_vm_bytecode::Instruction::GetElemInt { .. } => "GetElemInt",
+        otter_vm_bytecode::Instruction::SetElem { .. } => "SetElem",
+        otter_vm_bytecode::Instruction::DeleteProp { .. } => "DeleteProp",
+        otter_vm_bytecode::Instruction::DefineProperty { .. } => "DefineProperty",
+        otter_vm_bytecode::Instruction::SetPrototype { .. } => "SetPrototype",
+        otter_vm_bytecode::Instruction::RequireCoercible { .. } => "RequireCoercible",
+        otter_vm_bytecode::Instruction::InstanceOf { .. } => "InstanceOf",
+        otter_vm_bytecode::Instruction::In { .. } => "In",
+        otter_vm_bytecode::Instruction::NewObject { .. } => "NewObject",
+        otter_vm_bytecode::Instruction::NewArray { .. } => "NewArray",
+        otter_vm_bytecode::Instruction::Closure { .. } => "Closure",
+        otter_vm_bytecode::Instruction::AsyncClosure { .. } => "AsyncClosure",
+        otter_vm_bytecode::Instruction::GeneratorClosure { .. } => "GeneratorClosure",
+        otter_vm_bytecode::Instruction::AsyncGeneratorClosure { .. } => "AsyncGeneratorClosure",
+        otter_vm_bytecode::Instruction::Call { .. } => "Call",
+        otter_vm_bytecode::Instruction::Construct { .. } => "Construct",
+        otter_vm_bytecode::Instruction::CallMethod { .. } => "CallMethod",
+        otter_vm_bytecode::Instruction::CallWithReceiver { .. } => "CallWithReceiver",
+        otter_vm_bytecode::Instruction::CallMethodComputed { .. } => "CallMethodComputed",
+        otter_vm_bytecode::Instruction::CallSpread { .. } => "CallSpread",
+        otter_vm_bytecode::Instruction::ConstructSpread { .. } => "ConstructSpread",
+        otter_vm_bytecode::Instruction::CallMethodComputedSpread { .. } => {
+            "CallMethodComputedSpread"
+        }
+        otter_vm_bytecode::Instruction::TailCall { .. } => "TailCall",
+        otter_vm_bytecode::Instruction::CallEval { .. } => "CallEval",
+        otter_vm_bytecode::Instruction::Jump { .. } => "Jump",
+        otter_vm_bytecode::Instruction::JumpIfTrue { .. } => "JumpIfTrue",
+        otter_vm_bytecode::Instruction::JumpIfFalse { .. } => "JumpIfFalse",
+        otter_vm_bytecode::Instruction::JumpIfNullish { .. } => "JumpIfNullish",
+        otter_vm_bytecode::Instruction::JumpIfNotNullish { .. } => "JumpIfNotNullish",
+        otter_vm_bytecode::Instruction::TryStart { .. } => "TryStart",
+        otter_vm_bytecode::Instruction::TryEnd => "TryEnd",
+        otter_vm_bytecode::Instruction::Catch { .. } => "Catch",
+        otter_vm_bytecode::Instruction::Throw { .. } => "Throw",
+        otter_vm_bytecode::Instruction::Return { .. } => "Return",
+        otter_vm_bytecode::Instruction::ReturnUndefined => "ReturnUndefined",
+        otter_vm_bytecode::Instruction::Pop => "Pop",
+        otter_vm_bytecode::Instruction::Dup { .. } => "Dup",
+        otter_vm_bytecode::Instruction::Debugger => "Debugger",
+        otter_vm_bytecode::Instruction::DefineGetter { .. } => "DefineGetter",
+        otter_vm_bytecode::Instruction::DefineSetter { .. } => "DefineSetter",
+        otter_vm_bytecode::Instruction::DefineMethod { .. } => "DefineMethod",
+        otter_vm_bytecode::Instruction::Spread { .. } => "Spread",
+        otter_vm_bytecode::Instruction::CreateArguments { .. } => "CreateArguments",
+        otter_vm_bytecode::Instruction::GetIterator { .. } => "GetIterator",
+        otter_vm_bytecode::Instruction::GetAsyncIterator { .. } => "GetAsyncIterator",
+        otter_vm_bytecode::Instruction::IteratorNext { .. } => "IteratorNext",
+        otter_vm_bytecode::Instruction::IteratorClose { .. } => "IteratorClose",
+        otter_vm_bytecode::Instruction::ForInNext { .. } => "ForInNext",
+        otter_vm_bytecode::Instruction::Yield { .. } => "Yield",
+        otter_vm_bytecode::Instruction::Await { .. } => "Await",
+        otter_vm_bytecode::Instruction::Import { .. } => "Import",
+        otter_vm_bytecode::Instruction::Export { .. } => "Export",
+        otter_vm_bytecode::Instruction::DeclareGlobalVar { .. } => "DeclareGlobalVar",
+        otter_vm_bytecode::Instruction::DefineClass { .. } => "DefineClass",
+        otter_vm_bytecode::Instruction::GetSuper { .. } => "GetSuper",
+        otter_vm_bytecode::Instruction::CallSuper { .. } => "CallSuper",
+        otter_vm_bytecode::Instruction::GetSuperProp { .. } => "GetSuperProp",
+        otter_vm_bytecode::Instruction::SetHomeObject { .. } => "SetHomeObject",
+        otter_vm_bytecode::Instruction::CallSuperForward { .. } => "CallSuperForward",
+        otter_vm_bytecode::Instruction::CallSuperSpread { .. } => "CallSuperSpread",
+        otter_vm_bytecode::Instruction::ToNumber { .. } => "ToNumber",
+        otter_vm_bytecode::Instruction::ToString { .. } => "ToString",
+        otter_vm_bytecode::Instruction::Nop => "Nop",
     }
 }
 
 fn push_top_bailout_site(top: &mut [Option<JitBailoutSiteStat>; 3], candidate: JitBailoutSiteStat) {
+    for idx in 0..top.len() {
+        match top[idx] {
+            Some(existing) if existing.count >= candidate.count => continue,
+            _ => {
+                for shift in (idx + 1..top.len()).rev() {
+                    top[shift] = top[shift - 1];
+                }
+                top[idx] = Some(candidate);
+                break;
+            }
+        }
+    }
+}
+
+fn push_top_helper_call(top: &mut [Option<JitHelperCallStat>; 3], candidate: JitHelperCallStat) {
     for idx in 0..top.len() {
         match top[idx] {
             Some(existing) if existing.count >= candidate.count => continue,
@@ -441,6 +598,7 @@ fn run_background_worker(
             let _ = result_tx.send(BackgroundCompileResult::Error {
                 module_id,
                 function_index,
+                duration_ns: 0,
             });
             continue;
         }
@@ -452,12 +610,14 @@ fn run_background_worker(
                     let _ = result_tx.send(BackgroundCompileResult::Error {
                         module_id,
                         function_index,
+                        duration_ns: 0,
                     });
                     continue;
                 }
             }
         }
 
+        let started = Instant::now();
         let compile_result = compiler
             .as_mut()
             .expect("jit compiler should be initialized")
@@ -466,12 +626,16 @@ fn run_background_worker(
                 &request.constants,
                 &request.module_functions,
             );
+        let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
         match compile_result {
             Ok((artifact, deopt_metadata)) => {
                 let _ = result_tx.send(BackgroundCompileResult::Compiled {
                     module_id,
                     function_index,
+                    function_name: request.function_name,
+                    module_source_url: request.module_source_url,
+                    duration_ns,
                     artifact,
                     deopt_metadata,
                 });
@@ -480,6 +644,7 @@ fn run_background_worker(
                 let _ = result_tx.send(BackgroundCompileResult::Error {
                     module_id,
                     function_index,
+                    duration_ns,
                 });
             }
         }
@@ -504,15 +669,30 @@ fn drain_background_results() {
             Ok(BackgroundCompileResult::Compiled {
                 module_id,
                 function_index,
+                function_name,
+                module_source_url,
+                duration_ns,
                 artifact,
                 deopt_metadata,
             }) => {
                 let mut state = lock_state();
+                state.compile_time_total_ns =
+                    state.compile_time_total_ns.saturating_add(duration_ns);
+                state.compile_time_last_ns = duration_ns;
+                state.compiled_code_size_total_bytes = state
+                    .compiled_code_size_total_bytes
+                    .saturating_add(artifact.code_size_bytes);
+                state.compiled_code_size_last_bytes = artifact.code_size_bytes;
+                state.compiled_code_size_max_bytes = state
+                    .compiled_code_size_max_bytes
+                    .max(artifact.code_size_bytes);
                 state.compiled_entries.insert(
                     (module_id, function_index),
                     CompiledFunctionEntry {
                         artifact,
                         deopt_metadata,
+                        function_name,
+                        module_source_url,
                     },
                 );
                 if is_jit_stats_enabled() {
@@ -524,8 +704,12 @@ fn drain_background_results() {
             Ok(BackgroundCompileResult::Error {
                 module_id,
                 function_index,
+                duration_ns,
             }) => {
                 let mut state = lock_state();
+                state.compile_time_total_ns =
+                    state.compile_time_total_ns.saturating_add(duration_ns);
+                state.compile_time_last_ns = duration_ns;
                 state.compile_errors = state.compile_errors.saturating_add(1);
                 drop(state);
                 jit_queue::mark_request_finished(module_id, function_index);
@@ -557,12 +741,23 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
         .as_mut()
         .expect("jit compiler should be initialized");
 
+    let started = Instant::now();
     match compiler.compile_function_with_inlining(
         &request.function,
         &request.constants,
         &request.module_functions,
     ) {
         Ok((artifact, deopt_metadata)) => {
+            let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            state.compile_time_total_ns = state.compile_time_total_ns.saturating_add(duration_ns);
+            state.compile_time_last_ns = duration_ns;
+            state.compiled_code_size_total_bytes = state
+                .compiled_code_size_total_bytes
+                .saturating_add(artifact.code_size_bytes);
+            state.compiled_code_size_last_bytes = artifact.code_size_bytes;
+            state.compiled_code_size_max_bytes = state
+                .compiled_code_size_max_bytes
+                .max(artifact.code_size_bytes);
             let code_ptr = artifact.code_ptr as usize;
             request.function.set_jit_entry_ptr(code_ptr);
             state.compiled_entries.insert(
@@ -570,6 +765,8 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
                 CompiledFunctionEntry {
                     artifact,
                     deopt_metadata,
+                    function_name: request.function_name,
+                    module_source_url: request.module_source_url,
                 },
             );
             if is_jit_stats_enabled() {
@@ -577,6 +774,9 @@ fn compile_request_sync(request: JitCompileRequest, helpers: &RuntimeHelpers) {
             }
         }
         Err(_) => {
+            let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            state.compile_time_total_ns = state.compile_time_total_ns.saturating_add(duration_ns);
+            state.compile_time_last_ns = duration_ns;
             state.compile_errors = state.compile_errors.saturating_add(1);
         }
     }
@@ -712,6 +912,14 @@ pub fn try_execute_jit_raw(
         }
         state.last_bailout_module_id = Some(module_id);
         state.last_bailout_function_index = Some(function_index);
+        state.last_bailout_function_name = state
+            .compiled_entries
+            .get(&(module_id, function_index))
+            .and_then(|entry| entry.function_name.clone());
+        state.last_bailout_module_source_url = state
+            .compiled_entries
+            .get(&(module_id, function_index))
+            .map(|entry| entry.module_source_url.clone());
         state.last_bailout_opcode = telemetry.pc.and_then(|pc| opcode_name_at_pc(function, pc));
         state.last_bailout = telemetry;
         let snapshot = make_deopt_snapshot(module_id, function_index, telemetry, has_mapped_site);
@@ -795,6 +1003,7 @@ pub fn stats_snapshot() -> JitRuntimeStats {
         drain_background_results();
     }
     let state = lock_state();
+    let helper_snapshot = helper_call_stats_snapshot();
     let mut top_sites: [Option<JitBailoutSiteStat>; 3] = [None, None, None];
     for (&(module_id, function_index, pc), counter) in &state.bailout_site_counts {
         push_top_bailout_site(
@@ -805,6 +1014,21 @@ pub fn stats_snapshot() -> JitRuntimeStats {
                 pc,
                 opcode: counter.opcode,
                 count: counter.count,
+            },
+        );
+    }
+    let mut top_helpers: [Option<JitHelperCallStat>; 3] = [None, None, None];
+    for (index, &count) in helper_snapshot.per_helper.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let kind = unsafe { std::mem::transmute::<u8, HelperKind>(index as u8) };
+        push_top_helper_call(
+            &mut top_helpers,
+            JitHelperCallStat {
+                helper: kind.symbol_name(),
+                family: helper_family_name(kind.family_index()),
+                count,
             },
         );
     }
@@ -824,6 +1048,8 @@ pub fn stats_snapshot() -> JitRuntimeStats {
         compiled_functions: state.compiled_entries.len() as u64,
         last_bailout_module_id: state.last_bailout_module_id,
         last_bailout_function_index: state.last_bailout_function_index,
+        last_bailout_function_name: state.last_bailout_function_name.clone(),
+        last_bailout_module_source_url: state.last_bailout_module_source_url.clone(),
         last_bailout_pc: state.last_bailout.pc,
         last_bailout_opcode: state.last_bailout_opcode,
         last_bailout_reason: state.last_bailout.reason,
@@ -834,6 +1060,16 @@ pub fn stats_snapshot() -> JitRuntimeStats {
         back_edge_compilations: state.back_edge_compilations,
         osr_attempts: state.osr_attempts,
         osr_successes: state.osr_successes,
+        compile_time_total_ns: state.compile_time_total_ns,
+        compile_time_last_ns: state.compile_time_last_ns,
+        compiled_code_size_total_bytes: state.compiled_code_size_total_bytes,
+        compiled_code_size_last_bytes: state.compiled_code_size_last_bytes,
+        compiled_code_size_max_bytes: state.compiled_code_size_max_bytes,
+        helper_calls_total: helper_snapshot.total_calls,
+        helper_call_counts_by_family: helper_snapshot.per_family,
+        top_helper_call_1: top_helpers[0],
+        top_helper_call_2: top_helpers[1],
+        top_helper_call_3: top_helpers[2],
     }
 }
 
@@ -917,6 +1153,11 @@ fn clear_runtime_state_for_tests() {
         state.compile_errors = 0;
         state.compile_requests = 0;
         state.compile_successes = 0;
+        state.compile_time_total_ns = 0;
+        state.compile_time_last_ns = 0;
+        state.compiled_code_size_total_bytes = 0;
+        state.compiled_code_size_last_bytes = 0;
+        state.compiled_code_size_max_bytes = 0;
         state.execute_attempts = 0;
         state.execute_hits = 0;
         state.execute_not_compiled = 0;
@@ -928,11 +1169,14 @@ fn clear_runtime_state_for_tests() {
         state.bailout_site_counts.clear();
         state.last_bailout_module_id = None;
         state.last_bailout_function_index = None;
+        state.last_bailout_function_name = None;
+        state.last_bailout_module_source_url = None;
         state.last_bailout_opcode = None;
         state.last_bailout = BailoutTelemetry::default();
     }
 
     drain_background_results();
+    otter_vm_jit::runtime_helpers::clear_helper_call_stats_for_tests();
 }
 
 #[cfg(test)]
@@ -1051,6 +1295,96 @@ mod tests {
     }
 
     #[test]
+    fn opcode_name_from_instruction_covers_property_and_global_ops() {
+        assert_eq!(
+            opcode_name_from_instruction(&otter_vm_bytecode::Instruction::GetGlobal {
+                dst: otter_vm_bytecode::Register(0),
+                name: otter_vm_bytecode::ConstantIndex(0),
+                ic_index: 0,
+            }),
+            "GetGlobal"
+        );
+        assert_eq!(
+            opcode_name_from_instruction(&otter_vm_bytecode::Instruction::GetPropConst {
+                dst: otter_vm_bytecode::Register(0),
+                obj: otter_vm_bytecode::Register(1),
+                name: otter_vm_bytecode::ConstantIndex(0),
+                ic_index: 0,
+            }),
+            "GetPropConst"
+        );
+        assert_eq!(
+            opcode_name_from_instruction(&otter_vm_bytecode::Instruction::Construct {
+                dst: otter_vm_bytecode::Register(0),
+                func: otter_vm_bytecode::Register(1),
+                argc: 1,
+            }),
+            "Construct"
+        );
+    }
+
+    #[test]
+    fn push_top_helper_call_keeps_three_highest_counts() {
+        let mut top: [Option<JitHelperCallStat>; 3] = [None, None, None];
+
+        push_top_helper_call(
+            &mut top,
+            JitHelperCallStat {
+                helper: "otter_rt_get_prop_const",
+                family: "property_element",
+                count: 4,
+            },
+        );
+        push_top_helper_call(
+            &mut top,
+            JitHelperCallStat {
+                helper: "otter_rt_call_function",
+                family: "call_construct",
+                count: 9,
+            },
+        );
+        push_top_helper_call(
+            &mut top,
+            JitHelperCallStat {
+                helper: "otter_rt_generic_add",
+                family: "generic_op",
+                count: 6,
+            },
+        );
+        push_top_helper_call(
+            &mut top,
+            JitHelperCallStat {
+                helper: "otter_rt_to_number",
+                family: "type_conversion",
+                count: 5,
+            },
+        );
+
+        assert_eq!(top[0].map(|s| s.count), Some(9));
+        assert_eq!(top[1].map(|s| s.count), Some(6));
+        assert_eq!(top[2].map(|s| s.count), Some(5));
+    }
+
+    #[test]
+    fn stats_snapshot_reports_compiled_code_size_metrics() {
+        clear_runtime_state_for_tests();
+
+        {
+            let mut state = lock_state();
+            state.compiled_code_size_total_bytes = 320;
+            state.compiled_code_size_last_bytes = 96;
+            state.compiled_code_size_max_bytes = 160;
+        }
+
+        let stats = stats_snapshot();
+        assert_eq!(stats.compiled_code_size_total_bytes, 320);
+        assert_eq!(stats.compiled_code_size_last_bytes, 96);
+        assert_eq!(stats.compiled_code_size_max_bytes, 160);
+
+        clear_runtime_state_for_tests();
+    }
+
+    #[test]
     fn enqueue_compile_and_execute_pipeline_compiles_function() {
         let _guard = crate::test_lock();
         crate::clear_for_tests();
@@ -1119,6 +1453,8 @@ mod tests {
                 CompiledFunctionEntry {
                     artifact: JitCompileArtifact::from_raw_ptr(0x1234 as *const u8),
                     deopt_metadata: DeoptMetadata::default(),
+                    function_name: Some("jit_runtime_bg_compile".to_string()),
+                    module_source_url: "jit-runtime-bg.js".to_string(),
                 },
             );
         }
@@ -1148,6 +1484,8 @@ mod tests {
                 CompiledFunctionEntry {
                     artifact: JitCompileArtifact::from_raw_ptr(0x5678 as *const u8),
                     deopt_metadata: DeoptMetadata::default(),
+                    function_name: Some("jit_runtime_bg_compile".to_string()),
+                    module_source_url: "jit-runtime-bg.js".to_string(),
                 },
             );
         }

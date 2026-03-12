@@ -52,6 +52,12 @@ skip = [
     "test-process-spawn.js",                         # needs child_process
 ]
 
+[modules.url]
+patterns = ["test-url-*.js"]
+skip = [
+    "test-url-parse-invalid-input.js",             # legacy parse warnings + child_process
+]
+
 [modules.test]
 patterns = ["test-runner-*.js"]
 skip = [

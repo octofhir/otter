@@ -9,7 +9,7 @@ use cranelift_module::{Linkage, Module, ModuleError, default_libcall_names};
 use otter_vm_bytecode::instruction::Instruction;
 use otter_vm_bytecode::{Constant, Function};
 
-use crate::runtime_helpers::{HelperFuncIds, HelperRefs, RuntimeHelpers};
+use crate::runtime_helpers::{HelperFuncIds, HelperRefs, HelperSafetyClass, RuntimeHelpers};
 use crate::translator;
 
 /// Result of compiling a bytecode function to native code.
@@ -17,6 +17,8 @@ use crate::translator;
 pub struct JitCompileArtifact {
     /// Entry pointer for compiled native code.
     pub code_ptr: *const u8,
+    /// Finalized native code size in bytes.
+    pub code_size_bytes: u64,
     _owned_code: Option<OwnedJitCode>,
 }
 
@@ -61,6 +63,7 @@ impl JitCompileArtifact {
     pub fn from_raw_ptr(code_ptr: *const u8) -> Self {
         Self {
             code_ptr,
+            code_size_bytes: 0,
             _owned_code: None,
         }
     }
@@ -80,6 +83,18 @@ pub struct DeoptResumeSite {
     pub bytecode_pc: u32,
     /// Native code offset for the deopt point. Not wired yet.
     pub native_offset: Option<u32>,
+    /// Conservative helper/safepoint class for this bytecode site, if any.
+    pub helper_safety_class: Option<HelperSafetyClass>,
+    /// Whether this site is a GC safepoint that requires materialized roots.
+    pub is_gc_safepoint: bool,
+    /// Whether values must be materialized before crossing this boundary.
+    pub requires_root_materialization: bool,
+    /// Whether this site must be treated as an explicit deopt/reentry boundary.
+    pub requires_deopt_frame: bool,
+    /// Whether this site crosses host hooks or FFI.
+    pub crosses_host_boundary: bool,
+    /// Whether this site always forces interpreter fallback.
+    pub always_bails_out: bool,
     /// Live virtual register indices required for precise resume.
     pub live_registers: Vec<u16>,
     /// Live local indices required for precise resume.
@@ -95,6 +110,18 @@ pub struct DeoptResumeSite {
 pub struct DeoptMetadata {
     /// Sorted list of deopt-capable sites.
     pub sites: Vec<DeoptResumeSite>,
+    /// Number of sites that are true GC safepoints.
+    pub safepoint_site_count: u32,
+    /// Whether this function contains any GC safepoints.
+    pub has_gc_safepoints: bool,
+    /// Whether this function contains any VM re-entry boundaries.
+    pub has_vm_reentry_boundaries: bool,
+    /// Whether this function contains any host/FFI boundaries.
+    pub has_host_boundaries: bool,
+    /// Whether this function contains any forced bailout boundaries.
+    pub has_forced_bailout_sites: bool,
+    /// Highest-risk helper boundary observed in this function.
+    pub highest_boundary_class: Option<HelperSafetyClass>,
 }
 
 // Compile-time GC safety assertions: ensure deopt types are Send + Sync
@@ -182,6 +209,12 @@ impl LivenessState {
         DeoptResumeSite {
             bytecode_pc,
             native_offset: None,
+            helper_safety_class: None,
+            is_gc_safepoint: false,
+            requires_root_materialization: false,
+            requires_deopt_frame: false,
+            crosses_host_boundary: false,
+            always_bails_out: false,
             live_registers: self
                 .registers
                 .iter()
@@ -399,6 +432,10 @@ fn apply_instruction_uses(instruction: &Instruction, state: &mut LivenessState) 
             state.mark_register(obj.0);
             state.mark_register(key.0);
             state.mark_register(func.0);
+        }
+        Instruction::SetPrototype { obj, proto } => {
+            state.mark_register(obj.0);
+            state.mark_register(proto.0);
         }
         Instruction::GetPropConst { obj, .. }
         | Instruction::GetPropQuickened { obj, .. }
@@ -637,6 +674,7 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::DefineGetter { .. }
         | Instruction::DefineSetter { .. }
         | Instruction::DefineMethod { .. }
+        | Instruction::SetPrototype { .. }
         | Instruction::SetElem { .. }
         | Instruction::TailCall { .. }
         | Instruction::Return { .. }
@@ -656,6 +694,166 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::Pop
         | Instruction::Export { .. }
         | Instruction::SetPropQuickened { .. } => {}
+    }
+}
+
+fn instruction_boundary_class(
+    function: &Function,
+    instruction: &Instruction,
+) -> Option<HelperSafetyClass> {
+    let feedback = function.feedback_vector.read();
+    match instruction {
+        Instruction::LoadConst { .. } => Some(HelperSafetyClass::AllocatingLeaf),
+        Instruction::GetGlobal { .. } | Instruction::SetGlobal { .. } => {
+            Some(HelperSafetyClass::AllocatingLeaf)
+        }
+        Instruction::GetPropConst { ic_index, .. } | Instruction::GetLocalProp { ic_index, .. } => {
+            let mono = feedback.get(*ic_index as usize).is_some_and(|md| {
+                matches!(
+                    md.ic_state,
+                    otter_vm_bytecode::function::InlineCacheState::Monomorphic { depth: 0, .. }
+                )
+            });
+            Some(if mono {
+                HelperSafetyClass::LeafNoGc
+            } else {
+                HelperSafetyClass::AllocatingLeaf
+            })
+        }
+        Instruction::SetPropConst { .. }
+        | Instruction::GetProp { .. }
+        | Instruction::SetProp { .. }
+        | Instruction::GetElem { .. }
+        | Instruction::SetElem { .. }
+        | Instruction::DeleteProp { .. }
+        | Instruction::DefineProperty { .. }
+        | Instruction::DefineGetter { .. }
+        | Instruction::DefineSetter { .. }
+        | Instruction::DefineMethod { .. }
+        | Instruction::NewObject { .. }
+        | Instruction::NewArray { .. }
+        | Instruction::TypeOf { .. }
+        | Instruction::TypeOfName { .. }
+        | Instruction::InstanceOf { .. }
+        | Instruction::In { .. }
+        | Instruction::DeclareGlobalVar { .. }
+        | Instruction::Spread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::DefineClass { .. }
+        | Instruction::GetSuper { .. }
+        | Instruction::GetSuperProp { .. }
+        | Instruction::SetHomeObject { .. }
+        | Instruction::AsyncClosure { .. }
+        | Instruction::GeneratorClosure { .. }
+        | Instruction::AsyncGeneratorClosure { .. }
+        | Instruction::Add { .. } => Some(HelperSafetyClass::AllocatingLeaf),
+
+        Instruction::LoadThis { .. }
+        | Instruction::GetUpvalue { .. }
+        | Instruction::SetUpvalue { .. }
+        | Instruction::Pow { .. }
+        | Instruction::GetElemInt { .. }
+        | Instruction::Sub { .. }
+        | Instruction::Mul { .. }
+        | Instruction::Div { .. }
+        | Instruction::Mod { .. }
+        | Instruction::Neg { .. }
+        | Instruction::Inc { .. }
+        | Instruction::Dec { .. }
+        | Instruction::BitAnd { .. }
+        | Instruction::BitOr { .. }
+        | Instruction::BitXor { .. }
+        | Instruction::BitNot { .. }
+        | Instruction::Shl { .. }
+        | Instruction::Shr { .. }
+        | Instruction::Ushr { .. }
+        | Instruction::Eq { .. }
+        | Instruction::StrictEq { .. }
+        | Instruction::Ne { .. }
+        | Instruction::StrictNe { .. }
+        | Instruction::Lt { .. }
+        | Instruction::Le { .. }
+        | Instruction::Gt { .. }
+        | Instruction::Ge { .. }
+        | Instruction::Not { .. }
+        | Instruction::RequireCoercible { .. }
+        | Instruction::GetPropQuickened { .. } => Some(HelperSafetyClass::LeafNoGc),
+
+        Instruction::CloseUpvalue { .. }
+        | Instruction::TryStart { .. }
+        | Instruction::TryEnd
+        | Instruction::Catch { .. } => Some(HelperSafetyClass::VmStateOnly),
+
+        Instruction::Call { ic_index, .. } => {
+            let ffi = feedback
+                .get(*ic_index as usize)
+                .is_some_and(|md| md.ffi_call_info_ptr != 0);
+            Some(if ffi {
+                HelperSafetyClass::HostBoundary
+            } else {
+                HelperSafetyClass::VmReentry
+            })
+        }
+        Instruction::CallMethod { .. }
+        | Instruction::CallWithReceiver { .. }
+        | Instruction::CallMethodComputed { .. }
+        | Instruction::Construct { .. }
+        | Instruction::CallSpread { .. }
+        | Instruction::ConstructSpread { .. }
+        | Instruction::CallMethodComputedSpread { .. }
+        | Instruction::TailCall { .. }
+        | Instruction::ToNumber { .. }
+        | Instruction::ToString { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::GetAsyncIterator { .. }
+        | Instruction::CallEval { .. }
+        | Instruction::CallSuper { .. }
+        | Instruction::CallSuperForward { .. }
+        | Instruction::CallSuperSpread { .. } => Some(HelperSafetyClass::VmReentry),
+
+        Instruction::Import { .. } | Instruction::Export { .. } | Instruction::ForInNext { .. } => {
+            Some(HelperSafetyClass::HostBoundary)
+        }
+
+        Instruction::Throw { .. }
+        | Instruction::Closure { .. }
+        | Instruction::CreateArguments { .. }
+        | Instruction::Yield { .. }
+        | Instruction::Await { .. }
+        | Instruction::IncLocal { .. }
+        | Instruction::GetPropString { .. }
+        | Instruction::GetArrayLength { .. } => Some(HelperSafetyClass::AlwaysBailout),
+
+        Instruction::LoadUndefined { .. }
+        | Instruction::LoadNull { .. }
+        | Instruction::LoadTrue { .. }
+        | Instruction::LoadFalse { .. }
+        | Instruction::LoadInt8 { .. }
+        | Instruction::LoadInt32 { .. }
+        | Instruction::GetLocal { .. }
+        | Instruction::GetLocal2 { .. }
+        | Instruction::SetLocal { .. }
+        | Instruction::Move { .. }
+        | Instruction::SetPropQuickened { .. }
+        | Instruction::AddInt32 { .. }
+        | Instruction::SubInt32 { .. }
+        | Instruction::MulInt32 { .. }
+        | Instruction::DivInt32 { .. }
+        | Instruction::AddNumber { .. }
+        | Instruction::SubNumber { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfTrue { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::JumpIfNullish { .. }
+        | Instruction::JumpIfNotNullish { .. }
+        | Instruction::Return { .. }
+        | Instruction::ReturnUndefined
+        | Instruction::Nop
+        | Instruction::Debugger
+        | Instruction::Pop
+        | Instruction::Dup { .. } => None,
     }
 }
 
@@ -713,13 +911,73 @@ pub(crate) fn build_deopt_metadata(function: &Function) -> DeoptMetadata {
         }
     }
 
+    let mut safepoint_site_count = 0_u32;
+    let mut has_gc_safepoints = false;
+    let mut has_vm_reentry_boundaries = false;
+    let mut has_host_boundaries = false;
+    let mut has_forced_bailout_sites = false;
+    let mut highest_boundary_class: Option<HelperSafetyClass> = None;
+
     let sites = instructions
         .iter()
         .enumerate()
         .filter(|(_, instruction)| instruction_can_deopt(instruction))
-        .map(|(pc, _)| live_in[pc].to_site(pc as u32))
+        .map(|(pc, instruction)| {
+            let boundary_class = instruction_boundary_class(function, instruction);
+            let mut site = live_in[pc].to_site(pc as u32);
+            site.helper_safety_class = boundary_class;
+            site.is_gc_safepoint = boundary_class.is_some_and(|class| {
+                matches!(
+                    class,
+                    HelperSafetyClass::AllocatingLeaf
+                        | HelperSafetyClass::VmReentry
+                        | HelperSafetyClass::HostBoundary
+                )
+            });
+            site.requires_root_materialization = site.is_gc_safepoint;
+            site.requires_deopt_frame = boundary_class.is_some_and(|class| {
+                matches!(
+                    class,
+                    HelperSafetyClass::VmReentry
+                        | HelperSafetyClass::HostBoundary
+                        | HelperSafetyClass::AlwaysBailout
+                )
+            });
+            site.crosses_host_boundary = boundary_class == Some(HelperSafetyClass::HostBoundary);
+            site.always_bails_out = boundary_class == Some(HelperSafetyClass::AlwaysBailout);
+
+            if site.is_gc_safepoint {
+                safepoint_site_count = safepoint_site_count.saturating_add(1);
+                has_gc_safepoints = true;
+            }
+            if boundary_class == Some(HelperSafetyClass::VmReentry) {
+                has_vm_reentry_boundaries = true;
+            }
+            if site.crosses_host_boundary {
+                has_host_boundaries = true;
+            }
+            if site.always_bails_out {
+                has_forced_bailout_sites = true;
+            }
+            if let Some(class) = boundary_class {
+                highest_boundary_class = Some(match highest_boundary_class {
+                    Some(existing) => existing.max(class),
+                    None => class,
+                });
+            }
+
+            site
+        })
         .collect();
-    DeoptMetadata { sites }
+    DeoptMetadata {
+        sites,
+        safepoint_site_count,
+        has_gc_safepoints,
+        has_vm_reentry_boundaries,
+        has_host_boundaries,
+        has_forced_bailout_sites,
+        highest_boundary_class,
+    }
 }
 
 /// Errors produced by the baseline JIT compiler.
@@ -925,6 +1183,11 @@ impl JitCompiler {
         }
 
         module.define_function(func_id, &mut self.context)?;
+        let code_size_bytes = self
+            .context
+            .compiled_code()
+            .map(|compiled| compiled.code_buffer().len() as u64)
+            .unwrap_or(0);
         module.clear_context(&mut self.context);
         module.finalize_definitions()?;
 
@@ -933,6 +1196,7 @@ impl JitCompiler {
         Ok((
             JitCompileArtifact {
                 code_ptr,
+                code_size_bytes,
                 _owned_code: Some(OwnedJitCode::new(module)),
             },
             metadata,
@@ -1038,6 +1302,12 @@ mod tests {
         assert_eq!(metadata.sites[0].bytecode_pc, 2);
         assert_eq!(metadata.sites[0].live_registers, vec![0, 1]);
         assert!(metadata.sites[0].live_locals.is_empty());
+        assert_eq!(
+            metadata.sites[0].helper_safety_class,
+            Some(HelperSafetyClass::AllocatingLeaf)
+        );
+        assert!(metadata.sites[0].is_gc_safepoint);
+        assert!(metadata.has_gc_safepoints);
         assert!(metadata.has_site(2));
         assert!(!metadata.has_site(0));
     }
@@ -1073,6 +1343,13 @@ mod tests {
         let call_site = site(&metadata, 3);
         assert_eq!(call_site.live_registers, vec![1, 2, 3]);
         assert!(call_site.live_locals.is_empty());
+        assert_eq!(
+            call_site.helper_safety_class,
+            Some(HelperSafetyClass::VmReentry)
+        );
+        assert!(call_site.is_gc_safepoint);
+        assert!(call_site.requires_deopt_frame);
+        assert!(metadata.has_vm_reentry_boundaries);
     }
 
     #[test]
@@ -1111,6 +1388,80 @@ mod tests {
         let get_global_site = site(&metadata, 3);
         assert!(get_global_site.live_registers.is_empty());
         assert_eq!(get_global_site.live_locals, vec![0]);
+        assert_eq!(
+            get_global_site.helper_safety_class,
+            Some(HelperSafetyClass::AllocatingLeaf)
+        );
+        assert!(get_global_site.is_gc_safepoint);
+    }
+
+    #[test]
+    fn deopt_metadata_marks_monomorphic_get_prop_const_as_leaf_boundary() {
+        let function = Function::builder()
+            .name("deopt_mono_get_prop")
+            .register_count(2)
+            .instruction(Instruction::GetPropConst {
+                dst: Register(1),
+                obj: Register(0),
+                name: ConstantIndex(0),
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(1) })
+            .feedback_vector_size(1)
+            .build();
+
+        {
+            let feedback = function.feedback_vector.write();
+            feedback[0].ic_state = otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                shape_id: 42,
+                proto_shape_id: 0,
+                depth: 0,
+                offset: 3,
+            };
+        }
+
+        let metadata = build_deopt_metadata(&function);
+        let site = site(&metadata, 0);
+        assert_eq!(site.helper_safety_class, Some(HelperSafetyClass::LeafNoGc));
+        assert!(!site.is_gc_safepoint);
+        assert!(!site.requires_root_materialization);
+        assert_eq!(metadata.safepoint_site_count, 0);
+    }
+
+    #[test]
+    fn deopt_metadata_marks_ffi_calls_as_host_boundaries() {
+        let function = Function::builder()
+            .name("deopt_ffi_call")
+            .register_count(3)
+            .instruction(Instruction::Call {
+                dst: Register(2),
+                func: Register(0),
+                argc: 1,
+                ic_index: 0,
+            })
+            .instruction(Instruction::Return { src: Register(2) })
+            .feedback_vector_size(1)
+            .build();
+
+        {
+            let feedback = function.feedback_vector.write();
+            feedback[0].ffi_call_info_ptr = 1;
+        }
+
+        let metadata = build_deopt_metadata(&function);
+        let site = site(&metadata, 0);
+        assert_eq!(
+            site.helper_safety_class,
+            Some(HelperSafetyClass::HostBoundary)
+        );
+        assert!(site.is_gc_safepoint);
+        assert!(site.crosses_host_boundary);
+        assert!(site.requires_deopt_frame);
+        assert!(metadata.has_host_boundaries);
+        assert_eq!(
+            metadata.highest_boundary_class,
+            Some(HelperSafetyClass::HostBoundary)
+        );
     }
 
     #[test]
@@ -1284,6 +1635,41 @@ mod tests {
                 value: 42,
             }) // pc 4
             .instruction(Instruction::Return { src: Register(2) }) // pc 5
+            .build();
+
+        let mut jit = JitCompiler::new().expect("jit initialization should succeed");
+        let artifact = jit
+            .compile_function(&function)
+            .expect("translation should succeed");
+
+        assert_eq!(jit.execute_compiled_i64(artifact), boxed_i32(42));
+    }
+
+    #[test]
+    fn translation_unconditional_jump_skips_dead_read_reg_tail() {
+        let function = Function::builder()
+            .name("translation_dead_tail_after_jump")
+            .register_count(3)
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(0),
+                value: 42,
+            }) // pc 0
+            .instruction(Instruction::LoadInt32 {
+                dst: Register(1),
+                value: 1,
+            }) // pc 1
+            .instruction(Instruction::Jump {
+                offset: JumpOffset(3),
+            }) // pc 2 -> pc 5
+            .instruction(Instruction::Add {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                feedback_index: 0,
+            }) // pc 3 (dead)
+            .instruction(Instruction::Return { src: Register(2) }) // pc 4 (dead)
+            .instruction(Instruction::Return { src: Register(0) }) // pc 5
+            .feedback_vector_size(1)
             .build();
 
         let mut jit = JitCompiler::new().expect("jit initialization should succeed");

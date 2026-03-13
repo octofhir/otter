@@ -90,12 +90,16 @@ pub(crate) fn detect_loops(
                 break;
             }
 
-            // Check arithmetic/comparison instructions for Int32 feedback
+            // Check arithmetic/comparison instructions for Int32 feedback.
+            // Allow int32+number (numeric) since the versioned loop's overflow
+            // guards safely bail to the guarded path on float64 values.
+            // This handles the common `(x * y + z) | 0` pattern where
+            // intermediate overflow produces float64 but `| 0` truncates back.
             if let Some((feedback_idx, input_regs)) = arith_feedback_info(inst) {
-                let is_int32 = feedback_snapshot
+                let is_numeric_int32 = feedback_snapshot
                     .get(feedback_idx as usize)
-                    .is_some_and(|tf| tf.is_int32_only());
-                if !is_int32 {
+                    .is_some_and(|tf| tf.is_numeric_with_int32());
+                if !is_numeric_int32 {
                     qualifies = false;
                     break;
                 }
@@ -241,6 +245,11 @@ fn arith_feedback_info(inst: &Instruction) -> Option<(u16, Vec<u16>)> {
         // to check them for loop versioning — they work on any type
         _ => None,
     }
+}
+
+/// Public accessor for debug/diagnostic use.
+pub(crate) fn arith_feedback_info_pub(inst: &Instruction) -> Option<(u16, Vec<u16>)> {
+    arith_feedback_info(inst)
 }
 
 /// For Inc/Dec instructions, return the input register.

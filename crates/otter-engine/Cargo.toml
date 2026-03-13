@@ -28,7 +28,6 @@ reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 oxc_resolver = "11.16"
 dirs = "6.0"
 md5 = "0.8"
-regex = "1"
 dashmap = "6.1"
 futures-util = "0.3"
 http = "1.3"

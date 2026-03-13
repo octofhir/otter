@@ -15,12 +15,14 @@
 pub mod codegen;
 pub mod compiler;
 pub mod constant_fold;
+pub mod dep_scanner;
 pub mod error;
 pub mod literal_validator;
 pub mod peephole;
 pub mod scope;
 
 pub use compiler::Compiler;
+pub use dep_scanner::{DepRecord, has_module_syntax, scan_dependencies, scan_specifiers};
 pub use error::{CompileError, CompileResult};
 pub use literal_validator::{EcmaVersion, LiteralValidator, SourceLocation, ValidationContext};
 pub use peephole::PeepholeOptimizer;

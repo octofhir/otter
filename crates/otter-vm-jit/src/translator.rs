@@ -363,6 +363,372 @@ fn emit_jump_truthy_value(
     }
 }
 
+#[inline]
+fn instruction_reads_register(instruction: &Instruction, reg: Register) -> bool {
+    match instruction {
+        Instruction::SetLocal { src, .. }
+        | Instruction::SetUpvalue { src, .. }
+        | Instruction::Move { src, .. }
+        | Instruction::Neg { src, .. }
+        | Instruction::Inc { src, .. }
+        | Instruction::Dec { src, .. }
+        | Instruction::BitNot { src, .. }
+        | Instruction::Not { src, .. }
+        | Instruction::JumpIfNullish { src, .. }
+        | Instruction::JumpIfNotNullish { src, .. }
+        | Instruction::Return { src }
+        | Instruction::Yield { src, .. }
+        | Instruction::Await { src, .. }
+        | Instruction::Dup { src, .. }
+        | Instruction::ToNumber { src, .. }
+        | Instruction::ToString { src, .. }
+        | Instruction::TypeOf { src, .. }
+        | Instruction::Export { src, .. }
+        | Instruction::Spread { src, .. }
+        | Instruction::RequireCoercible { src } => *src == reg,
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::Mod { lhs, rhs, .. }
+        | Instruction::Pow { lhs, rhs, .. }
+        | Instruction::BitAnd { lhs, rhs, .. }
+        | Instruction::BitOr { lhs, rhs, .. }
+        | Instruction::BitXor { lhs, rhs, .. }
+        | Instruction::Shl { lhs, rhs, .. }
+        | Instruction::Shr { lhs, rhs, .. }
+        | Instruction::Ushr { lhs, rhs, .. }
+        | Instruction::Eq { lhs, rhs, .. }
+        | Instruction::StrictEq { lhs, rhs, .. }
+        | Instruction::Ne { lhs, rhs, .. }
+        | Instruction::StrictNe { lhs, rhs, .. }
+        | Instruction::Lt { lhs, rhs, .. }
+        | Instruction::Le { lhs, rhs, .. }
+        | Instruction::Gt { lhs, rhs, .. }
+        | Instruction::Ge { lhs, rhs, .. }
+        | Instruction::InstanceOf { lhs, rhs, .. }
+        | Instruction::In { lhs, rhs, .. } => *lhs == reg || *rhs == reg,
+        Instruction::JumpIfTrue { cond, .. } | Instruction::JumpIfFalse { cond, .. } => {
+            *cond == reg
+        }
+        Instruction::GetProp { obj, key, .. } | Instruction::DeleteProp { obj, key, .. } => {
+            *obj == reg || *key == reg
+        }
+        Instruction::GetElem { arr, idx, .. } => *arr == reg || *idx == reg,
+        Instruction::SetProp { obj, key, val, .. }
+        | Instruction::DefineProperty { obj, key, val } => {
+            *obj == reg || *key == reg || *val == reg
+        }
+        Instruction::SetElem { arr, idx, val, .. } => *arr == reg || *idx == reg || *val == reg,
+        Instruction::GetPropConst { obj, .. } => *obj == reg,
+        Instruction::SetPropConst { obj, val, .. } => *obj == reg || *val == reg,
+        Instruction::GetElemInt { obj, index, .. } => *obj == reg || *index == reg,
+        Instruction::DefineGetter { obj, key, func }
+        | Instruction::DefineSetter { obj, key, func } => {
+            *obj == reg || *key == reg || *func == reg
+        }
+        Instruction::DefineMethod { obj, key, val } => *obj == reg || *key == reg || *val == reg,
+        Instruction::SetPrototype { obj, proto } => *obj == reg || *proto == reg,
+        Instruction::Call { func, argc, .. } | Instruction::Construct { func, argc, .. } => {
+            let start = func.0;
+            let end = start.saturating_add(u16::from(*argc));
+            reg.0 >= start && reg.0 <= end
+        }
+        Instruction::CallMethod { .. } | Instruction::CallMethodComputed { .. } => true,
+        Instruction::CallWithReceiver {
+            func, this, argc, ..
+        } => {
+            if *func == reg || *this == reg {
+                return true;
+            }
+            let start = this.0.saturating_add(1);
+            let end = start.saturating_add(u16::from(argc.saturating_sub(1)));
+            reg.0 >= start && reg.0 <= end
+        }
+        Instruction::TailCall { func, argc } => {
+            let start = func.0;
+            let end = start.saturating_add(u16::from(*argc));
+            reg.0 >= start && reg.0 <= end
+        }
+        Instruction::CallEval { code, .. } => *code == reg,
+        Instruction::CallSpread { func, spread, .. }
+        | Instruction::ConstructSpread { func, spread, .. } => *func == reg || *spread == reg,
+        Instruction::CallMethodComputedSpread {
+            obj, key, spread, ..
+        } => *obj == reg || *key == reg || *spread == reg,
+        Instruction::LoadUndefined { .. }
+        | Instruction::LoadNull { .. }
+        | Instruction::LoadTrue { .. }
+        | Instruction::LoadFalse { .. }
+        | Instruction::LoadInt8 { .. }
+        | Instruction::LoadInt32 { .. }
+        | Instruction::LoadConst { .. }
+        | Instruction::GetLocal { .. }
+        | Instruction::GetLocal2 { .. }
+        | Instruction::GetUpvalue { .. }
+        | Instruction::GetGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::Jump { .. }
+        | Instruction::ReturnUndefined
+        | Instruction::Nop
+        | Instruction::Pop
+        | Instruction::NewObject { .. }
+        | Instruction::NewArray { .. }
+        | Instruction::Closure { .. }
+        | Instruction::AsyncClosure { .. }
+        | Instruction::GeneratorClosure { .. }
+        | Instruction::AsyncGeneratorClosure { .. }
+        | Instruction::CreateArguments { .. }
+        | Instruction::Import { .. }
+        | Instruction::CloseUpvalue { .. } => false,
+        _ => true,
+    }
+}
+
+#[inline]
+fn register_read_later_anywhere(
+    instructions: &[Instruction],
+    after_pc_exclusive: usize,
+    reg: Register,
+) -> bool {
+    instructions
+        .iter()
+        .skip(after_pc_exclusive.saturating_add(1))
+        .any(|instruction| instruction_reads_register(instruction, reg))
+}
+
+#[inline]
+fn next_jump_consumes_register(instructions: &[Instruction], pc: usize, reg: Register) -> bool {
+    matches!(
+        instructions.get(pc + 1),
+        Some(Instruction::JumpIfTrue { cond, .. } | Instruction::JumpIfFalse { cond, .. }) if *cond == reg
+    )
+}
+
+#[inline]
+fn fused_versioned_compare_cc(
+    instruction: &Instruction,
+    dst: Register,
+) -> Option<(Register, Register, IntCC)> {
+    match instruction {
+        Instruction::StrictEq { dst: d, lhs, rhs } if *d == dst => Some((*lhs, *rhs, IntCC::Equal)),
+        Instruction::StrictNe { dst: d, lhs, rhs } if *d == dst => {
+            Some((*lhs, *rhs, IntCC::NotEqual))
+        }
+        Instruction::Lt { dst: d, lhs, rhs } if *d == dst => {
+            Some((*lhs, *rhs, IntCC::SignedLessThan))
+        }
+        Instruction::Le { dst: d, lhs, rhs } if *d == dst => {
+            Some((*lhs, *rhs, IntCC::SignedLessThanOrEqual))
+        }
+        Instruction::Gt { dst: d, lhs, rhs } if *d == dst => {
+            Some((*lhs, *rhs, IntCC::SignedGreaterThan))
+        }
+        Instruction::Ge { dst: d, lhs, rhs } if *d == dst => {
+            Some((*lhs, *rhs, IntCC::SignedGreaterThanOrEqual))
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn can_fuse_versioned_compare_branch(
+    instructions: &[Instruction],
+    pc: usize,
+    dst: Register,
+) -> bool {
+    next_jump_consumes_register(instructions, pc, dst)
+        && !register_read_later_anywhere(instructions, pc + 1, dst)
+}
+
+/// Get the destination register(s) for an instruction (versioned loop subset).
+fn versioned_dst_registers(instr: &Instruction) -> [Option<u16>; 2] {
+    match instr {
+        Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::Mod { dst, .. }
+        | Instruction::Pow { dst, .. }
+        | Instruction::AddInt32 { dst, .. }
+        | Instruction::SubInt32 { dst, .. }
+        | Instruction::MulInt32 { dst, .. }
+        | Instruction::BitOr { dst, .. }
+        | Instruction::BitAnd { dst, .. }
+        | Instruction::BitXor { dst, .. }
+        | Instruction::Shl { dst, .. }
+        | Instruction::Shr { dst, .. }
+        | Instruction::Ushr { dst, .. }
+        | Instruction::BitNot { dst, .. }
+        | Instruction::Inc { dst, .. }
+        | Instruction::Dec { dst, .. }
+        | Instruction::Lt { dst, .. }
+        | Instruction::Le { dst, .. }
+        | Instruction::Gt { dst, .. }
+        | Instruction::Ge { dst, .. }
+        | Instruction::Eq { dst, .. }
+        | Instruction::Ne { dst, .. }
+        | Instruction::StrictEq { dst, .. }
+        | Instruction::StrictNe { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::Neg { dst, .. }
+        | Instruction::Dup { dst, .. }
+        | Instruction::ToNumber { dst, .. }
+        | Instruction::ToString { dst, .. }
+        | Instruction::TypeOf { dst, .. }
+        | Instruction::LoadInt8 { dst, .. }
+        | Instruction::LoadInt32 { dst, .. }
+        | Instruction::LoadTrue { dst }
+        | Instruction::LoadFalse { dst }
+        | Instruction::LoadNull { dst }
+        | Instruction::LoadUndefined { dst }
+        | Instruction::LoadConst { dst, .. }
+        | Instruction::GetLocal { dst, .. }
+        | Instruction::GetElemInt { dst, .. } => [Some(dst.0), None],
+        Instruction::GetLocal2 { dst1, dst2, .. } => [Some(dst1.0), Some(dst2.0)],
+        _ => [None, None],
+    }
+}
+
+/// Get source register indices for an instruction (versioned loop subset).
+fn versioned_src_registers(instr: &Instruction) -> [Option<u16>; 3] {
+    match instr {
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::Mod { lhs, rhs, .. }
+        | Instruction::Pow { lhs, rhs, .. }
+        | Instruction::AddInt32 { lhs, rhs, .. }
+        | Instruction::SubInt32 { lhs, rhs, .. }
+        | Instruction::MulInt32 { lhs, rhs, .. }
+        | Instruction::BitOr { lhs, rhs, .. }
+        | Instruction::BitAnd { lhs, rhs, .. }
+        | Instruction::BitXor { lhs, rhs, .. }
+        | Instruction::Shl { lhs, rhs, .. }
+        | Instruction::Shr { lhs, rhs, .. }
+        | Instruction::Ushr { lhs, rhs, .. }
+        | Instruction::Lt { lhs, rhs, .. }
+        | Instruction::Le { lhs, rhs, .. }
+        | Instruction::Gt { lhs, rhs, .. }
+        | Instruction::Ge { lhs, rhs, .. }
+        | Instruction::Eq { lhs, rhs, .. }
+        | Instruction::Ne { lhs, rhs, .. }
+        | Instruction::StrictEq { lhs, rhs, .. }
+        | Instruction::StrictNe { lhs, rhs, .. } => [Some(lhs.0), Some(rhs.0), None],
+        Instruction::Inc { src, .. }
+        | Instruction::Dec { src, .. }
+        | Instruction::BitNot { src, .. }
+        | Instruction::Not { src, .. }
+        | Instruction::Neg { src, .. }
+        | Instruction::Move { src, .. }
+        | Instruction::Dup { src, .. }
+        | Instruction::ToNumber { src, .. }
+        | Instruction::ToString { src, .. }
+        | Instruction::TypeOf { src, .. }
+        | Instruction::Return { src } => [Some(src.0), None, None],
+        Instruction::SetLocal { src, .. } => [Some(src.0), None, None],
+        Instruction::JumpIfTrue { cond, .. } | Instruction::JumpIfFalse { cond, .. } => {
+            [Some(cond.0), None, None]
+        }
+        _ => [None, None, None],
+    }
+}
+
+/// Build the set of PCs where arithmetic ops can use wrapping i32 (no overflow check)
+/// because ALL consumers of the result are bitwise/truncating operations.
+///
+/// This implements V8 TurboFan / JSC DFG-style backwards truncation propagation:
+/// - Any bitwise op (BitOr, BitAnd, BitXor, Shl, Shr) is a truncation sink
+/// - An arithmetic op (Add/Sub/Mul) is wrapping if ALL its consumers are either
+///   bitwise ops or themselves wrapping arithmetic ops
+/// - Propagation continues to fixpoint to handle chains like `(a * b + c) | 0`
+fn build_wrapping_set(
+    instructions: &[Instruction],
+    header_pc: usize,
+    back_edge_pc: usize,
+) -> std::collections::HashSet<usize> {
+    use std::collections::{HashMap, HashSet};
+
+    // Build def-use chains: for each register, track its most recent definition PC
+    // and the PCs that consume it before it's redefined.
+    let mut last_def: HashMap<u16, usize> = HashMap::new();
+    let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for pc in header_pc..=back_edge_pc {
+        let instr = &instructions[pc];
+
+        // Record uses FIRST (before updating defs)
+        for src_idx in versioned_src_registers(instr).into_iter().flatten() {
+            if let Some(&def_pc) = last_def.get(&src_idx) {
+                consumers.entry(def_pc).or_default().push(pc);
+            }
+        }
+
+        // Record defs
+        for dst_idx in versioned_dst_registers(instr).into_iter().flatten() {
+            last_def.insert(dst_idx, pc);
+        }
+    }
+
+    let is_bitwise = |pc: usize| -> bool {
+        matches!(
+            instructions[pc],
+            Instruction::BitOr { .. }
+                | Instruction::BitAnd { .. }
+                | Instruction::BitXor { .. }
+                | Instruction::BitNot { .. }
+                | Instruction::Shl { .. }
+                | Instruction::Shr { .. }
+                | Instruction::Ushr { .. }
+        )
+    };
+
+    let is_arith = |pc: usize| -> bool {
+        matches!(
+            instructions[pc],
+            Instruction::Add { .. }
+                | Instruction::Sub { .. }
+                | Instruction::Mul { .. }
+                | Instruction::AddInt32 { .. }
+                | Instruction::SubInt32 { .. }
+                | Instruction::MulInt32 { .. }
+        )
+    };
+
+    // Fixpoint iteration: mark arithmetic ops as wrapping if ALL consumers
+    // are bitwise ops or already-marked wrapping ops.
+    let mut wrapping: HashSet<usize> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for pc in header_pc..=back_edge_pc {
+            if wrapping.contains(&pc) {
+                continue;
+            }
+            if !is_arith(pc) {
+                continue;
+            }
+
+            let uses = consumers.get(&pc).map(|v| v.as_slice()).unwrap_or(&[]);
+            if uses.is_empty() {
+                continue; // dead result — conservative, don't mark
+            }
+
+            if uses
+                .iter()
+                .all(|&u| is_bitwise(u) || wrapping.contains(&u))
+            {
+                wrapping.insert(pc);
+                changed = true;
+            }
+        }
+    }
+
+    wrapping
+}
+
 fn number_to_nanbox_bits(number: f64) -> i64 {
     // Mirrors otter-vm-core::Value::number semantics.
     if number.is_nan() {
@@ -909,6 +1275,13 @@ struct VersionedLoop {
     i32_vars: Vec<Variable>,
     /// Map: register_index → index in i32_vars
     reg_to_i32: std::collections::HashMap<u16, usize>,
+    /// Raw i32 SSA Variables for loop-local variables (eliminates box/unbox round-trip)
+    i32_local_vars: Vec<Variable>,
+    /// Map: local_index → index in i32_local_vars
+    local_to_i32: std::collections::HashMap<u16, usize>,
+    /// PCs where arithmetic ops can use wrapping i32 (no overflow check).
+    /// Built by backwards truncation analysis (V8/JSC-style).
+    wrapping_pcs: std::collections::HashSet<usize>,
 }
 
 /// Read a register as raw i32 in a versioned loop body.
@@ -948,7 +1321,7 @@ fn write_reg_i32(
     }
 }
 
-/// Materialize all i32 variables back to their i64 (NaN-boxed) counterparts.
+/// Materialize all i32 variables (registers AND locals) back to their i64 (NaN-boxed) form.
 /// Call this on every edge leaving the versioned loop body (overflow, loop exit, fallback).
 fn materialize_i32_vars(
     builder: &mut FunctionBuilder<'_>,
@@ -959,6 +1332,22 @@ fn materialize_i32_vars(
         let raw = builder.use_var(vl.i32_vars[j]);
         let boxed = type_guards::emit_box_int32(builder, raw);
         builder.def_var(reg_vars[reg_idx as usize], boxed);
+    }
+}
+
+/// Materialize all i32 state (registers + locals) back to NaN-boxed form.
+/// Use on every exit from the versioned loop body.
+fn materialize_all_i32(
+    builder: &mut FunctionBuilder<'_>,
+    reg_vars: &[Variable],
+    local_vars: &[Variable],
+    vl: &VersionedLoop,
+) {
+    materialize_i32_vars(builder, reg_vars, vl);
+    for (&local_idx, &j) in &vl.local_to_i32 {
+        let raw = builder.use_var(vl.i32_local_vars[j]);
+        let boxed = type_guards::emit_box_int32(builder, raw);
+        builder.def_var(local_vars[local_idx as usize], boxed);
     }
 }
 
@@ -977,6 +1366,29 @@ fn read_reg_versioned(
     } else {
         builder.use_var(reg_vars[reg.index() as usize])
     }
+}
+
+#[inline]
+fn try_emit_versioned_fused_compare_condition(
+    builder: &mut FunctionBuilder<'_>,
+    reg_vars: &[Variable],
+    vl: &VersionedLoop,
+    instructions: &[Instruction],
+    jump_pc: usize,
+    cond: Register,
+) -> Option<Value> {
+    let prev_pc = jump_pc.checked_sub(1)?;
+    let (lhs, rhs, cc) = fused_versioned_compare_cc(instructions.get(prev_pc)?, cond)?;
+    if !can_fuse_versioned_compare_branch(instructions, prev_pc, cond) {
+        return None;
+    }
+    if !vl.reg_to_i32.contains_key(&lhs.0) || !vl.reg_to_i32.contains_key(&rhs.0) {
+        return None;
+    }
+
+    let left = read_reg_i32(builder, reg_vars, vl, lhs);
+    let right = read_reg_i32(builder, reg_vars, vl, rhs);
+    Some(builder.ins().icmp(cc, left, right))
 }
 
 /// Emit a `return BAILOUT_SENTINEL` — signals the caller to re-execute
@@ -1659,6 +2071,38 @@ pub fn translate_function_with_constants(
             i32_vars.push(var);
             reg_to_i32.insert(reg_idx, j);
         }
+
+        // Collect locals accessed within the loop body for i32 tracking.
+        // Track ALL read locals (not just read+written) so that loop-invariant
+        // locals like loop bounds are unboxed once in the pre-header.
+        let mut local_reads: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for inst in &instructions_ref[info.header_pc..=info.back_edge_pc] {
+            match inst {
+                Instruction::GetLocal { idx, .. } => {
+                    local_reads.insert(idx.index());
+                }
+                Instruction::GetLocal2 { idx1, idx2, .. } => {
+                    local_reads.insert(idx1.index());
+                    local_reads.insert(idx2.index());
+                }
+                _ => {}
+            }
+        }
+        let mut i32_local_vars = Vec::new();
+        let mut local_to_i32 = std::collections::HashMap::new();
+        for &local_idx in &local_reads {
+            if (local_idx as usize) < local_count {
+                let j = i32_local_vars.len();
+                let var = builder.declare_var(types::I32);
+                i32_local_vars.push(var);
+                local_to_i32.insert(local_idx, j);
+            }
+        }
+
+        // Build backwards truncation set (V8/JSC-style).
+        let wrapping_pcs =
+            build_wrapping_set(instructions_ref, info.header_pc, info.back_edge_pc);
+
         header_to_preheader.insert(info.header_pc, pre_header);
         versioned.push(VersionedLoop {
             header_pc: info.header_pc,
@@ -1668,6 +2112,9 @@ pub fn translate_function_with_constants(
             check_registers: info.check_registers.clone(),
             i32_vars,
             reg_to_i32,
+            i32_local_vars,
+            local_to_i32,
+            wrapping_pcs,
         });
     }
 
@@ -4819,6 +5266,15 @@ pub fn translate_function_with_constants(
                 });
             }
         }
+        // Also check tracked locals
+        for (&local_idx, _) in &vl.local_to_i32 {
+            let val = builder.use_var(local_vars[local_idx as usize]);
+            let is_i32 = type_guards::emit_is_int32(builder, val);
+            all_int32 = Some(match all_int32 {
+                None => is_i32,
+                Some(prev) => builder.ins().band(prev, is_i32),
+            });
+        }
 
         if let Some(check) = all_int32 {
             // Branch: all int32 → unbox block, otherwise → guarded
@@ -4835,6 +5291,12 @@ pub fn translate_function_with_constants(
                     let raw = type_guards::emit_unbox_int32(builder, boxed);
                     builder.def_var(vl.i32_vars[j], raw);
                 }
+            }
+            // Unbox tracked locals into raw i32 Variables
+            for (&local_idx, &j) in &vl.local_to_i32 {
+                let boxed = builder.use_var(local_vars[local_idx as usize]);
+                let raw = type_guards::emit_unbox_int32(builder, boxed);
+                builder.def_var(vl.i32_local_vars[j], raw);
             }
             builder.ins().jump(vl.opt_blocks[0], &[]);
         } else {
@@ -4854,7 +5316,7 @@ pub fn translate_function_with_constants(
                 // Non-int32 constants targeting a tracked register bail to guarded path.
                 Instruction::LoadUndefined { dst } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -4863,7 +5325,7 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::LoadNull { dst } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -4872,7 +5334,7 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::LoadTrue { dst } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -4881,7 +5343,7 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::LoadFalse { dst } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -4909,7 +5371,7 @@ pub fn translate_function_with_constants(
                 Instruction::LoadConst { dst, idx } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         // Can't determine const type at compile time; bail
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -4917,25 +5379,84 @@ pub fn translate_function_with_constants(
                         let v = builder.ins().iconst(types::I64, bits);
                         write_reg(builder, &reg_vars, *dst, v);
                     } else {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
                 }
                 // --- Variable access ---
                 Instruction::GetLocal { dst, idx } => {
-                    let v = read_local(builder, &local_vars, *idx);
-                    if vl.reg_to_i32.contains_key(&dst.0) {
-                        // In versioned body, locals for tracked regs should be int32
-                        let raw = type_guards::emit_unbox_int32(builder, v);
-                        write_reg_i32(builder, &reg_vars, vl, *dst, raw);
+                    if let Some(&lj) = vl.local_to_i32.get(&idx.index()) {
+                        // Local has i32 shadow — read directly as i32
+                        let raw = builder.use_var(vl.i32_local_vars[lj]);
+                        if vl.reg_to_i32.contains_key(&dst.0) {
+                            write_reg_i32(builder, &reg_vars, vl, *dst, raw);
+                        } else {
+                            let boxed = type_guards::emit_box_int32(builder, raw);
+                            write_reg(builder, &reg_vars, *dst, boxed);
+                        }
                     } else {
-                        write_reg(builder, &reg_vars, *dst, v);
+                        let v = read_local(builder, &local_vars, *idx);
+                        if vl.reg_to_i32.contains_key(&dst.0) {
+                            let raw = type_guards::emit_unbox_int32(builder, v);
+                            write_reg_i32(builder, &reg_vars, vl, *dst, raw);
+                        } else {
+                            write_reg(builder, &reg_vars, *dst, v);
+                        }
                     }
                 }
                 Instruction::SetLocal { idx, src } => {
-                    let v = read_reg_versioned(builder, &reg_vars, vl, *src);
-                    write_local(builder, &local_vars, *idx, v);
+                    if let Some(&lj) = vl.local_to_i32.get(&idx.index()) {
+                        // Local has i32 shadow — write raw i32, skip boxing
+                        let raw = read_reg_i32(builder, &reg_vars, vl, *src);
+                        builder.def_var(vl.i32_local_vars[lj], raw);
+                    } else {
+                        let v = read_reg_versioned(builder, &reg_vars, vl, *src);
+                        write_local(builder, &local_vars, *idx, v);
+                    }
+                }
+                Instruction::GetLocal2 {
+                    dst1,
+                    idx1,
+                    dst2,
+                    idx2,
+                } => {
+                    // First local
+                    if let Some(&lj) = vl.local_to_i32.get(&idx1.index()) {
+                        let raw = builder.use_var(vl.i32_local_vars[lj]);
+                        if vl.reg_to_i32.contains_key(&dst1.0) {
+                            write_reg_i32(builder, &reg_vars, vl, *dst1, raw);
+                        } else {
+                            let boxed = type_guards::emit_box_int32(builder, raw);
+                            write_reg(builder, &reg_vars, *dst1, boxed);
+                        }
+                    } else {
+                        let v = read_local(builder, &local_vars, *idx1);
+                        if vl.reg_to_i32.contains_key(&dst1.0) {
+                            let raw = type_guards::emit_unbox_int32(builder, v);
+                            write_reg_i32(builder, &reg_vars, vl, *dst1, raw);
+                        } else {
+                            write_reg(builder, &reg_vars, *dst1, v);
+                        }
+                    }
+                    // Second local
+                    if let Some(&lj) = vl.local_to_i32.get(&idx2.index()) {
+                        let raw = builder.use_var(vl.i32_local_vars[lj]);
+                        if vl.reg_to_i32.contains_key(&dst2.0) {
+                            write_reg_i32(builder, &reg_vars, vl, *dst2, raw);
+                        } else {
+                            let boxed = type_guards::emit_box_int32(builder, raw);
+                            write_reg(builder, &reg_vars, *dst2, boxed);
+                        }
+                    } else {
+                        let v = read_local(builder, &local_vars, *idx2);
+                        if vl.reg_to_i32.contains_key(&dst2.0) {
+                            let raw = type_guards::emit_unbox_int32(builder, v);
+                            write_reg_i32(builder, &reg_vars, vl, *dst2, raw);
+                        } else {
+                            write_reg(builder, &reg_vars, *dst2, v);
+                        }
+                    }
                 }
                 Instruction::Move { dst, src } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
@@ -4946,50 +5467,66 @@ pub fn translate_function_with_constants(
                         write_reg(builder, &reg_vars, *dst, v);
                     }
                 }
-                // --- Raw i32 arithmetic (unboxed, overflow only) ---
+                // --- Raw i32 arithmetic (wrapping if truncated, overflow-checked otherwise) ---
+                // Uses backwards truncation analysis: if ALL consumers of the result
+                // are bitwise ops (or themselves wrapping), overflow checks are eliminated.
                 Instruction::Add { dst, lhs, rhs, .. }
                 | Instruction::AddInt32 { dst, lhs, rhs, .. } => {
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
                     let right = read_reg_i32(builder, &reg_vars, vl, *rhs);
-                    let guarded =
-                        type_guards::emit_raw_i32_arith(builder, ArithOp::Add, left, right);
-                    // On overflow: materialize i32 vars and transfer to guarded path
-                    builder.switch_to_block(guarded.slow_block);
-                    materialize_i32_vars(builder, &reg_vars, vl);
-                    builder.ins().jump(blocks[body_pc], &[]);
-                    builder.switch_to_block(guarded.merge_block);
-                    write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    if vl.wrapping_pcs.contains(&body_pc) {
+                        let result = builder.ins().iadd(left, right);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, result);
+                    } else {
+                        let guarded =
+                            type_guards::emit_raw_i32_arith(builder, ArithOp::Add, left, right);
+                        builder.switch_to_block(guarded.slow_block);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        builder.switch_to_block(guarded.merge_block);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    }
                 }
                 Instruction::Sub { dst, lhs, rhs, .. }
                 | Instruction::SubInt32 { dst, lhs, rhs, .. } => {
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
                     let right = read_reg_i32(builder, &reg_vars, vl, *rhs);
-                    let guarded =
-                        type_guards::emit_raw_i32_arith(builder, ArithOp::Sub, left, right);
-                    builder.switch_to_block(guarded.slow_block);
-                    materialize_i32_vars(builder, &reg_vars, vl);
-                    builder.ins().jump(blocks[body_pc], &[]);
-                    builder.switch_to_block(guarded.merge_block);
-                    write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    if vl.wrapping_pcs.contains(&body_pc) {
+                        let result = builder.ins().isub(left, right);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, result);
+                    } else {
+                        let guarded =
+                            type_guards::emit_raw_i32_arith(builder, ArithOp::Sub, left, right);
+                        builder.switch_to_block(guarded.slow_block);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        builder.switch_to_block(guarded.merge_block);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    }
                 }
                 Instruction::Mul { dst, lhs, rhs, .. }
                 | Instruction::MulInt32 { dst, lhs, rhs, .. } => {
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
                     let right = read_reg_i32(builder, &reg_vars, vl, *rhs);
-                    let guarded =
-                        type_guards::emit_raw_i32_arith(builder, ArithOp::Mul, left, right);
-                    builder.switch_to_block(guarded.slow_block);
-                    materialize_i32_vars(builder, &reg_vars, vl);
-                    builder.ins().jump(blocks[body_pc], &[]);
-                    builder.switch_to_block(guarded.merge_block);
-                    write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    if vl.wrapping_pcs.contains(&body_pc) {
+                        let result = builder.ins().imul(left, right);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, result);
+                    } else {
+                        let guarded =
+                            type_guards::emit_raw_i32_arith(builder, ArithOp::Mul, left, right);
+                        builder.switch_to_block(guarded.slow_block);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        builder.switch_to_block(guarded.merge_block);
+                        write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
+                    }
                 }
                 // --- Inc/Dec (raw i32, overflow only) ---
                 Instruction::Inc { dst, src } => {
                     let val = read_reg_i32(builder, &reg_vars, vl, *src);
                     let guarded = type_guards::emit_raw_i32_inc(builder, val);
                     builder.switch_to_block(guarded.slow_block);
-                    materialize_i32_vars(builder, &reg_vars, vl);
+                    materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                     builder.ins().jump(blocks[body_pc], &[]);
                     builder.switch_to_block(guarded.merge_block);
                     write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
@@ -4998,7 +5535,7 @@ pub fn translate_function_with_constants(
                     let val = read_reg_i32(builder, &reg_vars, vl, *src);
                     let guarded = type_guards::emit_raw_i32_dec(builder, val);
                     builder.switch_to_block(guarded.slow_block);
-                    materialize_i32_vars(builder, &reg_vars, vl);
+                    materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                     builder.ins().jump(blocks[body_pc], &[]);
                     builder.switch_to_block(guarded.merge_block);
                     write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
@@ -5007,8 +5544,11 @@ pub fn translate_function_with_constants(
                 // Produce NaN-boxed booleans; bail if dst is a tracked i32 register.
                 Instruction::Lt { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5019,8 +5559,11 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::Le { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5035,8 +5578,11 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::Gt { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5051,8 +5597,11 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::Ge { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5109,7 +5658,7 @@ pub fn translate_function_with_constants(
                 Instruction::Ushr { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         // Unsigned shift result may exceed signed i32 range
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -5126,8 +5675,14 @@ pub fn translate_function_with_constants(
                 // Uses read_reg_versioned for potentially-tracked operands.
                 Instruction::StrictEq { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if vl.reg_to_i32.contains_key(&lhs.0)
+                        && vl.reg_to_i32.contains_key(&rhs.0)
+                        && can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst)
+                    {
                         continue;
                     }
                     let left = read_reg_versioned(builder, &reg_vars, vl, *lhs);
@@ -5137,8 +5692,14 @@ pub fn translate_function_with_constants(
                 }
                 Instruction::StrictNe { dst, lhs, rhs } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    if vl.reg_to_i32.contains_key(&lhs.0)
+                        && vl.reg_to_i32.contains_key(&rhs.0)
+                        && can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst)
+                    {
                         continue;
                     }
                     let left = read_reg_versioned(builder, &reg_vars, vl, *lhs);
@@ -5149,7 +5710,7 @@ pub fn translate_function_with_constants(
                 // --- Not ---
                 Instruction::Not { dst, src } => {
                     if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
@@ -5170,7 +5731,7 @@ pub fn translate_function_with_constants(
                             .ins()
                             .jump(vl.opt_blocks[target - vl.header_pc], &[]);
                     } else {
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[target], &[]);
                     }
                     continue;
@@ -5192,32 +5753,46 @@ pub fn translate_function_with_constants(
                     } else {
                         exit
                     };
-                    let condition_kind = classify_jump_condition(instructions_ref, body_pc, *cond);
-                    match condition_kind {
-                        JumpConditionKind::Constant(true) => {
-                            builder.ins().jump(jump_block, &[]);
-                        }
-                        JumpConditionKind::Constant(false) => {
-                            builder.ins().jump(ft_block, &[]);
-                        }
-                        JumpConditionKind::BoxedBoolean | JumpConditionKind::Generic => {
-                            let cond_val = read_reg_versioned(builder, &reg_vars, vl, *cond);
-                            let is_truthy =
-                                emit_jump_truthy_value(builder, condition_kind, cond_val);
-                            builder
-                                .ins()
-                                .brif(is_truthy, jump_block, &[], ft_block, &[]);
+                    if let Some(is_truthy) = try_emit_versioned_fused_compare_condition(
+                        builder,
+                        &reg_vars,
+                        vl,
+                        instructions_ref,
+                        body_pc,
+                        *cond,
+                    ) {
+                        builder
+                            .ins()
+                            .brif(is_truthy, jump_block, &[], ft_block, &[]);
+                    } else {
+                        let condition_kind =
+                            classify_jump_condition(instructions_ref, body_pc, *cond);
+                        match condition_kind {
+                            JumpConditionKind::Constant(true) => {
+                                builder.ins().jump(jump_block, &[]);
+                            }
+                            JumpConditionKind::Constant(false) => {
+                                builder.ins().jump(ft_block, &[]);
+                            }
+                            JumpConditionKind::BoxedBoolean | JumpConditionKind::Generic => {
+                                let cond_val = read_reg_versioned(builder, &reg_vars, vl, *cond);
+                                let is_truthy =
+                                    emit_jump_truthy_value(builder, condition_kind, cond_val);
+                                builder
+                                    .ins()
+                                    .brif(is_truthy, jump_block, &[], ft_block, &[]);
+                            }
                         }
                     }
                     // Emit interpose blocks that materialize before leaving the loop
                     if !jump_in_loop {
                         builder.switch_to_block(jump_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[jump_to], &[]);
                     }
                     if !ft_in_loop && fallthrough < instruction_count {
                         builder.switch_to_block(ft_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[fallthrough], &[]);
                     }
                     continue;
@@ -5239,31 +5814,45 @@ pub fn translate_function_with_constants(
                     } else {
                         exit
                     };
-                    let condition_kind = classify_jump_condition(instructions_ref, body_pc, *cond);
-                    match condition_kind {
-                        JumpConditionKind::Constant(true) => {
-                            builder.ins().jump(ft_block, &[]);
-                        }
-                        JumpConditionKind::Constant(false) => {
-                            builder.ins().jump(jump_block, &[]);
-                        }
-                        JumpConditionKind::BoxedBoolean | JumpConditionKind::Generic => {
-                            let cond_val = read_reg_versioned(builder, &reg_vars, vl, *cond);
-                            let is_truthy =
-                                emit_jump_truthy_value(builder, condition_kind, cond_val);
-                            builder
-                                .ins()
-                                .brif(is_truthy, ft_block, &[], jump_block, &[]);
+                    if let Some(is_truthy) = try_emit_versioned_fused_compare_condition(
+                        builder,
+                        &reg_vars,
+                        vl,
+                        instructions_ref,
+                        body_pc,
+                        *cond,
+                    ) {
+                        builder
+                            .ins()
+                            .brif(is_truthy, ft_block, &[], jump_block, &[]);
+                    } else {
+                        let condition_kind =
+                            classify_jump_condition(instructions_ref, body_pc, *cond);
+                        match condition_kind {
+                            JumpConditionKind::Constant(true) => {
+                                builder.ins().jump(ft_block, &[]);
+                            }
+                            JumpConditionKind::Constant(false) => {
+                                builder.ins().jump(jump_block, &[]);
+                            }
+                            JumpConditionKind::BoxedBoolean | JumpConditionKind::Generic => {
+                                let cond_val = read_reg_versioned(builder, &reg_vars, vl, *cond);
+                                let is_truthy =
+                                    emit_jump_truthy_value(builder, condition_kind, cond_val);
+                                builder
+                                    .ins()
+                                    .brif(is_truthy, ft_block, &[], jump_block, &[]);
+                            }
                         }
                     }
                     if !jump_in_loop {
                         builder.switch_to_block(jump_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[jump_to], &[]);
                     }
                     if !ft_in_loop && fallthrough < instruction_count {
                         builder.switch_to_block(ft_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[fallthrough], &[]);
                     }
                     continue;
@@ -5292,12 +5881,12 @@ pub fn translate_function_with_constants(
                         .brif(is_nullish, jump_block, &[], ft_block, &[]);
                     if !jump_in_loop {
                         builder.switch_to_block(jump_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[jump_to], &[]);
                     }
                     if !ft_in_loop && fallthrough < instruction_count {
                         builder.switch_to_block(ft_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[fallthrough], &[]);
                     }
                     continue;
@@ -5326,12 +5915,12 @@ pub fn translate_function_with_constants(
                         .brif(is_nullish, ft_block, &[], jump_block, &[]);
                     if !jump_in_loop {
                         builder.switch_to_block(jump_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[jump_to], &[]);
                     }
                     if !ft_in_loop && fallthrough < instruction_count {
                         builder.switch_to_block(ft_block);
-                        materialize_i32_vars(builder, &reg_vars, vl);
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[fallthrough], &[]);
                     }
                     continue;
@@ -5347,10 +5936,20 @@ pub fn translate_function_with_constants(
                     builder.ins().return_(&[undef]);
                     continue;
                 }
+                // --- CloseUpvalue: no-op if not captured, bail otherwise ---
+                Instruction::CloseUpvalue { local_idx } => {
+                    if captured_locals.contains(&local_idx.index()) {
+                        // Actually captured — bail to guarded path for real close
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                    // Not captured — treat as no-op in the versioned path
+                }
                 Instruction::Nop => {}
                 // --- Anything else: materialize and transfer to guarded version ---
                 _ => {
-                    materialize_i32_vars(builder, &reg_vars, vl);
+                    materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                     builder.ins().jump(blocks[body_pc], &[]);
                     continue;
                 }
@@ -5365,7 +5964,7 @@ pub fn translate_function_with_constants(
                 // is a Jump instruction, but handle gracefully
                 let post_pc = vl.back_edge_pc + 1;
                 if post_pc < instruction_count {
-                    materialize_i32_vars(builder, &reg_vars, vl);
+                    materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                     builder.ins().jump(blocks[post_pc], &[]);
                 } else {
                     let undef = builder.ins().iconst(types::I64, type_guards::TAG_UNDEFINED);
@@ -5788,6 +6387,50 @@ mod tests {
     }
 
     #[test]
+    fn versioned_compare_branch_fusion_allows_dead_boolean_temp() {
+        let instructions = vec![
+            Instruction::StrictEq {
+                dst: Register(3),
+                lhs: Register(1),
+                rhs: Register(2),
+            },
+            Instruction::JumpIfFalse {
+                cond: Register(3),
+                offset: JumpOffset(1),
+            },
+            Instruction::ReturnUndefined,
+        ];
+
+        assert!(can_fuse_versioned_compare_branch(
+            &instructions,
+            0,
+            Register(3)
+        ));
+    }
+
+    #[test]
+    fn versioned_compare_branch_fusion_rejects_live_boolean_temp() {
+        let instructions = vec![
+            Instruction::StrictEq {
+                dst: Register(3),
+                lhs: Register(1),
+                rhs: Register(2),
+            },
+            Instruction::JumpIfFalse {
+                cond: Register(3),
+                offset: JumpOffset(2),
+            },
+            Instruction::Return { src: Register(3) },
+        ];
+
+        assert!(!can_fuse_versioned_compare_branch(
+            &instructions,
+            0,
+            Register(3)
+        ));
+    }
+
+    #[test]
     fn real_compiled_nested_closure_shape_exposes_inline_snapshot_gap() {
         let module = Compiler::new()
             .compile(
@@ -5993,5 +6636,158 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(12, 38, false), (53, 87, false), (47, 93, false)]
         );
+    }
+
+    #[test]
+    fn backwards_truncation_direct_bitor() {
+        use otter_vm_bytecode::operand::Register;
+        // (x + y) | 0 — Add consumed by BitOr → wrapping
+        let instructions = vec![
+            Instruction::Add {
+                dst: Register(0),
+                lhs: Register(1),
+                rhs: Register(2),
+                feedback_index: 0,
+            },
+            Instruction::LoadInt32 {
+                dst: Register(3),
+                value: 0,
+            },
+            Instruction::BitOr {
+                dst: Register(4),
+                lhs: Register(0),
+                rhs: Register(3),
+            },
+        ];
+        let wrapping = build_wrapping_set(&instructions, 0, 2);
+        assert!(wrapping.contains(&0), "Add consumed by BitOr should be wrapping");
+    }
+
+    #[test]
+    fn backwards_truncation_chain() {
+        use otter_vm_bytecode::operand::Register;
+        // (x * 3 + 1) | 0 — Mul→Add→BitOr chain, both Mul and Add should be wrapping
+        let instructions = vec![
+            // PC 0: Mul r0 = r1 * r2
+            Instruction::Mul {
+                dst: Register(0),
+                lhs: Register(1),
+                rhs: Register(2),
+                feedback_index: 0,
+            },
+            // PC 1: Add r0 = r0 + r3
+            Instruction::Add {
+                dst: Register(0),
+                lhs: Register(0),
+                rhs: Register(3),
+                feedback_index: 1,
+            },
+            // PC 2: LoadInt32 r4 = 0
+            Instruction::LoadInt32 {
+                dst: Register(4),
+                value: 0,
+            },
+            // PC 3: BitOr r5 = r0 | r4
+            Instruction::BitOr {
+                dst: Register(5),
+                lhs: Register(0),
+                rhs: Register(4),
+            },
+        ];
+        let wrapping = build_wrapping_set(&instructions, 0, 3);
+        assert!(wrapping.contains(&1), "Add consumed by BitOr should be wrapping");
+        assert!(wrapping.contains(&0), "Mul consumed by wrapping Add should be wrapping");
+    }
+
+    #[test]
+    fn backwards_truncation_non_bitwise_consumer() {
+        use otter_vm_bytecode::operand::Register;
+        // x + y consumed by Lt (comparison) → NOT wrapping
+        let instructions = vec![
+            Instruction::Add {
+                dst: Register(0),
+                lhs: Register(1),
+                rhs: Register(2),
+                feedback_index: 0,
+            },
+            Instruction::Lt {
+                dst: Register(3),
+                lhs: Register(0),
+                rhs: Register(4),
+            },
+        ];
+        let wrapping = build_wrapping_set(&instructions, 0, 1);
+        assert!(!wrapping.contains(&0), "Add consumed by Lt should NOT be wrapping");
+    }
+
+    #[test]
+    fn backwards_truncation_mixed_consumers() {
+        use otter_vm_bytecode::operand::Register;
+        // x + y consumed by BOTH BitOr AND Lt → NOT wrapping (not ALL consumers are bitwise)
+        let instructions = vec![
+            Instruction::Add {
+                dst: Register(0),
+                lhs: Register(1),
+                rhs: Register(2),
+                feedback_index: 0,
+            },
+            Instruction::BitOr {
+                dst: Register(3),
+                lhs: Register(0),
+                rhs: Register(4),
+            },
+            Instruction::Lt {
+                dst: Register(5),
+                lhs: Register(0),
+                rhs: Register(6),
+            },
+        ];
+        let wrapping = build_wrapping_set(&instructions, 0, 2);
+        assert!(!wrapping.contains(&0), "Add with mixed consumers should NOT be wrapping");
+    }
+
+    #[test]
+    fn math_phase_bytecode_shows_local_access_pattern() {
+        let module = Compiler::new()
+            .compile(
+                r#"
+                function mathPhase() {
+                    let acc = 0;
+                    const iterations = 100;
+                    for (let i = 0; i < iterations; i++) {
+                        acc = (acc + i) | 0;
+                        acc ^= (acc << 1);
+                        if ((acc & 1) === 0) {
+                            acc = (acc * 3 + 1) | 0;
+                        }
+                    }
+                    return acc;
+                }
+                mathPhase();
+                "#,
+                "math-phase-locals.js",
+                false,
+            )
+            .expect("source should compile");
+
+        let math = module
+            .functions
+            .iter()
+            .find(|func| func.name.as_deref() == Some("mathPhase"))
+            .expect("mathPhase should exist");
+
+        let instructions = math.instructions.read();
+        // Dump bytecode for diagnostic
+        for (i, instr) in instructions.iter().enumerate() {
+            eprintln!("{:04}: {:?}", i, instr);
+        }
+        // Verify the loop exists and has some form of local access
+        let has_get_local = instructions.iter().any(|i| matches!(i, Instruction::GetLocal { .. }));
+        let has_get_local2 = instructions.iter().any(|i| matches!(i, Instruction::GetLocal2 { .. }));
+        let has_set_local = instructions.iter().any(|i| matches!(i, Instruction::SetLocal { .. }));
+        eprintln!("GetLocal: {}, GetLocal2: {}, SetLocal: {}", has_get_local, has_get_local2, has_set_local);
+        // At least one form of local access should exist
+        assert!(has_get_local || has_get_local2 || has_set_local,
+            "math loop should have local variable access");
     }
 }

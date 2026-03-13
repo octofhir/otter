@@ -177,6 +177,20 @@ impl TypeFlags {
             && !self.seen_function
     }
 
+    /// Check if only numeric types (int32 and/or number) have been seen.
+    /// Suitable for loop versioning where int32 is the fast path and
+    /// occasional float64 overflow is handled by guards.
+    #[inline]
+    pub fn is_numeric_with_int32(&self) -> bool {
+        self.seen_int32
+            && !self.seen_undefined
+            && !self.seen_null
+            && !self.seen_boolean
+            && !self.seen_string
+            && !self.seen_object
+            && !self.seen_function
+    }
+
     /// Check if only number (f64) has been seen
     #[inline]
     pub fn is_number_only(&self) -> bool {

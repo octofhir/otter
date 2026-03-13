@@ -415,11 +415,13 @@ impl ModuleLoader {
         // Resolver for ESM imports
         let esm_options = ResolveOptions {
             extensions: vec![
-                ".js".to_string(),
-                ".mjs".to_string(),
-                ".cjs".to_string(),
                 ".ts".to_string(),
+                ".tsx".to_string(),
+                ".js".to_string(),
+                ".jsx".to_string(),
+                ".mjs".to_string(),
                 ".mts".to_string(),
+                ".cjs".to_string(),
                 ".cts".to_string(),
                 ".json".to_string(),
             ],
@@ -511,33 +513,15 @@ impl ModuleLoader {
             for export_record in exports {
                 match export_record {
                     otter_vm_bytecode::module::ExportRecord::Named { local: _, exported } => {
-                        // First check captured exports (for ESM)
                         if let Some(val) = captured.and_then(|c| c.get(&exported)) {
-                            println!(
-                                "  Captured named export (from context): {} = {:?}",
-                                exported, val
-                            );
                             guard.namespace.set(&exported, *val);
                         } else if let Some(val) = global.get(&exported.as_str().into()) {
-                            println!(
-                                "  Captured named export (from global): {} = {:?}",
-                                exported, val
-                            );
                             guard.namespace.set(&exported, val);
-                        } else {
-                            // Fallback: try to see if it's in the realm's global
-                            if let Some(val) = ctx
-                                .realm_global(ctx.realm_id())
-                                .and_then(|g| g.get(&exported.as_str().into()))
-                            {
-                                println!(
-                                    "  Captured named export (from realm global): {} = {:?}",
-                                    exported, val
-                                );
-                                guard.namespace.set(&exported, val);
-                            } else {
-                                println!("  FAILED to capture named export: {}", exported);
-                            }
+                        } else if let Some(val) = ctx
+                            .realm_global(ctx.realm_id())
+                            .and_then(|g| g.get(&exported.as_str().into()))
+                        {
+                            guard.namespace.set(&exported, val);
                         }
                     }
                     otter_vm_bytecode::module::ExportRecord::Default { local: _ } => {
@@ -697,16 +681,25 @@ impl ModuleLoader {
 
         match resolver.resolve(referrer_dir, specifier) {
             Ok(resolution) => {
-                let normalized = self.normalize_url_key(&resolution.path().to_string_lossy());
+                let resolved_path = resolution.path();
+                let normalized = self.normalize_url_key(&resolved_path.to_string_lossy());
                 let module_type = if normalized.ends_with(".mjs") || normalized.ends_with(".mts") {
                     ModuleType::ESM
                 } else if normalized.ends_with(".cjs") || normalized.ends_with(".cts") {
                     ModuleType::CommonJS
                 } else {
-                    // .js/.ts/.json: use import context to determine type
-                    match context {
-                        ImportContext::ESM => ModuleType::ESM,
-                        ImportContext::CJS => ModuleType::CommonJS,
+                    // .js/.ts/.tsx/.jsx/.json: consult package.json "type" field
+                    match find_package_type(resolved_path) {
+                        Some(ref t) if t == "module" => ModuleType::ESM,
+                        Some(ref t) if t == "commonjs" => ModuleType::CommonJS,
+                        Some(_) => ModuleType::ESM, // unknown type value, default ESM
+                        None => {
+                            // No package.json found — fall back to import context
+                            match context {
+                                ImportContext::ESM => ModuleType::ESM,
+                                ImportContext::CJS => ModuleType::CommonJS,
+                            }
+                        }
                     }
                 };
                 Ok(ModuleResolution {

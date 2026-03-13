@@ -1260,10 +1260,13 @@ impl Otter {
         // Set top-level `this` to global object
         ctx.set_pending_this(Value::object(ctx.global()));
 
-        // Load, link and execute
-        let is_module =
-            code.contains("import ") || code.contains("export ") || code.contains("await ");
-        let main_url = if is_module { "main.mjs" } else { "main.js" };
+        // Detect ESM via AST: check for import/export declarations or top-level await.
+        // Uses the oxc parser so strings like 'import foo' don't cause false positives.
+        let main_url = if otter_vm_compiler::has_module_syntax(code) {
+            "main.mjs"
+        } else {
+            "main.js"
+        };
         let bytecode = match self.loader.compile_source(code, main_url, true) {
             Ok(b) => b,
             Err(e) => return Err(OtterError::Compile(e.to_string())),

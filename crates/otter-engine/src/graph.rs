@@ -3,27 +3,11 @@
 //! Provides topological sorting for correct module execution order.
 //! Supports circular dependencies (common in npm packages like zod).
 
-use crate::error::{EngineError, EngineResult};
+use crate::error::EngineResult;
 use crate::loader::{ImportContext, ModuleLoader, ModuleType, ResolvedModule, SourceType};
-use regex::Regex;
+use otter_vm_compiler::scan_dependencies as scan_deps_ast;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-/// Stub: transpile TypeScript to JavaScript
-///
-/// TODO: Implement actual transpilation using swc or oxc
-fn transpile_typescript(source: &str) -> Result<TranspileResult, String> {
-    // For now, just return the source as-is
-    // This is a stub - TypeScript files won't work until this is implemented
-    Ok(TranspileResult {
-        code: source.to_string(),
-    })
-}
-
-/// Result of TypeScript transpilation
-struct TranspileResult {
-    code: String,
-}
 
 /// Import record tracking the relationship between modules
 #[derive(Debug, Clone)]
@@ -200,17 +184,19 @@ impl ModuleGraph {
             if module.url.starts_with("otter:") || module.url.starts_with("node:") {
                 (Vec::new(), Vec::new())
             } else {
-                // Parse dependencies based on module type (ESM or CommonJS)
-                let deps = parse_dependencies(&module.source, module.module_type);
+                // Extract filename from URL for source type detection
+                let filename = module.url.strip_prefix("file://").unwrap_or(&module.url);
+
+                // Parse dependencies using AST-based scanner (oxc parser)
+                let ast_deps = scan_deps_ast(&module.source, filename);
+
+                let deps: Vec<String> = ast_deps.iter().map(|d| d.specifier.clone()).collect();
 
                 // Create import records with proper context
-                let records: Vec<ImportRecord> = deps
+                let records: Vec<ImportRecord> = ast_deps
                     .iter()
-                    .map(|spec| {
-                        let is_require = module.module_type.is_commonjs();
-
-                        // Resolve the dependency to determine its module type
-                        let context = if is_require {
+                    .map(|dep| {
+                        let context = if dep.is_require {
                             ImportContext::CJS
                         } else {
                             ImportContext::ESM
@@ -218,15 +204,13 @@ impl ModuleGraph {
 
                         let resolved = self
                             .loader
-                            .resolve_with_context(spec, Some(&module.url), context)
+                            .resolve_with_context(&dep.specifier, Some(&module.url), context)
                             .ok();
 
-                        // Determine wrapping flags based on importer and imported module types
-                        // We'll update these after loading the dependency
-                        let mut record = if is_require {
-                            ImportRecord::cjs_require(spec.clone())
+                        let mut record = if dep.is_require {
+                            ImportRecord::cjs_require(dep.specifier.clone())
                         } else {
-                            ImportRecord::esm_import(spec.clone())
+                            ImportRecord::esm_import(dep.specifier.clone())
                         };
 
                         if let Some(url) = resolved {
@@ -240,19 +224,13 @@ impl ModuleGraph {
                 (deps, records)
             };
 
-        // Compile TypeScript or wrap JSON (do this before recursing to have source ready)
+        // TypeScript is handled by the compiler (oxc TransformOptions) during compile_ext.
+        // Only JSON needs wrapping here for the bundler.
         let compiled = match module.source_type {
-            SourceType::TypeScript => {
-                let result = transpile_typescript(&module.source).map_err(|e| {
-                    EngineError::ModuleError(format!("Failed to transpile '{}': {}", module.url, e))
-                })?;
-                Some(result.code)
-            }
             SourceType::Json => {
-                // Wrap JSON in module.exports = ...
                 Some(format!("module.exports = {};", module.source))
             }
-            SourceType::JavaScript => None,
+            _ => None,
         };
 
         // Add to graph BEFORE loading dependencies to handle circular deps
@@ -410,81 +388,30 @@ impl ModuleGraph {
     }
 }
 
-/// Parse import statements from source (ESM)
+/// Parse import/export specifiers from source using AST-based scanning.
 ///
-/// Extracts both static and dynamic imports.
+/// Uses the oxc parser for correct handling of comments, string literals,
+/// and complex multi-line statements. Replaces the old regex-based parser.
 pub fn parse_imports(source: &str) -> Vec<String> {
-    let mut imports = Vec::new();
-
-    // Static imports: import ... from '...'
-    // Handles: import foo from 'x', import { foo } from 'x', import * as foo from 'x'
-    // Note: [\s\S]*? matches any character INCLUDING newlines for multi-line imports
-    let import_re =
-        Regex::new(r#"(?m)^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]"#).unwrap();
-
-    // Dynamic imports: import('...')
-    let dynamic_re = Regex::new(r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
-
-    // Export from: export ... from '...'
-    // Note: [\s\S]*? matches any character INCLUDING newlines for multi-line exports
-    let export_re = Regex::new(r#"(?m)^\s*export\s+[\s\S]*?\s+from\s+['"]([^'"]+)['"]"#).unwrap();
-
-    for cap in import_re.captures_iter(source) {
-        let specifier = cap[1].to_string();
-        if !imports.contains(&specifier) {
-            imports.push(specifier);
-        }
-    }
-
-    for cap in dynamic_re.captures_iter(source) {
-        let specifier = cap[1].to_string();
-        if !imports.contains(&specifier) {
-            imports.push(specifier);
-        }
-    }
-
-    for cap in export_re.captures_iter(source) {
-        let specifier = cap[1].to_string();
-        if !imports.contains(&specifier) {
-            imports.push(specifier);
-        }
-    }
-
-    imports
+    otter_vm_compiler::scan_specifiers(source, "input.js")
 }
 
-/// Parse require statements from source (CommonJS)
-///
-/// Extracts static require() calls.
+/// Parse require() specifiers from CommonJS source using AST-based scanning.
 pub fn parse_requires(source: &str) -> Vec<String> {
-    let mut requires = Vec::new();
-
-    // require('...') or require("...")
-    // Matches: require('module'), require("module")
-    // Does NOT match: require(variable), require(`template`)
-    let require_re = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
-
-    for cap in require_re.captures_iter(source) {
-        let specifier = cap[1].to_string();
-        if !requires.contains(&specifier) {
-            requires.push(specifier);
-        }
-    }
-
-    requires
+    otter_vm_compiler::scan_dependencies(source, "input.cjs")
+        .into_iter()
+        .filter(|d| d.is_require)
+        .map(|d| d.specifier)
+        .collect()
 }
 
-/// Parse dependencies from source based on module type
-///
-/// For ESM modules, uses regex-based parser.
-/// For CommonJS modules, parses require() calls with regex.
-///
-/// TODO: Use AST-based parsing for better accuracy
+/// Parse dependencies from source based on module type using AST-based scanning.
 pub fn parse_dependencies(source: &str, module_type: ModuleType) -> Vec<String> {
-    match module_type {
-        ModuleType::ESM => parse_imports(source),
-        ModuleType::CommonJS => parse_requires(source),
-    }
+    let filename = match module_type {
+        ModuleType::ESM => "input.mjs",
+        ModuleType::CommonJS => "input.cjs",
+    };
+    otter_vm_compiler::scan_specifiers(source, filename)
 }
 
 #[cfg(test)]

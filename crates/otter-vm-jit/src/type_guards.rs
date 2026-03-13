@@ -1717,30 +1717,23 @@ pub(crate) fn emit_raw_i32_arith(
     lhs: Value,
     rhs: Value,
 ) -> GuardedResult {
-    let box_block = builder.create_block();
+    let ok_block = builder.create_block();
     let slow_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I32);
 
-    // Sign-extend to i64 for overflow detection
-    let l64 = builder.ins().sextend(types::I64, lhs);
-    let r64 = builder.ins().sextend(types::I64, rhs);
-
-    let result_i64 = match op {
-        ArithOp::Add => builder.ins().iadd(l64, r64),
-        ArithOp::Sub => builder.ins().isub(l64, r64),
-        ArithOp::Mul => builder.ins().imul(l64, r64),
+    // Use native overflow-checked ops: (result, overflow_flag)
+    let (result_i32, overflow) = match op {
+        ArithOp::Add => builder.ins().sadd_overflow(lhs, rhs),
+        ArithOp::Sub => builder.ins().ssub_overflow(lhs, rhs),
+        ArithOp::Mul => builder.ins().smul_overflow(lhs, rhs),
     };
 
-    // Overflow check: truncate to i32, sign-extend back, compare
-    let result_i32 = builder.ins().ireduce(types::I32, result_i64);
-    let check = builder.ins().sextend(types::I64, result_i32);
-    let no_overflow = builder.ins().icmp(IntCC::Equal, result_i64, check);
     builder
         .ins()
-        .brif(no_overflow, box_block, &[], slow_block, &[]);
+        .brif(overflow, slow_block, &[], ok_block, &[]);
 
-    builder.switch_to_block(box_block);
+    builder.switch_to_block(ok_block);
     builder
         .ins()
         .jump(merge_block, &[BlockArg::Value(result_i32)]);

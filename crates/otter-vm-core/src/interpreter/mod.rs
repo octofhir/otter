@@ -60,8 +60,6 @@ pub(crate) enum PreferredType {
 
 mod jit;
 use jit::BackEdgeOsrOutcome;
-const JIT_LOOP_EAGER_CANDIDATE_BUDGET: usize = 8;
-
 fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
     match instruction {
         Instruction::IteratorNext { dst, done, .. } => vec![dst.0, done.0],
@@ -237,8 +235,6 @@ impl Interpreter {
         let entry_func = module
             .entry_function()
             .ok_or_else(|| VmError::internal("no entry function"))?;
-        self.precompile_module_jit_candidates(&module);
-
         // Record the function call for hot function detection
         let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
         if became_hot {
@@ -351,8 +347,6 @@ impl Interpreter {
             Some(f) => f,
             None => return VmExecutionResult::Error(VmError::internal("no entry function")),
         };
-        self.precompile_module_jit_candidates(&module);
-
         // Record the function call for hot function detection
         let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
         if became_hot {

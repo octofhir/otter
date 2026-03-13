@@ -491,10 +491,23 @@ fn register_read_later_anywhere(
     after_pc_exclusive: usize,
     reg: Register,
 ) -> bool {
-    instructions
-        .iter()
-        .skip(after_pc_exclusive.saturating_add(1))
-        .any(|instruction| instruction_reads_register(instruction, reg))
+    // Scan forward from after_pc_exclusive+1, but stop at the first
+    // instruction that REDEFINES the register (since any later reads
+    // refer to the new definition, not the old one).
+    for instruction in instructions.iter().skip(after_pc_exclusive.saturating_add(1)) {
+        if instruction_reads_register(instruction, reg) {
+            return true;
+        }
+        // If this instruction defines (writes) the register, later
+        // reads are of the new value — the old value is dead.
+        let redefines = versioned_dst_registers(instruction)
+            .iter()
+            .any(|d| *d == Some(reg.0));
+        if redefines {
+            return false;
+        }
+    }
+    false
 }
 
 #[inline]
@@ -5541,14 +5554,19 @@ pub fn translate_function_with_constants(
                     write_reg_i32(builder, &reg_vars, vl, *dst, guarded.result);
                 }
                 // --- Raw i32 comparisons ---
-                // Produce NaN-boxed booleans; bail if dst is a tracked i32 register.
+                // Produce NaN-boxed booleans; bail if dst is a tracked i32 register
+                // (unless the compare is fused into the subsequent branch).
                 Instruction::Lt { dst, lhs, rhs } => {
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
+                        // Fused into subsequent JumpIfTrue/JumpIfFalse — emit fall-through.
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
-                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5558,12 +5576,15 @@ pub fn translate_function_with_constants(
                     write_reg(builder, &reg_vars, *dst, out);
                 }
                 Instruction::Le { dst, lhs, rhs } => {
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
-                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5577,12 +5598,15 @@ pub fn translate_function_with_constants(
                     write_reg(builder, &reg_vars, *dst, out);
                 }
                 Instruction::Gt { dst, lhs, rhs } => {
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
-                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5596,12 +5620,15 @@ pub fn translate_function_with_constants(
                     write_reg(builder, &reg_vars, *dst, out);
                 }
                 Instruction::Ge { dst, lhs, rhs } => {
+                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
                     if vl.reg_to_i32.contains_key(&dst.0) {
                         materialize_all_i32(builder, &reg_vars, &local_vars, vl);
                         builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
-                    if can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst) {
                         continue;
                     }
                     let left = read_reg_i32(builder, &reg_vars, vl, *lhs);
@@ -5674,15 +5701,20 @@ pub fn translate_function_with_constants(
                 // Produce NaN-boxed boolean; bail if dst is tracked.
                 // Uses read_reg_versioned for potentially-tracked operands.
                 Instruction::StrictEq { dst, lhs, rhs } => {
-                    if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
-                        builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
+                    // Check fusion FIRST — if the result only feeds a branch,
+                    // we don't need to materialize even if dst is a tracked i32.
                     if vl.reg_to_i32.contains_key(&lhs.0)
                         && vl.reg_to_i32.contains_key(&rhs.0)
                         && can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst)
                     {
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
+                    if vl.reg_to_i32.contains_key(&dst.0) {
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
                     let left = read_reg_versioned(builder, &reg_vars, vl, *lhs);
@@ -5691,15 +5723,19 @@ pub fn translate_function_with_constants(
                     write_reg(builder, &reg_vars, *dst, out);
                 }
                 Instruction::StrictNe { dst, lhs, rhs } => {
-                    if vl.reg_to_i32.contains_key(&dst.0) {
-                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
-                        builder.ins().jump(blocks[body_pc], &[]);
-                        continue;
-                    }
+                    // Check fusion FIRST (same as StrictEq).
                     if vl.reg_to_i32.contains_key(&lhs.0)
                         && vl.reg_to_i32.contains_key(&rhs.0)
                         && can_fuse_versioned_compare_branch(instructions_ref, body_pc, *dst)
                     {
+                        if body_idx + 1 < body_len {
+                            builder.ins().jump(vl.opt_blocks[body_idx + 1], &[]);
+                        }
+                        continue;
+                    }
+                    if vl.reg_to_i32.contains_key(&dst.0) {
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
                         continue;
                     }
                     let left = read_reg_versioned(builder, &reg_vars, vl, *lhs);

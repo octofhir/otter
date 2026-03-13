@@ -224,7 +224,6 @@ struct JitRuntimeState {
 static JIT_RUNTIME_STATE: OnceLock<Mutex<JitRuntimeState>> = OnceLock::new();
 static JIT_ENABLED: OnceLock<bool> = OnceLock::new();
 static JIT_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
-static JIT_EAGER_ENABLED: OnceLock<bool> = OnceLock::new();
 static JIT_BACKGROUND_ENABLED: OnceLock<bool> = OnceLock::new();
 static JIT_HOT_THRESHOLD: OnceLock<u32> = OnceLock::new();
 static JIT_DEOPT_THRESHOLD: OnceLock<u32> = OnceLock::new();
@@ -511,14 +510,6 @@ fn is_jit_stats_enabled() -> bool {
     })
 }
 
-/// Check whether eager JIT mode is enabled.
-pub fn is_jit_eager_enabled() -> bool {
-    *JIT_EAGER_ENABLED.get_or_init(|| {
-        std::env::var("OTTER_JIT_EAGER")
-            .ok()
-            .is_some_and(|v| parse_env_truthy(&v))
-    })
-}
 
 /// Check whether background JIT compilation is enabled.
 ///

@@ -242,7 +242,7 @@ impl Interpreter {
             func.quicken_instruction(pc, new_instr);
         }
     }
-    #[inline]
+    #[cfg(test)]
     pub(super) fn has_backward_jump(function: &otter_vm_bytecode::Function) -> bool {
         function
             .instructions
@@ -258,23 +258,12 @@ impl Interpreter {
                 _ => false,
             })
     }
-    #[inline]
+    #[cfg(test)]
     pub(super) fn is_static_jit_candidate(function: &otter_vm_bytecode::Function) -> bool {
         !function.flags.is_async
             && !function.flags.has_rest
             && !function.flags.uses_arguments
             && !function.flags.uses_eval
-    }
-    #[inline]
-    pub(super) fn has_feedback_observations(function: &otter_vm_bytecode::Function) -> bool {
-        function.feedback_vector.read().iter().any(|metadata| {
-            metadata.hit_count > 0
-                || metadata.type_observations != TypeFlags::default()
-                || !matches!(
-                    metadata.ic_state,
-                    otter_vm_bytecode::function::InlineCacheState::Uninitialized
-                )
-        })
     }
     /// Handle a backward jump (back-edge) for loop-hot function detection and OSR.
     ///
@@ -418,54 +407,4 @@ impl Interpreter {
         }
     }
 
-    pub(super) fn precompile_module_jit_candidates(&self, module: &Arc<Module>) {
-        if !otter_vm_exec::is_jit_enabled() {
-            return;
-        }
-
-        if otter_vm_exec::is_jit_eager_enabled() {
-            let mut enqueued = 0usize;
-            for idx in 0..module.function_count() {
-                let function_index = idx as u32;
-                if let Some(function) = module.function(function_index)
-                    && otter_vm_exec::enqueue_hot_function(module, function_index, function)
-                {
-                    function.mark_hot();
-                    enqueued += 1;
-                }
-            }
-            for _ in 0..enqueued {
-                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-            }
-            return;
-        }
-
-        let mut enqueued = 0usize;
-        for idx in 0..module.function_count() {
-            if enqueued >= JIT_LOOP_EAGER_CANDIDATE_BUDGET {
-                break;
-            }
-            let function_index = idx as u32;
-            let Some(function) = module.function(function_index) else {
-                continue;
-            };
-            if function.is_hot_function() || function.is_deoptimized() {
-                continue;
-            }
-            if !Self::is_static_jit_candidate(function) || !Self::has_backward_jump(function) {
-                continue;
-            }
-            if !Self::has_feedback_observations(function) {
-                continue;
-            }
-            if otter_vm_exec::enqueue_hot_function(module, function_index, function) {
-                function.mark_hot();
-                enqueued += 1;
-            }
-        }
-
-        for _ in 0..enqueued {
-            otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-        }
-    }
 }

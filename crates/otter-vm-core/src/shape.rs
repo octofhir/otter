@@ -121,7 +121,10 @@ impl Shape {
         }
     }
 
-    /// Create a new root (empty) shape.
+    /// Create a new root (empty) shape with a unique ID.
+    ///
+    /// Used for dictionary mode transitions and other cases that need
+    /// a unique root to invalidate IC entries.
     pub fn root() -> Arc<Self> {
         Arc::new(Self {
             parent: None,
@@ -132,6 +135,27 @@ impl Shape {
             cached_map: RefCell::new(None),
             id: next_shape_id(),
         })
+    }
+
+    /// Get the shared root shape (same Arc for all objects created by NewObject).
+    ///
+    /// V8/JSC-style: all objects created by the same allocation site share
+    /// the same initial hidden class. Transitions from this shared root produce
+    /// shared shapes, making ICs monomorphic for uniform object construction
+    /// (e.g., `{ a: 1, b: 2, c: 3 }` → all objects get the same shape chain).
+    pub fn shared_root() -> Arc<Self> {
+        thread_local! {
+            static SHARED_ROOT: Arc<Shape> = Arc::new(Shape {
+                parent: None,
+                key: None,
+                offset: None,
+                depth: 0,
+                transitions: RefCell::new(FxHashMap::default()),
+                cached_map: RefCell::new(None),
+                id: next_shape_id(),
+            });
+        }
+        SHARED_ROOT.with(|r| r.clone())
     }
 
     /// Find a transition for a given key, or create a new one.

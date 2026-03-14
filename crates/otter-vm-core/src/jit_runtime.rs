@@ -252,6 +252,7 @@ pub(crate) fn try_execute_jit(
         },
         deopt_regs_count: reg_count as u32,
         osr_entry_pc,
+        tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;
@@ -347,6 +348,7 @@ pub(crate) fn try_execute_jit_from_raw_args(
         deopt_regs_ptr: std::ptr::null_mut(),
         deopt_regs_count: 0,
         osr_entry_pc: -1,
+        tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;

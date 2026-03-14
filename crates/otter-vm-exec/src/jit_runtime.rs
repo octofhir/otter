@@ -988,6 +988,38 @@ pub fn compile_one_pending_request(helpers: &RuntimeHelpers) {
     compile_request_sync(request, helpers);
 }
 
+/// Compile the next pending JIT request synchronously (blocking).
+///
+/// Unlike `compile_one_pending_request`, this always compiles on the calling
+/// thread — never delegates to the background worker. Used by IC-driven
+/// tier-up recompilation where the interpreter needs the result immediately
+/// for OSR re-entry.
+pub fn compile_one_pending_request_sync(helpers: &RuntimeHelpers) {
+    if !is_jit_enabled() {
+        return;
+    }
+
+    drain_background_results();
+
+    let Some(request) = jit_queue::pop_next_request() else {
+        return;
+    };
+
+    if request.function.is_deoptimized() {
+        jit_queue::mark_request_finished(request.module_id, request.function_index);
+        return;
+    }
+
+    if is_jit_stats_enabled() {
+        let mut state = runtime_state()
+            .lock()
+            .expect("jit runtime mutex should not be poisoned");
+        state.compile_requests = state.compile_requests.saturating_add(1);
+    }
+
+    compile_request_sync(request, helpers);
+}
+
 /// Snapshot runtime JIT counters.
 pub fn stats_snapshot() -> JitRuntimeStats {
     if is_jit_enabled() {

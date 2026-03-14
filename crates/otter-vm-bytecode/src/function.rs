@@ -619,6 +619,13 @@ pub struct Function {
     #[serde(skip)]
     pub back_edge_count: AtomicU32,
 
+    /// IC-driven recompilation flag. Set by JIT helpers when a property access
+    /// IC transitions from Uninitialized to Monomorphic AFTER JIT compilation.
+    /// This indicates the compiled code has stale IC snapshots and would benefit
+    /// from recompilation with the warm IC data.
+    #[serde(skip)]
+    pub ic_recompilation_needed: std::sync::atomic::AtomicBool,
+
     /// For derived constructors: index of an inner function that initializes
     /// instance fields. Called on `this` after `super()` returns.
     pub field_init_func: Option<u32>,
@@ -769,6 +776,23 @@ impl Function {
             && self.jit_entry_ptr() == 0
     }
 
+    /// Request IC-driven recompilation. Called by JIT helpers when an IC
+    /// transitions from Uninitialized to Monomorphic after JIT compilation.
+    /// Clears the JIT entry pointer so the next back-edge triggers recompilation.
+    #[inline]
+    pub fn request_ic_recompilation(&self) {
+        if !self.ic_recompilation_needed.swap(true, Ordering::Release) {
+            // First transition — clear JIT entry to force recompilation
+            self.clear_jit_entry_ptr();
+        }
+    }
+
+    /// Check and clear the IC recompilation flag (consume it).
+    #[inline]
+    pub fn take_ic_recompilation_needed(&self) -> bool {
+        self.ic_recompilation_needed.swap(false, Ordering::Acquire)
+    }
+
     /// Get the current recompilation count
     #[inline]
     pub fn get_recompilation_count(&self) -> u32 {
@@ -870,6 +894,7 @@ impl Clone for Function {
             ),
             jit_entry_ptr: AtomicUsize::new(0),
             back_edge_count: AtomicU32::new(0),
+            ic_recompilation_needed: std::sync::atomic::AtomicBool::new(false),
             field_init_func: self.field_init_func,
         }
     }
@@ -1032,6 +1057,7 @@ impl FunctionBuilder {
             is_deoptimized: std::sync::atomic::AtomicBool::new(false),
             jit_entry_ptr: AtomicUsize::new(0),
             back_edge_count: AtomicU32::new(0),
+            ic_recompilation_needed: std::sync::atomic::AtomicBool::new(false),
             field_init_func: None,
         }
     }

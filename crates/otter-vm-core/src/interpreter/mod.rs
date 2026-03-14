@@ -5719,7 +5719,10 @@ impl Interpreter {
                     })
                     .and_then(|proto_val| proto_val.as_object());
 
-                let obj = GcRef::new(JsObject::new(
+                // Use shared root shape (V8/JSC pattern): all objects created
+                // by NewObject share the same initial shape, making ICs
+                // monomorphic for uniform construction like `{ a: 1, b: 2 }`.
+                let obj = GcRef::new(JsObject::new_with_shared_shape(
                     proto.map(Value::object).unwrap_or_else(Value::null),
                 ));
                 ctx.set_register(dst.0, Value::object(obj));

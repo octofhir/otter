@@ -93,14 +93,20 @@ pub struct JitContext {
     /// `>= 0` = on-stack replacement: load locals/regs from deopt buffers
     /// and jump directly to the loop header at this bytecode PC.
     pub osr_entry_pc: i64,
+    /// Tier-up budget for JIT back-edge recompilation.
+    /// Decremented at each backward jump in JIT-compiled code.
+    /// When it reaches 0, a tier-up check fires: if ICs warmed up since
+    /// compilation, the function bails out for recompilation.
+    pub tier_up_budget: i64,
 }
 
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
     JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
-    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
-    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
+    JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
+    JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 const _: () = {
     assert!(
@@ -146,6 +152,10 @@ const _: () = {
     assert!(
         std::mem::offset_of!(JitContext, osr_entry_pc) as i32 == JIT_CTX_OSR_ENTRY_PC_OFFSET,
         "JitContext::osr_entry_pc offset changed — update JIT_CTX_OSR_ENTRY_PC_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, tier_up_budget) as i32 == JIT_CTX_TIER_UP_BUDGET_OFFSET,
+        "JitContext::tier_up_budget offset changed — update JIT_CTX_TIER_UP_BUDGET_OFFSET in runtime_helpers.rs"
     );
     assert!(
         std::mem::size_of::<UpvalueCell>() as i32 == JIT_UPVALUE_CELL_SIZE,
@@ -256,6 +266,146 @@ pub(crate) extern "C" fn otter_rt_get_prop_mono_impl(
         Some(val) => val.to_jit_bits(),
         None => BAILOUT_SENTINEL,
     }
+}
+
+/// Monomorphic property write — compile-time shape and offset baked in.
+///
+/// Skips JitContext, feedback vector, IC lookup, and proto epoch check.
+/// Returns 0 on success or BAILOUT_SENTINEL on shape mismatch / frozen / accessor.
+///
+/// Signature: `(obj: i64, expected_shape: i64, offset: i64, value: i64) -> i64`
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_set_prop_mono_impl(
+    obj_raw: i64,
+    expected_shape: i64,
+    offset: i64,
+    value_raw: i64,
+) -> i64 {
+    let obj_ref = match extract_js_object_ref(obj_raw as u64) {
+        Some(o) => o,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    if unsafe { obj_ref.shape_id_unchecked() } != expected_shape as u64 {
+        return BAILOUT_SENTINEL;
+    }
+
+    // Reconstruct the Value to write.
+    let value_bits = value_raw as u64;
+    let write_value = if (value_bits & TAG_MASK) == TAG_POINTER {
+        match unsafe { crate::value::Value::from_raw_bits_unchecked(value_bits) } {
+            Some(v) => v,
+            None => return BAILOUT_SENTINEL,
+        }
+    } else {
+        match crate::value::Value::from_jit_bits(value_bits) {
+            Some(v) => v,
+            None => return BAILOUT_SENTINEL,
+        }
+    };
+
+    match obj_ref.set_by_offset(offset as usize, write_value) {
+        Ok(()) => 0,
+        Err(_) => BAILOUT_SENTINEL,
+    }
+}
+
+/// Dense array element read — no IC, no context needed.
+///
+/// Checks: is array, index is non-negative int32, in-bounds, not a hole.
+/// Returns element value or BAILOUT_SENTINEL on miss.
+///
+/// Signature: `(obj: i64, index_value: i64, unused: i64) -> i64`
+///
+/// The third argument is unused (padding to match 3-arg helper signature).
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_get_elem_dense_impl(
+    obj_raw: i64,
+    index_raw: i64,
+    _unused: i64,
+) -> i64 {
+    let obj_ref = match extract_js_object_ref(obj_raw as u64) {
+        Some(o) => o,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    // Check it's an array
+    let flags = obj_ref.flags.borrow();
+    if !flags.is_array {
+        return BAILOUT_SENTINEL;
+    }
+    drop(flags);
+
+    // Extract int32 index from NaN-boxed value
+    let index_bits = index_raw as u64;
+    // TAG_INT32 = 0x7FF8_0001_0000_0000 — int32 values have this prefix
+    if (index_bits & 0xFFFF_FFFF_0000_0000) != TAG_INT32 {
+        return BAILOUT_SENTINEL;
+    }
+    let index = (index_bits & 0x0000_0000_FFFF_FFFF) as i32;
+    if index < 0 {
+        return BAILOUT_SENTINEL;
+    }
+    let idx = index as usize;
+
+    // Direct element access
+    let elements = obj_ref.elements.borrow();
+    match &*elements {
+        crate::object::ElementsKind::Smi(v) => {
+            if idx < v.len() {
+                crate::value::Value::int32(v[idx]).to_jit_bits()
+            } else {
+                BAILOUT_SENTINEL
+            }
+        }
+        crate::object::ElementsKind::Double(v) => {
+            if idx < v.len() {
+                crate::value::Value::number(v[idx]).to_jit_bits()
+            } else {
+                BAILOUT_SENTINEL
+            }
+        }
+        crate::object::ElementsKind::Object(v) => {
+            if idx < v.len() {
+                let val = v[idx];
+                if val.is_hole() {
+                    BAILOUT_SENTINEL
+                } else {
+                    val.to_jit_bits()
+                }
+            } else {
+                BAILOUT_SENTINEL
+            }
+        }
+    }
+}
+
+/// JIT back-edge tier-up check.
+///
+/// Called when the JIT back-edge budget reaches zero. Checks if the function's
+/// IC state has changed since compilation (Uninitialized → Monomorphic transitions).
+/// If recompilation is needed, returns `NeedsRecompilation` bailout sentinel.
+/// Otherwise resets the budget and returns 0 to continue execution.
+///
+/// Signature: `(ctx) -> 0_or_bailout`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_check_tier_up(ctx_raw: i64) -> i64 {
+    let ctx = unsafe { &mut *(ctx_raw as *mut JitContext) };
+
+    // Check if IC recompilation was requested by a helper
+    let func = unsafe { &*ctx.function_ptr };
+    if func
+        .ic_recompilation_needed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // Signal the caller to bail out for recompilation.
+        // The interpreter's try_back_edge_osr will handle the actual recompile.
+        return BAILOUT_SENTINEL;
+    }
+
+    // No recompilation needed — reset the budget and continue
+    ctx.tier_up_budget = otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT;
+    0
 }
 
 #[allow(unsafe_code)]
@@ -432,6 +582,11 @@ extern "C" fn otter_rt_get_prop_const(
                         offset: offset as u32,
                     };
                     ic.proto_epoch = current_epoch;
+                    // IC just warmed up — JIT code compiled with stale snapshot
+                    // should be recompiled to use the mono fast path.
+                    if function.jit_entry_ptr() != 0 {
+                        function.request_ic_recompilation();
+                    }
                 }
                 InlineCacheState::Monomorphic {
                     shape_id: old_shape,
@@ -618,6 +773,11 @@ extern "C" fn otter_rt_set_prop_const(
                     offset: offset as u32,
                 };
                 ic.proto_epoch = current_epoch;
+                // IC just warmed up — JIT code compiled with stale snapshot
+                // should be recompiled to use the mono fast path.
+                if function.jit_entry_ptr() != 0 {
+                    function.request_ic_recompilation();
+                }
             }
             InlineCacheState::Monomorphic {
                 shape_id: old_shape,
@@ -983,7 +1143,7 @@ extern "C" fn otter_rt_new_object(ctx_raw: i64) -> i64 {
                 .and_then(|proto_val| proto_val.as_object())
         });
 
-    let obj = crate::gc::GcRef::new(JsObject::new(
+    let obj = crate::gc::GcRef::new(JsObject::new_with_shared_shape(
         proto
             .map(crate::value::Value::object)
             .unwrap_or_else(crate::value::Value::null),
@@ -4765,7 +4925,55 @@ extern "C" fn otter_rt_call_ffi(
 }
 
 /// Build a `RuntimeHelpers` table with all available helper functions.
+/// Compute JsObject field layout offsets for JIT inline property access.
+///
+/// These offsets are computed empirically because RefCell's internal layout
+/// (borrow flag position relative to data) is not guaranteed by Rust.
+/// The function creates a temporary JsObject and measures pointer differences.
+#[allow(unsafe_code)]
+fn compute_jsobject_layout() -> otter_vm_jit::runtime_helpers::JsObjectLayoutOffsets {
+    // We can't create a full JsObject here (needs StringTable for Shape::root()).
+    // Instead, compute offsets from the struct definition using offset_of! for
+    // the ObjectCell fields, then add the RefCell borrow flag size.
+    //
+    // ObjectCell<T> is a single-field struct wrapping RefCell<T>.
+    // RefCell<T> layout: Cell<BorrowFlag=isize>(8 bytes) + UnsafeCell<T>.
+    // UnsafeCell<T> is #[repr(transparent)] so it has the same layout as T.
+    //
+    // We verify this assumption with a static assertion.
+    const REFCELL_BORROW_FLAG_SIZE: usize = std::mem::size_of::<isize>();
+
+    // Verify RefCell layout assumption: data follows borrow flag at the expected offset.
+    // RefCell<u64>::as_ptr() should return borrow_flag_addr + sizeof(isize).
+    let test_cell = std::cell::RefCell::new(42u64);
+    let cell_base = &test_cell as *const _ as usize;
+    let data_ptr = test_cell.as_ptr() as usize;
+    let measured_borrow_size = data_ptr - cell_base;
+    assert_eq!(
+        measured_borrow_size, REFCELL_BORROW_FLAG_SIZE,
+        "RefCell layout assumption violated: borrow flag is {} bytes, expected {}",
+        measured_borrow_size, REFCELL_BORROW_FLAG_SIZE
+    );
+
+    let inline_slots_field = std::mem::offset_of!(JsObject, inline_slots);
+    let inline_meta_field = std::mem::offset_of!(JsObject, inline_meta);
+
+    // Data is at field_offset + sizeof(ObjectCell wrapper=0) + sizeof(RefCell borrow flag)
+    // ObjectCell is a single-field struct so it adds 0 to the offset.
+    let inline_slots_data = (inline_slots_field + REFCELL_BORROW_FLAG_SIZE) as i32;
+    let inline_meta_data = (inline_meta_field + REFCELL_BORROW_FLAG_SIZE) as i32;
+
+    otter_vm_jit::runtime_helpers::JsObjectLayoutOffsets {
+        inline_slots_data,
+        inline_meta_data,
+    }
+}
+
 pub fn build_runtime_helpers() -> RuntimeHelpers {
+    // Initialize JsObject layout offsets for JIT inline property access.
+    let layout = compute_jsobject_layout();
+    otter_vm_jit::runtime_helpers::set_jsobject_layout(layout);
+
     let mut helpers = RuntimeHelpers::new();
 
     macro_rules! register_helper_1 {
@@ -4926,7 +5134,11 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
         register_helper_2!(HelperKind::GenericBitNot, otter_rt_generic_bitnot);
         register_helper_2!(HelperKind::GenericNot, otter_rt_generic_not);
         register_helper_3!(HelperKind::GetPropMono, otter_rt_get_prop_mono_stub);
+        register_helper_4!(HelperKind::SetPropMono, otter_rt_set_prop_mono_impl);
+        register_helper_3!(HelperKind::GetElemDense, otter_rt_get_elem_dense_impl);
         register_helper_5!(HelperKind::CallFfi, otter_rt_call_ffi);
+
+        register_helper_1!(HelperKind::CheckTierUp, otter_rt_check_tier_up);
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
         register_helper_1!(HelperKind::YieldOp, otter_rt_bailout_stub);
@@ -4986,6 +5198,7 @@ mod tests {
             deopt_regs_ptr: std::ptr::null_mut(),
             deopt_regs_count: 0,
             osr_entry_pc: -1,
+            tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
         };
 
         let result = otter_rt_set_prop_const(

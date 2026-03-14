@@ -329,6 +329,18 @@ impl Interpreter {
         let upvalues = frame.upvalues.clone();
         // frame borrow ends here
 
+        // IC-driven recompilation: if a JIT helper detected IC transitions
+        // (Uninitialized → Monomorphic) after the function was compiled,
+        // it cleared the JIT entry and set the recompilation flag. Recompile
+        // synchronously (not via background worker) so the result is available
+        // for immediate OSR re-entry.
+        if func.take_ic_recompilation_needed() && otter_vm_exec::is_jit_enabled() {
+            otter_vm_exec::enqueue_hot_function(module, func_index, func);
+            otter_vm_exec::compile_one_pending_request_sync(
+                crate::jit_runtime::runtime_helpers(),
+            );
+        }
+
         // Background JIT may have compiled code in the runtime cache while
         // function-local entry pointer is still not populated.
         if !otter_vm_exec::hydrate_jit_entry_ptr(module.module_id, func_index, func) {

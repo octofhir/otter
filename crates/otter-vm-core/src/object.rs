@@ -12,6 +12,7 @@
 use crate::memory::MemoryManager;
 use crate::object_cell::ObjectCell;
 use indexmap::IndexMap;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::gc::GcRef;
@@ -1387,13 +1388,24 @@ impl ElementsKind {
 /// The first `INLINE_PROPERTY_COUNT` properties are stored inline in the object
 /// for faster access. Additional properties overflow to the `properties` Vec.
 /// Both inline and overflow use flat Value slots + SlotMeta for storage.
+/// JsObject uses `#[repr(C)]` to guarantee field layout for JIT inline access.
+/// `shape_tag` at offset 0 allows direct memory loads from JIT-compiled code
+/// without function call overhead.
+#[repr(C)]
 pub struct JsObject {
+    /// Cached shape ID for O(1) inline cache comparison.
+    /// Updated whenever the shape changes. Avoids Arc<Shape> dereference
+    /// on the JIT/IC hot path (just a Cell<u64> load + cmp).
+    /// MUST be the first field — JIT code loads from obj_ptr + 0.
+    shape_tag: Cell<u64>,
     /// Current shape of the object
     shape: ObjectCell<Arc<Shape>>,
-    /// Inline value slots for first N properties
-    inline_slots: ObjectCell<[Value; INLINE_PROPERTY_COUNT]>,
-    /// Inline metadata for first N properties
-    inline_meta: ObjectCell<[SlotMeta; INLINE_PROPERTY_COUNT]>,
+    /// Inline value slots for first N properties.
+    /// `pub(crate)` for `offset_of!` in JIT layout computation.
+    pub(crate) inline_slots: ObjectCell<[Value; INLINE_PROPERTY_COUNT]>,
+    /// Inline metadata for first N properties.
+    /// `pub(crate)` for `offset_of!` in JIT layout computation.
+    pub(crate) inline_meta: ObjectCell<[SlotMeta; INLINE_PROPERTY_COUNT]>,
     /// Overflow value slots (for properties beyond INLINE_PROPERTY_COUNT)
     overflow_slots: ObjectCell<Vec<Value>>,
     /// Overflow metadata (parallel to overflow_slots)
@@ -1459,8 +1471,37 @@ impl JsObject {
     /// Memory accounting is handled by `GcRef::new()` which calls
     /// `MemoryManager::current()` (thread-local) — no per-object Arc needed.
     pub fn new(prototype: Value) -> Self {
+        let shape = Shape::root();
+        let tag = shape.id;
         Self {
-            shape: ObjectCell::new(Shape::root()),
+            shape_tag: Cell::new(tag),
+            shape: ObjectCell::new(shape),
+            inline_slots: ObjectCell::new([Value::undefined(); INLINE_PROPERTY_COUNT]),
+            inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
+            overflow_slots: ObjectCell::new(Vec::new()),
+            overflow_meta: ObjectCell::new(Vec::new()),
+            dictionary_properties: ObjectCell::new(None),
+            prototype: ObjectCell::new(prototype),
+            elements: ObjectCell::new(ElementsKind::new()),
+            flags: ObjectCell::new(ObjectFlags {
+                extensible: true,
+                ..Default::default()
+            }),
+            argument_mapping: ObjectCell::new(None),
+        }
+    }
+
+    /// Create a new object with a shared root shape (V8/JSC pattern).
+    ///
+    /// All objects created via this method share the same initial shape,
+    /// making IC monomorphic for uniform object construction patterns.
+    /// Used by the `NewObject` interpreter instruction (object literals).
+    pub fn new_with_shared_shape(prototype: Value) -> Self {
+        let shape = Shape::shared_root();
+        let tag = shape.id;
+        Self {
+            shape_tag: Cell::new(tag),
+            shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new([Value::undefined(); INLINE_PROPERTY_COUNT]),
             inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
             overflow_slots: ObjectCell::new(Vec::new()),
@@ -1505,6 +1546,7 @@ impl JsObject {
         }
 
         Self {
+            shape_tag: Cell::new(shape.id),
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new(inline_slots),
             inline_meta: ObjectCell::new(inline_meta),
@@ -1548,6 +1590,7 @@ impl JsObject {
         }
 
         Self {
+            shape_tag: Cell::new(shape.id),
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new(inline_slots),
             inline_meta: ObjectCell::new(inline_meta),
@@ -1887,26 +1930,19 @@ impl JsObject {
         borrow.get_offset(key)
     }
 
-    /// Get the raw pointer value of the current shape (for IC comparison).
-    ///
-    /// Returns `Arc::as_ptr()` without cloning the Arc, avoiding the atomic
-    /// reference count increment/decrement overhead. The returned value is
-    /// only valid for pointer comparison (not for dereferencing).
-    /// Get unique shape ID.
+    /// Get unique shape ID from cached tag (O(1), no Arc deref, no borrow).
     #[inline]
     pub(crate) fn shape_id(&self) -> u64 {
-        self.shape.borrow().id
+        self.shape_tag.get()
     }
 
-    /// Get unique shape ID without borrow tracking overhead.
+    /// Get unique shape ID — same as `shape_id()` (Cell::get is already lock-free).
     ///
-    /// # Safety
-    ///
-    /// Caller must guarantee no active mutable borrow of `shape`.
+    /// Kept for API compatibility with callers that previously needed `unsafe`.
     #[inline]
     #[allow(unsafe_code)]
     pub(crate) unsafe fn shape_id_unchecked(&self) -> u64 {
-        unsafe { self.shape.get_unchecked() }.id
+        self.shape_tag.get()
     }
 
     /// Get raw shape pointer... (for pointer comparison only)
@@ -2007,7 +2043,9 @@ impl JsObject {
         *self.dictionary_properties.borrow_mut() = Some(dict);
         // Replace shape with a fresh root — the unique Arc pointer invalidates
         // all IC entries that cached the old shape_id for this object.
-        *self.shape.borrow_mut() = Shape::root();
+        let new_shape = Shape::root();
+        self.shape_tag.set(new_shape.id);
+        *self.shape.borrow_mut() = new_shape;
         flags.is_dictionary = true;
     }
 
@@ -2570,6 +2608,7 @@ impl JsObject {
                 return Err(SetPropertyError::NonExtensible);
             }
 
+            self.shape_tag.set(next_shape.id);
             *shape_write = next_shape;
 
             gc_write_barrier(&value);
@@ -3106,6 +3145,7 @@ impl JsObject {
             return false;
         }
 
+        self.shape_tag.set(next_shape.id);
         *shape_write = next_shape;
 
         Self::write_desc_to_slot(self, offset, &desc);
@@ -3191,6 +3231,7 @@ impl JsObject {
             return;
         }
 
+        self.shape_tag.set(next_shape.id);
         *shape_write = next_shape;
         Self::write_desc_to_slot(self, offset, &desc);
     }
@@ -4281,6 +4322,7 @@ impl JsObject {
             return;
         }
 
+        self.shape_tag.set(next_shape.id);
         *shape_write = next_shape;
 
         if offset < INLINE_PROPERTY_COUNT {
@@ -4542,6 +4584,69 @@ impl PropertyDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jsobject_shape_tag_offset() {
+        // JsObject is #[repr(C)] with shape_tag as first field.
+        // The JIT translator depends on this being at offset 0.
+        assert_eq!(
+            std::mem::offset_of!(JsObject, shape_tag),
+            0,
+            "shape_tag must be at offset 0 for JIT inline access"
+        );
+        // Validate that shape_tag is read correctly after construction
+        let obj = JsObject::new(crate::value::Value::null());
+        let tag = obj.shape_tag.get();
+        assert_ne!(tag, 0, "shape_tag should be non-zero (Shape IDs start at 1)");
+        assert_eq!(tag, obj.shape.borrow().id);
+    }
+
+    #[test]
+    fn test_jsobject_inline_slots_layout() {
+        let _rt = crate::runtime::VmRuntime::new();
+        let obj = JsObject::new(crate::value::Value::null());
+        // Write a known value to inline_slots[0]
+        let test_val = crate::value::Value::int32(42);
+        obj.inline_slots.borrow_mut()[0] = test_val;
+        obj.inline_meta.borrow_mut()[0] = SlotMeta::DEFAULT_DATA;
+
+        // Compute offsets the same way compute_jsobject_layout does
+        let base = &obj as *const _ as usize;
+        let slots_data = unsafe { obj.inline_slots.get_unchecked() as *const _ as usize };
+        let meta_data = unsafe { obj.inline_meta.get_unchecked() as *const _ as usize };
+
+        let slots_offset = (slots_data - base) as i32;
+        let meta_offset = (meta_data - base) as i32;
+
+        // These should match what compute_jsobject_layout computes
+        let expected_slots = (std::mem::offset_of!(JsObject, inline_slots)
+            + std::mem::size_of::<isize>()) as i32;
+        let expected_meta = (std::mem::offset_of!(JsObject, inline_meta)
+            + std::mem::size_of::<isize>()) as i32;
+
+        assert_eq!(
+            slots_offset, expected_slots,
+            "inline_slots data offset mismatch: measured={}, computed={}",
+            slots_offset, expected_slots
+        );
+        assert_eq!(
+            meta_offset, expected_meta,
+            "inline_meta data offset mismatch: measured={}, computed={}",
+            meta_offset, expected_meta
+        );
+
+        // Verify we can read the value at the computed offset
+        let read_val = unsafe {
+            let ptr = base as *const u8;
+            let val_ptr = ptr.add(slots_offset as usize) as *const u64;
+            *val_ptr
+        };
+        assert_eq!(
+            read_val,
+            test_val.to_jit_bits() as u64,
+            "Value at computed offset doesn't match written value"
+        );
+    }
 
     #[test]
     fn test_property_key_string_canonical_index_fast_path() {

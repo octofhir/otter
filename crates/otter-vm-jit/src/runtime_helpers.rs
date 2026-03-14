@@ -219,10 +219,16 @@ pub enum HelperKind {
     GetElemInt = 85,
     /// `(ctx, callee, argc, argv_ptr, ffi_call_info_ptr) -> value` — FFI direct call
     CallFfi = 86,
+    /// `(obj, expected_shape, offset, value) -> 0_or_bailout` — monomorphic property write (no ctx)
+    SetPropMono = 87,
+    /// `(obj, index_value) -> value` — dense array element read (no ctx)
+    GetElemDense = 88,
+    /// `(ctx) -> 0_or_bailout` — JIT back-edge tier-up check (no ctx needed for the check itself)
+    CheckTierUp = 89,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 87;
+pub const HELPER_COUNT: usize = 90;
 
 /// Number of helper telemetry families.
 pub const HELPER_FAMILY_COUNT: usize = 10;
@@ -466,6 +472,55 @@ pub const JIT_CTX_DEOPT_REGS_COUNT_OFFSET: i32 = 128;
 /// Layout: deopt_regs_count:u32(128) pad(132) osr_entry_pc:i64(136)
 pub const JIT_CTX_OSR_ENTRY_PC_OFFSET: i32 = 136;
 
+/// Byte offset of `tier_up_budget` in JitContext (`#[repr(C)]`).
+/// Layout: osr_entry_pc:i64(136) tier_up_budget:i64(144)
+pub const JIT_CTX_TIER_UP_BUDGET_OFFSET: i32 = 144;
+
+/// Default tier-up budget for JIT back-edge recompilation checks.
+/// After this many backward jumps, a tier-up check fires.
+/// Low budget (100) ensures IC warmup is detected quickly. The helper call
+/// (every 100 iterations) costs ~10ns — negligible vs the property access
+/// savings from recompilation.
+pub const JIT_TIER_UP_BUDGET_DEFAULT: i64 = 100;
+
+// ---------------------------------------------------------------------------
+// JsObject layout offsets — JsObject uses #[repr(C)], shape_tag is first field
+// ---------------------------------------------------------------------------
+
+/// Byte offset of `shape_tag: Cell<u64>` within JsObject.
+/// Cell<u64> is `#[repr(transparent)]` so this is just a u64 at offset 0.
+pub const JSOBJECT_SHAPE_TAG_OFFSET: i32 = 0;
+
+/// SlotMeta KIND_DATA constant (lower 2 bits = 0b01).
+pub const SLOTMETA_KIND_DATA: i64 = 0b01;
+
+/// SlotMeta KIND_MASK (lower 2 bits).
+pub const SLOTMETA_KIND_MASK: i64 = 0b11;
+
+/// JsObject layout offsets for inline property access.
+/// Computed once at startup by otter-vm-core, used by the JIT translator
+/// to emit direct memory loads instead of helper function calls.
+#[derive(Debug, Clone, Copy)]
+pub struct JsObjectLayoutOffsets {
+    /// Byte offset from JsObject start to the first Value in inline_slots data.
+    /// Skips through ObjectCell → RefCell borrow flag → actual [Value; 8] data.
+    pub inline_slots_data: i32,
+    /// Byte offset from JsObject start to the first SlotMeta in inline_meta data.
+    pub inline_meta_data: i32,
+}
+
+static JSOBJECT_LAYOUT: std::sync::OnceLock<JsObjectLayoutOffsets> = std::sync::OnceLock::new();
+
+/// Set the JsObject layout offsets (called once at VM startup).
+pub fn set_jsobject_layout(offsets: JsObjectLayoutOffsets) {
+    let _ = JSOBJECT_LAYOUT.set(offsets);
+}
+
+/// Get the JsObject layout offsets (returns None if not yet initialized).
+pub fn jsobject_layout() -> Option<JsObjectLayoutOffsets> {
+    JSOBJECT_LAYOUT.get().copied()
+}
+
 impl HelperKind {
     /// Symbol name used for Cranelift import resolution.
     pub fn symbol_name(self) -> &'static str {
@@ -557,6 +612,9 @@ impl HelperKind {
             Self::CallMono => "otter_rt_call_mono",
             Self::GetElemInt => "otter_rt_get_elem_int",
             Self::CallFfi => "otter_rt_call_ffi",
+            Self::SetPropMono => "otter_rt_set_prop_mono",
+            Self::GetElemDense => "otter_rt_get_elem_dense",
+            Self::CheckTierUp => "otter_rt_check_tier_up",
         }
     }
 
@@ -582,7 +640,9 @@ impl HelperKind {
             | Self::DefineProperty
             | Self::DeleteProp
             | Self::GetPropMono
-            | Self::GetElemInt => 1,
+            | Self::GetElemInt
+            | Self::SetPropMono
+            | Self::GetElemDense => 1,
 
             Self::CallFunction
             | Self::Construct
@@ -643,7 +703,8 @@ impl HelperKind {
             | Self::TryEnd
             | Self::CatchOp
             | Self::YieldOp
-            | Self::AwaitOp => 7,
+            | Self::AwaitOp
+            | Self::CheckTierUp => 7,
 
             Self::DefineGetter
             | Self::DefineSetter
@@ -691,7 +752,10 @@ impl HelperKind {
             | Self::GenericBitOp
             | Self::GenericBitNot
             | Self::GenericNot
-            | Self::RequireCoercible => HelperSafetyClass::LeafNoGc,
+            | Self::RequireCoercible
+            | Self::SetPropMono
+            | Self::GetElemDense
+            | Self::CheckTierUp => HelperSafetyClass::LeafNoGc,
 
             Self::CloseUpvalue | Self::TryStart | Self::TryEnd | Self::CatchOp => {
                 HelperSafetyClass::VmStateOnly
@@ -797,7 +861,8 @@ impl HelperKind {
             | Self::GetSuper
             | Self::CallSuperForward
             | Self::YieldOp
-            | Self::AwaitOp => 1,
+            | Self::AwaitOp
+            | Self::CheckTierUp => 1,
             Self::LoadConst
             | Self::NewArray
             | Self::ThrowValue
@@ -846,7 +911,8 @@ impl HelperKind {
             | Self::SetHomeObject
             | Self::CallSuper
             | Self::GetPropMono
-            | Self::GetElemInt => 3,
+            | Self::GetElemInt
+            | Self::GetElemDense => 3,
             Self::GetPropConst
             | Self::GetProp
             | Self::GetElem
@@ -860,7 +926,8 @@ impl HelperKind {
             | Self::InstanceOf
             | Self::InOp
             | Self::TailCallHelper
-            | Self::DefineClass => 4,
+            | Self::DefineClass
+            | Self::SetPropMono => 4,
             Self::SetPropConst
             | Self::SetProp
             | Self::SetElem

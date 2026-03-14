@@ -23,8 +23,9 @@ use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
     JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
-    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
-    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
+    JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
+    JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
 use otter_vm_bytecode::function::InlineCacheState;
@@ -1661,6 +1662,189 @@ fn lower_guarded_with_bailout(
     guarded.result
 }
 
+/// Emit tier-up budget decrement and check at a backward jump.
+///
+/// Every backward jump (loop back-edge) decrements a budget counter in JitContext.
+/// When the budget reaches zero, calls CheckTierUp helper to see if IC state
+/// changed since compilation. If recompilation needed, bails out; otherwise
+/// resets budget and continues.
+///
+/// This enables single-call multi-loop functions to recompile mid-execution
+/// when inner loops warm up new ICs (V8 Maglev-style tier-up).
+fn emit_tier_up_budget_check(
+    builder: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    tier_up_ref: cranelift_codegen::ir::FuncRef,
+    target_block: cranelift_codegen::ir::Block,
+    bailout_pc: usize,
+) {
+    // Decrement budget: ctx.tier_up_budget -= 1
+    let budget_addr = builder
+        .ins()
+        .iadd_imm(ctx_ptr, JIT_CTX_TIER_UP_BUDGET_OFFSET as i64);
+    let old_budget = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), budget_addr, 0);
+    let new_budget = builder.ins().iadd_imm(old_budget, -1);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_budget, budget_addr, 0);
+
+    // Check if budget expired (new_budget <= 0)
+    let expired = builder
+        .ins()
+        .icmp_imm(IntCC::SignedLessThanOrEqual, new_budget, 0);
+    let tier_up_block = builder.create_block();
+    builder
+        .ins()
+        .brif(expired, tier_up_block, &[], target_block, &[]);
+
+    // Tier-up check: call helper
+    builder.switch_to_block(tier_up_block);
+    let result = builder.ins().call(tier_up_ref, &[ctx_ptr]);
+    let result_val = builder.inst_results(result)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let needs_recompile = builder.ins().icmp(IntCC::Equal, result_val, sentinel);
+    let bail_block = builder.create_block();
+    builder
+        .ins()
+        .brif(needs_recompile, bail_block, &[], target_block, &[]);
+
+    // Bailout: store reason and PC, return BAILOUT_SENTINEL
+    builder.switch_to_block(bail_block);
+    let reason_addr = builder
+        .ins()
+        .iadd_imm(ctx_ptr, JIT_CTX_BAILOUT_REASON_OFFSET as i64);
+    let reason_code = builder
+        .ins()
+        .iconst(types::I64, BailoutReason::HelperReturnedSentinel.code());
+    builder
+        .ins()
+        .store(MemFlags::trusted(), reason_code, reason_addr, 0);
+    let pc_addr = builder
+        .ins()
+        .iadd_imm(ctx_ptr, JIT_CTX_BAILOUT_PC_OFFSET as i64);
+    let pc_val = builder.ins().iconst(types::I64, bailout_pc as i64);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), pc_val, pc_addr, 0);
+    builder.ins().return_(&[sentinel]);
+}
+
+/// Emit inline monomorphic property read (V8/JSC-style shape check + direct load).
+///
+/// For inline properties (offset < INLINE_PROPERTY_COUNT=8), emits:
+/// 1. Extract pointer from NaN-boxed value (band with PAYLOAD_MASK)
+/// 2. Verify TAG_PTR_OBJECT tag
+/// 3. Load shape_tag from obj_ptr + 0, compare with expected
+/// 4. Load SlotMeta, verify data property
+/// 5. Load Value from inline_slots at known offset
+///
+/// On any mismatch, falls back to full GetPropConst helper.
+/// No function call on the monomorphic fast path (~11 instructions vs ~35).
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_prop_read(
+    builder: &mut FunctionBuilder<'_>,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    ctx_ptr: Value,
+    shape_id: u64,
+    offset: u32,
+    name_index: u32,
+    ic_index: u16,
+    layout: &crate::runtime_helpers::JsObjectLayoutOffsets,
+) -> Value {
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    let slow_block = builder.create_block();
+
+    // 1. Tag check: is this a TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder.ins().brif(is_obj, tag_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 2. Extract raw pointer
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+
+    // 3. Shape check: load shape_tag (offset 0) and compare
+    let shape_tag = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+    let expected_shape = builder.ins().iconst(types::I64, shape_id as i64);
+    let shape_match = builder.ins().icmp(IntCC::Equal, shape_tag, expected_shape);
+    let shape_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(shape_match, shape_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(shape_ok);
+
+    // 4. Meta check: load inline_meta[offset], verify it's a data property
+    let meta_byte_offset = layout.inline_meta_data + offset as i32;
+    let meta = builder
+        .ins()
+        .load(types::I8, MemFlags::trusted(), obj_ptr, meta_byte_offset);
+    let meta_i32 = builder.ins().uextend(types::I32, meta);
+    let kind_mask = builder.ins().iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_MASK);
+    let kind = builder.ins().band(meta_i32, kind_mask);
+    let data_kind = builder.ins().iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
+    let is_data = builder.ins().icmp(IntCC::Equal, kind, data_kind);
+    let data_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_data, data_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(data_ok);
+
+    // 5. Load value from inline_slots[offset]
+    let value_byte_offset = layout.inline_slots_data + (offset as i32) * 8;
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, value_byte_offset);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(value)]);
+
+    // Slow path: call full GetPropConst
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    let full_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(full_bail, bail_block, &[], full_ok, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return(builder);
+
+    builder.switch_to_block(full_ok);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(full_result)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
 /// Emit monomorphic property read with fallback to full GetPropConst.
 ///
 /// 1. Call GetPropMono(obj, shape_id, offset) — lightweight, no JitContext
@@ -1709,6 +1893,128 @@ fn emit_mono_prop_with_fallback(
     let full_call = builder
         .ins()
         .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    let full_ok = builder.create_block();
+    builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return(builder);
+
+    builder.switch_to_block(full_ok);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(full_result)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit monomorphic property write with fallback to full SetPropConst.
+///
+/// 1. Call SetPropMono(obj, shape_id, offset, value) — lightweight, no JitContext
+/// 2. If BAILOUT → call full SetPropConst(ctx, obj, name_idx, value, ic_idx)
+/// 3. If still BAILOUT → bail out function
+#[allow(clippy::too_many_arguments)]
+fn emit_mono_set_with_fallback(
+    builder: &mut FunctionBuilder<'_>,
+    mono_ref: cranelift_codegen::ir::FuncRef,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    write_val: Value,
+    ctx_ptr: Value,
+    shape_id: u64,
+    offset: u32,
+    name_index: u32,
+    ic_index: u16,
+) {
+    // Fast path: monomorphic helper
+    let shape_const = builder.ins().iconst(types::I64, shape_id as i64);
+    let offset_const = builder.ins().iconst(types::I64, offset as i64);
+    let mono_call = builder
+        .ins()
+        .call(mono_ref, &[obj_val, shape_const, offset_const, write_val]);
+    let mono_result = builder.inst_results(mono_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let mono_bail = builder.ins().icmp(IntCC::Equal, mono_result, sentinel);
+    let slow_block = builder.create_block();
+    let continue_block = builder.create_block();
+    let mono_ok = builder.create_block();
+    builder.ins().brif(mono_bail, slow_block, &[], mono_ok, &[]);
+
+    // Mono hit → continue
+    builder.switch_to_block(mono_ok);
+    builder.ins().jump(continue_block, &[]);
+
+    // Slow path: full SetPropConst
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    let full_ok = builder.create_block();
+    builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return(builder);
+
+    builder.switch_to_block(full_ok);
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(continue_block);
+}
+
+/// Emit dense array element read with fallback to full GetElem.
+///
+/// 1. Call GetElemDense(obj, index, 0) — lightweight, no JitContext
+/// 2. If BAILOUT → call full GetElem(ctx, obj, index, ic_idx)
+/// 3. If still BAILOUT → bail out function
+/// 4. Merge results from either path
+fn emit_dense_elem_with_fallback(
+    builder: &mut FunctionBuilder<'_>,
+    dense_ref: cranelift_codegen::ir::FuncRef,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    idx_val: Value,
+    ctx_ptr: Value,
+    ic_index: u16,
+) -> Value {
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    // Fast path: dense array helper
+    let zero = builder.ins().iconst(types::I64, 0);
+    let dense_call = builder
+        .ins()
+        .call(dense_ref, &[obj_val, idx_val, zero]);
+    let dense_result = builder.inst_results(dense_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let dense_bail = builder.ins().icmp(IntCC::Equal, dense_result, sentinel);
+    let slow_block = builder.create_block();
+    let dense_ok = builder.create_block();
+    builder.ins().brif(dense_bail, slow_block, &[], dense_ok, &[]);
+
+    // Dense hit → merge
+    builder.switch_to_block(dense_ok);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(dense_result)]);
+
+    // Slow path: full GetElem
+    builder.switch_to_block(slow_block);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, idx_val, ic_idx_val]);
     let full_result = builder.inst_results(full_call)[0];
 
     let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
@@ -3121,19 +3427,32 @@ pub fn translate_function_with_constants(
                     }
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
+                let layout = crate::runtime_helpers::jsobject_layout();
 
                 let result =
-                    if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                    if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                        if (offset as usize) < 8 {
+                            emit_inline_prop_read(
+                                builder, full_ref, obj_val, ctx_ptr,
+                                shape_id, offset, name.index(), *ic_index, &lo,
+                            )
+                        } else if let Some(mono_helper) = mono_ref {
+                            emit_mono_prop_with_fallback(
+                                builder, mono_helper, full_ref, obj_val, ctx_ptr,
+                                shape_id, offset, name.index(), *ic_index,
+                            )
+                        } else {
+                            let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                            let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                            emit_helper_call_with_bailout(
+                                builder, full_ref,
+                                &[ctx_ptr, obj_val, name_idx, ic_idx],
+                            )
+                        }
+                    } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
                         emit_mono_prop_with_fallback(
-                            builder,
-                            mono_helper,
-                            full_ref,
-                            obj_val,
-                            ctx_ptr,
-                            shape_id,
-                            offset,
-                            name.index(),
-                            *ic_index,
+                            builder, mono_helper, full_ref, obj_val, ctx_ptr,
+                            shape_id, offset, name.index(), *ic_index,
                         )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -3172,19 +3491,32 @@ pub fn translate_function_with_constants(
                     }
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
+                let layout = crate::runtime_helpers::jsobject_layout();
 
                 let result =
-                    if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                    if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                        if (offset as usize) < 8 {
+                            emit_inline_prop_read(
+                                builder, full_ref, obj_val, ctx_ptr,
+                                shape_id, offset, name.index(), *ic_index, &lo,
+                            )
+                        } else if let Some(mono_helper) = mono_ref {
+                            emit_mono_prop_with_fallback(
+                                builder, mono_helper, full_ref, obj_val, ctx_ptr,
+                                shape_id, offset, name.index(), *ic_index,
+                            )
+                        } else {
+                            let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                            let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                            emit_helper_call_with_bailout(
+                                builder, full_ref,
+                                &[ctx_ptr, obj_val, name_idx, ic_idx],
+                            )
+                        }
+                    } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
                         emit_mono_prop_with_fallback(
-                            builder,
-                            mono_helper,
-                            full_ref,
-                            obj_val,
-                            ctx_ptr,
-                            shape_id,
-                            offset,
-                            name.index(),
-                            *ic_index,
+                            builder, mono_helper, full_ref, obj_val, ctx_ptr,
+                            shape_id, offset, name.index(), *ic_index,
                         )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -3203,32 +3535,62 @@ pub fn translate_function_with_constants(
                 val,
                 ic_index,
             } => {
-                let helper_ref = helpers
+                let full_ref = helpers
                     .and_then(|h| h.get(HelperKind::SetPropConst))
                     .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_vars, *obj);
-                let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
                 let value = read_reg(builder, &reg_vars, *val);
-                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                let call = builder
-                    .ins()
-                    .call(helper_ref, &[ctx_ptr, obj_val, name_idx, value, ic_idx]);
-                let result = builder.inst_results(call)[0];
 
-                // If helper returns BAILOUT_SENTINEL, bail out the whole function
-                let bail_block = builder.create_block();
-                let continue_block = builder.create_block();
-                let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
-                let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
-                builder
-                    .ins()
-                    .brif(is_bailout, bail_block, &[], continue_block, &[]);
+                // Try monomorphic fast path based on compile-time IC snapshot
+                let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                    if let InlineCacheState::Monomorphic {
+                        shape_id,
+                        offset,
+                        depth: 0,
+                        ..
+                    } = ic
+                    {
+                        Some((*shape_id, *offset))
+                    } else {
+                        None
+                    }
+                });
+                let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
 
-                builder.switch_to_block(bail_block);
-                emit_bailout_return(builder);
+                if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                    emit_mono_set_with_fallback(
+                        builder,
+                        mono_helper,
+                        full_ref,
+                        obj_val,
+                        value,
+                        ctx_ptr,
+                        shape_id,
+                        offset,
+                        name.index(),
+                        *ic_index,
+                    );
+                } else {
+                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    let call = builder
+                        .ins()
+                        .call(full_ref, &[ctx_ptr, obj_val, name_idx, value, ic_idx]);
+                    let result = builder.inst_results(call)[0];
 
-                builder.switch_to_block(continue_block);
-                // SetPropConst doesn't write to a dst register
+                    let bail_block = builder.create_block();
+                    let continue_block = builder.create_block();
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+                    builder
+                        .ins()
+                        .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                    builder.switch_to_block(bail_block);
+                    emit_bailout_return(builder);
+
+                    builder.switch_to_block(continue_block);
+                }
             }
             Instruction::Call {
                 dst,
@@ -4309,50 +4671,30 @@ pub fn translate_function_with_constants(
             } => {
                 let obj_val = read_reg(builder, &reg_vars, *obj);
                 let value = read_reg(builder, &reg_vars, *val);
+                let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
+                if let Some(mono_helper) = mono_ref {
+                    let shape_const = builder.ins().iconst(types::I64, *shape_id as i64);
+                    let offset_const = builder.ins().iconst(types::I64, *offset as i64);
+                    let mono_call = builder
+                        .ins()
+                        .call(mono_helper, &[obj_val, shape_const, offset_const, value]);
+                    let mono_result = builder.inst_results(mono_call)[0];
 
-                let bail_block = builder.create_block();
-                let continue_block = builder.create_block();
-                let is_object = type_guards::emit_is_object(builder, obj_val);
-
-                let shape_check_block = builder.create_block();
-                builder
-                    .ins()
-                    .brif(is_object, shape_check_block, &[], bail_block, &[]);
-
-                builder.switch_to_block(shape_check_block);
-                let obj_ptr = builder.ins().band_imm(obj_val, !type_guards::PTR_MASK);
-                let shape_ptr_addr = builder.ins().iadd_imm(obj_ptr, 16);
-                let current_shape =
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bailout = builder.ins().icmp(IntCC::Equal, mono_result, sentinel);
+                    let bail_block = builder.create_block();
+                    let continue_block = builder.create_block();
                     builder
                         .ins()
-                        .load(types::I64, MemFlags::trusted(), shape_ptr_addr, 0);
-                let expected_shape = builder.ins().iconst(types::I64, *shape_id as i64);
-                let shape_match = builder
-                    .ins()
-                    .icmp(IntCC::Equal, current_shape, expected_shape);
+                        .brif(is_bailout, bail_block, &[], continue_block, &[]);
 
-                let store_block = builder.create_block();
-                builder
-                    .ins()
-                    .brif(shape_match, store_block, &[], bail_block, &[]);
+                    builder.switch_to_block(bail_block);
+                    emit_bailout_return(builder);
 
-                builder.switch_to_block(store_block);
-                let props_ptr_addr = builder.ins().iadd_imm(obj_ptr, 24);
-                let props_ptr =
-                    builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), props_ptr_addr, 0);
-                let val_addr = builder.ins().iadd_imm(props_ptr, (*offset as i64) * 8);
-                builder.ins().store(MemFlags::trusted(), value, val_addr, 0);
-
-                // Note: Object pointers in memory need to trigger GC write barriers!
-                // Since this engine is embedding first, it handles write barriers in the allocator. We rely on standard conservative GC.
-                builder.ins().jump(continue_block, &[]);
-
-                builder.switch_to_block(bail_block);
-                emit_bailout_return(builder);
-
-                builder.switch_to_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    emit_bailout_return(builder);
+                }
             }
             // --- Quickened string/array.length — bail out to interpreter ---
             Instruction::GetPropString { .. } | Instruction::GetArrayLength { .. } => {
@@ -4446,17 +4788,24 @@ pub fn translate_function_with_constants(
                 );
             }
             Instruction::GetElemInt { dst, obj, index } => {
-                let helper_ref = helpers
+                let full_ref = helpers
                     .and_then(|h| h.get(HelperKind::GetElem))
                     .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_vars, *obj);
                 let idx_val = read_reg(builder, &reg_vars, *index);
-                let ic_idx = builder.ins().iconst(types::I64, 0); // GetElemInt has no IC
-                let result = emit_helper_call_with_bailout(
-                    builder,
-                    helper_ref,
-                    &[ctx_ptr, obj_val, idx_val, ic_idx],
-                );
+                let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
+                let result = if let Some(dense_helper) = dense_ref {
+                    emit_dense_elem_with_fallback(
+                        builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, 0,
+                    )
+                } else {
+                    let ic_idx = builder.ins().iconst(types::I64, 0);
+                    emit_helper_call_with_bailout(
+                        builder,
+                        full_ref,
+                        &[ctx_ptr, obj_val, idx_val, ic_idx],
+                    )
+                };
                 write_reg(builder, &reg_vars, *dst, result);
             }
             // --- GetElem / SetElem ---
@@ -4466,17 +4815,24 @@ pub fn translate_function_with_constants(
                 idx,
                 ic_index,
             } => {
-                let helper_ref = helpers
+                let full_ref = helpers
                     .and_then(|h| h.get(HelperKind::GetElem))
                     .ok_or_else(|| unsupported(pc, instruction))?;
                 let obj_val = read_reg(builder, &reg_vars, *arr);
                 let idx_val = read_reg(builder, &reg_vars, *idx);
-                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                let result = emit_helper_call_with_bailout(
-                    builder,
-                    helper_ref,
-                    &[ctx_ptr, obj_val, idx_val, ic_idx],
-                );
+                let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
+                let result = if let Some(dense_helper) = dense_ref {
+                    emit_dense_elem_with_fallback(
+                        builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, *ic_index,
+                    )
+                } else {
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    emit_helper_call_with_bailout(
+                        builder,
+                        full_ref,
+                        &[ctx_ptr, obj_val, idx_val, ic_idx],
+                    )
+                };
                 write_reg(builder, &reg_vars, *dst, result);
             }
             Instruction::SetElem {

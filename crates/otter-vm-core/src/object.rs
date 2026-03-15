@@ -955,6 +955,31 @@ impl Default for ElementsKind {
 }
 
 impl ElementsKind {
+    /// JIT element kind tag for Smi variant
+    pub const JIT_KIND_SMI: u8 = 0;
+    /// JIT element kind tag for Double variant
+    pub const JIT_KIND_DOUBLE: u8 = 1;
+    /// JIT element kind tag for Object (Value) variant
+    pub const JIT_KIND_OBJECT: u8 = 2;
+
+    /// Get the JIT kind tag for this variant
+    pub fn jit_kind(&self) -> u8 {
+        match self {
+            Self::Smi(_) => Self::JIT_KIND_SMI,
+            Self::Double(_) => Self::JIT_KIND_DOUBLE,
+            Self::Object(_) => Self::JIT_KIND_OBJECT,
+        }
+    }
+
+    /// Get the data pointer and length for JIT cache
+    pub fn jit_data_ptr_and_len(&self) -> (usize, u32) {
+        match self {
+            Self::Smi(v) => (v.as_ptr() as usize, v.len() as u32),
+            Self::Double(v) => (v.as_ptr() as usize, v.len() as u32),
+            Self::Object(v) => (v.as_ptr() as usize, v.len() as u32),
+        }
+    }
+
     /// Create a new empty Object elements store
     pub fn new() -> Self {
         Self::default()
@@ -1398,6 +1423,19 @@ pub struct JsObject {
     /// on the JIT/IC hot path (just a Cell<u64> load + cmp).
     /// MUST be the first field — JIT code loads from obj_ptr + 0.
     shape_tag: Cell<u64>,
+    /// JIT-accessible cached pointer to elements data (Vec<T> data ptr).
+    /// Points directly to the Vec's heap allocation. Updated whenever elements
+    /// change (push, pop, set, transition). Null when elements are empty.
+    /// JIT code loads from obj_ptr + 8 for zero-overhead array element access.
+    pub(crate) jit_elements_data: Cell<usize>,
+    /// JIT-accessible cached element count.
+    /// JIT code loads from obj_ptr + 16 for bounds checking.
+    pub(crate) jit_elements_len: Cell<u32>,
+    /// JIT-accessible cached element kind: 0=Smi(i32), 1=Double(f64), 2=Object(Value)
+    /// JIT code loads from obj_ptr + 20 to determine element size and type.
+    pub(crate) jit_elements_kind: Cell<u8>,
+    /// Padding to maintain 8-byte alignment for subsequent fields.
+    _jit_pad: [u8; 3],
     /// Current shape of the object
     shape: ObjectCell<Arc<Shape>>,
     /// Inline value slots for first N properties.
@@ -1475,6 +1513,10 @@ impl JsObject {
         let tag = shape.id;
         Self {
             shape_tag: Cell::new(tag),
+            jit_elements_data: Cell::new(0),
+            jit_elements_len: Cell::new(0),
+            jit_elements_kind: Cell::new(0),
+            _jit_pad: [0; 3],
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new([Value::undefined(); INLINE_PROPERTY_COUNT]),
             inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
@@ -1501,6 +1543,10 @@ impl JsObject {
         let tag = shape.id;
         Self {
             shape_tag: Cell::new(tag),
+            jit_elements_data: Cell::new(0),
+            jit_elements_len: Cell::new(0),
+            jit_elements_kind: Cell::new(0),
+            _jit_pad: [0; 3],
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new([Value::undefined(); INLINE_PROPERTY_COUNT]),
             inline_meta: ObjectCell::new([SlotMeta::EMPTY; INLINE_PROPERTY_COUNT]),
@@ -1547,6 +1593,10 @@ impl JsObject {
 
         Self {
             shape_tag: Cell::new(shape.id),
+            jit_elements_data: Cell::new(0),
+            jit_elements_len: Cell::new(0),
+            jit_elements_kind: Cell::new(0),
+            _jit_pad: [0; 3],
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new(inline_slots),
             inline_meta: ObjectCell::new(inline_meta),
@@ -1591,6 +1641,10 @@ impl JsObject {
 
         Self {
             shape_tag: Cell::new(shape.id),
+            jit_elements_data: Cell::new(0),
+            jit_elements_len: Cell::new(0),
+            jit_elements_kind: Cell::new(0),
+            _jit_pad: [0; 3],
             shape: ObjectCell::new(shape),
             inline_slots: ObjectCell::new(inline_slots),
             inline_meta: ObjectCell::new(inline_meta),
@@ -1934,6 +1988,18 @@ impl JsObject {
     #[inline]
     pub(crate) fn shape_id(&self) -> u64 {
         self.shape_tag.get()
+    }
+
+    /// Sync the JIT elements cache from the current elements state.
+    /// Must be called after any mutation to the elements storage.
+    #[inline]
+    pub fn sync_jit_elements(&self) {
+        let elements = self.elements.borrow();
+        let (ptr, len) = elements.jit_data_ptr_and_len();
+        let kind = elements.jit_kind();
+        self.jit_elements_data.set(ptr);
+        self.jit_elements_len.set(len);
+        self.jit_elements_kind.set(kind);
     }
 
     /// Get unique shape ID — same as `shape_id()` (Cell::get is already lock-free).

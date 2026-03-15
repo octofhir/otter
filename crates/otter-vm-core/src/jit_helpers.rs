@@ -98,12 +98,20 @@ pub struct JitContext {
     /// When it reaches 0, a tier-up check fires: if ICs warmed up since
     /// compilation, the function bails out for recompilation.
     pub tier_up_budget: i64,
+    /// Pointer to JIT IC probe table (flat `[JitIcProbe]` array).
+    /// JIT code reads from this at runtime for IC sites that were Uninitialized
+    /// at compile time. Helpers update these probes as ICs warm up.
+    /// Null if no probe table is initialized.
+    pub ic_probes_ptr: *const otter_vm_bytecode::function::JitIcProbe,
+    /// Number of entries in the IC probe table.
+    pub ic_probes_count: u32,
 }
 
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
-    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
+    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
+    JIT_CTX_IC_PROBES_COUNT_OFFSET, JIT_CTX_IC_PROBES_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
     JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
     JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
     JIT_UPVALUE_GCBOX_VALUE_OFFSET,
@@ -156,6 +164,33 @@ const _: () = {
     assert!(
         std::mem::offset_of!(JitContext, tier_up_budget) as i32 == JIT_CTX_TIER_UP_BUDGET_OFFSET,
         "JitContext::tier_up_budget offset changed — update JIT_CTX_TIER_UP_BUDGET_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, ic_probes_ptr) as i32 == JIT_CTX_IC_PROBES_PTR_OFFSET,
+        "JitContext::ic_probes_ptr offset changed — update JIT_CTX_IC_PROBES_PTR_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, ic_probes_count) as i32 == JIT_CTX_IC_PROBES_COUNT_OFFSET,
+        "JitContext::ic_probes_count offset changed — update JIT_CTX_IC_PROBES_COUNT_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::size_of::<otter_vm_bytecode::function::JitIcProbe>() == 16,
+        "JitIcProbe size must be 16 bytes for JIT offset computation"
+    );
+    assert!(
+        std::mem::offset_of!(crate::object::JsObject, jit_elements_data) as i32
+            == otter_vm_jit::runtime_helpers::JSOBJECT_ELEMENTS_DATA_OFFSET,
+        "JsObject::jit_elements_data offset changed"
+    );
+    assert!(
+        std::mem::offset_of!(crate::object::JsObject, jit_elements_len) as i32
+            == otter_vm_jit::runtime_helpers::JSOBJECT_ELEMENTS_LEN_OFFSET,
+        "JsObject::jit_elements_len offset changed"
+    );
+    assert!(
+        std::mem::offset_of!(crate::object::JsObject, jit_elements_kind) as i32
+            == otter_vm_jit::runtime_helpers::JSOBJECT_ELEMENTS_KIND_OFFSET,
+        "JsObject::jit_elements_kind offset changed"
     );
     assert!(
         std::mem::size_of::<UpvalueCell>() as i32 == JIT_UPVALUE_CELL_SIZE,
@@ -350,6 +385,14 @@ pub(crate) extern "C" fn otter_rt_get_elem_dense_impl(
 
     // Direct element access
     let elements = obj_ref.elements.borrow();
+
+    // Sync JIT elements cache so subsequent inline accesses can use cached values
+    let (data_ptr, data_len) = elements.jit_data_ptr_and_len();
+    let kind = elements.jit_kind();
+    obj_ref.jit_elements_data.set(data_ptr);
+    obj_ref.jit_elements_len.set(data_len);
+    obj_ref.jit_elements_kind.set(kind);
+
     match &*elements {
         crate::object::ElementsKind::Smi(v) => {
             if idx < v.len() {
@@ -464,8 +507,13 @@ extern "C" fn otter_rt_get_prop_const(
         return BAILOUT_SENTINEL;
     };
 
-    // Check proto epoch
-    if !ic.proto_epoch_matches(ctx.proto_epoch) {
+    // Check proto epoch — but only for ICs that have cached data.
+    // Uninitialized ICs have no cached shape data, so the proto_epoch check
+    // is meaningless for them. Skipping it allows the slow path to resolve
+    // the property and warm up the IC + probe table, enabling the runtime IC
+    // probe fast path on subsequent iterations.
+    let is_uninitialized = matches!(ic.ic_state, InlineCacheState::Uninitialized);
+    if !is_uninitialized && !ic.proto_epoch_matches(ctx.proto_epoch) {
         return BAILOUT_SENTINEL;
     }
 
@@ -573,6 +621,7 @@ extern "C" fn otter_rt_get_prop_const(
             let current_epoch = ctx.proto_epoch;
             let proto_shape_id = if depth > 0 { found_shape } else { 0 };
 
+            let ic_idx_usize = ic_idx as usize;
             match &mut ic.ic_state {
                 InlineCacheState::Uninitialized => {
                     ic.ic_state = InlineCacheState::Monomorphic {
@@ -582,10 +631,13 @@ extern "C" fn otter_rt_get_prop_const(
                         offset: offset as u32,
                     };
                     ic.proto_epoch = current_epoch;
-                    // IC just warmed up — JIT code compiled with stale snapshot
-                    // should be recompiled to use the mono fast path.
-                    if function.jit_entry_ptr() != 0 {
-                        function.request_ic_recompilation();
+                    // Update JIT IC probe table for runtime inline fast path
+                    if depth == 0 {
+                        if let Some(probe) = function.jit_ic_probes.get_mut(ic_idx_usize) {
+                            probe.set_mono_inline(obj_shape_ptr, offset as u32);
+                        }
+                    } else if let Some(probe) = function.jit_ic_probes.get_mut(ic_idx_usize) {
+                        probe.set_other();
                     }
                 }
                 InlineCacheState::Monomorphic {
@@ -600,6 +652,10 @@ extern "C" fn otter_rt_get_prop_const(
                         entries[1] = (obj_shape_ptr, proto_shape_id, depth, offset as u32);
                         ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                         ic.proto_epoch = current_epoch;
+                        // Probe degrades: no longer simple monomorphic
+                        if let Some(probe) = function.jit_ic_probes.get_mut(ic_idx_usize) {
+                            probe.set_other();
+                        }
                     }
                 }
                 InlineCacheState::Polymorphic { count, entries } => {
@@ -764,6 +820,7 @@ extern "C" fn otter_rt_set_prop_const(
         && let Some(offset) = obj_ref.shape_get_offset(&key)
     {
         let current_epoch = ctx.proto_epoch;
+        let ic_idx_usize = ic_idx as usize;
         match &mut ic.ic_state {
             InlineCacheState::Uninitialized => {
                 ic.ic_state = InlineCacheState::Monomorphic {
@@ -773,10 +830,9 @@ extern "C" fn otter_rt_set_prop_const(
                     offset: offset as u32,
                 };
                 ic.proto_epoch = current_epoch;
-                // IC just warmed up — JIT code compiled with stale snapshot
-                // should be recompiled to use the mono fast path.
-                if function.jit_entry_ptr() != 0 {
-                    function.request_ic_recompilation();
+                // Update JIT IC probe table for runtime inline fast path
+                if let Some(probe) = function.jit_ic_probes.get_mut(ic_idx_usize) {
+                    probe.set_mono_inline(obj_shape_ptr, offset as u32);
                 }
             }
             InlineCacheState::Monomorphic {
@@ -790,6 +846,9 @@ extern "C" fn otter_rt_set_prop_const(
                     entries[1] = (obj_shape_ptr, 0, 0, offset as u32);
                     ic.ic_state = InlineCacheState::Polymorphic { count: 2, entries };
                     ic.proto_epoch = current_epoch;
+                    if let Some(probe) = function.jit_ic_probes.get_mut(ic_idx_usize) {
+                        probe.set_other();
+                    }
                 }
             }
             InlineCacheState::Polymorphic { count, entries } => {
@@ -5199,6 +5258,8 @@ mod tests {
             deopt_regs_count: 0,
             osr_entry_pc: -1,
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
+            ic_probes_ptr: std::ptr::null(),
+            ic_probes_count: 0,
         };
 
         let result = otter_rt_set_prop_const(

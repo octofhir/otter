@@ -22,12 +22,17 @@ use crate::compiler::{DeoptResumeSite, build_deopt_metadata};
 use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
-    JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
-    JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
-    JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
-    JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_IC_PROBES_PTR_OFFSET,
+    JIT_CTX_OSR_ENTRY_PC_OFFSET, JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET,
+    JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE,
+    JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
+
+/// NaN-boxed bits for Value::hole() — array hole sentinel.
+mod value_constants {
+    pub const HOLE_BITS: u64 = 0x7FF8_0000_0000_0004;
+}
 use otter_vm_bytecode::function::InlineCacheState;
 
 fn jump_target(pc: usize, offset: i32, instruction_count: usize) -> Result<usize, JitError> {
@@ -1845,6 +1850,414 @@ fn emit_inline_prop_read(
     builder.block_params(merge_block)[0]
 }
 
+/// Emit runtime IC probe read for cold ICs (V8/JSC-style adaptive inline cache).
+///
+/// For IC sites that were Uninitialized at compile time, reads the JIT IC probe
+/// table at runtime. If the IC has warmed up since compilation (probe.state ==
+/// STATE_MONO_INLINE), does an inline shape check + direct memory load without
+/// any function call. Falls back to the full helper on miss.
+///
+/// This gives us V8-like behavior: the first iteration goes through the helper
+/// (which warms up the IC + probe), and all subsequent iterations take the inline
+/// fast path — without requiring function-level recompilation.
+#[allow(clippy::too_many_arguments)]
+fn emit_runtime_ic_probe_read(
+    builder: &mut FunctionBuilder<'_>,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    ctx_ptr: Value,
+    name_index: u32,
+    ic_index: u16,
+    layout: &crate::runtime_helpers::JsObjectLayoutOffsets,
+    pc: usize,
+    local_vars: &[Variable],
+    reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
+) -> Value {
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+    use otter_vm_bytecode::function::JitIcProbe;
+
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    let slow_block = builder.create_block();
+
+    // 1. Load ic_probes_ptr from JitContext
+    let probes_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        ctx_ptr,
+        JIT_CTX_IC_PROBES_PTR_OFFSET,
+    );
+
+    // 2. Check probes_ptr is not null
+    let null = builder.ins().iconst(types::I64, 0);
+    let probes_not_null = builder.ins().icmp(IntCC::NotEqual, probes_ptr, null);
+    let probe_check = builder.create_block();
+    builder
+        .ins()
+        .brif(probes_not_null, probe_check, &[], slow_block, &[]);
+
+    builder.switch_to_block(probe_check);
+
+    // 3. Compute probe entry address: probes_ptr + ic_index * 16
+    let probe_byte_offset = (ic_index as i64) * (JitIcProbe::SIZE as i64);
+    let probe_ptr = builder.ins().iadd_imm(probes_ptr, probe_byte_offset);
+
+    // 4. Load probe.state (offset 12) and check == STATE_MONO_INLINE (1)
+    let probe_state = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::STATE_OFFSET,
+    );
+    let mono_state = builder
+        .ins()
+        .iconst(types::I32, JitIcProbe::STATE_MONO_INLINE as i64);
+    let is_mono = builder.ins().icmp(IntCC::Equal, probe_state, mono_state);
+    let inline_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_mono, inline_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(inline_block);
+
+    // 5. Load probe.shape_id (offset 0) and probe.offset (offset 8)
+    let probe_shape = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::SHAPE_ID_OFFSET,
+    );
+    let probe_offset = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::OFFSET_OFFSET,
+    );
+
+    // 6. Check offset < 8 (inline property limit)
+    let inline_limit = builder.ins().iconst(types::I32, 8);
+    let offset_ok = builder.ins().icmp(IntCC::UnsignedLessThan, probe_offset, inline_limit);
+    let offset_ok_block = builder.create_block();
+    builder
+        .ins()
+        .brif(offset_ok, offset_ok_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(offset_ok_block);
+
+    // 7. Tag check: is this a TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder.ins().brif(is_obj, tag_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 8. Extract raw pointer
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+
+    // 9. Shape check: load shape_tag from obj_ptr + 0, compare with probe_shape
+    let shape_tag = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+    let shape_match = builder.ins().icmp(IntCC::Equal, shape_tag, probe_shape);
+    let shape_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(shape_match, shape_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(shape_ok);
+
+    // 10. Meta check: load inline_meta[offset], verify it's a data property
+    // meta_addr = obj_ptr + layout.inline_meta_data + offset (as i64)
+    let meta_base = builder
+        .ins()
+        .iadd_imm(obj_ptr, layout.inline_meta_data as i64);
+    let probe_offset_i64 = builder.ins().uextend(types::I64, probe_offset);
+    let meta_addr = builder.ins().iadd(meta_base, probe_offset_i64);
+    let meta = builder
+        .ins()
+        .load(types::I8, MemFlags::trusted(), meta_addr, 0);
+    let meta_i32 = builder.ins().uextend(types::I32, meta);
+    let kind_mask = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_MASK);
+    let kind = builder.ins().band(meta_i32, kind_mask);
+    let data_kind = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
+    let is_data = builder.ins().icmp(IntCC::Equal, kind, data_kind);
+    let data_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_data, data_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(data_ok);
+
+    // 11. Load value from inline_slots[offset]
+    // value_addr = obj_ptr + layout.inline_slots_data + offset * 8
+    let slots_base = builder
+        .ins()
+        .iadd_imm(obj_ptr, layout.inline_slots_data as i64);
+    let offset_bytes = builder.ins().ishl_imm(probe_offset_i64, 3); // * 8
+    let value_addr = builder.ins().iadd(slots_base, offset_bytes);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), value_addr, 0);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(value)]);
+
+    // Slow path: call full GetPropConst helper
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    let full_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(full_bail, bail_block, &[], full_ok, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return_with_state(
+        builder,
+        ctx_ptr,
+        pc,
+        BailoutReason::HelperReturnedSentinel,
+        local_vars,
+        reg_vars,
+        deopt_site,
+    );
+
+    builder.switch_to_block(full_ok);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(full_result)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit runtime IC probe write for cold SetPropConst ICs.
+///
+/// Same architecture as runtime IC probe read but for property writes:
+/// 1. Read probe table at runtime → check state == MONO_INLINE
+/// 2. Shape check + meta check (data + writable)
+/// 3. Value check: only inline-store non-heap values (numbers, int32, undefined, etc.)
+///    Heap values (objects, strings) fall to helper for GC write barrier safety.
+/// 4. Direct store to inline_slots[offset]
+///
+/// Falls back to the full SetPropConst helper on any miss.
+#[allow(clippy::too_many_arguments)]
+fn emit_runtime_ic_probe_write(
+    builder: &mut FunctionBuilder<'_>,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    write_val: Value,
+    ctx_ptr: Value,
+    name_index: u32,
+    ic_index: u16,
+    layout: &crate::runtime_helpers::JsObjectLayoutOffsets,
+    pc: usize,
+    local_vars: &[Variable],
+    reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
+) {
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+    use otter_vm_bytecode::function::JitIcProbe;
+
+    let done_block = builder.create_block();
+    let slow_block = builder.create_block();
+
+    // 1. Load ic_probes_ptr from JitContext
+    let probes_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        ctx_ptr,
+        JIT_CTX_IC_PROBES_PTR_OFFSET,
+    );
+
+    // 2. Check probes_ptr is not null
+    let null = builder.ins().iconst(types::I64, 0);
+    let probes_not_null = builder.ins().icmp(IntCC::NotEqual, probes_ptr, null);
+    let probe_check = builder.create_block();
+    builder
+        .ins()
+        .brif(probes_not_null, probe_check, &[], slow_block, &[]);
+
+    builder.switch_to_block(probe_check);
+
+    // 3. Compute probe entry address
+    let probe_byte_offset = (ic_index as i64) * (JitIcProbe::SIZE as i64);
+    let probe_ptr = builder.ins().iadd_imm(probes_ptr, probe_byte_offset);
+
+    // 4. Load probe.state, check == STATE_MONO_INLINE
+    let probe_state = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::STATE_OFFSET,
+    );
+    let mono_state = builder
+        .ins()
+        .iconst(types::I32, JitIcProbe::STATE_MONO_INLINE as i64);
+    let is_mono = builder.ins().icmp(IntCC::Equal, probe_state, mono_state);
+    let inline_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_mono, inline_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(inline_block);
+
+    // 5. Load shape_id and offset from probe
+    let probe_shape = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::SHAPE_ID_OFFSET,
+    );
+    let probe_offset = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        probe_ptr,
+        JitIcProbe::OFFSET_OFFSET,
+    );
+
+    // 6. Check offset < 8
+    let inline_limit = builder.ins().iconst(types::I32, 8);
+    let offset_ok = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, probe_offset, inline_limit);
+    let offset_ok_block = builder.create_block();
+    builder
+        .ins()
+        .brif(offset_ok, offset_ok_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(offset_ok_block);
+
+    // 7. Tag check on obj: is TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder.ins().brif(is_obj, tag_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 8. Extract raw pointer
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+
+    // 9. Shape check
+    let shape_tag = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+    let shape_match = builder.ins().icmp(IntCC::Equal, shape_tag, probe_shape);
+    let shape_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(shape_match, shape_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(shape_ok);
+
+    // 10. Meta check: is_data + is_writable
+    let meta_base = builder
+        .ins()
+        .iadd_imm(obj_ptr, layout.inline_meta_data as i64);
+    let probe_offset_i64 = builder.ins().uextend(types::I64, probe_offset);
+    let meta_addr = builder.ins().iadd(meta_base, probe_offset_i64);
+    let meta = builder
+        .ins()
+        .load(types::I8, MemFlags::trusted(), meta_addr, 0);
+    let meta_i32 = builder.ins().uextend(types::I32, meta);
+    let dw_mask = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_DATA_WRITABLE_MASK);
+    let dw_bits = builder.ins().band(meta_i32, dw_mask);
+    let dw_expected = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_DATA_WRITABLE);
+    let is_data_writable = builder.ins().icmp(IntCC::Equal, dw_bits, dw_expected);
+    let dw_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_data_writable, dw_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(dw_ok);
+
+    // 11. Value check: only inline non-heap values (no write barrier needed).
+    // Heap values have tag >= 0x7FFC (TAG_PTR_OBJECT/STRING/FUNCTION/OTHER).
+    // Non-heap: doubles, int32, undefined, null, bool — all have tag < 0x7FFC.
+    let val_tag = builder.ins().band(write_val, tag_mask);
+    let heap_threshold = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_non_heap = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, val_tag, heap_threshold);
+    let store_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_non_heap, store_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(store_ok);
+
+    // 12. Direct store to inline_slots[offset]
+    let slots_base = builder
+        .ins()
+        .iadd_imm(obj_ptr, layout.inline_slots_data as i64);
+    let offset_bytes = builder.ins().ishl_imm(probe_offset_i64, 3);
+    let value_addr = builder.ins().iadd(slots_base, offset_bytes);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), write_val, value_addr, 0);
+    builder.ins().jump(done_block, &[]);
+
+    // Slow path: call full SetPropConst helper
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    builder
+        .ins()
+        .brif(full_bail, bail_block, &[], done_block, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return_with_state(
+        builder,
+        ctx_ptr,
+        pc,
+        BailoutReason::HelperReturnedSentinel,
+        local_vars,
+        reg_vars,
+        deopt_site,
+    );
+
+    builder.switch_to_block(done_block);
+}
+
 /// Emit monomorphic property read with fallback to full GetPropConst.
 ///
 /// 1. Call GetPropMono(obj, shape_id, offset) — lightweight, no JitContext
@@ -1978,6 +2391,180 @@ fn emit_mono_set_with_fallback(
 /// 2. If BAILOUT → call full GetElem(ctx, obj, index, ic_idx)
 /// 3. If still BAILOUT → bail out function
 /// 4. Merge results from either path
+/// Emit inline dense array element read using JsObject cached element fields.
+///
+/// Three-tier fast path:
+/// 1. Inline: tag check → extract obj_ptr → load cached elements_kind/len/data →
+///    kind == Object → index < len → load value → not hole → return value
+/// 2. Dense helper: GetElemDense (syncs cache on call)
+/// 3. Full helper: GetElem with IC
+///
+/// After the first dense helper call syncs the cache, subsequent iterations
+/// take the inline path — no function call at all.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_dense_elem_with_fallback(
+    builder: &mut FunctionBuilder<'_>,
+    dense_ref: cranelift_codegen::ir::FuncRef,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    idx_val: Value,
+    ctx_ptr: Value,
+    ic_index: u16,
+    pc: usize,
+    local_vars: &[Variable],
+    reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
+) -> Value {
+    use crate::runtime_helpers::{
+        ELEMENTS_KIND_OBJECT, JSOBJECT_ELEMENTS_DATA_OFFSET, JSOBJECT_ELEMENTS_KIND_OFFSET,
+        JSOBJECT_ELEMENTS_LEN_OFFSET,
+    };
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    let helper_block = builder.create_block();
+
+    // 1. Tag check: is obj a TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_obj, tag_ok, &[], helper_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 2. Extract raw pointer
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+
+    // 3. Load cached elements_kind, check == OBJECT (2)
+    let kind = builder.ins().load(
+        types::I8,
+        MemFlags::trusted(),
+        obj_ptr,
+        JSOBJECT_ELEMENTS_KIND_OFFSET,
+    );
+    let kind_i32 = builder.ins().uextend(types::I32, kind);
+    let expected_kind = builder
+        .ins()
+        .iconst(types::I32, ELEMENTS_KIND_OBJECT);
+    let kind_ok = builder.ins().icmp(IntCC::Equal, kind_i32, expected_kind);
+    let kind_check = builder.create_block();
+    builder
+        .ins()
+        .brif(kind_ok, kind_check, &[], helper_block, &[]);
+
+    builder.switch_to_block(kind_check);
+
+    // 4. Extract int32 index from NaN-boxed value
+    let idx_tag_mask = builder
+        .ins()
+        .iconst(types::I64, 0xFFFF_FFFF_0000_0000_u64 as i64);
+    let idx_tag = builder.ins().band(idx_val, idx_tag_mask);
+    let expected_int_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FF8_0001_0000_0000_u64 as i64);
+    let is_int = builder.ins().icmp(IntCC::Equal, idx_tag, expected_int_tag);
+    let int_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(is_int, int_ok, &[], helper_block, &[]);
+
+    builder.switch_to_block(int_ok);
+
+    // 5. Extract index value (lower 32 bits), check non-negative
+    let idx_i32 = builder.ins().ireduce(types::I32, idx_val);
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    let idx_non_neg = builder
+        .ins()
+        .icmp(IntCC::SignedGreaterThanOrEqual, idx_i32, zero_i32);
+    let idx_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(idx_non_neg, idx_ok, &[], helper_block, &[]);
+
+    builder.switch_to_block(idx_ok);
+
+    // 6. Load cached elements_len, check index < len
+    let elem_len = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        obj_ptr,
+        JSOBJECT_ELEMENTS_LEN_OFFSET,
+    );
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, idx_i32, elem_len);
+    let bounds_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(in_bounds, bounds_ok, &[], helper_block, &[]);
+
+    builder.switch_to_block(bounds_ok);
+
+    // 7. Load cached elements_data pointer
+    let elem_data = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        obj_ptr,
+        JSOBJECT_ELEMENTS_DATA_OFFSET,
+    );
+
+    // 8. Check elements_data is not null
+    let null = builder.ins().iconst(types::I64, 0);
+    let data_not_null = builder.ins().icmp(IntCC::NotEqual, elem_data, null);
+    let data_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(data_not_null, data_ok, &[], helper_block, &[]);
+
+    builder.switch_to_block(data_ok);
+
+    // 9. Load value from data[index] (Value = 8 bytes)
+    let idx_i64 = builder.ins().uextend(types::I64, idx_i32);
+    let byte_offset = builder.ins().ishl_imm(idx_i64, 3); // index * 8
+    let value_addr = builder.ins().iadd(elem_data, byte_offset);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), value_addr, 0);
+
+    // 10. Hole check: Value::HOLE is a special bit pattern
+    // Hole = undefined NaN-boxed with a specific marker. Check it's not hole.
+    let hole_bits = builder
+        .ins()
+        .iconst(types::I64, value_constants::HOLE_BITS as i64);
+    let is_hole = builder.ins().icmp(IntCC::Equal, value, hole_bits);
+    let not_hole = builder.create_block();
+    builder
+        .ins()
+        .brif(is_hole, helper_block, &[], not_hole, &[]);
+
+    builder.switch_to_block(not_hole);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(value)]);
+
+    // Helper fallback: dense helper → full helper
+    builder.switch_to_block(helper_block);
+    let helper_result = emit_dense_elem_with_fallback(
+        builder, dense_ref, full_ref, obj_val, idx_val, ctx_ptr, ic_index,
+        pc, local_vars, reg_vars, deopt_site,
+    );
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(helper_result)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_dense_elem_with_fallback(
     builder: &mut FunctionBuilder<'_>,
     dense_ref: cranelift_codegen::ir::FuncRef,
@@ -1986,6 +2573,10 @@ fn emit_dense_elem_with_fallback(
     idx_val: Value,
     ctx_ptr: Value,
     ic_index: u16,
+    pc: usize,
+    local_vars: &[Variable],
+    reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
 ) -> Value {
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
@@ -2023,7 +2614,10 @@ fn emit_dense_elem_with_fallback(
     builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
 
     builder.switch_to_block(bail_block);
-    emit_bailout_return(builder);
+    emit_bailout_return_with_state(
+        builder, ctx_ptr, pc, BailoutReason::HelperReturnedSentinel,
+        local_vars, reg_vars, deopt_site,
+    );
 
     builder.switch_to_block(full_ok);
     builder
@@ -3454,6 +4048,15 @@ pub fn translate_function_with_constants(
                             builder, mono_helper, full_ref, obj_val, ctx_ptr,
                             shape_id, offset, name.index(), *ic_index,
                         )
+                    } else if let Some(lo) = layout {
+                        // Cold IC: use runtime IC probe — reads probe table at
+                        // runtime. After the first iteration warms up the IC,
+                        // subsequent iterations take the inline fast path.
+                        emit_runtime_ic_probe_read(
+                            builder, full_ref, obj_val, ctx_ptr,
+                            name.index(), *ic_index, &lo,
+                            pc, &local_vars, &reg_vars, deopt_site,
+                        )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
                         let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
@@ -3518,6 +4121,12 @@ pub fn translate_function_with_constants(
                             builder, mono_helper, full_ref, obj_val, ctx_ptr,
                             shape_id, offset, name.index(), *ic_index,
                         )
+                    } else if let Some(lo) = layout {
+                        emit_runtime_ic_probe_read(
+                            builder, full_ref, obj_val, ctx_ptr,
+                            name.index(), *ic_index, &lo,
+                            pc, &local_vars, &reg_vars, deopt_site,
+                        )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
                         let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
@@ -3557,6 +4166,8 @@ pub fn translate_function_with_constants(
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
 
+                let layout = crate::runtime_helpers::jsobject_layout();
+
                 if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
                     emit_mono_set_with_fallback(
                         builder,
@@ -3569,6 +4180,13 @@ pub fn translate_function_with_constants(
                         offset,
                         name.index(),
                         *ic_index,
+                    );
+                } else if let Some(lo) = layout {
+                    // Cold IC: runtime IC probe for writes
+                    emit_runtime_ic_probe_write(
+                        builder, full_ref, obj_val, value, ctx_ptr,
+                        name.index(), *ic_index, &lo,
+                        pc, &local_vars, &reg_vars, deopt_site,
                     );
                 } else {
                     let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -4795,8 +5413,9 @@ pub fn translate_function_with_constants(
                 let idx_val = read_reg(builder, &reg_vars, *index);
                 let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
                 let result = if let Some(dense_helper) = dense_ref {
-                    emit_dense_elem_with_fallback(
+                    emit_inline_dense_elem_with_fallback(
                         builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, 0,
+                        pc, &local_vars, &reg_vars, deopt_site,
                     )
                 } else {
                     let ic_idx = builder.ins().iconst(types::I64, 0);
@@ -4822,8 +5441,9 @@ pub fn translate_function_with_constants(
                 let idx_val = read_reg(builder, &reg_vars, *idx);
                 let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
                 let result = if let Some(dense_helper) = dense_ref {
-                    emit_dense_elem_with_fallback(
+                    emit_inline_dense_elem_with_fallback(
                         builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, *ic_index,
+                        pc, &local_vars, &reg_vars, deopt_site,
                     )
                 } else {
                     let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);

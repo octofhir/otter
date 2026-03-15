@@ -206,6 +206,28 @@ pub(crate) fn try_execute_jit(
         -1
     };
 
+    // Initialize IC probe table if not yet done.
+    // This ensures the probe array exists for JIT code to read at runtime.
+    let fv_len = function.feedback_vector.read().len();
+    if fv_len > 0 && function.jit_ic_probes.is_empty() {
+        function.jit_ic_probes.init(fv_len);
+        // Pre-populate probes from current IC state (some ICs may already be warm)
+        let fv = function.feedback_vector.read();
+        for (i, ic) in fv.iter().enumerate() {
+            if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                shape_id,
+                depth: 0,
+                offset,
+                ..
+            } = &ic.ic_state
+            {
+                if let Some(probe) = function.jit_ic_probes.get_mut(i) {
+                    probe.set_mono_inline(*shape_id, *offset);
+                }
+            }
+        }
+    }
+
     let jit_ctx = JitContext {
         function_ptr: function as *const Function,
         proto_epoch,
@@ -253,6 +275,12 @@ pub(crate) fn try_execute_jit(
         deopt_regs_count: reg_count as u32,
         osr_entry_pc,
         tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
+        ic_probes_ptr: if function.jit_ic_probes.is_empty() {
+            std::ptr::null()
+        } else {
+            function.jit_ic_probes.as_ptr()
+        },
+        ic_probes_count: function.jit_ic_probes.len() as u32,
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;
@@ -349,6 +377,12 @@ pub(crate) fn try_execute_jit_from_raw_args(
         deopt_regs_count: 0,
         osr_entry_pc: -1,
         tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
+        ic_probes_ptr: if function.jit_ic_probes.is_empty() {
+            std::ptr::null()
+        } else {
+            function.jit_ic_probes.as_ptr()
+        },
+        ic_probes_count: function.jit_ic_probes.len() as u32,
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;

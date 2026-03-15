@@ -476,6 +476,14 @@ pub const JIT_CTX_OSR_ENTRY_PC_OFFSET: i32 = 136;
 /// Layout: osr_entry_pc:i64(136) tier_up_budget:i64(144)
 pub const JIT_CTX_TIER_UP_BUDGET_OFFSET: i32 = 144;
 
+/// Byte offset of `ic_probes_ptr` in JitContext (`#[repr(C)]`).
+/// Layout: tier_up_budget:i64(144) ic_probes_ptr:*const(152)
+pub const JIT_CTX_IC_PROBES_PTR_OFFSET: i32 = 152;
+
+/// Byte offset of `ic_probes_count` in JitContext (`#[repr(C)]`).
+/// Layout: ic_probes_ptr:*const(152) ic_probes_count:u32(160)
+pub const JIT_CTX_IC_PROBES_COUNT_OFFSET: i32 = 160;
+
 /// Default tier-up budget for JIT back-edge recompilation checks.
 /// After this many backward jumps, a tier-up check fires.
 /// Low budget (100) ensures IC warmup is detected quickly. The helper call
@@ -491,11 +499,34 @@ pub const JIT_TIER_UP_BUDGET_DEFAULT: i64 = 100;
 /// Cell<u64> is `#[repr(transparent)]` so this is just a u64 at offset 0.
 pub const JSOBJECT_SHAPE_TAG_OFFSET: i32 = 0;
 
+/// Byte offset of `jit_elements_data: Cell<usize>` within JsObject.
+/// Raw pointer to the elements Vec data. JIT loads for inline array access.
+pub const JSOBJECT_ELEMENTS_DATA_OFFSET: i32 = 8;
+
+/// Byte offset of `jit_elements_len: Cell<u32>` within JsObject.
+/// Element count for bounds checking.
+pub const JSOBJECT_ELEMENTS_LEN_OFFSET: i32 = 16;
+
+/// Byte offset of `jit_elements_kind: Cell<u8>` within JsObject.
+/// 0=Smi(i32), 1=Double(f64), 2=Object(Value).
+pub const JSOBJECT_ELEMENTS_KIND_OFFSET: i32 = 20;
+
+/// ElementsKind tag for Object(Vec<Value>) variant.
+pub const ELEMENTS_KIND_OBJECT: i64 = 2;
+
 /// SlotMeta KIND_DATA constant (lower 2 bits = 0b01).
 pub const SLOTMETA_KIND_DATA: i64 = 0b01;
 
 /// SlotMeta KIND_MASK (lower 2 bits).
 pub const SLOTMETA_KIND_MASK: i64 = 0b11;
+
+/// SlotMeta WRITABLE bit (bit 2).
+pub const SLOTMETA_WRITABLE_BIT: i64 = 0b0000_0100;
+
+/// Combined mask for data + writable check: kind bits == DATA and writable bit set.
+/// Checks lower 3 bits: (meta & 0b111) == 0b101 means KIND_DATA (0b01) + WRITABLE (0b100).
+pub const SLOTMETA_DATA_WRITABLE: i64 = 0b101;
+pub const SLOTMETA_DATA_WRITABLE_MASK: i64 = 0b111;
 
 /// JsObject layout offsets for inline property access.
 /// Computed once at startup by otter-vm-core, used by the JIT translator

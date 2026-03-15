@@ -550,6 +550,143 @@ impl<'de> Deserialize<'de> for BytecodeVector {
     }
 }
 
+/// Compact, JIT-readable IC probe for runtime shape checking.
+///
+/// When the JIT compiles a function with cold (Uninitialized) ICs, it emits code
+/// that reads from this probe table at runtime. After the first iteration warms up
+/// the IC via the helper slow path, subsequent iterations take the inline fast path
+/// without any function call — just load probe → shape check → direct memory load.
+///
+/// This is the Otter equivalent of V8's IC stub patching: instead of self-modifying
+/// code, we read a fixed-layout side table that the helpers update as ICs warm up.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct JitIcProbe {
+    /// Shape ID for monomorphic fast path (0 if not ready)
+    pub shape_id: u64,
+    /// Property offset for monomorphic fast path
+    pub offset: u32,
+    /// Probe state: 0=not ready, 1=mono depth=0 (inline read/write), 2=other
+    pub state: u32,
+}
+
+
+impl JitIcProbe {
+    /// State value: IC not warmed up yet
+    pub const STATE_COLD: u32 = 0;
+    /// State value: monomorphic, depth=0 — eligible for inline fast path
+    pub const STATE_MONO_INLINE: u32 = 1;
+    /// State value: polymorphic/megamorphic/proto-chain — use helper
+    pub const STATE_OTHER: u32 = 2;
+
+    /// Size of this struct in bytes (for JIT offset computation)
+    pub const SIZE: i32 = 16;
+
+    /// Byte offset of `shape_id` field
+    pub const SHAPE_ID_OFFSET: i32 = 0;
+    /// Byte offset of `offset` field
+    pub const OFFSET_OFFSET: i32 = 8;
+    /// Byte offset of `state` field
+    pub const STATE_OFFSET: i32 = 12;
+
+    /// Update this probe to reflect a monomorphic IC with depth=0
+    #[inline]
+    pub fn set_mono_inline(&mut self, shape_id: u64, offset: u32) {
+        self.shape_id = shape_id;
+        self.offset = offset;
+        self.state = Self::STATE_MONO_INLINE;
+    }
+
+    /// Mark this probe as non-inlineable (polymorphic, megamorphic, or proto-chain)
+    #[inline]
+    pub fn set_other(&mut self) {
+        self.state = Self::STATE_OTHER;
+    }
+}
+
+/// Thread-confined mutable vector for JIT IC probes.
+///
+/// Same pattern as FeedbackVector — UnsafeCell for zero-overhead interior mutability.
+#[allow(unsafe_code)]
+pub struct JitIcProbeTable {
+    inner: std::cell::UnsafeCell<Vec<JitIcProbe>>,
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for JitIcProbeTable {}
+#[allow(unsafe_code)]
+unsafe impl Sync for JitIcProbeTable {}
+
+#[allow(unsafe_code)]
+impl JitIcProbeTable {
+    /// Create a new empty probe table
+    pub fn new() -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(Vec::new()),
+        }
+    }
+
+    /// Initialize probe table with N cold entries
+    pub fn init(&self, count: usize) {
+        let vec = unsafe { &mut *self.inner.get() };
+        if vec.len() < count {
+            vec.resize(count, JitIcProbe::default());
+        }
+    }
+
+    /// Get a mutable reference to a probe entry
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut(&self, index: usize) -> Option<&mut JitIcProbe> {
+        let vec = unsafe { &mut *self.inner.get() };
+        vec.get_mut(index)
+    }
+
+    /// Get raw pointer to the probe array (for JIT code to read)
+    #[inline]
+    pub fn as_ptr(&self) -> *const JitIcProbe {
+        let vec = unsafe { &*self.inner.get() };
+        vec.as_ptr()
+    }
+
+    /// Number of entries
+    #[inline]
+    pub fn len(&self) -> usize {
+        let vec = unsafe { &*self.inner.get() };
+        vec.len()
+    }
+
+    /// Is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for JitIcProbeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(unsafe_code)]
+impl Clone for JitIcProbeTable {
+    fn clone(&self) -> Self {
+        let vec = unsafe { &*self.inner.get() };
+        Self {
+            inner: std::cell::UnsafeCell::new(vec.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for JitIcProbeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitIcProbeTable")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 /// A bytecode function
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Function {
@@ -629,6 +766,13 @@ pub struct Function {
     /// For derived constructors: index of an inner function that initializes
     /// instance fields. Called on `this` after `super()` returns.
     pub field_init_func: Option<u32>,
+
+    /// JIT IC probe table — flat, #[repr(C)] array for runtime shape checking.
+    /// Initialized when function is first JIT-compiled. Updated by IC helpers
+    /// when ICs transition to Monomorphic. Read by JIT code at runtime for
+    /// IC sites that were Uninitialized at compile time.
+    #[serde(skip)]
+    pub jit_ic_probes: JitIcProbeTable,
 }
 
 impl Function {
@@ -896,6 +1040,7 @@ impl Clone for Function {
             back_edge_count: AtomicU32::new(0),
             ic_recompilation_needed: std::sync::atomic::AtomicBool::new(false),
             field_init_func: self.field_init_func,
+            jit_ic_probes: JitIcProbeTable::new(),
         }
     }
 }
@@ -1059,6 +1204,7 @@ impl FunctionBuilder {
             back_edge_count: AtomicU32::new(0),
             ic_recompilation_needed: std::sync::atomic::AtomicBool::new(false),
             field_init_func: None,
+            jit_ic_probes: JitIcProbeTable::new(),
         }
     }
 }

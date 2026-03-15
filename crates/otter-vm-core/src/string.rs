@@ -113,9 +113,20 @@ impl StringTable {
             }
         }
 
-        // Create new interned string (single alloc via Arc::from_iter)
+        // Create new interned string
+        let bytes = s.as_bytes();
+        let utf16_data: Arc<[u16]> = if bytes.iter().all(|&b| b < 0x80) {
+            // Fast ASCII path: direct widening, single allocation
+            let mut units = Vec::with_capacity(bytes.len());
+            for &b in bytes {
+                units.push(b as u16);
+            }
+            Arc::from(units)
+        } else {
+            Arc::from_iter(s.encode_utf16())
+        };
         let js_str = GcRef::new(JsString {
-            repr: StringRepr::Flat(Arc::from_iter(s.encode_utf16())),
+            repr: StringRepr::Flat(utf16_data),
             flattened: OnceLock::new(),
             utf8: OnceLock::new(),
             hash: OnceLock::from(hash),
@@ -360,9 +371,29 @@ impl JsString {
     /// Create a string without interning (for temporary strings)
     ///
     /// Returns a `GcRef<JsString>` for the new string.
+    /// Pre-caches the UTF-8 representation since we already have it.
     pub fn new_gc(s: impl AsRef<str>) -> GcRef<Self> {
-        let units: Vec<u16> = s.as_ref().encode_utf16().collect();
-        Self::from_utf16_units_gc(units)
+        let s_ref = s.as_ref();
+        let bytes = s_ref.as_bytes();
+        // Fast path for ASCII: direct widening without encode_utf16 iterator overhead
+        let units: Vec<u16> = if bytes.iter().all(|&b| b < 0x80) {
+            let mut v = Vec::with_capacity(bytes.len());
+            for &b in bytes {
+                v.push(b as u16);
+            }
+            v
+        } else {
+            s_ref.encode_utf16().collect()
+        };
+        // Pre-cache the UTF-8 form since we already have it as a Rust &str
+        let utf8_cache = OnceLock::new();
+        let _ = utf8_cache.set(Arc::<str>::from(s_ref));
+        GcRef::new(Self {
+            repr: StringRepr::Flat(units.into()),
+            flattened: OnceLock::new(),
+            utf8: utf8_cache,
+            hash: OnceLock::new(),
+        })
     }
 
     /// Create a string from UTF-16 code units without interning

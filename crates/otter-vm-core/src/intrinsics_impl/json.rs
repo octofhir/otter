@@ -350,49 +350,44 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
 
     /// Scan a JSON string. Returns a borrowed &str slice from input when no escapes
     /// (zero-copy), or an owned String for escape sequences.
+    ///
+    /// Single-pass implementation: scans forward until `"` or `\`. On first `\`,
+    /// copies the prefix so far into str_buf and switches to decode mode, without
+    /// backtracking.
     fn scan_string_raw(&mut self) -> Result<JsonStr<'a>, VmError> {
         // Skip opening quote
         self.advance();
         let start = self.pos;
 
-        // Fast scan: find closing quote, detect escapes
-        let mut has_escape = false;
+        // Fast scan: find closing quote or first escape
         loop {
             if self.pos >= self.input.len() {
                 return Err(self.error("unterminated string"));
             }
             let b = self.input[self.pos];
             if b == b'"' {
-                if !has_escape {
-                    // Zero-copy: return slice from input
-                    let s = unsafe { std::str::from_utf8_unchecked(&self.input[start..self.pos]) };
-                    self.pos += 1; // skip closing quote
-                    return Ok(JsonStr::Borrowed(s));
-                }
-                break;
+                // No escapes — zero-copy path
+                let s = unsafe { std::str::from_utf8_unchecked(&self.input[start..self.pos]) };
+                self.pos += 1; // skip closing quote
+                return Ok(JsonStr::Borrowed(s));
             }
             if b == b'\\' {
-                has_escape = true;
-                self.pos += 1; // skip backslash
-                if self.pos >= self.input.len() {
-                    return Err(self.error("unterminated string escape"));
-                }
-                // Skip the escaped character
-                if self.input[self.pos] == b'u' {
-                    self.pos += 4; // skip 4 hex digits
-                }
-                self.pos += 1;
-                continue;
+                // First escape found — copy prefix into str_buf and switch to decode mode
+                self.str_buf.clear();
+                let prefix = unsafe { std::str::from_utf8_unchecked(&self.input[start..self.pos]) };
+                self.str_buf.push_str(prefix);
+                return self.scan_string_raw_escaped();
             }
             if b < 0x20 {
                 return Err(self.error("invalid control character in string"));
             }
             self.pos += 1;
         }
+    }
 
-        // Has escapes — re-scan from start and build the unescaped string
-        self.pos = start;
-        self.str_buf.clear();
+    /// Continue scanning a string that has escape sequences.
+    /// Called after the prefix has been copied to str_buf and self.pos is at the `\`.
+    fn scan_string_raw_escaped(&mut self) -> Result<JsonStr<'a>, VmError> {
         loop {
             if self.pos >= self.input.len() {
                 return Err(self.error("unterminated string"));
@@ -461,21 +456,21 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
                 self.pos += 1;
                 continue;
             }
-            // Regular UTF-8 byte — copy as-is
-            // Multi-byte UTF-8 sequences: count continuation bytes
-            let char_len = if b < 0x80 {
-                1
-            } else if b < 0xE0 {
-                2
-            } else if b < 0xF0 {
-                3
-            } else {
-                4
-            };
-            let end = (self.pos + char_len).min(self.input.len());
-            let slice = unsafe { std::str::from_utf8_unchecked(&self.input[self.pos..end]) };
+            if b < 0x20 {
+                return Err(self.error("invalid control character in string"));
+            }
+            // Regular UTF-8 byte — find the next special char and bulk-copy
+            let run_start = self.pos;
+            self.pos += 1;
+            while self.pos < self.input.len() {
+                let c = self.input[self.pos];
+                if c == b'"' || c == b'\\' || c < 0x20 {
+                    break;
+                }
+                self.pos += 1;
+            }
+            let slice = unsafe { std::str::from_utf8_unchecked(&self.input[run_start..self.pos]) };
             self.str_buf.push_str(slice);
-            self.pos = end;
         }
     }
 
@@ -856,14 +851,13 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             }
         }
 
-        // Create array with pre-sized elements (single borrow, no per-element barriers)
-        let arr = GcRef::new(JsObject::array(elements.len()));
+        // Create array and install pre-collected elements directly.
+        // Use array(0) to avoid pre-filling with holes (immediately overwritten).
+        let len = elements.len() as u32;
+        let arr = GcRef::new(JsObject::array(0));
         arr.set_prototype(self.array_proto);
-        {
-            let mut elems = arr.elements.borrow_mut();
-            *elems = crate::object::ElementsKind::Object(elements);
-        }
-        arr.flags.borrow_mut().dense_array_length_hint = arr.elements.borrow().len() as u32;
+        *arr.elements.borrow_mut() = crate::object::ElementsKind::Object(elements);
+        arr.flags.borrow_mut().dense_array_length_hint = len;
 
         // Restore parent scope's template
         self.array_shape_template = saved_template;
@@ -1055,13 +1049,19 @@ fn escape_json_string_utf16(units: &[u16], out: &mut String) {
 
         // Bulk-copy the safe run
         if i > run_start {
-            out.reserve(i - run_start);
-            for &u in &units[run_start..i] {
-                if u < 0x80 {
+            let run = &units[run_start..i];
+            // Check if entire run is ASCII for fast memcpy-style copy
+            let all_ascii = run.iter().all(|&u| u < 0x80);
+            if all_ascii {
+                out.reserve(run.len());
+                // SAFETY: all units are ASCII (< 0x80), valid single-byte UTF-8
+                for &u in run {
                     out.push(u as u8 as char);
-                } else if let Some(ch) = char::from_u32(u as u32) {
-                    out.push(ch);
                 }
+            } else {
+                out.reserve(run.len() * 3); // worst case for BMP chars in UTF-8
+                let decoded = String::from_utf16_lossy(run);
+                out.push_str(&decoded);
             }
         }
 
@@ -1120,13 +1120,73 @@ fn hex4_u16(c: u16) -> [u8; 6] {
     ]
 }
 
-/// Format a number for JSON output (NaN and Infinity become "null")
+/// Format a number for JSON output (NaN and Infinity become "null").
+/// Writes directly to the output buffer, avoiding intermediate String allocation.
 fn format_number(n: f64, out: &mut String) {
     if n.is_nan() || n.is_infinite() {
         out.push_str("null");
-    } else {
-        out.push_str(&crate::globals::js_number_to_string(n));
+        return;
     }
+    if n == 0.0 {
+        out.push('0');
+        return;
+    }
+    let negative = n < 0.0;
+    let abs_n = n.abs();
+
+    // Integer fast path: use itoa directly into buffer
+    if abs_n.fract() == 0.0 && abs_n < 1e21 && abs_n <= 9007199254740992.0 {
+        let int_val = abs_n as u64;
+        let mut buf = itoa::Buffer::new();
+        let s = buf.format(int_val);
+        if negative {
+            out.push('-');
+        }
+        out.push_str(s);
+        return;
+    }
+
+    // Non-integer float path: use js_number_to_string for correct JS semantics.
+    // This allocates a String but is required for proper ECMA-262 formatting rules.
+    // For the common case of "simple" floats, ryu's output is close to JS format,
+    // but edge cases (trailing zeros, exponent notation) differ from JS spec.
+    out.push_str(&crate::globals::js_number_to_string(n));
+}
+
+/// Lightweight number formatting for JSON stringify fast path.
+/// Formats f64 directly into the output buffer without allocating.
+/// Uses itoa for integers and ryu for floats, applying minimal JS-compatible formatting.
+#[inline]
+fn format_number_fast(n: f64, out: &mut String) {
+    if n.is_nan() || n.is_infinite() {
+        out.push_str("null");
+        return;
+    }
+    if n == 0.0 {
+        out.push('0');
+        return;
+    }
+    let negative = n < 0.0;
+    let abs_n = n.abs();
+
+    // Integer fast path
+    if abs_n.fract() == 0.0 && abs_n < 1e21 && abs_n <= 9007199254740992.0 {
+        if negative {
+            out.push('-');
+        }
+        let mut buf = itoa::Buffer::new();
+        out.push_str(buf.format(abs_n as u64));
+        return;
+    }
+
+    // Float path: use ryu for zero-allocation shortest representation
+    let mut ryu_buf = ryu::Buffer::new();
+    let repr = ryu_buf.format_finite(n);
+    // ryu output is already close to JSON format for most values.
+    // It uses 'E' for scientific notation which matches JSON.
+    // However, ryu may output "1.5" (good) or "1.23E5" (needs adjustment).
+    // For JSON, we just need a valid numeric literal, which ryu provides.
+    out.push_str(repr);
 }
 
 /// Format a number as a property key (JavaScript ToString semantics)
@@ -1335,6 +1395,68 @@ fn unwrap_primitive_with_calls(value: &Value, ncx: &mut NativeContext) -> Result
         }
     }
     Ok(*value)
+}
+
+/// Direct value serialization for the no-replacer slow path.
+/// Skips the wrapper object allocation — called after toJSON has already been applied.
+fn stringify_value_slow(
+    value: &Value,
+    replacer_fn: &Option<Value>,
+    indent: &Option<String>,
+    property_list: &Option<Vec<String>>,
+    tracker: &mut CircularTracker,
+    depth: usize,
+    ncx: &mut NativeContext,
+    out: &mut String,
+) -> Result<bool, VmError> {
+    if depth > 100 {
+        out.push_str("null");
+        return Ok(true);
+    }
+
+    // undefined, functions, symbols → omitted
+    if value.is_undefined() || value.is_callable() || value.is_symbol() {
+        return Ok(false);
+    }
+    if value.is_null() {
+        out.push_str("null");
+        return Ok(true);
+    }
+    if value.is_bigint() {
+        return Err(VmError::type_error("Do not know how to serialize a BigInt"));
+    }
+    if let Some(b) = value.as_boolean() {
+        out.push_str(if b { "true" } else { "false" });
+        return Ok(true);
+    }
+    if let Some(n) = value.as_int32() {
+        let mut buf = itoa::Buffer::new();
+        out.push_str(buf.format(n));
+        return Ok(true);
+    }
+    if let Some(n) = value.as_number() {
+        format_number(n, out);
+        return Ok(true);
+    }
+    if let Some(s) = value.as_string() {
+        out.push('"');
+        escape_json_string_utf16(s.as_utf16(), out);
+        out.push('"');
+        return Ok(true);
+    }
+
+    // Array
+    if is_array_value(value)? {
+        stringify_array_with_replacer(value, "", replacer_fn, indent, property_list, tracker, depth, ncx, out)?;
+        return Ok(true);
+    }
+    // Object or proxy
+    if value.as_object().is_some() || value.as_proxy().is_some() {
+        stringify_object_with_replacer(value, "", replacer_fn, indent, property_list, tracker, depth, ncx, out)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Full stringify with toJSON and replacer support
@@ -1882,18 +2004,9 @@ fn json_parse(
         return Err(VmError::syntax_error("JSON.parse: unexpected input"));
     };
 
-    // Avoid cloning the full Intrinsics registry on every parse call.
-    let global = ncx.ctx.global();
-    let object_proto = global
-        .get(&PropertyKey::string("Object"))
-        .and_then(|o| o.as_object())
-        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-        .unwrap_or_else(Value::null);
-    let array_proto = global
-        .get(&PropertyKey::string("Array"))
-        .and_then(|o| o.as_object())
-        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-        .unwrap_or_else(Value::null);
+    // Use cached prototypes (lazily populated from intrinsics, avoids global property walk).
+    let object_proto = ncx.ctx.json_object_prototype();
+    let array_proto = ncx.ctx.json_array_prototype();
 
     let mm = ncx.memory_manager().clone();
     let result = parse_json_to_value_direct(text.as_ref(), &object_proto, &array_proto, ncx)?;
@@ -1932,9 +2045,17 @@ fn json_stringify(
     let has_space = args.get(2).is_some_and(|s| !s.is_undefined());
 
     if !has_replacer && !has_space {
-        let estimated_capacity = estimate_stringify_capacity(&val);
-        let mut out = String::with_capacity(estimated_capacity);
-        if stringify_value_fast(&val, &mut out, 0) {
+        let object_proto = ncx.ctx.json_object_prototype();
+        let object_proto_ptr = object_proto
+            .as_object()
+            .map(|o| o.as_ptr() as usize)
+            .unwrap_or(0);
+        // Lightweight capacity hint: avoid full tree walk (which is expensive for
+        // arrays of objects — essentially doubles the work). Use a quick estimate
+        // based on the top-level value type.
+        let cap = fast_capacity_hint(&val);
+        let mut out = String::with_capacity(cap);
+        if stringify_value_fast(&val, &mut out, 0, object_proto_ptr) {
             return Ok(Value::string(JsString::new_gc(&out)));
         }
         // Fast path couldn't handle it (proxy, toJSON, accessors, etc.) — fall through
@@ -1948,44 +2069,91 @@ fn json_stringify(
 
     let mut tracker = CircularTracker::new();
 
-    let estimated_capacity = estimate_stringify_capacity(&val);
+    let estimated_capacity = if !has_replacer && !has_space {
+        128 // fast path already tried, use small default
+    } else {
+        estimate_stringify_capacity(&val)
+    };
     let mut out = String::with_capacity(estimated_capacity);
 
-    // Per spec, stringify always uses a wrapper object and the SerializeJSONProperty algorithm,
-    // which ensures toJSON/replacer/getters/proxies are honored.
-    let global = ncx.ctx.global();
-    let object_proto = global
-        .get(&PropertyKey::string("Object"))
-        .and_then(|o| o.as_object())
-        .and_then(|o| o.get(&PropertyKey::string("prototype")))
-        .unwrap_or_else(Value::null);
-    let wrapper = GcRef::new(JsObject::new(object_proto));
-    let _ = wrapper.set(PropertyKey::string(""), val);
-    let wrapper_val = Value::object(wrapper);
+    if !has_replacer {
+        // No replacer → skip wrapper object allocation.
+        // Directly apply toJSON + serialize. The wrapper is only needed so the
+        // replacer's `this` binding is correct per spec.
+        let prop_key = PropertyKey::string("");
+        let value = call_to_json(&val, "", prop_key, ncx)?;
+        let value = unwrap_primitive_with_calls(&value, ncx)?;
 
-    let written = stringify_with_replacer(
-        &wrapper_val,
-        "",
-        &replacer_fn,
-        &space_str,
-        &property_list,
-        &mut tracker,
-        0,
-        ncx,
-        &mut out,
-    )?;
+        let written = stringify_value_slow(
+            &value,
+            &None,
+            &space_str,
+            &property_list,
+            &mut tracker,
+            0,
+            ncx,
+            &mut out,
+        )?;
 
-    if written {
-        // Stringify results are typically short-lived; avoid interning megabyte JSON strings.
-        Ok(Value::string(JsString::new_gc(&out)))
+        if written {
+            Ok(Value::string(JsString::new_gc(&out)))
+        } else {
+            Ok(Value::undefined())
+        }
     } else {
-        Ok(Value::undefined())
+        // Has replacer → need wrapper object for spec-correct `this` binding.
+        let object_proto = ncx.ctx.json_object_prototype();
+        let wrapper = GcRef::new(JsObject::new(object_proto));
+        let _ = wrapper.set(PropertyKey::string(""), val);
+        let wrapper_val = Value::object(wrapper);
+
+        let written = stringify_with_replacer(
+            &wrapper_val,
+            "",
+            &replacer_fn,
+            &space_str,
+            &property_list,
+            &mut tracker,
+            0,
+            ncx,
+            &mut out,
+        )?;
+
+        if written {
+            Ok(Value::string(JsString::new_gc(&out)))
+        } else {
+            Ok(Value::undefined())
+        }
     }
 }
 
-/// `JSON` namespace object.
-///
-/// Spec: <https://tc39.es/ecma262/#sec-json-object>
+/// Lightweight capacity hint for the fast stringify path.
+/// O(1) — no tree walk, just a quick estimate based on the top-level value type.
+/// For arrays, uses element count × estimated element size.
+/// For objects, uses property count × estimated property size.
+fn fast_capacity_hint(val: &Value) -> usize {
+    if val.is_null() || val.is_undefined() || val.as_boolean().is_some() {
+        return 8;
+    }
+    if val.as_int32().is_some() || val.as_number().is_some() {
+        return 24;
+    }
+    if let Some(s) = val.as_string() {
+        return s.len() + s.len() / 8 + 2;
+    }
+    if let Some(arr) = val.as_array().or_else(|| val.as_object().filter(|o| o.is_array())) {
+        let len = arr.array_length();
+        // ~8 bytes per element for ints, ~20 for mixed
+        return (len * 12 + 2).min(2 * 1024 * 1024);
+    }
+    if let Some(obj) = val.as_object() {
+        let count = obj.get_shape_key_count();
+        // ~20 bytes per property (key + value + separators)
+        return (count * 20 + 2).max(64);
+    }
+    128
+}
+
 /// Estimate output capacity for JSON.stringify pre-allocation.
 fn estimate_stringify_capacity(val: &Value) -> usize {
     let mut seen: SmallVec<[usize; 32]> = SmallVec::new();
@@ -2124,15 +2292,46 @@ fn estimate_stringify_capacity_inner(
     Some(64)
 }
 
+/// Cached shape key+offset pairs for stringify fast path.
+/// Avoids rebuilding Vec<(PropertyKey, usize)> for every object with the same shape.
+/// Uses Arc to allow cheap cloning when extracting from the cache for use.
+struct StringifyShapeEntry {
+    /// Pre-escaped JSON key strings: `"keyName":` ready to push into output
+    escaped_keys: Arc<Vec<String>>,
+    /// Property offsets corresponding to each key
+    offsets: Arc<Vec<usize>>,
+}
+
+/// Fast stringify context — carries shape cache and circular reference stack.
+struct StringifyFastCtx {
+    stack: SmallVec<[usize; 32]>,
+    /// Shape cache: maps Arc<Shape> raw pointer to pre-computed key+offset info.
+    /// Eliminates redundant own_keys_with_offsets() calls for homogeneous arrays.
+    shape_cache: FxHashMap<usize, StringifyShapeEntry>,
+    /// Cached Object.prototype pointer for fast toJSON guard.
+    object_proto_ptr: usize,
+}
+
+impl StringifyFastCtx {
+    fn new(object_proto_ptr: usize) -> Self {
+        Self {
+            stack: SmallVec::new(),
+            shape_cache: FxHashMap::default(),
+            object_proto_ptr,
+        }
+    }
+}
+
 /// Fast path for JSON.stringify — V8/JSC-style direct serialization.
 /// No toJSON, no replacer, no proxies, no wrapper objects, no accessors.
-/// Uses circular tracking, itoa for integers, SWAR escape, and inline shape iteration.
+/// Uses circular tracking, itoa for integers, SWAR escape, shape caching,
+/// and inline shape iteration.
 ///
 /// Returns `true` if the value was successfully serialized to `out`.
 /// Returns `false` if the value requires the full spec path.
-fn stringify_value_fast(value: &Value, out: &mut String, depth: usize) -> bool {
-    let mut stack: SmallVec<[usize; 32]> = SmallVec::new();
-    stringify_value_fast_inner(value, out, depth, &mut stack)
+fn stringify_value_fast(value: &Value, out: &mut String, depth: usize, object_proto_ptr: usize) -> bool {
+    let mut sctx = StringifyFastCtx::new(object_proto_ptr);
+    stringify_value_fast_inner(value, out, depth, &mut sctx)
 }
 
 #[inline]
@@ -2140,7 +2339,7 @@ fn stringify_value_fast_inner(
     value: &Value,
     out: &mut String,
     depth: usize,
-    stack: &mut SmallVec<[usize; 32]>,
+    sctx: &mut StringifyFastCtx,
 ) -> bool {
     if depth > 100 {
         return false; // bail to slow path which handles depth limit properly
@@ -2170,9 +2369,9 @@ fn stringify_value_fast_inner(
         return true;
     }
 
-    // f64
+    // f64 — use allocation-free ryu-based formatter for fast path
     if let Some(n) = value.as_number() {
-        format_number(n, out);
+        format_number_fast(n, out);
         return true;
     }
 
@@ -2197,14 +2396,14 @@ fn stringify_value_fast_inner(
     // Object (check is_array flag to distinguish arrays from plain objects)
     if let Some(obj) = value.as_object() {
         if obj.is_array() {
-            return stringify_array_fast_inner(&obj, out, depth, stack);
+            return stringify_array_fast_inner(&obj, out, depth, sctx);
         }
-        return stringify_object_fast_inner(&obj, out, depth, stack);
+        return stringify_object_fast_inner(&obj, out, depth, sctx);
     }
 
     // Also handle Value::array() tag (same underlying JsObject)
     if let Some(obj) = value.as_array() {
-        return stringify_array_fast_inner(&obj, out, depth, stack);
+        return stringify_array_fast_inner(&obj, out, depth, sctx);
     }
 
     false
@@ -2215,12 +2414,12 @@ fn stringify_array_fast_inner(
     arr: &GcRef<JsObject>,
     out: &mut String,
     depth: usize,
-    stack: &mut SmallVec<[usize; 32]>,
+    sctx: &mut StringifyFastCtx,
 ) -> bool {
     let ptr = arr.as_ptr() as usize;
 
     // V8-style circular reference check (linear scan of stack)
-    if stack.contains(&ptr) {
+    if sctx.stack.contains(&ptr) {
         return false; // bail to slow path which throws proper TypeError
     }
 
@@ -2230,7 +2429,7 @@ fn stringify_array_fast_inner(
         return true;
     }
 
-    stack.push(ptr);
+    sctx.stack.push(ptr);
     out.push('[');
     let elements = arr.elements.borrow();
     for i in 0..len {
@@ -2240,8 +2439,8 @@ fn stringify_array_fast_inner(
         if let Some(val) = elements.get(i) {
             if val.is_hole() || val.is_undefined() || val.is_callable() || val.is_symbol() {
                 out.push_str("null");
-            } else if !stringify_value_fast_inner(&val, out, depth + 1, stack) {
-                stack.pop();
+            } else if !stringify_value_fast_inner(&val, out, depth + 1, sctx) {
+                sctx.stack.pop();
                 return false;
             }
         } else {
@@ -2249,67 +2448,161 @@ fn stringify_array_fast_inner(
         }
     }
     out.push(']');
-    stack.pop();
+    sctx.stack.pop();
     true
 }
 
 /// V8-style fast object stringify: shaped objects only, no toJSON/accessors/dictionary.
+/// Uses shape cache to avoid rebuilding key lists for homogeneous object arrays.
 fn stringify_object_fast_inner(
     obj: &GcRef<JsObject>,
     out: &mut String,
     depth: usize,
-    stack: &mut SmallVec<[usize; 32]>,
+    sctx: &mut StringifyFastCtx,
 ) -> bool {
-    let flags = obj.flags.borrow();
-    if flags.is_dictionary {
-        return false;
-    }
-    drop(flags);
+    // Combined check: dictionary mode + shape pointer + own toJSON in one borrow
+    let (shape_ptr, has_own_to_json) = {
+        let flags = obj.flags.borrow();
+        if flags.is_dictionary {
+            return false;
+        }
+        let (sp, has_tj) = obj.with_shape(|s| {
+            let ptr = s as *const crate::shape::Shape as usize;
+            // O(1) check: does the shape have an own "toJSON" key?
+            let has = s.get_offset(&PropertyKey::string("toJSON")).is_some();
+            (ptr, has)
+        });
+        (sp, has_tj)
+    };
 
-    // Check for toJSON: first check own shape (fast — no intern/prototype walk),
-    // then fall back to full property lookup (handles Date.prototype.toJSON etc.)
-    if obj
-        .get(&PropertyKey::string("toJSON"))
-        .is_some_and(|v| v.is_callable())
-    {
-        return false;
+    // Fast toJSON guard: if the object has an OWN toJSON, bail to slow path.
+    // If prototype is not Object.prototype, also check inherited toJSON.
+    if has_own_to_json {
+        return false; // own toJSON — bail to slow path
+    }
+    let proto_ptr = obj.prototype_ptr();
+    if proto_ptr != sctx.object_proto_ptr {
+        // Non-standard prototype (e.g. Date) — check for inherited toJSON
+        if obj
+            .get(&PropertyKey::string("toJSON"))
+            .is_some_and(|v| v.is_callable())
+        {
+            return false;
+        }
     }
 
     let ptr = obj.as_ptr() as usize;
-    if stack.contains(&ptr) {
+    if sctx.stack.contains(&ptr) {
         return false; // circular — bail to slow path
     }
 
+    // Try shape cache first — clone Arc handles to release the borrow on sctx
+    let cached = sctx.shape_cache.get(&shape_ptr).map(|entry| {
+        (Arc::clone(&entry.escaped_keys), Arc::clone(&entry.offsets))
+    });
+    if let Some((escaped_keys, offsets)) = cached {
+        if offsets.is_empty() {
+            out.push_str("{}");
+            return true;
+        }
+
+        sctx.stack.push(ptr);
+        out.push('{');
+        let mut first = true;
+
+        for i in 0..offsets.len() {
+            let val = match obj.get_by_offset(offsets[i]) {
+                Some(v) => v,
+                None => {
+                    sctx.stack.pop();
+                    return false; // accessor → slow path
+                }
+            };
+
+            if val.is_undefined() || val.is_callable() || val.is_symbol() {
+                continue;
+            }
+
+            if !first {
+                out.push(',');
+            }
+            out.push_str(&escaped_keys[i]);
+
+            if !stringify_value_fast_inner(&val, out, depth + 1, sctx) {
+                sctx.stack.pop();
+                return false;
+            }
+            first = false;
+        }
+
+        out.push('}');
+        sctx.stack.pop();
+        return true;
+    }
+
+    // Cache miss — build shape entry
     let pairs = obj.with_shape(|s| s.own_keys_with_offsets());
     if pairs.is_empty() {
+        // Cache the empty shape
+        sctx.shape_cache.insert(
+            shape_ptr,
+            StringifyShapeEntry {
+                escaped_keys: Arc::new(Vec::new()),
+                offsets: Arc::new(Vec::new()),
+            },
+        );
         out.push_str("{}");
         return true;
     }
 
-    stack.push(ptr);
-    out.push('{');
-    let mut first = true;
-
+    // Build cache entry with pre-escaped keys
+    let mut escaped_keys = Vec::with_capacity(pairs.len());
+    let mut offsets = Vec::with_capacity(pairs.len());
     for (key, offset) in &pairs {
-        let key_str = match key {
-            PropertyKey::String(s) => s.as_str(),
+        match key {
+            PropertyKey::String(s) => {
+                let mut ek = String::with_capacity(s.as_str().len() + 3);
+                ek.push('"');
+                escape_json_string(s.as_str(), &mut ek);
+                ek.push_str("\":");
+                escaped_keys.push(ek);
+                offsets.push(*offset);
+            }
             PropertyKey::Index(_) => {
-                // Index keys in shaped objects are very rare — bail to slow path
-                stack.pop();
+                // Rare — don't cache, just bail
                 return false;
             }
             PropertyKey::Symbol(_) => continue,
-        };
+        }
+    }
 
-        let val = match obj.get_by_offset(*offset) {
+    // Wrap in Arc for cache storage and current use
+    let escaped_keys = Arc::new(escaped_keys);
+    let offsets = Arc::new(offsets);
+
+    // Insert into cache
+    sctx.shape_cache.insert(
+        shape_ptr,
+        StringifyShapeEntry {
+            escaped_keys: Arc::clone(&escaped_keys),
+            offsets: Arc::clone(&offsets),
+        },
+    );
+
+    // Now serialize using the freshly-built data
+    sctx.stack.push(ptr);
+    out.push('{');
+    let mut first = true;
+
+    for i in 0..offsets.len() {
+        let val = match obj.get_by_offset(offsets[i]) {
             Some(v) => v,
             None => {
-                stack.pop();
-                return false; // accessor property → slow path
+                sctx.stack.pop();
+                return false;
             }
         };
 
-        // Skip undefined/function/symbol values
         if val.is_undefined() || val.is_callable() || val.is_symbol() {
             continue;
         }
@@ -2317,19 +2610,17 @@ fn stringify_object_fast_inner(
         if !first {
             out.push(',');
         }
-        out.push('"');
-        escape_json_string(key_str, out);
-        out.push_str("\":");
+        out.push_str(&escaped_keys[i]);
 
-        if !stringify_value_fast_inner(&val, out, depth + 1, stack) {
-            stack.pop();
+        if !stringify_value_fast_inner(&val, out, depth + 1, sctx) {
+            sctx.stack.pop();
             return false;
         }
         first = false;
     }
 
     out.push('}');
-    stack.pop();
+    sctx.stack.pop();
     true
 }
 

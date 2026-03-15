@@ -14,7 +14,7 @@ use crate::async_context::SavedFrame;
 use crate::error::{VmError, VmResult};
 use crate::gc::GcRef;
 use crate::interpreter::PreferredType;
-use crate::object::JsObject;
+use crate::object::{JsObject, PropertyKey};
 use crate::promise::JsPromise;
 use crate::realm::{RealmId, RealmRegistry};
 use crate::string::JsString;
@@ -774,6 +774,11 @@ pub struct VmContext {
     /// Cached String.prototype for fast string method dispatch.
     /// Lazily populated on first use, avoids get_global("String") per string op.
     string_prototype_cache: Option<GcRef<JsObject>>,
+    /// Cached Object.prototype for JSON fast paths.
+    /// Lazily populated on first use, avoids global property walk per JSON call.
+    json_object_prototype_cache: Option<Value>,
+    /// Cached Array.prototype for JSON fast paths.
+    json_array_prototype_cache: Option<Value>,
 }
 
 /// Trait for JS job queue access (allows runtime to inject the queue)
@@ -970,6 +975,8 @@ impl VmContext {
             json_shape_cache: FxHashMap::default(),
             cached_proto_epoch: crate::object::get_proto_epoch(),
             string_prototype_cache: None,
+            json_object_prototype_cache: None,
+            json_array_prototype_cache: None,
         }
     }
 
@@ -1020,6 +1027,48 @@ impl VmContext {
                 shape,
             },
         );
+    }
+
+    /// Get cached Object.prototype for JSON, populating lazily from intrinsics or global.
+    pub(crate) fn json_object_prototype(&mut self) -> Value {
+        if let Some(v) = self.json_object_prototype_cache {
+            return v;
+        }
+        // Try intrinsics first (fast path)
+        let proto = self
+            .realm_intrinsics(self.realm_id)
+            .map(|i| Value::object(i.object_prototype))
+            .unwrap_or_else(|| {
+                // Fallback to global walk
+                let global = self.global();
+                global
+                    .get(&PropertyKey::string("Object"))
+                    .and_then(|o| o.as_object())
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .unwrap_or_else(Value::null)
+            });
+        self.json_object_prototype_cache = Some(proto);
+        proto
+    }
+
+    /// Get cached Array.prototype for JSON, populating lazily from intrinsics or global.
+    pub(crate) fn json_array_prototype(&mut self) -> Value {
+        if let Some(v) = self.json_array_prototype_cache {
+            return v;
+        }
+        let proto = self
+            .realm_intrinsics(self.realm_id)
+            .map(|i| Value::object(i.array_prototype))
+            .unwrap_or_else(|| {
+                let global = self.global();
+                global
+                    .get(&PropertyKey::string("Array"))
+                    .and_then(|o| o.as_object())
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .unwrap_or_else(Value::null)
+            });
+        self.json_array_prototype_cache = Some(proto);
+        proto
     }
 
     /// Set captured module exports.
@@ -3289,6 +3338,14 @@ impl VmContext {
             for key in &entry.keys {
                 roots.push(key.header() as *const _);
             }
+        }
+
+        // Add cached JSON prototypes.
+        if let Some(v) = &self.json_object_prototype_cache {
+            v.trace(&mut |header| roots.push(header));
+        }
+        if let Some(v) = &self.json_array_prototype_cache {
+            v.trace(&mut |header| roots.push(header));
         }
 
         // Add open upvalues

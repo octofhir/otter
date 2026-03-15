@@ -3934,6 +3934,17 @@ impl JsObject {
         *self.prototype.borrow()
     }
 
+    /// Get the raw pointer identity of the prototype object (for fast comparison).
+    /// Returns 0 for null/non-object prototypes.
+    #[inline]
+    pub fn prototype_ptr(&self) -> usize {
+        let proto = *self.prototype.borrow();
+        proto
+            .as_object()
+            .map(|o| o.as_ptr() as usize)
+            .unwrap_or(0)
+    }
+
     /// Set prototype
     /// Returns false if object is not extensible, if it would create a cycle,
     /// or if the chain would be too deep

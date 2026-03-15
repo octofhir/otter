@@ -4663,7 +4663,10 @@ mod tests {
         // Validate that shape_tag is read correctly after construction
         let obj = JsObject::new(crate::value::Value::null());
         let tag = obj.shape_tag.get();
-        assert_ne!(tag, 0, "shape_tag should be non-zero (Shape IDs start at 1)");
+        assert_ne!(
+            tag, 0,
+            "shape_tag should be non-zero (Shape IDs start at 1)"
+        );
         assert_eq!(tag, obj.shape.borrow().id);
     }
 
@@ -4685,10 +4688,10 @@ mod tests {
         let meta_offset = (meta_data - base) as i32;
 
         // These should match what compute_jsobject_layout computes
-        let expected_slots = (std::mem::offset_of!(JsObject, inline_slots)
-            + std::mem::size_of::<isize>()) as i32;
-        let expected_meta = (std::mem::offset_of!(JsObject, inline_meta)
-            + std::mem::size_of::<isize>()) as i32;
+        let expected_slots =
+            (std::mem::offset_of!(JsObject, inline_slots) + std::mem::size_of::<isize>()) as i32;
+        let expected_meta =
+            (std::mem::offset_of!(JsObject, inline_meta) + std::mem::size_of::<isize>()) as i32;
 
         assert_eq!(
             slots_offset, expected_slots,

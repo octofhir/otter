@@ -1521,17 +1521,11 @@ pub(crate) fn emit_specialized_arith(
         SpecializationHint::Float64 => emit_guarded_f64_arith(builder, op, lhs, rhs),
         SpecializationHint::Numeric => emit_guarded_numeric_arith(builder, op, lhs, rhs),
         SpecializationHint::Generic => {
-            // Can't specialize — emit immediate bailout
-            let slow_block = builder.create_block();
-            let merge_block = builder.create_block();
-            builder.append_block_param(merge_block, types::I64);
-            builder.ins().jump(slow_block, &[]);
-            let result = builder.block_params(merge_block)[0];
-            GuardedResult {
-                merge_block,
-                slow_block,
-                result,
-            }
+            // No type feedback — still try numeric inline (i32 → f64 → slow).
+            // If operands are numeric (common even with Generic feedback), we
+            // save the full helper call (~40ns). If non-numeric, the type check
+            // fails in ~2 instructions (~3ns overhead) before falling to helper.
+            emit_guarded_numeric_arith(builder, op, lhs, rhs)
         }
     }
 }
@@ -1729,9 +1723,7 @@ pub(crate) fn emit_raw_i32_arith(
         ArithOp::Mul => builder.ins().smul_overflow(lhs, rhs),
     };
 
-    builder
-        .ins()
-        .brif(overflow, slow_block, &[], ok_block, &[]);
+    builder.ins().brif(overflow, slow_block, &[], ok_block, &[]);
 
     builder.switch_to_block(ok_block);
     builder

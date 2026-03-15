@@ -500,7 +500,10 @@ fn register_read_later_anywhere(
     // Scan forward from after_pc_exclusive+1, but stop at the first
     // instruction that REDEFINES the register (since any later reads
     // refer to the new definition, not the old one).
-    for instruction in instructions.iter().skip(after_pc_exclusive.saturating_add(1)) {
+    for instruction in instructions
+        .iter()
+        .skip(after_pc_exclusive.saturating_add(1))
+    {
         if instruction_reads_register(instruction, reg) {
             return true;
         }
@@ -735,10 +738,7 @@ fn build_wrapping_set(
                 continue; // dead result — conservative, don't mark
             }
 
-            if uses
-                .iter()
-                .all(|&u| is_bitwise(u) || wrapping.contains(&u))
-            {
+            if uses.iter().all(|&u| is_bitwise(u) || wrapping.contains(&u)) {
                 wrapping.insert(pc);
                 changed = true;
             }
@@ -1178,6 +1178,16 @@ pub fn can_translate_function_with_helpers(function: &Function, constants: &[Con
     can_translate_impl(function, constants, true)
 }
 
+/// Maximum function size for JIT compilation (instructions).
+/// Functions beyond this are too expensive to compile (O(n²) regalloc)
+/// and rarely benefit from JIT (usually cold sprawling code).
+const MAX_JIT_FUNCTION_SIZE: usize = 2000;
+
+/// Minimum ratio of inlineable instructions for JIT to be profitable.
+/// If < 20% of instructions can be executed inline (rest are helper calls),
+/// the function gains minimal benefit from JIT.
+const MIN_INLINE_RATIO: f64 = 0.15;
+
 fn can_translate_impl(function: &Function, constants: &[Constant], has_helpers: bool) -> bool {
     if function.flags.has_rest
         || function.flags.uses_arguments
@@ -1189,10 +1199,47 @@ fn can_translate_impl(function: &Function, constants: &[Constant], has_helpers: 
         return false;
     }
 
-    let instruction_count = function.instructions.read().len();
+    let instructions = function.instructions.read();
+    let instruction_count = instructions.len();
     if instruction_count == 0 {
         return true;
     }
+
+    // Profitability: reject very large functions (compilation cost too high)
+    if instruction_count > MAX_JIT_FUNCTION_SIZE {
+        return false;
+    }
+
+    // Profitability: check instruction mix — skip functions that are mostly helper calls.
+    // Count instructions that execute purely in Cranelift IR (arithmetic, comparisons,
+    // control flow, local access) vs instructions that require helper FFI calls.
+    if has_helpers && instruction_count > 20 {
+        let mut inline_count = 0usize;
+        let mut has_backward_jump = false;
+        for (pc, inst) in instructions.iter().enumerate() {
+            if is_supported_baseline_opcode(inst) {
+                inline_count += 1;
+            }
+            // Check for backward jumps (loops) — main source of JIT benefit
+            match inst {
+                Instruction::Jump { offset }
+                | Instruction::JumpIfTrue { offset, .. }
+                | Instruction::JumpIfFalse { offset, .. } => {
+                    if offset.offset() < 0 || (offset.offset() as usize) < pc {
+                        has_backward_jump = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ratio = inline_count as f64 / instruction_count as f64;
+        // Functions without loops AND low inline ratio are poor JIT candidates.
+        // Functions WITH loops always get compiled (loops are the primary JIT benefit).
+        if !has_backward_jump && ratio < MIN_INLINE_RATIO {
+            return false;
+        }
+    }
+    drop(instructions);
 
     let opcode_check = if has_helpers {
         is_supported_with_helpers
@@ -1301,6 +1348,11 @@ struct VersionedLoop {
     /// PCs where arithmetic ops can use wrapping i32 (no overflow check).
     /// Built by backwards truncation analysis (V8/JSC-style).
     wrapping_pcs: std::collections::HashSet<usize>,
+    /// Map: obj_register → cached raw pointer Variable (shape pre-verified in pre-header).
+    /// For property reads on loop-invariant objects, the tag check + shape check + pointer
+    /// extraction is hoisted to the pre-header. Loop body uses the cached pointer directly
+    /// (just a load from inline_slots — one instruction instead of ~11).
+    shape_hoisted_ptrs: std::collections::HashMap<u16, Variable>,
 }
 
 /// Read a register as raw i32 in a versioned loop body.
@@ -1731,9 +1783,7 @@ fn emit_tier_up_budget_check(
         .ins()
         .iadd_imm(ctx_ptr, JIT_CTX_BAILOUT_PC_OFFSET as i64);
     let pc_val = builder.ins().iconst(types::I64, bailout_pc as i64);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), pc_val, pc_addr, 0);
+    builder.ins().store(MemFlags::trusted(), pc_val, pc_addr, 0);
     builder.ins().return_(&[sentinel]);
 }
 
@@ -1801,14 +1851,16 @@ fn emit_inline_prop_read(
         .ins()
         .load(types::I8, MemFlags::trusted(), obj_ptr, meta_byte_offset);
     let meta_i32 = builder.ins().uextend(types::I32, meta);
-    let kind_mask = builder.ins().iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_MASK);
+    let kind_mask = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_MASK);
     let kind = builder.ins().band(meta_i32, kind_mask);
-    let data_kind = builder.ins().iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
+    let data_kind = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
     let is_data = builder.ins().icmp(IntCC::Equal, kind, data_kind);
     let data_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(is_data, data_ok, &[], slow_block, &[]);
+    builder.ins().brif(is_data, data_ok, &[], slow_block, &[]);
 
     builder.switch_to_block(data_ok);
 
@@ -1817,9 +1869,7 @@ fn emit_inline_prop_read(
     let value = builder
         .ins()
         .load(types::I64, MemFlags::trusted(), obj_ptr, value_byte_offset);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(value)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(value)]);
 
     // Slow path: call full GetPropConst
     builder.switch_to_block(slow_block);
@@ -1834,9 +1884,126 @@ fn emit_inline_prop_read(
     let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
     let bail_block = builder.create_block();
     let full_ok = builder.create_block();
+    builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return(builder);
+
+    builder.switch_to_block(full_ok);
     builder
         .ins()
-        .brif(full_bail, bail_block, &[], full_ok, &[]);
+        .jump(merge_block, &[BlockArg::Value(full_result)]);
+
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit polymorphic inline property read (V8/JSC-style linear scan).
+///
+/// For 2-4 shape entries with own properties (depth == 0) and offset < 8:
+/// 1. Tag check: is object pointer?
+/// 2. Extract raw pointer, load shape_tag
+/// 3. Linear scan: compare shape_tag with each entry's shape_id
+///    - Match → load meta, verify data property, load value from inline_slots
+/// 4. No match → fall to GetPropConst helper
+///
+/// Pure Cranelift IR on the fast path — zero function calls for known shapes.
+#[allow(clippy::too_many_arguments)]
+fn emit_polymorphic_inline_read(
+    builder: &mut FunctionBuilder<'_>,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    obj_val: Value,
+    ctx_ptr: Value,
+    entries: &[(u64, u32)], // (shape_id, offset) — pre-filtered: depth==0, offset<8
+    name_index: u32,
+    ic_index: u16,
+    layout: &crate::runtime_helpers::JsObjectLayoutOffsets,
+) -> Value {
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    let slow_block = builder.create_block();
+
+    // 1. Tag check: is TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder.ins().brif(is_obj, tag_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 2. Extract raw pointer + load shape_tag
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+    let shape_tag = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+
+    // 3. Linear scan over shapes
+    let mut next_check = builder.create_block();
+    for (i, &(shape_id, offset)) in entries.iter().enumerate() {
+        let is_last = i == entries.len() - 1;
+        let expected_shape = builder.ins().iconst(types::I64, shape_id as i64);
+        let shape_match = builder.ins().icmp(IntCC::Equal, shape_tag, expected_shape);
+        let hit_block = builder.create_block();
+        let miss_target = if is_last { slow_block } else { next_check };
+        builder
+            .ins()
+            .brif(shape_match, hit_block, &[], miss_target, &[]);
+
+        builder.switch_to_block(hit_block);
+
+        // Meta check: is_data?
+        let meta_byte_offset = layout.inline_meta_data + offset as i32;
+        let meta = builder
+            .ins()
+            .load(types::I8, MemFlags::trusted(), obj_ptr, meta_byte_offset);
+        let meta_i32 = builder.ins().uextend(types::I32, meta);
+        let kind_mask = builder
+            .ins()
+            .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_MASK);
+        let kind = builder.ins().band(meta_i32, kind_mask);
+        let data_kind = builder
+            .ins()
+            .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
+        let is_data = builder.ins().icmp(IntCC::Equal, kind, data_kind);
+        let data_ok = builder.create_block();
+        builder.ins().brif(is_data, data_ok, &[], slow_block, &[]);
+
+        builder.switch_to_block(data_ok);
+
+        // Load value from inline_slots
+        let value_byte_offset = layout.inline_slots_data + (offset as i32) * 8;
+        let value = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj_ptr, value_byte_offset);
+        builder.ins().jump(merge_block, &[BlockArg::Value(value)]);
+
+        if !is_last {
+            builder.switch_to_block(next_check);
+            next_check = builder.create_block();
+        }
+    }
+
+    // Slow path: full GetPropConst
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder
+        .ins()
+        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, ic_idx_val]);
+    let full_result = builder.inst_results(full_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    let full_ok = builder.create_block();
+    builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
 
     builder.switch_to_block(bail_block);
     emit_bailout_return(builder);
@@ -1937,7 +2104,9 @@ fn emit_runtime_ic_probe_read(
 
     // 6. Check offset < 8 (inline property limit)
     let inline_limit = builder.ins().iconst(types::I32, 8);
-    let offset_ok = builder.ins().icmp(IntCC::UnsignedLessThan, probe_offset, inline_limit);
+    let offset_ok = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, probe_offset, inline_limit);
     let offset_ok_block = builder.create_block();
     builder
         .ins()
@@ -1993,9 +2162,7 @@ fn emit_runtime_ic_probe_read(
         .iconst(types::I32, crate::runtime_helpers::SLOTMETA_KIND_DATA);
     let is_data = builder.ins().icmp(IntCC::Equal, kind, data_kind);
     let data_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(is_data, data_ok, &[], slow_block, &[]);
+    builder.ins().brif(is_data, data_ok, &[], slow_block, &[]);
 
     builder.switch_to_block(data_ok);
 
@@ -2009,9 +2176,7 @@ fn emit_runtime_ic_probe_read(
     let value = builder
         .ins()
         .load(types::I64, MemFlags::trusted(), value_addr, 0);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(value)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(value)]);
 
     // Slow path: call full GetPropConst helper
     builder.switch_to_block(slow_block);
@@ -2026,9 +2191,7 @@ fn emit_runtime_ic_probe_read(
     let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
     let bail_block = builder.create_block();
     let full_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(full_bail, bail_block, &[], full_ok, &[]);
+    builder.ins().brif(full_bail, bail_block, &[], full_ok, &[]);
 
     builder.switch_to_block(bail_block);
     emit_bailout_return_with_state(
@@ -2064,6 +2227,7 @@ fn emit_runtime_ic_probe_read(
 fn emit_runtime_ic_probe_write(
     builder: &mut FunctionBuilder<'_>,
     full_ref: cranelift_codegen::ir::FuncRef,
+    barrier_ref: Option<cranelift_codegen::ir::FuncRef>,
     obj_val: Value,
     write_val: Value,
     ctx_ptr: Value,
@@ -2185,9 +2349,10 @@ fn emit_runtime_ic_probe_write(
         .ins()
         .load(types::I8, MemFlags::trusted(), meta_addr, 0);
     let meta_i32 = builder.ins().uextend(types::I32, meta);
-    let dw_mask = builder
-        .ins()
-        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_DATA_WRITABLE_MASK);
+    let dw_mask = builder.ins().iconst(
+        types::I32,
+        crate::runtime_helpers::SLOTMETA_DATA_WRITABLE_MASK,
+    );
     let dw_bits = builder.ins().band(meta_i32, dw_mask);
     let dw_expected = builder
         .ins()
@@ -2200,41 +2365,65 @@ fn emit_runtime_ic_probe_write(
 
     builder.switch_to_block(dw_ok);
 
-    // 11. Value check: only inline non-heap values (no write barrier needed).
-    // Heap values have tag >= 0x7FFC (TAG_PTR_OBJECT/STRING/FUNCTION/OTHER).
-    // Non-heap: doubles, int32, undefined, null, bool — all have tag < 0x7FFC.
-    let val_tag = builder.ins().band(write_val, tag_mask);
-    let heap_threshold = builder
-        .ins()
-        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
-    let is_non_heap = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, val_tag, heap_threshold);
-    let store_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(is_non_heap, store_ok, &[], slow_block, &[]);
-
-    builder.switch_to_block(store_ok);
-
-    // 12. Direct store to inline_slots[offset]
+    // 11. Direct store to inline_slots[offset] + GC write barrier
     let slots_base = builder
         .ins()
         .iadd_imm(obj_ptr, layout.inline_slots_data as i64);
     let offset_bytes = builder.ins().ishl_imm(probe_offset_i64, 3);
     let value_addr = builder.ins().iadd(slots_base, offset_bytes);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), write_val, value_addr, 0);
-    builder.ins().jump(done_block, &[]);
+
+    if let Some(barrier) = barrier_ref {
+        // Store unconditionally (both heap and non-heap)
+        builder
+            .ins()
+            .store(MemFlags::trusted(), write_val, value_addr, 0);
+
+        // Call barrier only for heap values
+        let val_tag = builder.ins().band(write_val, tag_mask);
+        let heap_threshold = builder
+            .ins()
+            .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+        let is_heap =
+            builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, val_tag, heap_threshold);
+        let barrier_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_heap, barrier_block, &[], done_block, &[]);
+
+        builder.switch_to_block(barrier_block);
+        builder.ins().call(barrier, &[write_val]);
+        builder.ins().jump(done_block, &[]);
+    } else {
+        // No barrier — only inline non-heap values
+        let val_tag = builder.ins().band(write_val, tag_mask);
+        let heap_threshold = builder
+            .ins()
+            .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+        let is_non_heap = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, val_tag, heap_threshold);
+        let store_ok = builder.create_block();
+        builder
+            .ins()
+            .brif(is_non_heap, store_ok, &[], slow_block, &[]);
+
+        builder.switch_to_block(store_ok);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), write_val, value_addr, 0);
+        builder.ins().jump(done_block, &[]);
+    }
 
     // Slow path: call full SetPropConst helper
     builder.switch_to_block(slow_block);
     let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
     let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
-    let full_call = builder
-        .ins()
-        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val]);
+    let full_call = builder.ins().call(
+        full_ref,
+        &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val],
+    );
     let full_result = builder.inst_results(full_call)[0];
 
     let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
@@ -2325,6 +2514,167 @@ fn emit_mono_prop_with_fallback(
     builder.block_params(merge_block)[0]
 }
 
+/// Emit inline monomorphic property write (compile-time shape constant).
+///
+/// For inline properties (offset < 8) with compile-time monomorphic IC:
+/// 1. Tag check (is object pointer?)
+/// 2. Shape check (load shape_tag, compare with expected)
+/// 3. Meta check (is data + writable?)
+/// 4. Direct store to inline_slots[offset]
+/// 5. If value is heap-tagged → call GC write barrier helper
+///
+/// Falls to SetPropConst helper only on tag/shape/meta mismatch.
+/// Heap values are stored inline + barrier (no full helper round-trip).
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_prop_write(
+    builder: &mut FunctionBuilder<'_>,
+    full_ref: cranelift_codegen::ir::FuncRef,
+    barrier_ref: Option<cranelift_codegen::ir::FuncRef>,
+    obj_val: Value,
+    write_val: Value,
+    ctx_ptr: Value,
+    shape_id: u64,
+    offset: u32,
+    name_index: u32,
+    ic_index: u16,
+    layout: &crate::runtime_helpers::JsObjectLayoutOffsets,
+    pc: usize,
+    local_vars: &[Variable],
+    reg_vars: &[Variable],
+    deopt_site: Option<&DeoptResumeSite>,
+) {
+    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+
+    let done_block = builder.create_block();
+    let slow_block = builder.create_block();
+
+    // 1. Tag check: is this a TAG_PTR_OBJECT?
+    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+    let tag = builder.ins().band(obj_val, tag_mask);
+    let expected_tag = builder
+        .ins()
+        .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+    let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
+    let tag_ok = builder.create_block();
+    builder.ins().brif(is_obj, tag_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(tag_ok);
+
+    // 2. Extract raw pointer
+    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+    let obj_ptr = builder.ins().band(obj_val, payload_mask);
+
+    // 3. Shape check
+    let shape_tag = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+    let expected_shape = builder.ins().iconst(types::I64, shape_id as i64);
+    let shape_match = builder.ins().icmp(IntCC::Equal, shape_tag, expected_shape);
+    let shape_ok = builder.create_block();
+    builder
+        .ins()
+        .brif(shape_match, shape_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(shape_ok);
+
+    // 4. Meta check: is_data + is_writable (combined check)
+    let meta_byte_offset = layout.inline_meta_data + offset as i32;
+    let meta = builder
+        .ins()
+        .load(types::I8, MemFlags::trusted(), obj_ptr, meta_byte_offset);
+    let meta_i32 = builder.ins().uextend(types::I32, meta);
+    let dw_mask = builder.ins().iconst(
+        types::I32,
+        crate::runtime_helpers::SLOTMETA_DATA_WRITABLE_MASK,
+    );
+    let dw_bits = builder.ins().band(meta_i32, dw_mask);
+    let dw_expected = builder
+        .ins()
+        .iconst(types::I32, crate::runtime_helpers::SLOTMETA_DATA_WRITABLE);
+    let is_dw = builder.ins().icmp(IntCC::Equal, dw_bits, dw_expected);
+    let dw_ok = builder.create_block();
+    builder.ins().brif(is_dw, dw_ok, &[], slow_block, &[]);
+
+    builder.switch_to_block(dw_ok);
+
+    // 5. Direct store + GC write barrier
+    let value_byte_offset = layout.inline_slots_data + (offset as i32) * 8;
+
+    if let Some(barrier) = barrier_ref {
+        // Store unconditionally (both heap and non-heap values)
+        builder
+            .ins()
+            .store(MemFlags::trusted(), write_val, obj_ptr, value_byte_offset);
+
+        // Call barrier only for heap values (tag >= 0x7FFC)
+        let val_tag = builder.ins().band(write_val, tag_mask);
+        let heap_threshold = builder
+            .ins()
+            .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+        let is_heap =
+            builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, val_tag, heap_threshold);
+        let barrier_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_heap, barrier_block, &[], done_block, &[]);
+
+        builder.switch_to_block(barrier_block);
+        builder.ins().call(barrier, &[write_val]);
+        builder.ins().jump(done_block, &[]);
+    } else {
+        // No barrier available — only inline non-heap values (no GC barrier needed)
+        let val_tag = builder.ins().band(write_val, tag_mask);
+        let heap_threshold = builder
+            .ins()
+            .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+        let is_non_heap = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, val_tag, heap_threshold);
+        let store_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_non_heap, store_block, &[], slow_block, &[]);
+
+        builder.switch_to_block(store_block);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), write_val, obj_ptr, value_byte_offset);
+        builder.ins().jump(done_block, &[]);
+    }
+
+    // Slow path: full SetPropConst helper (tag/shape/meta mismatch)
+    builder.switch_to_block(slow_block);
+    let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
+    let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
+    let full_call = builder.ins().call(
+        full_ref,
+        &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val],
+    );
+    let full_result = builder.inst_results(full_call)[0];
+
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+    let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
+    let bail_block = builder.create_block();
+    builder
+        .ins()
+        .brif(full_bail, bail_block, &[], done_block, &[]);
+
+    builder.switch_to_block(bail_block);
+    emit_bailout_return_with_state(
+        builder,
+        ctx_ptr,
+        pc,
+        BailoutReason::HelperReturnedSentinel,
+        local_vars,
+        reg_vars,
+        deopt_site,
+    );
+
+    builder.switch_to_block(done_block);
+}
+
 /// Emit monomorphic property write with fallback to full SetPropConst.
 ///
 /// 1. Call SetPropMono(obj, shape_id, offset, value) — lightweight, no JitContext
@@ -2366,9 +2716,10 @@ fn emit_mono_set_with_fallback(
     builder.switch_to_block(slow_block);
     let name_idx_val = builder.ins().iconst(types::I64, name_index as i64);
     let ic_idx_val = builder.ins().iconst(types::I64, ic_index as i64);
-    let full_call = builder
-        .ins()
-        .call(full_ref, &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val]);
+    let full_call = builder.ins().call(
+        full_ref,
+        &[ctx_ptr, obj_val, name_idx_val, write_val, ic_idx_val],
+    );
     let full_result = builder.inst_results(full_call)[0];
 
     let full_bail = builder.ins().icmp(IntCC::Equal, full_result, sentinel);
@@ -2433,9 +2784,7 @@ fn emit_inline_dense_elem_with_fallback(
         .iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
     let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_tag);
     let tag_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(is_obj, tag_ok, &[], helper_block, &[]);
+    builder.ins().brif(is_obj, tag_ok, &[], helper_block, &[]);
 
     builder.switch_to_block(tag_ok);
 
@@ -2451,9 +2800,7 @@ fn emit_inline_dense_elem_with_fallback(
         JSOBJECT_ELEMENTS_KIND_OFFSET,
     );
     let kind_i32 = builder.ins().uextend(types::I32, kind);
-    let expected_kind = builder
-        .ins()
-        .iconst(types::I32, ELEMENTS_KIND_OBJECT);
+    let expected_kind = builder.ins().iconst(types::I32, ELEMENTS_KIND_OBJECT);
     let kind_ok = builder.ins().icmp(IntCC::Equal, kind_i32, expected_kind);
     let kind_check = builder.create_block();
     builder
@@ -2472,9 +2819,7 @@ fn emit_inline_dense_elem_with_fallback(
         .iconst(types::I64, 0x7FF8_0001_0000_0000_u64 as i64);
     let is_int = builder.ins().icmp(IntCC::Equal, idx_tag, expected_int_tag);
     let int_ok = builder.create_block();
-    builder
-        .ins()
-        .brif(is_int, int_ok, &[], helper_block, &[]);
+    builder.ins().brif(is_int, int_ok, &[], helper_block, &[]);
 
     builder.switch_to_block(int_ok);
 
@@ -2546,15 +2891,13 @@ fn emit_inline_dense_elem_with_fallback(
         .brif(is_hole, helper_block, &[], not_hole, &[]);
 
     builder.switch_to_block(not_hole);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(value)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(value)]);
 
     // Helper fallback: dense helper → full helper
     builder.switch_to_block(helper_block);
     let helper_result = emit_dense_elem_with_fallback(
-        builder, dense_ref, full_ref, obj_val, idx_val, ctx_ptr, ic_index,
-        pc, local_vars, reg_vars, deopt_site,
+        builder, dense_ref, full_ref, obj_val, idx_val, ctx_ptr, ic_index, pc, local_vars,
+        reg_vars, deopt_site,
     );
     builder
         .ins()
@@ -2583,16 +2926,16 @@ fn emit_dense_elem_with_fallback(
 
     // Fast path: dense array helper
     let zero = builder.ins().iconst(types::I64, 0);
-    let dense_call = builder
-        .ins()
-        .call(dense_ref, &[obj_val, idx_val, zero]);
+    let dense_call = builder.ins().call(dense_ref, &[obj_val, idx_val, zero]);
     let dense_result = builder.inst_results(dense_call)[0];
 
     let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
     let dense_bail = builder.ins().icmp(IntCC::Equal, dense_result, sentinel);
     let slow_block = builder.create_block();
     let dense_ok = builder.create_block();
-    builder.ins().brif(dense_bail, slow_block, &[], dense_ok, &[]);
+    builder
+        .ins()
+        .brif(dense_bail, slow_block, &[], dense_ok, &[]);
 
     // Dense hit → merge
     builder.switch_to_block(dense_ok);
@@ -2615,8 +2958,13 @@ fn emit_dense_elem_with_fallback(
 
     builder.switch_to_block(bail_block);
     emit_bailout_return_with_state(
-        builder, ctx_ptr, pc, BailoutReason::HelperReturnedSentinel,
-        local_vars, reg_vars, deopt_site,
+        builder,
+        ctx_ptr,
+        pc,
+        BailoutReason::HelperReturnedSentinel,
+        local_vars,
+        reg_vars,
+        deopt_site,
     );
 
     builder.switch_to_block(full_ok);
@@ -3013,8 +3361,39 @@ pub fn translate_function_with_constants(
         }
 
         // Build backwards truncation set (V8/JSC-style).
-        let wrapping_pcs =
-            build_wrapping_set(instructions_ref, info.header_pc, info.back_edge_pc);
+        let wrapping_pcs = build_wrapping_set(instructions_ref, info.header_pc, info.back_edge_pc);
+
+        // Shape hoisting: detect property reads on loop-invariant objects.
+        // Build set of registers written inside the loop body.
+        let mut shape_hoisted_ptrs = std::collections::HashMap::new();
+        {
+            let mut written_regs = std::collections::HashSet::new();
+            for inst in &instructions_ref[info.header_pc..=info.back_edge_pc] {
+                if let Some(dst) = instruction_dst_register(inst) {
+                    written_regs.insert(dst);
+                }
+            }
+            // Find GetPropConst on invariant receivers with warm monomorphic IC
+            let mut seen_obj_regs = std::collections::HashSet::new();
+            for inst in &instructions_ref[info.header_pc..=info.back_edge_pc] {
+                let (obj_reg, ic_idx) = match inst {
+                    Instruction::GetPropConst { obj, ic_index, .. } => (obj.0, *ic_index),
+                    _ => continue,
+                };
+                if written_regs.contains(&obj_reg) || seen_obj_regs.contains(&obj_reg) {
+                    continue;
+                }
+                if let Some(InlineCacheState::Monomorphic { depth: 0, offset, .. }) =
+                    ic_snapshot.get(ic_idx as usize)
+                {
+                    if (*offset as usize) < 8 {
+                        seen_obj_regs.insert(obj_reg);
+                        let ptr_var = builder.declare_var(types::I64);
+                        shape_hoisted_ptrs.insert(obj_reg, ptr_var);
+                    }
+                }
+            }
+        }
 
         header_to_preheader.insert(info.header_pc, pre_header);
         versioned.push(VersionedLoop {
@@ -3028,6 +3407,7 @@ pub fn translate_function_with_constants(
             i32_local_vars,
             local_to_i32,
             wrapping_pcs,
+            shape_hoisted_ptrs,
         });
     }
 
@@ -4020,42 +4400,47 @@ pub fn translate_function_with_constants(
                         None
                     }
                 });
+                // Polymorphic: extract own-property entries with offset < 8
+                let poly_entries: Option<Vec<(u64, u32)>> =
+                    ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                        if let InlineCacheState::Polymorphic { count, entries } = ic {
+                            let v: Vec<(u64, u32)> = entries[..(*count as usize)]
+                                .iter()
+                                .filter(|e| e.2 == 0 && (e.3 as usize) < 8)
+                                .map(|e| (e.0, e.3))
+                                .collect();
+                            if v.len() >= 2 { Some(v) } else { None }
+                        } else {
+                            None
+                        }
+                    });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
                 let layout = crate::runtime_helpers::jsobject_layout();
 
-                let result =
-                    if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
-                        if (offset as usize) < 8 {
-                            emit_inline_prop_read(
-                                builder, full_ref, obj_val, ctx_ptr,
-                                shape_id, offset, name.index(), *ic_index, &lo,
-                            )
-                        } else if let Some(mono_helper) = mono_ref {
-                            emit_mono_prop_with_fallback(
-                                builder, mono_helper, full_ref, obj_val, ctx_ptr,
-                                shape_id, offset, name.index(), *ic_index,
-                            )
-                        } else {
-                            let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
-                            let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                            emit_helper_call_with_bailout(
-                                builder, full_ref,
-                                &[ctx_ptr, obj_val, name_idx, ic_idx],
-                            )
-                        }
-                    } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
-                        emit_mono_prop_with_fallback(
-                            builder, mono_helper, full_ref, obj_val, ctx_ptr,
-                            shape_id, offset, name.index(), *ic_index,
+                let result = if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                    if (offset as usize) < 8 {
+                        emit_inline_prop_read(
+                            builder,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                            &lo,
                         )
-                    } else if let Some(lo) = layout {
-                        // Cold IC: use runtime IC probe — reads probe table at
-                        // runtime. After the first iteration warms up the IC,
-                        // subsequent iterations take the inline fast path.
-                        emit_runtime_ic_probe_read(
-                            builder, full_ref, obj_val, ctx_ptr,
-                            name.index(), *ic_index, &lo,
-                            pc, &local_vars, &reg_vars, deopt_site,
+                    } else if let Some(mono_helper) = mono_ref {
+                        emit_mono_prop_with_fallback(
+                            builder,
+                            mono_helper,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
                         )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -4065,7 +4450,57 @@ pub fn translate_function_with_constants(
                             full_ref,
                             &[ctx_ptr, obj_val, name_idx, ic_idx],
                         )
-                    };
+                    }
+                } else if let (Some(ref pe), Some(lo)) = (poly_entries, layout) {
+                    // Polymorphic inline reads: 2-4 shape linear scan
+                    emit_polymorphic_inline_read(
+                        builder,
+                        full_ref,
+                        obj_val,
+                        ctx_ptr,
+                        pe,
+                        name.index(),
+                        *ic_index,
+                        &lo,
+                    )
+                } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                    emit_mono_prop_with_fallback(
+                        builder,
+                        mono_helper,
+                        full_ref,
+                        obj_val,
+                        ctx_ptr,
+                        shape_id,
+                        offset,
+                        name.index(),
+                        *ic_index,
+                    )
+                } else if let Some(lo) = layout {
+                    // Cold IC: use runtime IC probe — reads probe table at
+                    // runtime. After the first iteration warms up the IC,
+                    // subsequent iterations take the inline fast path.
+                    emit_runtime_ic_probe_read(
+                        builder,
+                        full_ref,
+                        obj_val,
+                        ctx_ptr,
+                        name.index(),
+                        *ic_index,
+                        &lo,
+                        pc,
+                        &local_vars,
+                        &reg_vars,
+                        deopt_site,
+                    )
+                } else {
+                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    emit_helper_call_with_bailout(
+                        builder,
+                        full_ref,
+                        &[ctx_ptr, obj_val, name_idx, ic_idx],
+                    )
+                };
                 write_reg(builder, &reg_vars, *dst, result);
             }
             // Superinstruction: fused GetLocal + GetPropConst
@@ -4096,36 +4531,30 @@ pub fn translate_function_with_constants(
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::GetPropMono));
                 let layout = crate::runtime_helpers::jsobject_layout();
 
-                let result =
-                    if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
-                        if (offset as usize) < 8 {
-                            emit_inline_prop_read(
-                                builder, full_ref, obj_val, ctx_ptr,
-                                shape_id, offset, name.index(), *ic_index, &lo,
-                            )
-                        } else if let Some(mono_helper) = mono_ref {
-                            emit_mono_prop_with_fallback(
-                                builder, mono_helper, full_ref, obj_val, ctx_ptr,
-                                shape_id, offset, name.index(), *ic_index,
-                            )
-                        } else {
-                            let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
-                            let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                            emit_helper_call_with_bailout(
-                                builder, full_ref,
-                                &[ctx_ptr, obj_val, name_idx, ic_idx],
-                            )
-                        }
-                    } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
-                        emit_mono_prop_with_fallback(
-                            builder, mono_helper, full_ref, obj_val, ctx_ptr,
-                            shape_id, offset, name.index(), *ic_index,
+                let result = if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                    if (offset as usize) < 8 {
+                        emit_inline_prop_read(
+                            builder,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                            &lo,
                         )
-                    } else if let Some(lo) = layout {
-                        emit_runtime_ic_probe_read(
-                            builder, full_ref, obj_val, ctx_ptr,
-                            name.index(), *ic_index, &lo,
-                            pc, &local_vars, &reg_vars, deopt_site,
+                    } else if let Some(mono_helper) = mono_ref {
+                        emit_mono_prop_with_fallback(
+                            builder,
+                            mono_helper,
+                            full_ref,
+                            obj_val,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
                         )
                     } else {
                         let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -4135,7 +4564,42 @@ pub fn translate_function_with_constants(
                             full_ref,
                             &[ctx_ptr, obj_val, name_idx, ic_idx],
                         )
-                    };
+                    }
+                } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                    emit_mono_prop_with_fallback(
+                        builder,
+                        mono_helper,
+                        full_ref,
+                        obj_val,
+                        ctx_ptr,
+                        shape_id,
+                        offset,
+                        name.index(),
+                        *ic_index,
+                    )
+                } else if let Some(lo) = layout {
+                    emit_runtime_ic_probe_read(
+                        builder,
+                        full_ref,
+                        obj_val,
+                        ctx_ptr,
+                        name.index(),
+                        *ic_index,
+                        &lo,
+                        pc,
+                        &local_vars,
+                        &reg_vars,
+                        deopt_site,
+                    )
+                } else {
+                    let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    emit_helper_call_with_bailout(
+                        builder,
+                        full_ref,
+                        &[ctx_ptr, obj_val, name_idx, ic_idx],
+                    )
+                };
                 write_reg(builder, &reg_vars, *dst, result);
             }
             Instruction::SetPropConst {
@@ -4165,10 +4629,51 @@ pub fn translate_function_with_constants(
                     }
                 });
                 let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
+                let barrier_ref = helpers.and_then(|h| h.get(HelperKind::GcWriteBarrier));
 
                 let layout = crate::runtime_helpers::jsobject_layout();
 
-                if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
+                if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                    if (offset as usize) < 8 {
+                        // Inline write: direct Cranelift store + barrier, no full helper
+                        emit_inline_prop_write(
+                            builder,
+                            full_ref,
+                            barrier_ref,
+                            obj_val,
+                            value,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                            &lo,
+                            pc,
+                            &local_vars,
+                            &reg_vars,
+                            deopt_site,
+                        );
+                    } else if let Some(mono_helper) = mono_ref {
+                        emit_mono_set_with_fallback(
+                            builder,
+                            mono_helper,
+                            full_ref,
+                            obj_val,
+                            value,
+                            ctx_ptr,
+                            shape_id,
+                            offset,
+                            name.index(),
+                            *ic_index,
+                        );
+                    } else {
+                        let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                        let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                        builder
+                            .ins()
+                            .call(full_ref, &[ctx_ptr, obj_val, name_idx, value, ic_idx]);
+                    }
+                } else if let (Some((shape_id, offset)), Some(mono_helper)) = (mono_ic, mono_ref) {
                     emit_mono_set_with_fallback(
                         builder,
                         mono_helper,
@@ -4184,9 +4689,19 @@ pub fn translate_function_with_constants(
                 } else if let Some(lo) = layout {
                     // Cold IC: runtime IC probe for writes
                     emit_runtime_ic_probe_write(
-                        builder, full_ref, obj_val, value, ctx_ptr,
-                        name.index(), *ic_index, &lo,
-                        pc, &local_vars, &reg_vars, deopt_site,
+                        builder,
+                        full_ref,
+                        barrier_ref,
+                        obj_val,
+                        value,
+                        ctx_ptr,
+                        name.index(),
+                        *ic_index,
+                        &lo,
+                        pc,
+                        &local_vars,
+                        &reg_vars,
+                        deopt_site,
                     );
                 } else {
                     let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
@@ -5285,33 +5800,81 @@ pub fn translate_function_with_constants(
                 val,
                 shape_id,
                 offset,
-                ..
+                name,
+                ic_index,
             } => {
                 let obj_val = read_reg(builder, &reg_vars, *obj);
                 let value = read_reg(builder, &reg_vars, *val);
-                let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
-                if let Some(mono_helper) = mono_ref {
-                    let shape_const = builder.ins().iconst(types::I64, *shape_id as i64);
-                    let offset_const = builder.ins().iconst(types::I64, *offset as i64);
-                    let mono_call = builder
-                        .ins()
-                        .call(mono_helper, &[obj_val, shape_const, offset_const, value]);
-                    let mono_result = builder.inst_results(mono_call)[0];
+                let layout = crate::runtime_helpers::jsobject_layout();
+                let barrier_ref = helpers.and_then(|h| h.get(HelperKind::GcWriteBarrier));
+                let full_ref = helpers.and_then(|h| h.get(HelperKind::SetPropConst));
 
-                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
-                    let is_bailout = builder.ins().icmp(IntCC::Equal, mono_result, sentinel);
-                    let bail_block = builder.create_block();
-                    let continue_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(is_bailout, bail_block, &[], continue_block, &[]);
-
-                    builder.switch_to_block(bail_block);
-                    emit_bailout_return(builder);
-
-                    builder.switch_to_block(continue_block);
+                if let (Some(lo), Some(fr)) = (layout, full_ref) {
+                    if (*offset as usize) < 8 {
+                        // Inline write: direct store + barrier
+                        emit_inline_prop_write(
+                            builder,
+                            fr,
+                            barrier_ref,
+                            obj_val,
+                            value,
+                            ctx_ptr,
+                            *shape_id,
+                            *offset,
+                            name.index(),
+                            *ic_index,
+                            &lo,
+                            pc,
+                            &local_vars,
+                            &reg_vars,
+                            deopt_site,
+                        );
+                    } else {
+                        // Overflow slot — use SetPropMono helper
+                        let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
+                        if let Some(mono_helper) = mono_ref {
+                            emit_mono_set_with_fallback(
+                                builder,
+                                mono_helper,
+                                fr,
+                                obj_val,
+                                value,
+                                ctx_ptr,
+                                *shape_id,
+                                *offset,
+                                name.index(),
+                                *ic_index,
+                            );
+                        } else {
+                            emit_bailout_return(builder);
+                        }
+                    }
                 } else {
-                    emit_bailout_return(builder);
+                    // Fallback: SetPropMono helper or bail
+                    let mono_ref = helpers.and_then(|h| h.get(HelperKind::SetPropMono));
+                    if let Some(mono_helper) = mono_ref {
+                        let shape_const = builder.ins().iconst(types::I64, *shape_id as i64);
+                        let offset_const = builder.ins().iconst(types::I64, *offset as i64);
+                        let mono_call = builder
+                            .ins()
+                            .call(mono_helper, &[obj_val, shape_const, offset_const, value]);
+                        let mono_result = builder.inst_results(mono_call)[0];
+
+                        let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                        let is_bailout = builder.ins().icmp(IntCC::Equal, mono_result, sentinel);
+                        let bail_block = builder.create_block();
+                        let continue_block = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(is_bailout, bail_block, &[], continue_block, &[]);
+
+                        builder.switch_to_block(bail_block);
+                        emit_bailout_return(builder);
+
+                        builder.switch_to_block(continue_block);
+                    } else {
+                        emit_bailout_return(builder);
+                    }
                 }
             }
             // --- Quickened string/array.length — bail out to interpreter ---
@@ -5414,8 +5977,17 @@ pub fn translate_function_with_constants(
                 let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
                 let result = if let Some(dense_helper) = dense_ref {
                     emit_inline_dense_elem_with_fallback(
-                        builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, 0,
-                        pc, &local_vars, &reg_vars, deopt_site,
+                        builder,
+                        dense_helper,
+                        full_ref,
+                        obj_val,
+                        idx_val,
+                        ctx_ptr,
+                        0,
+                        pc,
+                        &local_vars,
+                        &reg_vars,
+                        deopt_site,
                     )
                 } else {
                     let ic_idx = builder.ins().iconst(types::I64, 0);
@@ -5442,8 +6014,17 @@ pub fn translate_function_with_constants(
                 let dense_ref = helpers.and_then(|h| h.get(HelperKind::GetElemDense));
                 let result = if let Some(dense_helper) = dense_ref {
                     emit_inline_dense_elem_with_fallback(
-                        builder, dense_helper, full_ref, obj_val, idx_val, ctx_ptr, *ic_index,
-                        pc, &local_vars, &reg_vars, deopt_site,
+                        builder,
+                        dense_helper,
+                        full_ref,
+                        obj_val,
+                        idx_val,
+                        ctx_ptr,
+                        *ic_index,
+                        pc,
+                        &local_vars,
+                        &reg_vars,
+                        deopt_site,
                     )
                 } else {
                     let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
@@ -5552,40 +6133,371 @@ pub fn translate_function_with_constants(
                 argc,
                 ic_index,
             } => {
-                let helper_ref = helpers
-                    .and_then(|h| h.get(HelperKind::CallMethod))
-                    .ok_or_else(|| unsupported(pc, instruction))?;
-                let obj_val = read_reg(builder, &reg_vars, *obj);
-                let method_name_idx = builder.ins().iconst(types::I64, method.index() as i64);
-                let argc_val = builder.ins().iconst(types::I64, *argc as i64);
-                let argv_ptr = if *argc > 0 {
+                // Fast path: recognize common built-in methods at compile time
+                const PUSH_UTF16: [u16; 4] = [112, 117, 115, 104]; // "push"
+                const POP_UTF16: [u16; 3] = [112, 111, 112]; // "pop"
+
+                let push_ref = helpers.and_then(|h| h.get(HelperKind::ArrayPush));
+                let pop_ref = helpers.and_then(|h| h.get(HelperKind::ArrayPop));
+
+                if *argc == 1
+                    && is_const_utf16(constants, *method, &PUSH_UTF16)
+                    && let Some(push_helper) = push_ref
+                {
+                    // arr.push(val) → ArrayPush(arr, val) → new length
+                    let obj_val = read_reg(builder, &reg_vars, *obj);
+                    let arg_val = read_reg(builder, &reg_vars, Register(obj.0 + 1));
+                    let push_call = builder.ins().call(push_helper, &[obj_val, arg_val]);
+                    let push_result = builder.inst_results(push_call)[0];
+
+                    // If ArrayPush returns BAILOUT_SENTINEL, fall to generic CallMethod
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bail = builder.ins().icmp(IntCC::Equal, push_result, sentinel);
+                    let fast_ok = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
+                    builder.ins().brif(is_bail, slow_block, &[], fast_ok, &[]);
+
+                    builder.switch_to_block(fast_ok);
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(push_result)]);
+
+                    builder.switch_to_block(slow_block);
+                    let helper_ref = helpers
+                        .and_then(|h| h.get(HelperKind::CallMethod))
+                        .ok_or_else(|| unsupported(pc, instruction))?;
+                    let method_name_idx = builder.ins().iconst(types::I64, method.index() as i64);
+                    let argc_val = builder.ins().iconst(types::I64, 1_i64);
                     let slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
-                        (*argc as u32) * 8,
+                        8,
                         8,
                     ));
-                    for i in 0..(*argc as u16) {
-                        let arg_val = read_reg(builder, &reg_vars, Register(obj.0 + 1 + i));
-                        builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
-                    }
-                    builder.ins().stack_addr(types::I64, slot, 0)
+                    builder.ins().stack_store(arg_val, slot, 0);
+                    let argv_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    let slow_result = emit_helper_call_with_bailout(
+                        builder,
+                        helper_ref,
+                        &[
+                            ctx_ptr,
+                            obj_val,
+                            method_name_idx,
+                            argc_val,
+                            argv_ptr,
+                            ic_idx,
+                        ],
+                    );
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                    builder.switch_to_block(merge_block);
+                    let result = builder.block_params(merge_block)[0];
+                    write_reg(builder, &reg_vars, *dst, result);
+                } else if *argc == 0
+                    && is_const_utf16(constants, *method, &POP_UTF16)
+                    && let Some(pop_helper) = pop_ref
+                {
+                    // arr.pop() → ArrayPop(arr) → popped value
+                    let obj_val = read_reg(builder, &reg_vars, *obj);
+                    let pop_call = builder.ins().call(pop_helper, &[obj_val]);
+                    let pop_result = builder.inst_results(pop_call)[0];
+
+                    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                    let is_bail = builder.ins().icmp(IntCC::Equal, pop_result, sentinel);
+                    let fast_ok = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
+                    builder.ins().brif(is_bail, slow_block, &[], fast_ok, &[]);
+
+                    builder.switch_to_block(fast_ok);
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(pop_result)]);
+
+                    builder.switch_to_block(slow_block);
+                    let helper_ref = helpers
+                        .and_then(|h| h.get(HelperKind::CallMethod))
+                        .ok_or_else(|| unsupported(pc, instruction))?;
+                    let method_name_idx = builder.ins().iconst(types::I64, method.index() as i64);
+                    let argc_val = builder.ins().iconst(types::I64, 0_i64);
+                    let argv_ptr = builder.ins().iconst(types::I64, 0);
+                    let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                    let slow_result = emit_helper_call_with_bailout(
+                        builder,
+                        helper_ref,
+                        &[
+                            ctx_ptr,
+                            obj_val,
+                            method_name_idx,
+                            argc_val,
+                            argv_ptr,
+                            ic_idx,
+                        ],
+                    );
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                    builder.switch_to_block(merge_block);
+                    let result = builder.block_params(merge_block)[0];
+                    write_reg(builder, &reg_vars, *dst, result);
                 } else {
-                    builder.ins().iconst(types::I64, 0)
-                };
-                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
-                let result = emit_helper_call_with_bailout(
-                    builder,
-                    helper_ref,
-                    &[
-                        ctx_ptr,
-                        obj_val,
-                        method_name_idx,
-                        argc_val,
-                        argv_ptr,
-                        ic_idx,
-                    ],
-                );
-                write_reg(builder, &reg_vars, *dst, result);
+                    // toString() fast path: skip method resolution for primitives
+                    const TO_STRING_UTF16: [u16; 8] = [116, 111, 83, 116, 114, 105, 110, 103];
+                    let tostring_helper =
+                        helpers.and_then(|h| h.get(HelperKind::PrimitiveToString));
+
+                    if *argc == 0
+                        && is_const_utf16(constants, *method, &TO_STRING_UTF16)
+                        && let Some(ts_helper) = tostring_helper
+                    {
+                        let obj_val = read_reg(builder, &reg_vars, *obj);
+
+                        // Fast: try PrimitiveToString (1-arg, no ctx)
+                        let ts_call = builder.ins().call(ts_helper, &[obj_val]);
+                        let ts_result = builder.inst_results(ts_call)[0];
+
+                        let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
+                        let is_bail = builder.ins().icmp(IntCC::Equal, ts_result, sentinel);
+                        let fast_ok = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
+                        builder.ins().brif(is_bail, slow_block, &[], fast_ok, &[]);
+
+                        builder.switch_to_block(fast_ok);
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(ts_result)]);
+
+                        // Slow: full CallMethod for objects
+                        builder.switch_to_block(slow_block);
+                        let helper_ref = helpers
+                            .and_then(|h| h.get(HelperKind::CallMethod))
+                            .ok_or_else(|| unsupported(pc, instruction))?;
+                        let method_name_idx =
+                            builder.ins().iconst(types::I64, method.index() as i64);
+                        let argc_val = builder.ins().iconst(types::I64, 0_i64);
+                        let argv_ptr = builder.ins().iconst(types::I64, 0);
+                        let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                        let slow_result = emit_helper_call_with_bailout(
+                            builder,
+                            helper_ref,
+                            &[
+                                ctx_ptr,
+                                obj_val,
+                                method_name_idx,
+                                argc_val,
+                                argv_ptr,
+                                ic_idx,
+                            ],
+                        );
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                        builder.switch_to_block(merge_block);
+                        let result = builder.block_params(merge_block)[0];
+                        write_reg(builder, &reg_vars, *dst, result);
+                    } else {
+                        // Try IC-accelerated method call: inline resolve + CallWithReceiver
+                        let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                            if let InlineCacheState::Monomorphic {
+                                shape_id,
+                                offset,
+                                depth: 0,
+                                ..
+                            } = ic
+                            {
+                                Some((*shape_id, *offset))
+                            } else {
+                                None
+                            }
+                        });
+                        let layout = crate::runtime_helpers::jsobject_layout();
+                        let get_prop_ref = helpers.and_then(|h| h.get(HelperKind::GetPropConst));
+                        let call_recv_ref =
+                            helpers.and_then(|h| h.get(HelperKind::CallWithReceiver));
+
+                        if let (Some((shape_id, offset)), Some(lo), Some(gp_ref), Some(cr_ref)) =
+                            (mono_ic, layout, get_prop_ref, call_recv_ref)
+                        {
+                            if (offset as usize) < 8 {
+                                // Inline method resolution + CallWithReceiver
+                                let obj_val = read_reg(builder, &reg_vars, *obj);
+
+                                // Build argv before branching (stack slots are function-scoped)
+                                let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+                                let argv_ptr = if *argc > 0 {
+                                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                        StackSlotKind::ExplicitSlot,
+                                        (*argc as u32) * 8,
+                                        8,
+                                    ));
+                                    for i in 0..(*argc as u16) {
+                                        let arg_val =
+                                            read_reg(builder, &reg_vars, Register(obj.0 + 1 + i));
+                                        builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                                    }
+                                    builder.ins().stack_addr(types::I64, slot, 0)
+                                } else {
+                                    builder.ins().iconst(types::I64, 0)
+                                };
+
+                                // Inline property read to resolve method
+                                let method_val = emit_inline_prop_read(
+                                    builder,
+                                    gp_ref,
+                                    obj_val,
+                                    ctx_ptr,
+                                    shape_id,
+                                    offset,
+                                    method.index(),
+                                    *ic_index,
+                                    &lo,
+                                );
+
+                                // Call resolved method with receiver
+                                let result = emit_helper_call_with_bailout(
+                                    builder,
+                                    cr_ref,
+                                    &[ctx_ptr, method_val, obj_val, argc_val, argv_ptr],
+                                );
+                                write_reg(builder, &reg_vars, *dst, result);
+                            } else {
+                                // Overflow slot — fall to full CallMethod
+                                let helper_ref = helpers
+                                    .and_then(|h| h.get(HelperKind::CallMethod))
+                                    .ok_or_else(|| unsupported(pc, instruction))?;
+                                let obj_val = read_reg(builder, &reg_vars, *obj);
+                                let method_name_idx =
+                                    builder.ins().iconst(types::I64, method.index() as i64);
+                                let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+                                let argv_ptr = if *argc > 0 {
+                                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                        StackSlotKind::ExplicitSlot,
+                                        (*argc as u32) * 8,
+                                        8,
+                                    ));
+                                    for i in 0..(*argc as u16) {
+                                        let arg_val =
+                                            read_reg(builder, &reg_vars, Register(obj.0 + 1 + i));
+                                        builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                                    }
+                                    builder.ins().stack_addr(types::I64, slot, 0)
+                                } else {
+                                    builder.ins().iconst(types::I64, 0)
+                                };
+                                let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                                let result = emit_helper_call_with_bailout(
+                                    builder,
+                                    helper_ref,
+                                    &[
+                                        ctx_ptr,
+                                        obj_val,
+                                        method_name_idx,
+                                        argc_val,
+                                        argv_ptr,
+                                        ic_idx,
+                                    ],
+                                );
+                                write_reg(builder, &reg_vars, *dst, result);
+                            }
+                        } else if let (Some(lo), Some(gp_ref2), Some(cr_ref2)) = (
+                            crate::runtime_helpers::jsobject_layout(),
+                            helpers.and_then(|h| h.get(HelperKind::GetPropConst)),
+                            helpers.and_then(|h| h.get(HelperKind::CallWithReceiver)),
+                        ) {
+                            // Cold IC: runtime IC probe → inline resolve → CallWithReceiver
+                            let obj_val = read_reg(builder, &reg_vars, *obj);
+
+                            // Build argv before branching
+                            let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+                            let argv_ptr = if *argc > 0 {
+                                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                    StackSlotKind::ExplicitSlot,
+                                    (*argc as u32) * 8,
+                                    8,
+                                ));
+                                for i in 0..(*argc as u16) {
+                                    let arg_val =
+                                        read_reg(builder, &reg_vars, Register(obj.0 + 1 + i));
+                                    builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                                }
+                                builder.ins().stack_addr(types::I64, slot, 0)
+                            } else {
+                                builder.ins().iconst(types::I64, 0)
+                            };
+
+                            // Runtime IC probe read resolves method
+                            // (inline on probe hit, GetPropConst on miss)
+                            let method_val = emit_runtime_ic_probe_read(
+                                builder,
+                                gp_ref2,
+                                obj_val,
+                                ctx_ptr,
+                                method.index(),
+                                *ic_index,
+                                &lo,
+                                pc,
+                                &local_vars,
+                                &reg_vars,
+                                deopt_site,
+                            );
+
+                            // Call resolved method with receiver
+                            let result = emit_helper_call_with_bailout(
+                                builder,
+                                cr_ref2,
+                                &[ctx_ptr, method_val, obj_val, argc_val, argv_ptr],
+                            );
+                            write_reg(builder, &reg_vars, *dst, result);
+                        } else {
+                            // No layout available — full CallMethod
+                            let helper_ref = helpers
+                                .and_then(|h| h.get(HelperKind::CallMethod))
+                                .ok_or_else(|| unsupported(pc, instruction))?;
+                            let obj_val = read_reg(builder, &reg_vars, *obj);
+                            let method_name_idx =
+                                builder.ins().iconst(types::I64, method.index() as i64);
+                            let argc_val = builder.ins().iconst(types::I64, *argc as i64);
+                            let argv_ptr = if *argc > 0 {
+                                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                    StackSlotKind::ExplicitSlot,
+                                    (*argc as u32) * 8,
+                                    8,
+                                ));
+                                for i in 0..(*argc as u16) {
+                                    let arg_val =
+                                        read_reg(builder, &reg_vars, Register(obj.0 + 1 + i));
+                                    builder.ins().stack_store(arg_val, slot, (i as i32) * 8);
+                                }
+                                builder.ins().stack_addr(types::I64, slot, 0)
+                            } else {
+                                builder.ins().iconst(types::I64, 0)
+                            };
+                            let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                            let result = emit_helper_call_with_bailout(
+                                builder,
+                                helper_ref,
+                                &[
+                                    ctx_ptr,
+                                    obj_val,
+                                    method_name_idx,
+                                    argc_val,
+                                    argv_ptr,
+                                    ic_idx,
+                                ],
+                            );
+                            write_reg(builder, &reg_vars, *dst, result);
+                        }
+                    }
+                }
             }
             // --- CallWithReceiver ---
             Instruction::CallWithReceiver {
@@ -5676,11 +6588,25 @@ pub fn translate_function_with_constants(
                 write_reg(builder, &reg_vars, *dst, result);
             }
             Instruction::RequireCoercible { src } => {
-                let helper_ref = helpers
-                    .and_then(|h| h.get(HelperKind::RequireCoercible))
-                    .ok_or_else(|| unsupported(pc, instruction))?;
+                // Inline: bail if value is null or undefined (pure IR, no helper call)
                 let val = read_reg(builder, &reg_vars, *src);
-                emit_helper_call_with_bailout(builder, helper_ref, &[ctx_ptr, val]);
+                let is_nullish = type_guards::emit_is_nullish(builder, val);
+                let ok_block = builder.create_block();
+                let bail_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_nullish, bail_block, &[], ok_block, &[]);
+                builder.switch_to_block(bail_block);
+                emit_bailout_return_with_state(
+                    builder,
+                    ctx_ptr,
+                    pc,
+                    BailoutReason::TypeGuardFailure,
+                    &local_vars,
+                    &reg_vars,
+                    deopt_site,
+                );
+                builder.switch_to_block(ok_block);
             }
             // --- InstanceOf / In ---
             Instruction::InstanceOf {
@@ -6287,6 +7213,59 @@ pub fn translate_function_with_constants(
                 let raw = type_guards::emit_unbox_int32(builder, boxed);
                 builder.def_var(vl.i32_local_vars[j], raw);
             }
+
+            // Shape hoisting: verify object shapes and cache raw pointers.
+            // After this, loop body can load from inline_slots without any checks.
+            if !vl.shape_hoisted_ptrs.is_empty() {
+                if let Some(lo) = crate::runtime_helpers::jsobject_layout() {
+                    use crate::type_guards::{PAYLOAD_MASK, PTR_MASK};
+                    let tag_mask = builder.ins().iconst(types::I64, PTR_MASK);
+                    let expected_obj_tag = builder.ins().iconst(types::I64, 0x7FFC_0000_0000_0000_u64 as i64);
+                    let payload_mask = builder.ins().iconst(types::I64, PAYLOAD_MASK);
+
+                    // Collect shape_id for each hoisted obj register from IC snapshot
+                    for (&obj_reg, &ptr_var) in &vl.shape_hoisted_ptrs {
+                        // Find the shape_id from the first GetPropConst on this register
+                        let shape_id = instructions_ref[vl.header_pc..=vl.back_edge_pc]
+                            .iter()
+                            .find_map(|inst| match inst {
+                                Instruction::GetPropConst { obj, ic_index, .. } if obj.0 == obj_reg => {
+                                    ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                                        if let InlineCacheState::Monomorphic { shape_id, depth: 0, .. } = ic {
+                                            Some(*shape_id)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }
+                                _ => None,
+                            });
+                        let Some(sid) = shape_id else { continue };
+
+                        let obj_val = builder.use_var(reg_vars[obj_reg as usize]);
+                        // Tag check
+                        let tag = builder.ins().band(obj_val, tag_mask);
+                        let is_obj = builder.ins().icmp(IntCC::Equal, tag, expected_obj_tag);
+                        let tag_ok = builder.create_block();
+                        builder.ins().brif(is_obj, tag_ok, &[], blocks[vl.header_pc], &[]);
+                        builder.switch_to_block(tag_ok);
+                        // Extract pointer
+                        let obj_ptr = builder.ins().band(obj_val, payload_mask);
+                        // Shape check
+                        let shape_tag = builder.ins().load(types::I64, MemFlags::trusted(), obj_ptr, 0);
+                        let expected_shape = builder.ins().iconst(types::I64, sid as i64);
+                        let shape_ok = builder.ins().icmp(IntCC::Equal, shape_tag, expected_shape);
+                        let shape_ok_block = builder.create_block();
+                        builder.ins().brif(shape_ok, shape_ok_block, &[], blocks[vl.header_pc], &[]);
+                        builder.switch_to_block(shape_ok_block);
+                        // Cache the raw pointer for loop body use
+                        builder.def_var(ptr_var, obj_ptr);
+                    }
+
+                    let _ = lo; // used for inline_slots_data offset in loop body
+                }
+            }
+
             builder.ins().jump(vl.opt_blocks[0], &[]);
         } else {
             // No registers to check (shouldn't happen for qualified loops)
@@ -6959,6 +7938,138 @@ pub fn translate_function_with_constants(
                     // Not captured — treat as no-op in the versioned path
                 }
                 Instruction::Nop => {}
+                // --- Inline property reads in versioned loops ---
+                // If shape was hoisted to pre-header: direct load, ZERO checks (~1 instruction).
+                // Otherwise: full inline read with shape check (~11 instructions).
+                Instruction::GetPropConst { dst, obj, name, ic_index } => {
+                    let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                        if let InlineCacheState::Monomorphic { shape_id, offset, depth: 0, .. } = ic {
+                            Some((*shape_id, *offset))
+                        } else {
+                            None
+                        }
+                    });
+                    let layout = crate::runtime_helpers::jsobject_layout();
+
+                    // LICM fast path: shape pre-verified in pre-header → direct load
+                    if let (Some((_sid, offset)), Some(lo), Some(&ptr_var)) =
+                        (mono_ic, layout, vl.shape_hoisted_ptrs.get(&obj.0))
+                    {
+                        if (offset as usize) < 8 {
+                            let obj_ptr = builder.use_var(ptr_var);
+                            let value_byte_offset = lo.inline_slots_data + (offset as i32) * 8;
+                            let prop_val = builder.ins().load(
+                                types::I64, MemFlags::trusted(), obj_ptr, value_byte_offset,
+                            );
+                            if vl.reg_to_i32.contains_key(&dst.0) {
+                                let is_i32 = type_guards::emit_is_int32(builder, prop_val);
+                                let ok = builder.create_block();
+                                let bail = builder.create_block();
+                                builder.ins().brif(is_i32, ok, &[], bail, &[]);
+                                builder.switch_to_block(bail);
+                                materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                                builder.ins().jump(blocks[body_pc], &[]);
+                                builder.switch_to_block(ok);
+                                let raw_i32 = type_guards::emit_unbox_int32(builder, prop_val);
+                                let j = vl.reg_to_i32[&dst.0];
+                                builder.def_var(vl.i32_vars[j], raw_i32);
+                                write_reg(builder, &reg_vars, *dst, prop_val);
+                            } else {
+                                write_reg(builder, &reg_vars, *dst, prop_val);
+                            }
+                        } else {
+                            materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                            builder.ins().jump(blocks[body_pc], &[]);
+                            continue;
+                        }
+                    } else if let (Some((shape_id, offset)), Some(lo)) = (mono_ic, layout) {
+                        // Non-hoisted: full inline read with shape check
+                        if (offset as usize) < 8 {
+                            let gp_ref = helpers.and_then(|h| h.get(HelperKind::GetPropConst));
+                            if let Some(gp) = gp_ref {
+                                let obj_val = read_reg_versioned(builder, &reg_vars, vl, *obj);
+                                let prop_val = emit_inline_prop_read(
+                                    builder, gp, obj_val, ctx_ptr,
+                                    shape_id, offset, name.index(), *ic_index, &lo,
+                                );
+                                if vl.reg_to_i32.contains_key(&dst.0) {
+                                    let is_i32 = type_guards::emit_is_int32(builder, prop_val);
+                                    let ok = builder.create_block();
+                                    let bail = builder.create_block();
+                                    builder.ins().brif(is_i32, ok, &[], bail, &[]);
+                                    builder.switch_to_block(bail);
+                                    materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                                    builder.ins().jump(blocks[body_pc], &[]);
+                                    builder.switch_to_block(ok);
+                                    let raw_i32 = type_guards::emit_unbox_int32(builder, prop_val);
+                                    let j = vl.reg_to_i32[&dst.0];
+                                    builder.def_var(vl.i32_vars[j], raw_i32);
+                                    write_reg(builder, &reg_vars, *dst, prop_val);
+                                } else {
+                                    write_reg(builder, &reg_vars, *dst, prop_val);
+                                }
+                            } else {
+                                materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                                builder.ins().jump(blocks[body_pc], &[]);
+                                continue;
+                            }
+                        } else {
+                            materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                            builder.ins().jump(blocks[body_pc], &[]);
+                            continue;
+                        }
+                    } else {
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                }
+                Instruction::GetLocalProp { dst, local_idx, name, ic_index } => {
+                    let get_prop_ref = helpers.and_then(|h| h.get(HelperKind::GetPropConst));
+                    let layout = crate::runtime_helpers::jsobject_layout();
+                    let mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                        if let InlineCacheState::Monomorphic { shape_id, offset, depth: 0, .. } = ic {
+                            Some((*shape_id, *offset))
+                        } else {
+                            None
+                        }
+                    });
+                    if let (Some((shape_id, offset)), Some(lo), Some(gp_ref)) = (mono_ic, layout, get_prop_ref) {
+                        if (offset as usize) < 8 {
+                            let obj_val = read_local(builder, &local_vars, *local_idx);
+                            let prop_val = emit_inline_prop_read(
+                                builder, gp_ref, obj_val, ctx_ptr,
+                                shape_id, offset, name.index(), *ic_index, &lo,
+                            );
+                            if vl.reg_to_i32.contains_key(&dst.0) {
+                                let is_i32 = type_guards::emit_is_int32(builder, prop_val);
+                                let ok = builder.create_block();
+                                let bail = builder.create_block();
+                                builder.ins().brif(is_i32, ok, &[], bail, &[]);
+
+                                builder.switch_to_block(bail);
+                                materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                                builder.ins().jump(blocks[body_pc], &[]);
+
+                                builder.switch_to_block(ok);
+                                let raw_i32 = type_guards::emit_unbox_int32(builder, prop_val);
+                                let j = vl.reg_to_i32[&dst.0];
+                                builder.def_var(vl.i32_vars[j], raw_i32);
+                                write_reg(builder, &reg_vars, *dst, prop_val);
+                            } else {
+                                write_reg(builder, &reg_vars, *dst, prop_val);
+                            }
+                        } else {
+                            materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                            builder.ins().jump(blocks[body_pc], &[]);
+                            continue;
+                        }
+                    } else {
+                        materialize_all_i32(builder, &reg_vars, &local_vars, vl);
+                        builder.ins().jump(blocks[body_pc], &[]);
+                        continue;
+                    }
+                }
                 // --- Anything else: materialize and transfer to guarded version ---
                 _ => {
                     materialize_all_i32(builder, &reg_vars, &local_vars, vl);
@@ -7672,7 +8783,10 @@ mod tests {
             },
         ];
         let wrapping = build_wrapping_set(&instructions, 0, 2);
-        assert!(wrapping.contains(&0), "Add consumed by BitOr should be wrapping");
+        assert!(
+            wrapping.contains(&0),
+            "Add consumed by BitOr should be wrapping"
+        );
     }
 
     #[test]
@@ -7707,8 +8821,14 @@ mod tests {
             },
         ];
         let wrapping = build_wrapping_set(&instructions, 0, 3);
-        assert!(wrapping.contains(&1), "Add consumed by BitOr should be wrapping");
-        assert!(wrapping.contains(&0), "Mul consumed by wrapping Add should be wrapping");
+        assert!(
+            wrapping.contains(&1),
+            "Add consumed by BitOr should be wrapping"
+        );
+        assert!(
+            wrapping.contains(&0),
+            "Mul consumed by wrapping Add should be wrapping"
+        );
     }
 
     #[test]
@@ -7729,7 +8849,10 @@ mod tests {
             },
         ];
         let wrapping = build_wrapping_set(&instructions, 0, 1);
-        assert!(!wrapping.contains(&0), "Add consumed by Lt should NOT be wrapping");
+        assert!(
+            !wrapping.contains(&0),
+            "Add consumed by Lt should NOT be wrapping"
+        );
     }
 
     #[test]
@@ -7755,7 +8878,10 @@ mod tests {
             },
         ];
         let wrapping = build_wrapping_set(&instructions, 0, 2);
-        assert!(!wrapping.contains(&0), "Add with mixed consumers should NOT be wrapping");
+        assert!(
+            !wrapping.contains(&0),
+            "Add with mixed consumers should NOT be wrapping"
+        );
     }
 
     #[test]
@@ -7794,12 +8920,23 @@ mod tests {
             eprintln!("{:04}: {:?}", i, instr);
         }
         // Verify the loop exists and has some form of local access
-        let has_get_local = instructions.iter().any(|i| matches!(i, Instruction::GetLocal { .. }));
-        let has_get_local2 = instructions.iter().any(|i| matches!(i, Instruction::GetLocal2 { .. }));
-        let has_set_local = instructions.iter().any(|i| matches!(i, Instruction::SetLocal { .. }));
-        eprintln!("GetLocal: {}, GetLocal2: {}, SetLocal: {}", has_get_local, has_get_local2, has_set_local);
+        let has_get_local = instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::GetLocal { .. }));
+        let has_get_local2 = instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::GetLocal2 { .. }));
+        let has_set_local = instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::SetLocal { .. }));
+        eprintln!(
+            "GetLocal: {}, GetLocal2: {}, SetLocal: {}",
+            has_get_local, has_get_local2, has_set_local
+        );
         // At least one form of local access should exist
-        assert!(has_get_local || has_get_local2 || has_set_local,
-            "math loop should have local variable access");
+        assert!(
+            has_get_local || has_get_local2 || has_set_local,
+            "math loop should have local variable access"
+        );
     }
 }

@@ -227,9 +227,7 @@ impl ModuleGraph {
         // TypeScript is handled by the compiler (oxc TransformOptions) during compile_ext.
         // Only JSON needs wrapping here for the bundler.
         let compiled = match module.source_type {
-            SourceType::Json => {
-                Some(format!("module.exports = {};", module.source))
-            }
+            SourceType::Json => Some(format!("module.exports = {};", module.source)),
             _ => None,
         };
 

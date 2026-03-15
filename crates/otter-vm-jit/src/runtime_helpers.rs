@@ -225,10 +225,18 @@ pub enum HelperKind {
     GetElemDense = 88,
     /// `(ctx) -> 0_or_bailout` — JIT back-edge tier-up check (no ctx needed for the check itself)
     CheckTierUp = 89,
+    /// `(obj, value) -> new_length` — fast array push (no method resolution)
+    ArrayPush = 90,
+    /// `(obj) -> popped_value` — fast array pop (no method resolution)
+    ArrayPop = 91,
+    /// `(value_raw) -> 0` — GC write barrier for heap values stored inline by JIT (no ctx)
+    GcWriteBarrier = 92,
+    /// `(value_raw) -> string_value | BAILOUT` — primitive toString() (no ctx, no method resolution)
+    PrimitiveToString = 93,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 90;
+pub const HELPER_COUNT: usize = 94;
 
 /// Number of helper telemetry families.
 pub const HELPER_FAMILY_COUNT: usize = 10;
@@ -646,6 +654,10 @@ impl HelperKind {
             Self::SetPropMono => "otter_rt_set_prop_mono",
             Self::GetElemDense => "otter_rt_get_elem_dense",
             Self::CheckTierUp => "otter_rt_check_tier_up",
+            Self::ArrayPush => "otter_rt_array_push",
+            Self::ArrayPop => "otter_rt_array_pop",
+            Self::GcWriteBarrier => "otter_rt_gc_write_barrier",
+            Self::PrimitiveToString => "otter_rt_primitive_to_string",
         }
     }
 
@@ -673,7 +685,10 @@ impl HelperKind {
             | Self::GetPropMono
             | Self::GetElemInt
             | Self::SetPropMono
-            | Self::GetElemDense => 1,
+            | Self::GetElemDense
+            | Self::ArrayPush
+            | Self::ArrayPop
+            | Self::GcWriteBarrier => 1,
 
             Self::CallFunction
             | Self::Construct
@@ -720,7 +735,8 @@ impl HelperKind {
             | Self::JsToString
             | Self::RequireCoercible
             | Self::InstanceOf
-            | Self::InOp => 5,
+            | Self::InOp
+            | Self::PrimitiveToString => 5,
 
             Self::SpreadArray
             | Self::GetIterator
@@ -786,7 +802,8 @@ impl HelperKind {
             | Self::RequireCoercible
             | Self::SetPropMono
             | Self::GetElemDense
-            | Self::CheckTierUp => HelperSafetyClass::LeafNoGc,
+            | Self::CheckTierUp
+            | Self::GcWriteBarrier => HelperSafetyClass::LeafNoGc,
 
             Self::CloseUpvalue | Self::TryStart | Self::TryEnd | Self::CatchOp => {
                 HelperSafetyClass::VmStateOnly
@@ -823,7 +840,10 @@ impl HelperKind {
             | Self::SetHomeObject
             | Self::AsyncClosure
             | Self::GeneratorClosure
-            | Self::AsyncGeneratorClosure => HelperSafetyClass::AllocatingLeaf,
+            | Self::AsyncGeneratorClosure
+            | Self::ArrayPush
+            | Self::ArrayPop
+            | Self::PrimitiveToString => HelperSafetyClass::AllocatingLeaf,
 
             Self::CallFunction
             | Self::Construct
@@ -893,7 +913,10 @@ impl HelperKind {
             | Self::CallSuperForward
             | Self::YieldOp
             | Self::AwaitOp
-            | Self::CheckTierUp => 1,
+            | Self::CheckTierUp
+            | Self::ArrayPop
+            | Self::GcWriteBarrier
+            | Self::PrimitiveToString => 1,
             Self::LoadConst
             | Self::NewArray
             | Self::ThrowValue
@@ -921,7 +944,8 @@ impl HelperKind {
             | Self::TryStart
             | Self::AsyncClosure
             | Self::GeneratorClosure
-            | Self::AsyncGeneratorClosure => 2,
+            | Self::AsyncGeneratorClosure
+            | Self::ArrayPush => 2,
             Self::GetGlobal
             | Self::DeleteProp
             | Self::SetUpvalue

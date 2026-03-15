@@ -39,6 +39,7 @@ pub(crate) struct DeoptValueSlot {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JitResumeState {
     pub bailout_pc: u32,
+    pub bailout_reason: otter_vm_jit::BailoutReason,
     pub locals: Vec<DeoptValueSlot>,
     pub registers: Vec<DeoptValueSlot>,
 }
@@ -123,6 +124,7 @@ fn map_exec_result(
                 };
                 return JitCallResult::BailoutResume(JitResumeState {
                     bailout_pc: pc,
+                    bailout_reason: snapshot.reason,
                     locals,
                     registers,
                 });

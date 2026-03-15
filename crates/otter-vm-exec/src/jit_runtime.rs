@@ -510,7 +510,6 @@ fn is_jit_stats_enabled() -> bool {
     })
 }
 
-
 /// Check whether background JIT compilation is enabled.
 ///
 /// Enabled by default. Set `OTTER_JIT_BACKGROUND=0` to force synchronous
@@ -861,7 +860,18 @@ pub fn try_execute_jit_raw(
             reason: outcome.bailout_reason,
             pc: outcome.bailout_pc,
         };
-        let action = function.record_bailout(jit_deopt_threshold());
+        // Reason-aware bailout threshold: TypeGuardFailure triggers faster
+        // recompilation (wider type feedback is already available from the
+        // interpreter handling the failed case). HelperReturnedSentinel and
+        // Unknown use the default higher threshold.
+        let threshold = match outcome.bailout_reason {
+            BailoutReason::TypeGuardFailure => {
+                // Recompile quickly — feedback vector already has wider types
+                jit_deopt_threshold().min(3)
+            }
+            _ => jit_deopt_threshold(),
+        };
+        let action = function.record_bailout(threshold);
 
         let mut state = lock_state();
         state.total_bailouts = state.total_bailouts.saturating_add(1);

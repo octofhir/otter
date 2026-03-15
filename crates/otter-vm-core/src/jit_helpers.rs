@@ -110,11 +110,10 @@ pub struct JitContext {
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
-    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET,
-    JIT_CTX_IC_PROBES_COUNT_OFFSET, JIT_CTX_IC_PROBES_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
-    JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
-    JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
-    JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_IC_PROBES_COUNT_OFFSET,
+    JIT_CTX_IC_PROBES_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET, JIT_CTX_TIER_UP_BUDGET_OFFSET,
+    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
+    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 const _: () = {
     assert!(
@@ -345,6 +344,102 @@ pub(crate) extern "C" fn otter_rt_set_prop_mono_impl(
     }
 }
 
+/// GC write barrier for heap values stored inline by JIT code.
+///
+/// Called after JIT code stores a heap-tagged Value directly into
+/// inline_slots (bypassing set_by_offset). Runs the generational barrier
+/// (remembered set) and incremental barrier (gray marking) as needed.
+///
+/// The caller (JIT) has already verified the value is a heap pointer
+/// (tag >= 0x7FFC). For non-heap values, this is a no-op.
+///
+/// Signature: `(value_raw: i64) -> i64`
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_gc_write_barrier_jit(value_raw: i64) -> i64 {
+    let value_bits = value_raw as u64;
+    // Fast exit for non-heap values (defensive; caller should only call for heap)
+    if (value_bits >> 48) < 0x7FFC {
+        return 0;
+    }
+    // Extract raw payload pointer
+    let raw_ptr = (value_bits & PAYLOAD_MASK) as *const u8;
+    if raw_ptr.is_null() {
+        return 0;
+    }
+    // Navigate from T* back to GcHeader*
+    let offset = std::mem::offset_of!(GcAllocation<JsObject>, value);
+    let header_ptr = unsafe { raw_ptr.sub(offset) as *const GcHeader };
+    // Generational barrier: add to remembered set if value is in nursery
+    otter_vm_gc::remembered_set_add_if_young(header_ptr);
+    // Incremental barrier: gray the object if marking is in progress
+    if otter_vm_gc::global_registry().is_marking() {
+        let header = unsafe { &*header_ptr };
+        if header.mark() == otter_vm_gc::object::MarkColor::White {
+            header.set_mark(otter_vm_gc::object::MarkColor::Gray);
+            otter_vm_gc::barrier_push(header_ptr);
+        }
+    }
+    0
+}
+
+/// Primitive toString() — no context, no method resolution, no IC.
+///
+/// Handles the common case: `number.toString()`, `string.toString()`,
+/// `boolean.toString()`. Returns the NaN-boxed string Value on success
+/// or BAILOUT_SENTINEL for non-primitive receivers (objects, etc.).
+///
+/// This is ~10x cheaper than full CallMethod for primitive receivers:
+/// no constant table lookup, no IC, no interpreter re-entry.
+///
+/// Signature: `(value_raw: i64) -> i64`
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_primitive_to_string(value_raw: i64) -> i64 {
+    let bits = value_raw as u64;
+
+    // String → identity
+    if (bits & TAG_MASK) == 0x7FFD_0000_0000_0000 {
+        return value_raw;
+    }
+
+    // Boolean
+    if bits == 0x7FF8_0000_0000_0002 {
+        // TAG_TRUE
+        return crate::value::Value::string(JsString::intern("true")).to_jit_bits();
+    }
+    if bits == 0x7FF8_0000_0000_0003 {
+        // TAG_FALSE
+        return crate::value::Value::string(JsString::intern("false")).to_jit_bits();
+    }
+
+    // Int32
+    if (bits & 0xFFFF_FFFF_0000_0000) == TAG_INT32 {
+        let n = (bits & 0x0000_0000_FFFF_FFFF) as i32;
+        let s = crate::globals::js_number_to_string(n as f64);
+        return crate::value::Value::string(JsString::intern(&s)).to_jit_bits();
+    }
+
+    // Float64 (raw double: quiet NaN bits NOT set)
+    if (bits & 0x7FF8_0000_0000_0000) != 0x7FF8_0000_0000_0000 {
+        let n = f64::from_bits(bits);
+        let s = crate::globals::js_number_to_string(n);
+        return crate::value::Value::string(JsString::intern(&s)).to_jit_bits();
+    }
+
+    // Canonical NaN (0x7FFA_0000_0000_0000)
+    if bits == 0x7FFA_0000_0000_0000 {
+        return crate::value::Value::string(JsString::intern("NaN")).to_jit_bits();
+    }
+
+    // Undefined → "undefined"
+    if bits == 0x7FF8_0000_0000_0000 {
+        return crate::value::Value::string(JsString::intern("undefined")).to_jit_bits();
+    }
+
+    // Null → "null" (would throw in real JS, but let the full helper handle that)
+    // Everything else (objects, functions, etc.) → bail to full CallMethod
+    BAILOUT_SENTINEL
+}
+
 /// Dense array element read — no IC, no context needed.
 ///
 /// Checks: is array, index is non-negative int32, in-bounds, not a hole.
@@ -421,6 +516,57 @@ pub(crate) extern "C" fn otter_rt_get_elem_dense_impl(
             }
         }
     }
+}
+
+/// Runtime helper: fast array push (no method resolution).
+///
+/// Signature: `(obj: i64, value: i64) -> i64`
+///
+/// Extracts array from NaN-boxed pointer, pushes value, returns new length
+/// as NaN-boxed int32. Returns BAILOUT_SENTINEL if not an array.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_array_push_impl(obj_raw: i64, value_raw: i64) -> i64 {
+    let obj_ref = match extract_js_object_ref(obj_raw as u64) {
+        Some(o) => o,
+        None => return BAILOUT_SENTINEL,
+    };
+    let flags = obj_ref.flags.borrow();
+    if !flags.is_array {
+        return BAILOUT_SENTINEL;
+    }
+    drop(flags);
+
+    let value = match crate::value::Value::from_jit_bits(value_raw as u64) {
+        Some(v) => v,
+        None => return BAILOUT_SENTINEL,
+    };
+
+    let new_len = obj_ref.array_push(value);
+    obj_ref.sync_jit_elements();
+    crate::value::Value::int32(new_len as i32).to_jit_bits()
+}
+
+/// Runtime helper: fast array pop (no method resolution).
+///
+/// Signature: `(obj: i64) -> i64`
+///
+/// Extracts array from NaN-boxed pointer, pops last element, returns it
+/// as NaN-boxed value. Returns BAILOUT_SENTINEL if not an array.
+#[allow(unsafe_code)]
+pub(crate) extern "C" fn otter_rt_array_pop_impl(obj_raw: i64) -> i64 {
+    let obj_ref = match extract_js_object_ref(obj_raw as u64) {
+        Some(o) => o,
+        None => return BAILOUT_SENTINEL,
+    };
+    let flags = obj_ref.flags.borrow();
+    if !flags.is_array {
+        return BAILOUT_SENTINEL;
+    }
+    drop(flags);
+
+    let val = obj_ref.array_pop();
+    obj_ref.sync_jit_elements();
+    val.to_jit_bits()
 }
 
 /// JIT back-edge tier-up check.
@@ -5198,6 +5344,13 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
         register_helper_5!(HelperKind::CallFfi, otter_rt_call_ffi);
 
         register_helper_1!(HelperKind::CheckTierUp, otter_rt_check_tier_up);
+        register_helper_2!(HelperKind::ArrayPush, otter_rt_array_push_impl);
+        register_helper_1!(HelperKind::ArrayPop, otter_rt_array_pop_impl);
+
+        // GC write barrier for inline property stores
+        register_helper_1!(HelperKind::GcWriteBarrier, otter_rt_gc_write_barrier_jit);
+        // Primitive toString() (no method resolution)
+        register_helper_1!(HelperKind::PrimitiveToString, otter_rt_primitive_to_string);
 
         // Bail-out stubs: JIT can't suspend (Yield/Await)
         register_helper_1!(HelperKind::YieldOp, otter_rt_bailout_stub);

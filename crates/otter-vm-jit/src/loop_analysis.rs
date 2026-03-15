@@ -11,6 +11,17 @@ use otter_vm_bytecode::instruction::Instruction;
 /// Larger loops produce too much code bloat from duplication.
 const MAX_LOOP_BODY_SIZE: usize = 64;
 
+/// A property read inside a loop that can have its shape check hoisted.
+#[derive(Debug, Clone)]
+pub(crate) struct HoistedShapeCheck {
+    /// Register holding the object (must be loop-invariant).
+    pub obj_reg: u16,
+    /// Expected shape_id from the monomorphic IC snapshot.
+    pub shape_id: u64,
+    /// Property offset within inline_slots.
+    pub offset: u32,
+}
+
 /// Information about a detected loop.
 #[derive(Debug)]
 pub(crate) struct LoopInfo {
@@ -23,6 +34,9 @@ pub(crate) struct LoopInfo {
     /// Registers that must be type-checked in the pre-header.
     /// These are the union of all arithmetic/comparison input registers in the loop body.
     pub check_registers: Vec<u16>,
+    /// Property reads on loop-invariant objects whose shape checks can be hoisted.
+    /// Shape verified once in pre-header, direct load in loop body.
+    pub hoisted_shapes: Vec<HoistedShapeCheck>,
 }
 
 /// Detect loops and determine which qualify for guard hoisting.
@@ -64,6 +78,7 @@ pub(crate) fn detect_loops(
                 back_edge_pc: pc,
                 qualifies: false,
                 check_registers: Vec::new(),
+                hoisted_shapes: Vec::new(),
             });
             continue;
         }
@@ -78,8 +93,9 @@ pub(crate) fn detect_loops(
                 break;
             }
 
-            // Disqualify: property access can trigger arbitrary JS (getters/setters/Proxy)
-            if is_property_access(inst) {
+            // Disqualify: unsafe property access can trigger arbitrary JS (getters/setters/Proxy).
+            // Safe reads (GetPropConst/GetLocalProp with inline IC) are allowed in versioned loops.
+            if is_unsafe_property_access(inst) {
                 qualifies = false;
                 break;
             }
@@ -128,10 +144,67 @@ pub(crate) fn detect_loops(
             back_edge_pc: pc,
             qualifies,
             check_registers,
+            hoisted_shapes: Vec::new(), // populated by translator with IC snapshot data
         });
     }
 
     loops
+}
+
+/// Extract the destination register index if the instruction writes one.
+fn instruction_dst_reg(inst: &Instruction) -> Option<u16> {
+    match inst {
+        Instruction::LoadUndefined { dst }
+        | Instruction::LoadNull { dst }
+        | Instruction::LoadTrue { dst }
+        | Instruction::LoadFalse { dst }
+        | Instruction::LoadInt8 { dst, .. }
+        | Instruction::LoadInt32 { dst, .. }
+        | Instruction::LoadConst { dst, .. }
+        | Instruction::GetLocal { dst, .. }
+        | Instruction::GetUpvalue { dst, .. }
+        | Instruction::GetGlobal { dst, .. }
+        | Instruction::LoadThis { dst }
+        | Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::Mod { dst, .. }
+        | Instruction::Neg { dst, .. }
+        | Instruction::Inc { dst, .. }
+        | Instruction::Dec { dst, .. }
+        | Instruction::BitAnd { dst, .. }
+        | Instruction::BitOr { dst, .. }
+        | Instruction::BitXor { dst, .. }
+        | Instruction::BitNot { dst, .. }
+        | Instruction::Shl { dst, .. }
+        | Instruction::Shr { dst, .. }
+        | Instruction::Ushr { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::Eq { dst, .. }
+        | Instruction::Ne { dst, .. }
+        | Instruction::StrictEq { dst, .. }
+        | Instruction::StrictNe { dst, .. }
+        | Instruction::Lt { dst, .. }
+        | Instruction::Le { dst, .. }
+        | Instruction::Gt { dst, .. }
+        | Instruction::Ge { dst, .. }
+        | Instruction::GetPropConst { dst, .. }
+        | Instruction::GetProp { dst, .. }
+        | Instruction::GetElem { dst, .. }
+        | Instruction::GetLocalProp { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::NewObject { dst }
+        | Instruction::NewArray { dst, .. }
+        | Instruction::Dup { dst, .. }
+        | Instruction::AddInt32 { dst, .. }
+        | Instruction::SubInt32 { dst, .. }
+        | Instruction::MulInt32 { dst, .. }
+        | Instruction::GetPropQuickened { dst, .. }
+        | Instruction::Move { dst, .. } => Some(dst.0),
+        _ => None,
+    }
 }
 
 /// Returns true if the instruction is a function call.
@@ -154,27 +227,33 @@ fn is_call_instruction(inst: &Instruction) -> bool {
     )
 }
 
-/// Returns true if the instruction accesses object properties (can trigger arbitrary JS).
-fn is_property_access(inst: &Instruction) -> bool {
+/// Returns true if the instruction accesses object properties unsafely
+/// (can trigger arbitrary JS via getters/setters/Proxy).
+///
+/// Monomorphic data property reads (GetPropConst/GetLocalProp with warm IC)
+/// are safe for versioned loops — the inline shape check + meta check guards
+/// against getters/setters, and the fallback bails to the un-versioned path.
+fn is_unsafe_property_access(inst: &Instruction) -> bool {
     matches!(
         inst,
         Instruction::GetProp { .. }
             | Instruction::SetProp { .. }
             | Instruction::GetElem { .. }
             | Instruction::SetElem { .. }
-            | Instruction::GetPropConst { .. }
             | Instruction::SetPropConst { .. }
             | Instruction::GetPropQuickened { .. }
             | Instruction::GetPropString { .. }
             | Instruction::GetArrayLength { .. }
             | Instruction::SetPropQuickened { .. }
-            | Instruction::GetLocalProp { .. }
             | Instruction::DeleteProp { .. }
             | Instruction::DefineProperty { .. }
             | Instruction::GetGlobal { .. }
             | Instruction::SetGlobal { .. }
             | Instruction::GetSuperProp { .. }
     )
+    // Note: GetPropConst and GetLocalProp are NOT in this list.
+    // They are safe for versioned loops when the IC is warm + monomorphic
+    // (the inline shape check prevents getter/setter execution).
 }
 
 /// Returns true if the instruction is try/catch related.

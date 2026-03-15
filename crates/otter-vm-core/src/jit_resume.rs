@@ -49,6 +49,10 @@ fn build_window_from_resume_state(
 
 pub(crate) fn resume_in_place(ctx: &mut VmContext, state: &JitResumeState) {
     ctx.restore_deopt_state(state.bailout_pc, &state.locals, &state.registers);
+    // Note: explicit feedback widening is NOT needed here. The interpreter
+    // will naturally record wider type observations when it executes the bailed
+    // instruction. The reason-aware bailout threshold (TypeGuardFailure → 3)
+    // ensures fast recompilation with the wider feedback.
 }
 
 pub(crate) fn try_materialize_generator_yield(
@@ -132,6 +136,7 @@ mod tests {
 
         let state = JitResumeState {
             bailout_pc: 5,
+            bailout_reason: otter_vm_jit::BailoutReason::Unknown,
             locals: vec![DeoptValueSlot {
                 index: 1,
                 value: Value::int32(99),
@@ -177,6 +182,7 @@ mod tests {
 
         let state = JitResumeState {
             bailout_pc: 0,
+            bailout_reason: otter_vm_jit::BailoutReason::Unknown,
             locals: vec![DeoptValueSlot {
                 index: 0,
                 value: Value::int32(55),

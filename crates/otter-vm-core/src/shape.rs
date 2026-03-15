@@ -82,42 +82,42 @@ impl Shape {
 
     /// Trace all GC-managed property keys in this shape for the garbage collector.
     ///
-    /// Walks the parent chain from this shape to root, tracing each key.
-    /// Also traces keys in the transitions map.
-    /// Trace all GC-managed property keys in this shape for the garbage collector.
-    ///
-    /// Walks up to the root of the shape tree and traces every key in every
-    /// reachable transition branch. This ensures that all property keys held
-    /// by live (via Arc or Weak) Shapes are protected from GC collection.
+    /// Walks the live parent chain from this shape to root, tracing each key.
+    /// For each shape on that chain, prunes dead weak transitions and traces
+    /// keys for the remaining live edges so future shape transitions stay safe.
     pub fn trace_keys(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
-        let mut root = self;
-        while let Some(parent) = &root.parent {
-            root = parent;
-        }
-        root.trace_down(tracer);
-    }
+        let mut current = Some(self);
+        while let Some(shape) = current {
+            if let Some(key) = &shape.key {
+                match key {
+                    PropertyKey::String(s) => tracer(s.header() as *const _),
+                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                    PropertyKey::Index(_) => {}
+                }
+            }
 
-    /// Internal helper for recursive downward tracing of property keys.
-    fn trace_down(&self, tracer: &mut dyn FnMut(*const crate::gc::GcHeader)) {
-        // Trace current shape's own key
-        if let Some(key) = &self.key {
-            match key {
-                PropertyKey::String(s) => tracer(s.header() as *const _),
-                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
-                PropertyKey::Index(_) => {}
+            if let Some(cached_map) = shape.cached_map.borrow().as_ref() {
+                for key in cached_map.keys() {
+                    match key {
+                        PropertyKey::String(s) => tracer(s.header() as *const _),
+                        PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                        PropertyKey::Index(_) => {}
+                    }
+                }
             }
-        }
 
-        // Trace all keys in transitions and recurse into child shapes
-        for (key, child_weak) in self.transitions.borrow().iter() {
-            match key {
-                PropertyKey::String(s) => tracer(s.header() as *const _),
-                PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
-                PropertyKey::Index(_) => {}
+            let mut transitions = shape.transitions.borrow_mut();
+            transitions.retain(|_, weak| weak.strong_count() > 0);
+            for key in transitions.keys() {
+                match key {
+                    PropertyKey::String(s) => tracer(s.header() as *const _),
+                    PropertyKey::Symbol(sym) => tracer(sym.header() as *const _),
+                    PropertyKey::Index(_) => {}
+                }
             }
-            if let Some(child) = child_weak.upgrade() {
-                child.trace_down(tracer);
-            }
+            drop(transitions);
+
+            current = shape.parent.as_deref();
         }
     }
 

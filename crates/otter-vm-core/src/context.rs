@@ -766,6 +766,8 @@ pub struct VmContext {
     template_cache: HashMap<TemplateCacheKey, GcRef<JsObject>>,
     /// Cached RegExp objects per (module_ptr, constant_index) so each literal is only compiled once.
     regexp_cache: HashMap<(u64, u32), Value>,
+    /// Reusable JSON.parse shape cache keyed by property-sequence fingerprint.
+    json_shape_cache: FxHashMap<u64, JsonShapeCacheEntry>,
     /// Cached proto epoch value, refreshed once per run_loop iteration.
     /// Avoids repeated atomic loads in IC hot paths.
     pub(crate) cached_proto_epoch: u64,
@@ -830,6 +832,12 @@ pub struct TemplateCacheKey {
     pub realm_id: RealmId,
     pub module_ptr: usize,
     pub site_id: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct JsonShapeCacheEntry {
+    pub keys: Vec<GcRef<JsString>>,
+    pub shape: Arc<crate::shape::Shape>,
 }
 
 /// Lightweight debug snapshot of VM execution state.
@@ -959,6 +967,7 @@ impl VmContext {
             pending_throw: None,
             template_cache: HashMap::new(),
             regexp_cache: HashMap::new(),
+            json_shape_cache: FxHashMap::default(),
             cached_proto_epoch: crate::object::get_proto_epoch(),
             string_prototype_cache: None,
         }
@@ -981,6 +990,36 @@ impl VmContext {
 
     pub(crate) fn cache_regexp(&mut self, module_id: u64, const_idx: u32, val: Value) {
         self.regexp_cache.insert((module_id, const_idx), val);
+    }
+
+    pub(crate) fn get_cached_json_shape(
+        &self,
+        fingerprint: u64,
+    ) -> Option<(Vec<GcRef<JsString>>, Arc<crate::shape::Shape>)> {
+        self.json_shape_cache
+            .get(&fingerprint)
+            .map(|entry| (entry.keys.clone(), Arc::clone(&entry.shape)))
+    }
+
+    pub(crate) fn cache_json_shape(
+        &mut self,
+        fingerprint: u64,
+        keys: &[GcRef<JsString>],
+        shape: Arc<crate::shape::Shape>,
+    ) {
+        const JSON_SHAPE_CACHE_LIMIT: usize = 1024;
+
+        if self.json_shape_cache.len() >= JSON_SHAPE_CACHE_LIMIT {
+            self.json_shape_cache.clear();
+        }
+
+        self.json_shape_cache.insert(
+            fingerprint,
+            JsonShapeCacheEntry {
+                keys: keys.to_vec(),
+                shape,
+            },
+        );
     }
 
     /// Set captured module exports.
@@ -1155,6 +1194,10 @@ impl VmContext {
 
     pub fn regexp_cache_to_trace(&self) -> &HashMap<(u64, u32), Value> {
         &self.regexp_cache
+    }
+
+    pub(crate) fn json_shape_cache_to_trace(&self) -> &FxHashMap<u64, JsonShapeCacheEntry> {
+        &self.json_shape_cache
     }
 
     pub fn string_prototype_cache_to_trace(&self) -> &Option<GcRef<JsObject>> {
@@ -3239,6 +3282,13 @@ impl VmContext {
         // Add cached RegExp objects
         for value in self.regexp_cache.values() {
             value.trace(&mut |header| roots.push(header));
+        }
+
+        // Add cached JSON shape keys so shared shape chains stay valid across GCs.
+        for entry in self.json_shape_cache.values() {
+            for key in &entry.keys {
+                roots.push(key.header() as *const _);
+            }
         }
 
         // Add open upvalues

@@ -45,17 +45,35 @@ pub fn scan_dependencies(source: &str, filename: &str) -> Vec<DepRecord> {
         match stmt {
             Statement::ImportDeclaration(decl) => {
                 let spec = decl.source.value.as_str().to_string();
-                push_unique(&mut deps, DepRecord { specifier: spec, is_require: false });
+                push_unique(
+                    &mut deps,
+                    DepRecord {
+                        specifier: spec,
+                        is_require: false,
+                    },
+                );
             }
             Statement::ExportNamedDeclaration(decl) => {
                 if let Some(ref src) = decl.source {
                     let spec = src.value.as_str().to_string();
-                    push_unique(&mut deps, DepRecord { specifier: spec, is_require: false });
+                    push_unique(
+                        &mut deps,
+                        DepRecord {
+                            specifier: spec,
+                            is_require: false,
+                        },
+                    );
                 }
             }
             Statement::ExportAllDeclaration(decl) => {
                 let spec = decl.source.value.as_str().to_string();
-                push_unique(&mut deps, DepRecord { specifier: spec, is_require: false });
+                push_unique(
+                    &mut deps,
+                    DepRecord {
+                        specifier: spec,
+                        is_require: false,
+                    },
+                );
             }
             _ => {}
         }
@@ -119,7 +137,10 @@ pub fn scan_specifiers(source: &str, filename: &str) -> Vec<String> {
 }
 
 fn push_unique(deps: &mut Vec<DepRecord>, record: DepRecord) {
-    if !deps.iter().any(|d| d.specifier == record.specifier && d.is_require == record.is_require) {
+    if !deps
+        .iter()
+        .any(|d| d.specifier == record.specifier && d.is_require == record.is_require)
+    {
         deps.push(record);
     }
 }
@@ -237,10 +258,13 @@ fn scan_expr(expr: &Expression<'_>, deps: &mut Vec<DepRecord>) {
         // import('specifier')
         Expression::ImportExpression(import_expr) => {
             if let Expression::StringLiteral(lit) = &import_expr.source {
-                push_unique(deps, DepRecord {
-                    specifier: lit.value.as_str().to_string(),
-                    is_require: false,
-                });
+                push_unique(
+                    deps,
+                    DepRecord {
+                        specifier: lit.value.as_str().to_string(),
+                        is_require: false,
+                    },
+                );
             }
             // Also scan the source expression in case it's complex
             scan_expr(&import_expr.source, deps);
@@ -250,10 +274,13 @@ fn scan_expr(expr: &Expression<'_>, deps: &mut Vec<DepRecord>) {
             if is_require_call(call)
                 && let Some(Argument::StringLiteral(lit)) = call.arguments.first()
             {
-                push_unique(deps, DepRecord {
-                    specifier: lit.value.as_str().to_string(),
-                    is_require: true,
-                });
+                push_unique(
+                    deps,
+                    DepRecord {
+                        specifier: lit.value.as_str().to_string(),
+                        is_require: true,
+                    },
+                );
             }
             // Scan callee and arguments recursively
             scan_expr(&call.callee, deps);
@@ -545,9 +572,18 @@ mod tests {
         "#;
         let deps = scan_dependencies(source, "test.js");
         assert_eq!(deps.len(), 3);
-        assert!(deps.iter().any(|d| d.specifier == "./foo.js" && !d.is_require));
-        assert!(deps.iter().any(|d| d.specifier == "./bar.cjs" && d.is_require));
-        assert!(deps.iter().any(|d| d.specifier == "./baz.js" && !d.is_require));
+        assert!(
+            deps.iter()
+                .any(|d| d.specifier == "./foo.js" && !d.is_require)
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.specifier == "./bar.cjs" && d.is_require)
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.specifier == "./baz.js" && !d.is_require)
+        );
     }
 
     #[test]
@@ -580,7 +616,9 @@ mod tests {
 
     #[test]
     fn test_has_module_syntax_top_level_await() {
-        assert!(has_module_syntax("const x = await fetch('http://example.com');"));
+        assert!(has_module_syntax(
+            "const x = await fetch('http://example.com');"
+        ));
         assert!(has_module_syntax("await Promise.resolve(1);"));
     }
 

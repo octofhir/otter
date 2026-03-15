@@ -790,6 +790,13 @@ impl Trace for crate::context::VmContext {
             tracer.mark_value(value);
         }
 
+        // Trace cached JSON shape keys held across JSON.parse calls.
+        for entry in self.json_shape_cache_to_trace().values() {
+            for key in &entry.keys {
+                tracer.mark(key.as_ref());
+            }
+        }
+
         // Trace string prototype cache
         if let Some(proto) = self.string_prototype_cache_to_trace() {
             tracer.mark(proto.as_ref());

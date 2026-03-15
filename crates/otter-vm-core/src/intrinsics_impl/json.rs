@@ -67,7 +67,7 @@ fn has_escape_char_in_word(word: u64) -> bool {
 }
 
 /// Native JSON hot-loop interrupt check cadence (power-of-two for bitmask checks).
-const JSON_INTERRUPT_CHECK_INTERVAL: usize = 1024;
+const JSON_INTERRUPT_CHECK_INTERVAL: usize = 4096;
 
 #[inline]
 fn maybe_check_interrupt(ncx: &mut NativeContext<'_>, index: usize) -> Result<(), VmError> {
@@ -135,20 +135,25 @@ enum JsonStr<'a> {
     Owned(String),
 }
 
-impl<'a> JsonStr<'a> {
-    #[inline]
-    fn as_str(&self) -> &str {
-        match self {
-            JsonStr::Borrowed(s) => s,
-            JsonStr::Owned(s) => s.as_str(),
-        }
-    }
-}
-
 /// Cached shape template for arrays of same-shaped objects.
 struct ShapeTemplate {
     keys: Vec<GcRef<JsString>>,
+    key_bytes: Vec<Box<[u8]>>,
     shape: Arc<crate::shape::Shape>,
+}
+
+impl ShapeTemplate {
+    fn new(keys: Vec<GcRef<JsString>>, shape: Arc<crate::shape::Shape>) -> Self {
+        let key_bytes = keys
+            .iter()
+            .map(|key| key.as_str().as_bytes().to_vec().into_boxed_slice())
+            .collect();
+        Self {
+            keys,
+            key_bytes,
+            shape,
+        }
+    }
 }
 
 /// V8-style JSON parser. Scans input bytes directly, creates Values inline.
@@ -325,18 +330,16 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             }
         }
 
-        // SAFETY: JSON numbers are always valid ASCII
-        let num_str = unsafe { std::str::from_utf8_unchecked(&self.input[start..self.pos]) };
-
         // Integer fast path
         if !is_float {
-            if let Ok(i) = num_str.parse::<i32>() {
-                return Ok(Value::int32(i));
-            }
-            if let Ok(i) = num_str.parse::<i64>() {
-                return Ok(Value::number(i as f64));
+            let digits = &self.input[start..self.pos];
+            if let Some(parsed) = parse_json_integer_fast(digits) {
+                return Ok(parsed);
             }
         }
+
+        // SAFETY: JSON numbers are always valid ASCII
+        let num_str = unsafe { std::str::from_utf8_unchecked(&self.input[start..self.pos]) };
 
         // Float path (Eisel-Lemire via Rust stdlib)
         match num_str.parse::<f64>() {
@@ -504,6 +507,34 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
         Ok(val)
     }
 
+    /// Fast path for array-of-objects templates: compare the next JSON key
+    /// against the expected UTF-8 bytes without fully materializing the string.
+    fn scan_string_matches_expected(&mut self, expected: &[u8]) -> Result<bool, VmError> {
+        let start = self.pos;
+        if self.peek() != Some(b'"') {
+            return Ok(false);
+        }
+        self.advance();
+
+        let mut idx = 0usize;
+        while self.pos < self.input.len() {
+            let b = self.input[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                return Ok(idx == expected.len());
+            }
+            if b == b'\\' || b < 0x20 || idx >= expected.len() || expected[idx] != b {
+                self.pos = start;
+                return Ok(false);
+            }
+            idx += 1;
+            self.pos += 1;
+        }
+
+        self.pos = start;
+        Err(self.error("unterminated string"))
+    }
+
     /// Parse a string value (for JSON values, not keys)
     fn parse_string_value(&mut self) -> Result<Value, VmError> {
         let scanned = self.scan_string_raw()?;
@@ -558,7 +589,7 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
 
         if self.peek() == Some(b'}') {
             self.advance();
-            let obj = GcRef::new(JsObject::new(self.object_proto));
+            let obj = GcRef::new(JsObject::new_with_shared_shape(self.object_proto));
             return Ok(Value::object(obj));
         }
 
@@ -579,6 +610,7 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
         let mut values: SmallVec<[Value; 8]> = SmallVec::with_capacity(expected_len);
         let mut matched = true;
         let mut key_idx = 0;
+        let mut mismatch_entry: Option<(GcRef<JsString>, Value)> = None;
 
         loop {
             self.skip_whitespace();
@@ -587,15 +619,20 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
                 break;
             }
 
-            let key_scanned = self.scan_string_raw()?;
-            let key_str = key_scanned.as_str();
-            if key_idx >= expected_len || tmpl.keys[key_idx].as_str() != key_str {
+            let key_start = self.pos;
+            let key_matches = key_idx < expected_len
+                && self.scan_string_matches_expected(&tmpl.key_bytes[key_idx])?;
+            if !key_matches {
                 matched = false;
-                // Still need to parse the value to advance position
+                self.pos = key_start;
+                let key_scanned = self.scan_string_raw()?;
+                let key = self.intern_key_json(key_scanned);
                 self.skip_whitespace();
                 self.expect(b':')?;
-                let _ = self.parse_value()?;
-                // TODO: handle remaining keys in slow path
+                let saved = self.array_shape_template.take();
+                let value = self.parse_value()?;
+                self.array_shape_template = saved;
+                mismatch_entry = Some((key, value));
                 break;
             }
 
@@ -632,11 +669,14 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
         }
 
         // Mismatch — build object from prefix + remaining
-        let obj = GcRef::new(JsObject::new(self.object_proto));
-        for (i, val) in values.into_iter().enumerate() {
+        let fallback_obj = GcRef::new(JsObject::new_with_shared_shape(self.object_proto));
+        for (i, value) in values.into_iter().enumerate() {
             if i < tmpl.keys.len() {
-                obj.define_data_property_for_construction(tmpl.keys[i], val);
+                fallback_obj.define_data_property_for_construction(tmpl.keys[i], value);
             }
+        }
+        if let Some((key, value)) = mismatch_entry {
+            fallback_obj.define_data_property_for_construction(key, value);
         }
         // Parse remaining properties
         loop {
@@ -662,11 +702,11 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             self.skip_whitespace();
             self.expect(b':')?;
             let value = self.parse_value()?;
-            obj.define_data_property_for_construction(key, value);
+            fallback_obj.define_data_property_for_construction(key, value);
         }
         // Invalidate template
         self.array_shape_template = None;
-        Ok(Value::object(obj))
+        Ok(Value::object(fallback_obj))
     }
 
     /// Compute a fast fingerprint for a key sequence (for shape cache lookup).
@@ -719,33 +759,45 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
 
         // Build object with shape
         if keys.len() <= crate::object::DICTIONARY_THRESHOLD {
-            // Check global shape cache first — reuses shapes for ALL objects
-            // with the same key set (metadata, preferences, etc.), not just array siblings.
             let fp = Self::key_fingerprint(&keys);
-            let shape = if let Some((cached_keys, cached_shape)) = self.shape_cache.get(&fp) {
-                // Verify keys match (collision check)
-                if cached_keys.len() == keys.len()
+            let keys_match = |cached_keys: &[GcRef<JsString>]| {
+                cached_keys.len() == keys.len()
                     && cached_keys
                         .iter()
                         .zip(keys.iter())
                         .all(|(a, b)| a.as_ptr() == b.as_ptr())
-                {
-                    Arc::clone(cached_shape)
-                } else {
-                    let root = crate::shape::Shape::root();
-                    let prop_keys: SmallVec<[PropertyKey; 8]> =
-                        keys.iter().map(|k| PropertyKey::String(*k)).collect();
-                    crate::shape::Shape::from_keys(&root, &prop_keys)
-                }
-            } else {
-                let root = crate::shape::Shape::root();
+            };
+            let build_shape = || {
+                let root = crate::shape::Shape::shared_root();
                 let prop_keys: SmallVec<[PropertyKey; 8]> =
                     keys.iter().map(|k| PropertyKey::String(*k)).collect();
-                let shape = crate::shape::Shape::from_keys(&root, &prop_keys);
-                self.shape_cache
-                    .insert(fp, (keys.to_vec(), Arc::clone(&shape)));
-                shape
+                crate::shape::Shape::from_keys(&root, &prop_keys)
             };
+
+            // V8-style leaf-shape reuse: first try this parse call's L1 cache,
+            // then the per-context cache shared across JSON.parse invocations.
+            let shape = if let Some((cached_keys, cached_shape)) = self.shape_cache.get(&fp) {
+                if keys_match(cached_keys) {
+                    Arc::clone(cached_shape)
+                } else {
+                    build_shape()
+                }
+            } else if let Some((cached_keys, cached_shape)) = self.ncx.ctx.get_cached_json_shape(fp)
+            {
+                if keys_match(&cached_keys) {
+                    self.shape_cache
+                        .insert(fp, (cached_keys, Arc::clone(&cached_shape)));
+                    cached_shape
+                } else {
+                    build_shape()
+                }
+            } else {
+                build_shape()
+            };
+
+            self.shape_cache
+                .insert(fp, (keys.to_vec(), Arc::clone(&shape)));
+            self.ncx.ctx.cache_json_shape(fp, &keys, Arc::clone(&shape));
 
             let obj = GcRef::new(JsObject::with_shape_and_values_no_barrier(
                 self.object_proto,
@@ -754,16 +806,14 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             ));
 
             // Cache shape template for sibling objects in the same array
-            self.array_shape_template = Some(ShapeTemplate {
-                keys: keys.to_vec(),
-                shape,
-            });
+            let template = ShapeTemplate::new(keys.to_vec(), shape);
+            self.array_shape_template = Some(template);
 
             return Ok(Value::object(obj));
         }
 
         // Dictionary fallback for very large objects
-        let obj = GcRef::new(JsObject::new(self.object_proto));
+        let obj = GcRef::new(JsObject::new_with_shared_shape(self.object_proto));
         for (key, value) in keys.into_iter().zip(values.into_iter()) {
             obj.define_data_property_for_construction(key, value);
         }
@@ -829,6 +879,63 @@ impl<'a, 'ctx> JsonParser<'a, 'ctx> {
             return Err(self.error("unexpected trailing content"));
         }
         Ok(value)
+    }
+}
+
+#[inline]
+fn parse_json_integer_fast(bytes: &[u8]) -> Option<Value> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let (negative, digits) = if bytes[0] == b'-' {
+        (true, &bytes[1..])
+    } else {
+        (false, bytes)
+    };
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    let limit = if negative {
+        (i64::MAX as u64).saturating_add(1)
+    } else {
+        i64::MAX as u64
+    };
+
+    let mut acc = 0u64;
+    for &b in digits {
+        let digit = (b.wrapping_sub(b'0')) as u64;
+        if digit > 9 {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(digit)?;
+        if acc > limit {
+            return Some(Value::number(if negative {
+                -(acc as f64)
+            } else {
+                acc as f64
+            }));
+        }
+    }
+
+    if negative {
+        if acc <= (i32::MAX as u64) + 1 {
+            let int = if acc == (i32::MAX as u64) + 1 {
+                i32::MIN
+            } else {
+                -(acc as i32)
+            };
+            return Some(Value::int32(int));
+        }
+        return Some(Value::number(-(acc as f64)));
+    }
+
+    if acc <= i32::MAX as u64 {
+        Some(Value::int32(acc as i32))
+    } else {
+        Some(Value::number(acc as f64))
     }
 }
 
@@ -1881,16 +1988,140 @@ fn json_stringify(
 /// Spec: <https://tc39.es/ecma262/#sec-json-object>
 /// Estimate output capacity for JSON.stringify pre-allocation.
 fn estimate_stringify_capacity(val: &Value) -> usize {
-    if let Some(obj) = val.as_object() {
-        if obj.is_array() {
-            obj.array_length() * 8 + 16
-        } else {
-            obj.get_shape_key_count() * 32 + 16
-        }
-    } else {
-        128
+    let mut seen: SmallVec<[usize; 32]> = SmallVec::new();
+    estimate_stringify_capacity_inner(val, 0, &mut seen)
+        .unwrap_or(128)
+        .clamp(128, 8 * 1024 * 1024)
+}
+
+fn estimate_stringify_capacity_inner(
+    value: &Value,
+    depth: usize,
+    seen: &mut SmallVec<[usize; 32]>,
+) -> Option<usize> {
+    if depth > 6 {
+        return Some(64);
     }
-    .max(128)
+
+    if value.is_null() {
+        return Some(4);
+    }
+    if value.is_undefined() || value.is_callable() || value.is_symbol() {
+        return Some(8);
+    }
+    if let Some(b) = value.as_boolean() {
+        return Some(if b { 4 } else { 5 });
+    }
+    if let Some(n) = value.as_int32() {
+        let digits = if n == 0 {
+            1
+        } else {
+            let abs = (n as i64).unsigned_abs();
+            abs.ilog10() as usize + 1 + usize::from(n < 0)
+        };
+        return Some(digits);
+    }
+    if value.as_number().is_some() {
+        return Some(24);
+    }
+    if let Some(s) = value.as_string() {
+        let units = s.len();
+        return Some(2 + units + units / 8);
+    }
+    if value.is_bigint() {
+        return Some(8);
+    }
+    if value.as_proxy().is_some() {
+        return None;
+    }
+
+    if let Some(arr) = value
+        .as_array()
+        .or_else(|| value.as_object().filter(|o| o.is_array()))
+    {
+        let ptr = arr.as_ptr() as usize;
+        if seen.contains(&ptr) {
+            return Some(16);
+        }
+        seen.push(ptr);
+
+        let len = arr.array_length();
+        let estimate = if len == 0 {
+            2
+        } else {
+            let elems = arr.elements.borrow();
+            let sample = len.min(4);
+            let mut sample_total = 0usize;
+            for i in 0..sample {
+                let elem_estimate = elems
+                    .get(i)
+                    .and_then(|v| {
+                        if v.is_hole() || v.is_undefined() || v.is_callable() || v.is_symbol() {
+                            Some(4)
+                        } else {
+                            estimate_stringify_capacity_inner(&v, depth + 1, seen)
+                        }
+                    })
+                    .unwrap_or(8);
+                sample_total = sample_total.saturating_add(elem_estimate);
+            }
+            let average = (sample_total / sample.max(1)).max(4);
+            2 + len.saturating_sub(1) + len.saturating_mul(average)
+        };
+
+        seen.pop();
+        return Some(estimate);
+    }
+
+    if let Some(obj) = value.as_object() {
+        let flags = obj.flags.borrow();
+        if flags.is_dictionary {
+            return Some(obj.get_shape_key_count() * 48 + 16);
+        }
+        drop(flags);
+
+        let ptr = obj.as_ptr() as usize;
+        if seen.contains(&ptr) {
+            return Some(16);
+        }
+        seen.push(ptr);
+
+        let mut estimate = 2usize;
+        let mut property_count = 0usize;
+        let pairs = obj.with_shape(|s| s.own_keys_with_offsets());
+        for (key, offset) in pairs {
+            let key_len = match key {
+                PropertyKey::String(s) => s.len(),
+                PropertyKey::Index(i) => {
+                    if i == 0 {
+                        1
+                    } else {
+                        i.ilog10() as usize + 1
+                    }
+                }
+                PropertyKey::Symbol(_) => continue,
+            };
+            let Some(val) = obj.get_by_offset(offset) else {
+                seen.pop();
+                return Some(obj.get_shape_key_count() * 48 + 16);
+            };
+            if val.is_undefined() || val.is_callable() || val.is_symbol() {
+                continue;
+            }
+
+            let value_estimate =
+                estimate_stringify_capacity_inner(&val, depth + 1, seen).unwrap_or(32);
+            estimate = estimate
+                .saturating_add(3 + key_len + value_estimate)
+                .saturating_add(usize::from(property_count > 0));
+            property_count += 1;
+        }
+
+        seen.pop();
+        return Some(estimate.max(2));
+    }
+
+    Some(64)
 }
 
 /// Fast path for JSON.stringify — V8/JSC-style direct serialization.
@@ -2563,5 +2794,23 @@ mod tests {
         assert_eq!(&h, b"\\u000a");
         let h = hex4(0x1F);
         assert_eq!(&h, b"\\u001f");
+    }
+
+    #[test]
+    fn parse_json_integer_fast_handles_common_ranges() {
+        assert_eq!(parse_json_integer_fast(b"0"), Some(Value::int32(0)));
+        assert_eq!(parse_json_integer_fast(b"-1"), Some(Value::int32(-1)));
+        assert_eq!(
+            parse_json_integer_fast(b"2147483647"),
+            Some(Value::int32(i32::MAX))
+        );
+        assert_eq!(
+            parse_json_integer_fast(b"-2147483648"),
+            Some(Value::int32(i32::MIN))
+        );
+        assert_eq!(
+            parse_json_integer_fast(b"2147483648"),
+            Some(Value::number(2147483648.0))
+        );
     }
 }

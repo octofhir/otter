@@ -570,7 +570,6 @@ pub struct JitIcProbe {
     pub state: u32,
 }
 
-
 impl JitIcProbe {
     /// State value: IC not warmed up yet
     pub const STATE_COLD: u32 = 0;

@@ -336,9 +336,7 @@ impl Interpreter {
         // for immediate OSR re-entry.
         if func.take_ic_recompilation_needed() && otter_vm_exec::is_jit_enabled() {
             otter_vm_exec::enqueue_hot_function(module, func_index, func);
-            otter_vm_exec::compile_one_pending_request_sync(
-                crate::jit_runtime::runtime_helpers(),
-            );
+            otter_vm_exec::compile_one_pending_request_sync(crate::jit_runtime::runtime_helpers());
         }
 
         // Background JIT may have compiled code in the runtime cache while
@@ -418,5 +416,4 @@ impl Interpreter {
             _ => BackEdgeOsrOutcome::ContinueWithJump,
         }
     }
-
 }

@@ -449,6 +449,108 @@ fn make_typed_array_value(ta: JsTypedArray) -> Value {
     Value::typed_array(GcRef::new(ta))
 }
 
+/// ES2026 §7.1.13 ToBigInt(argument), truncated to i64 for storage in BigInt64/BigUint64 arrays.
+///
+/// Spec: https://tc39.es/ecma262/#sec-tobigint
+/// - BigInt → return as i64 (with wrapping for values > i64::MAX)
+/// - String → StringToBigInt (parse decimal integer)
+/// - Boolean → false=0, true=1
+/// - undefined, null, Number, Symbol → throw TypeError
+fn to_bigint_i64(val: &Value) -> Result<i64, VmError> {
+    if let Some(b) = val.as_bigint() {
+        // Parse BigInt string value, handle large values via wrapping
+        if let Ok(n) = b.value.parse::<i64>() {
+            return Ok(n);
+        }
+        // Value too large for i64 — use BigInt for proper wrapping
+        if let Ok(big) = b.value.parse::<num_bigint::BigInt>() {
+            use num_traits::ToPrimitive;
+            // Mask to 64 bits for proper wrapping semantics
+            let mask = num_bigint::BigInt::from(u64::MAX);
+            let truncated = &big & &mask;
+            return Ok(truncated.to_u64().unwrap_or(0) as i64);
+        }
+        return Ok(0);
+    }
+    if let Some(s) = val.as_string() {
+        let s_str = s.as_str().trim();
+        if s_str.is_empty() {
+            return Ok(0);
+        }
+        // Parse as BigInt — only pure decimal integers allowed
+        if let Ok(n) = s_str.parse::<i64>() {
+            return Ok(n);
+        }
+        if let Ok(big) = s_str.parse::<num_bigint::BigInt>() {
+            use num_traits::ToPrimitive;
+            let mask = num_bigint::BigInt::from(u64::MAX);
+            let truncated = &big & &mask;
+            return Ok(truncated.to_u64().unwrap_or(0) as i64);
+        }
+        // Invalid string → SyntaxError per spec
+        return Err(VmError::syntax_error(&format!(
+            "Cannot convert '{}' to a BigInt", s_str
+        )));
+    }
+    if let Some(b) = val.as_boolean() {
+        return Ok(if b { 1 } else { 0 });
+    }
+    // undefined, null, Number, Symbol → TypeError
+    if val.is_undefined() || val.is_null() {
+        return Err(VmError::type_error("Cannot convert undefined or null to a BigInt"));
+    }
+    if val.as_number().is_some() || val.as_int32().is_some() {
+        return Err(VmError::type_error("Cannot convert a Number to a BigInt"));
+    }
+    if val.as_symbol().is_some() {
+        return Err(VmError::type_error("Cannot convert a Symbol to a BigInt"));
+    }
+    Err(VmError::type_error("Cannot convert value to a BigInt"))
+}
+
+/// Implement ES2026 §7.1.22 ToIndex(value).
+///
+/// 1. If value is undefined, return 0.
+/// 2. Let integerIndex = ToIntegerOrInfinity(value).
+/// 3. If integerIndex < 0, throw RangeError.
+/// 4. Let index = ToLength(integerIndex).
+/// 5. If SameValue(integerIndex, index) is false, throw RangeError.
+/// 6. Return index.
+fn to_index(
+    ncx: &mut crate::context::NativeContext<'_>,
+    value: &Value,
+    error_msg: &str,
+) -> Result<usize, VmError> {
+    if value.is_undefined() {
+        return Ok(0);
+    }
+    let n = ncx.to_number_value(value)?;
+    // ToIntegerOrInfinity: NaN/+0/-0 → 0
+    let integer_index = if n.is_nan() || n == 0.0 {
+        0.0
+    } else if n.is_infinite() {
+        if n > 0.0 {
+            // +∞ — will fail the range check below
+            f64::INFINITY
+        } else {
+            // -∞ — negative
+            return Err(VmError::range_error(error_msg));
+        }
+    } else {
+        n.trunc()
+    };
+    // Check negative (after truncation — so -0.1 truncates to -0.0 which is ≥ 0)
+    if integer_index < 0.0 {
+        return Err(VmError::range_error(error_msg));
+    }
+    // Check upper bound (2^53 - 1)
+    const MAX_SAFE: f64 = 9007199254740991.0; // 2^53 - 1
+    if integer_index > MAX_SAFE {
+        return Err(VmError::range_error(error_msg));
+    }
+    Ok(integer_index as usize)
+}
+
 fn create_typed_array_constructor(
     kind: TypedArrayKind,
     proto: GcRef<JsObject>,
@@ -456,7 +558,7 @@ fn create_typed_array_constructor(
 + Send
 + Sync
 + 'static {
-    move |_this, args, ncx| {
+    move |this_val, args, ncx| {
         // §22.2.4 step 1: If NewTarget is undefined, throw a TypeError.
         if !ncx.is_construct() {
             return Err(VmError::type_error(
@@ -464,9 +566,23 @@ fn create_typed_array_constructor(
             ));
         }
 
+        // §22.2.4.2.1 AllocateTypedArray step 1: GetPrototypeFromConstructor(newTarget, defaultProto)
+        // When called via Reflect.construct(TA, args, newTarget), `this` already
+        // has newTarget.prototype set. Use it instead of the built-in prototype.
+        let actual_proto = if let Some(this_obj) = this_val.as_object() {
+            let p = this_obj.prototype();
+            if p.is_object() {
+                p.as_object().unwrap()
+            } else {
+                proto
+            }
+        } else {
+            proto
+        };
+
         if args.is_empty() {
             let buffer = GcRef::new(JsArrayBuffer::new(0, None));
-            let object = GcRef::new(JsObject::new(Value::object(proto)));
+            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
             let ta = JsTypedArray::new(object, buffer, kind, 0, 0)?;
             return Ok(make_typed_array_value(ta));
         }
@@ -476,42 +592,76 @@ fn create_typed_array_constructor(
         // §22.2.4.5 TypedArray(buffer [, byteOffset [, length]])
         if let Some(buffer) = arg0.as_array_buffer() {
             // §22.2.4.5 step 7: Let offset be ? ToIndex(byteOffset).
-            let byte_offset = if let Some(bo_val) = args.get(1) {
-                if bo_val.as_symbol().is_some() {
-                    return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+            let bo_val = args.get(1).copied().unwrap_or(Value::undefined());
+            let byte_offset = to_index(ncx, &bo_val, "Invalid byte offset")?;
+
+            // §22.2.4.5 step 9: If offset modulo elementSize ≠ 0, throw RangeError.
+            let elem_size = kind.element_size();
+            if byte_offset % elem_size != 0 {
+                return Err(VmError::range_error(
+                    "Start offset of typed array should be a multiple of the element size",
+                ));
+            }
+            // §22.2.4.5 step 10: If IsDetachedBuffer(buffer), throw TypeError.
+            if buffer.is_detached() {
+                return Err(VmError::type_error("ArrayBuffer is detached"));
+            }
+            let buf_byte_len = buffer.byte_length();
+
+            // §22.2.4.5 step 11-16: Determine length
+            let len_val = args.get(2).copied().unwrap_or(Value::undefined());
+            let length = if !len_val.is_undefined() {
+                // §22.2.4.5 step 14: Let newLength be ? ToIndex(length).
+                let new_length = to_index(ncx, &len_val, "Invalid typed array length")?;
+                // §22.2.4.5 step 14b: Re-check detached after ToIndex (user code may detach)
+                if buffer.is_detached() {
+                    return Err(VmError::type_error("ArrayBuffer is detached"));
                 }
-                let n = crate::globals::to_number(bo_val);
-                if n.is_nan() || n < 0.0 { 0usize } else { n as usize }
-            } else {
-                0
-            };
-            let length = if let Some(len_val) = args.get(2) {
-                if len_val.as_symbol().is_some() {
-                    return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
-                }
-                let n = crate::globals::to_number(len_val);
-                if n < 0.0 {
+                // Check: offset + newLength * elementSize > bufferByteLength
+                if byte_offset + new_length * elem_size > buf_byte_len {
                     return Err(VmError::range_error("Invalid typed array length"));
                 }
-                n as usize
+                new_length
             } else {
-                let available = buffer.byte_length().saturating_sub(byte_offset);
-                available / kind.element_size()
+                // §22.2.4.5 step 13: If bufferByteLength modulo elementSize ≠ 0, throw.
+                if buf_byte_len % elem_size != 0 {
+                    return Err(VmError::range_error(
+                        "Byte length of typed array should be a multiple of element size",
+                    ));
+                }
+                if byte_offset > buf_byte_len {
+                    return Err(VmError::range_error("Invalid typed array length"));
+                }
+                let available = buf_byte_len.saturating_sub(byte_offset);
+                available / elem_size
             };
 
-            let object = GcRef::new(JsObject::new(Value::object(proto)));
+            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
             let ta = JsTypedArray::new(object, buffer, kind, byte_offset, length)?;
             return Ok(make_typed_array_value(ta));
         }
 
         // §22.2.4.3 TypedArray(typedArray)
         if let Some(other_ta) = arg0.as_typed_array() {
+            // §22.2.4.3 step 4: If srcData.[[ContentType]] ≠ O.[[ContentType]], throw TypeError.
+            if kind.is_bigint() != other_ta.kind().is_bigint() {
+                return Err(VmError::type_error(
+                    "Cannot create a BigInt typed array from a non-BigInt typed array, or vice versa",
+                ));
+            }
             let length = other_ta.length();
             let byte_len = length
                 .checked_mul(kind.element_size())
                 .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-            let object = GcRef::new(JsObject::new(Value::object(proto)));
+            // §22.2.4.3 step 17/18: Use SpeciesConstructor(srcBuffer, %ArrayBuffer%)
+            // For now, always use default ArrayBuffer (species null/undefined → default).
+            // Get ArrayBuffer.prototype from intrinsics for the new buffer.
+            let realm_id = ncx.ctx.realm_id();
+            let ab_proto = ncx.ctx.realm_intrinsics(realm_id)
+                .map(|i| Some(i.array_buffer_prototype))
+                .unwrap_or(None);
+            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto));
+            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
             let ta =
                 JsTypedArray::new(object, buffer, kind, 0, length)?;
             for i in 0..length {
@@ -524,10 +674,22 @@ fn create_typed_array_constructor(
 
         // §22.2.4.4 TypedArray(object) — first argument is Object
         if let Some(obj) = arg0.as_object() {
+            // §22.2.4.4 step 4: Let usingIterator be ? GetMethod(object, @@iterator).
             let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
-            if let Some(iter_fn) = obj.get(&PropertyKey::Symbol(iterator_sym))
-                && iter_fn.is_callable()
-            {
+            // Use ncx.get_property to properly invoke accessor getters (Object.defineProperty get())
+            let iter_prop = ncx.get_property(&obj, &PropertyKey::Symbol(iterator_sym))?;
+            // §7.3.10 GetMethod: if value is undefined/null → return undefined (no iterator)
+            // If defined but not callable → throw TypeError
+            let iter_fn_opt = if iter_prop.is_undefined() || iter_prop.is_null() {
+                None
+            } else if !iter_prop.is_callable() {
+                return Err(VmError::type_error(
+                    "TypedArray constructor: @@iterator is not callable",
+                ));
+            } else {
+                Some(iter_prop)
+            };
+            if let Some(iter_fn) = iter_fn_opt {
                 let iterator = ncx.call_function(&iter_fn, *arg0, &[])?;
                 let iter_obj = iterator.as_object().ok_or_else(|| {
                     VmError::type_error("TypedArray constructor: iterator is not an object")
@@ -567,43 +729,67 @@ fn create_typed_array_constructor(
                     .checked_mul(kind.element_size())
                     .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                 let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-                let object = GcRef::new(JsObject::new(Value::object(proto)));
+                let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                     ?;
 
                 for (i, val) in values.into_iter().enumerate() {
                     if kind.is_bigint() {
-                        if let Some(b) = val.as_bigint()
-                            && let Ok(bigint) = b.value.parse::<i64>()
-                        {
-                            let _ = ta.set_bigint(i, bigint);
-                        }
-                    } else if let Some(num) = val.as_number() {
-                        let _ = ta.set(i, num);
-                    } else if let Some(num_int) = val.as_int32() {
-                        let _ = ta.set(i, num_int as f64);
+                        // §10.4.5.11 IntegerIndexedElementSet step 3: ToBigInt(value)
+                        // ToBigInt on objects calls ToPrimitive first
+                        let prim = if val.is_object() || val.as_object().is_some() {
+                            ncx.to_primitive(&val, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            val
+                        };
+                        let n = to_bigint_i64(&prim)?;
+                        ta.set_bigint(i, n);
+                    } else {
+                        // §10.4.5.11 IntegerIndexedElementSet step 4: ToNumber(value)
+                        let n = ncx.to_number_value(&val)?;
+                        ta.set(i, n);
                     }
                 }
 
                 return Ok(make_typed_array_value(ta));
             }
 
-            if let Some(length_val) = obj.get(&PropertyKey::string("length"))
-                && let Some(length) = length_val.as_int32()
+            // §22.2.4.4 step 4: array-like path — Get(O, "length") via JS getter
+            let length_val = ncx.get_property(&obj, &PropertyKey::string("length"))?;
+            // §7.1.4 ToNumber — Symbol throws TypeError
+            if length_val.as_symbol().is_some() {
+                return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+            }
+            let length_num = crate::globals::to_number(&length_val);
+            if !(length_num >= 0.0 && length_num <= 1_073_741_824.0) {
+                if length_num.is_nan() {
+                    // NaN → length 0
+                } else {
+                    return Err(VmError::range_error("Invalid typed array length"));
+                }
+            }
+            let length = if length_num.is_nan() { 0 } else { length_num as usize };
             {
-                let length = length.max(0) as usize;
-                let buffer = GcRef::new(JsArrayBuffer::new(length * kind.element_size(), None));
-                let object = GcRef::new(JsObject::new(Value::object(proto)));
-                let ta = JsTypedArray::new(object, buffer, kind, 0, length)
-                    ?;
+                let byte_len = length.checked_mul(kind.element_size())
+                    .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
+                let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
+                let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+                let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
 
                 for i in 0..length {
-                    if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
-                        if let Some(num) = val.as_number() {
-                            let _ = ta.set(i, num);
-                        } else if let Some(num_int) = val.as_int32() {
-                            let _ = ta.set(i, num_int as f64);
-                        }
+                    // §22.2.4.4 step 8b: Let kValue be ? Get(arrayLike, Pk).
+                    let val = ncx.get_property(&obj, &PropertyKey::Index(i as u32))?;
+                    if kind.is_bigint() {
+                        let prim = if val.is_object() || val.as_object().is_some() {
+                            ncx.to_primitive(&val, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            val
+                        };
+                        let n = to_bigint_i64(&prim)?;
+                        ta.set_bigint(i, n);
+                    } else {
+                        let n = ncx.to_number_value(&val)?;
+                        ta.set(i, n);
                     }
                 }
 
@@ -626,13 +812,12 @@ fn create_typed_array_constructor(
         } else {
             crate::globals::to_number(arg0)
         };
-        // ToIndex: NaN/+0/-0 → 0, negative or non-integer → RangeError
-        let length = if length_num.is_nan() || length_num == 0.0 {
+        // §7.1.22 ToIndex: undefined→0, NaN→0, negative→RangeError, truncate fractional
+        let length = if length_num.is_nan() || length_num == 0.0 || arg0.is_undefined() {
             0usize
         } else {
             let trunc = length_num.trunc();
-            // Cap at 1GB to prevent OOM
-            if length_num < 0.0 || trunc != length_num || trunc > 1_073_741_824.0 {
+            if trunc < 0.0 || trunc > 1_073_741_824.0 {
                 return Err(VmError::range_error("Invalid typed array length"));
             }
             trunc as usize
@@ -641,7 +826,7 @@ fn create_typed_array_constructor(
             .checked_mul(kind.element_size())
             .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
         let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-        let object = GcRef::new(JsObject::new(Value::object(proto)));
+        let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
         let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
         Ok(make_typed_array_value(ta))
     }

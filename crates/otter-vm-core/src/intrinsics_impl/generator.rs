@@ -118,11 +118,15 @@ fn async_generator_result_to_promise(
             );
         }
         GeneratorResult::Error(e) => {
-            let error_msg = e.to_string();
+            // Preserve the original thrown JS value if available
+            let reject_value = match e {
+                VmError::Exception(thrown) => thrown.value,
+                other => Value::string(JsString::intern(&other.to_string())),
+            };
             let js_queue = js_queue.clone();
             JsPromise::reject_with_js_jobs(
                 promise,
-                Value::string(JsString::intern(&error_msg)),
+                reject_value,
                 move |job, args| {
                     if let Some(queue) = &js_queue {
                         queue.enqueue(job, args);

@@ -807,7 +807,7 @@ impl Interpreter {
                     } => {
                         ctx.advance_pc();
                         // Extract func info from module table (borrow scoped, no Arc clone)
-                        let (local_count, became_hot, can_try_jit) = {
+                        let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
                             let m = ctx.module_table.get(module_id);
                             let f = m
                                 .function(func_index)
@@ -815,7 +815,13 @@ impl Interpreter {
                             let hot =
                                 f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
                             let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (f.local_count, hot, jit)
+                            (
+                                f.local_count,
+                                f.flags.has_rest,
+                                f.param_count as usize,
+                                hot,
+                                jit,
+                            )
                         };
 
                         // JIT paths (cold) — clone Arc only when needed
@@ -871,6 +877,29 @@ impl Interpreter {
                                 crate::jit_runtime::JitCallResult::BailoutRestart
                                 | crate::jit_runtime::JitCallResult::NotCompiled => {}
                             }
+                        }
+
+                        if has_rest {
+                            let mut args = ctx.take_pending_args();
+                            let rest_args: Vec<Value> = if args.len() > param_count {
+                                args.drain(param_count..).collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
+                            if let Some(array_obj) =
+                                ctx.get_global("Array").and_then(|v| v.as_object())
+                                && let Some(array_proto) = array_obj
+                                    .get(&PropertyKey::string("prototype"))
+                                    .and_then(|v| v.as_object())
+                            {
+                                rest_arr.set_prototype(Value::object(array_proto));
+                            }
+                            for (i, arg) in rest_args.into_iter().enumerate() {
+                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
+                            }
+                            args.push(Value::object(rest_arr));
+                            ctx.set_pending_args(args);
                         }
 
                         // Hot path: push frame (no Arc clone)
@@ -4373,13 +4402,12 @@ impl Interpreter {
                     },
                 );
 
-                // Create the .prototype for instances - this becomes the prototype of generator instances
+                // Create the .prototype for instances — inherits from %GeneratorPrototype%
                 let gen_proto = ctx
-                    .get_global("GeneratorPrototype")
-                    .and_then(|v| v.as_object());
-                let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
-                ));
+                    .realm_intrinsics(ctx.realm_id())
+                    .map(|i| Value::object(i.generator_prototype))
+                    .unwrap_or_else(Value::null);
+                let proto = GcRef::new(JsObject::new(gen_proto));
 
                 let closure = GcRef::new(Closure {
                     function_index: func.0,
@@ -4467,13 +4495,12 @@ impl Interpreter {
                     },
                 );
 
-                // Create the .prototype for instances - this becomes the prototype of generator instances
-                let gen_proto = ctx
-                    .get_global("GeneratorPrototype")
-                    .and_then(|v| v.as_object());
-                let proto = GcRef::new(JsObject::new(
-                    gen_proto.map(Value::object).unwrap_or_else(Value::null),
-                ));
+                // Create the .prototype for instances — inherits from %AsyncGeneratorPrototype%
+                let async_gen_proto = ctx
+                    .realm_intrinsics(ctx.realm_id())
+                    .map(|i| Value::object(i.async_generator_prototype))
+                    .unwrap_or_else(Value::null);
+                let proto = GcRef::new(JsObject::new(async_gen_proto));
 
                 let closure = GcRef::new(Closure {
                     function_index: func.0,
@@ -5756,6 +5783,9 @@ impl Interpreter {
                     .current_frame()
                     .ok_or_else(|| VmError::internal("no frame"))?;
                 let argc = frame.argc as usize;
+                let register_base = frame.register_base;
+                let extra_args_offset = frame.extra_args_offset as usize;
+                let extra_args_count = frame.extra_args_count as usize;
                 let func = &module.functions[frame.function_index as usize];
                 let param_count = func.param_count as usize;
                 let local_count = func.local_count as usize;
@@ -5793,8 +5823,15 @@ impl Interpreter {
                     }
                     // Extra args beyond param_count — just copy
                     for i in param_count..argc {
-                        let offset = local_count + (i - param_count);
-                        let val = ctx.get_local(offset as u16)?;
+                            let extra_index = i - param_count;
+                            let val = if extra_index < extra_args_count {
+                                ctx.get_absolute_slot(
+                                    register_base + extra_args_offset + extra_index,
+                                )?
+                            } else {
+                                let offset = local_count + extra_index;
+                                ctx.get_local(offset as u16)?
+                        };
                         let _ = args_obj.set(PropertyKey::index(i as u32), val);
                     }
                     args_obj.set_argument_mapping(crate::object::ArgumentMapping { cells });
@@ -5815,8 +5852,13 @@ impl Interpreter {
                         let val = if i < param_count {
                             ctx.get_local(i as u16)?
                         } else {
-                            let offset = local_count + (i - param_count);
-                            ctx.get_local(offset as u16)?
+                            let extra_index = i - param_count;
+                            if extra_index < extra_args_count {
+                                ctx.get_absolute_slot(register_base + extra_args_offset + extra_index)?
+                            } else {
+                                let offset = local_count + extra_index;
+                                ctx.get_local(offset as u16)?
+                            }
                         };
                         let _ = args_obj.set(PropertyKey::index(i as u32), val);
                     }

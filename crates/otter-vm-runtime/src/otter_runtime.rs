@@ -841,7 +841,11 @@ impl Otter {
             let referrer_lit =
                 serde_json::to_string(source_url).unwrap_or_else(|_| "\"main.js\"".to_string());
             let rescope = format!(
-                "globalThis.require = globalThis.__createRequire({});",
+                "globalThis.require = globalThis.__createRequire({0});\
+                 globalThis.module = globalThis.module || {{ exports: {{}} }};\
+                 globalThis.module.filename = {0};\
+                 globalThis.exports = globalThis.module.exports;\
+                 globalThis.require.main = globalThis.module;",
                 referrer_lit
             );
             let _ = self.execute_js(&mut ctx, &rescope, "<require-scope>");

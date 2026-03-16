@@ -262,6 +262,36 @@ async fn test_eval_waits_for_detached_fs_async_ops() {
     assert_eq!(written, "promises-done");
 }
 
+#[tokio::test]
+async fn test_next_tick_preserves_rest_parameters_for_nested_calls() {
+    let mut otter = full_engine_for_parity();
+    let code = r#"
+        globalThis.__nextTickRestResult = 'pending';
+
+        function collect(...values) {
+            if (!Array.isArray(values)) {
+                throw new Error('rest is not array');
+            }
+            if (values.length !== 2 || values[0] !== 'a' || values[1] !== 'b') {
+                throw new Error(`bad rest payload: ${values.length}:${values[0]}:${values[1]}`);
+            }
+            globalThis.__nextTickRestResult = 'ok';
+        }
+
+        process.nextTick(() => collect('a', 'b'));
+        'scheduled';
+    "#;
+
+    otter.eval(code, None).await.expect("eval");
+    let result = otter
+        .eval_sync("globalThis.__nextTickRestResult")
+        .expect("result");
+    assert_eq!(
+        result.as_string().map(|s| s.as_str().to_string()),
+        Some("ok".to_string())
+    );
+}
+
 #[test]
 fn test_process_extended_api_surface() {
     let mut otter = full_engine_for_parity();

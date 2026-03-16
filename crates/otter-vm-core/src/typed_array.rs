@@ -260,37 +260,78 @@ impl JsTypedArray {
             let bytes = &mut data[byte_index..];
             match self.kind {
                 TypedArrayKind::Int8 => {
-                    bytes[0] = value as i8 as u8;
+                    // §7.1.9 ToInt8: NaN/Infinity → 0, then modulo 2^8
+                    bytes[0] = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0
+                    } else {
+                        value.trunc() as i64 as u8
+                    };
                 }
                 TypedArrayKind::Uint8 => {
-                    bytes[0] = value as u8;
+                    // §7.1.10 ToUint8: NaN/Infinity → 0, then modulo 2^8
+                    bytes[0] = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0
+                    } else {
+                        value.trunc() as i64 as u8
+                    };
                 }
                 TypedArrayKind::Uint8Clamped => {
-                    bytes[0] = if value.is_nan() || value < 0.0 {
+                    // §7.1.15 ToUint8Clamp: round-half-to-even (banker's rounding)
+                    bytes[0] = if value.is_nan() || value <= 0.0 {
                         0
-                    } else if value > 255.0 {
+                    } else if value >= 255.0 {
                         255
                     } else {
-                        value.round() as u8
+                        let f = value.floor();
+                        let frac = value - f;
+                        if frac < 0.5 {
+                            f as u8
+                        } else if frac > 0.5 {
+                            (f + 1.0) as u8
+                        } else {
+                            // Exactly 0.5: round to even
+                            let fi = f as u8;
+                            if fi % 2 == 0 { fi } else { fi + 1 }
+                        }
                     };
                 }
                 TypedArrayKind::Int16 => {
-                    let v = (value as i16).to_le_bytes();
-                    bytes[0] = v[0];
-                    bytes[1] = v[1];
+                    // §7.1.11 ToInt16: NaN/Infinity → 0, then modulo 2^16
+                    let v = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0i16
+                    } else {
+                        value.trunc() as i64 as u16 as i16
+                    };
+                    bytes[0] = v.to_le_bytes()[0];
+                    bytes[1] = v.to_le_bytes()[1];
                 }
                 TypedArrayKind::Uint16 => {
-                    let v = (value as u16).to_le_bytes();
-                    bytes[0] = v[0];
-                    bytes[1] = v[1];
+                    // §7.1.12 ToUint16: NaN/Infinity → 0, then modulo 2^16
+                    let v = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0u16
+                    } else {
+                        value.trunc() as i64 as u16
+                    };
+                    bytes[0] = v.to_le_bytes()[0];
+                    bytes[1] = v.to_le_bytes()[1];
                 }
                 TypedArrayKind::Int32 => {
-                    let v = (value as i32).to_le_bytes();
-                    bytes[..4].copy_from_slice(&v);
+                    // §7.1.7 ToInt32: NaN/Infinity/0 → 0, then modulo 2^32
+                    let v = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0i32
+                    } else {
+                        (value.trunc() as i64 as u32 as i32)
+                    };
+                    bytes[..4].copy_from_slice(&v.to_le_bytes());
                 }
                 TypedArrayKind::Uint32 => {
-                    let v = (value as u32).to_le_bytes();
-                    bytes[..4].copy_from_slice(&v);
+                    // §7.1.8 ToUint32: NaN/Infinity/0 → 0
+                    let v = if value.is_nan() || value.is_infinite() || value == 0.0 {
+                        0u32
+                    } else {
+                        value.trunc() as i64 as u32
+                    };
+                    bytes[..4].copy_from_slice(&v.to_le_bytes());
                 }
                 TypedArrayKind::Float32 => {
                     let v = (value as f32).to_le_bytes();
@@ -336,7 +377,14 @@ impl JsTypedArray {
     /// Returns None if out of bounds or detached.
     pub fn get_value(&self, index: usize) -> Option<Value> {
         if self.kind.is_bigint() {
-            self.get_bigint(index).map(|v| Value::bigint(v.to_string()))
+            self.get_bigint(index).map(|v| {
+                // BigUint64: format as unsigned; BigInt64: format as signed
+                if self.kind == TypedArrayKind::BigUint64 {
+                    Value::bigint((v as u64).to_string())
+                } else {
+                    Value::bigint(v.to_string())
+                }
+            })
         } else {
             self.get(index).map(Value::number)
         }
@@ -352,6 +400,12 @@ impl JsTypedArray {
             if let Some(b) = val.as_bigint() {
                 if let Ok(n) = b.value.parse::<i64>() {
                     self.set_bigint(index, n);
+                } else if let Ok(big) = b.value.parse::<num_bigint::BigInt>() {
+                    // Value exceeds i64 — wrap to 64 bits
+                    use num_traits::ToPrimitive;
+                    let mask = num_bigint::BigInt::from(u64::MAX);
+                    let truncated = &big & &mask;
+                    self.set_bigint(index, truncated.to_u64().unwrap_or(0) as i64);
                 }
             } else {
                 let n = crate::globals::to_number(val) as i64;

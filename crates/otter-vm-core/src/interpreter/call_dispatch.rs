@@ -102,16 +102,21 @@ impl Interpreter {
         if let Some(native_fn) = func.as_native_function() {
             let realm_id = self.realm_id_for_function(ctx, func);
 
-            // Create a new `this` object with the constructor's prototype
-            let ctor_proto = func
-                .as_object()
-                .and_then(|o| o.get(&PropertyKey::string("prototype")))
-                .and_then(|v| v.as_object())
-                .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
-            let new_obj = GcRef::new(JsObject::new(
-                ctor_proto.map(Value::object).unwrap_or_else(Value::null),
-            ));
-            let new_obj_value = Value::object(new_obj);
+            // If caller already provided a `this` object (e.g. Reflect.construct),
+            // use it. Otherwise create a new `this` with the constructor's prototype.
+            let new_obj_value = if this_value.is_object() {
+                this_value
+            } else {
+                let ctor_proto = func
+                    .as_object()
+                    .and_then(|o| o.get(&PropertyKey::string("prototype")))
+                    .and_then(|v| v.as_object())
+                    .or_else(|| self.default_object_prototype_for_constructor(ctx, func));
+                let new_obj = GcRef::new(JsObject::new(
+                    ctor_proto.map(Value::object).unwrap_or_else(Value::null),
+                ));
+                Value::object(new_obj)
+            };
 
             let result = self.call_native_fn_with_realm(
                 ctx,

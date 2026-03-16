@@ -506,6 +506,11 @@ pub struct CallFrame {
     pub realm_id: RealmId,
     /// Number of arguments passed to this function
     pub argc: u16,
+    /// Offset from `register_base` to the stable spill area that stores
+    /// arguments beyond the formal parameter list.
+    pub extra_args_offset: u16,
+    /// Number of spilled extra arguments stored at `extra_args_offset`.
+    pub extra_args_count: u16,
     /// Packed boolean flags: is_construct | is_async | this_initialized | is_derived
     pub flags: CallFrameFlags,
 
@@ -1679,6 +1684,15 @@ impl VmContext {
             .ok_or_else(|| VmError::internal(format!("local index {} out of bounds", index)))
     }
 
+    /// Get a value from an absolute slot in the shared register array.
+    #[inline]
+    pub fn get_absolute_slot(&self, index: usize) -> VmResult<Value> {
+        self.registers
+            .get(index)
+            .copied()
+            .ok_or_else(|| VmError::internal(format!("register slot {} out of bounds", index)))
+    }
+
     /// Read a local slot for bytecode execution.
     /// Locals live at `registers[register_base + index]`.
     #[inline]
@@ -2318,6 +2332,9 @@ impl VmContext {
             param_count
         };
 
+        let mut extra_args_offset = 0u16;
+        let mut extra_args_count_u16 = 0u16;
+
         if let Some((src_start, src_count)) = self.pending_args_register_source.take() {
             // Fast path: args are still in the caller's register window.
             // Copy directly register-to-register (no Vec intermediary).
@@ -2329,28 +2346,25 @@ impl VmContext {
                     self.registers[register_base + i] = self.registers[src_start + i];
                 }
             } else {
-                let total_locals = local_count + extra_args_count;
-                let new_window = total_locals + scratch_regs;
+                let new_window = window_size + extra_args_count;
                 let new_needed = register_base + new_window;
                 if new_needed > self.registers.len() {
                     self.registers.resize(new_needed, Value::undefined());
                 }
-                for slot in
-                    &mut self.registers[register_base + local_count..register_base + total_locals]
-                {
+                let spill_start = register_base + window_size;
+                for slot in &mut self.registers[spill_start..spill_start + extra_args_count] {
                     *slot = Value::undefined();
                 }
+                extra_args_offset = window_size as u16;
+                extra_args_count_u16 = extra_args_count as u16;
                 for i in 0..src_count {
                     if i < effective_param_count {
-                        if i < total_locals {
+                        if i < local_count {
                             self.registers[register_base + i] = self.registers[src_start + i];
                         }
                     } else {
-                        let target_idx = local_count + (i - effective_param_count);
-                        if target_idx < total_locals {
-                            self.registers[register_base + target_idx] =
-                                self.registers[src_start + i];
-                        }
+                        let spill_idx = spill_start + (i - effective_param_count);
+                        self.registers[spill_idx] = self.registers[src_start + i];
                     }
                 }
             }
@@ -2366,32 +2380,29 @@ impl VmContext {
                     }
                 }
             } else {
-                let total_locals = local_count + extra_args_count;
-                let new_window = total_locals + scratch_regs;
+                let new_window = window_size + extra_args_count;
                 let new_needed = register_base + new_window;
                 if new_needed > self.registers.len() {
                     self.registers.resize(new_needed, Value::undefined());
                 }
-                for slot in
-                    &mut self.registers[register_base + local_count..register_base + total_locals]
-                {
+                let spill_start = register_base + window_size;
+                for slot in &mut self.registers[spill_start..spill_start + extra_args_count] {
                     *slot = Value::undefined();
                 }
+                extra_args_offset = window_size as u16;
+                extra_args_count_u16 = extra_args_count as u16;
                 for (i, arg) in self.pending_args.drain(..).enumerate() {
                     if i < effective_param_count {
-                        if i < total_locals {
+                        if i < local_count {
                             self.registers[register_base + i] = arg;
                         }
                     } else {
-                        let target_idx = local_count + (i - effective_param_count);
-                        if target_idx < total_locals {
-                            self.registers[register_base + target_idx] = arg;
-                        }
+                        let spill_idx = spill_start + (i - effective_param_count);
+                        self.registers[spill_idx] = arg;
                     }
                 }
             }
         }
-
         static TRACE_ASSERT_ARGS: OnceLock<bool> = OnceLock::new();
         if *TRACE_ASSERT_ARGS.get_or_init(|| std::env::var("OTTER_TRACE_ASSERT_ARGS").is_ok())
             && func_name_is_assert
@@ -2444,6 +2455,8 @@ impl VmContext {
             upvalues,
             realm_id: frame_realm_id,
             argc,
+            extra_args_offset,
+            extra_args_count: extra_args_count_u16,
             flags: CallFrameFlags::new(is_construct, is_async, !is_derived, is_derived),
             home_object,
             new_target_proto: self.pending_new_target_proto.take(),
@@ -2918,6 +2931,8 @@ impl VmContext {
                 is_async: frame.flags.is_async(),
                 frame_id: frame.frame_id,
                 argc: frame.argc,
+                extra_args_offset: frame.extra_args_offset,
+                extra_args_count: frame.extra_args_count,
             })
             .collect();
         self.open_upvalues.clear();
@@ -2959,6 +2974,8 @@ impl VmContext {
                 upvalues: saved.upvalues,
                 realm_id: saved.realm_id,
                 argc: saved.argc,
+                extra_args_offset: saved.extra_args_offset,
+                extra_args_count: saved.extra_args_count,
                 flags: CallFrameFlags::new(saved.is_construct, saved.is_async, true, false),
                 home_object: None,
                 new_target_proto: None,

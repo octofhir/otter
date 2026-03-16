@@ -2268,6 +2268,7 @@ dependencies = [
  "futures",
  "indicatif",
  "otter-engine",
+ "otter-nodejs",
  "otter-vm-core",
  "serde",
  "serde_json",

@@ -1149,6 +1149,9 @@ try {{
             .map_err(|_| ModuleError::NotFound(specifier.to_string()))?;
 
         if guard.is_esm() {
+            if let Some(module_exports) = guard.namespace.get("module.exports") {
+                return Ok(module_exports);
+            }
             let cjs_view = interop::esm_to_cjs(&guard.namespace);
             return Ok(namespace_to_object(&cjs_view, mm));
         }
@@ -1437,6 +1440,7 @@ globalThis.__createRequire = function(referrer) {{
     require.cache = {{}};
     require.filename = __module_filename(referrer);
     require.dirname = __module_dirname(referrer);
+    require.main = globalThis.module;
 
     return require;
 }};

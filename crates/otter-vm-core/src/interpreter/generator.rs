@@ -898,6 +898,14 @@ impl Interpreter {
                         // Pop the current frame
                         let frame = ctx.pop_frame().unwrap();
 
+                        // §13.2.2 step 8: For construct calls, if the return value
+                        // is not an object, use the constructed `this` instead.
+                        let result = if frame.flags.is_construct() && !value.is_object() {
+                            frame.this_value
+                        } else {
+                            value
+                        };
+
                         // Check if we're back to the initial depth (generator is returning)
                         if ctx.stack_depth() <= initial_depth {
                             generator.complete();
@@ -905,12 +913,12 @@ impl Interpreter {
                             if let Some(pending) = generator.take_pending_return() {
                                 return GeneratorResult::Returned(pending);
                             }
-                            return GeneratorResult::Returned(value);
+                            return GeneratorResult::Returned(result);
                         }
 
                         // There's a caller frame within the generator - pass return value
                         if let Some(ret_reg) = frame.return_register {
-                            ctx.set_register(ret_reg, value);
+                            ctx.set_register(ret_reg, result);
                         }
                         cached_frame_id = u32::MAX;
                     }

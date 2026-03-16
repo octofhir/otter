@@ -89,6 +89,10 @@ pub struct SavedFrame {
     pub frame_id: u32,
     /// Number of arguments passed to this function
     pub argc: u16,
+    /// Offset from `register_base` to spilled extra arguments.
+    pub extra_args_offset: u16,
+    /// Number of spilled extra arguments.
+    pub extra_args_count: u16,
 }
 
 /// Result of VM execution that can indicate suspension

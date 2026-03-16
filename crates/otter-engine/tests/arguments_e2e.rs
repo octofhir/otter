@@ -93,3 +93,50 @@ fn test_arguments_instanceof_object() {
         Err(e) => panic!("Failed: {:?}", e),
     }
 }
+
+#[test]
+fn test_function_apply_accepts_arguments_object() {
+    let mut engine = create_test_engine();
+    let result = engine.eval_sync(
+        r#"
+        function invoke(fn) {
+            return function() {
+                return fn.apply(this, arguments);
+            };
+        }
+
+        const wrapped = invoke((socket) => socket.end());
+        wrapped({
+            end() {
+                return 42;
+            }
+        });
+    "#,
+    );
+    match result {
+        Ok(v) => assert_eq!(v.as_int32(), Some(42)),
+        Err(e) => panic!("Failed: {:?}", e),
+    }
+}
+
+#[test]
+fn test_arguments_zero_param_function_preserves_object_value() {
+    let mut engine = create_test_engine();
+    let result = engine.eval_sync(
+        r#"
+        function foo() {
+            return arguments[0].end();
+        }
+
+        foo({
+            end() {
+                return 7;
+            }
+        });
+    "#,
+    );
+    match result {
+        Ok(v) => assert_eq!(v.as_int32(), Some(7)),
+        Err(e) => panic!("Failed: {:?}", e),
+    }
+}

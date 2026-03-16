@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use otter_engine::{EngineBuilder, Otter};
+use otter_nodejs::{
+    set_default_auto_select_family_attempt_timeout_override,
+    set_default_auto_select_family_override,
+    set_process_argv_override,
+    set_process_exec_argv_override,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::NodeCompatConfig;
@@ -49,6 +55,28 @@ pub enum TestOutcome {
     Skip,
     Timeout,
     Crash,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TestMetadata {
+    flags: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct NetFlagOverrides {
+    default_auto_select_family: Option<bool>,
+    default_auto_select_family_attempt_timeout_ms: Option<u64>,
+}
+
+struct RuntimeOverrideGuard;
+
+impl Drop for RuntimeOverrideGuard {
+    fn drop(&mut self) {
+        set_process_argv_override(None);
+        set_process_exec_argv_override(None);
+        set_default_auto_select_family_attempt_timeout_override(None);
+        set_default_auto_select_family_override(None);
+    }
 }
 
 impl NodeCompatRunner {
@@ -173,6 +201,7 @@ impl NodeCompatRunner {
                 };
             }
         };
+        let metadata = parse_test_metadata(&test_source);
 
         // Compose: harness + test
         // `require` and `module`/`exports` are set up by the engine's module extension
@@ -190,6 +219,9 @@ impl NodeCompatRunner {
             "var __filename = '{}';\nvar __dirname = '{}';\n{}\n\n// --- Test: {} ---\n{}",
             test_filename, test_dirname, self.harness_source, rel_path, test_source
         );
+
+        let _runtime_overrides =
+            apply_test_runtime_overrides(&metadata, &test_path_abs, self.engine());
 
         // Reset realm for clean test
         self.engine_mut().reset_realm();
@@ -245,6 +277,8 @@ impl NodeCompatRunner {
                         TestOutcome::Timeout,
                         Some(format!("Timeout: {}", test_name)),
                     )
+                } else if msg.contains("Process exited with code 0") {
+                    (TestOutcome::Skip, Some(msg))
                 } else {
                     (TestOutcome::Fail, Some(msg))
                 }
@@ -334,5 +368,96 @@ fn extract_panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+fn parse_test_metadata(source: &str) -> TestMetadata {
+    let mut metadata = TestMetadata::default();
+    for line in source.lines().take(16) {
+        let trimmed = line.trim();
+        if let Some(flags) = trimmed.strip_prefix("// Flags:") {
+            metadata
+                .flags
+                .extend(flags.split_whitespace().map(|flag| flag.to_string()));
+        }
+    }
+    metadata
+}
+
+fn parse_net_flag_overrides(flags: &[String]) -> NetFlagOverrides {
+    let mut overrides = NetFlagOverrides::default();
+    for flag in flags {
+        if flag == "--no-network-family-autoselection" {
+            overrides.default_auto_select_family = Some(false);
+            continue;
+        }
+        if flag == "--network-family-autoselection" {
+            overrides.default_auto_select_family = Some(true);
+            continue;
+        }
+        if let Some(value) = flag.strip_prefix("--network-family-autoselection-attempt-timeout=")
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            overrides.default_auto_select_family_attempt_timeout_ms = Some(ms);
+        }
+    }
+    overrides
+}
+
+fn apply_test_runtime_overrides(
+    metadata: &TestMetadata,
+    test_path: &Path,
+    _engine: &Otter,
+) -> RuntimeOverrideGuard {
+    let exec_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "otter".to_string());
+
+    set_process_argv_override(Some(vec![
+        exec_path,
+        test_path.to_string_lossy().to_string(),
+    ]));
+    set_process_exec_argv_override(Some(metadata.flags.clone()));
+
+    let net_overrides = parse_net_flag_overrides(&metadata.flags);
+    set_default_auto_select_family_attempt_timeout_override(
+        net_overrides.default_auto_select_family_attempt_timeout_ms,
+    );
+    set_default_auto_select_family_override(net_overrides.default_auto_select_family);
+
+    RuntimeOverrideGuard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_net_flag_overrides, parse_test_metadata, NetFlagOverrides, TestMetadata};
+
+    #[test]
+    fn parse_test_metadata_extracts_flags() {
+        let metadata = parse_test_metadata(
+            "'use strict';\n// Flags: --foo --bar=baz\nconst x = 1;\n",
+        );
+        assert_eq!(
+            metadata,
+            TestMetadata {
+                flags: vec!["--foo".to_string(), "--bar=baz".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_net_flag_overrides_extracts_supported_net_flags() {
+        let overrides = parse_net_flag_overrides(&[
+            "--no-network-family-autoselection".to_string(),
+            "--network-family-autoselection-attempt-timeout=123".to_string(),
+        ]);
+        assert_eq!(
+            overrides,
+            NetFlagOverrides {
+                default_auto_select_family: Some(false),
+                default_auto_select_family_attempt_timeout_ms: Some(123),
+            }
+        );
     }
 }

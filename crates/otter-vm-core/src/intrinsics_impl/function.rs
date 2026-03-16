@@ -25,7 +25,7 @@ use crate::context::NativeContext;
 use crate::error::VmError;
 use crate::gc::GcRef;
 use crate::memory::MemoryManager;
-use crate::object::{JsObject, PropertyDescriptor, PropertyKey};
+use crate::object::{JsObject, PropertyAttributes, PropertyDescriptor, PropertyKey};
 use crate::realm::RealmId;
 use crate::string::JsString;
 use crate::value::Value;
@@ -90,6 +90,92 @@ impl IntrinsicObject for FunctionIntrinsic {
             .inherits(ctx.obj_proto())
             .constructor_fn(create_async_generator_function_constructor(realm_id), 1)
             .build_and_install(&global);
+
+            // §27.4.1 AsyncGeneratorFunction.prototype adjustments:
+            // constructor is {writable: false, configurable: true} (not writable like normal ctors)
+            {
+                let agf_proto = ctx.intrinsics().async_generator_function_prototype;
+                // Override constructor to writable:false
+                if let Some(ctor_val) = agf_proto.get(&PropertyKey::string("constructor")) {
+                    agf_proto.define_property(
+                        PropertyKey::string("constructor"),
+                        PropertyDescriptor::data_with_attrs(
+                            ctor_val,
+                            PropertyAttributes {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                    );
+                }
+                // §27.4.1.1 AsyncGeneratorFunction.prototype.prototype = %AsyncGeneratorPrototype%
+                agf_proto.define_property(
+                    PropertyKey::string("prototype"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::object(ctx.intrinsics().async_generator_prototype),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ),
+                );
+                // §27.4.1.2 AsyncGeneratorFunction.prototype[@@toStringTag] = "AsyncGeneratorFunction"
+                let to_string_tag_sym = crate::intrinsics::well_known::to_string_tag_symbol();
+                agf_proto.define_property(
+                    PropertyKey::Symbol(to_string_tag_sym),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::string(JsString::intern("AsyncGeneratorFunction")),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ),
+                );
+            }
+
+            // Same for GeneratorFunction.prototype (§27.3.1)
+            {
+                let gf_proto = ctx.intrinsics().generator_function_prototype;
+                if let Some(ctor_val) = gf_proto.get(&PropertyKey::string("constructor")) {
+                    gf_proto.define_property(
+                        PropertyKey::string("constructor"),
+                        PropertyDescriptor::data_with_attrs(
+                            ctor_val,
+                            PropertyAttributes {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        ),
+                    );
+                }
+                gf_proto.define_property(
+                    PropertyKey::string("prototype"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::object(ctx.intrinsics().generator_prototype),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ),
+                );
+                let to_string_tag_sym = crate::intrinsics::well_known::to_string_tag_symbol();
+                gf_proto.define_property(
+                    PropertyKey::Symbol(to_string_tag_sym),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::string(JsString::intern("GeneratorFunction")),
+                        PropertyAttributes {
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                        },
+                    ),
+                );
+            }
 
             global.define_property(
                 PropertyKey::string("GeneratorFunctionPrototype"),
@@ -197,10 +283,9 @@ fn function_apply(
             .unwrap_or(0.0) as usize;
         let mut extracted = Vec::with_capacity(len.min(1024));
         for i in 0..len {
-            extracted.push(
-                crate::object::get_value_full(&arr_obj, &PropertyKey::Index(i as u32), ncx)
-                    .unwrap_or_default(),
-            );
+            // Indexed values on `arguments` and other array-like objects live in
+            // element storage, so use ordinary object Get semantics here.
+            extracted.push(arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or_default());
         }
         extracted
     } else {
@@ -369,6 +454,44 @@ enum DynamicFunctionKind {
     AsyncGenerator,
 }
 
+/// Check if `source` contains `keyword` as a standalone token (not inside string literals).
+fn contains_keyword_token(source: &str, keyword: &str) -> bool {
+    let bytes = source.as_bytes();
+    let kw_bytes = keyword.as_bytes();
+    let kw_len = kw_bytes.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip string literals
+        if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' {
+                    i += 1; // skip escaped char
+                }
+                i += 1;
+            }
+            i += 1; // skip closing quote
+            continue;
+        }
+        // Check for keyword match
+        if i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw_bytes {
+            // Verify it's a standalone token (not part of a larger identifier)
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' && bytes[i - 1] != b'$';
+            let after_ok = i + kw_len >= bytes.len()
+                || !bytes[i + kw_len].is_ascii_alphanumeric()
+                    && bytes[i + kw_len] != b'_'
+                    && bytes[i + kw_len] != b'$';
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn build_dynamic_function_source(
     kind: DynamicFunctionKind,
     params: &[String],
@@ -421,6 +544,26 @@ fn create_dynamic_function_constructor(
                 params.push(ncx.to_string_value(arg)?);
             }
             body = ncx.to_string_value(args.last().unwrap())?;
+        }
+
+        // §20.2.1.1.1 CreateDynamicFunction steps 28-29:
+        // Check for yield/await in generator/async params
+        let joined_params = params.join(",");
+        if matches!(kind, DynamicFunctionKind::Generator | DynamicFunctionKind::AsyncGenerator) {
+            if contains_keyword_token(&joined_params, "yield") {
+                return Err(VmError::SyntaxError(
+                    "yield expression is not allowed in formal parameters of a generator function"
+                        .to_string(),
+                ));
+            }
+        }
+        if matches!(kind, DynamicFunctionKind::Async | DynamicFunctionKind::AsyncGenerator) {
+            if contains_keyword_token(&joined_params, "await") {
+                return Err(VmError::SyntaxError(
+                    "await expression is not allowed in formal parameters of an async function"
+                        .to_string(),
+                ));
+            }
         }
 
         let source = build_dynamic_function_source(kind, &params, &body);

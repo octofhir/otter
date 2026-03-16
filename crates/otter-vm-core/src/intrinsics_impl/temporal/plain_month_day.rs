@@ -88,6 +88,7 @@ fn resolve_plain_month_day_fields(
     // Case 2: String — try month-day, then date, then datetime
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         // Try PlainMonthDay first
         if let Ok((ref_year, month, day)) = parse_temporal_month_day_string(s.as_str()) {
             return Ok((month as i32, day as i32, ref_year));

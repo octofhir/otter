@@ -27,6 +27,31 @@ use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// CanonicalNumericIndexString → usize for TypedArray indexed access.
+/// Returns Some(idx) if the string is a valid non-negative integer index
+/// (e.g. "0", "1", "123"), None otherwise.
+/// Per spec §7.1.21, "-0" is a canonical numeric index but not a valid
+/// TypedArray index, so we return None for it.
+fn canonical_numeric_index_usize(s: &str) -> Option<usize> {
+    if s.is_empty() || s == "-0" {
+        return None;
+    }
+    // Fast path: single ASCII digit
+    if s.len() == 1 {
+        let b = s.as_bytes()[0];
+        if b.is_ascii_digit() {
+            return Some((b - b'0') as usize);
+        }
+        return None;
+    }
+    // Reject leading zeros (except "0" handled above)
+    if s.starts_with('0') {
+        return None;
+    }
+    // Parse as usize — only pure non-negative integers
+    s.parse::<usize>().ok()
+}
+
 /// Extract a human-readable message from a panic payload.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -4023,6 +4048,29 @@ impl Interpreter {
                     ));
                 };
 
+                // TypedArray [[HasProperty]]: numeric indices within bounds are own properties
+                if let Some(ta_val) = right_obj.get(&PropertyKey::string("__TypedArrayData__"))
+                    && let Some(ta) = ta_val.as_typed_array()
+                {
+                    let maybe_idx: Option<usize> = if let Some(n) = left.as_int32() {
+                        if n >= 0 { Some(n as usize) } else { None }
+                    } else if let Some(n) = left.as_number() {
+                        let idx = n as usize;
+                        if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                    } else if let Some(s) = left.as_string() {
+                        canonical_numeric_index_usize(s.as_str())
+                    } else {
+                        None
+                    };
+                    if let Some(idx) = maybe_idx {
+                        // Numeric index: true iff in bounds (and not detached)
+                        let result = !ta.is_detached() && idx < ta.length();
+                        ctx.set_register(dst.0, Value::boolean(result));
+                        return Ok(());
+                    }
+                    // Non-numeric key: fall through to normal property lookup
+                }
+
                 let key = if let Some(n) = left.as_int32() {
                     PropertyKey::Index(n as u32)
                 } else if let Some(s) = left.as_string() {
@@ -6455,6 +6503,9 @@ impl Interpreter {
                             } else {
                                 None
                             }
+                        } else if let Some(s) = key_value.as_string() {
+                            // CanonicalNumericIndexString: parse "0", "1", etc.
+                            canonical_numeric_index_usize(s.as_str())
                         } else {
                             None
                         };
@@ -6469,7 +6520,6 @@ impl Interpreter {
                             return Ok(());
                         }
                     }
-
                     let receiver = object;
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
@@ -6597,6 +6647,8 @@ impl Interpreter {
                             } else {
                                 None
                             }
+                        } else if let Some(s) = key_value.as_string() {
+                            canonical_numeric_index_usize(s.as_str())
                         } else {
                             None
                         };
@@ -6776,10 +6828,20 @@ impl Interpreter {
                 if let Some(idx) = idx_val.as_int32()
                     && idx >= 0
                     && let Some(obj_ref) = object.as_object()
-                    && let Some(val) = obj_ref.get_index(idx as usize)
                 {
-                    ctx.set_register(dst.0, val);
-                    return Ok(());
+                    // TypedArray fast path — route through buffer
+                    if let Some(ta_val) =
+                        obj_ref.get(&PropertyKey::string("__TypedArrayData__"))
+                        && let Some(ta) = ta_val.as_typed_array()
+                    {
+                        let val = ta.get_value(idx as usize).unwrap_or(Value::undefined());
+                        ctx.set_register(dst.0, val);
+                        return Ok(());
+                    }
+                    if let Some(val) = obj_ref.get_index(idx as usize) {
+                        ctx.set_register(dst.0, val);
+                        return Ok(());
+                    }
                 }
 
                 // Fallback to generic GetElem semantics if fast path fails
@@ -6819,6 +6881,28 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = array.as_object() {
+                    // TypedArray fast path — route through buffer
+                    if let Some(ta_val) =
+                        obj.get(&PropertyKey::string("__TypedArrayData__"))
+                        && let Some(ta) = ta_val.as_typed_array()
+                    {
+                        let maybe_idx: Option<usize> = if let Some(n) = index.as_int32() {
+                            if n >= 0 { Some(n as usize) } else { None }
+                        } else if let Some(n) = index.as_number() {
+                            let idx = n as usize;
+                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                        } else if let Some(s) = index.as_string() {
+                            canonical_numeric_index_usize(s.as_str())
+                        } else {
+                            None
+                        };
+                        if let Some(idx) = maybe_idx {
+                            let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                            ctx.set_register(dst.0, val);
+                            return Ok(());
+                        }
+                    }
+
                     // Fast path for numeric index access on arrays
                     if obj.is_array()
                         && let Some(n) = index.as_int32()
@@ -6978,6 +7062,27 @@ impl Interpreter {
                 }
 
                 if let Some(obj) = array.as_object() {
+                    // TypedArray fast path — route through buffer
+                    if let Some(ta_val) =
+                        obj.get(&PropertyKey::string("__TypedArrayData__"))
+                        && let Some(ta) = ta_val.as_typed_array()
+                    {
+                        let maybe_idx: Option<usize> = if let Some(n) = index.as_int32() {
+                            if n >= 0 { Some(n as usize) } else { None }
+                        } else if let Some(n) = index.as_number() {
+                            let idx = n as usize;
+                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
+                        } else if let Some(s) = index.as_string() {
+                            canonical_numeric_index_usize(s.as_str())
+                        } else {
+                            None
+                        };
+                        if let Some(idx) = maybe_idx {
+                            ta.set_value(idx, &val_val);
+                            return Ok(());
+                        }
+                    }
+
                     // Fast path for numeric index access on arrays
                     if obj.is_array()
                         && !obj.is_dictionary_mode()

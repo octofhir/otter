@@ -415,6 +415,9 @@ fn register_all_types(registry: &mut otter_vm_gc::AllocationRegistry) {
     registry.register_type::<JsDataView>();
     registry.register_type::<JsGenerator>();
 
+    // Accessor pairs (getter + setter stored in property slots)
+    registry.register_type::<crate::object::AccessorPair>();
+
     // GC-internal types
     registry.register_type::<otter_vm_gc::WeakRefCell>();
     registry.register_type::<otter_vm_gc::FinalizationRegistryData>();

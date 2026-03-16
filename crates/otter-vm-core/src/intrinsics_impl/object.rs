@@ -494,7 +494,9 @@ pub fn init_object_constructor(
                 use crate::intrinsics_impl::reflect::to_property_key;
                 let pk = to_property_key(&key_val);
 
-                if let Some(desc) = obj.0.get_own_property_descriptor(&pk) {
+                let desc_opt = obj.0.get_own_property_descriptor(&pk)
+                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(&obj.0, &pk));
+                if let Some(desc) = desc_opt {
                     // Build descriptor object with Object.prototype
                     let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
                         .map(Value::object)
@@ -566,7 +568,7 @@ pub fn init_object_constructor(
                 let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
                 } else {
-                    obj.as_ref().unwrap().own_keys()
+                    crate::intrinsics_impl::typed_array::typed_array_own_keys(obj.as_ref().unwrap())
                 };
 
                 let mut anchored_keys = Vec::with_capacity(raw_keys.len());
@@ -585,7 +587,9 @@ pub fn init_object_constructor(
                                     ncx, p, key, *key_value,
                                 )?
                             } else {
-                                obj.as_ref().unwrap().get_own_property_descriptor(key)
+                                let o = obj.as_ref().unwrap();
+                                o.get_own_property_descriptor(key)
+                                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(o, key))
                             };
                             if let Some(desc) = desc
                                 && desc.enumerable()
@@ -599,7 +603,9 @@ pub fn init_object_constructor(
                                     ncx, p, key, *key_value,
                                 )?
                             } else {
-                                obj.as_ref().unwrap().get_own_property_descriptor(key)
+                                let o = obj.as_ref().unwrap();
+                                o.get_own_property_descriptor(key)
+                                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(o, key))
                             };
                             if let Some(desc) = desc
                                 && desc.enumerable()
@@ -649,7 +655,7 @@ pub fn init_object_constructor(
                 let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
                 } else {
-                    obj.as_ref().unwrap().own_keys()
+                    crate::intrinsics_impl::typed_array::typed_array_own_keys(obj.as_ref().unwrap())
                 };
 
                 let mut anchored_keys = Vec::with_capacity(raw_keys.len());
@@ -1364,7 +1370,7 @@ pub fn init_object_constructor(
                 let keys = if let Some(proxy) = arg.as_proxy() {
                     crate::proxy_operations::proxy_own_keys(ncx_inner, proxy)?
                 } else if let Some(obj) = arg.as_object() {
-                    obj.own_keys()
+                    crate::intrinsics_impl::typed_array::typed_array_own_keys(&obj)
                 } else {
                     let arr = GcRef::new(JsObject::array(0));
                     if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))

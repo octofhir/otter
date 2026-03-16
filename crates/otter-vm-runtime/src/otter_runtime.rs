@@ -593,10 +593,9 @@ impl Otter {
         // This is critical for test isolation and preventing leaks from timed-out tests.
         self.event_loop.clear_all_queues();
 
-        // Eagerly collect garbage now that original realm roots are dropped.
-        // This prevents memory accumulation across thousands of Test262 runs
-        // and keeps the live set minimal.
-        self.isolate.runtime().create_context().collect_garbage();
+        // NOTE: Removed eager GC here — it was collecting intrinsic objects
+        // (like Temporal.Duration.prototype accessor closures) from the NEW realm
+        // before they became reachable through a VmContext.
 
         // Reset execution state
         self.clear_interrupt();

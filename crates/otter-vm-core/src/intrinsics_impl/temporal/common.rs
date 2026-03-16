@@ -180,15 +180,46 @@ pub(super) fn extract_date_like(obj: &GcRef<JsObject>) -> Result<temporal_rs::Pl
 // Error conversion
 // ============================================================================
 
-/// Convert a temporal_rs error into a VmError preserving TypeError vs RangeError
+/// Convert a temporal_rs error into a VmError preserving TypeError vs RangeError.
+///
+/// `temporal_rs` Display format includes the error kind prefix (e.g. "RangeError: ..."),
+/// so we strip it to avoid double-prefixing when VmError wraps it.
 pub(super) fn temporal_err(e: temporal_rs::error::TemporalError) -> VmError {
-    let msg = format!("{e}");
+    let raw = format!("{e}");
+    // Strip "TypeError: ", "RangeError: ", etc. prefixes from temporal_rs Display
+    let msg = raw
+        .strip_prefix("TypeError: ")
+        .or_else(|| raw.strip_prefix("RangeError: "))
+        .or_else(|| raw.strip_prefix("SyntaxError: "))
+        .unwrap_or(&raw)
+        .to_string();
     match e.kind() {
         temporal_rs::error::ErrorKind::Type => VmError::type_error(msg),
         temporal_rs::error::ErrorKind::Range => VmError::range_error(msg),
         temporal_rs::error::ErrorKind::Syntax => VmError::range_error(msg),
         _ => VmError::type_error(msg),
     }
+}
+
+/// Validate that an ISO 8601 time string does not contain more than 9
+/// fractional-second digits. `temporal_rs` silently truncates excess digits
+/// rather than rejecting the string as the spec requires.
+pub(super) fn validate_iso_fractional_seconds(s: &str) -> Result<(), VmError> {
+    // Find the fractional part: look for '.' after time digits
+    // Pattern: ...HH:MM:SS.fractional... (dot must follow digits)
+    if let Some(dot_pos) = s.find('.') {
+        // Count contiguous digits after the dot
+        let frac_digits = s[dot_pos + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if frac_digits > 9 {
+            return Err(VmError::range_error(
+                "Fractional second must not have more than 9 digits",
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -842,6 +873,7 @@ pub(super) fn to_temporal_datetime_standalone(
     if item.is_string() {
         let s = ncx.to_string_value(item)?;
         reject_utc_designator_for_plain(s.as_str())?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::PlainDateTime::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     if item.is_undefined()
@@ -1024,6 +1056,7 @@ pub(super) fn to_temporal_datetime_standalone(
 /// Parse an ISO date string for PlainMonthDay, returning (year, month, day)
 /// Uses temporal_rs for spec-compliant parsing of all ISO 8601 + RFC 9557 formats.
 pub(super) fn parse_temporal_month_day_string(s: &str) -> Result<(i32, u32, u32), VmError> {
+    validate_iso_fractional_seconds(s)?;
     let pmd = temporal_rs::PlainMonthDay::from_utf8(s.as_bytes()).map_err(temporal_err)?;
     Ok((
         pmd.reference_year(),
@@ -1460,6 +1493,7 @@ pub(super) fn strip_time_offset(time: &str) -> &str {
 pub(super) fn parse_iso_datetime_string(
     s: &str,
 ) -> Result<(i32, u32, u32, i32, i32, i32, i32, i32, i32), VmError> {
+    validate_iso_fractional_seconds(s)?;
     let pdt = temporal_rs::PlainDateTime::from_utf8(s.as_bytes()).map_err(temporal_err)?;
     Ok((
         pdt.year(),
@@ -1490,6 +1524,7 @@ pub(super) fn to_temporal_plain_date(
     if item.is_string() {
         let s = ncx.to_string_value(item)?;
         reject_utc_designator_for_plain(s.as_str())?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::PlainDate::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     if item.is_undefined()
@@ -1626,6 +1661,7 @@ pub(super) fn to_temporal_plain_time(
 ) -> Result<temporal_rs::PlainTime, VmError> {
     if item.is_string() {
         let s = ncx.to_string_value(item)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::PlainTime::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     // Handle objects AND proxies

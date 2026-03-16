@@ -788,6 +788,7 @@ pub(super) fn install_plain_year_month(
                 }
                 // Reject UTC designator Z
                 reject_utc_designator_for_plain(s.as_str())?;
+                validate_iso_fractional_seconds(s.as_str())?;
                 // Parse via temporal_rs
                 let pym =
                     temporal_rs::PlainYearMonth::from_utf8(s.as_bytes()).map_err(temporal_err)?;
@@ -1002,6 +1003,7 @@ fn to_temporal_year_month(
 ) -> Result<temporal_rs::PlainYearMonth, VmError> {
     if item.is_string() {
         let s = ncx.to_string_value(item)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::PlainYearMonth::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     let is_object_like = item.as_object().is_some() || item.as_proxy().is_some();

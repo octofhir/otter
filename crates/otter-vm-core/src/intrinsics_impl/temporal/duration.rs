@@ -237,23 +237,26 @@ pub(super) fn install_duration(
     // Installed as accessor properties (like PlainDate year/month/day)
     for field in DURATION_FIELDS.iter() {
         let field_name: &'static str = field;
+        // Capture field index instead of string — index is a plain usize, immune
+        // to any pointer corruption from GC bugs, and avoids the string match.
+        let field_index: usize = DURATION_FIELDS.iter().position(|&f| f == field_name).unwrap();
         let getter_fn = Value::native_function_with_proto(
             move |this, _args, _ncx| {
                 let obj = this.as_object().ok_or_else(|| {
-                    VmError::type_error(format!("{} called on non-Duration", field_name))
+                    VmError::type_error("getter called on non-Duration")
                 })?;
                 let dur = extract_duration(&obj)?;
-                let val = match field_name {
-                    "years" => dur.years() as f64,
-                    "months" => dur.months() as f64,
-                    "weeks" => dur.weeks() as f64,
-                    "days" => dur.days() as f64,
-                    "hours" => dur.hours() as f64,
-                    "minutes" => dur.minutes() as f64,
-                    "seconds" => dur.seconds() as f64,
-                    "milliseconds" => dur.milliseconds() as f64,
-                    "microseconds" => dur.microseconds() as f64,
-                    "nanoseconds" => dur.nanoseconds() as f64,
+                let val = match field_index {
+                    0 => dur.years() as f64,
+                    1 => dur.months() as f64,
+                    2 => dur.weeks() as f64,
+                    3 => dur.days() as f64,
+                    4 => dur.hours() as f64,
+                    5 => dur.minutes() as f64,
+                    6 => dur.seconds() as f64,
+                    7 => dur.milliseconds() as f64,
+                    8 => dur.microseconds() as f64,
+                    9 => dur.nanoseconds() as f64,
                     _ => unreachable!(),
                 };
                 Ok(Value::number(val))

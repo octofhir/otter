@@ -3546,13 +3546,25 @@ pub fn translate_function_with_constants(
         }
     }
 
+    // Intra-block CSE for property reads: cache obj_ptr + shape_id per register.
+    // Within a basic block, if the same object is read multiple times, skip
+    // tag check + pointer extraction + shape check on 2nd+ access.
+    // Just load directly from inline_slots — 1 instruction instead of ~11.
+    let mut prop_read_cache: std::collections::HashMap<u16, (Value, u64)> = std::collections::HashMap::new();
+
     for pc in 0..instruction_count {
         let instruction = &instructions_ref[pc];
         let deopt_site = deopt_metadata.site(pc as u32);
         if leaders[pc] {
+            prop_read_cache.clear(); // new basic block → invalidate cache
             builder.switch_to_block(blocks[pc]);
         } else if current_block_is_filled(builder) {
             continue;
+        }
+
+        // Invalidate cache for registers written by this instruction
+        if let Some(dst) = instruction_dst_register(instruction) {
+            prop_read_cache.remove(&dst);
         }
         let emit_bailout_return = |builder: &mut FunctionBuilder<'_>| {
             emit_bailout_return_with_state(
@@ -4381,6 +4393,45 @@ pub fn translate_function_with_constants(
                 name,
                 ic_index,
             } => {
+                // Intra-block CSE: if we already extracted + shape-verified this
+                // object's pointer earlier in this basic block, just load directly.
+                let layout = crate::runtime_helpers::jsobject_layout();
+                let cse_mono_ic = ic_snapshot.get(*ic_index as usize).and_then(|ic| {
+                    if let InlineCacheState::Monomorphic { shape_id, offset, depth: 0, .. } = ic {
+                        Some((*shape_id, *offset))
+                    } else {
+                        None
+                    }
+                });
+                if let (Some((shape_id, offset)), Some(lo), Some(&(cached_ptr, cached_shape))) =
+                    (cse_mono_ic, layout, prop_read_cache.get(&obj.0))
+                {
+                    if cached_shape == shape_id && (offset as usize) < 8 {
+                        // CSE hit: skip tag + extract + shape check → direct load
+                        let value_byte_offset = lo.inline_slots_data + (offset as i32) * 8;
+                        let result = builder.ins().load(
+                            types::I64, MemFlags::trusted(), cached_ptr, value_byte_offset,
+                        );
+                        write_reg(builder, &reg_vars, *dst, result);
+                        // Don't skip — fall through to next instruction
+                    } else {
+                        // Shape mismatch between cached and this IC → full read
+                        prop_read_cache.remove(&obj.0);
+                        // Fall through to full inline read below
+                        let full_ref = helpers
+                            .and_then(|h| h.get(HelperKind::GetPropConst))
+                            .ok_or_else(|| unsupported(pc, instruction))?;
+                        let obj_val = read_reg(builder, &reg_vars, *obj);
+                        let name_idx = builder.ins().iconst(types::I64, name.index() as i64);
+                        let ic_idx = builder.ins().iconst(types::I64, *ic_index as i64);
+                        let result = emit_helper_call_with_bailout(
+                            builder, full_ref, &[ctx_ptr, obj_val, name_idx, ic_idx],
+                        );
+                        write_reg(builder, &reg_vars, *dst, result);
+                    }
+                } else {
+                // No cache hit — fall through to normal path
+
                 let full_ref = helpers
                     .and_then(|h| h.get(HelperKind::GetPropConst))
                     .ok_or_else(|| unsupported(pc, instruction))?;
@@ -4502,6 +4553,19 @@ pub fn translate_function_with_constants(
                     )
                 };
                 write_reg(builder, &reg_vars, *dst, result);
+
+                // Populate CSE cache: if we did a monomorphic inline read on this
+                // obj register, cache the obj_ptr for future reads in this block.
+                if let (Some((shape_id, _offset)), Some(_lo)) = (cse_mono_ic, layout) {
+                    // Extract obj_ptr (band with PAYLOAD_MASK) — already done inside
+                    // emit_inline_prop_read, but not accessible. Re-extract here
+                    // (Cranelift will CSE the band instruction automatically).
+                    let obj_val2 = read_reg(builder, &reg_vars, *obj);
+                    let payload_mask = builder.ins().iconst(types::I64, crate::type_guards::PAYLOAD_MASK);
+                    let obj_ptr = builder.ins().band(obj_val2, payload_mask);
+                    prop_read_cache.insert(obj.0, (obj_ptr, shape_id));
+                }
+                } // close else-block for CSE check
             }
             // Superinstruction: fused GetLocal + GetPropConst
             Instruction::GetLocalProp {

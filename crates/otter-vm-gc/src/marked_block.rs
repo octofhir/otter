@@ -65,9 +65,10 @@ pub const NUM_SIZE_CLASSES: usize = 14; // must match SIZE_CLASSES.len()
 /// The block tracks which cells are free via a bitvector and stores
 /// per-cell drop/trace functions for polymorphic type support.
 pub struct MarkedBlock {
-    /// Raw storage for cells (16KB, 8-byte aligned via Vec<u64>).
-    /// We use Vec<u64> to guarantee 8-byte alignment.
-    storage: Vec<u64>,
+    /// Raw storage for cells (16KB, 16-byte aligned via Vec<u128>).
+    /// We use Vec<u128> to guarantee 16-byte alignment, which is required
+    /// for types like temporal_rs that contain i128 fields.
+    storage: Vec<u128>,
     /// Cell size in bytes (one of SIZE_CLASSES).
     cell_size: usize,
     /// Number of cells that fit in this block.
@@ -93,16 +94,16 @@ impl MarkedBlock {
     pub fn new(cell_size: usize) -> Self {
         assert!(cell_size >= 16, "cell size must be at least 16 bytes");
         assert!(
-            cell_size.is_multiple_of(8),
-            "cell size must be 8-byte aligned"
+            cell_size.is_multiple_of(16),
+            "cell size must be 16-byte aligned"
         );
 
         let num_cells = BLOCK_SIZE / cell_size;
         assert!(num_cells > 0, "cell size too large for block");
 
-        // Allocate storage as u64 array for alignment
-        let storage_u64s = BLOCK_SIZE.div_ceil(8);
-        let storage = vec![0u64; storage_u64s];
+        // Allocate storage as u128 array for 16-byte alignment
+        let storage_u128s = BLOCK_SIZE.div_ceil(16);
+        let storage = vec![0u128; storage_u128s];
 
         // Initialize free bits: all cells start free (bit = 1)
         let num_words = num_cells.div_ceil(64);

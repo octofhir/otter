@@ -718,6 +718,7 @@ pub(super) fn install_plain_time(
             // Per spec: parse string first, then read (and discard) overflow option
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
+                validate_iso_fractional_seconds(s.as_str())?;
                 let pt = temporal_rs::PlainTime::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 // Read overflow after parsing for observable side effects, then discard
                 let _ = parse_overflow_option(ncx, &options_val)?;

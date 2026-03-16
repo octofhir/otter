@@ -27,6 +27,131 @@ use crate::typed_array::{JsTypedArray, TypedArrayKind};
 use crate::value::Value;
 
 // ============================================================================
+// TypedArray utility functions for exotic object behavior
+// ============================================================================
+
+/// Try to get the TypedArray data from an object (via __TypedArrayData__ hidden prop).
+pub fn get_typed_array_data(obj: &GcRef<JsObject>) -> Option<GcRef<JsTypedArray>> {
+    obj.get(&PropertyKey::string("__TypedArrayData__"))
+        .and_then(|v| v.as_typed_array())
+}
+
+/// Get own property keys for an object, prepending TypedArray numeric indices if applicable.
+/// Per ES2026 §9.4.5.6 [[OwnPropertyKeys]], TypedArray returns:
+///   1. Numeric indices in ascending order
+///   2. String keys in creation order
+///   3. Symbol keys in creation order
+pub fn typed_array_own_keys(obj: &GcRef<JsObject>) -> Vec<PropertyKey> {
+    let mut keys = Vec::new();
+
+    // If this is a TypedArray, prepend numeric indices
+    if let Some(ta) = get_typed_array_data(obj) {
+        if !ta.is_detached() {
+            for i in 0..ta.length() {
+                keys.push(PropertyKey::Index(i as u32));
+            }
+        }
+    }
+
+    // Add regular own keys, but filter out __TypedArrayData__ and numeric indices
+    // that are already included from TypedArray
+    let has_ta = get_typed_array_data(obj).is_some();
+    for key in obj.own_keys() {
+        if has_ta {
+            // Skip __TypedArrayData__ hidden property
+            if let PropertyKey::String(s) = &key {
+                if s.as_str() == "__TypedArrayData__" {
+                    continue;
+                }
+            }
+            // Skip numeric indices (already added above)
+            if let PropertyKey::Index(_) = &key {
+                continue;
+            }
+        }
+        keys.push(key);
+    }
+
+    keys
+}
+
+/// Check if a TypedArray has an own property for a given numeric index.
+/// Returns Some(true/false) if this is a TypedArray and the key is a numeric index,
+/// None if not a TypedArray or key is not numeric.
+pub fn typed_array_has_index(obj: &GcRef<JsObject>, key: &PropertyKey) -> Option<bool> {
+    let ta = get_typed_array_data(obj)?;
+    let idx = match key {
+        PropertyKey::Index(i) => Some(*i as usize),
+        PropertyKey::String(s) => {
+            let s_str = s.as_str();
+            // Check for canonical numeric index string
+            if s_str.is_empty() || s_str == "-0" {
+                return None; // not a valid index but is canonical numeric → return false for TA
+            }
+            if s_str.len() == 1 {
+                let b = s_str.as_bytes()[0];
+                if b.is_ascii_digit() {
+                    Some((b - b'0') as usize)
+                } else {
+                    None
+                }
+            } else if s_str.starts_with('0') {
+                None
+            } else {
+                s_str.parse::<usize>().ok()
+            }
+        }
+        _ => None,
+    };
+    let idx = idx?;
+    Some(!ta.is_detached() && idx < ta.length())
+}
+
+/// Get own property descriptor for a TypedArray numeric index.
+/// Returns a data descriptor for valid indices (enumerable, writable, not configurable).
+pub fn typed_array_get_own_property_descriptor(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+) -> Option<PropertyDescriptor> {
+    let ta = get_typed_array_data(obj)?;
+    let idx = match key {
+        PropertyKey::Index(i) => Some(*i as usize),
+        PropertyKey::String(s) => {
+            let s_str = s.as_str();
+            if s_str.is_empty() || s_str == "-0" {
+                return None;
+            }
+            if s_str.len() == 1 {
+                let b = s_str.as_bytes()[0];
+                if b.is_ascii_digit() {
+                    Some((b - b'0') as usize)
+                } else {
+                    return None;
+                }
+            } else if s_str.starts_with('0') {
+                return None;
+            } else {
+                s_str.parse::<usize>().ok()
+            }
+        }
+        _ => return None,
+    };
+    let idx = idx?;
+    if ta.is_detached() || idx >= ta.length() {
+        return None;
+    }
+    let value = ta.get_value(idx)?;
+    Some(PropertyDescriptor::data_with_attrs(
+        value,
+        PropertyAttributes {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        },
+    ))
+}
+
+// ============================================================================
 // %TypedArray%.prototype initialization
 // ============================================================================
 
@@ -447,7 +572,14 @@ fn make_typed_array_object(ta: JsTypedArray) -> Value {
     let obj = ta_arc.object;
     obj.define_property(
         PropertyKey::string("__TypedArrayData__"),
-        PropertyDescriptor::data(Value::typed_array(ta_arc)),
+        PropertyDescriptor::data_with_attrs(
+            Value::typed_array(ta_arc),
+            PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        ),
     );
     Value::object(obj)
 }
@@ -1081,9 +1213,15 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                         .constructor_fn(create_typed_array_constructor(kind, proto), 3)
                         .build_and_install(&global);
                     ctor.set_prototype(typed_array_ctor);
+                    let bpe = Value::int32(kind.element_size() as i32);
                     ctor.define_property(
                         PropertyKey::string("BYTES_PER_ELEMENT"),
-                        PropertyDescriptor::builtin_data(Value::int32(kind.element_size() as i32)),
+                        PropertyDescriptor::builtin_data(bpe),
+                    );
+                    // Per spec §23.2.6, prototype.BYTES_PER_ELEMENT = element_size
+                    proto.define_property(
+                        PropertyKey::string("BYTES_PER_ELEMENT"),
+                        PropertyDescriptor::builtin_data(bpe),
                     );
                     ctor.define_property(
                         PropertyKey::string("of"),

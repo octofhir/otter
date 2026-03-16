@@ -356,6 +356,7 @@ pub(super) fn install_zoned_date_time(
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
                 let s_str = s.as_str();
+                validate_iso_fractional_seconds(s_str)?;
 
                 // Step 1: Validate string is well-formed by parsing with safe defaults.
                 // Use OffsetDisambiguation::Use (never fails due to offset mismatch).
@@ -1963,6 +1964,7 @@ fn to_temporal_zdt(
     // 3. If string, parse
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         let zdt = temporal_rs::ZonedDateTime::from_utf8_with_provider(
             s.as_bytes(),
             temporal_rs::options::Disambiguation::Compatible,
@@ -2024,6 +2026,7 @@ fn to_temporal_plain_time(
 
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::PlainTime::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
 

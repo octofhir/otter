@@ -32,15 +32,18 @@ fn to_temporal_instant(
         }
         // Generic object: call toString, then parse as ISO string
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     if val.is_string() {
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     // Try toString for proxies
     if val.as_proxy().is_some() {
         let s = ncx.to_string_value(val)?;
+        validate_iso_fractional_seconds(s.as_str())?;
         return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err);
     }
     Err(VmError::type_error("Cannot convert to Instant"))
@@ -519,6 +522,7 @@ pub(super) fn install_instant(
                 }
                 // Generic object: call toString, then parse as ISO string
                 let s = ncx.to_string_value(&item)?;
+                validate_iso_fractional_seconds(s.as_str())?;
                 let instant =
                     temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 let ns = instant.epoch_nanoseconds().0;
@@ -532,6 +536,7 @@ pub(super) fn install_instant(
             // String: parse ISO 8601
             if item.is_string() {
                 let s = ncx.to_string_value(&item)?;
+                validate_iso_fractional_seconds(s.as_str())?;
                 let instant =
                     temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(temporal_err)?;
                 let ns = instant.epoch_nanoseconds().0;

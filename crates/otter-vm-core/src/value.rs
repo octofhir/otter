@@ -1484,18 +1484,22 @@ impl Value {
 
     /// Read the `GcHeader::tag()` byte from a pointer-tagged value.
     ///
-    /// This dereferences the pointer to read the type tag from the GcHeader,
-    /// which is at a fixed negative offset from the value pointer.
+    /// The NaN-boxed pointer points to the `value` field of `GcAllocation<T>`.
+    /// The GcHeader is at the start of the allocation. All GC allocations are
+    /// 16-byte aligned, so the header is at `(value_ptr - 8) & !15`:
+    /// - For T with align ≤ 8: value at alloc+8, formula gives alloc ✓
+    /// - For T with align 16: value at alloc+16, formula gives alloc ✓
     ///
     /// # Safety
     /// Caller must ensure this value is pointer-tagged and points to a live GcBox.
     #[inline(always)]
     #[allow(unsafe_code)]
     unsafe fn gc_header_tag_from_bits(&self) -> u8 {
-        let raw_ptr = self.raw_heap_ptr();
-        debug_assert!(!raw_ptr.is_null());
-        let header_offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
-        let header_ptr = unsafe { raw_ptr.sub(header_offset) as *const otter_vm_gc::GcHeader };
+        let raw_ptr = self.raw_heap_ptr() as usize;
+        debug_assert!(raw_ptr != 0);
+        // GcHeader is 8 bytes; allocation is 16-byte aligned.
+        // value_ptr - 8 is inside the GcAllocation; rounding down to 16 gives the header.
+        let header_ptr = ((raw_ptr - 8) & !15) as *const otter_vm_gc::GcHeader;
         unsafe { (*header_ptr).tag() }
     }
 
@@ -1630,14 +1634,14 @@ impl Value {
         let tag16 = self.bits & TAG_MASK;
         match tag16 {
             TAG_PTR_OBJECT | TAG_PTR_STRING | TAG_PTR_FUNCTION | TAG_PTR_OTHER => {
-                let raw_ptr = self.raw_heap_ptr();
-                if raw_ptr.is_null() {
+                let raw_ptr = self.raw_heap_ptr() as usize;
+                if raw_ptr == 0 {
                     return None;
                 }
-                unsafe {
-                    let offset = std::mem::offset_of!(crate::gc::GcBox<JsObject>, value);
-                    Some(raw_ptr.sub(offset) as *const otter_vm_gc::GcHeader)
-                }
+                // Same formula as gc_header_tag_from_bits: all GC allocations
+                // are 16-byte aligned, so (value_ptr - 8) rounded down to 16
+                // gives the header address.
+                Some(((raw_ptr - 8) & !15) as *const otter_vm_gc::GcHeader)
             }
             _ => None,
         }
@@ -1919,6 +1923,12 @@ impl Value {
                         // FinalizationRegistry: trace callback + held values
                         if let Some(r) = self.as_finalization_registry() {
                             otter_vm_gc::GcTraceable::trace(&*r, tracer);
+                        }
+                    }
+                    gc_tags::ACCESSOR_PAIR => {
+                        // AccessorPair: trace getter + setter Values
+                        if let Some(pair) = self.as_accessor_pair() {
+                            otter_vm_gc::GcTraceable::trace(&*pair, tracer);
                         }
                     }
                     _ => {

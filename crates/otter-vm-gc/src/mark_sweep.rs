@@ -223,7 +223,7 @@ impl AllocationRegistry {
         let large = LargeAllocation {
             header,
             size,
-            _layout: std::alloc::Layout::from_size_align(size, 8).unwrap(),
+            _layout: std::alloc::Layout::from_size_align(size, 16).unwrap(),
             drop_fn,
             _trace_fn: None,
         };
@@ -1224,7 +1224,13 @@ pub unsafe fn gc_alloc_in<T>(registry: &AllocationRegistry, value: T) -> *mut T
 where
     T: GcTraceable + 'static,
 {
-    let layout = std::alloc::Layout::new::<GcAllocation<T>>();
+    // Force 16-byte alignment for ALL allocations so that the NaN-boxing
+    // header-finding formula `(value_ptr - 8) & !15` works universally.
+    // Types with align > 8 (e.g. TemporalValue with i128 fields) need this.
+    let layout = std::alloc::Layout::new::<GcAllocation<T>>()
+        .align_to(16)
+        .expect("16-byte alignment should always be valid")
+        .pad_to_align();
     let alloc_size = layout.size();
 
     let ptr: *mut GcAllocation<T>;
@@ -1299,7 +1305,11 @@ unsafe fn drop_gc_box_in_block<T>(ptr: *mut u8) {
 
 /// Drop function for large GC boxes (individually allocated).
 unsafe fn drop_gc_box<T>(ptr: *mut u8) {
-    let layout = std::alloc::Layout::new::<GcAllocation<T>>();
+    // Must match the layout used in gc_alloc_in (16-byte aligned, padded).
+    let layout = std::alloc::Layout::new::<GcAllocation<T>>()
+        .align_to(16)
+        .expect("16-byte alignment should always be valid")
+        .pad_to_align();
     let box_ptr = ptr as *mut GcAllocation<T>;
     // SAFETY: ptr is valid and points to an initialized GcAllocation<T>
     unsafe {

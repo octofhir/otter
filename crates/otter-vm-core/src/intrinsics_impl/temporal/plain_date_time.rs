@@ -1177,6 +1177,7 @@ pub(super) fn install_plain_date_time_prototype(
         if item.is_string() {
             let s = ncx.to_string_value(item)?;
             reject_utc_designator_for_plain(s.as_str())?;
+            validate_iso_fractional_seconds(s.as_str())?;
             return temporal_rs::PlainDateTime::from_utf8(s.as_bytes()).map_err(temporal_err);
         }
 

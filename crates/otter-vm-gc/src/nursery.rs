@@ -23,8 +23,12 @@ use crate::object::GcHeader;
 /// (4MB) because OtterJS is embedding-first and we want bounded memory.
 const DEFAULT_NURSERY_SIZE: usize = 2 * 1024 * 1024;
 
-/// Minimum alignment for nursery allocations (8 bytes for GcHeader).
-const MIN_ALIGN: usize = 8;
+/// Minimum alignment for nursery allocations.
+///
+/// Must be 16 to support types with align(16) requirements (e.g. temporal_rs
+/// types which contain i128 fields). The nursery region itself is allocated
+/// with this alignment, and every bump-pointer advance is rounded up to it.
+const MIN_ALIGN: usize = 16;
 
 /// Maximum number of minor GC survivals before an object is considered tenured.
 ///

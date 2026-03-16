@@ -107,11 +107,12 @@ fn is_constructor_value(value: &Value) -> bool {
     if !value.is_callable() {
         return false;
     }
+    // Check OWN __non_constructor (not inherited), since abstract constructors
+    // like %TypedArray% set this flag but their concrete subclasses should
+    // still be constructable.
     if let Some(obj) = value.as_object()
-        && obj
-            .get(&PropertyKey::string("__non_constructor"))
-            .and_then(|v| v.as_boolean())
-            == Some(true)
+        && let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::string("__non_constructor"))
+        && desc.value().and_then(|v| v.as_boolean()) == Some(true)
     {
         return false;
     }

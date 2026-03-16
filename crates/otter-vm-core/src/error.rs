@@ -139,7 +139,8 @@ fn format_thrown_value_message(value: &Value) -> String {
             .get(&PropertyKey::string("__is_error__"))
             .and_then(|v| v.as_boolean())
             .unwrap_or(false);
-        if is_error_object {
+        let has_message = obj.get(&PropertyKey::string("message")).is_some();
+        if is_error_object || has_message {
             let name = obj
                 .get(&PropertyKey::string("name"))
                 .and_then(|v| v.as_string())

@@ -32,6 +32,8 @@ const FULL_BUILTIN_MODULES: &[&str] = &[
     "node:test",
     "node:worker_threads",
     "node:net",
+    "node:internal/net",
+    "internal/net",
     "node:child_process",
     "node:url",
     "node:internal/url",
@@ -119,6 +121,10 @@ static NODE_MODULES: &[NodeModuleEntry] = &[
     },
     NodeModuleEntry {
         name: "net",
+        safe_core: false,
+    },
+    NodeModuleEntry {
+        name: "internal/net",
         safe_core: false,
     },
     NodeModuleEntry {

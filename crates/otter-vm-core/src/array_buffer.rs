@@ -38,13 +38,17 @@ impl otter_vm_gc::GcTraceable for JsArrayBuffer {
 }
 
 impl JsArrayBuffer {
+    /// Maximum allocation size (1 GB) to prevent OOM crashes from pathological inputs
+    const MAX_BYTE_LENGTH: usize = 1_073_741_824;
+
     /// Create a new ArrayBuffer with the specified byte length
     pub fn new(byte_length: usize, prototype: Option<GcRef<JsObject>>) -> Self {
+        let capped = byte_length.min(Self::MAX_BYTE_LENGTH);
         let proto_value = prototype.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value));
         Self {
             object,
-            data: RefCell::new(Some(vec![0; byte_length])),
+            data: RefCell::new(Some(vec![0; capped])),
             max_byte_length: None,
         }
     }

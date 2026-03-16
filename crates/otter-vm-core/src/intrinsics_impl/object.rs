@@ -488,15 +488,33 @@ pub fn init_object_constructor(
                 }
 
                 // Handle regular object case (including primitives via ToObject)
+                // TypedArray [[GetOwnProperty]] — §10.4.5.1
                 let target = args.first().cloned().unwrap_or(Value::undefined());
-                let obj = to_object_for_builtin(ncx_inner, &target)?;
                 let key_val = args.get(1).cloned().unwrap_or(Value::undefined());
                 use crate::intrinsics_impl::reflect::to_property_key;
                 let pk = to_property_key(&key_val);
 
-                let desc_opt = obj.0.get_own_property_descriptor(&pk)
-                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(&obj.0, &pk));
-                if let Some(desc) = desc_opt {
+                // TypedArray: check exotic numeric descriptors first
+                if let Some(ta) = target.as_typed_array() {
+                    if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, &pk) {
+                        let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
+                            .map(Value::object)
+                            .unwrap_or(Value::null());
+                        let desc_obj = GcRef::new(JsObject::new(obj_proto));
+                        if let PropertyDescriptor::Data { value, attributes } = &desc {
+                            let _ = desc_obj.set(PropertyKey::string("value"), *value);
+                            let _ = desc_obj.set(PropertyKey::string("writable"), Value::boolean(attributes.writable));
+                            let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
+                            let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                        }
+                        return Ok(Value::object(desc_obj));
+                    }
+                    // Fall through to ta.object for named properties
+                }
+
+                let obj = to_object_for_builtin(ncx_inner, &target)?;
+
+                if let Some(desc) = obj.0.get_own_property_descriptor(&pk) {
                     // Build descriptor object with Object.prototype
                     let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
                         .map(Value::object)
@@ -551,14 +569,16 @@ pub fn init_object_constructor(
         )),
     );
 
-    // Object.keys
+    // Object.keys — §20.1.2.17
     object_ctor.define_property(
         PropertyKey::string("keys"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx| {
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
-                let obj = if proxy.is_none() {
+                // TypedArray [[OwnPropertyKeys]] — §10.4.5.7
+                let ta = arg.as_typed_array();
+                let obj = if proxy.is_none() && ta.is_none() {
                     let (o, _guard) = to_object_for_builtin(ncx, &arg)?;
                     Some(o)
                 } else {
@@ -567,8 +587,10 @@ pub fn init_object_constructor(
 
                 let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
+                } else if let Some(ta) = &ta {
+                    crate::typed_array_ops::ta_own_keys_full(ta)
                 } else {
-                    crate::intrinsics_impl::typed_array::typed_array_own_keys(obj.as_ref().unwrap())
+                    obj.as_ref().unwrap().own_keys()
                 };
 
                 let mut anchored_keys = Vec::with_capacity(raw_keys.len());
@@ -580,17 +602,19 @@ pub fn init_object_constructor(
 
                 let mut names = Vec::new();
                 for (key, key_value) in anchored_keys.iter() {
+                    // Get own property descriptor — TypedArray has exotic numeric descriptors
+                    let desc = if let Some(p) = proxy {
+                        crate::proxy_operations::proxy_get_own_property_descriptor(
+                            ncx, p, key, *key_value,
+                        )?
+                    } else if let Some(ref ta) = ta {
+                        crate::typed_array_ops::ta_get_own_property(ta, key)
+                            .or_else(|| ta.object.get_own_property_descriptor(key))
+                    } else {
+                        obj.as_ref().unwrap().get_own_property_descriptor(key)
+                    };
                     match key {
                         PropertyKey::String(s) => {
-                            let desc = if let Some(p) = proxy {
-                                crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx, p, key, *key_value,
-                                )?
-                            } else {
-                                let o = obj.as_ref().unwrap();
-                                o.get_own_property_descriptor(key)
-                                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(o, key))
-                            };
                             if let Some(desc) = desc
                                 && desc.enumerable()
                             {
@@ -598,15 +622,6 @@ pub fn init_object_constructor(
                             }
                         }
                         PropertyKey::Index(i) => {
-                            let desc = if let Some(p) = proxy {
-                                crate::proxy_operations::proxy_get_own_property_descriptor(
-                                    ncx, p, key, *key_value,
-                                )?
-                            } else {
-                                let o = obj.as_ref().unwrap();
-                                o.get_own_property_descriptor(key)
-                                    .or_else(|| crate::intrinsics_impl::typed_array::typed_array_get_own_property_descriptor(o, key))
-                            };
                             if let Some(desc) = desc
                                 && desc.enumerable()
                             {
@@ -638,14 +653,15 @@ pub fn init_object_constructor(
         )),
     );
 
-    // Object.values
+    // Object.values — §20.1.2.22
     object_ctor.define_property(
         PropertyKey::string("values"),
         PropertyDescriptor::builtin_method(Value::native_function_with_proto(
             |_this, args, ncx| {
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
-                let obj = if proxy.is_none() {
+                let ta = arg.as_typed_array();
+                let obj = if proxy.is_none() && ta.is_none() {
                     let (o, _guard) = to_object_for_builtin(ncx, &arg)?;
                     Some(o)
                 } else {
@@ -654,8 +670,10 @@ pub fn init_object_constructor(
 
                 let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx, p)?
+                } else if let Some(ref ta) = ta {
+                    crate::typed_array_ops::ta_own_keys_full(ta)
                 } else {
-                    crate::intrinsics_impl::typed_array::typed_array_own_keys(obj.as_ref().unwrap())
+                    obj.as_ref().unwrap().own_keys()
                 };
 
                 let mut anchored_keys = Vec::with_capacity(raw_keys.len());
@@ -715,7 +733,8 @@ pub fn init_object_constructor(
             |_this, args, ncx_inner| {
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let proxy = arg.as_proxy();
-                let obj_and_guard = if proxy.is_none() {
+                let ta = arg.as_typed_array();
+                let obj_and_guard = if proxy.is_none() && ta.is_none() {
                     Some(to_object_for_builtin(ncx_inner, &arg)?)
                 } else {
                     None
@@ -724,6 +743,8 @@ pub fn init_object_constructor(
 
                 let raw_keys = if let Some(p) = proxy {
                     crate::proxy_operations::proxy_own_keys(ncx_inner, p)?
+                } else if let Some(ref ta) = ta {
+                    crate::typed_array_ops::ta_own_keys_full(ta)
                 } else {
                     obj.as_ref().unwrap().own_keys()
                 };
@@ -1366,11 +1387,13 @@ pub fn init_object_constructor(
             |_this, args, ncx_inner| {
                 let arg = args.first().cloned().unwrap_or(Value::undefined());
 
-                // Proxy path: use ownKeys trap
+                // Proxy / TypedArray / Object path
                 let keys = if let Some(proxy) = arg.as_proxy() {
                     crate::proxy_operations::proxy_own_keys(ncx_inner, proxy)?
+                } else if let Some(ta) = arg.as_typed_array() {
+                    crate::typed_array_ops::ta_own_keys_full(&ta)
                 } else if let Some(obj) = arg.as_object() {
-                    crate::intrinsics_impl::typed_array::typed_array_own_keys(&obj)
+                    obj.own_keys()
                 } else {
                     let arr = GcRef::new(JsObject::array(0));
                     if let Some(array_ctor) = ncx_inner.global().get(&PropertyKey::string("Array"))
@@ -1430,9 +1453,11 @@ pub fn init_object_constructor(
                     ));
                 }
 
-                // Proxy path: use ownKeys trap
+                // Proxy / TypedArray / Object path
                 let keys = if let Some(proxy) = arg.as_proxy() {
                     crate::proxy_operations::proxy_own_keys(ncx_inner, proxy)?
+                } else if let Some(ta) = arg.as_typed_array() {
+                    crate::typed_array_ops::ta_own_keys_full(&ta)
                 } else if let Some(obj) = arg.as_object() {
                     obj.own_keys()
                 } else {

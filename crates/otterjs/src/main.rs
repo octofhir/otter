@@ -887,9 +887,28 @@ async fn run_code(
     let timeout_handle = if cli.timeout > 0 {
         let interrupt_flag = engine.interrupt_flag();
         let timeout_secs = cli.timeout;
+        let event_loop = engine.event_loop().clone();
         Some(tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
-            interrupt_flag.store(true, Ordering::Relaxed);
+            let timeout_window = std::time::Duration::from_secs(timeout_secs);
+            let poll_interval = std::time::Duration::from_millis(200);
+            let mut idle_since = std::time::Instant::now();
+
+            loop {
+                tokio::time::sleep(poll_interval).await;
+
+                let has_live_handles = event_loop.has_active_http_servers()
+                    || event_loop.has_pending_async_ops();
+
+                if has_live_handles {
+                    idle_since = std::time::Instant::now();
+                    continue;
+                }
+
+                if idle_since.elapsed() >= timeout_window {
+                    interrupt_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
         }))
     } else {
         None

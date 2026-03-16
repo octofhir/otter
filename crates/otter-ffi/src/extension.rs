@@ -598,14 +598,8 @@ fn ffi_ptr(args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
 
     let byte_offset = args.get(1).map(|v| to_number(v) as usize).unwrap_or(0);
 
-    // Try direct TypedArray value (TAG_PTR_OTHER)
-    let ta_opt = val.as_typed_array().or_else(|| {
-        // TypedArrays created by constructors are stored as plain objects
-        // with an internal __TypedArrayData__ property
-        val.as_object()
-            .and_then(|obj| obj.get(&PropertyKey::string("__TypedArrayData__")))
-            .and_then(|v| v.as_typed_array())
-    });
+    // TypedArray values use TAG_PTR_OTHER with TYPED_ARRAY GC tag
+    let ta_opt = val.as_typed_array();
 
     if let Some(ta) = ta_opt {
         if ta.is_detached() {

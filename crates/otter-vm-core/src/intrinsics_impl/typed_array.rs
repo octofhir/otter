@@ -27,131 +27,6 @@ use crate::typed_array::{JsTypedArray, TypedArrayKind};
 use crate::value::Value;
 
 // ============================================================================
-// TypedArray utility functions for exotic object behavior
-// ============================================================================
-
-/// Try to get the TypedArray data from an object (via __TypedArrayData__ hidden prop).
-pub fn get_typed_array_data(obj: &GcRef<JsObject>) -> Option<GcRef<JsTypedArray>> {
-    obj.get(&PropertyKey::string("__TypedArrayData__"))
-        .and_then(|v| v.as_typed_array())
-}
-
-/// Get own property keys for an object, prepending TypedArray numeric indices if applicable.
-/// Per ES2026 §9.4.5.6 [[OwnPropertyKeys]], TypedArray returns:
-///   1. Numeric indices in ascending order
-///   2. String keys in creation order
-///   3. Symbol keys in creation order
-pub fn typed_array_own_keys(obj: &GcRef<JsObject>) -> Vec<PropertyKey> {
-    let mut keys = Vec::new();
-
-    // If this is a TypedArray, prepend numeric indices
-    if let Some(ta) = get_typed_array_data(obj) {
-        if !ta.is_detached() {
-            for i in 0..ta.length() {
-                keys.push(PropertyKey::Index(i as u32));
-            }
-        }
-    }
-
-    // Add regular own keys, but filter out __TypedArrayData__ and numeric indices
-    // that are already included from TypedArray
-    let has_ta = get_typed_array_data(obj).is_some();
-    for key in obj.own_keys() {
-        if has_ta {
-            // Skip __TypedArrayData__ hidden property
-            if let PropertyKey::String(s) = &key {
-                if s.as_str() == "__TypedArrayData__" {
-                    continue;
-                }
-            }
-            // Skip numeric indices (already added above)
-            if let PropertyKey::Index(_) = &key {
-                continue;
-            }
-        }
-        keys.push(key);
-    }
-
-    keys
-}
-
-/// Check if a TypedArray has an own property for a given numeric index.
-/// Returns Some(true/false) if this is a TypedArray and the key is a numeric index,
-/// None if not a TypedArray or key is not numeric.
-pub fn typed_array_has_index(obj: &GcRef<JsObject>, key: &PropertyKey) -> Option<bool> {
-    let ta = get_typed_array_data(obj)?;
-    let idx = match key {
-        PropertyKey::Index(i) => Some(*i as usize),
-        PropertyKey::String(s) => {
-            let s_str = s.as_str();
-            // Check for canonical numeric index string
-            if s_str.is_empty() || s_str == "-0" {
-                return None; // not a valid index but is canonical numeric → return false for TA
-            }
-            if s_str.len() == 1 {
-                let b = s_str.as_bytes()[0];
-                if b.is_ascii_digit() {
-                    Some((b - b'0') as usize)
-                } else {
-                    None
-                }
-            } else if s_str.starts_with('0') {
-                None
-            } else {
-                s_str.parse::<usize>().ok()
-            }
-        }
-        _ => None,
-    };
-    let idx = idx?;
-    Some(!ta.is_detached() && idx < ta.length())
-}
-
-/// Get own property descriptor for a TypedArray numeric index.
-/// Returns a data descriptor for valid indices (enumerable, writable, not configurable).
-pub fn typed_array_get_own_property_descriptor(
-    obj: &GcRef<JsObject>,
-    key: &PropertyKey,
-) -> Option<PropertyDescriptor> {
-    let ta = get_typed_array_data(obj)?;
-    let idx = match key {
-        PropertyKey::Index(i) => Some(*i as usize),
-        PropertyKey::String(s) => {
-            let s_str = s.as_str();
-            if s_str.is_empty() || s_str == "-0" {
-                return None;
-            }
-            if s_str.len() == 1 {
-                let b = s_str.as_bytes()[0];
-                if b.is_ascii_digit() {
-                    Some((b - b'0') as usize)
-                } else {
-                    return None;
-                }
-            } else if s_str.starts_with('0') {
-                return None;
-            } else {
-                s_str.parse::<usize>().ok()
-            }
-        }
-        _ => return None,
-    };
-    let idx = idx?;
-    if ta.is_detached() || idx >= ta.length() {
-        return None;
-    }
-    let value = ta.get_value(idx)?;
-    Some(PropertyDescriptor::data_with_attrs(
-        value,
-        PropertyAttributes {
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        },
-    ))
-}
-
-// ============================================================================
 // %TypedArray%.prototype initialization
 // ============================================================================
 
@@ -315,7 +190,7 @@ pub fn init_data_view_prototype(
                         let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = dv
                             .$method(offset, little_endian)
-                            .map_err(VmError::type_error)?;
+                            ?;
                         Ok(Value::number(val as f64))
                     },
                     mm.clone(),
@@ -335,7 +210,7 @@ pub fn init_data_view_prototype(
                             .first()
                             .map(|v| crate::globals::to_number(v) as usize)
                             .unwrap_or(0);
-                        let val = dv.$method(offset).map_err(VmError::type_error)?;
+                        let val = dv.$method(offset)?;
                         Ok(Value::number(val as f64))
                     },
                     mm.clone(),
@@ -362,7 +237,7 @@ pub fn init_data_view_prototype(
                         let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = ($conv)(raw);
                         dv.$method(offset, val, little_endian)
-                            .map_err(VmError::type_error)?;
+                            ?;
                         Ok(Value::undefined())
                     },
                     mm.clone(),
@@ -384,7 +259,7 @@ pub fn init_data_view_prototype(
                             .unwrap_or(0);
                         let raw = args.get(1).map(crate::globals::to_number).unwrap_or(0.0);
                         let val = ($conv)(raw);
-                        dv.$method(offset, val).map_err(VmError::type_error)?;
+                        dv.$method(offset, val)?;
                         Ok(Value::undefined())
                     },
                     mm.clone(),
@@ -426,7 +301,7 @@ pub fn init_data_view_prototype(
                 let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                 let val = dv
                     .get_big_int64(offset, little_endian)
-                    .map_err(VmError::type_error)?;
+                    ?;
                 Ok(Value::bigint(val.to_string()))
             },
             mm.clone(),
@@ -447,7 +322,7 @@ pub fn init_data_view_prototype(
                 let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                 let val = dv
                     .get_big_uint64(offset, little_endian)
-                    .map_err(VmError::type_error)?;
+                    ?;
                 Ok(Value::bigint(val.to_string()))
             },
             mm.clone(),
@@ -471,7 +346,7 @@ pub fn init_data_view_prototype(
                     .unwrap_or(0);
                 let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                 dv.set_big_int64(offset, val, little_endian)
-                    .map_err(VmError::type_error)?;
+                    ?;
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -495,7 +370,7 @@ pub fn init_data_view_prototype(
                     .unwrap_or(0);
                 let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                 dv.set_big_uint64(offset, val, little_endian)
-                    .map_err(VmError::type_error)?;
+                    ?;
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -567,21 +442,11 @@ pub fn init_data_view_prototype(
     );
 }
 
-fn make_typed_array_object(ta: JsTypedArray) -> Value {
-    let ta_arc = GcRef::new(ta);
-    let obj = ta_arc.object;
-    obj.define_property(
-        PropertyKey::string("__TypedArrayData__"),
-        PropertyDescriptor::data_with_attrs(
-            Value::typed_array(ta_arc),
-            PropertyAttributes {
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            },
-        ),
-    );
-    Value::object(obj)
+/// Create a TypedArray value directly — no hidden property hack.
+/// The returned Value is TAG_PTR_OTHER with TYPED_ARRAY GC tag.
+/// Property access dispatches through typed_array_ops exotic methods.
+fn make_typed_array_value(ta: JsTypedArray) -> Value {
+    Value::typed_array(GcRef::new(ta))
 }
 
 fn create_typed_array_constructor(
@@ -592,30 +457,54 @@ fn create_typed_array_constructor(
 + Sync
 + 'static {
     move |_this, args, ncx| {
+        // §22.2.4 step 1: If NewTarget is undefined, throw a TypeError.
+        if !ncx.is_construct() {
+            return Err(VmError::type_error(
+                &format!("{} constructor requires 'new'", kind.name()),
+            ));
+        }
+
         if args.is_empty() {
             let buffer = GcRef::new(JsArrayBuffer::new(0, None));
             let object = GcRef::new(JsObject::new(Value::object(proto)));
-            let ta = JsTypedArray::new(object, buffer, kind, 0, 0).map_err(VmError::type_error)?;
-            return Ok(make_typed_array_object(ta));
+            let ta = JsTypedArray::new(object, buffer, kind, 0, 0)?;
+            return Ok(make_typed_array_value(ta));
         }
 
         let arg0 = &args[0];
 
+        // §22.2.4.5 TypedArray(buffer [, byteOffset [, length]])
         if let Some(buffer) = arg0.as_array_buffer() {
-            let byte_offset = args.get(1).and_then(|v| v.as_int32()).unwrap_or(0) as usize;
+            // §22.2.4.5 step 7: Let offset be ? ToIndex(byteOffset).
+            let byte_offset = if let Some(bo_val) = args.get(1) {
+                if bo_val.as_symbol().is_some() {
+                    return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+                }
+                let n = crate::globals::to_number(bo_val);
+                if n.is_nan() || n < 0.0 { 0usize } else { n as usize }
+            } else {
+                0
+            };
             let length = if let Some(len_val) = args.get(2) {
-                len_val.as_int32().unwrap_or(0) as usize
+                if len_val.as_symbol().is_some() {
+                    return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+                }
+                let n = crate::globals::to_number(len_val);
+                if n < 0.0 {
+                    return Err(VmError::range_error("Invalid typed array length"));
+                }
+                n as usize
             } else {
                 let available = buffer.byte_length().saturating_sub(byte_offset);
                 available / kind.element_size()
             };
 
             let object = GcRef::new(JsObject::new(Value::object(proto)));
-            let ta = JsTypedArray::new(object, buffer, kind, byte_offset, length)
-                .map_err(VmError::type_error)?;
-            return Ok(make_typed_array_object(ta));
+            let ta = JsTypedArray::new(object, buffer, kind, byte_offset, length)?;
+            return Ok(make_typed_array_value(ta));
         }
 
+        // §22.2.4.3 TypedArray(typedArray)
         if let Some(other_ta) = arg0.as_typed_array() {
             let length = other_ta.length();
             let byte_len = length
@@ -624,49 +513,16 @@ fn create_typed_array_constructor(
             let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
             let object = GcRef::new(JsObject::new(Value::object(proto)));
             let ta =
-                JsTypedArray::new(object, buffer, kind, 0, length).map_err(VmError::type_error)?;
+                JsTypedArray::new(object, buffer, kind, 0, length)?;
             for i in 0..length {
                 if let Some(val) = other_ta.get(i) {
                     let _ = ta.set(i, val);
                 }
             }
-            return Ok(make_typed_array_object(ta));
+            return Ok(make_typed_array_value(ta));
         }
 
-        if let Some(length_num) = arg0.as_number() {
-            let length = if length_num < 0.0
-                || length_num.is_nan()
-                || length_num > (usize::MAX / 8) as f64
-            {
-                return Err(VmError::range_error("Invalid typed array length"));
-            } else {
-                length_num as usize
-            };
-            let byte_len = length
-                .checked_mul(kind.element_size())
-                .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-            let object = GcRef::new(JsObject::new(Value::object(proto)));
-            let ta =
-                JsTypedArray::new(object, buffer, kind, 0, length).map_err(VmError::type_error)?;
-            return Ok(make_typed_array_object(ta));
-        }
-
-        if let Some(length_int) = arg0.as_int32() {
-            if length_int < 0 {
-                return Err(VmError::range_error("Invalid typed array length"));
-            }
-            let length = length_int as usize;
-            let byte_len = length
-                .checked_mul(kind.element_size())
-                .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-            let object = GcRef::new(JsObject::new(Value::object(proto)));
-            let ta =
-                JsTypedArray::new(object, buffer, kind, 0, length).map_err(VmError::type_error)?;
-            return Ok(make_typed_array_object(ta));
-        }
-
+        // §22.2.4.4 TypedArray(object) — first argument is Object
         if let Some(obj) = arg0.as_object() {
             let iterator_sym = crate::intrinsics::well_known::iterator_symbol();
             if let Some(iter_fn) = obj.get(&PropertyKey::Symbol(iterator_sym))
@@ -713,7 +569,7 @@ fn create_typed_array_constructor(
                 let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
                 let object = GcRef::new(JsObject::new(Value::object(proto)));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
-                    .map_err(VmError::type_error)?;
+                    ?;
 
                 for (i, val) in values.into_iter().enumerate() {
                     if kind.is_bigint() {
@@ -729,7 +585,7 @@ fn create_typed_array_constructor(
                     }
                 }
 
-                return Ok(make_typed_array_object(ta));
+                return Ok(make_typed_array_value(ta));
             }
 
             if let Some(length_val) = obj.get(&PropertyKey::string("length"))
@@ -739,7 +595,7 @@ fn create_typed_array_constructor(
                 let buffer = GcRef::new(JsArrayBuffer::new(length * kind.element_size(), None));
                 let object = GcRef::new(JsObject::new(Value::object(proto)));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
-                    .map_err(VmError::type_error)?;
+                    ?;
 
                 for i in 0..length {
                     if let Some(val) = obj.get(&PropertyKey::Index(i as u32)) {
@@ -751,14 +607,43 @@ fn create_typed_array_constructor(
                     }
                 }
 
-                return Ok(make_typed_array_object(ta));
+                return Ok(make_typed_array_value(ta));
             }
         }
 
-        let buffer = GcRef::new(JsArrayBuffer::new(0, None));
+        // §22.2.4.2 TypedArray(length) — first argument is NOT Object
+        // Step 3: Let elementLength be ? ToIndex(length).
+        if arg0.as_symbol().is_some() {
+            return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+        }
+        if arg0.as_bigint().is_some() {
+            return Err(VmError::type_error("Cannot convert a BigInt value to a number"));
+        }
+        let length_num = if let Some(n) = arg0.as_int32() {
+            n as f64
+        } else if let Some(n) = arg0.as_number() {
+            n
+        } else {
+            crate::globals::to_number(arg0)
+        };
+        // ToIndex: NaN/+0/-0 → 0, negative or non-integer → RangeError
+        let length = if length_num.is_nan() || length_num == 0.0 {
+            0usize
+        } else {
+            let trunc = length_num.trunc();
+            // Cap at 1GB to prevent OOM
+            if length_num < 0.0 || trunc != length_num || trunc > 1_073_741_824.0 {
+                return Err(VmError::range_error("Invalid typed array length"));
+            }
+            trunc as usize
+        };
+        let byte_len = length
+            .checked_mul(kind.element_size())
+            .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
         let object = GcRef::new(JsObject::new(Value::object(proto)));
-        let ta = JsTypedArray::new(object, buffer, kind, 0, 0).map_err(VmError::type_error)?;
-        Ok(make_typed_array_object(ta))
+        let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
+        Ok(make_typed_array_value(ta))
     }
 }
 
@@ -862,15 +747,7 @@ fn typed_array_from_static(
         Value::undefined(),
         &[Value::number(values.len() as f64)],
     )?;
-    let target_obj = target.as_object().ok_or_else(|| {
-        VmError::type_error("TypedArray.from: constructor did not return an object")
-    })?;
-    let ta_data = target_obj
-        .get(&PropertyKey::string("__TypedArrayData__"))
-        .ok_or_else(|| {
-            VmError::type_error("TypedArray.from: constructor did not create a TypedArray")
-        })?;
-    let target_ta = ta_data.as_typed_array().ok_or_else(|| {
+    let target_ta = target.as_typed_array().ok_or_else(|| {
         VmError::type_error("TypedArray.from: constructor did not create a TypedArray")
     })?;
 
@@ -911,19 +788,12 @@ fn typed_array_from_static(
                     "TypedArray.from: value does not fit in target typed array",
                 ));
             }
-            let _ = target_obj.set(
-                PropertyKey::Index(i as u32),
-                Value::bigint(bigint.to_string()),
-            );
         } else {
             let number = ncx.to_number_value(&mapped)?;
             if !target_ta.set(i, number) {
                 return Err(VmError::type_error(
                     "TypedArray.from: value does not fit in target typed array",
                 ));
-            }
-            if let Some(stored) = target_ta.get(i) {
-                let _ = target_obj.set(PropertyKey::Index(i as u32), Value::number(stored));
             }
         }
     }
@@ -942,7 +812,7 @@ fn typed_array_of_static(
         let length = args.len();
         let buffer = GcRef::new(JsArrayBuffer::new(length * kind.element_size(), None));
         let object = GcRef::new(JsObject::new(Value::object(proto)));
-        let ta = JsTypedArray::new(object, buffer, kind, 0, length).map_err(VmError::type_error)?;
+        let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
         for (i, arg) in args.iter().enumerate() {
             if let Some(num) = arg.as_number() {
                 let _ = ta.set(i, num);
@@ -950,7 +820,7 @@ fn typed_array_of_static(
                 let _ = ta.set(i, num_int as f64);
             }
         }
-        Ok(make_typed_array_object(ta))
+        Ok(make_typed_array_value(ta))
     }
 }
 
@@ -1214,14 +1084,19 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                         .build_and_install(&global);
                     ctor.set_prototype(typed_array_ctor);
                     let bpe = Value::int32(kind.element_size() as i32);
+                    let bpe_attrs = PropertyAttributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    };
                     ctor.define_property(
                         PropertyKey::string("BYTES_PER_ELEMENT"),
-                        PropertyDescriptor::builtin_data(bpe),
+                        PropertyDescriptor::data_with_attrs(bpe, bpe_attrs),
                     );
                     // Per spec §23.2.6, prototype.BYTES_PER_ELEMENT = element_size
                     proto.define_property(
                         PropertyKey::string("BYTES_PER_ELEMENT"),
-                        PropertyDescriptor::builtin_data(bpe),
+                        PropertyDescriptor::data_with_attrs(bpe, bpe_attrs),
                     );
                     ctor.define_property(
                         PropertyKey::string("of"),
@@ -1243,20 +1118,9 @@ impl IntrinsicObject for TypedArrayIntrinsic {
 
 /// Helper to get TypedArray from this_val (handles both direct value and hidden property)
 fn get_typed_array(this_val: &Value) -> Result<GcRef<JsTypedArray>, VmError> {
-    // Try to get TypedArray from the value directly first
-    if let Some(ta) = this_val.as_typed_array() {
-        return Ok(ta);
-    }
-
-    // If this_val is an object, try to get the TypedArray from a hidden property
-    if let Some(obj) = this_val.as_object()
-        && let Some(ta_val) = obj.get(&PropertyKey::string("__TypedArrayData__"))
-        && let Some(ta) = ta_val.as_typed_array()
-    {
-        return Ok(ta);
-    }
-
-    Err(VmError::type_error("Method called on non-TypedArray"))
+    this_val
+        .as_typed_array()
+        .ok_or_else(|| VmError::type_error("Method called on non-TypedArray"))
 }
 
 fn init_typed_array_getters(
@@ -1577,7 +1441,7 @@ fn init_typed_array_methods(
 
                 let end = args.get(1).and_then(|v| v.as_int32()).map(|v| v as i64);
 
-                let new_ta = ta.slice(start, end).map_err(VmError::type_error)?;
+                let new_ta = ta.slice(start, end)?;
 
                 Ok(Value::typed_array(GcRef::new(new_ta)))
             },
@@ -1597,7 +1461,7 @@ fn init_typed_array_methods(
 
                 let end = args.get(1).and_then(|v| v.as_int32()).map(|v| v as i64);
 
-                let new_ta = ta.subarray(begin, end).map_err(VmError::type_error)?;
+                let new_ta = ta.subarray(begin, end)?;
 
                 Ok(Value::typed_array(GcRef::new(new_ta)))
             },
@@ -1735,7 +1599,7 @@ fn init_typed_array_iterators(
             .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
         let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
         let object = GcRef::new(JsObject::new(proto));
-        JsTypedArray::new(object, buffer, kind, 0, length).map_err(VmError::type_error)
+        JsTypedArray::new(object, buffer, kind, 0, length)
     }
 
     // Helper: get element at index as Value (handles BigInt arrays)
@@ -1989,12 +1853,7 @@ fn init_typed_array_iterators(
                 })();
                 ncx.ctx.pop_root_slots(1);
                 loop_result?;
-                let obj = new_ta.object;
-                obj.define_property(
-                    PropertyKey::string("__TypedArrayData__"),
-                    PropertyDescriptor::data(Value::typed_array(GcRef::new(new_ta))),
-                );
-                Ok(Value::object(obj))
+                Ok(make_typed_array_value(new_ta))
             },
             mm.clone(),
             fn_proto,
@@ -2032,12 +1891,7 @@ fn init_typed_array_iterators(
                 for (i, val) in kept.iter().enumerate() {
                     ta_set_from_value(&new_ta, i, val);
                 }
-                let obj = new_ta.object;
-                obj.define_property(
-                    PropertyKey::string("__TypedArrayData__"),
-                    PropertyDescriptor::data(Value::typed_array(GcRef::new(new_ta))),
-                );
-                Ok(Value::object(obj))
+                Ok(make_typed_array_value(new_ta))
             },
             mm.clone(),
             fn_proto,

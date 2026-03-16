@@ -107,20 +107,24 @@ impl JsTypedArray {
         kind: TypedArrayKind,
         byte_offset: usize,
         length: usize,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, crate::error::VmError> {
         let elem_size = kind.element_size();
 
         // Validate alignment
         if !byte_offset.is_multiple_of(elem_size) {
-            return Err("byte offset must be aligned to element size");
+            return Err(crate::error::VmError::range_error(
+                "byte offset must be aligned to element size",
+            ));
         }
 
         // Validate bounds
-        let byte_length = length
-            .checked_mul(elem_size)
-            .ok_or("TypedArray length overflow")?;
+        let byte_length = length.checked_mul(elem_size).ok_or_else(|| {
+            crate::error::VmError::range_error("TypedArray length overflow")
+        })?;
         if byte_offset + byte_length > buffer.byte_length() {
-            return Err("TypedArray would extend past end of buffer");
+            return Err(crate::error::VmError::range_error(
+                "TypedArray would extend past end of buffer",
+            ));
         }
 
         Ok(Self {

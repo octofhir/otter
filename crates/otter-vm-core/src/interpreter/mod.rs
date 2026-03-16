@@ -19,6 +19,7 @@ use crate::promise::{JsPromise, JsPromiseJob, JsPromiseJobKind, PromiseState};
 use crate::realm::RealmId;
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
+use crate::typed_array_ops::{self, TaHasResult, TaSetResult};
 use crate::value::{Closure, NativeFn, UpvalueCell, Value};
 
 use num_bigint::BigInt as NumBigInt;
@@ -26,31 +27,6 @@ use num_traits::{One, ToPrimitive, Zero};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::Arc;
-
-/// CanonicalNumericIndexString → usize for TypedArray indexed access.
-/// Returns Some(idx) if the string is a valid non-negative integer index
-/// (e.g. "0", "1", "123"), None otherwise.
-/// Per spec §7.1.21, "-0" is a canonical numeric index but not a valid
-/// TypedArray index, so we return None for it.
-fn canonical_numeric_index_usize(s: &str) -> Option<usize> {
-    if s.is_empty() || s == "-0" {
-        return None;
-    }
-    // Fast path: single ASCII digit
-    if s.len() == 1 {
-        let b = s.as_bytes()[0];
-        if b.is_ascii_digit() {
-            return Some((b - b'0') as usize);
-        }
-        return None;
-    }
-    // Reject leading zeros (except "0" handled above)
-    if s.starts_with('0') {
-        return None;
-    }
-    // Parse as usize — only pure non-negative integers
-    s.parse::<usize>().ok()
-}
 
 /// Extract a human-readable message from a panic payload.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -4042,34 +4018,32 @@ impl Interpreter {
                     return Ok(());
                 }
 
+                // TypedArray [[HasProperty]] — check before as_object()
+                if let Some(ta) = right.as_typed_array() {
+                    let key = self.value_to_property_key(ctx, &left)?;
+                    match typed_array_ops::ta_has(&ta, &key) {
+                        TaHasResult::Present => {
+                            ctx.set_register(dst.0, Value::boolean(true));
+                            return Ok(());
+                        }
+                        TaHasResult::Absent => {
+                            ctx.set_register(dst.0, Value::boolean(false));
+                            return Ok(());
+                        }
+                        TaHasResult::NotAnIndex => {
+                            // Fall through to ta.object for named property lookup
+                            let result = self.has_with_proxy_chain(ctx, &ta.object, &key, left)?;
+                            ctx.set_register(dst.0, Value::boolean(result));
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let Some(right_obj) = right.as_object() else {
                     return Err(VmError::type_error(
                         "Cannot use 'in' operator to search for property in non-object",
                     ));
                 };
-
-                // TypedArray [[HasProperty]]: numeric indices within bounds are own properties
-                if let Some(ta_val) = right_obj.get(&PropertyKey::string("__TypedArrayData__"))
-                    && let Some(ta) = ta_val.as_typed_array()
-                {
-                    let maybe_idx: Option<usize> = if let Some(n) = left.as_int32() {
-                        if n >= 0 { Some(n as usize) } else { None }
-                    } else if let Some(n) = left.as_number() {
-                        let idx = n as usize;
-                        if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
-                    } else if let Some(s) = left.as_string() {
-                        canonical_numeric_index_usize(s.as_str())
-                    } else {
-                        None
-                    };
-                    if let Some(idx) = maybe_idx {
-                        // Numeric index: true iff in bounds (and not detached)
-                        let result = !ta.is_detached() && idx < ta.length();
-                        ctx.set_register(dst.0, Value::boolean(result));
-                        return Ok(());
-                    }
-                    // Non-numeric key: fall through to normal property lookup
-                }
 
                 let key = if let Some(n) = left.as_int32() {
                     PropertyKey::Index(n as u32)
@@ -6491,35 +6465,22 @@ impl Interpreter {
                     }
                 }
 
-                if let Some(obj) = object.as_object() {
-                    // TypedArray indexed element access — route through buffer
-                    {
-                        let maybe_idx: Option<usize> = if let Some(n) = key_value.as_int32() {
-                            if n >= 0 { Some(n as usize) } else { None }
-                        } else if let Some(n) = key_value.as_number() {
-                            let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 {
-                                Some(idx)
-                            } else {
-                                None
-                            }
-                        } else if let Some(s) = key_value.as_string() {
-                            // CanonicalNumericIndexString: parse "0", "1", etc.
-                            canonical_numeric_index_usize(s.as_str())
-                        } else {
-                            None
-                        };
-
-                        if let Some(idx) = maybe_idx
-                            && let Some(ta_val) =
-                                obj.get(&PropertyKey::string("__TypedArrayData__"))
-                            && let Some(ta) = ta_val.as_typed_array()
-                        {
-                            let val = ta.get_value(idx).unwrap_or(Value::undefined());
-                            ctx.set_register(dst.0, val);
-                            return Ok(());
-                        }
+                // TypedArray [[Get]] — check before as_object()
+                if let Some(ta) = object.as_typed_array() {
+                    if let Some(idx) = typed_array_ops::value_to_numeric_index(&key_value) {
+                        let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                        ctx.set_register(dst.0, val);
+                        return Ok(());
                     }
+                    // Non-numeric key: look up on ta.object (prototype chain)
+                    let key = self.value_to_property_key(ctx, &key_value)?;
+                    let key_val_for_proxy = crate::proxy_operations::property_key_to_value_pub(&key);
+                    let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val_for_proxy, &object)?;
+                    ctx.set_register(dst.0, value);
+                    return Ok(());
+                }
+
+                if let Some(obj) = object.as_object() {
                     let receiver = object;
                     // Convert key to property key
                     let key = self.value_to_property_key(ctx, &key_value)?;
@@ -6635,34 +6596,23 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                if let Some(obj) = object.as_object() {
-                    // TypedArray indexed element set — route through buffer
-                    {
-                        let maybe_idx: Option<usize> = if let Some(n) = key_value.as_int32() {
-                            if n >= 0 { Some(n as usize) } else { None }
-                        } else if let Some(n) = key_value.as_number() {
-                            let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 {
-                                Some(idx)
-                            } else {
-                                None
-                            }
-                        } else if let Some(s) = key_value.as_string() {
-                            canonical_numeric_index_usize(s.as_str())
-                        } else {
-                            None
-                        };
-
-                        if let Some(idx) = maybe_idx
-                            && let Some(ta_val) =
-                                obj.get(&PropertyKey::string("__TypedArrayData__"))
-                            && let Some(ta) = ta_val.as_typed_array()
-                        {
-                            ta.set_value(idx, &val_val);
+                // TypedArray [[Set]] — check before as_object()
+                if let Some(ta) = object.as_typed_array() {
+                    let key = self.value_to_property_key(ctx, &key_value)?;
+                    match typed_array_ops::ta_set(&ta, &key, &val_val) {
+                        TaSetResult::Written | TaSetResult::OutOfBounds => return Ok(()),
+                        TaSetResult::Detached => {
+                            return Err(VmError::type_error("Cannot set property on detached TypedArray"));
+                        }
+                        TaSetResult::NotAnIndex => {
+                            // Named property: set on ta.object
+                            let _ = ta.object.set(key, val_val);
                             return Ok(());
                         }
                     }
+                }
 
+                if let Some(obj) = object.as_object() {
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
                     match obj.lookup_property_descriptor(&key) {
@@ -6825,19 +6775,20 @@ impl Interpreter {
                 let object = *ctx.get_register(obj.0);
                 let idx_val = *ctx.get_register(index.0);
 
+                // TypedArray fast path
+                if let Some(ta) = object.as_typed_array()
+                    && let Some(idx) = idx_val.as_int32()
+                    && idx >= 0
+                {
+                    let val = ta.get_value(idx as usize).unwrap_or(Value::undefined());
+                    ctx.set_register(dst.0, val);
+                    return Ok(());
+                }
+
                 if let Some(idx) = idx_val.as_int32()
                     && idx >= 0
                     && let Some(obj_ref) = object.as_object()
                 {
-                    // TypedArray fast path — route through buffer
-                    if let Some(ta_val) =
-                        obj_ref.get(&PropertyKey::string("__TypedArrayData__"))
-                        && let Some(ta) = ta_val.as_typed_array()
-                    {
-                        let val = ta.get_value(idx as usize).unwrap_or(Value::undefined());
-                        ctx.set_register(dst.0, val);
-                        return Ok(());
-                    }
                     if let Some(val) = obj_ref.get_index(idx as usize) {
                         ctx.set_register(dst.0, val);
                         return Ok(());
@@ -6880,29 +6831,22 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                if let Some(obj) = array.as_object() {
-                    // TypedArray fast path — route through buffer
-                    if let Some(ta_val) =
-                        obj.get(&PropertyKey::string("__TypedArrayData__"))
-                        && let Some(ta) = ta_val.as_typed_array()
-                    {
-                        let maybe_idx: Option<usize> = if let Some(n) = index.as_int32() {
-                            if n >= 0 { Some(n as usize) } else { None }
-                        } else if let Some(n) = index.as_number() {
-                            let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
-                        } else if let Some(s) = index.as_string() {
-                            canonical_numeric_index_usize(s.as_str())
-                        } else {
-                            None
-                        };
-                        if let Some(idx) = maybe_idx {
-                            let val = ta.get_value(idx).unwrap_or(Value::undefined());
-                            ctx.set_register(dst.0, val);
-                            return Ok(());
-                        }
+                // TypedArray [[Get]] — §10.4.5.4
+                if let Some(ta) = array.as_typed_array() {
+                    if let Some(idx) = typed_array_ops::value_to_numeric_index(&index) {
+                        let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                        ctx.set_register(dst.0, val);
+                        return Ok(());
                     }
+                    // Non-numeric key: look up on ta.object (prototype chain)
+                    let key = self.value_to_property_key(ctx, &index)?;
+                    let key_val = crate::proxy_operations::property_key_to_value_pub(&key);
+                    let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val, &array)?;
+                    ctx.set_register(dst.0, value);
+                    return Ok(());
+                }
 
+                if let Some(obj) = array.as_object() {
                     // Fast path for numeric index access on arrays
                     if obj.is_array()
                         && let Some(n) = index.as_int32()
@@ -7061,28 +7005,22 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                if let Some(obj) = array.as_object() {
-                    // TypedArray fast path — route through buffer
-                    if let Some(ta_val) =
-                        obj.get(&PropertyKey::string("__TypedArrayData__"))
-                        && let Some(ta) = ta_val.as_typed_array()
-                    {
-                        let maybe_idx: Option<usize> = if let Some(n) = index.as_int32() {
-                            if n >= 0 { Some(n as usize) } else { None }
-                        } else if let Some(n) = index.as_number() {
-                            let idx = n as usize;
-                            if n >= 0.0 && n == idx as f64 { Some(idx) } else { None }
-                        } else if let Some(s) = index.as_string() {
-                            canonical_numeric_index_usize(s.as_str())
-                        } else {
-                            None
-                        };
-                        if let Some(idx) = maybe_idx {
-                            ta.set_value(idx, &val_val);
+                // TypedArray [[Set]] — §10.4.5.5
+                if let Some(ta) = array.as_typed_array() {
+                    let key = self.value_to_property_key(ctx, &index)?;
+                    match typed_array_ops::ta_set(&ta, &key, &val_val) {
+                        TaSetResult::Written | TaSetResult::OutOfBounds => return Ok(()),
+                        TaSetResult::Detached => {
+                            return Err(VmError::type_error("Cannot set property on detached TypedArray"));
+                        }
+                        TaSetResult::NotAnIndex => {
+                            let _ = ta.object.set(key, val_val);
                             return Ok(());
                         }
                     }
+                }
 
+                if let Some(obj) = array.as_object() {
                     // Fast path for numeric index access on arrays
                     if obj.is_array()
                         && !obj.is_dictionary_mode()

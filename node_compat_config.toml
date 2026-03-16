@@ -97,3 +97,19 @@ skip = [
     "test-runner-watch-mode*.js",                     # needs watch mode
     "test-runner-global*.js",                         # needs --test flag globals
 ]
+
+[modules.net]
+patterns = [
+    "test-internal-net-isLoopback.js",
+    "test-net-isip.js",
+    "test-net-isipv4.js",
+    "test-net-isipv6.js",
+    "test-net-connect-no-arg.js",
+    "test-net-connect-options-invalid.js",
+    "test-net-socket-connect-invalid-autoselectfamily.js",
+    "test-net-listen-invalid-port.js",
+    "test-net-server-listen-options.js",
+    "test-net-listen-close-server.js",
+    "test-net-server-call-listen-multiple-times.js",
+]
+skip = []

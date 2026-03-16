@@ -419,7 +419,7 @@ impl StructuredCloner {
             ta.byte_offset(),
             ta.length(),
         )
-        .map_err(StructuredCloneError::DataCloneError)?;
+        .map_err(|_| StructuredCloneError::DataCloneError("failed to clone TypedArray"))?;
         let new_value = Value::typed_array(GcRef::new(new_ta));
         self.memory.insert(ptr, new_value);
         Ok(new_value)

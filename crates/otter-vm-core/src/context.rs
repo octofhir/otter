@@ -85,6 +85,10 @@ pub struct NativeContext<'a> {
     interpreter: &'a crate::interpreter::Interpreter,
     /// Whether this native function is being called as a constructor (via `new`).
     is_construct: bool,
+    /// The NewTarget value for `Reflect.construct(target, args, newTarget)`.
+    /// When set, constructors should use this to derive the prototype
+    /// via GetPrototypeFromConstructor instead of using the default.
+    new_target: Option<crate::value::Value>,
 }
 
 impl<'a> NativeContext<'a> {
@@ -94,6 +98,7 @@ impl<'a> NativeContext<'a> {
             ctx,
             interpreter,
             is_construct: false,
+            new_target: None,
         }
     }
 
@@ -106,12 +111,44 @@ impl<'a> NativeContext<'a> {
             ctx,
             interpreter,
             is_construct: true,
+            new_target: None,
         }
     }
 
     /// Returns true if this function is being called as a constructor (via `new`).
     pub fn is_construct(&self) -> bool {
         self.is_construct
+    }
+
+    /// Get the NewTarget value (set by Reflect.construct).
+    pub fn new_target(&self) -> Option<crate::value::Value> {
+        self.new_target
+    }
+
+    /// Set the NewTarget value (called by Reflect.construct before invoking the constructor).
+    pub fn set_new_target(&mut self, value: crate::value::Value) {
+        self.new_target = Some(value);
+    }
+
+    /// ES2026 §10.4.5.1 GetPrototypeFromConstructor(newTarget, intrinsicDefaultProto).
+    /// If newTarget is set, reads newTarget.prototype (observable Get).
+    /// Falls back to `default_proto` if newTarget.prototype is not an object.
+    pub fn get_prototype_from_new_target(
+        &mut self,
+        default_proto: crate::gc::GcRef<crate::object::JsObject>,
+    ) -> crate::error::VmResult<crate::gc::GcRef<crate::object::JsObject>> {
+        if let Some(nt) = self.new_target {
+            if let Some(nt_obj) = nt.as_object() {
+                let proto_val = self.get_property(
+                    &nt_obj,
+                    &crate::object::PropertyKey::string("prototype"),
+                )?;
+                if let Some(proto_obj) = proto_val.as_object() {
+                    return Ok(proto_obj);
+                }
+            }
+        }
+        Ok(default_proto)
     }
 
     /// Check if the VM has been interrupted (e.g. by a timeout watchdog).
@@ -668,6 +705,8 @@ pub struct VmContext {
     pending_args_register_source: Option<(usize, usize)>,
     /// Pending `this` value for next call
     pending_this: Option<Value>,
+    /// Pending NewTarget for Reflect.construct — consumed by the next native constructor call
+    pending_new_target: Option<Value>,
     /// Pending upvalues for next call (captured closure cells)
     pending_upvalues: Vec<UpvalueCell>,
     /// Pending home object for next call (for super resolution in methods)
@@ -936,6 +975,7 @@ impl VmContext {
             pending_args: SmallVec::new(),
             pending_args_register_source: None,
             pending_this: None,
+            pending_new_target: None,
             pending_upvalues: Vec::new(),
             pending_home_object: None,
             pending_is_derived: false,
@@ -2726,6 +2766,16 @@ impl VmContext {
     /// Take pending `this` value (defaults to undefined)
     pub fn take_pending_this(&mut self) -> Value {
         self.pending_this.take().unwrap_or_else(Value::undefined)
+    }
+
+    /// Set pending NewTarget for Reflect.construct
+    pub fn set_pending_new_target(&mut self, value: Value) {
+        self.pending_new_target = Some(value);
+    }
+
+    /// Take pending NewTarget (consumed by native constructor)
+    pub fn take_pending_new_target(&mut self) -> Option<Value> {
+        self.pending_new_target.take()
     }
 
     /// Set pending upvalues for next function call (captured closure cells)

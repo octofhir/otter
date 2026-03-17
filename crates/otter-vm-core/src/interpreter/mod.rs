@@ -6410,6 +6410,30 @@ impl Interpreter {
                     PropertyKey::string(&key_str)
                 };
 
+                // TypedArray exotic [[Delete]] — §10.4.5.6
+                if let Some(ta) = object.as_typed_array() {
+                    let result = if let Some(del_result) = typed_array_ops::ta_delete(&ta, &prop_key) {
+                        del_result
+                    } else {
+                        // Not a numeric index — ordinary delete on ta.object
+                        ta.object.delete(&prop_key)
+                    };
+                    if !result {
+                        let is_strict = ctx
+                            .current_frame()
+                            .and_then(|frame| module.function(frame.function_index))
+                            .map(|func| func.flags.is_strict)
+                            .unwrap_or(false);
+                        if is_strict {
+                            return Err(VmError::type_error(
+                                "Cannot delete property of a TypedArray",
+                            ));
+                        }
+                    }
+                    ctx.set_register(dst.0, Value::boolean(result));
+                    return Ok(());
+                }
+
                 let result = if let Some(obj) = object.as_object() {
                     if !obj.has_own(&prop_key) {
                         true
@@ -6509,17 +6533,26 @@ impl Interpreter {
 
                 // TypedArray [[Get]] — check before as_object()
                 if let Some(ta) = object.as_typed_array() {
-                    if let Some(idx) = typed_array_ops::value_to_numeric_index(&key_value) {
-                        let val = ta.get_value(idx).unwrap_or(Value::undefined());
-                        ctx.set_register(dst.0, val);
-                        return Ok(());
+                    match typed_array_ops::value_to_canonical_index(&key_value) {
+                        Some(typed_array_ops::CanonicalIndex::Int(idx)) => {
+                            let val = ta.get_value(idx).unwrap_or(Value::undefined());
+                            ctx.set_register(dst.0, val);
+                            return Ok(());
+                        }
+                        Some(typed_array_ops::CanonicalIndex::NonInt) => {
+                            // Canonical numeric but not valid index → undefined, no prototype lookup
+                            ctx.set_register(dst.0, Value::undefined());
+                            return Ok(());
+                        }
+                        None => {
+                            // Not a canonical numeric index — fall through to OrdinaryGet on ta.object
+                            let key = self.value_to_property_key(ctx, &key_value)?;
+                            let key_val_for_proxy = crate::proxy_operations::property_key_to_value_pub(&key);
+                            let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val_for_proxy, &object)?;
+                            ctx.set_register(dst.0, value);
+                            return Ok(());
+                        }
                     }
-                    // Non-numeric key: look up on ta.object (prototype chain)
-                    let key = self.value_to_property_key(ctx, &key_value)?;
-                    let key_val_for_proxy = crate::proxy_operations::property_key_to_value_pub(&key);
-                    let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val_for_proxy, &object)?;
-                    ctx.set_register(dst.0, value);
-                    return Ok(());
                 }
 
                 if let Some(obj) = object.as_object() {

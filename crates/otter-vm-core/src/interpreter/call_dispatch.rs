@@ -35,12 +35,18 @@ impl Interpreter {
         }
 
         ctx.enter_native_call()?;
+        // Take pending NewTarget before creating NativeContext (avoids double borrow)
+        let pending_nt = ctx.take_pending_new_target();
         let result = {
             let mut ncx = if as_construct {
                 crate::context::NativeContext::new_construct(ctx, self)
             } else {
                 crate::context::NativeContext::new(ctx, self)
             };
+            // Propagate pending NewTarget from Reflect.construct
+            if let Some(nt) = pending_nt {
+                ncx.set_new_target(nt);
+            }
             native_fn(this_value, args, &mut ncx)
         };
         ctx.exit_native_call();

@@ -456,7 +456,7 @@ fn make_typed_array_value(ta: JsTypedArray) -> Value {
 /// - String → StringToBigInt (parse decimal integer)
 /// - Boolean → false=0, true=1
 /// - undefined, null, Number, Symbol → throw TypeError
-fn to_bigint_i64(val: &Value) -> Result<i64, VmError> {
+pub fn to_bigint_i64(val: &Value) -> Result<i64, VmError> {
     if let Some(b) = val.as_bigint() {
         // Parse BigInt string value, handle large values via wrapping
         if let Ok(n) = b.value.parse::<i64>() {
@@ -566,23 +566,15 @@ fn create_typed_array_constructor(
             ));
         }
 
-        // §22.2.4.2.1 AllocateTypedArray step 1: GetPrototypeFromConstructor(newTarget, defaultProto)
-        // When called via Reflect.construct(TA, args, newTarget), `this` already
-        // has newTarget.prototype set. Use it instead of the built-in prototype.
-        let actual_proto = if let Some(this_obj) = this_val.as_object() {
-            let p = this_obj.prototype();
-            if p.is_object() {
-                p.as_object().unwrap()
-            } else {
-                proto
-            }
-        } else {
-            proto
+        // Get ArrayBuffer.prototype for all new buffer allocations
+        let ab_proto_for_new_buffer = {
+            let rid = ncx.ctx.realm_id();
+            ncx.ctx.realm_intrinsics(rid).map(|i| i.array_buffer_prototype)
         };
 
         if args.is_empty() {
-            let buffer = GcRef::new(JsArrayBuffer::new(0, None));
-            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+            let buffer = GcRef::new(JsArrayBuffer::new(0, ab_proto_for_new_buffer));
+            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
             let ta = JsTypedArray::new(object, buffer, kind, 0, 0)?;
             return Ok(make_typed_array_value(ta));
         }
@@ -636,7 +628,7 @@ fn create_typed_array_constructor(
                 available / elem_size
             };
 
-            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
             let ta = JsTypedArray::new(object, buffer, kind, byte_offset, length)?;
             return Ok(make_typed_array_value(ta));
         }
@@ -654,14 +646,8 @@ fn create_typed_array_constructor(
                 .checked_mul(kind.element_size())
                 .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
             // §22.2.4.3 step 17/18: Use SpeciesConstructor(srcBuffer, %ArrayBuffer%)
-            // For now, always use default ArrayBuffer (species null/undefined → default).
-            // Get ArrayBuffer.prototype from intrinsics for the new buffer.
-            let realm_id = ncx.ctx.realm_id();
-            let ab_proto = ncx.ctx.realm_intrinsics(realm_id)
-                .map(|i| Some(i.array_buffer_prototype))
-                .unwrap_or(None);
-            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto));
-            let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+            let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
+            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
             let ta =
                 JsTypedArray::new(object, buffer, kind, 0, length)?;
             for i in 0..length {
@@ -728,8 +714,8 @@ fn create_typed_array_constructor(
                 let byte_len = length
                     .checked_mul(kind.element_size())
                     .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-                let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-                let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+                let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
+                let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)
                     ?;
 
@@ -772,8 +758,8 @@ fn create_typed_array_constructor(
             {
                 let byte_len = length.checked_mul(kind.element_size())
                     .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-                let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-                let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+                let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
+                let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
 
                 for i in 0..length {
@@ -825,8 +811,8 @@ fn create_typed_array_constructor(
         let byte_len = length
             .checked_mul(kind.element_size())
             .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
-        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, None));
-        let object = GcRef::new(JsObject::new(Value::object(actual_proto)));
+        let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
+        let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
         let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
         Ok(make_typed_array_value(ta))
     }
@@ -1046,11 +1032,9 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                 TypedArrayKind::BigUint64,
             ),
         ] {
-            init_specific_typed_array_prototype(
-                proto,
-                kind,
-                crate::intrinsics::well_known::to_string_tag_symbol(),
-            );
+            // Per §23.2.3.32, @@toStringTag is a getter on %TypedArray%.prototype only.
+            // Individual prototypes (Int8Array.prototype etc.) do NOT have their own @@toStringTag.
+            let _ = (proto, kind); // suppress unused
         }
         init_array_buffer_prototype(
             intrinsics.array_buffer_prototype,

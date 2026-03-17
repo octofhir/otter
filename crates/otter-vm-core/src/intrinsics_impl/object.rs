@@ -256,6 +256,60 @@ pub fn init_object_prototype(
         )),
     );
 
+    // Object.prototype.__proto__ (Annex B §B.2.2.1)
+    // Getter: get __proto__ — returns Object.getPrototypeOf(this)
+    let proto_getter = Value::native_function_with_proto(
+        |this_val, _args, _ncx| {
+            // For any object-like value, return its [[Prototype]]
+            if let Some(obj) = this_val.as_object() {
+                let p = obj.prototype();
+                return Ok(if p.is_null() { Value::null() } else { p });
+            }
+            // TypedArray, ArrayBuffer, etc. — get inner object's prototype
+            if let Some(ta) = this_val.as_typed_array() {
+                let p = ta.object.prototype();
+                return Ok(if p.is_null() { Value::null() } else { p });
+            }
+            if let Some(ab) = this_val.as_array_buffer() {
+                let p = ab.object.prototype();
+                return Ok(if p.is_null() { Value::null() } else { p });
+            }
+            if let Some(generator) = this_val.as_generator() {
+                let p = generator.object.prototype();
+                return Ok(if p.is_null() { Value::null() } else { p });
+            }
+            // For other exotic types, try as_object() fallback (covers RegExp, DataView via inner object)
+            // as_object() already extracts inner .object for these types
+            Ok(Value::null())
+        },
+        mm.clone(),
+        fn_proto,
+    );
+    // Setter: set __proto__ — calls Object.setPrototypeOf(this, value)
+    let proto_setter = Value::native_function_with_proto(
+        |this_val, args, _ncx| {
+            let proto_val = args.first().copied().unwrap_or(Value::undefined());
+            if let Some(obj) = this_val.as_object() {
+                obj.set_prototype(proto_val);
+            }
+            Ok(Value::undefined())
+        },
+        mm.clone(),
+        fn_proto,
+    );
+    object_proto.define_property(
+        PropertyKey::string("__proto__"),
+        PropertyDescriptor::Accessor {
+            get: Some(proto_getter),
+            set: Some(proto_setter),
+            attributes: PropertyAttributes {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        },
+    );
+
     // Object.prototype.hasOwnProperty
     object_proto.define_property(
         PropertyKey::string("hasOwnProperty"),
@@ -494,22 +548,37 @@ pub fn init_object_constructor(
                 use crate::intrinsics_impl::reflect::to_property_key;
                 let pk = to_property_key(&key_val);
 
-                // TypedArray: check exotic numeric descriptors first
+                // TypedArray exotic [[GetOwnProperty]] — §10.4.5.1
                 if let Some(ta) = target.as_typed_array() {
-                    if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, &pk) {
-                        let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
-                            .map(Value::object)
-                            .unwrap_or(Value::null());
-                        let desc_obj = GcRef::new(JsObject::new(obj_proto));
-                        if let PropertyDescriptor::Data { value, attributes } = &desc {
-                            let _ = desc_obj.set(PropertyKey::string("value"), *value);
-                            let _ = desc_obj.set(PropertyKey::string("writable"), Value::boolean(attributes.writable));
-                            let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
-                            let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                    // Check if it's a canonical numeric index first
+                    if let Some(ci) = crate::typed_array_ops::canonical_numeric_index(&pk) {
+                        // It IS a canonical numeric index — TypedArray handles exclusively
+                        match ci {
+                            crate::typed_array_ops::CanonicalIndex::Int(idx) => {
+                                if !ta.is_detached() && idx < ta.length() {
+                                    if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, &pk) {
+                                        let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
+                                            .map(Value::object)
+                                            .unwrap_or(Value::null());
+                                        let desc_obj = GcRef::new(JsObject::new(obj_proto));
+                                        if let PropertyDescriptor::Data { value, attributes } = &desc {
+                                            let _ = desc_obj.set(PropertyKey::string("value"), *value);
+                                            let _ = desc_obj.set(PropertyKey::string("writable"), Value::boolean(attributes.writable));
+                                            let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
+                                            let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                                        }
+                                        return Ok(Value::object(desc_obj));
+                                    }
+                                }
+                                // Out of bounds or detached → undefined
+                                return Ok(Value::undefined());
+                            }
+                            crate::typed_array_ops::CanonicalIndex::NonInt => {
+                                return Ok(Value::undefined());
+                            }
                         }
-                        return Ok(Value::object(desc_obj));
                     }
-                    // Fall through to ta.object for named properties
+                    // Not a numeric index — fall through to ta.object for named properties
                 }
 
                 let obj = to_object_for_builtin(ncx_inner, &target)?;
@@ -1176,6 +1245,7 @@ pub fn init_object_constructor(
                 && obj_val.as_proxy().is_none()
                 && obj_val.as_function().is_none()
                 && obj_val.native_function_object().is_none()
+                && obj_val.as_typed_array().is_none()
             {
                 return Err(VmError::type_error(
                     "Object.defineProperty called on non-object",
@@ -1243,6 +1313,72 @@ pub fn init_object_constructor(
                     ));
                 }
                 return Ok(*obj_val);
+            }
+
+            // TypedArray exotic [[DefineOwnProperty]] — §10.4.5.3
+            if let Some(ta) = obj_val.as_typed_array() {
+                use crate::typed_array_ops::{CanonicalIndex, canonical_numeric_index};
+                match canonical_numeric_index(&key) {
+                    Some(CanonicalIndex::Int(idx)) => {
+                        // Accessor desc → rejected
+                        if desc.is_accessor_descriptor() {
+                            return Err(VmError::type_error(
+                                "Cannot define accessor property on TypedArray numeric index",
+                            ));
+                        }
+                        // Check attribute constraints
+                        if desc.configurable == Some(false)
+                            || desc.enumerable == Some(false)
+                            || desc.writable == Some(false)
+                        {
+                            return Err(VmError::type_error(
+                                "Cannot define non-standard attributes on TypedArray numeric index",
+                            ));
+                        }
+                        if ta.is_detached() || idx >= ta.length() {
+                            return Err(VmError::type_error(
+                                "Cannot define property on a TypedArray at this index",
+                            ));
+                        }
+                        // §10.4.5.11 IntegerIndexedElementSet: call ToNumber/ToBigInt
+                        if let Some(val) = desc.value {
+                            if ta.kind().is_bigint() {
+                                // ToBigInt(value) — can throw
+                                let prim = if val.is_object() || val.as_object().is_some() {
+                                    ncx.to_primitive(&val, crate::interpreter::PreferredType::Number)?
+                                } else {
+                                    val
+                                };
+                                let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                if !ta.is_detached() {
+                                    ta.set_bigint(idx, n);
+                                }
+                            } else {
+                                // ToNumber(value) — can throw
+                                let n = ncx.to_number_value(&val)?;
+                                if !ta.is_detached() {
+                                    ta.set(idx, n);
+                                }
+                            }
+                        }
+                        return Ok(*obj_val);
+                    }
+                    Some(CanonicalIndex::NonInt) => {
+                        return Err(VmError::type_error(
+                            "Cannot define property on a TypedArray at this index",
+                        ));
+                    }
+                    None => {
+                        // Not a numeric index — ordinary define on ta.object
+                        let success = ta.object.define_own_property(key, &desc);
+                        if !success {
+                            return Err(VmError::type_error(
+                                "Cannot define property: object is not extensible or property is non-configurable",
+                            ));
+                        }
+                        return Ok(*obj_val);
+                    }
+                }
             }
 
             let obj = obj_val

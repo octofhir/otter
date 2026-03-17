@@ -814,6 +814,10 @@ impl Interpreter {
                             self.make_error(ctx, "URIError", &message),
                         ));
                     }
+                    VmError::Exception(thrown) => {
+                        // Dispatch as a throw so try-catch inside the generator can catch it
+                        ctx.dispatch_action = Some(DispatchAction::Throw(thrown.value));
+                    }
                     other => {
                         generator.complete();
                         return GeneratorResult::Error(other);

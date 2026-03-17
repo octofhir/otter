@@ -255,6 +255,21 @@ fn reflect_set(
         return Ok(Value::boolean(success));
     }
 
+    // TypedArray exotic [[Set]] — §10.4.5.5
+    if let Some(ta) = target.as_typed_array() {
+        let key = to_property_key(property_key);
+        match crate::typed_array_ops::ta_set(&ta, &key, &value) {
+            crate::typed_array_ops::TaSetResult::Written => return Ok(Value::boolean(true)),
+            crate::typed_array_ops::TaSetResult::OutOfBounds => return Ok(Value::boolean(false)),
+            crate::typed_array_ops::TaSetResult::Detached => return Ok(Value::boolean(false)),
+            crate::typed_array_ops::TaSetResult::NotAnIndex => {
+                // Fall through to ordinary set on ta.object
+                let _ = ta.object.set(key, value);
+                return Ok(Value::boolean(true));
+            }
+        }
+    }
+
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
     let _ = obj.set(key, value);
@@ -279,6 +294,19 @@ fn reflect_has(
         let key = to_property_key(property_key);
         let result = crate::proxy_operations::proxy_has(ncx, proxy, &key, *property_key)?;
         return Ok(Value::boolean(result));
+    }
+
+    // TypedArray exotic [[HasProperty]]
+    if let Some(ta) = target.as_typed_array() {
+        let key = to_property_key(property_key);
+        match crate::typed_array_ops::ta_has(&ta, &key) {
+            crate::typed_array_ops::TaHasResult::Present => return Ok(Value::boolean(true)),
+            crate::typed_array_ops::TaHasResult::Absent => return Ok(Value::boolean(false)),
+            crate::typed_array_ops::TaHasResult::NotAnIndex => {
+                // Fall through to ordinary has on ta.object
+                return Ok(Value::boolean(ta.object.has(&key)));
+            }
+        }
     }
 
     let obj = get_target_object(target)?;
@@ -307,6 +335,17 @@ fn reflect_delete_property(
         return Ok(Value::boolean(result));
     }
 
+    // TypedArray exotic [[Delete]] — §10.4.5.6
+    if let Some(ta) = target.as_typed_array() {
+        let key = to_property_key(property_key);
+        if let Some(result) = crate::typed_array_ops::ta_delete(&ta, &key) {
+            return Ok(Value::boolean(result));
+        }
+        // Not a numeric index — fall through to ordinary delete on ta.object
+        let deleted = ta.object.delete(&key);
+        return Ok(Value::boolean(deleted));
+    }
+
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
     let deleted = obj.delete(&key);
@@ -326,6 +365,9 @@ fn reflect_own_keys(
 
     let keys = if let Some(proxy) = target.as_proxy() {
         crate::proxy_operations::proxy_own_keys(ncx, proxy)?
+    } else if let Some(ta) = target.as_typed_array() {
+        // TypedArray exotic [[OwnPropertyKeys]] — §10.4.5.7
+        crate::typed_array_ops::ta_own_keys_full(&ta)
     } else {
         let obj = get_target_object(target)?;
         obj.own_keys()
@@ -365,6 +407,34 @@ fn reflect_get_own_property_descriptor(
         return Ok(result_desc
             .map(|desc| descriptor_to_value(desc, ncx))
             .unwrap_or(Value::undefined()));
+    }
+
+    // TypedArray exotic [[GetOwnProperty]] — §10.4.5.1
+    if let Some(ta) = target.as_typed_array() {
+        let key = to_property_key(property_key);
+        // Check if it's a canonical numeric index first
+        if let Some(ci) = crate::typed_array_ops::canonical_numeric_index(&key) {
+            // It IS a canonical numeric index — TypedArray handles it exclusively.
+            return match ci {
+                crate::typed_array_ops::CanonicalIndex::Int(idx) => {
+                    if !ta.is_detached() && idx < ta.length() {
+                        if let Some(desc) =
+                            crate::typed_array_ops::ta_get_own_property(&ta, &key)
+                        {
+                            return Ok(descriptor_to_value(desc, ncx));
+                        }
+                    }
+                    // Out of bounds or detached → property absent
+                    Ok(Value::undefined())
+                }
+                crate::typed_array_ops::CanonicalIndex::NonInt => Ok(Value::undefined()),
+            };
+        }
+        // Not a numeric index — fall through to ta.object for named properties
+        if let Some(prop_desc) = ta.object.get_own_property_descriptor(&key) {
+            return Ok(descriptor_to_value(prop_desc, ncx));
+        }
+        return Ok(Value::undefined());
     }
 
     let obj = get_target_object(target)?;
@@ -452,6 +522,52 @@ fn reflect_define_property(
             &full_desc,
         )?;
         return Ok(Value::boolean(result));
+    }
+
+    // TypedArray exotic [[DefineOwnProperty]] — §10.4.5.3
+    if let Some(ta) = target.as_typed_array() {
+        use crate::typed_array_ops::{CanonicalIndex, canonical_numeric_index};
+        match canonical_numeric_index(&key) {
+            Some(CanonicalIndex::Int(idx)) => {
+                if desc.is_accessor_descriptor() {
+                    return Ok(Value::boolean(false));
+                }
+                if desc.configurable == Some(false)
+                    || desc.enumerable == Some(false)
+                    || desc.writable == Some(false)
+                {
+                    return Ok(Value::boolean(false));
+                }
+                if ta.is_detached() || idx >= ta.length() {
+                    return Ok(Value::boolean(false));
+                }
+                // §10.4.5.11 IntegerIndexedElementSet: call ToNumber/ToBigInt
+                if let Some(val) = desc.value {
+                    if ta.kind().is_bigint() {
+                        let prim = if val.is_object() || val.as_object().is_some() {
+                            ncx.to_primitive(&val, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            val
+                        };
+                        let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                        if !ta.is_detached() {
+                            ta.set_bigint(idx, n);
+                        }
+                    } else {
+                        let n = ncx.to_number_value(&val)?;
+                        if !ta.is_detached() {
+                            ta.set(idx, n);
+                        }
+                    }
+                }
+                return Ok(Value::boolean(true));
+            }
+            Some(CanonicalIndex::NonInt) => return Ok(Value::boolean(false)),
+            None => {
+                let ok = ta.object.define_own_property(key, &desc);
+                return Ok(Value::boolean(ok));
+            }
+        }
     }
 
     let obj = get_target_object(target)?;
@@ -633,24 +749,39 @@ fn reflect_construct(
 
     let args_array = value_to_array_args(args_list)?;
 
-    // GetPrototypeFromConstructor(newTarget, intrinsicDefaultProto)
-    // Must use observable [[Get]] to trigger accessors on newTarget.prototype
-    let proto = if let Some(nt_obj) = new_target.as_object() {
-        let proto_val =
-            ncx.get_property(&nt_obj, &crate::object::PropertyKey::string("prototype"))?;
-        if proto_val.is_object() {
-            proto_val
+    // Per spec, native constructors (TypedArray etc.) must process arguments
+    // BEFORE GetPrototypeFromConstructor(newTarget). So we set newTarget on
+    // the NativeContext and let the constructor call get_prototype_from_new_target()
+    // at the correct point. For closure constructors, we do eager prototype read
+    // since the JS `new` machinery handles it.
+    let is_native = target.as_native_function().is_some();
+
+    if is_native {
+        // Set newTarget on VmContext; call_native_fn_with_realm will propagate to NativeContext
+        ncx.ctx.set_pending_new_target(new_target);
+    }
+
+    let this_val = if is_native {
+        // Pass undefined — call_function_construct creates `this` from target's proto
+        Value::undefined()
+    } else {
+        // Closure constructors: eager GetPrototypeFromConstructor
+        let proto = if let Some(nt_obj) = new_target.as_object() {
+            let proto_val =
+                ncx.get_property(&nt_obj, &crate::object::PropertyKey::string("prototype"))?;
+            if proto_val.is_object() {
+                proto_val
+            } else {
+                let default_proto = default_proto_for_construct(ncx, target, &new_target);
+                default_proto.map(Value::object).unwrap_or_else(Value::null)
+            }
         } else {
-            // Fall back to default prototype
             let default_proto = default_proto_for_construct(ncx, target, &new_target);
             default_proto.map(Value::object).unwrap_or_else(Value::null)
-        }
-    } else {
-        let default_proto = default_proto_for_construct(ncx, target, &new_target);
-        default_proto.map(Value::object).unwrap_or_else(Value::null)
+        };
+        let new_obj = GcRef::new(JsObject::new(proto));
+        Value::object(new_obj)
     };
-    let new_obj = GcRef::new(JsObject::new(proto));
-    let this_val = Value::object(new_obj);
 
     let result = ncx.call_function_construct(target, this_val, &args_array)?;
     if result.is_object() {

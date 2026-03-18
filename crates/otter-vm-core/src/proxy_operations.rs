@@ -176,11 +176,40 @@ fn target_set(
         ncx.ctx.exit_native_call();
         return result;
     }
+    // TypedArray target: use exotic [[Set]]
+    if let Some(ta) = target.as_typed_array() {
+        match crate::typed_array_ops::canonical_numeric_index(key) {
+            Some(crate::typed_array_ops::CanonicalIndex::Int(idx)) => {
+                // Check SameValue(target, receiver)
+                let is_same = receiver.as_typed_array()
+                    .map(|r| std::ptr::eq(r.as_ptr(), ta.as_ptr()))
+                    .unwrap_or(false);
+                if !is_same {
+                    return Ok(false);
+                }
+                if !ta.is_detached() && idx < ta.length() {
+                    ta.set_value(idx, &value);
+                }
+                return Ok(true);
+            }
+            Some(crate::typed_array_ops::CanonicalIndex::NonInt) => return Ok(true),
+            None => {
+                // Non-numeric: OrdinarySet on ta.object with receiver
+                let result = crate::intrinsics_impl::reflect::ordinary_set_with_receiver(
+                    &ta.object, key, value, &receiver, ncx,
+                )?;
+                return Ok(result.as_boolean().unwrap_or(false));
+            }
+        }
+    }
     let obj = target
         .as_object()
         .ok_or_else(|| VmError::type_error("Proxy target must be an object"))?;
-    let _ = obj.set(*key, value);
-    Ok(true)
+    // OrdinarySet with proper receiver support
+    let result = crate::intrinsics_impl::reflect::ordinary_set_with_receiver(
+        &obj, key, value, &receiver, ncx,
+    )?;
+    Ok(result.as_boolean().unwrap_or(false))
 }
 
 fn target_delete_property(

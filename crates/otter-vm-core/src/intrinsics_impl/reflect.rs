@@ -157,6 +157,290 @@ fn descriptor_to_value(desc: PropertyDescriptor, ncx: &NativeContext) -> Value {
     }
 }
 
+/// ES2026 §10.1.7 OrdinaryHasProperty with observable prototype chain walking.
+///
+/// Walks the prototype chain invoking proxy traps when a Proxy is encountered.
+/// This is needed because `JsObject::has()` skips proxy trap invocation.
+fn ordinary_has_property(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    key_value: Value,
+    ncx: &mut NativeContext<'_>,
+) -> Result<bool, VmError> {
+    // Check own property
+    if obj.has_own(key) {
+        return Ok(true);
+    }
+    // Also check elements for Index keys
+    if let PropertyKey::Index(i) = key {
+        let elements = obj.get_elements_storage().borrow();
+        let idx = *i as usize;
+        if let Some(v) = elements.get(idx)
+            && !v.is_hole()
+        {
+            return Ok(true);
+        }
+    }
+    // Walk prototype chain
+    let mut current = obj.prototype();
+    let mut depth = 0;
+    loop {
+        if current.is_null() || current.is_undefined() {
+            return Ok(false);
+        }
+        depth += 1;
+        if depth > 256 {
+            return Ok(false);
+        }
+        if let Some(proxy) = current.as_proxy() {
+            return crate::proxy_operations::proxy_has(ncx, proxy, key, key_value);
+        }
+        if let Some(proto_obj) = current.as_object() {
+            if proto_obj.has_own(key) {
+                return Ok(true);
+            }
+            // Check elements for Index keys
+            if let PropertyKey::Index(i) = key {
+                let elements = proto_obj.get_elements_storage().borrow();
+                let idx = *i as usize;
+                if let Some(v) = elements.get(idx)
+                    && !v.is_hole()
+                {
+                    return Ok(true);
+                }
+            }
+            current = proto_obj.prototype();
+        } else {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+/// ES2026 §10.1.9 OrdinarySet with explicit receiver.
+///
+/// Walks prototype chain looking for accessors or non-writable data properties.
+/// When the property is not found or is writable data, attempts to create/update
+/// on receiver. Returns `Ok(Value::boolean(success))`.
+pub fn ordinary_set_with_receiver(
+    obj: &GcRef<JsObject>,
+    key: &PropertyKey,
+    value: Value,
+    receiver: &Value,
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    // 1. Get own property descriptor on the target
+    let own_desc = obj.get_own_property_descriptor(key);
+
+    match own_desc {
+        Some(PropertyDescriptor::Accessor { set, .. }) => {
+            // §10.1.9.2 step 4: If desc is accessor, call setter with receiver as this
+            if let Some(setter) = set {
+                ncx.call_function(&setter, *receiver, &[value])?;
+                return Ok(Value::boolean(true));
+            }
+            return Ok(Value::boolean(false));
+        }
+        Some(PropertyDescriptor::Data { attributes, .. }) => {
+            if !attributes.writable {
+                // Non-writable own data property — return false
+                return Ok(Value::boolean(false));
+            }
+            // Own writable data property — set on receiver
+            return ordinary_set_on_receiver(receiver, key, value, ncx);
+        }
+        Some(PropertyDescriptor::Deleted) | None => {
+            // Not found on obj — walk prototype chain
+        }
+    }
+
+    // Also check elements for Index keys (arguments object stores values in elements)
+    if let PropertyKey::Index(i) = key {
+        let elements = obj.get_elements_storage().borrow();
+        let idx = *i as usize;
+        if let Some(v) = elements.get(idx)
+            && !v.is_hole()
+        {
+            drop(elements);
+            return ordinary_set_on_receiver(receiver, key, value, ncx);
+        }
+    }
+
+    // Walk prototype chain
+    let mut current = obj.prototype();
+    let mut depth = 0;
+    loop {
+        if current.is_null() || current.is_undefined() {
+            // End of chain — create property on receiver
+            return ordinary_set_on_receiver(receiver, key, value, ncx);
+        }
+        depth += 1;
+        if depth > 256 {
+            return Ok(Value::boolean(false));
+        }
+        if let Some(proxy) = current.as_proxy() {
+            let key_value = crate::proxy_operations::property_key_to_value_pub(key);
+            let success = crate::proxy_operations::proxy_set(
+                ncx, proxy, key, key_value, value, *receiver,
+            )?;
+            return Ok(Value::boolean(success));
+        }
+        // TypedArray in prototype chain: use exotic [[GetOwnProperty]] for numeric indices
+        if let Some(ta) = current.as_typed_array() {
+            if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, key) {
+                // TypedArray owns this numeric index as writable data → set on receiver
+                match desc {
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        if !attributes.writable {
+                            return Ok(Value::boolean(false));
+                        }
+                        return ordinary_set_on_receiver(receiver, key, value, ncx);
+                    }
+                    _ => return Ok(Value::boolean(false)),
+                }
+            }
+            // Check if it's a canonical numeric index that's out of bounds
+            if let Some(_) = crate::typed_array_ops::canonical_numeric_index(key) {
+                // Canonical numeric but not a valid index — don't walk further
+                return ordinary_set_on_receiver(receiver, key, value, ncx);
+            }
+            // Non-numeric key: continue walking via ta.object
+            current = ta.object.prototype();
+            continue;
+        }
+        if let Some(proto_obj) = current.as_object() {
+            if let Some(desc) = proto_obj.get_own_property_descriptor(key) {
+                match desc {
+                    PropertyDescriptor::Accessor { set, .. } => {
+                        if let Some(setter) = set {
+                            ncx.call_function(&setter, *receiver, &[value])?;
+                            return Ok(Value::boolean(true));
+                        }
+                        return Ok(Value::boolean(false));
+                    }
+                    PropertyDescriptor::Data { attributes, .. } => {
+                        if !attributes.writable {
+                            return Ok(Value::boolean(false));
+                        }
+                        // Writable data in prototype — set on receiver (not prototype)
+                        return ordinary_set_on_receiver(receiver, key, value, ncx);
+                    }
+                    PropertyDescriptor::Deleted => {}
+                }
+            }
+            // Check elements for Index keys
+            if let PropertyKey::Index(i) = key {
+                let elements = proto_obj.get_elements_storage().borrow();
+                let idx = *i as usize;
+                if let Some(v) = elements.get(idx)
+                    && !v.is_hole()
+                {
+                    drop(elements);
+                    return ordinary_set_on_receiver(receiver, key, value, ncx);
+                }
+            }
+            current = proto_obj.prototype();
+        } else {
+            break;
+        }
+    }
+    ordinary_set_on_receiver(receiver, key, value, ncx)
+}
+
+/// OrdinarySet final step: create or update property on receiver.
+///
+/// Per §10.1.9.2 step 6: If receiver is an object, check receiver's own property.
+/// - If receiver has own accessor → false (can't create data over accessor).
+/// - If receiver has own non-writable data → false.
+/// - If receiver has own writable data → update.
+/// - If receiver has no own property → create if extensible.
+/// - If receiver is not an object → false.
+fn ordinary_set_on_receiver(
+    receiver: &Value,
+    key: &PropertyKey,
+    value: Value,
+    ncx: &mut NativeContext<'_>,
+) -> Result<Value, VmError> {
+    // Proxy receiver: call [[DefineOwnProperty]] which invokes proxy trap
+    if let Some(proxy) = receiver.as_proxy() {
+        let key_value = crate::proxy_operations::property_key_to_value_pub(key);
+        let desc = PropertyDescriptor::data_with_attrs(
+            value,
+            PropertyAttributes {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let success = crate::proxy_operations::proxy_define_property(
+            ncx, proxy, key, key_value, &desc,
+        )?;
+        return Ok(Value::boolean(success));
+    }
+
+    // TypedArray receiver: use exotic [[Set]] for canonical numeric indices
+    if let Some(recv_ta) = receiver.as_typed_array() {
+        if let Some(ci) = crate::typed_array_ops::canonical_numeric_index(key) {
+            match ci {
+                crate::typed_array_ops::CanonicalIndex::Int(idx) => {
+                    if recv_ta.kind().is_bigint() {
+                        let prim = if value.is_object() || value.as_object().is_some() {
+                            ncx.to_primitive(&value, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            value
+                        };
+                        let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                        if !recv_ta.is_detached() && idx < recv_ta.length() {
+                            recv_ta.set_bigint(idx, n);
+                        }
+                    } else {
+                        let n = ncx.to_number_value(&value)?;
+                        if !recv_ta.is_detached() && idx < recv_ta.length() {
+                            recv_ta.set(idx, n);
+                        }
+                    }
+                    return Ok(Value::boolean(true));
+                }
+                crate::typed_array_ops::CanonicalIndex::NonInt => {
+                    return Ok(Value::boolean(true));
+                }
+            }
+        }
+        // Non-numeric key: set on recv_ta.object
+        let _ = recv_ta.object.set(*key, value);
+        return Ok(Value::boolean(true));
+    }
+
+    if let Some(recv_obj) = receiver.as_object() {
+        // Check receiver's own property descriptor
+        if let Some(existing) = recv_obj.get_own_property_descriptor(key) {
+            match existing {
+                PropertyDescriptor::Accessor { .. } => {
+                    // Can't create data property over accessor on receiver
+                    return Ok(Value::boolean(false));
+                }
+                PropertyDescriptor::Data { attributes, .. } => {
+                    if !attributes.writable {
+                        return Ok(Value::boolean(false));
+                    }
+                    // Update existing writable data property
+                    let ok = recv_obj.set(*key, value).is_ok();
+                    return Ok(Value::boolean(ok));
+                }
+                PropertyDescriptor::Deleted => {}
+            }
+        }
+        // No own property on receiver — create if extensible
+        if recv_obj.is_extensible() {
+            let ok = recv_obj.set(*key, value).is_ok();
+            return Ok(Value::boolean(ok));
+        }
+        return Ok(Value::boolean(false));
+    }
+    // Receiver is not an object (primitive, null, etc.) — return false
+    Ok(Value::boolean(false))
+}
+
 /// CreateListFromArrayLike(obj) — ES2024 §7.3.18
 /// Accepts any object with a numeric `length` property (not just arrays).
 /// Throws TypeError for non-objects (null, undefined, primitives).
@@ -256,24 +540,75 @@ fn reflect_set(
     }
 
     // TypedArray exotic [[Set]] — §10.4.5.5
+    // Per spec: IntegerIndexedElementSet checks receiver === target.
     if let Some(ta) = target.as_typed_array() {
         let key = to_property_key(property_key);
-        match crate::typed_array_ops::ta_set(&ta, &key, &value) {
-            crate::typed_array_ops::TaSetResult::Written => return Ok(Value::boolean(true)),
-            crate::typed_array_ops::TaSetResult::OutOfBounds => return Ok(Value::boolean(false)),
-            crate::typed_array_ops::TaSetResult::Detached => return Ok(Value::boolean(false)),
-            crate::typed_array_ops::TaSetResult::NotAnIndex => {
-                // Fall through to ordinary set on ta.object
-                let _ = ta.object.set(key, value);
-                return Ok(Value::boolean(true));
+        match crate::typed_array_ops::canonical_numeric_index(&key) {
+            Some(crate::typed_array_ops::CanonicalIndex::Int(idx)) => {
+                let receiver_is_target = receiver
+                    .as_typed_array()
+                    .map(|r| std::ptr::eq(r.as_ptr(), ta.as_ptr()))
+                    .unwrap_or(false);
+                if receiver_is_target {
+                    // §10.4.5.5 step 1.b.i: SameValue(O, Receiver) → IntegerIndexedElementSet
+                    if ta.kind().is_bigint() {
+                        let prim = if value.is_object() || value.as_object().is_some() {
+                            ncx.to_primitive(&value, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            value
+                        };
+                        let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                        if !ta.is_detached() && idx < ta.length() {
+                            ta.set_bigint(idx, n);
+                        }
+                    } else {
+                        let n = ncx.to_number_value(&value)?;
+                        if !ta.is_detached() && idx < ta.length() {
+                            ta.set(idx, n);
+                        }
+                    }
+                    return Ok(Value::boolean(true));
+                }
+                // §10.4.5.5 step 1.b.ii: IsValidIntegerIndex check
+                if ta.is_detached() || idx >= ta.length() {
+                    return Ok(Value::boolean(true));
+                }
+                // §10.4.5.5 step 2: Fall through to OrdinarySet(O, P, V, Receiver)
+                // TypedArray owns index as writable data → set on receiver
+                return ordinary_set_on_receiver(&receiver, &key, value, ncx);
+            }
+            Some(crate::typed_array_ops::CanonicalIndex::NonInt) => {
+                let receiver_is_target = receiver
+                    .as_typed_array()
+                    .map(|r| std::ptr::eq(r.as_ptr(), ta.as_ptr()))
+                    .unwrap_or(false);
+                if receiver_is_target {
+                    // IntegerIndexedElementSet: still call ToNumber/ToBigInt
+                    if ta.kind().is_bigint() {
+                        let prim = if value.is_object() || value.as_object().is_some() {
+                            ncx.to_primitive(&value, crate::interpreter::PreferredType::Number)?
+                        } else {
+                            value
+                        };
+                        let _ = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                    } else {
+                        let _ = ncx.to_number_value(&value)?;
+                    }
+                    return Ok(Value::boolean(true));
+                }
+                // Non-valid index, receiver !== target → OrdinarySet
+                return ordinary_set_on_receiver(&receiver, &key, value, ncx);
+            }
+            None => {
+                // Not a numeric index — OrdinarySet with receiver support
+                return ordinary_set_with_receiver(&ta.object, &key, value, &receiver, ncx);
             }
         }
     }
 
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
-    let _ = obj.set(key, value);
-    Ok(Value::boolean(true))
+    ordinary_set_with_receiver(&obj, &key, value, &receiver, ncx)
 }
 
 /// Spec: <https://tc39.es/ecma262/#sec-reflect.has>
@@ -303,15 +638,18 @@ fn reflect_has(
             crate::typed_array_ops::TaHasResult::Present => return Ok(Value::boolean(true)),
             crate::typed_array_ops::TaHasResult::Absent => return Ok(Value::boolean(false)),
             crate::typed_array_ops::TaHasResult::NotAnIndex => {
-                // Fall through to ordinary has on ta.object
-                return Ok(Value::boolean(ta.object.has(&key)));
+                // Fall through to OrdinaryHasProperty on ta.object,
+                // walking prototype chain with proxy trap support.
+                let result = ordinary_has_property(&ta.object, &key, *property_key, ncx)?;
+                return Ok(Value::boolean(result));
             }
         }
     }
 
     let obj = get_target_object(target)?;
     let key = to_property_key(property_key);
-    Ok(Value::boolean(obj.has(&key)))
+    let result = ordinary_has_property(&obj, &key, *property_key, ncx)?;
+    Ok(Value::boolean(result))
 }
 
 /// Spec: <https://tc39.es/ecma262/#sec-reflect.deleteproperty>

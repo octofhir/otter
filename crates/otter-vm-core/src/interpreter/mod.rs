@@ -6671,16 +6671,51 @@ impl Interpreter {
                     return Ok(());
                 }
 
-                // TypedArray [[Set]] — check before as_object()
+                // TypedArray [[Set]] — §10.4.5.5
                 if let Some(ta) = object.as_typed_array() {
-                    let key = self.value_to_property_key(ctx, &key_value)?;
-                    match typed_array_ops::ta_set(&ta, &key, &val_val) {
-                        TaSetResult::Written | TaSetResult::OutOfBounds => return Ok(()),
-                        TaSetResult::Detached => {
-                            return Err(VmError::type_error("Cannot set property on detached TypedArray"));
+                    match typed_array_ops::value_to_canonical_index(&key_value) {
+                        Some(typed_array_ops::CanonicalIndex::Int(idx)) => {
+                            if ta.kind().is_bigint() {
+                                let prim = if val_val.is_object() || val_val.as_object().is_some() {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                } else {
+                                    val_val
+                                };
+                                let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set_bigint(idx, n);
+                                }
+                            } else {
+                                let n = {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_number_value(&val_val)?
+                                };
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set(idx, n);
+                                }
+                            }
+                            return Ok(());
                         }
-                        TaSetResult::NotAnIndex => {
-                            // Named property: set on ta.object
+                        Some(typed_array_ops::CanonicalIndex::NonInt) => {
+                            // §10.4.5.11 IntegerIndexedElementSet: still call ToNumber/ToBigInt
+                            // which can trigger side effects / throw
+                            if ta.kind().is_bigint() {
+                                let prim = if val_val.is_object() || val_val.as_object().is_some() {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                } else {
+                                    val_val
+                                };
+                                let _ = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                            } else {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                let _ = ncx.to_number_value(&val_val)?;
+                            }
+                            return Ok(());
+                        }
+                        None => {
+                            let key = self.value_to_property_key(ctx, &key_value)?;
                             let _ = ta.object.set(key, val_val);
                             return Ok(());
                         }
@@ -6689,6 +6724,62 @@ impl Interpreter {
 
                 if let Some(obj) = object.as_object() {
                     let key = self.value_to_property_key(ctx, &key_value)?;
+
+                    // §10.4.5: TypedArray in prototype chain intercepts numeric index
+                    if let Some(ci) = typed_array_ops::canonical_numeric_index(&key) {
+                        let mut proto_val = obj.prototype();
+                        let mut ta_owns_index = false;
+                        for _ in 0..64 {
+                            if proto_val.is_null() || proto_val.is_undefined() { break; }
+                            if let Some(ta) = proto_val.as_typed_array() {
+                                match ci {
+                                    typed_array_ops::CanonicalIndex::Int(idx) => {
+                                        if !ta.is_detached() && idx < ta.length() {
+                                            ta_owns_index = true;
+                                        }
+                                    }
+                                    typed_array_ops::CanonicalIndex::NonInt => {
+                                        ta_owns_index = true;
+                                    }
+                                }
+                                break;
+                            }
+                            if let Some(p) = proto_val.as_object() {
+                                proto_val = p.prototype();
+                            } else { break; }
+                        }
+                        if ta_owns_index {
+                            // Set directly on receiver, respecting its exotic behavior
+                            let success = if obj.is_array() {
+                                if let PropertyKey::Index(i) = &key {
+                                    obj.set_index(*i as usize, val_val).is_ok()
+                                } else {
+                                    obj.set(key, val_val).is_ok()
+                                }
+                            } else if !obj.is_extensible() {
+                                // Non-extensible: can't add new property
+                                false
+                            } else {
+                                obj.define_property(
+                                    key,
+                                    PropertyDescriptor::data_with_attrs(
+                                        val_val,
+                                        PropertyAttributes {
+                                            writable: true,
+                                            enumerable: true,
+                                            configurable: true,
+                                        },
+                                    ),
+                                )
+                            };
+                            if !success && is_strict {
+                                return Err(VmError::type_error(
+                                    "Cannot add property to a non-extensible object",
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
 
                     match obj.lookup_property_descriptor(&key) {
                         Some(crate::object::PropertyDescriptor::Accessor { set, .. }) => {
@@ -6849,6 +6940,20 @@ impl Interpreter {
             Instruction::GetElemInt { dst, obj, index } => {
                 let object = *ctx.get_register(obj.0);
                 let idx_val = *ctx.get_register(index.0);
+
+                // Proxy must be checked first — integer index access must go through proxy trap
+                if let Some(proxy) = object.as_proxy() {
+                    let prop_key = self.value_to_property_key(ctx, &idx_val)?;
+                    let key_value = crate::proxy_operations::property_key_to_value_pub(&prop_key);
+                    let result = {
+                        let mut ncx = crate::context::NativeContext::new(ctx, self);
+                        crate::proxy_operations::proxy_get(
+                            &mut ncx, proxy, &prop_key, key_value, object,
+                        )?
+                    };
+                    ctx.set_register(dst.0, result);
+                    return Ok(());
+                }
 
                 // TypedArray fast path
                 if let Some(ta) = object.as_typed_array()
@@ -7081,14 +7186,54 @@ impl Interpreter {
                 }
 
                 // TypedArray [[Set]] — §10.4.5.5
+                // Per spec: for canonical numeric index, call ToNumber/ToBigInt(value),
+                // write if buffer alive and index valid, always return true (no throw).
                 if let Some(ta) = array.as_typed_array() {
-                    let key = self.value_to_property_key(ctx, &index)?;
-                    match typed_array_ops::ta_set(&ta, &key, &val_val) {
-                        TaSetResult::Written | TaSetResult::OutOfBounds => return Ok(()),
-                        TaSetResult::Detached => {
-                            return Err(VmError::type_error("Cannot set property on detached TypedArray"));
+                    match typed_array_ops::value_to_canonical_index(&index) {
+                        Some(typed_array_ops::CanonicalIndex::Int(idx)) => {
+                            // §10.4.5.11 IntegerIndexedElementSet: ToNumber/ToBigInt first
+                            if ta.kind().is_bigint() {
+                                let prim = if val_val.is_object() || val_val.as_object().is_some() {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                } else {
+                                    val_val
+                                };
+                                let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set_bigint(idx, n);
+                                }
+                            } else {
+                                let n = {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_number_value(&val_val)?
+                                };
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set(idx, n);
+                                }
+                            }
+                            return Ok(());
                         }
-                        TaSetResult::NotAnIndex => {
+                        Some(typed_array_ops::CanonicalIndex::NonInt) => {
+                            // §10.4.5.11 IntegerIndexedElementSet: still call ToNumber/ToBigInt
+                            // which can trigger side effects / throw
+                            if ta.kind().is_bigint() {
+                                let prim = if val_val.is_object() || val_val.as_object().is_some() {
+                                    let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                } else {
+                                    val_val
+                                };
+                                let _ = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                            } else {
+                                let mut ncx = crate::context::NativeContext::new(ctx, self);
+                                let _ = ncx.to_number_value(&val_val)?;
+                            }
+                            return Ok(());
+                        }
+                        None => {
+                            // Not a numeric index — OrdinarySet on ta.object
+                            let key = self.value_to_property_key(ctx, &index)?;
                             let _ = ta.object.set(key, val_val);
                             return Ok(());
                         }
@@ -7238,6 +7383,63 @@ impl Interpreter {
                                     _ => {}
                                 }
                             }
+                        }
+                    }
+
+                    // §10.4.5: If a TypedArray in the prototype chain owns this
+                    // numeric index as a data property, skip any accessor setters
+                    // found further up the chain and set directly on receiver.
+                    if let Some(ci) = typed_array_ops::canonical_numeric_index(&key) {
+                        let mut proto_val = obj.prototype();
+                        let mut ta_owns_index = false;
+                        for _ in 0..64 {
+                            if proto_val.is_null() || proto_val.is_undefined() { break; }
+                            if let Some(ta) = proto_val.as_typed_array() {
+                                match ci {
+                                    typed_array_ops::CanonicalIndex::Int(idx) => {
+                                        if !ta.is_detached() && idx < ta.length() {
+                                            ta_owns_index = true;
+                                        }
+                                    }
+                                    typed_array_ops::CanonicalIndex::NonInt => {
+                                        ta_owns_index = true;
+                                    }
+                                }
+                                break;
+                            }
+                            if let Some(p) = proto_val.as_object() {
+                                proto_val = p.prototype();
+                            } else { break; }
+                        }
+                        if ta_owns_index {
+                            // Set directly on receiver, respecting its exotic behavior
+                            let success = if obj.is_array() {
+                                if let PropertyKey::Index(i) = &key {
+                                    obj.set_index(*i as usize, val_val).is_ok()
+                                } else {
+                                    obj.set(key, val_val).is_ok()
+                                }
+                            } else if !obj.is_extensible() {
+                                false
+                            } else {
+                                obj.define_property(
+                                    key,
+                                    PropertyDescriptor::data_with_attrs(
+                                        val_val,
+                                        PropertyAttributes {
+                                            writable: true,
+                                            enumerable: true,
+                                            configurable: true,
+                                        },
+                                    ),
+                                )
+                            };
+                            if !success && is_strict {
+                                return Err(VmError::type_error(
+                                    "Cannot add property to a non-extensible object",
+                                ));
+                            }
+                            return Ok(());
                         }
                     }
 

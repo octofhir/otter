@@ -1189,6 +1189,49 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                     )),
                 );
 
+                // §23.2.2.2 %TypedArray%.of(...items)
+                typed_array_ctor_obj.define_property(
+                    PropertyKey::string("of"),
+                    PropertyDescriptor::builtin_method(Value::native_function_with_proto_named(
+                        |this_val, args, ncx| {
+                            // this = TypedArray constructor (e.g. Float64Array)
+                            // Create new this(args.length), then set each element
+                            let len_val = Value::int32(args.len() as i32);
+                            let ta_val = ncx.call_function_construct(this_val, Value::undefined(), &[len_val])?;
+                            let ta = ta_val.as_typed_array().ok_or_else(|| {
+                                VmError::type_error("TypedArray.of: constructor did not return a TypedArray")
+                            })?;
+                            // §23.2.2.2 step 5: TypedArrayCreate validates length
+                            if ta.length() < args.len() {
+                                return Err(VmError::type_error(
+                                    "TypedArray.of: created TypedArray is too small",
+                                ));
+                            }
+                            for (i, arg) in args.iter().enumerate() {
+                                if ta.kind().is_bigint() {
+                                    // ToBigInt
+                                    let prim = if arg.is_object() || arg.as_object().is_some() {
+                                        ncx.to_primitive(arg, crate::interpreter::PreferredType::Number)?
+                                    } else {
+                                        *arg
+                                    };
+                                    let n = to_bigint_i64(&prim)?;
+                                    ta.set_bigint(i, n);
+                                } else {
+                                    // ToNumber
+                                    let n = ncx.to_number_value(arg)?;
+                                    ta.set(i, n);
+                                }
+                            }
+                            Ok(ta_val)
+                        },
+                        mm.clone(),
+                        ctx.fn_proto(),
+                        "of",
+                        0,
+                    )),
+                );
+
                 for (kind, name, proto) in [
                     (
                         TypedArrayKind::Int8,
@@ -1267,14 +1310,7 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                         PropertyKey::string("BYTES_PER_ELEMENT"),
                         PropertyDescriptor::data_with_attrs(bpe, bpe_attrs),
                     );
-                    ctor.define_property(
-                        PropertyKey::string("of"),
-                        PropertyDescriptor::builtin_method(Value::native_function_with_proto(
-                            typed_array_of_static(kind, proto),
-                            mm.clone(),
-                            ctx.fn_proto(),
-                        )),
-                    );
+                    // `of` is inherited from %TypedArray% — not set on individual constructors
                 }
             }
         }

@@ -49,6 +49,30 @@ impl IntrinsicObject for GeneratorIntrinsic {
             crate::intrinsics::well_known::async_iterator_symbol(),
             crate::intrinsics::well_known::to_string_tag_symbol(),
         );
+
+        // §27.1.2 %AsyncIteratorPrototype%[@@asyncIterator]() — returns this
+        let async_iter_proto = intrinsics.async_iterator_prototype;
+        let async_iter_sym = crate::intrinsics::well_known::async_iterator_symbol();
+        let async_iter_fn = Value::native_function_with_proto(
+            |this_val, _args, _ncx| Ok(*this_val),
+            mm.clone(),
+            ctx.fn_proto(),
+        );
+        // Set name and length on the function
+        if let Some(fn_obj) = async_iter_fn.as_object() {
+            fn_obj.define_property(
+                PropertyKey::string("name"),
+                PropertyDescriptor::function_length(Value::string(JsString::intern("[Symbol.asyncIterator]"))),
+            );
+            fn_obj.define_property(
+                PropertyKey::string("length"),
+                PropertyDescriptor::function_length(Value::int32(0)),
+            );
+        }
+        async_iter_proto.define_property(
+            PropertyKey::Symbol(async_iter_sym),
+            PropertyDescriptor::builtin_method(async_iter_fn),
+        );
     }
 }
 

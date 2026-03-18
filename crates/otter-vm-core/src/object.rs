@@ -2465,7 +2465,25 @@ impl JsObject {
         let mut depth = 0;
 
         loop {
-            if let Some(proto_obj) = current_proto.as_object() {
+            // TypedArray in prototype chain: use exotic [[GetOwnProperty]]
+            if let Some(ta) = current_proto.as_typed_array() {
+                depth += 1;
+                if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
+                    return None;
+                }
+                if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, key) {
+                    return Some(desc);
+                }
+                // Check if canonical numeric index (always handled by TA, never fall through)
+                if crate::typed_array_ops::canonical_numeric_index(key).is_some() {
+                    return None; // TA handles all canonical numeric indices
+                }
+                // Non-numeric: check ta.object own properties
+                if let Some(desc) = ta.object.get_own_property_descriptor(key) {
+                    return Some(desc);
+                }
+                current_proto = *ta.object.prototype.borrow();
+            } else if let Some(proto_obj) = current_proto.as_object() {
                 depth += 1;
                 if depth > MAX_PROTOTYPE_CHAIN_DEPTH {
                     return None; // Limit reached
@@ -2475,8 +2493,6 @@ impl JsObject {
                     return Some(desc);
                 }
                 // Also check elements for Index keys on any object
-                // (set() stores Index values in elements for arrays, and has_own checks them,
-                // but get_own_property_descriptor may miss them for non-array objects)
                 if let PropertyKey::Index(i) = key {
                     let idx = *i as usize;
                     let elements = proto_obj.elements.borrow();
@@ -3120,6 +3136,20 @@ impl JsObject {
 
     /// Define a property with descriptor
     pub fn define_property(&self, key: PropertyKey, desc: PropertyDescriptor) -> bool {
+        // Normalize Index keys to String for non-array objects.
+        // Arrays store Index keys in elements, but plain objects use shape/dictionary
+        // for named properties. Without normalization, define_property(Index(0), ...)
+        // creates a shape entry for Index(0) but get() looks up String("0") → mismatch.
+        let key = if let PropertyKey::Index(i) = &key {
+            if !self.is_array() {
+                PropertyKey::String(crate::string::JsString::intern(&i.to_string()))
+            } else {
+                key
+            }
+        } else {
+            key
+        };
+
         // For mapped arguments: if defining an accessor descriptor on a mapped index, unmap it
         if let PropertyKey::Index(i) = &key {
             let idx = *i as usize;

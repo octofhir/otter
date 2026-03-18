@@ -58,6 +58,7 @@ impl IntrinsicObject for FunctionIntrinsic {
             .constructor_fn(create_function_constructor(realm_id), 1)
             .build_and_install(&global);
 
+            // §27.3.1: GeneratorFunction.prototype.[[Prototype]] = Function.prototype
             BuiltInBuilder::new(
                 mm.clone(),
                 ctx.fn_proto(),
@@ -65,10 +66,11 @@ impl IntrinsicObject for FunctionIntrinsic {
                 ctx.intrinsics().generator_function_prototype,
                 "GeneratorFunction",
             )
-            .inherits(ctx.obj_proto())
+            .inherits(ctx.fn_proto())
             .constructor_fn(create_generator_function_constructor(realm_id), 1)
             .build_and_install(&global);
 
+            // §27.7.1: AsyncFunction.prototype.[[Prototype]] = Function.prototype
             BuiltInBuilder::new(
                 mm.clone(),
                 ctx.fn_proto(),
@@ -76,10 +78,11 @@ impl IntrinsicObject for FunctionIntrinsic {
                 ctx.intrinsics().async_function_prototype,
                 "AsyncFunction",
             )
-            .inherits(ctx.obj_proto())
+            .inherits(ctx.fn_proto())
             .constructor_fn(create_async_function_constructor(realm_id), 1)
             .build_and_install(&global);
 
+            // §27.4.1: AsyncGeneratorFunction.prototype.[[Prototype]] = Function.prototype
             BuiltInBuilder::new(
                 mm.clone(),
                 ctx.fn_proto(),
@@ -87,7 +90,7 @@ impl IntrinsicObject for FunctionIntrinsic {
                 ctx.intrinsics().async_generator_function_prototype,
                 "AsyncGeneratorFunction",
             )
-            .inherits(ctx.obj_proto())
+            .inherits(ctx.fn_proto())
             .constructor_fn(create_async_generator_function_constructor(realm_id), 1)
             .build_and_install(&global);
 
@@ -417,6 +420,31 @@ pub fn init_function_prototype(fn_proto: GcRef<JsObject>, mm: &Arc<MemoryManager
         fn_proto.define_property(
             PropertyKey::string(name),
             PropertyDescriptor::builtin_method(fn_val),
+        );
+    }
+
+    // §20.2.3.1-2: Function.prototype.caller and Function.prototype.arguments
+    // are accessor properties whose get and set are both %ThrowTypeError%.
+    let throw_type_error = Value::native_function(
+        |_this: &Value, _args: &[Value], _ncx: &mut crate::context::NativeContext<'_>| {
+            Err(VmError::type_error(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+            ))
+        },
+        mm.clone(),
+    );
+    for prop_name in &["caller", "arguments"] {
+        fn_proto.define_property(
+            PropertyKey::string(prop_name),
+            PropertyDescriptor::Accessor {
+                get: Some(throw_type_error),
+                set: Some(throw_type_error),
+                attributes: PropertyAttributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            },
         );
     }
 }

@@ -6725,21 +6725,26 @@ impl Interpreter {
                 if let Some(obj) = object.as_object() {
                     let key = self.value_to_property_key(ctx, &key_value)?;
 
-                    // §10.4.5: TypedArray in prototype chain intercepts numeric index
+                    // §10.4.5.5: TypedArray in prototype chain intercepts numeric index
+                    // When TA's [[Set]] is called with O !== Receiver:
+                    //   - If IsValidIntegerIndex(O, idx) is false → return true (do nothing)
+                    //   - If IsValidIntegerIndex(O, idx) is true → OrdinarySet on receiver
                     if let Some(ci) = typed_array_ops::canonical_numeric_index(&key) {
                         let mut proto_val = obj.prototype();
-                        let mut ta_owns_index = false;
+                        let mut found_ta = false;
+                        let mut ta_valid_index = false;
                         for _ in 0..64 {
                             if proto_val.is_null() || proto_val.is_undefined() { break; }
                             if let Some(ta) = proto_val.as_typed_array() {
+                                found_ta = true;
                                 match ci {
                                     typed_array_ops::CanonicalIndex::Int(idx) => {
                                         if !ta.is_detached() && idx < ta.length() {
-                                            ta_owns_index = true;
+                                            ta_valid_index = true;
                                         }
                                     }
                                     typed_array_ops::CanonicalIndex::NonInt => {
-                                        ta_owns_index = true;
+                                        // NonInt → IsValidIntegerIndex always false
                                     }
                                 }
                                 break;
@@ -6748,8 +6753,12 @@ impl Interpreter {
                                 proto_val = p.prototype();
                             } else { break; }
                         }
-                        if ta_owns_index {
-                            // Set directly on receiver, respecting its exotic behavior
+                        if found_ta && !ta_valid_index {
+                            // §10.4.5.5 step 2.b.ii: invalid index → return true (do nothing)
+                            return Ok(());
+                        }
+                        if ta_valid_index {
+                            // Valid index, receiver !== TA → OrdinarySet on receiver
                             let success = if obj.is_array() {
                                 if let PropertyKey::Index(i) = &key {
                                     obj.set_index(*i as usize, val_val).is_ok()
@@ -7386,23 +7395,23 @@ impl Interpreter {
                         }
                     }
 
-                    // §10.4.5: If a TypedArray in the prototype chain owns this
-                    // numeric index as a data property, skip any accessor setters
-                    // found further up the chain and set directly on receiver.
+                    // §10.4.5.5: TypedArray in prototype chain intercepts numeric index
                     if let Some(ci) = typed_array_ops::canonical_numeric_index(&key) {
                         let mut proto_val = obj.prototype();
-                        let mut ta_owns_index = false;
+                        let mut found_ta = false;
+                        let mut ta_valid_index = false;
                         for _ in 0..64 {
                             if proto_val.is_null() || proto_val.is_undefined() { break; }
                             if let Some(ta) = proto_val.as_typed_array() {
+                                found_ta = true;
                                 match ci {
                                     typed_array_ops::CanonicalIndex::Int(idx) => {
                                         if !ta.is_detached() && idx < ta.length() {
-                                            ta_owns_index = true;
+                                            ta_valid_index = true;
                                         }
                                     }
                                     typed_array_ops::CanonicalIndex::NonInt => {
-                                        ta_owns_index = true;
+                                        // NonInt → IsValidIntegerIndex always false
                                     }
                                 }
                                 break;
@@ -7411,8 +7420,12 @@ impl Interpreter {
                                 proto_val = p.prototype();
                             } else { break; }
                         }
-                        if ta_owns_index {
-                            // Set directly on receiver, respecting its exotic behavior
+                        if found_ta && !ta_valid_index {
+                            // §10.4.5.5 step 2.b.ii: invalid index → return true (do nothing)
+                            return Ok(());
+                        }
+                        if ta_valid_index {
+                            // Valid index, receiver !== TA → OrdinarySet on receiver
                             let success = if obj.is_array() {
                                 if let PropertyKey::Index(i) = &key {
                                     obj.set_index(*i as usize, val_val).is_ok()

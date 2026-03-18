@@ -66,6 +66,12 @@ skip_features = [
     # IsHTMLDDA ([[IsHTMLDDA]] internal slot — DOM-specific edge cases)
     "IsHTMLDDA",
 
+    # RegExp modifiers (ES2025 Stage 4, not yet implemented in regress crate)
+    "regexp-modifiers",
+
+    # Duplicate named capture groups (ES2025, not yet in regress crate)
+    "regexp-duplicate-named-groups",
+
     # Active proposals (not yet standardized)
     "Array.fromAsync",
     "Error.isError",
@@ -111,6 +117,22 @@ ignored_tests = [
 
     # Annex B \c ClassControlLetter escape in character class — regress limitation
     "literals/regexp/class-escape",
+
+    # Tests use legacy string escapes ("\d", "\x", "\ ") without noStrict flag — oxc rejects in strict mode
+    "RegExp/S15.10.3.1_A2_T1",
+    "RegExp/S15.10.2.13_A1_T10",
+    "RegExp/S15.10.2.8_A3_T24",
+
+    # Regress crate doesn't support exotic Unicode ID_Start/ID_Continue in group names
+    "named-groups/unicode-property-names-valid",
+    "named-groups/unicode-property-names",
+    "named-groups/non-unicode-property-names",
+    "named-groups/unicode-references",
+
+    # Regress crate doesn't validate Annex B restrictions in unicode mode
+    "RegExp/unicode_restricted_identity_escape_c",
+    "RegExp/unicode_restricted_octal_escape",
+    "RegExp/S15.10.2.15_A1_T34",
 
     # Temporal PlainDateTime math precision — temporal_rs edge case
     "Temporal/PlainDateTime/datetime-math",

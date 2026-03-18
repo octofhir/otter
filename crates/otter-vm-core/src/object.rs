@@ -2358,8 +2358,11 @@ impl JsObject {
             });
         }
 
-        // ES §10.4.3.1: String exotic [[GetOwnProperty]] — synthesize
-        // character-index descriptors and "length" for String wrapper objects.
+        // ES §10.4.3.1: String exotic [[GetOwnProperty]] — per spec:
+        // 1. Let desc = OrdinaryGetOwnProperty(S, P)
+        // 2. If desc is not undefined, return desc
+        // 3. Return StringGetOwnProperty(S, P)
+        // "length" is always virtual (not an ordinary property).
         if self.flags.borrow().is_string_exotic {
             if let PropertyKey::String(s) = key
                 && s.as_str() == "length"
@@ -2374,21 +2377,10 @@ impl JsObject {
                     },
                 });
             }
-            if let PropertyKey::Index(i) = key {
-                let elements = self.elements.borrow();
-                let idx = *i as usize;
-                if idx < elements.len() {
-                    return Some(PropertyDescriptor::Data {
-                        value: elements.get(idx).unwrap_or_else(Value::undefined),
-                        attributes: PropertyAttributes {
-                            writable: false,
-                            enumerable: true,
-                            configurable: false,
-                        },
-                    });
-                }
-                return None;
-            }
+            // For Index keys: check ordinary properties first (step 1-2),
+            // then fall back to StringGetOwnProperty (step 3).
+            // We do NOT return None here for out-of-range indices — fall through
+            // to the shape/dictionary lookup below.
         }
 
         // Dictionary mode: lookup in HashMap first (may contain accessor properties)
@@ -2438,6 +2430,21 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
+            // For String exotic objects, elements store character code units — check
+            // StringGetOwnProperty (step 3 of §10.4.3.1) instead of treating as data.
+            if self.flags.borrow().is_string_exotic {
+                if idx < elements.len() {
+                    return Some(PropertyDescriptor::Data {
+                        value: elements.get(idx).unwrap_or_else(Value::undefined),
+                        attributes: PropertyAttributes {
+                            writable: false,
+                            enumerable: true,
+                            configurable: false,
+                        },
+                    });
+                }
+                return None;
+            }
             if idx < elements.len() && !elements.get(idx).unwrap_or_default().is_hole() {
                 let flags = self.flags.borrow();
                 return Some(PropertyDescriptor::Data {
@@ -2894,16 +2901,14 @@ impl JsObject {
             return true;
         }
 
-        // String exotic objects: character indices and "length" are own properties
+        // String exotic objects: "length" is always an own property.
+        // For Index keys, check ordinary properties first (per §10.4.3.1),
+        // then fall back to StringGetOwnProperty (character indices) at the end.
         if self.flags.borrow().is_string_exotic {
             if let PropertyKey::String(s) = key
                 && s.as_str() == "length"
             {
                 return true;
-            }
-            if let PropertyKey::Index(i) = key {
-                let idx = *i as usize;
-                return idx < self.elements.borrow().len();
             }
         }
 
@@ -2944,6 +2949,10 @@ impl JsObject {
         if let PropertyKey::Index(i) = key {
             let elements = self.elements.borrow();
             let idx = *i as usize;
+            // For String exotic: StringGetOwnProperty — in-range character indices are own props
+            if self.flags.borrow().is_string_exotic {
+                return idx < elements.len();
+            }
             return idx < elements.len() && !elements.get(idx).unwrap_or_default().is_hole();
         }
 

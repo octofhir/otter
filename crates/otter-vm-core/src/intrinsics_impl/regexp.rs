@@ -930,18 +930,8 @@ fn regexp_exec(
 ) -> Result<Value, VmError> {
     let obj = get_this_object(this_val)?;
 
-    // Fast path: if the object has no own "exec" property, the user has not
-    // overridden exec on this instance. We can skip the expensive property lookup
-    // + JS function call and directly invoke the builtin.
-    let exec_key = PropertyKey::string("exec");
-    if !obj.has_own(&exec_key)
-        && let Some(regex) = this_val.as_regex()
-    {
-        return regexp_builtin_exec(&regex, input, ncx);
-    }
-
     // 1. Let exec be ? Get(R, "exec")
-    let exec = obj_get(&obj, "exec", ncx)?;
+    let exec = crate::object::get_value_full(&obj, &PropertyKey::string("exec"), ncx)?;
 
     // 2. If IsCallable(exec), then
     if exec.is_callable() {
@@ -1001,23 +991,23 @@ fn apply_replacement(
                     i += 2;
                 }
                 '<' => {
-                    // Named group reference: $<name>
-                    if let Some(close) = chars[i + 2..].iter().position(|&c| c == '>') {
+                    if named_captures.is_none() {
+                        // §22.1.3.19.1: If namedCaptures is undefined, literal "$<"
+                        result.push('$');
+                        result.push('<');
+                        i += 2;
+                    } else if let Some(groups) = named_captures
+                        && let Some(close) =
+                            chars[i + 2..].iter().position(|&c| c == '>')
+                    {
+                        // Named group reference: $<name>
                         let name: String = chars[i + 2..i + 2 + close].iter().collect();
-                        if let Some(groups) = named_captures {
-                            let capture = obj_get(groups, &name, ncx)?;
-                            if !capture.is_undefined() {
-                                let s = ncx.to_string_value(&capture)?;
-                                result.push_str(&s);
-                            }
-                            // If undefined, append empty string (nothing)
-                        } else {
-                            // No named captures: $<name> is literal
-                            result.push('$');
-                            result.push('<');
-                            result.push_str(&name);
-                            result.push('>');
+                        let capture = obj_get(groups, &name, ncx)?;
+                        if !capture.is_undefined() {
+                            let s = ncx.to_string_value(&capture)?;
+                            result.push_str(&s);
                         }
+                        // If undefined, append empty string (nothing)
                         i += 3 + close; // $< + name + >
                     } else {
                         // No closing >, literal $<
@@ -2358,12 +2348,6 @@ pub fn create_regexp_constructor(
             }
         }
 
-        // Validate pattern
-        let parsed_flags = regress::Flags::from(flags_str.as_str());
-        let engine_pattern =
-            crate::regexp::compile_pattern_for_regress(&pattern_str, &parsed_flags);
-        let _native_regex = regress::Regex::with_flags(&engine_pattern, parsed_flags).ok();
-
         let proto = if is_construct {
             this_val
                 .as_object()
@@ -2373,7 +2357,10 @@ pub fn create_regexp_constructor(
             regexp_proto
         };
 
-        let regex = GcRef::new(JsRegExp::new(pattern_str, flags_str, Some(proto)));
+        let regex = match JsRegExp::new_checked(pattern_str, flags_str, Some(proto)) {
+            Ok(re) => GcRef::new(re),
+            Err(msg) => return Err(VmError::syntax_error(msg)),
+        };
         Ok(Value::regex(regex))
     })
 }

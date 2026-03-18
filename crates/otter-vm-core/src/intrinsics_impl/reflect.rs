@@ -17,12 +17,12 @@ use otter_macros::dive;
 
 /// Helper to convert Value to PropertyKey
 pub fn to_property_key(value: &Value) -> PropertyKey {
-    if let Some(n) = value.as_number()
-        && n.fract() == 0.0
-        && n >= 0.0
-        && n <= u32::MAX as f64
-    {
-        return PropertyKey::Index(n as u32);
+    if let Some(n) = value.as_number() {
+        if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
+            return PropertyKey::Index(n as u32);
+        }
+        // Non-index numbers: convert to string (e.g., 1.5 → "1.5", -1 → "-1")
+        return PropertyKey::String(JsString::intern(&crate::globals::js_number_to_string(n)));
     }
     if let Some(s) = value.as_string() {
         // Use PropertyKey::string() to canonicalize numeric strings like "0" → Index(0)
@@ -285,24 +285,75 @@ pub fn ordinary_set_with_receiver(
             )?;
             return Ok(Value::boolean(success));
         }
-        // TypedArray in prototype chain: use exotic [[GetOwnProperty]] for numeric indices
+        // TypedArray in prototype chain: delegate to TA's exotic [[Set]]
+        // per §10.4.5.5, which is what `parent.[[Set]](P, V, Receiver)` does.
         if let Some(ta) = current.as_typed_array() {
-            if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, key) {
-                // TypedArray owns this numeric index as writable data → set on receiver
-                match desc {
-                    PropertyDescriptor::Data { attributes, .. } => {
-                        if !attributes.writable {
-                            return Ok(Value::boolean(false));
+            if let Some(ci) = crate::typed_array_ops::canonical_numeric_index(key) {
+                let receiver_is_ta = receiver
+                    .as_typed_array()
+                    .map(|r| std::ptr::eq(r.as_ptr(), ta.as_ptr()))
+                    .unwrap_or(false);
+                if receiver_is_ta {
+                    // §10.4.5.5 step 2.b.i: SameValue(O, Receiver) → IntegerIndexedElementSet
+                    match ci {
+                        crate::typed_array_ops::CanonicalIndex::Int(idx) => {
+                            if ta.kind().is_bigint() {
+                                let prim = if value.is_object() || value.as_object().is_some() {
+                                    ncx.to_primitive(
+                                        &value,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
+                                } else {
+                                    value
+                                };
+                                let n =
+                                    crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set_bigint(idx, n);
+                                }
+                            } else {
+                                let n = ncx.to_number_value(&value)?;
+                                if !ta.is_detached() && idx < ta.length() {
+                                    ta.set(idx, n);
+                                }
+                            }
+                            return Ok(Value::boolean(true));
                         }
+                        crate::typed_array_ops::CanonicalIndex::NonInt => {
+                            // ToNumber/ToBigInt for side effects
+                            if ta.kind().is_bigint() {
+                                let prim = if value.is_object() || value.as_object().is_some() {
+                                    ncx.to_primitive(
+                                        &value,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
+                                } else {
+                                    value
+                                };
+                                let _ =
+                                    crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                            } else {
+                                let _ = ncx.to_number_value(&value)?;
+                            }
+                            return Ok(Value::boolean(true));
+                        }
+                    }
+                }
+                // §10.4.5.5 step 2.b.ii: O !== Receiver
+                match ci {
+                    crate::typed_array_ops::CanonicalIndex::Int(idx) => {
+                        if ta.is_detached() || idx >= ta.length() {
+                            // IsValidIntegerIndex is false → return true
+                            return Ok(Value::boolean(true));
+                        }
+                        // Valid index → fall through to OrdinarySet on receiver
                         return ordinary_set_on_receiver(receiver, key, value, ncx);
                     }
-                    _ => return Ok(Value::boolean(false)),
+                    crate::typed_array_ops::CanonicalIndex::NonInt => {
+                        // IsValidIntegerIndex always false for non-int → return true
+                        return Ok(Value::boolean(true));
+                    }
                 }
-            }
-            // Check if it's a canonical numeric index that's out of bounds
-            if let Some(_) = crate::typed_array_ops::canonical_numeric_index(key) {
-                // Canonical numeric but not a valid index — don't walk further
-                return ordinary_set_on_receiver(receiver, key, value, ncx);
             }
             // Non-numeric key: continue walking via ta.object
             current = ta.object.prototype();
@@ -378,33 +429,41 @@ fn ordinary_set_on_receiver(
         return Ok(Value::boolean(success));
     }
 
-    // TypedArray receiver: use exotic [[Set]] for canonical numeric indices
+    // TypedArray receiver: follow OrdinarySet §10.1.9.2 steps with TA exotic methods
     if let Some(recv_ta) = receiver.as_typed_array() {
-        if let Some(ci) = crate::typed_array_ops::canonical_numeric_index(key) {
-            match ci {
-                crate::typed_array_ops::CanonicalIndex::Int(idx) => {
-                    if recv_ta.kind().is_bigint() {
-                        let prim = if value.is_object() || value.as_object().is_some() {
-                            ncx.to_primitive(&value, crate::interpreter::PreferredType::Number)?
-                        } else {
-                            value
-                        };
-                        let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
-                        if !recv_ta.is_detached() && idx < recv_ta.length() {
-                            recv_ta.set_bigint(idx, n);
-                        }
-                    } else {
-                        let n = ncx.to_number_value(&value)?;
-                        if !recv_ta.is_detached() && idx < recv_ta.length() {
-                            recv_ta.set(idx, n);
-                        }
-                    }
-                    return Ok(Value::boolean(true));
+        if let Some(_ci) = crate::typed_array_ops::canonical_numeric_index(key) {
+            // Check receiver's [[GetOwnProperty]] first
+            let existing = crate::typed_array_ops::ta_get_own_property(&recv_ta, key);
+            if let Some(PropertyDescriptor::Data { attributes, .. }) = &existing {
+                if !attributes.writable {
+                    return Ok(Value::boolean(false));
                 }
-                crate::typed_array_ops::CanonicalIndex::NonInt => {
-                    return Ok(Value::boolean(true));
-                }
+                // Update existing writable data via [[DefineOwnProperty]]
+                let desc = PropertyDescriptor::data(value);
+                let result = crate::typed_array_ops::ta_define_own_property(&recv_ta, key, &desc);
+                return Ok(Value::boolean(matches!(
+                    result,
+                    crate::typed_array_ops::TaDefineResult::Ok
+                )));
             }
+            if existing.is_some() {
+                // Accessor on TypedArray — shouldn't happen, but return false
+                return Ok(Value::boolean(false));
+            }
+            // No own property → CreateDataProperty → [[DefineOwnProperty]]
+            let desc = PropertyDescriptor::data_with_attrs(
+                value,
+                PropertyAttributes {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+            let result = crate::typed_array_ops::ta_define_own_property(&recv_ta, key, &desc);
+            return Ok(Value::boolean(matches!(
+                result,
+                crate::typed_array_ops::TaDefineResult::Ok
+            )));
         }
         // Non-numeric key: set on recv_ta.object
         let _ = recv_ta.object.set(*key, value);
@@ -596,8 +655,9 @@ fn reflect_set(
                     }
                     return Ok(Value::boolean(true));
                 }
-                // Non-valid index, receiver !== target → OrdinarySet
-                return ordinary_set_on_receiver(&receiver, &key, value, ncx);
+                // §10.4.5.5 step 2.b.ii: IsValidIntegerIndex is always false for
+                // non-integer canonical indices → return true
+                return Ok(Value::boolean(true));
             }
             None => {
                 // Not a numeric index — OrdinarySet with receiver support

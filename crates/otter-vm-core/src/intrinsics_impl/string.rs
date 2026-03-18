@@ -118,10 +118,10 @@ impl IntrinsicObject for StringIntrinsic {
                         if let Some(ch) = char::from_u32(code) {
                             result.push(ch);
                         } else {
-                            return Err(VmError::range_error(format!(
-                                "Invalid code point {}",
-                                code
-                            )));
+                            // Lone surrogate (0xD800-0xDFFF): valid in JS but not Rust char.
+                            // Encode as UTF-16 code unit via WTF-8 or lossy fallback.
+                            let utf16 = [code as u16];
+                            result.push_str(&String::from_utf16_lossy(&utf16));
                         }
                     }
                     Ok(Value::string(JsString::intern(&result)))

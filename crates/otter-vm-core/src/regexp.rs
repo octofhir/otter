@@ -34,8 +34,22 @@ impl otter_vm_gc::GcTraceable for JsRegExp {
 }
 
 impl JsRegExp {
-    /// Create a new JsRegExp
-    pub fn new(pattern: String, flags: String, proto: Option<GcRef<JsObject>>) -> Self {
+    /// Create a new JsRegExp, throwing SyntaxError on invalid patterns.
+    pub fn new_checked(
+        pattern: String,
+        flags: String,
+        proto: Option<GcRef<JsObject>>,
+    ) -> Result<Self, String> {
+        let parsed_flags = Flags::from(flags.as_str());
+        let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
+        let capture_group_names = parse_capture_group_names(&pattern);
+        let engine_pattern = compile_pattern_for_regress(&pattern, &parsed_flags);
+        let fallback_literal_utf16 = compute_literal_utf16_fallback(&pattern, &parsed_flags);
+        let native_regex = match Regex::with_flags(&engine_pattern, parsed_flags) {
+            Ok(re) => Some(re),
+            Err(e) => return Err(format!("Invalid regular expression: /{}/: {}", pattern, e)),
+        };
+
         let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
         let object = GcRef::new(JsObject::new(proto_value));
         object.define_property(
@@ -49,18 +63,8 @@ impl JsRegExp {
                 },
             ),
         );
-        // Per spec, regex instances do NOT have own properties for flags, source,
-        // global, etc. These are accessor getters on RegExp.prototype that read
-        // from the [[RegExpMatcher]] internal slot (our JsRegExp struct fields).
-        // Only lastIndex is an own data property.
-        let parsed_flags = Flags::from(flags.as_str());
-        let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
-        let capture_group_names = parse_capture_group_names(&pattern);
-        let engine_pattern = compile_pattern_for_regress(&pattern, &parsed_flags);
-        let fallback_literal_utf16 = compute_literal_utf16_fallback(&pattern, &parsed_flags);
-        let native_regex = Regex::with_flags(&engine_pattern, parsed_flags).ok();
 
-        Self {
+        Ok(Self {
             object,
             pattern,
             flags,
@@ -68,6 +72,41 @@ impl JsRegExp {
             capture_group_names,
             fallback_literal_utf16,
             native_regex,
+        })
+    }
+
+    /// Create a new JsRegExp (legacy, silently accepts compile failures)
+    pub fn new(pattern: String, flags: String, proto: Option<GcRef<JsObject>>) -> Self {
+        let flags_clone = flags.clone();
+        match Self::new_checked(pattern, flags, proto) {
+            Ok(re) => re,
+            Err(_) => {
+                // Fall back to creating without native regex
+                let parsed_flags = Flags::from(flags_clone.as_str());
+                let unicode = parsed_flags.unicode || parsed_flags.unicode_sets;
+                let proto_value = proto.map(Value::object).unwrap_or_else(Value::null);
+                let object = GcRef::new(JsObject::new(proto_value));
+                object.define_property(
+                    PropertyKey::string("lastIndex"),
+                    PropertyDescriptor::data_with_attrs(
+                        Value::number(0.0),
+                        PropertyAttributes {
+                            writable: true,
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    ),
+                );
+                Self {
+                    object,
+                    pattern: String::new(),
+                    flags: String::new(),
+                    unicode,
+                    capture_group_names: vec![],
+                    fallback_literal_utf16: None,
+                    native_regex: None,
+                }
+            }
         }
     }
 
@@ -128,7 +167,9 @@ pub(crate) fn compile_pattern_for_regress(pattern: &str, flags: &Flags) -> Strin
                 | '*'
                 | '+'
                 | '?'
-                | '|' => {
+                | '|'
+                | 'k' => {
+                    // \k<name> — named backreference, must be preserved for regress
                     result.push('\\');
                     result.push(next);
                     i += 2;

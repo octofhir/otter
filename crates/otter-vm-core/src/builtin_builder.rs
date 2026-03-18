@@ -559,7 +559,11 @@ impl BuiltInBuilder {
             }
         }
 
-        // 3. Wire constructor.prototype = prototype (non-enumerable, non-configurable per spec)
+        // 3. Set constructor.[[Prototype]] = %Function.prototype%
+        // Per spec, all built-in constructors inherit from Function.prototype.
+        constructor.set_prototype(Value::object(fn_proto));
+
+        // 4. Wire constructor.prototype = prototype (non-enumerable, non-configurable per spec)
         constructor.define_property(
             PropertyKey::string("prototype"),
             PropertyDescriptor::data_with_attrs(

@@ -283,6 +283,12 @@ pub(crate) fn try_execute_jit(
             function.jit_ic_probes.as_ptr()
         },
         ic_probes_count: function.jit_ic_probes.len() as u32,
+        interrupt_flag_ptr: if vm_ctx.is_null() {
+            std::ptr::null()
+        } else {
+            // SAFETY: vm_ctx is valid for the duration of JIT execution
+            unsafe { (*vm_ctx).interrupt_flag_raw_ptr() }
+        },
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;
@@ -385,6 +391,12 @@ pub(crate) fn try_execute_jit_from_raw_args(
             function.jit_ic_probes.as_ptr()
         },
         ic_probes_count: function.jit_ic_probes.len() as u32,
+        interrupt_flag_ptr: if vm_ctx.is_null() {
+            std::ptr::null()
+        } else {
+            // SAFETY: vm_ctx is valid for the duration of JIT execution
+            unsafe { (*vm_ctx).interrupt_flag_raw_ptr() }
+        },
     };
 
     let ctx_ptr = &jit_ctx as *const JitContext as *mut u8;

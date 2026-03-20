@@ -492,6 +492,10 @@ pub const JIT_CTX_IC_PROBES_PTR_OFFSET: i32 = 152;
 /// Layout: ic_probes_ptr:*const(152) ic_probes_count:u32(160)
 pub const JIT_CTX_IC_PROBES_COUNT_OFFSET: i32 = 160;
 
+/// Byte offset of `interrupt_flag_ptr` in JitContext (`#[repr(C)]`).
+/// Layout: ic_probes_count:u32(160) pad(164) interrupt_flag_ptr:*const u8(168)
+pub const JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET: i32 = 168;
+
 /// Default tier-up budget for JIT back-edge recompilation checks.
 /// After this many backward jumps, a tier-up check fires.
 /// Low budget (100) ensures IC warmup is detected quickly. The helper call

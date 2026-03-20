@@ -23,9 +23,9 @@ use crate::loop_analysis;
 use crate::runtime_helpers::{
     HelperKind, HelperRefs, JIT_CTX_BAILOUT_PC_OFFSET, JIT_CTX_BAILOUT_REASON_OFFSET,
     JIT_CTX_DEOPT_LOCALS_PTR_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_IC_PROBES_PTR_OFFSET,
-    JIT_CTX_OSR_ENTRY_PC_OFFSET, JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET,
-    JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE,
-    JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET, JIT_CTX_TIER_UP_BUDGET_OFFSET,
+    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
+    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 use crate::type_guards::{self, ArithOp, BitwiseOp, SpecializationHint};
 
@@ -1467,6 +1467,41 @@ fn try_emit_versioned_fused_compare_condition(
 fn emit_bailout_return(builder: &mut FunctionBuilder<'_>) {
     let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL);
     builder.ins().return_(&[sentinel]);
+}
+
+/// Emit an interrupt check at backward jumps (loop back-edges).
+///
+/// Loads the `interrupt_flag_ptr` from the JitContext. If the pointer is non-null,
+/// loads the byte at that address. If nonzero (interrupted), emits a bailout return
+/// so the interpreter can handle the timeout/cancellation.
+fn emit_interrupt_check(builder: &mut FunctionBuilder<'_>, ctx_ptr: Value) {
+    let flag_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::trusted(),
+        ctx_ptr,
+        JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET,
+    );
+
+    // Skip check if pointer is null
+    let is_null = builder.ins().icmp_imm(IntCC::Equal, flag_ptr, 0);
+    let check_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_null, continue_block, &[], check_block, &[]);
+
+    builder.switch_to_block(check_block);
+    let flag_val = builder.ins().load(types::I8, MemFlags::new(), flag_ptr, 0);
+    let is_interrupted = builder.ins().icmp_imm(IntCC::NotEqual, flag_val, 0);
+    let bailout_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_interrupted, bailout_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(bailout_block);
+    emit_bailout_return(builder);
+
+    builder.switch_to_block(continue_block);
 }
 
 /// Record bailout telemetry AND dump live local/register state to deopt buffers.
@@ -4277,6 +4312,12 @@ pub fn translate_function_with_constants(
             Instruction::Jump { offset } => {
                 let target = jump_target(pc, offset.offset(), instruction_count)?;
                 let target_block = resolve_target(pc, target);
+
+                // Check interrupt flag at backward jumps (loop back-edges)
+                if offset.offset() < 0 {
+                    emit_interrupt_check(builder, ctx_ptr);
+                }
+
                 builder.ins().jump(target_block, &[]);
                 continue;
             }
@@ -4284,6 +4325,12 @@ pub fn translate_function_with_constants(
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
                 let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
+
+                // Check interrupt flag at backward jumps (loop back-edges)
+                if offset.offset() < 0 {
+                    emit_interrupt_check(builder, ctx_ptr);
+                }
+
                 let condition_kind = classify_jump_condition(instructions_ref, pc, *cond);
                 match condition_kind {
                     JumpConditionKind::Constant(true) => {
@@ -4316,6 +4363,12 @@ pub fn translate_function_with_constants(
                 let jump_to = jump_target(pc, offset.offset(), instruction_count)?;
                 let jump_block = resolve_target(pc, jump_to);
                 let fallthrough = pc + 1;
+
+                // Check interrupt flag at backward jumps (loop back-edges)
+                if offset.offset() < 0 {
+                    emit_interrupt_check(builder, ctx_ptr);
+                }
+
                 let condition_kind = classify_jump_condition(instructions_ref, pc, *cond);
                 match condition_kind {
                     JumpConditionKind::Constant(true) => {
@@ -7778,6 +7831,12 @@ pub fn translate_function_with_constants(
                 // --- Control flow in optimized body ---
                 Instruction::Jump { offset } => {
                     let target = jump_target(body_pc, offset.offset(), instruction_count)?;
+
+                    // Check interrupt flag at backward jumps (loop back-edges)
+                    if offset.offset() < 0 {
+                        emit_interrupt_check(builder, ctx_ptr);
+                    }
+
                     // Back-edge → stay in optimized; exit → materialize and leave
                     if target == vl.header_pc {
                         builder.ins().jump(vl.opt_blocks[0], &[]);
@@ -7792,6 +7851,11 @@ pub fn translate_function_with_constants(
                     continue;
                 }
                 Instruction::JumpIfTrue { cond, offset } => {
+                    // Check interrupt flag at backward jumps (loop back-edges)
+                    if offset.offset() < 0 {
+                        emit_interrupt_check(builder, ctx_ptr);
+                    }
+
                     let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
                     let jump_in_loop = jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc;
                     let jump_block = if jump_in_loop {
@@ -7853,6 +7917,11 @@ pub fn translate_function_with_constants(
                     continue;
                 }
                 Instruction::JumpIfFalse { cond, offset } => {
+                    // Check interrupt flag at backward jumps (loop back-edges)
+                    if offset.offset() < 0 {
+                        emit_interrupt_check(builder, ctx_ptr);
+                    }
+
                     let jump_to = jump_target(body_pc, offset.offset(), instruction_count)?;
                     let jump_in_loop = jump_to >= vl.header_pc && jump_to <= vl.back_edge_pc;
                     let jump_block = if jump_in_loop {

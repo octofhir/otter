@@ -28,7 +28,7 @@ pub struct TestReport {
     pub by_feature: HashMap<String, FeatureReport>,
     /// Failed test details
     pub failures: Vec<FailureInfo>,
-    /// Timed out test paths
+    /// Timed out test details (path with mode)
     pub timeouts: Vec<String>,
 }
 
@@ -86,7 +86,7 @@ impl TestReport {
                 TestOutcome::Skip => report.skipped += 1,
                 TestOutcome::Timeout => {
                     report.timeout += 1;
-                    report.timeouts.push(result.path.clone());
+                    report.timeouts.push(format!("{} ({})", result.path, result.mode));
                 }
                 TestOutcome::Crash => report.crashed += 1,
             }
@@ -255,7 +255,7 @@ impl RunSummary {
             TestOutcome::Skip => self.skipped += 1,
             TestOutcome::Timeout => {
                 self.timeout += 1;
-                self.timeouts.push(result.path.clone());
+                self.timeouts.push(format!("{} ({})", result.path, result.mode));
             }
             TestOutcome::Crash => self.crashed += 1,
         }

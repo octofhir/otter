@@ -339,33 +339,6 @@ fn format_value(value: &Value) -> String {
     format!("{:?}", value)
 }
 
-/// Standard harness files content
-pub struct HarnessFiles {
-    /// assert.js content
-    pub assert: &'static str,
-    /// sta.js content (standard test assertions)
-    pub sta: &'static str,
-    /// doneprintHandle.js for async tests
-    pub done_print_handle: &'static str,
-}
-
-impl Default for HarnessFiles {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HarnessFiles {
-    /// Create harness files with embedded content
-    pub fn new() -> Self {
-        Self {
-            assert: include_str!("harness/assert.js"),
-            sta: include_str!("harness/sta.js"),
-            done_print_handle: include_str!("harness/donePrintHandle.js"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

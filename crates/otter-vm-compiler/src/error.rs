@@ -3,14 +3,18 @@
 use thiserror::Error;
 
 /// Compilation errors
+///
+/// Per ES2026 spec, all parse-time errors are SyntaxError (§13.1.1).
+/// The Display format prefixes all variants with "SyntaxError:" so that
+/// error messages are spec-compliant and can be matched in test262.
 #[derive(Debug, Error)]
 pub enum CompileError {
-    /// Parse error
-    #[error("Parse error: {0}")]
+    /// Parse error (from oxc parser)
+    #[error("SyntaxError: {0}")]
     Parse(String),
 
-    /// Syntax error
-    #[error("Syntax error at {location}: {message}")]
+    /// Syntax error (from compiler static semantics)
+    #[error("SyntaxError: {message} (at {location})")]
     Syntax {
         /// Error message
         message: String,
@@ -19,31 +23,31 @@ pub enum CompileError {
     },
 
     /// Unsupported feature
-    #[error("Unsupported: {0}")]
+    #[error("SyntaxError: Unsupported: {0}")]
     Unsupported(String),
 
     /// Internal compiler error
-    #[error("Internal error: {0}")]
+    #[error("SyntaxError: Internal error: {0}")]
     Internal(String),
 
     /// Too many locals
-    #[error("Too many local variables (max 65535)")]
+    #[error("SyntaxError: Too many local variables (max 65535)")]
     TooManyLocals,
 
     /// Too many constants
-    #[error("Too many constants (max 4294967295)")]
+    #[error("SyntaxError: Too many constants (max 4294967295)")]
     TooManyConstants,
 
     /// Too many functions
-    #[error("Too many functions")]
+    #[error("SyntaxError: Too many functions")]
     TooManyFunctions,
 
     /// Invalid assignment target
-    #[error("Invalid assignment target")]
+    #[error("SyntaxError: Invalid assignment target")]
     InvalidAssignmentTarget,
 
     /// Early error detected during parsing/validation
-    #[error("Early error at {location}: {message}")]
+    #[error("SyntaxError: {message} (at {location})")]
     EarlyError {
         /// Error message
         message: String,
@@ -52,7 +56,7 @@ pub enum CompileError {
     },
 
     /// Legacy syntax error in strict mode
-    #[error("Legacy syntax not allowed in strict mode at {location}: {message}")]
+    #[error("SyntaxError: Legacy syntax not allowed in strict mode: {message} (at {location})")]
     LegacySyntax {
         /// Error message
         message: String,
@@ -61,7 +65,7 @@ pub enum CompileError {
     },
 
     /// Invalid literal syntax
-    #[error("Invalid literal syntax at {location}: {message}")]
+    #[error("SyntaxError: Invalid literal: {message} (at {location})")]
     InvalidLiteral {
         /// Error message
         message: String,

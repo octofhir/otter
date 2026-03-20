@@ -934,6 +934,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let state = JitCallReentryState::new(
@@ -990,6 +991,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let state = JitCallReentryState::new(
@@ -1044,6 +1046,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
         let args = [5_i64, 6_i64];
 
@@ -1085,6 +1088,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let outcome = unsafe {
@@ -1181,6 +1185,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let result = otter_rt_call_mono_ic_fast_target(
@@ -1242,6 +1247,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let result = otter_rt_call_function_ic_fast_target(

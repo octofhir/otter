@@ -63,9 +63,6 @@ skip_features = [
     # Hashbang (parser feature)
     "hashbang",
 
-    # IsHTMLDDA ([[IsHTMLDDA]] internal slot — DOM-specific edge cases)
-    "IsHTMLDDA",
-
     # RegExp modifiers (ES2025 Stage 4, not yet implemented in regress crate)
     "regexp-modifiers",
 

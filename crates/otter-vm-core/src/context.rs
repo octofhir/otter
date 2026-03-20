@@ -1512,6 +1512,15 @@ impl VmContext {
         self.interrupt_flag.store(false, Ordering::Relaxed);
     }
 
+    /// Get a raw pointer to the interrupt flag's inner boolean.
+    /// Used by JIT code to check for interrupts without going through Arc.
+    pub fn interrupt_flag_raw_ptr(&self) -> *const u8 {
+        // AtomicBool is repr(transparent) over u8, and Arc points to the inner value
+        use std::sync::atomic::AtomicBool;
+        let atomic_ref: &AtomicBool = &self.interrupt_flag;
+        atomic_ref as *const AtomicBool as *const u8
+    }
+
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn update_debug_snapshot(&self) {
         let Some(target) = &self.debug_snapshot else {
@@ -3246,8 +3255,12 @@ impl VmContext {
         // Check if nursery needs minor GC (fast, cheap collection)
         if registry.should_minor_gc() {
             let roots = self.collect_gc_roots();
-            let _reclaimed = registry
-                .collect_minor_with_pre_sweep_hook(&roots, crate::weak_gc::combined_pre_sweep_hook);
+            // NOTE: Do NOT pass `combined_pre_sweep_hook` to minor GC.
+            // Minor GC only marks nursery objects — old-gen objects stay White.
+            // The pre-sweep hook prunes White entries from the string table and
+            // clears White WeakRef targets, which would incorrectly destroy
+            // live old-gen strings and weak references.
+            let _reclaimed = registry.collect_minor(&roots);
             // Don't reset allocation count — minor GC is cheap.
             // Only update live bytes for accurate threshold tracking.
             let live_bytes = registry.total_bytes();

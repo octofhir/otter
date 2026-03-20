@@ -412,10 +412,6 @@ impl Test262Runner {
         path: &Path,
         timeout: Option<Duration>,
     ) -> Vec<TestResult> {
-        // Fresh engine per test (like Boa): complete isolation between tests.
-        // reset_realm() has GC timing hazards that cause flaky failures in batch.
-        self.rebuild_engine();
-
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
         let relative_path_str = relative_path.to_string_lossy().to_string();
 
@@ -454,6 +450,8 @@ impl Test262Runner {
         let modes = metadata.execution_modes();
         let mut results = Vec::with_capacity(modes.len());
 
+        // Run ALL modes regardless of failures (like Boa).
+        // A test can fail in non-strict but pass in strict — both results matter.
         for mode in &modes {
             let start = Instant::now();
             let result = self
@@ -468,12 +466,6 @@ impl Test262Runner {
                 error: result.1,
                 features: metadata.features.clone(),
             });
-
-            // If non-strict mode fails, skip strict mode:
-            // if the simpler mode fails, the stricter one will too)
-            if *mode == ExecutionMode::NonStrict && result.0 == TestOutcome::Fail {
-                break;
-            }
         }
 
         results
@@ -504,7 +496,7 @@ impl Test262Runner {
         mode: ExecutionMode,
         timeout: Option<Duration>,
     ) -> (TestOutcome, Option<String>) {
-        // Fresh engine per test (like Boa): complete isolation between tests.
+        // Fresh engine per mode: complete isolation between tests.
         // reset_realm() has GC timing hazards that cause flaky failures in batch.
         self.rebuild_engine();
 
@@ -514,46 +506,53 @@ impl Test262Runner {
         // Configure trace for this test
         self.configure_test_trace(&test_name);
 
-        // Build test source with harness
+        let is_raw = metadata.is_raw();
+
+        // Build test source
         let mut test_source = String::new();
 
-        // For strict mode, put "use strict" first so the entire script (including harness)
-        // runs in strict mode. This ensures parse-phase negative tests detect SyntaxErrors.
+        // For strict mode, prepend "use strict" before everything (including harness).
+        // This matches the test262 spec and how other engines handle it.
         if mode == ExecutionMode::Strict {
             test_source.push_str("\"use strict\";\n");
         }
 
-        // Add default harness files (sta.js and assert.js)
-        let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
+        // For raw tests, skip ALL harness files (per test262 INTERPRETING.md).
+        // For parse-phase negative tests, also skip harness — they should fail
+        // during parsing without needing assert.js etc. (like Boa does).
+        if !is_raw {
+            // Add default harness files (sta.js and assert.js)
+            let mut includes = vec!["sta.js".to_string(), "assert.js".to_string()];
 
-        // For async tests, add doneprintHandle.js
-        if metadata.is_async() && !includes.contains(&"doneprintHandle.js".to_string()) {
-            includes.push("doneprintHandle.js".to_string());
-        }
+            // For async tests, add doneprintHandle.js
+            if metadata.is_async() {
+                includes.push("doneprintHandle.js".to_string());
+            }
 
-        // Add explicitly requested harness files
-        for include in &metadata.includes {
-            if !includes.contains(include) {
-                includes.push(include.clone());
+            // Add explicitly requested harness files
+            for include in &metadata.includes {
+                if !includes.contains(include) {
+                    includes.push(include.clone());
+                }
+            }
+
+            // Add harness files to source (from cache)
+            for include in &includes {
+                if let Some(harness_content) = self.harness_cache.get(include) {
+                    test_source.push_str(harness_content);
+                    test_source.push('\n');
+                } else {
+                    eprintln!(
+                        "ERROR: Harness file '{}' not found in cache (required by test)",
+                        include
+                    );
+                }
             }
         }
 
-        // Add harness files to source (from cache) — always in sloppy mode
-        // to avoid duplicate function declaration errors (e.g. isPrimitive in
-        // both assert.js and testTypedArray.js).
-        for include in &includes {
-            if let Some(harness_content) = self.harness_cache.get(include) {
-                test_source.push_str(harness_content);
-                test_source.push('\n');
-            } else {
-                eprintln!(
-                    "ERROR: Harness file '{}' not found in cache (required by test)",
-                    include
-                );
-            }
-        }
-
-        // Add test content (strip metadata)
+        // Add test content. The /*--- ... ---*/ frontmatter is a valid JS block
+        // comment, so we don't need to strip it. However, stripping it avoids
+        // potential issues with nested block comments in some parsers.
         let test_content = content
             .find("---*/")
             .map(|i| &content[i + 5..])
@@ -658,21 +657,33 @@ impl Test262Runner {
             }
             Err(err) => match err {
                 OtterError::Compile(msg) => {
-                    if metadata.expects_early_error() {
+                    if metadata.expects_early_error() || metadata.expects_resolution_error() {
                         self.validate_negative_error(metadata, &msg, ErrorPhase::Parse)
                     } else {
                         (TestOutcome::Fail, Some(format!("Compile error: {}", msg)))
                     }
                 }
                 OtterError::Runtime(msg) => {
-                    if metadata.expects_runtime_error() {
-                        self.validate_negative_error(metadata, &msg, ErrorPhase::Runtime)
-                    } else if msg == "Test timed out" || msg.contains("Execution interrupted") {
+                    // Check interrupt flag directly — more robust than string matching.
+                    // The flag is set by the watchdog thread on timeout.
+                    let is_timeout = self
+                        .engine
+                        .as_ref()
+                        .map(|e| e.interrupt_flag().load(Ordering::Relaxed))
+                        .unwrap_or(false)
+                        || msg.contains("Execution interrupted");
+
+                    if is_timeout {
                         // Dump snapshot on timeout if enabled
                         if self.dump_on_timeout {
                             self.dump_timeout_info(test_name, &msg);
                         }
-                        (TestOutcome::Timeout, None)
+                        (
+                            TestOutcome::Timeout,
+                            Some(format!("Timed out: {}", test_name)),
+                        )
+                    } else if metadata.expects_runtime_error() {
+                        self.validate_negative_error(metadata, &msg, ErrorPhase::Runtime)
                     } else {
                         (TestOutcome::Fail, Some(msg))
                     }
@@ -813,12 +824,9 @@ impl Test262Runner {
             (ErrorPhase::Parse, ErrorPhase::Parse) => true,
             (ErrorPhase::Early, ErrorPhase::Parse) => true, // Early errors detected at parse time
             (ErrorPhase::Runtime, ErrorPhase::Runtime) => true,
-            (ErrorPhase::Resolution, _) => {
-                return (
-                    TestOutcome::Skip,
-                    Some("Resolution phase not yet supported".to_string()),
-                );
-            }
+            // Resolution phase errors from module linking — treat as parse-time for now
+            (ErrorPhase::Resolution, ErrorPhase::Parse) => true,
+            (ErrorPhase::Resolution, ErrorPhase::Runtime) => true,
             _ => false,
         };
 
@@ -832,17 +840,18 @@ impl Test262Runner {
             );
         }
 
-        // Validate error type (lenient substring match for now)
+        // Validate error type — strict substring match (like Boa).
+        // The error message must contain the expected error type name.
         if error_msg.contains(&negative.error_type) {
             (TestOutcome::Pass, None)
         } else {
-            // Still pass but note the mismatch
+            // Error type mismatch is a real failure — don't pass with wrong type.
             (
-                TestOutcome::Pass,
+                TestOutcome::Fail,
                 Some(format!(
-                    "Type mismatch (lenient): expected {} in error: {}",
+                    "Wrong error type: expected {} but got: {}",
                     negative.error_type,
-                    error_msg.chars().take(100).collect::<String>()
+                    error_msg.chars().take(200).collect::<String>()
                 )),
             )
         }
@@ -880,24 +889,20 @@ impl Test262Runner {
         _test_name: &str,
         source_url: &str,
     ) -> Result<Value, OtterError> {
-        let result = if let Some(duration) = timeout {
-            // Cooperative timeout via dedicated watchdog thread.
-            let flag = self.engine().interrupt_flag();
-            let token = self.timeout_watchdog.arm(duration, flag);
+        // Always enforce a timeout to prevent indefinite hangs.
+        // Default fallback: 30 seconds (generous, but finite).
+        let duration = timeout.unwrap_or(Duration::from_secs(30));
 
-            let result = AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
-                .catch_unwind()
-                .await;
+        // Cooperative timeout via dedicated watchdog thread.
+        let flag = self.engine().interrupt_flag();
+        let token = self.timeout_watchdog.arm(duration, flag);
 
-            // Disarm watchdog if test finished before timeout
-            self.timeout_watchdog.disarm(token);
+        let result = AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
+            .catch_unwind()
+            .await;
 
-            result
-        } else {
-            AssertUnwindSafe(self.engine_mut().eval(source, Some(source_url)))
-                .catch_unwind()
-                .await
-        };
+        // Disarm watchdog if test finished before timeout
+        self.timeout_watchdog.disarm(token);
 
         match result {
             Ok(val) => val,

@@ -105,15 +105,20 @@ pub struct JitContext {
     pub ic_probes_ptr: *const otter_vm_bytecode::function::JitIcProbe,
     /// Number of entries in the IC probe table.
     pub ic_probes_count: u32,
+    /// Raw pointer to the interrupt flag (AtomicBool).
+    /// JIT code loads from this at backward jumps to check for timeout/cancellation.
+    /// When the byte at this address is nonzero, JIT bails out to the interpreter.
+    pub interrupt_flag_ptr: *const u8,
 }
 
 // Compile-time checks: offsets in runtime_helpers.rs must match JitContext layout.
 use otter_vm_jit::runtime_helpers::{
     JIT_CTX_DEOPT_LOCALS_COUNT_OFFSET, JIT_CTX_DEOPT_LOCALS_PTR_OFFSET,
     JIT_CTX_DEOPT_REGS_COUNT_OFFSET, JIT_CTX_DEOPT_REGS_PTR_OFFSET, JIT_CTX_IC_PROBES_COUNT_OFFSET,
-    JIT_CTX_IC_PROBES_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET, JIT_CTX_TIER_UP_BUDGET_OFFSET,
-    JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET, JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET,
-    JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET, JIT_UPVALUE_GCBOX_VALUE_OFFSET,
+    JIT_CTX_IC_PROBES_PTR_OFFSET, JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET, JIT_CTX_OSR_ENTRY_PC_OFFSET,
+    JIT_CTX_TIER_UP_BUDGET_OFFSET, JIT_CTX_UPVALUE_COUNT_OFFSET, JIT_CTX_UPVALUES_PTR_OFFSET,
+    JIT_UPVALUE_CELL_GCBOX_PTR_OFFSET, JIT_UPVALUE_CELL_SIZE, JIT_UPVALUE_DATA_VALUE_OFFSET,
+    JIT_UPVALUE_GCBOX_VALUE_OFFSET,
 };
 const _: () = {
     assert!(
@@ -171,6 +176,11 @@ const _: () = {
     assert!(
         std::mem::offset_of!(JitContext, ic_probes_count) as i32 == JIT_CTX_IC_PROBES_COUNT_OFFSET,
         "JitContext::ic_probes_count offset changed — update JIT_CTX_IC_PROBES_COUNT_OFFSET in runtime_helpers.rs"
+    );
+    assert!(
+        std::mem::offset_of!(JitContext, interrupt_flag_ptr) as i32
+            == JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET,
+        "JitContext::interrupt_flag_ptr offset changed — update JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET in runtime_helpers.rs"
     );
     assert!(
         std::mem::size_of::<otter_vm_bytecode::function::JitIcProbe>() == 16,
@@ -5413,6 +5423,7 @@ mod tests {
             tier_up_budget: otter_vm_jit::runtime_helpers::JIT_TIER_UP_BUDGET_DEFAULT,
             ic_probes_ptr: std::ptr::null(),
             ic_probes_count: 0,
+            interrupt_flag_ptr: std::ptr::null(),
         };
 
         let result = otter_rt_set_prop_const(

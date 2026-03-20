@@ -5002,23 +5002,52 @@ impl Interpreter {
                     .as_string()
                     .ok_or_else(|| VmError::internal("expected string constant"))?;
 
-                // IC Fast Path
+                // IC Fast Path — must handle depth > 0 for prototype properties
                 let cached_method = if let Some(obj_ref) = receiver.as_object() {
                     let frame = ctx
                         .current_frame()
                         .ok_or_else(|| VmError::internal("no frame"))?;
                     let feedback = frame.feedback().read();
                     if let Some(ic) = feedback.get(*ic_index as usize) {
-                        if let otter_vm_bytecode::function::InlineCacheState::Monomorphic {
-                            shape_id: shape_addr,
-                            offset,
-                            ..
-                        } = &ic.ic_state
-                        {
-                            if obj_ref.shape_id() == *shape_addr {
-                                obj_ref.get_by_offset(*offset as usize)
-                            } else {
-                                None
+                        if ic.proto_epoch_matches(ctx.cached_proto_epoch) {
+                            match &ic.ic_state {
+                                otter_vm_bytecode::function::InlineCacheState::Monomorphic {
+                                    shape_id: shape_addr,
+                                    depth,
+                                    offset,
+                                    ..
+                                } => {
+                                    if obj_ref.shape_id() == *shape_addr {
+                                        if *depth == 0 {
+                                            obj_ref.get_by_offset(*offset as usize)
+                                        } else {
+                                            get_proto_value_at_depth(&obj_ref, *depth, *offset)
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                                otter_vm_bytecode::function::InlineCacheState::Polymorphic {
+                                    count,
+                                    entries,
+                                } => {
+                                    let shape = obj_ref.shape_id();
+                                    let mut result = None;
+                                    for i in 0..(*count as usize) {
+                                        if shape == entries[i].0 {
+                                            let depth = entries[i].2;
+                                            let offset = entries[i].3;
+                                            result = if depth == 0 {
+                                                obj_ref.get_by_offset(offset as usize)
+                                            } else {
+                                                get_proto_value_at_depth(&obj_ref, depth, offset)
+                                            };
+                                            break;
+                                        }
+                                    }
+                                    result
+                                }
+                                _ => None,
                             }
                         } else {
                             None

@@ -95,7 +95,9 @@ impl TestMetadata {
         }
 
         let yaml_content = &content[start + 5..end];
-        serde_yaml::from_str(yaml_content).ok()
+        // Normalize \r\n to \n for Windows line endings
+        let yaml_normalized = yaml_content.replace('\r', "");
+        serde_yaml::from_str(&yaml_normalized).ok()
     }
 
     /// Check if test should run in strict mode
@@ -118,6 +120,11 @@ impl TestMetadata {
         self.flags.contains(&"async".to_string())
     }
 
+    /// Check if this is a raw test (no harness, no modifications)
+    pub fn is_raw(&self) -> bool {
+        self.flags.contains(&"raw".to_string())
+    }
+
     /// Check if test expects a parse/early error
     pub fn expects_early_error(&self) -> bool {
         matches!(
@@ -129,16 +136,33 @@ impl TestMetadata {
         )
     }
 
+    /// Check if test expects a resolution error (module linking)
+    pub fn expects_resolution_error(&self) -> bool {
+        matches!(
+            &self.negative,
+            Some(NegativeExpectation {
+                phase: ErrorPhase::Resolution,
+                ..
+            })
+        )
+    }
+
     /// Get the execution modes this test should run in.
     ///
-    /// Per the test262 spec:
+    /// Per the test262 INTERPRETING.md spec:
+    /// - `raw` flag → non-strict only, no harness
+    /// - `module` flag → module mode only
     /// - `onlyStrict` flag → strict mode only
     /// - `noStrict` flag → non-strict mode only
-    /// - `module` flag → module mode only (skipped for now)
     /// - no flag → both strict and non-strict
     pub fn execution_modes(&self) -> Vec<ExecutionMode> {
-        if self.is_module() {
-            return vec![ExecutionMode::Module];
+        if self.is_raw() || self.is_module() {
+            // raw tests: run once in non-strict, no harness (handled by runner)
+            // module tests: run once as module (always strict per spec)
+            if self.is_module() {
+                return vec![ExecutionMode::Module];
+            }
+            return vec![ExecutionMode::NonStrict];
         }
         if self.is_strict() {
             return vec![ExecutionMode::Strict];

@@ -58,24 +58,35 @@ fn to_boolean(val: &Value) -> bool {
     }
 }
 
+/// thisBooleanValue(value) — ES2026 §21.3.3
+/// Returns the boolean value if value is a boolean primitive or a Boolean object.
+/// Throws TypeError otherwise.
+fn this_boolean_value(this_val: &Value) -> Result<bool, VmError> {
+    // 1. If Type(value) is Boolean, return value.
+    if let Some(b) = this_val.as_boolean() {
+        return Ok(b);
+    }
+    // 2. If Type(value) is Object and value has a [[BooleanData]] internal slot...
+    if let Some(obj) = this_val.as_object() {
+        if let Some(val) = obj.get(&PropertyKey::string("__primitiveValue__")) {
+            if let Some(b) = val.as_boolean() {
+                return Ok(b);
+            }
+        }
+    }
+    // 3. Throw a TypeError exception.
+    Err(VmError::type_error(
+        "Boolean.prototype.valueOf requires that 'this' be a Boolean",
+    ))
+}
+
 #[dive(name = "valueOf", length = 0)]
 fn boolean_value_of(
     this_val: &Value,
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    if let Some(b) = this_val.as_boolean() {
-        Ok(Value::boolean(b))
-    } else if let Some(obj) = this_val.as_object() {
-        if let Some(val) = obj.get(&PropertyKey::string("__value__"))
-            && let Some(b) = val.as_boolean()
-        {
-            return Ok(Value::boolean(b));
-        }
-        Ok(Value::boolean(to_boolean(this_val)))
-    } else {
-        Ok(Value::boolean(to_boolean(this_val)))
-    }
+    Ok(Value::boolean(this_boolean_value(this_val)?))
 }
 
 #[dive(name = "toString", length = 0)]
@@ -84,22 +95,7 @@ fn boolean_to_string(
     _args: &[Value],
     _ncx: &mut NativeContext<'_>,
 ) -> Result<Value, VmError> {
-    let b = if let Some(b) = this_val.as_boolean() {
-        b
-    } else if let Some(obj) = this_val.as_object() {
-        if let Some(val) = obj.get(&PropertyKey::string("__value__")) {
-            if let Some(b) = val.as_boolean() {
-                b
-            } else {
-                to_boolean(this_val)
-            }
-        } else {
-            to_boolean(this_val)
-        }
-    } else {
-        to_boolean(this_val)
-    };
-
+    let b = this_boolean_value(this_val)?;
     Ok(Value::string(JsString::intern(if b {
         "true"
     } else {
@@ -120,6 +116,12 @@ pub fn init_boolean_prototype(
     _fn_proto: GcRef<JsObject>,
     mm: &Arc<MemoryManager>,
 ) {
+    // Boolean.prototype has [[BooleanData]] = false (ES2026 §21.3.3)
+    let _ = boolean_proto.set(
+        PropertyKey::string("__primitiveValue__"),
+        Value::boolean(false),
+    );
+
     let methods: &[(&str, crate::value::NativeFn, u32)] =
         &[boolean_value_of_decl(), boolean_to_string_decl()];
 
@@ -166,7 +168,7 @@ pub fn create_boolean_constructor() -> Box<
         } else if let Some(obj) = this_val.as_object() {
             // Construct form: new Boolean(value) → Boolean object
             // Store primitive value in internal [[BooleanData]] slot
-            let _ = obj.set(PropertyKey::string("__value__"), bool_val);
+            let _ = obj.set(PropertyKey::string("__primitiveValue__"), bool_val);
             Ok(*this_val)
         } else {
             // Call form fallback

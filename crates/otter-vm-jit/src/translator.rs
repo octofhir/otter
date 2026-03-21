@@ -391,7 +391,9 @@ fn instruction_reads_register(instruction: &Instruction, reg: Register) -> bool 
         | Instruction::TypeOf { src, .. }
         | Instruction::Export { src, .. }
         | Instruction::Spread { src, .. }
-        | Instruction::RequireCoercible { src } => *src == reg,
+        | Instruction::RequireCoercible { src }
+        | Instruction::ThrowIfNotObject { src } => *src == reg,
+        Instruction::JumpTable { index_reg, .. } => *index_reg == reg,
         Instruction::Add { lhs, rhs, .. }
         | Instruction::Sub { lhs, rhs, .. }
         | Instruction::Mul { lhs, rhs, .. }
@@ -1112,6 +1114,8 @@ fn is_supported_with_helpers(instruction: &Instruction) -> bool {
                 | Instruction::ToNumber { .. }
                 | Instruction::ToString { .. }
                 | Instruction::RequireCoercible { .. }
+                | Instruction::ThrowIfNotObject { .. }
+                | Instruction::JumpTable { .. }
                 | Instruction::InstanceOf { .. }
                 | Instruction::In { .. }
                 | Instruction::DeclareGlobalVar { .. }
@@ -6724,6 +6728,10 @@ pub fn translate_function_with_constants(
                     deopt_site,
                 );
                 builder.switch_to_block(ok_block);
+            }
+            Instruction::ThrowIfNotObject { .. } | Instruction::JumpTable { .. } => {
+                // Bail out to interpreter for these checks
+                return Err(unsupported(pc, instruction));
             }
             // --- InstanceOf / In ---
             Instruction::InstanceOf {

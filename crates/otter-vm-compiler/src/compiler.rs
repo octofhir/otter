@@ -77,6 +77,12 @@ pub struct Compiler {
     lexical_blocked_stack: Vec<HashSet<String>>,
     /// Top-level names that have Annex B global var-extension bindings.
     eval_hoisted_global_vars: HashSet<String>,
+    /// Stack of active try-finally scopes. When a `return` is compiled inside
+    /// a try-with-finally, the return value is saved to `return_value_reg`, the
+    /// completion type register is set to 1, and a jump to the finally entry is
+    /// emitted. After the finally block, a check dispatches: if completion_type
+    /// == 1, do the real return; otherwise continue normally.
+    finally_stack: Vec<FinallyScope>,
 }
 
 /// Context in which an identifier is used, for strict mode error messages
@@ -106,6 +112,17 @@ struct ControlScope {
     continue_target: Option<usize>,
     /// Iterator register for for-of loops (for IteratorClose on break)
     iterator_reg: Option<Register>,
+}
+
+/// Tracks a try-finally scope for proper control flow through finally blocks.
+#[derive(Debug)]
+struct FinallyScope {
+    /// Register that holds 0=normal, 1=return, 2=break, 3=continue
+    completion_type_reg: Register,
+    /// Register that holds the saved return value (if completion_type == 1)
+    return_value_reg: Register,
+    /// Jumps from return/break/continue sites inside the try body to the finally entry
+    return_jumps: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -175,6 +192,7 @@ impl Compiler {
             lexical_blocked_var_names: HashSet::new(),
             lexical_blocked_stack: Vec::new(),
             eval_hoisted_global_vars: HashSet::new(),
+            finally_stack: Vec::new(),
         }
     }
 
@@ -513,6 +531,9 @@ impl Compiler {
             if let Statement::FunctionDeclaration(func) = stmt {
                 if let Some(id) = &func.id {
                     let name = id.name.to_string();
+                    // ES2023 §14.1.2: In strict mode, function declarations with
+                    // names "eval" or "arguments" are early SyntaxErrors.
+                    self.check_identifier_early_error(&name, IdentifierContext::Declaration)?;
                     if self.codegen.current.scopes.current_scope_is_function() {
                         // Function-body/program-level declaration: var-scoped binding.
                         self.codegen
@@ -586,6 +607,9 @@ impl Compiler {
     ) -> CompileResult<()> {
         match pattern {
             BindingPattern::BindingIdentifier(ident) => {
+                // ES2023 §13.3.1.1: In strict mode, let/const declarations with
+                // names "eval" or "arguments" are early SyntaxErrors.
+                self.check_identifier_early_error(&ident.name, IdentifierContext::Declaration)?;
                 // Pre-declare the name; ignore errors from already-declared names
                 let _ = self.codegen.declare_variable_with_kind(&ident.name, kind);
             }
@@ -1010,12 +1034,40 @@ impl Compiler {
             Statement::VariableDeclaration(decl) => self.compile_variable_declaration(decl),
 
             Statement::ReturnStatement(ret) => {
-                if let Some(arg) = &ret.argument {
-                    let reg = self.compile_expression(arg)?;
-                    self.codegen.emit(Instruction::Return { src: reg });
-                    self.codegen.free_reg(reg);
+                if !self.finally_stack.is_empty() {
+                    // We're inside a try-with-finally. Save the return value and
+                    // jump to the finally block instead of returning directly.
+                    let finally_scope = self.finally_stack.last_mut().unwrap();
+                    let ret_val_reg = finally_scope.return_value_reg;
+                    let comp_type_reg = finally_scope.completion_type_reg;
+                    if let Some(arg) = &ret.argument {
+                        let reg = self.compile_expression(arg)?;
+                        self.codegen.emit(Instruction::Move {
+                            dst: ret_val_reg,
+                            src: reg,
+                        });
+                        self.codegen.free_reg(reg);
+                    } else {
+                        self.codegen.emit(Instruction::LoadUndefined {
+                            dst: ret_val_reg,
+                        });
+                    }
+                    // completion_type = 1 (return)
+                    self.codegen.emit(Instruction::LoadInt8 {
+                        dst: comp_type_reg,
+                        value: 1,
+                    });
+                    let jump_idx = self.codegen.emit_jump();
+                    // We need to re-borrow because emit_jump borrows self
+                    self.finally_stack.last_mut().unwrap().return_jumps.push(jump_idx);
                 } else {
-                    self.codegen.emit(Instruction::ReturnUndefined);
+                    if let Some(arg) = &ret.argument {
+                        let reg = self.compile_expression(arg)?;
+                        self.codegen.emit(Instruction::Return { src: reg });
+                        self.codegen.free_reg(reg);
+                    } else {
+                        self.codegen.emit(Instruction::ReturnUndefined);
+                    }
                 }
                 Ok(())
             }
@@ -1243,6 +1295,16 @@ impl Compiler {
             Statement::DoWhileStatement(stmt) => self.compile_do_while_statement(stmt),
             Statement::LabeledStatement(stmt) => self.compile_labeled_statement(stmt),
             Statement::WithStatement(with_stmt) => {
+                // ES2023 §13.11.1: `with` is a SyntaxError in strict mode code.
+                let is_strict = self.codegen.current.flags.is_strict
+                    || self.literal_validator.is_strict_mode();
+                if is_strict {
+                    return Err(CompileError::syntax(
+                        "Strict mode code may not include a with statement",
+                        0,
+                        0,
+                    ));
+                }
                 // Minimal non-strict fallback:
                 // - evaluate object expression for side-effects
                 // - execute body in current scope
@@ -1849,6 +1911,7 @@ impl Compiler {
         field_initializers: Option<&[ClassFieldInitializer<'_>]>,
     ) -> CompileResult<Register> {
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
         let inferred_name = self.pending_inferred_name.take();
 
         self.push_function_scope_lexical_blocked();
@@ -1871,6 +1934,7 @@ impl Compiler {
         });
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(dst)
     }
 
@@ -1882,6 +1946,7 @@ impl Compiler {
         field_initializers: Option<&[ClassFieldInitializer<'_>]>,
     ) -> CompileResult<Register> {
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
         let inferred_name = self.pending_inferred_name.take();
 
         self.push_function_scope_lexical_blocked();
@@ -1913,6 +1978,7 @@ impl Compiler {
         });
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(dst)
     }
 
@@ -2969,6 +3035,10 @@ impl Compiler {
                 src: result_reg,
             });
         }
+
+        // ES2023 7.4.2: IteratorNext result must be an Object
+        self.codegen
+            .emit(Instruction::ThrowIfNotObject { src: result_reg });
 
         // done = result.done; value = result.value
         let ic_index_done = self.codegen.alloc_ic();
@@ -4078,7 +4148,24 @@ impl Compiler {
 
     fn compile_try_statement(&mut self, try_stmt: &TryStatement) -> CompileResult<()> {
         if let Some(finalizer) = &try_stmt.finalizer {
-            // Wrap inner logic in Try/Finally
+            // Allocate registers for completion type tracking.
+            // completion_type: 0=normal, 1=return
+            let completion_type_reg = self.codegen.alloc_reg();
+            let return_value_reg = self.codegen.alloc_reg();
+
+            // Initialize completion_type to 0 (normal)
+            self.codegen.emit(Instruction::LoadInt8 {
+                dst: completion_type_reg,
+                value: 0,
+            });
+
+            // Push finally scope so return statements inside the try body
+            // redirect through the finally block
+            self.finally_stack.push(FinallyScope {
+                completion_type_reg,
+                return_value_reg,
+                return_jumps: Vec::new(),
+            });
 
             // 1. Emit outer TryStart
             let try_start = self.codegen.current_index();
@@ -4092,40 +4179,86 @@ impl Compiler {
             // 3. Emit TryEnd (for normal completion of inner)
             self.codegen.emit(Instruction::TryEnd);
 
-            // 4. Compile Finalizer (Normal Path)
-            // Note: In full implementation, we'd use a shared subroutine or Gosub.
-            // Here we duplicate code for simplicity as per plan.
+            // Pop the finally scope and collect return jumps
+            let finally_scope = self.finally_stack.pop().unwrap();
+            let return_jumps = finally_scope.return_jumps;
+
+            // 4. Patch return-site jumps to land here (finally entry for normal + return paths)
+            let finally_entry = self.codegen.current_index();
+            for jump in &return_jumps {
+                let offset = finally_entry as i32 - *jump as i32;
+                self.codegen.patch_jump(*jump, offset);
+            }
+
+            // 5. Compile Finalizer (Normal Path)
             for stmt in &finalizer.body {
                 self.compile_statement(stmt)?;
             }
 
-            // 5. Jump over Exception Path
+            // 6. After finally: check if we need to do a deferred return
+            if !return_jumps.is_empty() {
+                // Check completion_type_reg: if 1, do the real return
+                let check_reg = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::LoadInt8 {
+                    dst: check_reg,
+                    value: 1,
+                });
+                let cmp_reg = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::StrictEq {
+                    dst: cmp_reg,
+                    lhs: completion_type_reg,
+                    rhs: check_reg,
+                });
+                let jump_if_return = self.codegen.emit_jump_if_true(cmp_reg);
+                self.codegen.free_reg(cmp_reg);
+                self.codegen.free_reg(check_reg);
+
+                // Normal flow: jump over the return
+                let jump_over_return = self.codegen.emit_jump();
+
+                // Return path
+                let return_label = self.codegen.current_index();
+                let return_offset = return_label as i32 - jump_if_return as i32;
+                self.codegen.patch_jump(jump_if_return, return_offset);
+                self.codegen
+                    .emit(Instruction::Return { src: return_value_reg });
+
+                // Patch jump over return
+                let after_return = self.codegen.current_index();
+                let over_return_offset = after_return as i32 - jump_over_return as i32;
+                self.codegen.patch_jump(jump_over_return, over_return_offset);
+            }
+
+            // 7. Jump over Exception Path
             let jump_over_exc = self.codegen.emit_jump();
 
-            // 6. Exception Path Start
+            // 8. Exception Path Start
             let exc_start = self.codegen.current_index();
             let catch_offset = exc_start as i32 - try_start as i32;
             self.codegen.patch_jump(try_start, catch_offset);
 
-            // 7. Handle Exception (Catch -> Finally -> Rethrow)
+            // 9. Handle Exception (Catch -> Finally -> Rethrow)
             self.codegen.enter_scope();
             let exc_reg = self.codegen.alloc_reg();
             self.codegen.emit(Instruction::Catch { dst: exc_reg });
 
-            // 8. Compile Finalizer (Exception Path)
+            // 10. Compile Finalizer (Exception Path)
             for stmt in &finalizer.body {
                 self.compile_statement(stmt)?;
             }
 
-            // 9. Rethrow
+            // 11. Rethrow
             self.codegen.emit(Instruction::Throw { src: exc_reg });
 
             self.codegen.free_reg(exc_reg);
             self.codegen.exit_scope();
 
-            // 10. Patch jump over exception path
+            // 12. Patch jump over exception path
             let end_offset = self.codegen.current_index() as i32 - jump_over_exc as i32;
             self.codegen.patch_jump(jump_over_exc, end_offset);
+
+            self.codegen.free_reg(completion_type_reg);
+            self.codegen.free_reg(return_value_reg);
         } else {
             // No finally, just standard Try/Catch
             if try_stmt.handler.is_none() {
@@ -4145,6 +4278,7 @@ impl Compiler {
         let is_generator = func.generator;
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
 
         // Declare binding for the function declaration.
         if let Some(ref n) = name {
@@ -4421,6 +4555,7 @@ impl Compiler {
         }
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(())
     }
 
@@ -4446,6 +4581,7 @@ impl Compiler {
                 .unwrap_or(false);
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
 
         // Name is already declared in hoisting phase 1, so skip declare_variable
 
@@ -4696,6 +4832,7 @@ impl Compiler {
         }
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(())
     }
 
@@ -4723,6 +4860,7 @@ impl Compiler {
         let is_generator = func.generator;
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
 
         // Enter function context (save outer function's lexical blocked names)
         self.push_function_scope_lexical_blocked();
@@ -4975,6 +5113,7 @@ impl Compiler {
         }
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(dst)
     }
 
@@ -4988,6 +5127,7 @@ impl Compiler {
         let inferred_name = self.pending_inferred_name.take();
 
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
 
         // Enter function context (save outer function's lexical blocked names)
         self.push_function_scope_lexical_blocked();
@@ -5205,6 +5345,7 @@ impl Compiler {
         }
 
         self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         Ok(dst)
     }
 
@@ -9004,7 +9145,11 @@ impl Compiler {
         &mut self,
         block: &oxc_ast::ast::StaticBlock,
     ) -> CompileResult<Register> {
-        // Save outer function's lexical blocked names
+        // Save outer function's lexical blocked names and loop stack.
+        // Static blocks are a new function boundary — break/continue from
+        // outside must not leak into the static block body.
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
         self.push_function_scope_lexical_blocked();
         self.codegen
             .enter_function(Some("<static_block>".to_string()));
@@ -9020,6 +9165,8 @@ impl Compiler {
         // Exit function and get a closure
         let func_idx = self.codegen.exit_function();
         self.pop_function_scope_lexical_blocked();
+        self.loop_stack = saved_loop_stack;
+        self.finally_stack = saved_finally_stack;
         let dst = self.codegen.alloc_reg();
         self.codegen.emit(Instruction::Closure {
             dst,
@@ -9234,7 +9381,7 @@ impl Compiler {
 
     /// Compile a switch statement
     fn compile_switch_statement(&mut self, stmt: &SwitchStatement) -> CompileResult<()> {
-        // 1. Compile discriminant
+        // 1. Compile discriminant (outside the switch block scope)
         let discriminant = self.compile_expression(&stmt.discriminant)?;
 
         // 2. Setup control scope for breaks
@@ -9248,18 +9395,11 @@ impl Compiler {
             iterator_reg: None,
         });
 
-        // 3. Jump to checks
-        let jump_to_checks = self.codegen.emit_jump();
+        // 3. Enter the switch block scope — per ES2023 §14.12.4, both the case
+        //    selector expressions and the case bodies execute in this environment.
+        self.codegen.enter_scope();
 
-        // 4. Compile bodies and track their entry points
-        let mut case_body_labels = Vec::with_capacity(stmt.cases.len());
-        let mut default_case_idx = None;
-
-        self.codegen.enter_scope(); // Switch scope
-
-        // Collect all lexical (let/const) names from ALL case bodies.
-        // Per B.3.3.3, a `let f` anywhere in the switch block blocks Annex B
-        // var extension for `function f(){}` in nested blocks.
+        // Collect all lexical (let/const) names from ALL case bodies for Annex B.
         let mut switch_lexical_names = HashSet::new();
         for case in &stmt.cases {
             for s in &case.consequent {
@@ -9273,22 +9413,84 @@ impl Compiler {
             }
         }
 
+        // Pre-declare all lexical bindings so they are in scope for all case
+        // tests and bodies (they share a single block environment).
+        for case in &stmt.cases {
+            for s in &case.consequent {
+                if let Statement::VariableDeclaration(decl) = s
+                    && decl.kind != VariableDeclarationKind::Var
+                {
+                    let kind = match decl.kind {
+                        VariableDeclarationKind::Const => crate::scope::VariableKind::Const,
+                        _ => crate::scope::VariableKind::Let,
+                    };
+                    for declarator in &decl.declarations {
+                        self.hoist_lexical_names_from_binding(&declarator.id, kind)?;
+                    }
+                }
+                // Hoist function declarations in switch cases
+                if let Statement::FunctionDeclaration(func) = s {
+                    if let Some(id) = &func.id {
+                        let name = id.name.to_string();
+                        self.check_identifier_early_error(&name, IdentifierContext::Declaration)?;
+                        let kind = if self.is_strict_mode() {
+                            crate::scope::VariableKind::Let
+                        } else {
+                            crate::scope::VariableKind::BlockScopedFunction
+                        };
+                        let _ = self.codegen.declare_variable_with_kind(&name, kind);
+                    }
+                }
+            }
+        }
+
+        // 4. Compile case tests inside the scope, collecting forward jumps.
+        let mut default_case_idx = None;
+        let mut case_match_jumps: Vec<Option<usize>> = Vec::with_capacity(stmt.cases.len());
+
+        for (i, case) in stmt.cases.iter().enumerate() {
+            if let Some(test) = &case.test {
+                let test_val = self.compile_expression(test)?;
+                let cond = self.codegen.alloc_reg();
+                self.codegen.emit(Instruction::StrictEq {
+                    dst: cond,
+                    lhs: discriminant,
+                    rhs: test_val,
+                });
+                let jump_match = self.codegen.emit_jump_if_true(cond);
+                self.codegen.free_reg(cond);
+                self.codegen.free_reg(test_val);
+                case_match_jumps.push(Some(jump_match));
+            } else {
+                if default_case_idx.is_some() {
+                    return Err(CompileError::syntax("Multiple default clauses", 0, 0));
+                }
+                default_case_idx = Some(i);
+                case_match_jumps.push(None);
+            }
+        }
+
+        // After all tests fail: jump to default case or to end
+        let jump_to_default_or_end = self.codegen.emit_jump();
+
+        // 5. Compile case bodies (inside the same scope), recording body starts
+        let mut case_body_starts: Vec<usize> = Vec::with_capacity(stmt.cases.len());
+
         let compile_result = self.with_lexical_blocked_var_names(switch_lexical_names, |this| {
             for (i, case) in stmt.cases.iter().enumerate() {
-                // Mark start of this case's body
                 let body_start = this.codegen.current_index();
-                case_body_labels.push(body_start);
+                case_body_starts.push(body_start);
 
-                if case.test.is_none() {
-                    if default_case_idx.is_some() {
-                        return Err(CompileError::syntax("Multiple default clauses", 0, 0));
-                    }
-                    default_case_idx = Some(i);
+                // Patch the match jump for this case to land at its body
+                if let Some(Some(jump_match)) = case_match_jumps.get(i) {
+                    let offset = body_start as i32 - *jump_match as i32;
+                    this.codegen.patch_jump(*jump_match, offset);
                 }
 
-                for stmt in &case.consequent {
-                    this.compile_statement(stmt)?;
+                for s in &case.consequent {
+                    this.compile_statement(s)?;
                 }
+                // Fall through to next case body (no implicit break)
             }
             Ok(())
         });
@@ -9296,62 +9498,25 @@ impl Compiler {
 
         self.codegen.exit_scope();
 
-        // 5. Jump to end (implicit fallthrough after last case)
-        let jump_to_end = self.codegen.emit_jump();
-
-        // 6. Checks Logic
-        let checks_start = self.codegen.current_index() as i32;
-        self.codegen
-            .patch_jump(jump_to_checks, checks_start - jump_to_checks as i32);
-
-        for (i, case) in stmt.cases.iter().enumerate() {
-            if let Some(test) = &case.test {
-                // Compile test expression
-                let test_val = self.compile_expression(test)?;
-
-                // Compare strict equality: discriminant === test
-                let cond = self.codegen.alloc_reg();
-                self.codegen.emit(Instruction::StrictEq {
-                    dst: cond,
-                    lhs: discriminant, // Register is Copy
-                    rhs: test_val,
-                });
-
-                // If match, jump to body
-                let jump_match = self.codegen.emit_jump_if_true(cond);
-                let body_label = case_body_labels[i] as i32;
-                self.codegen
-                    .patch_jump(jump_match, body_label - jump_match as i32);
-
-                self.codegen.free_reg(cond);
-                self.codegen.free_reg(test_val);
-            }
-        }
-
-        // Post-checks: Jump to default or end
+        // 6. Patch the default/end jump
         if let Some(default_idx) = default_case_idx {
-            let default_label = case_body_labels[default_idx] as i32;
-            let jmp = self.codegen.emit_jump();
-            self.codegen.patch_jump(jmp, default_label - jmp as i32);
+            let default_label = case_body_starts[default_idx] as i32;
+            self.codegen
+                .patch_jump(jump_to_default_or_end, default_label - jump_to_default_or_end as i32);
         } else {
-            let jmp = self.codegen.emit_jump();
             let end_label = self.codegen.current_index() as i32;
-            self.codegen.patch_jump(jmp, end_label - jmp as i32);
+            self.codegen
+                .patch_jump(jump_to_default_or_end, end_label - jump_to_default_or_end as i32);
         }
-
-        // 7. Cleanup
-        let end_label = self.codegen.current_index() as i32;
-        let jump_to_end_offset = end_label - jump_to_end as i32;
-        self.codegen.patch_jump(jump_to_end, jump_to_end_offset);
 
         self.codegen.free_reg(discriminant);
 
-        // Patch breaks
+        // 7. Patch breaks
         let scope = self.loop_stack.pop().unwrap();
+        let break_target = self.codegen.current_index();
         for break_jump in scope.break_jumps {
-            let current_offset = self.codegen.current_index() as i32;
-            self.codegen
-                .patch_jump(break_jump, current_offset - break_jump as i32);
+            let offset = break_target as i32 - break_jump as i32;
+            self.codegen.patch_jump(break_jump, offset);
         }
 
         Ok(())

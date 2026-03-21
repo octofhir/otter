@@ -401,6 +401,8 @@ fn opcode_name_from_instruction(instruction: &otter_vm_bytecode::Instruction) ->
         otter_vm_bytecode::Instruction::DefineProperty { .. } => "DefineProperty",
         otter_vm_bytecode::Instruction::SetPrototype { .. } => "SetPrototype",
         otter_vm_bytecode::Instruction::RequireCoercible { .. } => "RequireCoercible",
+        otter_vm_bytecode::Instruction::ThrowIfNotObject { .. } => "ThrowIfNotObject",
+        otter_vm_bytecode::Instruction::JumpTable { .. } => "JumpTable",
         otter_vm_bytecode::Instruction::InstanceOf { .. } => "InstanceOf",
         otter_vm_bytecode::Instruction::In { .. } => "In",
         otter_vm_bytecode::Instruction::NewObject { .. } => "NewObject",

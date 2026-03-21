@@ -122,6 +122,9 @@ pub enum Opcode {
     RequireCoercible = 0x5D,
     /// ToString conversion: dst = ToString(src)
     ToString = 0x5E,
+    /// ThrowIfNotObject - throws TypeError if value is not an object
+    /// Used after IteratorNext to validate iterator result is an object (7.4.2)
+    ThrowIfNotObject = 0x5F,
 
     // ==================== Objects ====================
     /// Get property: dst = obj\[key\]
@@ -196,6 +199,11 @@ pub enum Opcode {
     JumpIfNullish = 0x93,
     /// Jump if not null and not undefined
     JumpIfNotNullish = 0x94,
+    /// Jump table dispatch: reads integer from `index_reg`, jumps to
+    /// `targets[index]`. Falls through when index is out of range.
+    /// Used after `finally` blocks to dispatch deferred break/continue/return.
+    /// Per ES2023 §14.15.3 (try-finally abrupt completion handling).
+    JumpTable = 0x95,
 
     // ==================== Exception Handling ====================
     /// Begin try block
@@ -325,6 +333,7 @@ impl Opcode {
             0x5C => Some(Self::TypeOfName),
             0x5D => Some(Self::RequireCoercible),
             0x5E => Some(Self::ToString),
+            0x5F => Some(Self::ThrowIfNotObject),
 
             0x60 => Some(Self::GetProp),
             0x61 => Some(Self::SetProp),
@@ -362,6 +371,7 @@ impl Opcode {
             0x92 => Some(Self::JumpIfFalse),
             0x93 => Some(Self::JumpIfNullish),
             0x94 => Some(Self::JumpIfNotNullish),
+            0x95 => Some(Self::JumpTable),
 
             0xA0 => Some(Self::TryStart),
             0xA1 => Some(Self::TryEnd),
@@ -465,6 +475,7 @@ impl Opcode {
             Self::TypeOfName => "TypeOfName",
             Self::RequireCoercible => "RequireCoercible",
             Self::ToString => "ToString",
+            Self::ThrowIfNotObject => "ThrowIfNotObject",
             // Objects
             Self::GetProp => "GetProp",
             Self::SetProp => "SetProp",
@@ -502,6 +513,7 @@ impl Opcode {
             Self::JumpIfFalse => "JumpIfFalse",
             Self::JumpIfNullish => "JumpIfNullish",
             Self::JumpIfNotNullish => "JumpIfNotNullish",
+            Self::JumpTable => "JumpTable",
             // Exception handling
             Self::TryStart => "TryStart",
             Self::TryEnd => "TryEnd",
@@ -791,6 +803,11 @@ pub enum Instruction {
     RequireCoercible {
         src: Register,
     },
+    /// ThrowIfNotObject - throws TypeError if value is not an object/proxy/function
+    /// Used after IteratorNext to validate iterator result per spec 7.4.2
+    ThrowIfNotObject {
+        src: Register,
+    },
 
     // Objects
     GetProp {
@@ -995,6 +1012,13 @@ pub enum Instruction {
     JumpIfNotNullish {
         src: Register,
         offset: JumpOffset,
+    },
+    /// Jump table dispatch for try-finally abrupt completion handling.
+    /// Reads an integer from `index_reg` and jumps to `targets[index]`.
+    /// Falls through when the index is out of range (normal completion).
+    JumpTable {
+        index_reg: Register,
+        targets: Vec<JumpOffset>,
     },
 
     // Exception handling

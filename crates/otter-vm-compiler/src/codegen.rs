@@ -420,6 +420,35 @@ impl CodeGen {
         idx
     }
 
+    /// Patch a jump to point to the current instruction index.
+    pub fn patch_jump_to_current(&mut self, jump_index: usize) {
+        let target = self.current_index();
+        let offset = target as i32 - jump_index as i32;
+        self.patch_jump(jump_index, offset);
+    }
+
+    /// Emit a JumpTable with all-zero offsets; returns instruction index for later patching.
+    pub fn emit_jump_table(&mut self, index_reg: Register, count: usize) -> usize {
+        let idx = self.current_index();
+        self.emit(Instruction::JumpTable {
+            index_reg,
+            targets: vec![JumpOffset(0); count],
+        });
+        idx
+    }
+
+    /// Patch a specific slot in a JumpTable instruction.
+    pub fn patch_jump_table_slot(&mut self, jump_table_index: usize, slot: usize, target: usize) {
+        let offset = target as i32 - jump_table_index as i32;
+        if let Instruction::JumpTable { targets, .. } =
+            &mut self.current.instructions[jump_table_index]
+        {
+            targets[slot] = JumpOffset(offset);
+        } else {
+            panic!("Not a JumpTable instruction at index {jump_table_index}");
+        }
+    }
+
     /// Enter a block scope
     pub fn enter_scope(&mut self) {
         self.current.scopes.enter(false);

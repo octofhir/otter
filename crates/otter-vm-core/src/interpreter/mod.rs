@@ -3273,6 +3273,16 @@ impl Interpreter {
                 Ok(())
             }
 
+            Instruction::ThrowIfNotObject { src } => {
+                let value = *ctx.get_register(src.0);
+                if !value.is_object() && !value.is_proxy() && value.as_function().is_none() {
+                    return Err(VmError::type_error(
+                        "Iterator result is not an object",
+                    ));
+                }
+                Ok(())
+            }
+
             // ==================== Arithmetic ====================
             Instruction::Add {
                 dst,
@@ -4138,6 +4148,19 @@ impl Interpreter {
                 } else {
                     Ok(())
                 }
+            }
+
+            Instruction::JumpTable { index_reg, targets } => {
+                let val = *ctx.get_register(index_reg.0);
+                if let Some(n) = val.as_number() {
+                    let idx = n as usize;
+                    if idx < targets.len() {
+                        if let Some(offset) = targets.get(idx) {
+                            ctx.dispatch_action = Some(DispatchAction::Jump(offset.0));
+                        }
+                    }
+                }
+                Ok(())
             }
 
             // ==================== Exception Handling ====================

@@ -249,6 +249,7 @@ fn instruction_can_deopt(instruction: &Instruction) -> bool {
             | Instruction::JumpIfFalse { .. }
             | Instruction::JumpIfNullish { .. }
             | Instruction::JumpIfNotNullish { .. }
+            | Instruction::JumpTable { .. }
             | Instruction::Return { .. }
             | Instruction::ReturnUndefined
             | Instruction::Nop
@@ -275,6 +276,7 @@ fn instruction_may_throw(instruction: &Instruction) -> bool {
             | Instruction::JumpIfFalse { .. }
             | Instruction::JumpIfNullish { .. }
             | Instruction::JumpIfNotNullish { .. }
+            | Instruction::JumpTable { .. }
             | Instruction::TryStart { .. }
             | Instruction::TryEnd
             | Instruction::Catch { .. }
@@ -557,7 +559,9 @@ fn apply_instruction_uses(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::Nop
         | Instruction::Debugger
         | Instruction::Pop
-        | Instruction::Import { .. } => {}
+        | Instruction::Import { .. }
+        | Instruction::ThrowIfNotObject { .. }
+        | Instruction::JumpTable { .. } => {}
     }
 }
 
@@ -693,7 +697,9 @@ fn apply_instruction_defs(instruction: &Instruction, state: &mut LivenessState) 
         | Instruction::Debugger
         | Instruction::Pop
         | Instruction::Export { .. }
-        | Instruction::SetPropQuickened { .. } => {}
+        | Instruction::SetPropQuickened { .. }
+        | Instruction::ThrowIfNotObject { .. }
+        | Instruction::JumpTable { .. } => {}
     }
 }
 
@@ -853,7 +859,9 @@ fn instruction_boundary_class(
         | Instruction::Nop
         | Instruction::Debugger
         | Instruction::Pop
-        | Instruction::Dup { .. } => None,
+        | Instruction::Dup { .. }
+        | Instruction::ThrowIfNotObject { .. }
+        | Instruction::JumpTable { .. } => None,
     }
 }
 

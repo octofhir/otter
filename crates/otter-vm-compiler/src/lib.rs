@@ -15,6 +15,7 @@
 pub mod codegen;
 pub mod compiler;
 pub mod constant_fold;
+pub(crate) mod jump_control;
 pub mod dep_scanner;
 pub mod error;
 pub mod literal_validator;

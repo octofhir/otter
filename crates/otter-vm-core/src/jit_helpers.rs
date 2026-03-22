@@ -21,6 +21,9 @@ use otter_vm_jit::runtime_helpers::{
     JIT_CTX_SECONDARY_RESULT_OFFSET, RuntimeHelpers,
 };
 
+use crate::value::Value;
+use crate::interpreter::Interpreter;
+
 use crate::gc::GcRef;
 use crate::jit_stubs::{
     JitCallReentryState, call_with_reentry_state, otter_rt_call_function_stub,
@@ -183,8 +186,8 @@ const _: () = {
         "JitContext::interrupt_flag_ptr offset changed — update JIT_CTX_INTERRUPT_FLAG_PTR_OFFSET in runtime_helpers.rs"
     );
     assert!(
-        std::mem::size_of::<otter_vm_bytecode::function::JitIcProbe>() == 16,
-        "JitIcProbe size must be 16 bytes for JIT offset computation"
+        std::mem::size_of::<otter_vm_bytecode::function::JitIcProbe>() == 40,
+        "JitIcProbe size must be 40 bytes for JIT offset computation"
     );
     assert!(
         std::mem::offset_of!(crate::object::JsObject, jit_elements_data) as i32
@@ -4802,7 +4805,7 @@ extern "C" fn otter_rt_generic_add(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> 
 
     // Fast path: both are numbers
     if let (Some(l), Some(r)) = (jit_to_f64(lhs_raw), jit_to_f64(rhs_raw)) {
-        return crate::value::Value::number(l + r).to_jit_bits();
+        return crate::value::Value::number(l + r).to_jit_bits() as i64;
     }
 
     // String concatenation path
@@ -4845,13 +4848,83 @@ extern "C" fn otter_rt_generic_add(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64) -> 
                     };
 
                     return crate::value::Value::string(JsString::concat_gc(s_l, s_r))
-                        .to_jit_bits();
+                        .to_jit_bits() as i64;
                 }
             }
         }
     }
 
     BAILOUT_SENTINEL
+}
+
+/// Specialized JS `+` with type feedback update for JIT ICs.
+/// Signature: `(ctx: i64, lhs: i64, rhs: i64, ic_idx: i64) -> i64`
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_arith_add(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64, ic_idx_raw: i64) -> i64 {
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    let lhs = Value::from_jit_bits(lhs_raw as u64).unwrap_or(Value::undefined());
+    let rhs = Value::from_jit_bits(rhs_raw as u64).unwrap_or(Value::undefined());
+
+    // Update IC feedback
+    let func = unsafe { &*ctx.function_ptr };
+    let vm_ctx = unsafe { &*ctx.vm_ctx };
+    Interpreter::update_arithmetic_ic_on_function(vm_ctx, func, ic_idx_raw as u16, &lhs, &rhs, None);
+
+    // Perform operation using Interpreter
+    let interp = unsafe { &*ctx.interpreter };
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    interp
+        .op_add(vm_ctx, &lhs, &rhs)
+        .map(|v| v.to_jit_bits() as i64)
+        .unwrap_or(BAILOUT_SENTINEL)
+}
+
+/// Specialized JS `-` with type feedback update for JIT ICs.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_arith_sub(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64, ic_idx_raw: i64) -> i64 {
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    let lhs = Value::from_jit_bits(lhs_raw as u64).unwrap_or(Value::undefined());
+    let rhs = Value::from_jit_bits(rhs_raw as u64).unwrap_or(Value::undefined());
+    let func = unsafe { &*ctx.function_ptr };
+    Interpreter::update_arithmetic_ic_on_function(unsafe { &*ctx.vm_ctx }, func, ic_idx_raw as u16, &lhs, &rhs, None);
+    let interp = unsafe { &*ctx.interpreter };
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    interp
+        .op_sub(vm_ctx, &lhs, &rhs)
+        .map(|v| v.to_jit_bits() as i64)
+        .unwrap_or(BAILOUT_SENTINEL)
+}
+
+/// Specialized JS `*` with type feedback update for JIT ICs.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_arith_mul(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64, ic_idx_raw: i64) -> i64 {
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    let lhs = Value::from_jit_bits(lhs_raw as u64).unwrap_or(Value::undefined());
+    let rhs = Value::from_jit_bits(rhs_raw as u64).unwrap_or(Value::undefined());
+    let func = unsafe { &*ctx.function_ptr };
+    Interpreter::update_arithmetic_ic_on_function(unsafe { &*ctx.vm_ctx }, func, ic_idx_raw as u16, &lhs, &rhs, None);
+    let interp = unsafe { &*ctx.interpreter };
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    interp
+        .op_mul(vm_ctx, &lhs, &rhs)
+        .map(|v| v.to_jit_bits() as i64)
+        .unwrap_or(BAILOUT_SENTINEL)
+}
+
+/// Specialized JS `/` with type feedback update for JIT ICs.
+#[allow(unsafe_code)]
+extern "C" fn otter_rt_arith_div(ctx_raw: i64, lhs_raw: i64, rhs_raw: i64, ic_idx_raw: i64) -> i64 {
+    let ctx = unsafe { &*(ctx_raw as *const JitContext) };
+    let lhs = Value::from_jit_bits(lhs_raw as u64).unwrap_or(Value::undefined());
+    let rhs = Value::from_jit_bits(rhs_raw as u64).unwrap_or(Value::undefined());
+    let func = unsafe { &*ctx.function_ptr };
+    Interpreter::update_arithmetic_ic_on_function(unsafe { &*ctx.vm_ctx }, func, ic_idx_raw as u16, &lhs, &rhs, None);
+    let interp = unsafe { &*ctx.interpreter };
+    let vm_ctx = unsafe { &mut *ctx.vm_ctx };
+    interp
+        .op_div(vm_ctx, &lhs, &rhs)
+        .map(|v| v.to_jit_bits() as i64)
+        .unwrap_or(BAILOUT_SENTINEL)
 }
 
 /// Generic JS `-` for numeric operands.
@@ -5348,6 +5421,10 @@ pub fn build_runtime_helpers() -> RuntimeHelpers {
         register_helper_4!(HelperKind::GenericBitOp, otter_rt_generic_bitop);
         register_helper_2!(HelperKind::GenericBitNot, otter_rt_generic_bitnot);
         register_helper_2!(HelperKind::GenericNot, otter_rt_generic_not);
+        register_helper_4!(HelperKind::ArithAdd, otter_rt_arith_add);
+        register_helper_4!(HelperKind::ArithSub, otter_rt_arith_sub);
+        register_helper_4!(HelperKind::ArithMul, otter_rt_arith_mul);
+        register_helper_4!(HelperKind::ArithDiv, otter_rt_arith_div);
         register_helper_3!(HelperKind::GetPropMono, otter_rt_get_prop_mono_stub);
         register_helper_4!(HelperKind::SetPropMono, otter_rt_set_prop_mono_impl);
         register_helper_3!(HelperKind::GetElemDense, otter_rt_get_elem_dense_impl);

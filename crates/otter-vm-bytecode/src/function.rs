@@ -101,6 +101,19 @@ pub enum InlineCacheState {
     },
     /// Megamorphic state: too many shapes seen, fallback to slow path
     Megamorphic,
+    /// Monomorphic call target: single function identity cached
+    MonoCall {
+        /// The function object ID (GcRef<Function>)
+        func_id: u64,
+        /// JIT-compiled entry point (if any)
+        jit_entry: u64,
+    },
+    /// Polymorphic call targets
+    PolyCall {
+        count: u8,
+        /// Array of (func_id, jit_entry)
+        entries: [(u64, u64); 4],
+    },
     /// Quickened arithmetic specialization type
     ArithmeticFastPath(ArithmeticType),
 }
@@ -566,8 +579,14 @@ pub struct JitIcProbe {
     pub shape_id: u64,
     /// Property offset for monomorphic fast path
     pub offset: u32,
-    /// Probe state: 0=not ready, 1=mono depth=0 (inline read/write), 2=other
+    /// Probe state: 0=not ready, 1=mono depth=0 (inline read/write), 2=other, 3=call mono
     pub state: u32,
+    /// Function object ID for monomorphic calls
+    pub func_id: u64,
+    /// JIT-compiled entry point for monomorphic calls
+    pub jit_entry: u64,
+    /// Reserved for future use
+    pub reserved: u64,
 }
 
 impl JitIcProbe {
@@ -577,9 +596,11 @@ impl JitIcProbe {
     pub const STATE_MONO_INLINE: u32 = 1;
     /// State value: polymorphic/megamorphic/proto-chain — use helper
     pub const STATE_OTHER: u32 = 2;
+    /// State value: monomorphic call target
+    pub const STATE_CALL_MONO: u32 = 3;
 
     /// Size of this struct in bytes (for JIT offset computation)
-    pub const SIZE: i32 = 16;
+    pub const SIZE: i32 = 40;
 
     /// Byte offset of `shape_id` field
     pub const SHAPE_ID_OFFSET: i32 = 0;
@@ -587,6 +608,10 @@ impl JitIcProbe {
     pub const OFFSET_OFFSET: i32 = 8;
     /// Byte offset of `state` field
     pub const STATE_OFFSET: i32 = 12;
+    /// Byte offset of `func_id` field
+    pub const FUNC_ID_OFFSET: i32 = 16;
+    /// Byte offset of `jit_entry` field
+    pub const JIT_ENTRY_OFFSET: i32 = 24;
 
     /// Update this probe to reflect a monomorphic IC with depth=0
     #[inline]
@@ -600,6 +625,14 @@ impl JitIcProbe {
     #[inline]
     pub fn set_other(&mut self) {
         self.state = Self::STATE_OTHER;
+    }
+
+    /// Update this probe to reflect a monomorphic call target
+    #[inline]
+    pub fn set_call_mono(&mut self, func_id: u64, jit_entry: u64) {
+        self.func_id = func_id;
+        self.jit_entry = jit_entry;
+        self.state = Self::STATE_CALL_MONO;
     }
 }
 

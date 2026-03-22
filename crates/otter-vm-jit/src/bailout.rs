@@ -50,6 +50,8 @@ pub enum BailoutReason {
     HelperReturnedSentinel = 1,
     /// A speculative/type fast path failed and entered the slow bailout branch.
     TypeGuardFailure = 2,
+    /// Operation is too complex for the current JIT tier (e.g., non-native call).
+    ComplexOperation = 3,
 }
 
 impl BailoutReason {
@@ -65,6 +67,7 @@ impl BailoutReason {
         match code {
             1 => Self::HelperReturnedSentinel,
             2 => Self::TypeGuardFailure,
+            3 => Self::ComplexOperation,
             _ => Self::Unknown,
         }
     }

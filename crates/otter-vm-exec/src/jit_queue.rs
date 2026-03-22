@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use otter_vm_bytecode::function::InlineCacheState;
 use otter_vm_bytecode::function::UpvalueCapture;
 use otter_vm_bytecode::{Constant, Function, Module};
-use otter_vm_jit::translator::can_translate_function_with_helpers;
+use otter_vm_jit::opt::compiler::can_translate_function_with_helpers;
 
 /// Maximum instruction count for a function to be eligible for inlining.
 const INLINE_BUDGET: usize = 32;

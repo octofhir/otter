@@ -639,7 +639,7 @@ impl Interpreter {
 
     /// Observe the type of a value for type feedback collection
     #[inline]
-    pub(super) fn observe_value_type(type_flags: &mut TypeFlags, value: &Value) {
+    pub(crate) fn observe_value_type(type_flags: &mut TypeFlags, value: &Value) {
         if value.is_undefined() {
             type_flags.observe_undefined();
         } else if value.is_null() {
@@ -660,7 +660,7 @@ impl Interpreter {
     }
 
     /// Add operation (handles string concatenation)
-    pub(super) fn op_add(
+    pub(crate) fn op_add(
         &self,
         ctx: &mut VmContext,
         left: &Value,
@@ -703,6 +703,66 @@ impl Interpreter {
         let left_num = self.to_number_value(ctx, &left_prim)?;
         let right_num = self.to_number_value(ctx, &right_prim)?;
         Ok(Value::number(left_num + right_num))
+    }
+
+    pub(crate) fn op_sub(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+    ) -> VmResult<Value> {
+        let left_num = self.to_numeric(ctx, left)?;
+        let right_num = self.to_numeric(ctx, right)?;
+        match (left_num, right_num) {
+            (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                Ok(Value::bigint((l - r).to_string()))
+            }
+            (Numeric::Number(l), Numeric::Number(r)) => {
+                Ok(Value::number(l - r))
+            }
+            _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
+        }
+    }
+
+    pub(crate) fn op_mul(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+    ) -> VmResult<Value> {
+        let left_num = self.to_numeric(ctx, left)?;
+        let right_num = self.to_numeric(ctx, right)?;
+        match (left_num, right_num) {
+            (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                Ok(Value::bigint((l * r).to_string()))
+            }
+            (Numeric::Number(l), Numeric::Number(r)) => {
+                Ok(Value::number(l * r))
+            }
+            _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
+        }
+    }
+
+    pub(crate) fn op_div(
+        &self,
+        ctx: &mut VmContext,
+        left: &Value,
+        right: &Value,
+    ) -> VmResult<Value> {
+        let left_num = self.to_numeric(ctx, left)?;
+        let right_num = self.to_numeric(ctx, right)?;
+        match (left_num, right_num) {
+            (Numeric::BigInt(l), Numeric::BigInt(r)) => {
+                if r.is_zero() {
+                    return Err(VmError::range_error("Division by zero"));
+                }
+                Ok(Value::bigint((l / r).to_string()))
+            }
+            (Numeric::Number(l), Numeric::Number(r)) => {
+                Ok(Value::number(l / r))
+            }
+            _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
+        }
     }
 
     /// Internal method dispatch helper for spread

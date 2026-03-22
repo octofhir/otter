@@ -233,10 +233,18 @@ pub enum HelperKind {
     GcWriteBarrier = 92,
     /// `(value_raw) -> string_value | BAILOUT` — primitive toString() (no ctx, no method resolution)
     PrimitiveToString = 93,
+    /// (ctx, lhs, rhs, ic_idx) -> value
+    ArithAdd = 94,
+    /// (ctx, lhs, rhs, ic_idx) -> value
+    ArithSub = 95,
+    /// (ctx, lhs, rhs, ic_idx) -> value
+    ArithMul = 96,
+    /// (ctx, lhs, rhs, ic_idx) -> value
+    ArithDiv = 97,
 }
 
 /// Total number of helper kinds.
-pub const HELPER_COUNT: usize = 94;
+pub const HELPER_COUNT: usize = 98;
 
 /// Number of helper telemetry families.
 pub const HELPER_FAMILY_COUNT: usize = 10;
@@ -662,6 +670,10 @@ impl HelperKind {
             Self::ArrayPop => "otter_rt_array_pop",
             Self::GcWriteBarrier => "otter_rt_gc_write_barrier",
             Self::PrimitiveToString => "otter_rt_primitive_to_string",
+            Self::ArithAdd => "otter_rt_arith_add",
+            Self::ArithSub => "otter_rt_arith_sub",
+            Self::ArithMul => "otter_rt_arith_mul",
+            Self::ArithDiv => "otter_rt_arith_div",
         }
     }
 
@@ -731,7 +743,11 @@ impl HelperKind {
             | Self::GenericBitOp
             | Self::GenericBitNot
             | Self::GenericNot
-            | Self::Pow => 4,
+            | Self::Pow
+            | Self::ArithAdd
+            | Self::ArithSub
+            | Self::ArithMul
+            | Self::ArithDiv => 4,
 
             Self::TypeOf
             | Self::TypeOfName
@@ -847,7 +863,11 @@ impl HelperKind {
             | Self::AsyncGeneratorClosure
             | Self::ArrayPush
             | Self::ArrayPop
-            | Self::PrimitiveToString => HelperSafetyClass::AllocatingLeaf,
+            | Self::PrimitiveToString
+            | Self::ArithAdd
+            | Self::ArithSub
+            | Self::ArithMul
+            | Self::ArithDiv => HelperSafetyClass::AllocatingLeaf,
 
             Self::CallFunction
             | Self::Construct
@@ -919,8 +939,7 @@ impl HelperKind {
             | Self::AwaitOp
             | Self::CheckTierUp
             | Self::ArrayPop
-            | Self::GcWriteBarrier
-            | Self::PrimitiveToString => 1,
+            | Self::GcWriteBarrier => 1,
             Self::LoadConst
             | Self::NewArray
             | Self::ThrowValue
@@ -949,7 +968,10 @@ impl HelperKind {
             | Self::AsyncClosure
             | Self::GeneratorClosure
             | Self::AsyncGeneratorClosure
-            | Self::ArrayPush => 2,
+            | Self::ArrayPush
+            | Self::PrimitiveToString
+            | Self::ImportOp
+            | Self::ForInNext => 2,
             Self::GetGlobal
             | Self::DeleteProp
             | Self::SetUpvalue
@@ -971,7 +993,8 @@ impl HelperKind {
             | Self::CallSuper
             | Self::GetPropMono
             | Self::GetElemInt
-            | Self::GetElemDense => 3,
+            | Self::GetElemDense
+            | Self::ExportOp => 3,
             Self::GetPropConst
             | Self::GetProp
             | Self::GetElem
@@ -986,7 +1009,11 @@ impl HelperKind {
             | Self::InOp
             | Self::TailCallHelper
             | Self::DefineClass
-            | Self::SetPropMono => 4,
+            | Self::SetPropMono
+            | Self::ArithAdd
+            | Self::ArithSub
+            | Self::ArithMul
+            | Self::ArithDiv => 4,
             Self::SetPropConst
             | Self::SetProp
             | Self::SetElem
@@ -998,8 +1025,6 @@ impl HelperKind {
             | Self::CallMono
             | Self::CallFfi => 5,
             Self::CallMethod | Self::CallMethodComputed => 6,
-            Self::ImportOp | Self::ForInNext => 2,
-            Self::ExportOp => 3,
         }
     }
 

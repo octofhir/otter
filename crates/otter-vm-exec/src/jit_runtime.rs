@@ -41,6 +41,8 @@ pub struct JitRuntimeStats {
     pub execute_bailouts_helper: u64,
     /// Bailouts from type/speculation guard failure.
     pub execute_bailouts_type_guard: u64,
+    /// Bailouts from complex operations not yet JIT-supported.
+    pub execute_bailouts_complex: u64,
     /// Number of functions deoptimized after repeated bailouts.
     pub deoptimizations: u64,
     /// Current number of compiled functions cached in runtime state.
@@ -209,6 +211,7 @@ struct JitRuntimeState {
     bailout_unknown: u64,
     bailout_helper: u64,
     bailout_type_guard: u64,
+    bailout_complex: u64,
     bailout_site_counts: HashMap<(u64, u32, u32), BailoutSiteCounter>,
     last_bailout_module_id: Option<u64>,
     last_bailout_function_index: Option<u32>,
@@ -887,6 +890,9 @@ pub fn try_execute_jit_raw(
             BailoutReason::TypeGuardFailure => {
                 state.bailout_type_guard = state.bailout_type_guard.saturating_add(1);
             }
+            BailoutReason::ComplexOperation => {
+                state.bailout_complex = state.bailout_complex.saturating_add(1);
+            }
         }
         let has_mapped_site = telemetry.pc.is_some_and(|pc| {
             state
@@ -1079,6 +1085,7 @@ pub fn stats_snapshot() -> JitRuntimeStats {
         execute_bailouts_unknown: state.bailout_unknown,
         execute_bailouts_helper: state.bailout_helper,
         execute_bailouts_type_guard: state.bailout_type_guard,
+        execute_bailouts_complex: state.bailout_complex,
         deoptimizations: state.total_deoptimizations,
         compiled_functions: state.compiled_entries.len() as u64,
         last_bailout_module_id: state.last_bailout_module_id,

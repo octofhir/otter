@@ -10,7 +10,6 @@ use otter_vm_bytecode::instruction::Instruction;
 use otter_vm_bytecode::{Constant, Function};
 
 use crate::runtime_helpers::{HelperFuncIds, HelperRefs, HelperSafetyClass, RuntimeHelpers};
-use crate::translator;
 
 /// Result of compiling a bytecode function to native code.
 #[derive(Debug)]
@@ -19,7 +18,7 @@ pub struct JitCompileArtifact {
     pub code_ptr: *const u8,
     /// Finalized native code size in bytes.
     pub code_size_bytes: u64,
-    _owned_code: Option<OwnedJitCode>,
+    pub(crate) _owned_code: Option<OwnedJitCode>,
 }
 
 // SAFETY: `code_ptr` always points into `_owned_code`'s JITModule allocation.
@@ -27,8 +26,11 @@ pub struct JitCompileArtifact {
 // machine code remains owned until the artifact is dropped.
 unsafe impl Send for JitCompileArtifact {}
 
-struct OwnedJitCode {
-    module: Option<JITModule>,
+use dynasmrt::ExecutableBuffer;
+
+pub enum OwnedJitCode {
+    Cranelift(Option<JITModule>),
+    Dynasm(ExecutableBuffer),
 }
 
 impl std::fmt::Debug for OwnedJitCode {
@@ -38,24 +40,32 @@ impl std::fmt::Debug for OwnedJitCode {
 }
 
 impl OwnedJitCode {
-    fn new(module: JITModule) -> Self {
-        Self {
-            module: Some(module),
-        }
+    pub fn new_cranelift(module: JITModule) -> Self {
+        Self::Cranelift(Some(module))
+    }
+    pub fn new_dynasm(buf: ExecutableBuffer) -> Self {
+        Self::Dynasm(buf)
     }
 }
 
 impl Drop for OwnedJitCode {
     fn drop(&mut self) {
-        if let Some(module) = self.module.take() {
-            unsafe {
-                // SAFETY: compiled entry removal only happens after the runtime
-                // stops publishing the function pointer. No code should execute
-                // from this module after ownership is dropped.
-                module.free_memory();
+        if let Self::Cranelift(module) = self {
+            if let Some(m) = module.take() {
+                unsafe {
+                    m.free_memory();
+                }
             }
         }
     }
+}
+
+pub trait CompilerBackend {
+    fn compile_function(
+        &mut self,
+        function: &Function,
+    ) -> Result<JitCompileArtifact, JitError>;
+    fn host_call_conv(&self) -> cranelift_codegen::isa::CallConv;
 }
 
 impl JitCompileArtifact {
@@ -1150,6 +1160,13 @@ impl JitCompiler {
         constants: &[Constant],
         module_functions: &[(u32, Function)],
     ) -> Result<(JitCompileArtifact, DeoptMetadata), JitError> {
+        // FAST PATH: Try baseline compiler first!
+        let mut baseline = crate::baseline::BaselineCompiler::new();
+        if let Ok(artifact) = baseline.compile_function(function) {
+            let metadata = build_deopt_metadata(function);
+            return Ok((artifact, metadata));
+        }
+
         let (mut module, helper_func_ids) = self.make_module()?;
         let mut signature = module.make_signature();
         // Signature: (ctx: I64, args_ptr: I64, argc: I32) -> I64
@@ -1180,7 +1197,7 @@ impl JitCompiler {
         {
             let mut builder =
                 FunctionBuilder::new(&mut self.context.func, &mut self.function_builder_ctx);
-            translator::translate_function_with_constants(
+            crate::opt::compiler::translate_function_with_constants(
                 &mut builder,
                 function,
                 constants,
@@ -1205,7 +1222,7 @@ impl JitCompiler {
             JitCompileArtifact {
                 code_ptr,
                 code_size_bytes,
-                _owned_code: Some(OwnedJitCode::new(module)),
+                _owned_code: Some(OwnedJitCode::new_cranelift(module)),
             },
             metadata,
         ))

@@ -25,47 +25,57 @@ impl Interpreter {
     }
 
     #[inline]
-    pub(super) fn update_arithmetic_ic(
+    pub(crate) fn update_arithmetic_ic(
         ctx: &VmContext,
         feedback_index: u16,
         left: &Value,
         right: &Value,
     ) {
         if let Some(frame) = ctx.current_frame() {
-            let feedback = frame.feedback().write();
-            if let Some(ic) = feedback.get_mut(feedback_index as usize) {
-                Self::observe_value_type(&mut ic.type_observations, left);
-                Self::observe_value_type(&mut ic.type_observations, right);
+            let function = ctx.module_table.get(frame.module_id).function(frame.function_index).unwrap();
+            Self::update_arithmetic_ic_on_function(ctx, function, feedback_index, left, right, Some(frame.pc));
+        }
+    }
 
-                let new_ty = if ic.type_observations.is_int32_only() {
-                    Some(otter_vm_bytecode::function::ArithmeticType::Int32)
-                } else if ic.type_observations.is_numeric_only() {
-                    Some(otter_vm_bytecode::function::ArithmeticType::Number)
-                } else if !ic.type_observations.seen_object
-                    && !ic.type_observations.seen_function
-                    && ic.type_observations.seen_string
-                {
-                    Some(otter_vm_bytecode::function::ArithmeticType::String)
-                } else {
-                    None
-                };
+    pub(crate) fn update_arithmetic_ic_on_function(
+        ctx: &VmContext,
+        func: &otter_vm_bytecode::Function,
+        feedback_index: u16,
+        left: &Value,
+        right: &Value,
+        pc: Option<usize>,
+    ) {
+        let mut feedback = func.feedback_vector.write();
+        if let Some(ic) = feedback.get_mut(feedback_index as usize) {
+            Self::observe_value_type(&mut ic.type_observations, left);
+            Self::observe_value_type(&mut ic.type_observations, right);
 
-                if let Some(ty) = new_ty {
-                    ic.ic_state =
-                        otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
-                } else {
-                    ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
-                }
+            let new_ty = if ic.type_observations.is_int32_only() {
+                Some(otter_vm_bytecode::function::ArithmeticType::Int32)
+            } else if ic.type_observations.is_numeric_only() {
+                Some(otter_vm_bytecode::function::ArithmeticType::Number)
+            } else if !ic.type_observations.seen_object
+                && !ic.type_observations.seen_function
+                && ic.type_observations.seen_string
+            {
+                Some(otter_vm_bytecode::function::ArithmeticType::String)
+            } else {
+                None
+            };
 
-                // Quickening: after enough consistent observations, specialize the instruction
-                ic.hit_count = ic.hit_count.saturating_add(1);
-                if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
-                    let frame_module = ctx.module_table.get(frame.module_id);
-                    if let Some(func) = frame_module.function(frame.function_index) {
-                        let pc = frame.pc;
-                        let instr = &func.instructions.read()[pc];
-                        Self::try_quicken_arithmetic(func, pc, instr, &ic.type_observations);
-                    }
+            if let Some(ty) = new_ty {
+                ic.ic_state =
+                    otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
+            } else {
+                ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
+            }
+
+            // Quickening: after enough consistent observations, specialize the instruction
+            ic.hit_count = ic.hit_count.saturating_add(1);
+            if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
+                if let Some(pc) = pc {
+                    let instr = &func.instructions.read()[pc];
+                    Self::try_quicken_arithmetic(func, pc, instr, &ic.type_observations);
                 }
             }
         }
@@ -146,7 +156,7 @@ impl Interpreter {
 
     /// Attempt to quicken an arithmetic instruction based on type observations.
     #[inline]
-    pub(super) fn try_quicken_arithmetic(
+    pub(crate) fn try_quicken_arithmetic(
         func: &otter_vm_bytecode::Function,
         pc: usize,
         instruction: &Instruction,

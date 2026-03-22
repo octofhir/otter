@@ -999,6 +999,16 @@ impl Value {
         (self.bits & TAG_MASK) == TAG_PTR_FUNCTION
     }
 
+    /// Get unique function ID (payload of internal pointer)
+    #[inline]
+    pub fn function_id(&self) -> u64 {
+        if self.is_function() {
+            self.bits & PAYLOAD_MASK
+        } else {
+            0
+        }
+    }
+
     /// Check if value is a promise
     #[inline]
     #[allow(unsafe_code)]

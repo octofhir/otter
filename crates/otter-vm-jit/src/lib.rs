@@ -9,8 +9,9 @@ pub mod bailout;
 pub mod compiler;
 mod loop_analysis;
 pub mod runtime_helpers;
-pub mod translator;
 mod type_guards;
+pub mod baseline;
+pub mod opt;
 
 pub use bailout::{BAILOUT_SENTINEL, BailoutReason, DEOPT_THRESHOLD, is_bailout};
 pub use compiler::{DeoptMetadata, DeoptResumeSite, JitCompileArtifact, JitCompiler, JitError};

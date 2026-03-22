@@ -11,7 +11,7 @@
 //!
 //! This ABI is shared by Tier 1 and Tier 2. No tier-specific conventions.
 
-use cranelift_codegen::ir::{types, AbiParam, Signature};
+use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 
 /// Build the Cranelift signature for a JIT-compiled function.

@@ -33,7 +33,9 @@ pub fn emit_box_int32(builder: &mut FunctionBuilder, val: Value) -> Value {
 /// Box an f64 value into NaN-boxed u64.
 /// Result = bitcast(f64 → i64)
 pub fn emit_box_float64(builder: &mut FunctionBuilder, val: Value) -> Value {
-    builder.ins().bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), val)
+    builder
+        .ins()
+        .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), val)
 }
 
 /// Box a boolean into NaN-boxed u64.
@@ -53,7 +55,9 @@ pub fn emit_unbox_int32(builder: &mut FunctionBuilder, val: Value) -> Value {
 /// Unbox an f64 from NaN-boxed u64 (unchecked).
 /// Result = bitcast(i64 → f64)
 pub fn emit_unbox_float64(builder: &mut FunctionBuilder, val: Value) -> Value {
-    builder.ins().bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), val)
+    builder
+        .ins()
+        .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), val)
 }
 
 /// Check if a NaN-boxed value is an Int32.
@@ -75,12 +79,16 @@ pub fn emit_is_float64(builder: &mut FunctionBuilder, val: Value) -> Value {
     let tag_mask = builder.ins().iconst(types::I64, TAG_MASK as i64);
     let tag = builder.ins().band(val, tag_mask);
     let ptr_threshold = builder.ins().iconst(types::I64, TAG_PTR_OBJECT as i64);
-    let is_not_ptr = builder.ins().icmp(IntCC::UnsignedLessThan, tag, ptr_threshold);
+    let is_not_ptr = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, tag, ptr_threshold);
 
     let int32_mask = builder.ins().iconst(types::I64, INT32_TAG_MASK as i64);
     let int32_tag = builder.ins().band(val, int32_mask);
     let expected_int32 = builder.ins().iconst(types::I64, TAG_INT32 as i64);
-    let is_not_int32 = builder.ins().icmp(IntCC::NotEqual, int32_tag, expected_int32);
+    let is_not_int32 = builder
+        .ins()
+        .icmp(IntCC::NotEqual, int32_tag, expected_int32);
 
     builder.ins().band(is_not_ptr, is_not_int32)
 }

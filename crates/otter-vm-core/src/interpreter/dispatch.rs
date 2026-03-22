@@ -176,21 +176,19 @@ impl Interpreter {
     ///
     /// The frame's locals are already initialized from args.
     /// register_base points to the callee's window.
-    fn try_jit_call(
-        &self,
-        ctx: &mut VmContext,
-        module_id: u64,
-        func_index: u32,
-    ) -> JitOutcome {
+    fn try_jit_call(&self, ctx: &mut VmContext, module_id: u64, func_index: u32) -> JitOutcome {
         // Read frame state — frame is already pushed and active.
-        let this_val = ctx.current_frame()
+        let this_val = ctx
+            .current_frame()
             .map(|f| f.this_value)
             .unwrap_or_else(Value::undefined);
-        let callee_raw = ctx.current_frame()
+        let callee_raw = ctx
+            .current_frame()
             .and_then(|f| f.callee_value)
             .map(|v| v.to_jit_bits() as u64)
             .unwrap_or(otter_jit::codegen::value_repr::TAG_UNDEFINED);
-        let home_obj_raw = ctx.current_frame()
+        let home_obj_raw = ctx
+            .current_frame()
             .and_then(|f| f.home_object)
             .map(|ho| Value::object(ho).to_jit_bits() as u64)
             .unwrap_or(otter_jit::codegen::value_repr::TAG_UNDEFINED);

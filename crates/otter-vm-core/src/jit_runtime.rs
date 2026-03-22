@@ -33,9 +33,7 @@ pub(crate) fn try_execute_jit(
     proto_epoch: u64,
     interrupt_flag: *const u8,
 ) -> JitCallResult {
-    let registers_base = unsafe {
-        registers_ptr.add(register_base) as *mut u64
-    };
+    let registers_base = unsafe { registers_ptr.add(register_base) as *mut u64 };
 
     let result = unsafe {
         otter_jit::pipeline::try_execute(

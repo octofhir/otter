@@ -239,12 +239,15 @@ pub(super) fn install_duration(
         let field_name: &'static str = field;
         // Capture field index instead of string — index is a plain usize, immune
         // to any pointer corruption from GC bugs, and avoids the string match.
-        let field_index: usize = DURATION_FIELDS.iter().position(|&f| f == field_name).unwrap();
+        let field_index: usize = DURATION_FIELDS
+            .iter()
+            .position(|&f| f == field_name)
+            .unwrap();
         let getter_fn = Value::native_function_with_proto(
             move |this, _args, _ncx| {
-                let obj = this.as_object().ok_or_else(|| {
-                    VmError::type_error("getter called on non-Duration")
-                })?;
+                let obj = this
+                    .as_object()
+                    .ok_or_else(|| VmError::type_error("getter called on non-Duration"))?;
                 let dur = extract_duration(&obj)?;
                 let val = match field_index {
                     0 => dur.years() as f64,

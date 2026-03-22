@@ -181,7 +181,8 @@ fn target_set(
         match crate::typed_array_ops::canonical_numeric_index(key) {
             Some(crate::typed_array_ops::CanonicalIndex::Int(idx)) => {
                 // Check SameValue(target, receiver)
-                let is_same = receiver.as_typed_array()
+                let is_same = receiver
+                    .as_typed_array()
                     .map(|r| std::ptr::eq(r.as_ptr(), ta.as_ptr()))
                     .unwrap_or(false);
                 if !is_same {

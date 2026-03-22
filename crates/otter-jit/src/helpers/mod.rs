@@ -6,7 +6,7 @@
 //! The helper function pointers are provided by the VM core at initialization
 //! time via `HelperTable`. The JIT crate only defines the interfaces.
 
-use cranelift_codegen::ir::{types, AbiParam, Signature};
+use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 
 /// A table of runtime helper function pointers.

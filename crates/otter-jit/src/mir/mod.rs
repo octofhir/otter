@@ -5,10 +5,10 @@
 //!
 //! Pipeline: `bytecode -> MIR -> [optimize] -> CLIF -> machine code`
 
-pub mod types;
-pub mod nodes;
-pub mod graph;
-pub mod display;
-pub mod verify;
 pub mod builder;
+pub mod display;
+pub mod graph;
+pub mod nodes;
 pub mod passes;
+pub mod types;
+pub mod verify;

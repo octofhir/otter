@@ -997,8 +997,7 @@ fn apply_replacement(
                         result.push('<');
                         i += 2;
                     } else if let Some(groups) = named_captures
-                        && let Some(close) =
-                            chars[i + 2..].iter().position(|&c| c == '>')
+                        && let Some(close) = chars[i + 2..].iter().position(|&c| c == '>')
                     {
                         // Named group reference: $<name>
                         let name: String = chars[i + 2..i + 2 + close].iter().collect();

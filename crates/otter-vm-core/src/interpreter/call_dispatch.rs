@@ -297,7 +297,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
+                        self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        )?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -308,7 +317,9 @@ impl Interpreter {
                         upvalues,
                     } => {
                         ctx.pop_frame_discard();
-                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
+                        self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        )?;
                     }
                     DispatchAction::Suspend { .. } => {
                         // Can't handle suspension in direct call, return undefined
@@ -607,12 +618,8 @@ impl Interpreter {
         let left_num = self.to_numeric(ctx, left)?;
         let right_num = self.to_numeric(ctx, right)?;
         match (left_num, right_num) {
-            (Numeric::BigInt(l), Numeric::BigInt(r)) => {
-                Ok(Value::bigint((l - r).to_string()))
-            }
-            (Numeric::Number(l), Numeric::Number(r)) => {
-                Ok(Value::number(l - r))
-            }
+            (Numeric::BigInt(l), Numeric::BigInt(r)) => Ok(Value::bigint((l - r).to_string())),
+            (Numeric::Number(l), Numeric::Number(r)) => Ok(Value::number(l - r)),
             _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
         }
     }
@@ -626,12 +633,8 @@ impl Interpreter {
         let left_num = self.to_numeric(ctx, left)?;
         let right_num = self.to_numeric(ctx, right)?;
         match (left_num, right_num) {
-            (Numeric::BigInt(l), Numeric::BigInt(r)) => {
-                Ok(Value::bigint((l * r).to_string()))
-            }
-            (Numeric::Number(l), Numeric::Number(r)) => {
-                Ok(Value::number(l * r))
-            }
+            (Numeric::BigInt(l), Numeric::BigInt(r)) => Ok(Value::bigint((l * r).to_string())),
+            (Numeric::Number(l), Numeric::Number(r)) => Ok(Value::number(l * r)),
             _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
         }
     }
@@ -651,9 +654,7 @@ impl Interpreter {
                 }
                 Ok(Value::bigint((l / r).to_string()))
             }
-            (Numeric::Number(l), Numeric::Number(r)) => {
-                Ok(Value::number(l / r))
-            }
+            (Numeric::Number(l), Numeric::Number(r)) => Ok(Value::number(l / r)),
             _ => Err(VmError::type_error("Cannot mix BigInt and other types")),
         }
     }

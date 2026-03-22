@@ -1447,12 +1447,32 @@ fn stringify_value_slow(
 
     // Array
     if is_array_value(value)? {
-        stringify_array_with_replacer(value, "", replacer_fn, indent, property_list, tracker, depth, ncx, out)?;
+        stringify_array_with_replacer(
+            value,
+            "",
+            replacer_fn,
+            indent,
+            property_list,
+            tracker,
+            depth,
+            ncx,
+            out,
+        )?;
         return Ok(true);
     }
     // Object or proxy
     if value.as_object().is_some() || value.as_proxy().is_some() {
-        stringify_object_with_replacer(value, "", replacer_fn, indent, property_list, tracker, depth, ncx, out)?;
+        stringify_object_with_replacer(
+            value,
+            "",
+            replacer_fn,
+            indent,
+            property_list,
+            tracker,
+            depth,
+            ncx,
+            out,
+        )?;
         return Ok(true);
     }
 
@@ -2141,7 +2161,10 @@ fn fast_capacity_hint(val: &Value) -> usize {
     if let Some(s) = val.as_string() {
         return s.len() + s.len() / 8 + 2;
     }
-    if let Some(arr) = val.as_array().or_else(|| val.as_object().filter(|o| o.is_array())) {
+    if let Some(arr) = val
+        .as_array()
+        .or_else(|| val.as_object().filter(|o| o.is_array()))
+    {
         let len = arr.array_length();
         // ~8 bytes per element for ints, ~20 for mixed
         return (len * 12 + 2).min(2 * 1024 * 1024);
@@ -2329,7 +2352,12 @@ impl StringifyFastCtx {
 ///
 /// Returns `true` if the value was successfully serialized to `out`.
 /// Returns `false` if the value requires the full spec path.
-fn stringify_value_fast(value: &Value, out: &mut String, depth: usize, object_proto_ptr: usize) -> bool {
+fn stringify_value_fast(
+    value: &Value,
+    out: &mut String,
+    depth: usize,
+    object_proto_ptr: usize,
+) -> bool {
     let mut sctx = StringifyFastCtx::new(object_proto_ptr);
     stringify_value_fast_inner(value, out, depth, &mut sctx)
 }
@@ -2497,9 +2525,10 @@ fn stringify_object_fast_inner(
     }
 
     // Try shape cache first — clone Arc handles to release the borrow on sctx
-    let cached = sctx.shape_cache.get(&shape_ptr).map(|entry| {
-        (Arc::clone(&entry.escaped_keys), Arc::clone(&entry.offsets))
-    });
+    let cached = sctx
+        .shape_cache
+        .get(&shape_ptr)
+        .map(|entry| (Arc::clone(&entry.escaped_keys), Arc::clone(&entry.offsets)));
     if let Some((escaped_keys, offsets)) = cached {
         if offsets.is_empty() {
             out.push_str("{}");

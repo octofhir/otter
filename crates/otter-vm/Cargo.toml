@@ -1,0 +1,15 @@
+[package]
+name = "otter-vm"
+version = "0.1.0"
+edition = "2024"
+description = "VM backend for Otter"
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]

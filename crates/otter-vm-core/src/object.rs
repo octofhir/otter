@@ -3978,10 +3978,7 @@ impl JsObject {
     #[inline]
     pub fn prototype_ptr(&self) -> usize {
         let proto = *self.prototype.borrow();
-        proto
-            .as_object()
-            .map(|o| o.as_ptr() as usize)
-            .unwrap_or(0)
+        proto.as_object().map(|o| o.as_ptr() as usize).unwrap_or(0)
     }
 
     /// Set prototype

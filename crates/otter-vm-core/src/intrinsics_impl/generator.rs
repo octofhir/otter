@@ -62,7 +62,9 @@ impl IntrinsicObject for GeneratorIntrinsic {
         if let Some(fn_obj) = async_iter_fn.as_object() {
             fn_obj.define_property(
                 PropertyKey::string("name"),
-                PropertyDescriptor::function_length(Value::string(JsString::intern("[Symbol.asyncIterator]"))),
+                PropertyDescriptor::function_length(Value::string(JsString::intern(
+                    "[Symbol.asyncIterator]",
+                ))),
             );
             fn_obj.define_property(
                 PropertyKey::string("length"),
@@ -148,15 +150,11 @@ fn async_generator_result_to_promise(
                 other => Value::string(JsString::intern(&other.to_string())),
             };
             let js_queue = js_queue.clone();
-            JsPromise::reject_with_js_jobs(
-                promise,
-                reject_value,
-                move |job, args| {
-                    if let Some(queue) = &js_queue {
-                        queue.enqueue(job, args);
-                    }
-                },
-            );
+            JsPromise::reject_with_js_jobs(promise, reject_value, move |job, args| {
+                if let Some(queue) = &js_queue {
+                    queue.enqueue(job, args);
+                }
+            });
         }
         GeneratorResult::Suspended {
             promise: awaited_promise,

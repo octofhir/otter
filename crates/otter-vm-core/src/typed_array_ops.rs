@@ -118,7 +118,11 @@ pub fn canonical_numeric_index_str(s: &str) -> Option<CanonicalIndex> {
     let roundtrip = if n.is_nan() {
         "NaN".to_string()
     } else if n.is_infinite() {
-        if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+        if n > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
     } else {
         // Use JS-style number formatting
         crate::globals::js_number_to_string(n)
@@ -162,7 +166,9 @@ pub fn canonical_numeric_index_utf16(name: &[u16]) -> Option<usize> {
         if !(b'0' as u16..=b'9' as u16).contains(&ch) {
             return None;
         }
-        result = result.checked_mul(10)?.checked_add((ch - b'0' as u16) as usize)?;
+        result = result
+            .checked_mul(10)?
+            .checked_add((ch - b'0' as u16) as usize)?;
     }
     Some(result)
 }
@@ -177,9 +183,7 @@ pub fn canonical_numeric_index_utf16(name: &[u16]) -> Option<usize> {
 /// Returns `None` if key is not a canonical numeric index (caller must fall through to OrdinaryGet).
 pub fn ta_get(ta: &GcRef<JsTypedArray>, key: &PropertyKey) -> Option<Value> {
     match canonical_numeric_index(key)? {
-        CanonicalIndex::Int(idx) => {
-            Some(ta.get_value(idx).unwrap_or(Value::undefined()))
-        }
+        CanonicalIndex::Int(idx) => Some(ta.get_value(idx).unwrap_or(Value::undefined())),
         CanonicalIndex::NonInt => Some(Value::undefined()),
     }
 }

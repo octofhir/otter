@@ -86,7 +86,9 @@ impl TestReport {
                 TestOutcome::Skip => report.skipped += 1,
                 TestOutcome::Timeout => {
                     report.timeout += 1;
-                    report.timeouts.push(format!("{} ({})", result.path, result.mode));
+                    report
+                        .timeouts
+                        .push(format!("{} ({})", result.path, result.mode));
                 }
                 TestOutcome::Crash => report.crashed += 1,
             }
@@ -255,7 +257,8 @@ impl RunSummary {
             TestOutcome::Skip => self.skipped += 1,
             TestOutcome::Timeout => {
                 self.timeout += 1;
-                self.timeouts.push(format!("{} ({})", result.path, result.mode));
+                self.timeouts
+                    .push(format!("{} ({})", result.path, result.mode));
             }
             TestOutcome::Crash => self.crashed += 1,
         }

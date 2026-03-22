@@ -80,7 +80,9 @@ impl NetHandleRef {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        if !self.refed.swap(true, Ordering::AcqRel) && let Some(counter) = &self.counter {
+        if !self.refed.swap(true, Ordering::AcqRel)
+            && let Some(counter) = &self.counter
+        {
             counter.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -89,13 +91,16 @@ impl NetHandleRef {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        if self.refed.swap(false, Ordering::AcqRel) && let Some(counter) = &self.counter {
+        if self.refed.swap(false, Ordering::AcqRel)
+            && let Some(counter) = &self.counter
+        {
             counter.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     fn deactivate(&self) {
-        if self.active.swap(false, Ordering::AcqRel) && self.refed.load(Ordering::Acquire)
+        if self.active.swap(false, Ordering::AcqRel)
+            && self.refed.load(Ordering::Acquire)
             && let Some(counter) = &self.counter
         {
             counter.fetch_sub(1, Ordering::Relaxed);
@@ -288,9 +293,9 @@ impl OtterExtension for NodeNetExtension {
         ctx: &mut RegistrationContext,
     ) -> Option<GcRef<JsObject>> {
         if specifier == "node:internal/net" || specifier == "internal/net" {
-            let normalized_args_symbol = ctx.global().get(&PropertyKey::string(
-                NORMALIZED_ARGS_SYMBOL_GLOBAL,
-            ))?;
+            let normalized_args_symbol = ctx
+                .global()
+                .get(&PropertyKey::string(NORMALIZED_ARGS_SYMBOL_GLOBAL))?;
             let ns = ctx
                 .module_namespace()
                 .property("normalizedArgsSymbol", normalized_args_symbol)
@@ -327,7 +332,11 @@ impl OtterExtension for NodeNetExtension {
                 0,
             )
             .function("createServer", Arc::new(NetModule::create_server), 2)
-            .function("createConnection", Arc::new(NetModule::create_connection), 0)
+            .function(
+                "createConnection",
+                Arc::new(NetModule::create_connection),
+                0,
+            )
             .function("connect", Arc::new(NetModule::create_connection), 0)
             .function("_normalizeArgs", Arc::new(NetModule::normalize_args), 1)
             .function("isIP", Arc::new(NetModule::is_ip), 1)
@@ -399,10 +408,22 @@ impl Socket {
             .map(|v| v.to_boolean())
             .unwrap_or(true);
 
-        let _ = obj.set(PropertyKey::string(SOCKET_ID_KEY), Value::number(socket_id as f64));
-        let _ = obj.set(PropertyKey::string(SOCKET_CONNECTED_KEY), Value::boolean(false));
-        let _ = obj.set(PropertyKey::string(SOCKET_CONNECTING_KEY), Value::boolean(false));
-        let _ = obj.set(PropertyKey::string(SOCKET_DESTROYED_KEY), Value::boolean(false));
+        let _ = obj.set(
+            PropertyKey::string(SOCKET_ID_KEY),
+            Value::number(socket_id as f64),
+        );
+        let _ = obj.set(
+            PropertyKey::string(SOCKET_CONNECTED_KEY),
+            Value::boolean(false),
+        );
+        let _ = obj.set(
+            PropertyKey::string(SOCKET_CONNECTING_KEY),
+            Value::boolean(false),
+        );
+        let _ = obj.set(
+            PropertyKey::string(SOCKET_DESTROYED_KEY),
+            Value::boolean(false),
+        );
         let _ = obj.set(PropertyKey::string(SOCKET_REFED_KEY), Value::boolean(true));
         let _ = obj.set(PropertyKey::string("bytesWritten"), Value::number(0.0));
         let _ = obj.set(PropertyKey::string("bytesRead"), Value::number(0.0));
@@ -446,9 +467,18 @@ impl Socket {
         let mm = ncx.memory_manager().clone();
 
         if let Some(obj) = this.as_object() {
-            let _ = obj.set(PropertyKey::string(SOCKET_CONNECTING_KEY), Value::boolean(true));
-            let _ = obj.set(PropertyKey::string(SOCKET_CONNECTED_KEY), Value::boolean(false));
-            let _ = obj.set(PropertyKey::string(SOCKET_DESTROYED_KEY), Value::boolean(false));
+            let _ = obj.set(
+                PropertyKey::string(SOCKET_CONNECTING_KEY),
+                Value::boolean(true),
+            );
+            let _ = obj.set(
+                PropertyKey::string(SOCKET_CONNECTED_KEY),
+                Value::boolean(false),
+            );
+            let _ = obj.set(
+                PropertyKey::string(SOCKET_DESTROYED_KEY),
+                Value::boolean(false),
+            );
         }
 
         let runtime = Arc::new(SocketRuntime::new(ncx.pending_async_ops(), None));
@@ -499,11 +529,7 @@ impl Socket {
     }
 
     #[js_method(name = "write", length = 1)]
-    pub fn write(
-        this: &Value,
-        args: &[Value],
-        ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn write(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let callback = args.iter().rev().find(|v| v.is_callable()).cloned();
         if socket_id_of(this)
             .ok()
@@ -626,11 +652,7 @@ impl Socket {
     }
 
     #[js_method(name = "cork", length = 0)]
-    pub fn cork(
-        this: &Value,
-        _args: &[Value],
-        _ncx: &mut NativeContext,
-    ) -> Result<Value, VmError> {
+    pub fn cork(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         Ok(this.clone())
     }
 
@@ -702,9 +724,18 @@ impl Server {
         let obj = this
             .as_object()
             .ok_or_else(|| VmError::type_error("Server constructor requires object receiver"))?;
-        let _ = obj.set(PropertyKey::string(SERVER_ID_KEY), Value::number(server_id as f64));
-        let _ = obj.set(PropertyKey::string(SERVER_LISTENING_KEY), Value::boolean(false));
-        let _ = obj.set(PropertyKey::string(SERVER_CLOSING_KEY), Value::boolean(false));
+        let _ = obj.set(
+            PropertyKey::string(SERVER_ID_KEY),
+            Value::number(server_id as f64),
+        );
+        let _ = obj.set(
+            PropertyKey::string(SERVER_LISTENING_KEY),
+            Value::boolean(false),
+        );
+        let _ = obj.set(
+            PropertyKey::string(SERVER_CLOSING_KEY),
+            Value::boolean(false),
+        );
         let _ = obj.set(PropertyKey::string(SERVER_REFED_KEY), Value::boolean(true));
         let _ = obj.set(PropertyKey::string("listening"), Value::boolean(false));
         let _ = obj.set(PropertyKey::string(SERVER_PORT_KEY), Value::undefined());
@@ -806,12 +837,7 @@ impl Server {
         apply_server_listening_state(this, binding.local_addr, parsed.path.as_deref());
         schedule_if_listening(this.clone(), "listening", ncx);
 
-        handle.spawn(run_accept_loop(
-            server_id,
-            listener,
-            runtime,
-            shutdown_rx,
-        ));
+        handle.spawn(run_accept_loop(server_id, listener, runtime, shutdown_rx));
 
         Ok(this.clone())
     }
@@ -827,9 +853,15 @@ impl Server {
             .ok_or_else(|| VmError::type_error("Server.close called on non-object"))?;
         let server_id = server_id_of(this)?;
 
-        let _ = obj.set(PropertyKey::string(SERVER_LISTENING_KEY), Value::boolean(false));
+        let _ = obj.set(
+            PropertyKey::string(SERVER_LISTENING_KEY),
+            Value::boolean(false),
+        );
         let _ = obj.set(PropertyKey::string("listening"), Value::boolean(false));
-        let _ = obj.set(PropertyKey::string(SERVER_CLOSING_KEY), Value::boolean(true));
+        let _ = obj.set(
+            PropertyKey::string(SERVER_CLOSING_KEY),
+            Value::boolean(true),
+        );
 
         if let Some(runtime) = get_server_runtime(server_id) {
             if let Ok(mut guard) = runtime.shutdown_tx.lock()
@@ -929,7 +961,7 @@ impl NetModule {
         _ncx: &mut NativeContext,
     ) -> Result<Value, VmError> {
         Ok(Value::number(
-            AUTO_SELECT_TIMEOUT.load(Ordering::Relaxed) as f64,
+            AUTO_SELECT_TIMEOUT.load(Ordering::Relaxed) as f64
         ))
     }
 
@@ -952,7 +984,11 @@ impl NetModule {
         Ok(Value::boolean(AUTO_SELECT_FAMILY.load(Ordering::Relaxed)))
     }
 
-    fn create_server(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
+    fn create_server(
+        this: &Value,
+        args: &[Value],
+        ncx: &mut NativeContext,
+    ) -> Result<Value, VmError> {
         let ctor = ncx
             .global()
             .get(&PropertyKey::string(SERVER_CTOR_GLOBAL))
@@ -991,7 +1027,8 @@ impl NetModule {
         let mut values = Vec::with_capacity(len);
         for i in 0..len {
             values.push(
-                input.get(&PropertyKey::Index(i as u32))
+                input
+                    .get(&PropertyKey::Index(i as u32))
                     .unwrap_or_else(Value::undefined),
             );
         }
@@ -1148,7 +1185,11 @@ fn build_normalized_args_array(args: &[Value], ncx: &mut NativeContext) -> Resul
         }
     }
 
-    let callback = args.last().filter(|v| v.is_callable()).cloned().unwrap_or_else(Value::null);
+    let callback = args
+        .last()
+        .filter(|v| v.is_callable())
+        .cloned()
+        .unwrap_or_else(Value::null);
     arr.array_push(Value::object(options));
     arr.array_push(callback);
     let sym = normalized_args_symbol(ncx)?;
@@ -1193,9 +1234,7 @@ fn normalize_connection_args(
             return Ok((options, callback));
         }
 
-        if first_obj
-            .get(&PropertyKey::string("port"))
-            .is_none()
+        if first_obj.get(&PropertyKey::string("port")).is_none()
             && first_obj.get(&PropertyKey::string("path")).is_none()
         {
             return throw_node_error(
@@ -1309,7 +1348,10 @@ fn validate_port(port: &Value, ncx: &mut NativeContext) -> Result<u16, VmError> 
             VmError::exception(create_node_error_value(
                 ncx,
                 "RangeError",
-                &format!("Port should be >= 0 and < 65536. Received {}", text.as_str()),
+                &format!(
+                    "Port should be >= 0 and < 65536. Received {}",
+                    text.as_str()
+                ),
                 Some("ERR_SOCKET_BAD_PORT"),
             ))
         })?
@@ -1348,11 +1390,7 @@ fn parse_port_string(text: &str) -> Option<f64> {
 
 fn parse_listen_args(args: &[Value], ncx: &mut NativeContext) -> Result<ParsedListenArgs, VmError> {
     let callback = args.iter().rev().find(|v| v.is_callable()).cloned();
-    let positional: Vec<Value> = args
-        .iter()
-        .filter(|v| !v.is_callable())
-        .cloned()
-        .collect();
+    let positional: Vec<Value> = args.iter().filter(|v| !v.is_callable()).cloned().collect();
 
     if positional.is_empty() {
         return Ok(ParsedListenArgs {
@@ -1445,7 +1483,10 @@ fn parse_listen_args(args: &[Value], ncx: &mut NativeContext) -> Result<ParsedLi
     })
 }
 
-fn extract_connect_target(options: &Value, ncx: &mut NativeContext) -> Result<ConnectTarget, VmError> {
+fn extract_connect_target(
+    options: &Value,
+    ncx: &mut NativeContext,
+) -> Result<ConnectTarget, VmError> {
     let options_obj = options
         .as_object()
         .ok_or_else(|| VmError::type_error("connect options must be an object"))?;
@@ -1480,7 +1521,10 @@ fn extract_connect_target(options: &Value, ncx: &mut NativeContext) -> Result<Co
     Ok(ConnectTarget { host, port })
 }
 
-fn bind_listener(parsed: &ParsedListenArgs, ncx: &mut NativeContext) -> Result<ListenBinding, Value> {
+fn bind_listener(
+    parsed: &ParsedListenArgs,
+    ncx: &mut NativeContext,
+) -> Result<ListenBinding, Value> {
     let requested_port = parsed.port.unwrap_or(0);
     let bind_host = normalize_bind_host(&parsed.host);
     let bind_addr = resolve_socket_addr(&bind_host, requested_port).map_err(|err| {
@@ -1619,12 +1663,7 @@ fn enqueue_accept_event(
                 connected,
                 server_value.clone(),
             )?;
-            emit_now(
-                &server_value,
-                "connection",
-                &[socket],
-                ncx,
-            )?;
+            emit_now(&server_value, "connection", &[socket], ncx)?;
             Ok(Value::undefined())
         },
         mm,
@@ -1774,7 +1813,10 @@ fn spawn_socket_reader(
                 if emit_close {
                     emit_now(&socket_for_callback, "close", &[], callback_ncx)?;
                 }
-                finish_owned_server_connection_with_value(owner_server_id, server_for_callback.clone());
+                finish_owned_server_connection_with_value(
+                    owner_server_id,
+                    server_for_callback.clone(),
+                );
                 Ok(Value::undefined())
             },
             mm,
@@ -1832,10 +1874,19 @@ fn apply_server_listening_state(server: &Value, addr: SocketAddr, path: Option<&
         addr.ip(),
         addr.port()
     );
-    let _ = obj.set(PropertyKey::string(SERVER_LISTENING_KEY), Value::boolean(true));
+    let _ = obj.set(
+        PropertyKey::string(SERVER_LISTENING_KEY),
+        Value::boolean(true),
+    );
     let _ = obj.set(PropertyKey::string("listening"), Value::boolean(true));
-    let _ = obj.set(PropertyKey::string(SERVER_CLOSING_KEY), Value::boolean(false));
-    let _ = obj.set(PropertyKey::string(SERVER_PORT_KEY), Value::number(addr.port() as f64));
+    let _ = obj.set(
+        PropertyKey::string(SERVER_CLOSING_KEY),
+        Value::boolean(false),
+    );
+    let _ = obj.set(
+        PropertyKey::string(SERVER_PORT_KEY),
+        Value::number(addr.port() as f64),
+    );
     let _ = obj.set(
         PropertyKey::string(SERVER_HOST_KEY),
         Value::string(JsString::new_gc(&addr.ip().to_string())),
@@ -1862,10 +1913,22 @@ fn apply_socket_connected_state(socket: &Value, local_addr: SocketAddr, remote_a
     let Some(obj) = socket.as_object() else {
         return;
     };
-    let _ = obj.set(PropertyKey::string(SOCKET_CONNECTING_KEY), Value::boolean(false));
-    let _ = obj.set(PropertyKey::string(SOCKET_CONNECTED_KEY), Value::boolean(true));
-    let _ = obj.set(PropertyKey::string(SOCKET_DESTROYED_KEY), Value::boolean(false));
-    let _ = obj.set(PropertyKey::string("_handle"), Value::object(GcRef::new(JsObject::new(Value::null()))));
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_CONNECTING_KEY),
+        Value::boolean(false),
+    );
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_CONNECTED_KEY),
+        Value::boolean(true),
+    );
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_DESTROYED_KEY),
+        Value::boolean(false),
+    );
+    let _ = obj.set(
+        PropertyKey::string("_handle"),
+        Value::object(GcRef::new(JsObject::new(Value::null()))),
+    );
     let _ = obj.set(
         PropertyKey::string("remoteAddress"),
         Value::string(JsString::new_gc(&remote_addr.ip().to_string())),
@@ -1888,9 +1951,18 @@ fn apply_socket_closed_state(socket: &Value) {
     let Some(obj) = socket.as_object() else {
         return;
     };
-    let _ = obj.set(PropertyKey::string(SOCKET_CONNECTING_KEY), Value::boolean(false));
-    let _ = obj.set(PropertyKey::string(SOCKET_CONNECTED_KEY), Value::boolean(false));
-    let _ = obj.set(PropertyKey::string(SOCKET_DESTROYED_KEY), Value::boolean(true));
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_CONNECTING_KEY),
+        Value::boolean(false),
+    );
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_CONNECTED_KEY),
+        Value::boolean(false),
+    );
+    let _ = obj.set(
+        PropertyKey::string(SOCKET_DESTROYED_KEY),
+        Value::boolean(true),
+    );
     let _ = obj.set(PropertyKey::string("_handle"), Value::null());
 }
 
@@ -2011,7 +2083,12 @@ fn emit_now(
     Ok(())
 }
 
-fn schedule_emit(target: Value, event_name: &'static str, args: Vec<Value>, ncx: &mut NativeContext) {
+fn schedule_emit(
+    target: Value,
+    event_name: &'static str,
+    args: Vec<Value>,
+    ncx: &mut NativeContext,
+) {
     let mm = ncx.memory_manager().clone();
     let callback = Value::native_function(
         move |_this, call_args, callback_ncx| {
@@ -2238,7 +2315,10 @@ fn copy_known_connect_options(dst: &GcRef<JsObject>, source: &Value) {
     }
 }
 
-fn ip_input_string(arg: Option<&Value>, ncx: &mut NativeContext) -> Result<Option<String>, VmError> {
+fn ip_input_string(
+    arg: Option<&Value>,
+    ncx: &mut NativeContext,
+) -> Result<Option<String>, VmError> {
     let Some(arg) = arg else {
         return Ok(None);
     };
@@ -2274,9 +2354,7 @@ fn parse_ip_input(text: Option<&str>) -> Option<IpKind> {
         && !base.is_empty()
         && base.contains(':')
         && !zone.is_empty()
-        && zone
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        && zone.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
         && matches!(base.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
     {
         return Some(IpKind::V6);

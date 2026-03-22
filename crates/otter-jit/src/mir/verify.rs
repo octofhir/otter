@@ -103,8 +103,13 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
     let mut ops = Vec::new();
 
     match op {
-        MirOp::Const(_) | MirOp::Undefined | MirOp::Null | MirOp::True | MirOp::False
-        | MirOp::ConstInt32(_) | MirOp::ConstFloat64(_) => {}
+        MirOp::Const(_)
+        | MirOp::Undefined
+        | MirOp::Null
+        | MirOp::True
+        | MirOp::False
+        | MirOp::ConstInt32(_)
+        | MirOp::ConstFloat64(_) => {}
 
         MirOp::GuardInt32 { val, .. }
         | MirOp::GuardFloat64 { val, .. }
@@ -114,21 +119,26 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
         | MirOp::GuardBool { val, .. }
         | MirOp::GuardNotHole { val, .. } => ops.push(*val),
 
-        MirOp::GuardShape { obj, .. }
-        | MirOp::GuardArrayDense { obj, .. } => ops.push(*obj),
+        MirOp::GuardShape { obj, .. } | MirOp::GuardArrayDense { obj, .. } => ops.push(*obj),
         MirOp::GuardProtoEpoch { .. } => {}
         MirOp::GuardBoundsCheck { arr, idx, .. } => {
             ops.push(*arr);
             ops.push(*idx);
         }
 
-        MirOp::BoxInt32(v) | MirOp::BoxFloat64(v) | MirOp::BoxBool(v)
-        | MirOp::UnboxInt32(v) | MirOp::UnboxFloat64(v) | MirOp::Int32ToFloat64(v) => {
+        MirOp::BoxInt32(v)
+        | MirOp::BoxFloat64(v)
+        | MirOp::BoxBool(v)
+        | MirOp::UnboxInt32(v)
+        | MirOp::UnboxFloat64(v)
+        | MirOp::Int32ToFloat64(v) => {
             ops.push(*v);
         }
 
-        MirOp::AddI32 { lhs, rhs, .. } | MirOp::SubI32 { lhs, rhs, .. }
-        | MirOp::MulI32 { lhs, rhs, .. } | MirOp::DivI32 { lhs, rhs, .. } => {
+        MirOp::AddI32 { lhs, rhs, .. }
+        | MirOp::SubI32 { lhs, rhs, .. }
+        | MirOp::MulI32 { lhs, rhs, .. }
+        | MirOp::DivI32 { lhs, rhs, .. } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }
@@ -136,24 +146,31 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
             ops.push(*val);
         }
 
-        MirOp::AddF64 { lhs, rhs } | MirOp::SubF64 { lhs, rhs }
-        | MirOp::MulF64 { lhs, rhs } | MirOp::DivF64 { lhs, rhs }
+        MirOp::AddF64 { lhs, rhs }
+        | MirOp::SubF64 { lhs, rhs }
+        | MirOp::MulF64 { lhs, rhs }
+        | MirOp::DivF64 { lhs, rhs }
         | MirOp::ModF64 { lhs, rhs } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }
         MirOp::NegF64(v) => ops.push(*v),
 
-        MirOp::BitAnd { lhs, rhs } | MirOp::BitOr { lhs, rhs }
-        | MirOp::BitXor { lhs, rhs } | MirOp::Shl { lhs, rhs }
-        | MirOp::Shr { lhs, rhs } | MirOp::Ushr { lhs, rhs } => {
+        MirOp::BitAnd { lhs, rhs }
+        | MirOp::BitOr { lhs, rhs }
+        | MirOp::BitXor { lhs, rhs }
+        | MirOp::Shl { lhs, rhs }
+        | MirOp::Shr { lhs, rhs }
+        | MirOp::Ushr { lhs, rhs } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }
         MirOp::BitNot(v) => ops.push(*v),
 
-        MirOp::CmpI32 { lhs, rhs, .. } | MirOp::CmpF64 { lhs, rhs, .. }
-        | MirOp::CmpStrictEq { lhs, rhs } | MirOp::CmpStrictNe { lhs, rhs } => {
+        MirOp::CmpI32 { lhs, rhs, .. }
+        | MirOp::CmpF64 { lhs, rhs, .. }
+        | MirOp::CmpStrictEq { lhs, rhs }
+        | MirOp::CmpStrictNe { lhs, rhs } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }
@@ -228,17 +245,23 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
             ops.extend_from_slice(args);
         }
 
-        MirOp::LoadLocal(_) | MirOp::LoadRegister(_) | MirOp::LoadUpvalue(_)
-        | MirOp::LoadThis | MirOp::LoadConstPool(_) => {}
+        MirOp::LoadLocal(_)
+        | MirOp::LoadRegister(_)
+        | MirOp::LoadUpvalue(_)
+        | MirOp::LoadThis
+        | MirOp::LoadConstPool(_) => {}
 
-        MirOp::StoreLocal { val, .. } | MirOp::StoreRegister { val, .. }
+        MirOp::StoreLocal { val, .. }
+        | MirOp::StoreRegister { val, .. }
         | MirOp::StoreUpvalue { val, .. } => ops.push(*val),
         MirOp::CloseUpvalue(_) => {}
 
         MirOp::GetGlobal { .. } => {}
         MirOp::SetGlobal { val, .. } => ops.push(*val),
 
-        MirOp::NewObject | MirOp::NewArray { .. } | MirOp::CreateClosure { .. }
+        MirOp::NewObject
+        | MirOp::NewArray { .. }
+        | MirOp::CreateClosure { .. }
         | MirOp::CreateArguments => {}
         MirOp::DefineProperty { obj, key, val } => {
             ops.push(*obj);
@@ -250,9 +273,14 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
             ops.push(*proto);
         }
 
-        MirOp::TypeOf(v) | MirOp::ToNumber(v) | MirOp::ToStringOp(v)
+        MirOp::TypeOf(v)
+        | MirOp::ToNumber(v)
+        | MirOp::ToStringOp(v)
         | MirOp::RequireCoercible(v) => ops.push(*v),
-        MirOp::InstanceOf { lhs, rhs, .. } | MirOp::In { key: lhs, obj: rhs, .. } => {
+        MirOp::InstanceOf { lhs, rhs, .. }
+        | MirOp::In {
+            key: lhs, obj: rhs, ..
+        } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }

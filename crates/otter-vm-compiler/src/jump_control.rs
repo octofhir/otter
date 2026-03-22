@@ -28,10 +28,7 @@ use otter_vm_bytecode::operand::Register;
 pub(crate) enum JumpRecordAction {
     /// Emit `IteratorClose` for the given iterator register.
     /// Needed when break/continue/return exits through a for-of loop.
-    CloseIterator {
-        iter: Register,
-        is_async: bool,
-    },
+    CloseIterator { iter: Register, is_async: bool },
 
     /// Record the finally-dispatch index into `finally_index_reg` and clear
     /// the rethrow flag, then Transfer to the enclosing TryWithFinally info.
@@ -50,9 +47,7 @@ pub(crate) enum JumpRecordAction {
 
     /// Emit a Jump placeholder and delegate the remaining actions to
     /// the `JumpControlInfo` at `jump_info[info_index]`.
-    Transfer {
-        info_index: u32,
-    },
+    Transfer { info_index: u32 },
 }
 
 // ─── JumpRecordKind ────────────────────────────────────────────────────────
@@ -95,10 +90,7 @@ impl JumpRecord {
         }
     }
 
-    pub(crate) fn new_return(
-        actions: Vec<JumpRecordAction>,
-        return_value_reg: Register,
-    ) -> Self {
+    pub(crate) fn new_return(actions: Vec<JumpRecordAction>, return_value_reg: Register) -> Self {
         Self {
             kind: JumpRecordKind::Return,
             jump_index: usize::MAX,

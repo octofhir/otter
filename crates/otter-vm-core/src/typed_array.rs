@@ -118,9 +118,9 @@ impl JsTypedArray {
         }
 
         // Validate bounds
-        let byte_length = length.checked_mul(elem_size).ok_or_else(|| {
-            crate::error::VmError::range_error("TypedArray length overflow")
-        })?;
+        let byte_length = length
+            .checked_mul(elem_size)
+            .ok_or_else(|| crate::error::VmError::range_error("TypedArray length overflow"))?;
         if byte_offset + byte_length > buffer.byte_length() {
             return Err(crate::error::VmError::range_error(
                 "TypedArray would extend past end of buffer",

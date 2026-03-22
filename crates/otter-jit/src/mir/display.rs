@@ -81,7 +81,11 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::GuardString { val, deopt } => write!(f, "guard_string {} {}", val, deopt),
         MirOp::GuardFunction { val, deopt } => write!(f, "guard_function {} {}", val, deopt),
         MirOp::GuardBool { val, deopt } => write!(f, "guard_bool {} {}", val, deopt),
-        MirOp::GuardShape { obj, shape_id, deopt } => {
+        MirOp::GuardShape {
+            obj,
+            shape_id,
+            deopt,
+        } => {
             write!(f, "guard_shape {} shape=0x{:x} {}", obj, shape_id, deopt)
         }
         MirOp::GuardProtoEpoch { epoch, deopt } => {
@@ -134,35 +138,81 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::IsTruthy(v) => write!(f, "is_truthy {}", v),
 
         // Property access
-        MirOp::GetPropShaped { obj, offset, inline } => {
-            write!(f, "get_prop_shaped {} offset={} inline={}", obj, offset, inline)
+        MirOp::GetPropShaped {
+            obj,
+            offset,
+            inline,
+        } => {
+            write!(
+                f,
+                "get_prop_shaped {} offset={} inline={}",
+                obj, offset, inline
+            )
         }
-        MirOp::SetPropShaped { obj, offset, val, inline } => {
-            write!(f, "set_prop_shaped {} offset={} {} inline={}", obj, offset, val, inline)
+        MirOp::SetPropShaped {
+            obj,
+            offset,
+            val,
+            inline,
+        } => {
+            write!(
+                f,
+                "set_prop_shaped {} offset={} {} inline={}",
+                obj, offset, val, inline
+            )
         }
         MirOp::GetPropGeneric { obj, key, ic_index } => {
             write!(f, "get_prop {} {} ic={}", obj, key, ic_index)
         }
-        MirOp::SetPropGeneric { obj, key, val, ic_index } => {
+        MirOp::SetPropGeneric {
+            obj,
+            key,
+            val,
+            ic_index,
+        } => {
             write!(f, "set_prop {} {} {} ic={}", obj, key, val, ic_index)
         }
-        MirOp::GetPropConstGeneric { obj, name_idx, ic_index } => {
-            write!(f, "get_prop_const {} name={} ic={}", obj, name_idx, ic_index)
+        MirOp::GetPropConstGeneric {
+            obj,
+            name_idx,
+            ic_index,
+        } => {
+            write!(
+                f,
+                "get_prop_const {} name={} ic={}",
+                obj, name_idx, ic_index
+            )
         }
-        MirOp::SetPropConstGeneric { obj, name_idx, val, ic_index } => {
-            write!(f, "set_prop_const {} name={} {} ic={}", obj, name_idx, val, ic_index)
+        MirOp::SetPropConstGeneric {
+            obj,
+            name_idx,
+            val,
+            ic_index,
+        } => {
+            write!(
+                f,
+                "set_prop_const {} name={} {} ic={}",
+                obj, name_idx, val, ic_index
+            )
         }
         MirOp::DeleteProp { obj, key } => write!(f, "delete_prop {} {}", obj, key),
 
         // Array access
         MirOp::GetElemDense { arr, idx } => write!(f, "get_elem_dense {} {}", arr, idx),
-        MirOp::SetElemDense { arr, idx, val } => write!(f, "set_elem_dense {} {} {}", arr, idx, val),
+        MirOp::SetElemDense { arr, idx, val } => {
+            write!(f, "set_elem_dense {} {} {}", arr, idx, val)
+        }
         MirOp::ArrayLength(arr) => write!(f, "array_length {}", arr),
         MirOp::ArrayPush { arr, val } => write!(f, "array_push {} {}", arr, val),
         MirOp::GetElemGeneric { obj, key, ic_index } => {
             write!(f, "get_elem {} {} ic={}", obj, key, ic_index)
         }
-        MirOp::SetElemGeneric { obj, key, val, ic_index } => {
+        MirOp::SetElemGeneric {
+            obj,
+            key,
+            val,
+            ic_index,
+        } => {
             write!(f, "set_elem {} {} {} ic={}", obj, key, val, ic_index)
         }
 
@@ -170,7 +220,12 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::CallDirect { target, args } => {
             write!(f, "call_direct {} ({})", target, format_args_list(args))
         }
-        MirOp::CallMonomorphic { callee, expected_bits, args, deopt } => {
+        MirOp::CallMonomorphic {
+            callee,
+            expected_bits,
+            args,
+            deopt,
+        } => {
             write!(
                 f,
                 "call_mono {} expect=0x{:x} ({}) {}",
@@ -180,10 +235,25 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
                 deopt,
             )
         }
-        MirOp::CallGeneric { callee, args, ic_index } => {
-            write!(f, "call {} ({}) ic={}", callee, format_args_list(args), ic_index)
+        MirOp::CallGeneric {
+            callee,
+            args,
+            ic_index,
+        } => {
+            write!(
+                f,
+                "call {} ({}) ic={}",
+                callee,
+                format_args_list(args),
+                ic_index
+            )
         }
-        MirOp::CallMethodGeneric { obj, name_idx, args, ic_index } => {
+        MirOp::CallMethodGeneric {
+            obj,
+            name_idx,
+            args,
+            ic_index,
+        } => {
             write!(
                 f,
                 "call_method {} name={} ({}) ic={}",
@@ -211,7 +281,11 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::GetGlobal { name_idx, ic_index } => {
             write!(f, "get_global name={} ic={}", name_idx, ic_index)
         }
-        MirOp::SetGlobal { name_idx, val, ic_index } => {
+        MirOp::SetGlobal {
+            name_idx,
+            val,
+            ic_index,
+        } => {
             write!(f, "set_global name={} {} ic={}", name_idx, val, ic_index)
         }
 
@@ -237,8 +311,16 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
 
         // Control flow
         MirOp::Jump(target) => write!(f, "jump {}", target),
-        MirOp::Branch { cond, true_block, false_block } => {
-            write!(f, "branch {} then={} else={}", cond, true_block, false_block)
+        MirOp::Branch {
+            cond,
+            true_block,
+            false_block,
+        } => {
+            write!(
+                f,
+                "branch {} then={} else={}",
+                cond, true_block, false_block
+            )
         }
         MirOp::Return(v) => write!(f, "return {}", v),
         MirOp::ReturnUndefined => write!(f, "return_undefined"),

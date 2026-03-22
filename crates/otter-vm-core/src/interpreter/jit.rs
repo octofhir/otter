@@ -80,8 +80,7 @@ impl Interpreter {
             };
 
             if let Some(ty) = new_ty {
-                ic.ic_state =
-                    otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
+                ic.ic_state = otter_vm_bytecode::function::InlineCacheState::ArithmeticFastPath(ty);
             } else {
                 ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
             }
@@ -105,9 +104,7 @@ impl Interpreter {
         is_async: bool,
         _argc: u8,
     ) -> bool {
-        otter_jit::pipeline::should_jit(func)
-            && !is_construct
-            && !is_async
+        otter_jit::pipeline::should_jit(func) && !is_construct && !is_async
     }
 
     /// Property access quickening (interpreter feature, not JIT).

@@ -148,7 +148,12 @@ pub struct MirGraph {
 
 impl MirGraph {
     /// Create a new empty MIR graph.
-    pub fn new(function_name: String, local_count: u16, register_count: u16, param_count: u16) -> Self {
+    pub fn new(
+        function_name: String,
+        local_count: u16,
+        register_count: u16,
+        param_count: u16,
+    ) -> Self {
         let entry = BasicBlock::new(BlockId(0));
         Self {
             blocks: vec![entry],
@@ -184,12 +189,7 @@ impl MirGraph {
     }
 
     /// Add an instruction to a block and return the value it defines.
-    pub fn push_instr(
-        &mut self,
-        block: BlockId,
-        op: MirOp,
-        bytecode_pc: u32,
-    ) -> ValueId {
+    pub fn push_instr(&mut self, block: BlockId, op: MirOp, bytecode_pc: u32) -> ValueId {
         let ty = op.result_type();
         let value = self.next_value();
         self.blocks[block.0 as usize].instrs.push(MirInstr {

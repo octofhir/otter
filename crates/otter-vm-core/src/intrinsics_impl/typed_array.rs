@@ -188,9 +188,7 @@ pub fn init_data_view_prototype(
                             .map(|v| crate::globals::to_number(v) as usize)
                             .unwrap_or(0);
                         let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                        let val = dv
-                            .$method(offset, little_endian)
-                            ?;
+                        let val = dv.$method(offset, little_endian)?;
                         Ok(Value::number(val as f64))
                     },
                     mm.clone(),
@@ -236,8 +234,7 @@ pub fn init_data_view_prototype(
                         let raw = args.get(1).map(crate::globals::to_number).unwrap_or(0.0);
                         let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = ($conv)(raw);
-                        dv.$method(offset, val, little_endian)
-                            ?;
+                        dv.$method(offset, val, little_endian)?;
                         Ok(Value::undefined())
                     },
                     mm.clone(),
@@ -299,9 +296,7 @@ pub fn init_data_view_prototype(
                     .map(|v| crate::globals::to_number(v) as usize)
                     .unwrap_or(0);
                 let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                let val = dv
-                    .get_big_int64(offset, little_endian)
-                    ?;
+                let val = dv.get_big_int64(offset, little_endian)?;
                 Ok(Value::bigint(val.to_string()))
             },
             mm.clone(),
@@ -320,9 +315,7 @@ pub fn init_data_view_prototype(
                     .map(|v| crate::globals::to_number(v) as usize)
                     .unwrap_or(0);
                 let little_endian = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                let val = dv
-                    .get_big_uint64(offset, little_endian)
-                    ?;
+                let val = dv.get_big_uint64(offset, little_endian)?;
                 Ok(Value::bigint(val.to_string()))
             },
             mm.clone(),
@@ -345,8 +338,7 @@ pub fn init_data_view_prototype(
                     .map(|v| crate::globals::to_number(v) as i64)
                     .unwrap_or(0);
                 let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
-                dv.set_big_int64(offset, val, little_endian)
-                    ?;
+                dv.set_big_int64(offset, val, little_endian)?;
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -369,8 +361,7 @@ pub fn init_data_view_prototype(
                     .map(|v| crate::globals::to_number(v) as u64)
                     .unwrap_or(0);
                 let little_endian = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
-                dv.set_big_uint64(offset, val, little_endian)
-                    ?;
+                dv.set_big_uint64(offset, val, little_endian)?;
                 Ok(Value::undefined())
             },
             mm.clone(),
@@ -489,7 +480,8 @@ pub fn to_bigint_i64(val: &Value) -> Result<i64, VmError> {
         }
         // Invalid string → SyntaxError per spec
         return Err(VmError::syntax_error(&format!(
-            "Cannot convert '{}' to a BigInt", s_str
+            "Cannot convert '{}' to a BigInt",
+            s_str
         )));
     }
     if let Some(b) = val.as_boolean() {
@@ -497,7 +489,9 @@ pub fn to_bigint_i64(val: &Value) -> Result<i64, VmError> {
     }
     // undefined, null, Number, Symbol → TypeError
     if val.is_undefined() || val.is_null() {
-        return Err(VmError::type_error("Cannot convert undefined or null to a BigInt"));
+        return Err(VmError::type_error(
+            "Cannot convert undefined or null to a BigInt",
+        ));
     }
     if val.as_number().is_some() || val.as_int32().is_some() {
         return Err(VmError::type_error("Cannot convert a Number to a BigInt"));
@@ -561,20 +555,25 @@ fn create_typed_array_constructor(
     move |this_val, args, ncx| {
         // §22.2.4 step 1: If NewTarget is undefined, throw a TypeError.
         if !ncx.is_construct() {
-            return Err(VmError::type_error(
-                &format!("{} constructor requires 'new'", kind.name()),
-            ));
+            return Err(VmError::type_error(&format!(
+                "{} constructor requires 'new'",
+                kind.name()
+            )));
         }
 
         // Get ArrayBuffer.prototype for all new buffer allocations
         let ab_proto_for_new_buffer = {
             let rid = ncx.ctx.realm_id();
-            ncx.ctx.realm_intrinsics(rid).map(|i| i.array_buffer_prototype)
+            ncx.ctx
+                .realm_intrinsics(rid)
+                .map(|i| i.array_buffer_prototype)
         };
 
         if args.is_empty() {
             let buffer = GcRef::new(JsArrayBuffer::new(0, ab_proto_for_new_buffer));
-            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
+            let object = GcRef::new(JsObject::new(Value::object(
+                ncx.get_prototype_from_new_target(proto)?,
+            )));
             let ta = JsTypedArray::new(object, buffer, kind, 0, 0)?;
             return Ok(make_typed_array_value(ta));
         }
@@ -628,7 +627,9 @@ fn create_typed_array_constructor(
                 available / elem_size
             };
 
-            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
+            let object = GcRef::new(JsObject::new(Value::object(
+                ncx.get_prototype_from_new_target(proto)?,
+            )));
             let ta = JsTypedArray::new(object, buffer, kind, byte_offset, length)?;
             return Ok(make_typed_array_value(ta));
         }
@@ -647,9 +648,10 @@ fn create_typed_array_constructor(
                 .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
             // §22.2.4.3 step 17/18: Use SpeciesConstructor(srcBuffer, %ArrayBuffer%)
             let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
-            let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
-            let ta =
-                JsTypedArray::new(object, buffer, kind, 0, length)?;
+            let object = GcRef::new(JsObject::new(Value::object(
+                ncx.get_prototype_from_new_target(proto)?,
+            )));
+            let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
             for i in 0..length {
                 if let Some(val) = other_ta.get(i) {
                     let _ = ta.set(i, val);
@@ -715,9 +717,10 @@ fn create_typed_array_constructor(
                     .checked_mul(kind.element_size())
                     .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                 let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
-                let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
-                let ta = JsTypedArray::new(object, buffer, kind, 0, length)
-                    ?;
+                let object = GcRef::new(JsObject::new(Value::object(
+                    ncx.get_prototype_from_new_target(proto)?,
+                )));
+                let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
 
                 for (i, val) in values.into_iter().enumerate() {
                     if kind.is_bigint() {
@@ -744,7 +747,9 @@ fn create_typed_array_constructor(
             let length_val = ncx.get_property(&obj, &PropertyKey::string("length"))?;
             // §7.1.4 ToNumber — Symbol throws TypeError
             if length_val.as_symbol().is_some() {
-                return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+                return Err(VmError::type_error(
+                    "Cannot convert a Symbol value to a number",
+                ));
             }
             let length_num = crate::globals::to_number(&length_val);
             if !(length_num >= 0.0 && length_num <= 1_073_741_824.0) {
@@ -754,12 +759,19 @@ fn create_typed_array_constructor(
                     return Err(VmError::range_error("Invalid typed array length"));
                 }
             }
-            let length = if length_num.is_nan() { 0 } else { length_num as usize };
+            let length = if length_num.is_nan() {
+                0
+            } else {
+                length_num as usize
+            };
             {
-                let byte_len = length.checked_mul(kind.element_size())
+                let byte_len = length
+                    .checked_mul(kind.element_size())
                     .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
                 let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
-                let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
+                let object = GcRef::new(JsObject::new(Value::object(
+                    ncx.get_prototype_from_new_target(proto)?,
+                )));
                 let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
 
                 for i in 0..length {
@@ -786,10 +798,14 @@ fn create_typed_array_constructor(
         // §22.2.4.2 TypedArray(length) — first argument is NOT Object
         // Step 3: Let elementLength be ? ToIndex(length).
         if arg0.as_symbol().is_some() {
-            return Err(VmError::type_error("Cannot convert a Symbol value to a number"));
+            return Err(VmError::type_error(
+                "Cannot convert a Symbol value to a number",
+            ));
         }
         if arg0.as_bigint().is_some() {
-            return Err(VmError::type_error("Cannot convert a BigInt value to a number"));
+            return Err(VmError::type_error(
+                "Cannot convert a BigInt value to a number",
+            ));
         }
         let length_num = if let Some(n) = arg0.as_int32() {
             n as f64
@@ -812,7 +828,9 @@ fn create_typed_array_constructor(
             .checked_mul(kind.element_size())
             .ok_or_else(|| VmError::range_error("Invalid typed array length"))?;
         let buffer = GcRef::new(JsArrayBuffer::new(byte_len, ab_proto_for_new_buffer));
-        let object = GcRef::new(JsObject::new(Value::object(ncx.get_prototype_from_new_target(proto)?)));
+        let object = GcRef::new(JsObject::new(Value::object(
+            ncx.get_prototype_from_new_target(proto)?,
+        )));
         let ta = JsTypedArray::new(object, buffer, kind, 0, length)?;
         Ok(make_typed_array_value(ta))
     }
@@ -1197,9 +1215,15 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                             // this = TypedArray constructor (e.g. Float64Array)
                             // Create new this(args.length), then set each element
                             let len_val = Value::int32(args.len() as i32);
-                            let ta_val = ncx.call_function_construct(this_val, Value::undefined(), &[len_val])?;
+                            let ta_val = ncx.call_function_construct(
+                                this_val,
+                                Value::undefined(),
+                                &[len_val],
+                            )?;
                             let ta = ta_val.as_typed_array().ok_or_else(|| {
-                                VmError::type_error("TypedArray.of: constructor did not return a TypedArray")
+                                VmError::type_error(
+                                    "TypedArray.of: constructor did not return a TypedArray",
+                                )
                             })?;
                             // §23.2.2.2 step 5: TypedArrayCreate validates length
                             if ta.length() < args.len() {
@@ -1211,7 +1235,10 @@ impl IntrinsicObject for TypedArrayIntrinsic {
                                 if ta.kind().is_bigint() {
                                     // ToBigInt
                                     let prim = if arg.is_object() || arg.as_object().is_some() {
-                                        ncx.to_primitive(arg, crate::interpreter::PreferredType::Number)?
+                                        ncx.to_primitive(
+                                            arg,
+                                            crate::interpreter::PreferredType::Number,
+                                        )?
                                     } else {
                                         *arg
                                     };

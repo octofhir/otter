@@ -20,9 +20,9 @@
 //! The MIR builder tracks scratch register values in `scratch_map`
 //! so we don't emit redundant loads.
 
+use otter_vm_bytecode::Function;
 use otter_vm_bytecode::function::ArithmeticType;
 use otter_vm_bytecode::instruction::Instruction;
-use otter_vm_bytecode::Function;
 
 use crate::feedback::{FeedbackSnapshot, IcSnapshot};
 use crate::mir::graph::{BlockId, DeoptId, DeoptInfo, MirGraph, ResumeMode, ValueId};
@@ -32,12 +32,22 @@ use crate::mir::types::CmpOp;
 /// Build a MIR graph from a bytecode function.
 pub fn build_mir(function: &Function) -> MirGraph {
     let feedback = FeedbackSnapshot::from_function(function);
-    let name = function.name.as_deref().unwrap_or("<anonymous>").to_string();
+    let name = function
+        .name
+        .as_deref()
+        .unwrap_or("<anonymous>")
+        .to_string();
     let local_count = function.local_count;
     let register_count = function.register_count;
     let param_count = function.param_count;
 
-    let mut ctx = BuilderContext::new(name, local_count, register_count, param_count as u16, &feedback);
+    let mut ctx = BuilderContext::new(
+        name,
+        local_count,
+        register_count,
+        param_count as u16,
+        &feedback,
+    );
     let instructions = function.instructions.read();
 
     // First pass: identify jump targets to split basic blocks.
@@ -134,11 +144,8 @@ impl<'a> BuilderContext<'a> {
         if idx < self.scratch_map.len() {
             self.scratch_map[idx] = Some(val);
         }
-        self.graph.push_instr(
-            block,
-            MirOp::StoreRegister { idx: reg, val },
-            pc,
-        );
+        self.graph
+            .push_instr(block, MirOp::StoreRegister { idx: reg, val }, pc);
     }
 
     /// Load from a local variable slot. Always emits LoadLocal (locals may change between loads).
@@ -148,7 +155,8 @@ impl<'a> BuilderContext<'a> {
 
     /// Store to a local variable slot.
     fn store_local(&mut self, block: BlockId, idx: u16, val: ValueId, pc: u32) {
-        self.graph.push_instr(block, MirOp::StoreLocal { idx, val }, pc);
+        self.graph
+            .push_instr(block, MirOp::StoreLocal { idx, val }, pc);
     }
 
     /// Invalidate the scratch register cache (at block boundaries).
@@ -193,7 +201,9 @@ fn find_block_starts(instructions: &[Instruction]) -> Vec<usize> {
                 starts.insert(target);
                 starts.insert(pc + 1);
             }
-            Instruction::Return { .. } | Instruction::ReturnUndefined | Instruction::Throw { .. } => {
+            Instruction::Return { .. }
+            | Instruction::ReturnUndefined
+            | Instruction::Throw { .. } => {
                 starts.insert(pc + 1);
             }
             _ => {}
@@ -242,7 +252,9 @@ fn lower_instruction(
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::LoadInt8 { dst, value } => {
-            let v = ctx.graph.push_instr(block, MirOp::ConstInt32(*value as i32), pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::ConstInt32(*value as i32), pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(v), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -274,56 +286,172 @@ fn lower_instruction(
         }
         Instruction::SetUpvalue { idx, src } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            ctx.graph.push_instr(block, MirOp::StoreUpvalue { idx: idx.0, val }, pc);
+            ctx.graph
+                .push_instr(block, MirOp::StoreUpvalue { idx: idx.0, val }, pc);
         }
         Instruction::LoadThis { dst } => {
             let v = ctx.graph.push_instr(block, MirOp::LoadThis, pc);
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::CloseUpvalue { local_idx } => {
-            ctx.graph.push_instr(block, MirOp::CloseUpvalue(local_idx.0), pc);
+            ctx.graph
+                .push_instr(block, MirOp::CloseUpvalue(local_idx.0), pc);
         }
 
         // ---- Globals ----
-        Instruction::GetGlobal { dst, name, ic_index } => {
-            let v = ctx.graph.push_instr(block, MirOp::GetGlobal { name_idx: name.0, ic_index: *ic_index }, pc);
+        Instruction::GetGlobal {
+            dst,
+            name,
+            ic_index,
+        } => {
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::GetGlobal {
+                    name_idx: name.0,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
-        Instruction::SetGlobal { name, src, ic_index, is_declaration: _ } => {
+        Instruction::SetGlobal {
+            name,
+            src,
+            ic_index,
+            is_declaration: _,
+        } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            ctx.graph.push_instr(block, MirOp::SetGlobal { name_idx: name.0, val, ic_index: *ic_index }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::SetGlobal {
+                    name_idx: name.0,
+                    val,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
         }
 
         // ---- Arithmetic ----
-        Instruction::Add { dst, lhs, rhs, feedback_index } => {
-            lower_binary_arith(ctx, block, pc, dst.0, lhs.0, rhs.0, *feedback_index, BinaryArithOp::Add);
+        Instruction::Add {
+            dst,
+            lhs,
+            rhs,
+            feedback_index,
+        } => {
+            lower_binary_arith(
+                ctx,
+                block,
+                pc,
+                dst.0,
+                lhs.0,
+                rhs.0,
+                *feedback_index,
+                BinaryArithOp::Add,
+            );
         }
-        Instruction::Sub { dst, lhs, rhs, feedback_index } => {
-            lower_binary_arith(ctx, block, pc, dst.0, lhs.0, rhs.0, *feedback_index, BinaryArithOp::Sub);
+        Instruction::Sub {
+            dst,
+            lhs,
+            rhs,
+            feedback_index,
+        } => {
+            lower_binary_arith(
+                ctx,
+                block,
+                pc,
+                dst.0,
+                lhs.0,
+                rhs.0,
+                *feedback_index,
+                BinaryArithOp::Sub,
+            );
         }
-        Instruction::Mul { dst, lhs, rhs, feedback_index } => {
-            lower_binary_arith(ctx, block, pc, dst.0, lhs.0, rhs.0, *feedback_index, BinaryArithOp::Mul);
+        Instruction::Mul {
+            dst,
+            lhs,
+            rhs,
+            feedback_index,
+        } => {
+            lower_binary_arith(
+                ctx,
+                block,
+                pc,
+                dst.0,
+                lhs.0,
+                rhs.0,
+                *feedback_index,
+                BinaryArithOp::Mul,
+            );
         }
-        Instruction::Div { dst, lhs, rhs, feedback_index } => {
-            lower_binary_arith(ctx, block, pc, dst.0, lhs.0, rhs.0, *feedback_index, BinaryArithOp::Div);
+        Instruction::Div {
+            dst,
+            lhs,
+            rhs,
+            feedback_index,
+        } => {
+            lower_binary_arith(
+                ctx,
+                block,
+                pc,
+                dst.0,
+                lhs.0,
+                rhs.0,
+                *feedback_index,
+                BinaryArithOp::Div,
+            );
         }
-        Instruction::AddInt32 { dst, lhs, rhs, feedback_index: _ } => {
+        Instruction::AddInt32 {
+            dst,
+            lhs,
+            rhs,
+            feedback_index: _,
+        } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let result = ctx.graph.push_instr(block, MirOp::AddI32 { lhs: gl, rhs: gr, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let result = ctx.graph.push_instr(
+                block,
+                MirOp::AddI32 {
+                    lhs: gl,
+                    rhs: gr,
+                    deopt,
+                },
+                pc,
+            );
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(result), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
-        Instruction::SubInt32 { dst, lhs, rhs, feedback_index: _ } => {
+        Instruction::SubInt32 {
+            dst,
+            lhs,
+            rhs,
+            feedback_index: _,
+        } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let result = ctx.graph.push_instr(block, MirOp::SubI32 { lhs: gl, rhs: gr, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let result = ctx.graph.push_instr(
+                block,
+                MirOp::SubI32 {
+                    lhs: gl,
+                    rhs: gr,
+                    deopt,
+                },
+                pc,
+            );
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(result), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -331,9 +459,21 @@ fn lower_instruction(
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let result = ctx.graph.push_instr(block, MirOp::MulI32 { lhs: gl, rhs: gr, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let result = ctx.graph.push_instr(
+                block,
+                MirOp::MulI32 {
+                    lhs: gl,
+                    rhs: gr,
+                    deopt,
+                },
+                pc,
+            );
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(result), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -341,9 +481,21 @@ fn lower_instruction(
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let result = ctx.graph.push_instr(block, MirOp::DivI32 { lhs: gl, rhs: gr, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let result = ctx.graph.push_instr(
+                block,
+                MirOp::DivI32 {
+                    lhs: gl,
+                    rhs: gr,
+                    deopt,
+                },
+                pc,
+            );
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(result), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -352,11 +504,20 @@ fn lower_instruction(
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardFloat64 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardFloat64 { val: r, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardFloat64 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardFloat64 { val: r, deopt }, pc);
             let raw = match inst {
-                Instruction::AddNumber { .. } => ctx.graph.push_instr(block, MirOp::AddF64 { lhs: gl, rhs: gr }, pc),
-                _ => ctx.graph.push_instr(block, MirOp::SubF64 { lhs: gl, rhs: gr }, pc),
+                Instruction::AddNumber { .. } => {
+                    ctx.graph
+                        .push_instr(block, MirOp::AddF64 { lhs: gl, rhs: gr }, pc)
+                }
+                _ => ctx
+                    .graph
+                    .push_instr(block, MirOp::SubF64 { lhs: gl, rhs: gr }, pc),
             };
             let boxed = ctx.graph.push_instr(block, MirOp::BoxFloat64(raw), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
@@ -366,51 +527,97 @@ fn lower_instruction(
         Instruction::Lt { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericLt, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericLt,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Le { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericLe, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericLe,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Gt { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericGt, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericGt,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Ge { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericGe, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericGe,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::StrictEq { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::CmpStrictEq { lhs: l, rhs: r }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::CmpStrictEq { lhs: l, rhs: r }, pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxBool(v), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
         Instruction::StrictNe { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::CmpStrictNe { lhs: l, rhs: r }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::CmpStrictNe { lhs: l, rhs: r }, pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxBool(v), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
         Instruction::Eq { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericEq, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericEq,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Ne { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericEq, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericEq,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             let negated = ctx.graph.push_instr(block, MirOp::LogicalNot(v), pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxBool(negated), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
@@ -426,17 +633,38 @@ fn lower_instruction(
         }
         Instruction::Neg { dst, src } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericNeg, args: vec![val] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericNeg,
+                    args: vec![val],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Inc { dst, src } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericInc, args: vec![val] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericInc,
+                    args: vec![val],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Dec { dst, src } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericDec, args: vec![val] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericDec,
+                    args: vec![val],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::TypeOf { dst, src } => {
@@ -446,87 +674,254 @@ fn lower_instruction(
         }
 
         // ---- Property Access ----
-        Instruction::GetPropConst { dst, obj, name, ic_index } => {
+        Instruction::GetPropConst {
+            dst,
+            obj,
+            name,
+            ic_index,
+        } => {
             let obj_val = ctx.get_scratch(block, obj.0, pc);
             let ic = ctx.feedback.ic(*ic_index);
             let result = match ic {
-                IcSnapshot::MonoProp { shape_id, offset, depth: 0, .. } => {
+                IcSnapshot::MonoProp {
+                    shape_id,
+                    offset,
+                    depth: 0,
+                    ..
+                } => {
                     let deopt = ctx.make_deopt(pc);
-                    let obj_ref = ctx.graph.push_instr(block, MirOp::GuardObject { val: obj_val, deopt }, pc);
-                    ctx.graph.push_instr(block, MirOp::GuardShape { obj: obj_ref, shape_id: *shape_id, deopt }, pc);
+                    let obj_ref = ctx.graph.push_instr(
+                        block,
+                        MirOp::GuardObject {
+                            val: obj_val,
+                            deopt,
+                        },
+                        pc,
+                    );
+                    ctx.graph.push_instr(
+                        block,
+                        MirOp::GuardShape {
+                            obj: obj_ref,
+                            shape_id: *shape_id,
+                            deopt,
+                        },
+                        pc,
+                    );
                     let inline = *offset < 8;
-                    ctx.graph.push_instr(block, MirOp::GetPropShaped { obj: obj_ref, offset: *offset, inline }, pc)
+                    ctx.graph.push_instr(
+                        block,
+                        MirOp::GetPropShaped {
+                            obj: obj_ref,
+                            offset: *offset,
+                            inline,
+                        },
+                        pc,
+                    )
                 }
-                _ => {
-                    ctx.graph.push_instr(block, MirOp::GetPropConstGeneric { obj: obj_val, name_idx: name.0, ic_index: *ic_index }, pc)
-                }
+                _ => ctx.graph.push_instr(
+                    block,
+                    MirOp::GetPropConstGeneric {
+                        obj: obj_val,
+                        name_idx: name.0,
+                        ic_index: *ic_index,
+                    },
+                    pc,
+                ),
             };
             ctx.set_scratch(block, dst.0, result, pc);
         }
-        Instruction::SetPropConst { obj, name, val, ic_index } => {
+        Instruction::SetPropConst {
+            obj,
+            name,
+            val,
+            ic_index,
+        } => {
             let obj_val = ctx.get_scratch(block, obj.0, pc);
             let set_val = ctx.get_scratch(block, val.0, pc);
             let ic = ctx.feedback.ic(*ic_index);
             match ic {
-                IcSnapshot::MonoProp { shape_id, offset, depth: 0, .. } => {
+                IcSnapshot::MonoProp {
+                    shape_id,
+                    offset,
+                    depth: 0,
+                    ..
+                } => {
                     let deopt = ctx.make_deopt(pc);
-                    let obj_ref = ctx.graph.push_instr(block, MirOp::GuardObject { val: obj_val, deopt }, pc);
-                    ctx.graph.push_instr(block, MirOp::GuardShape { obj: obj_ref, shape_id: *shape_id, deopt }, pc);
+                    let obj_ref = ctx.graph.push_instr(
+                        block,
+                        MirOp::GuardObject {
+                            val: obj_val,
+                            deopt,
+                        },
+                        pc,
+                    );
+                    ctx.graph.push_instr(
+                        block,
+                        MirOp::GuardShape {
+                            obj: obj_ref,
+                            shape_id: *shape_id,
+                            deopt,
+                        },
+                        pc,
+                    );
                     let inline = *offset < 8;
-                    ctx.graph.push_instr(block, MirOp::SetPropShaped { obj: obj_ref, offset: *offset, val: set_val, inline }, pc);
-                    ctx.graph.push_instr(block, MirOp::WriteBarrier(set_val), pc);
+                    ctx.graph.push_instr(
+                        block,
+                        MirOp::SetPropShaped {
+                            obj: obj_ref,
+                            offset: *offset,
+                            val: set_val,
+                            inline,
+                        },
+                        pc,
+                    );
+                    ctx.graph
+                        .push_instr(block, MirOp::WriteBarrier(set_val), pc);
                 }
                 _ => {
-                    ctx.graph.push_instr(block, MirOp::SetPropConstGeneric { obj: obj_val, name_idx: name.0, val: set_val, ic_index: *ic_index }, pc);
+                    ctx.graph.push_instr(
+                        block,
+                        MirOp::SetPropConstGeneric {
+                            obj: obj_val,
+                            name_idx: name.0,
+                            val: set_val,
+                            ic_index: *ic_index,
+                        },
+                        pc,
+                    );
                 }
             }
         }
-        Instruction::GetProp { dst, obj, key, ic_index } => {
+        Instruction::GetProp {
+            dst,
+            obj,
+            key,
+            ic_index,
+        } => {
             let o = ctx.get_scratch(block, obj.0, pc);
             let k = ctx.get_scratch(block, key.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::GetPropGeneric { obj: o, key: k, ic_index: *ic_index }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::GetPropGeneric {
+                    obj: o,
+                    key: k,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
-        Instruction::SetProp { obj, key, val, ic_index } => {
+        Instruction::SetProp {
+            obj,
+            key,
+            val,
+            ic_index,
+        } => {
             let o = ctx.get_scratch(block, obj.0, pc);
             let k = ctx.get_scratch(block, key.0, pc);
             let v = ctx.get_scratch(block, val.0, pc);
-            ctx.graph.push_instr(block, MirOp::SetPropGeneric { obj: o, key: k, val: v, ic_index: *ic_index }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::SetPropGeneric {
+                    obj: o,
+                    key: k,
+                    val: v,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
         }
 
         // ---- Arrays ----
         Instruction::NewArray { dst, len, .. } => {
-            let v = ctx.graph.push_instr(block, MirOp::NewArray { len: *len }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::NewArray { len: *len }, pc);
             ctx.set_scratch(block, dst.0, v, pc);
         }
-        Instruction::GetElem { dst, arr, idx, ic_index } => {
+        Instruction::GetElem {
+            dst,
+            arr,
+            idx,
+            ic_index,
+        } => {
             let o = ctx.get_scratch(block, arr.0, pc);
             let k = ctx.get_scratch(block, idx.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::GetElemGeneric { obj: o, key: k, ic_index: *ic_index }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::GetElemGeneric {
+                    obj: o,
+                    key: k,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
-        Instruction::SetElem { arr, idx, val, ic_index } => {
+        Instruction::SetElem {
+            arr,
+            idx,
+            val,
+            ic_index,
+        } => {
             let o = ctx.get_scratch(block, arr.0, pc);
             let k = ctx.get_scratch(block, idx.0, pc);
             let v = ctx.get_scratch(block, val.0, pc);
-            ctx.graph.push_instr(block, MirOp::SetElemGeneric { obj: o, key: k, val: v, ic_index: *ic_index }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::SetElemGeneric {
+                    obj: o,
+                    key: k,
+                    val: v,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
         }
 
         // ---- Calls ----
-        Instruction::Call { dst, func, argc, ic_index } => {
+        Instruction::Call {
+            dst,
+            func,
+            argc,
+            ic_index,
+        } => {
             let callee_val = ctx.get_scratch(block, func.0, pc);
             let args: Vec<ValueId> = (0..*argc)
                 .map(|i| ctx.get_scratch(block, func.0 + 1 + i as u16, pc))
                 .collect();
-            let v = ctx.graph.push_instr(block, MirOp::CallGeneric { callee: callee_val, args, ic_index: *ic_index }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::CallGeneric {
+                    callee: callee_val,
+                    args,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
-        Instruction::CallMethod { dst, obj, method, argc, ic_index } => {
+        Instruction::CallMethod {
+            dst,
+            obj,
+            method,
+            argc,
+            ic_index,
+        } => {
             let obj_val = ctx.get_scratch(block, obj.0, pc);
             let args: Vec<ValueId> = (0..*argc)
                 .map(|i| ctx.get_scratch(block, obj.0 + 1 + i as u16, pc))
                 .collect();
-            let v = ctx.graph.push_instr(block, MirOp::CallMethodGeneric { obj: obj_val, name_idx: method.0, args, ic_index: *ic_index }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::CallMethodGeneric {
+                    obj: obj_val,
+                    name_idx: method.0,
+                    args,
+                    ic_index: *ic_index,
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
 
@@ -536,14 +931,24 @@ fn lower_instruction(
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Closure { dst, func } => {
-            let v = ctx.graph.push_instr(block, MirOp::CreateClosure { func_idx: func.0 }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::CreateClosure { func_idx: func.0 }, pc);
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::DefineProperty { obj, key, val } => {
             let o = ctx.get_scratch(block, obj.0, pc);
             let k = ctx.get_scratch(block, key.0, pc);
             let v = ctx.get_scratch(block, val.0, pc);
-            ctx.graph.push_instr(block, MirOp::DefineProperty { obj: o, key: k, val: v }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::DefineProperty {
+                    obj: o,
+                    key: k,
+                    val: v,
+                },
+                pc,
+            );
         }
 
         // ---- Control Flow ----
@@ -556,14 +961,30 @@ fn lower_instruction(
             let truthy = ctx.graph.push_instr(block, MirOp::IsTruthy(val), pc);
             let target = resolve_target(pc, offset.0, pc_to_block);
             let fallthrough = resolve_target(pc, 1, pc_to_block);
-            ctx.graph.push_instr(block, MirOp::Branch { cond: truthy, true_block: target, false_block: fallthrough }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::Branch {
+                    cond: truthy,
+                    true_block: target,
+                    false_block: fallthrough,
+                },
+                pc,
+            );
         }
         Instruction::JumpIfFalse { cond, offset } => {
             let val = ctx.get_scratch(block, cond.0, pc);
             let truthy = ctx.graph.push_instr(block, MirOp::IsTruthy(val), pc);
             let target = resolve_target(pc, offset.0, pc_to_block);
             let fallthrough = resolve_target(pc, 1, pc_to_block);
-            ctx.graph.push_instr(block, MirOp::Branch { cond: truthy, true_block: fallthrough, false_block: target }, pc);
+            ctx.graph.push_instr(
+                block,
+                MirOp::Branch {
+                    cond: truthy,
+                    true_block: fallthrough,
+                    false_block: target,
+                },
+                pc,
+            );
         }
         Instruction::Return { src } => {
             let val = ctx.get_scratch(block, src.0, pc);
@@ -586,7 +1007,8 @@ fn lower_instruction(
         // ---- Exception Handling ----
         Instruction::TryStart { catch_offset } => {
             let catch_block = resolve_target(pc, catch_offset.0, pc_to_block);
-            ctx.graph.push_instr(block, MirOp::TryStart { catch_block }, pc);
+            ctx.graph
+                .push_instr(block, MirOp::TryStart { catch_block }, pc);
         }
         Instruction::TryEnd => {
             ctx.graph.push_instr(block, MirOp::TryEnd, pc);
@@ -625,7 +1047,8 @@ fn lower_instruction(
         }
         Instruction::RequireCoercible { src } => {
             let val = ctx.get_scratch(block, src.0, pc);
-            ctx.graph.push_instr(block, MirOp::RequireCoercible(val), pc);
+            ctx.graph
+                .push_instr(block, MirOp::RequireCoercible(val), pc);
         }
 
         // ---- Bitwise ----
@@ -633,9 +1056,15 @@ fn lower_instruction(
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let v = ctx.graph.push_instr(block, MirOp::BitAnd { lhs: gl, rhs: gr }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::BitAnd { lhs: gl, rhs: gr }, pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(v), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -643,9 +1072,15 @@ fn lower_instruction(
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
-            let v = ctx.graph.push_instr(block, MirOp::BitOr { lhs: gl, rhs: gr }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let v = ctx
+                .graph
+                .push_instr(block, MirOp::BitOr { lhs: gl, rhs: gr }, pc);
             let boxed = ctx.graph.push_instr(block, MirOp::BoxInt32(v), pc);
             ctx.set_scratch(block, dst.0, boxed, pc);
         }
@@ -654,13 +1089,27 @@ fn lower_instruction(
         Instruction::Mod { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::GenericMod, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::GenericMod,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
         Instruction::Pow { dst, lhs, rhs } => {
             let l = ctx.get_scratch(block, lhs.0, pc);
             let r = ctx.get_scratch(block, rhs.0, pc);
-            let v = ctx.graph.push_instr(block, MirOp::HelperCall { kind: HelperKind::Pow, args: vec![l, r] }, pc);
+            let v = ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind: HelperKind::Pow,
+                    args: vec![l, r],
+                },
+                pc,
+            );
             ctx.set_scratch(block, dst.0, v, pc);
         }
 
@@ -673,7 +1122,8 @@ fn lower_instruction(
         Instruction::SetPrototype { obj, proto } => {
             let o = ctx.get_scratch(block, obj.0, pc);
             let p = ctx.get_scratch(block, proto.0, pc);
-            ctx.graph.push_instr(block, MirOp::SetPrototype { obj: o, proto: p }, pc);
+            ctx.graph
+                .push_instr(block, MirOp::SetPrototype { obj: o, proto: p }, pc);
         }
 
         // ---- Nop / DeclareGlobalVar ----
@@ -697,7 +1147,12 @@ fn lower_instruction(
 // ---- IC-guided arithmetic specialization ----
 
 #[derive(Clone, Copy)]
-enum BinaryArithOp { Add, Sub, Mul, Div }
+enum BinaryArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 fn lower_binary_arith(
     ctx: &mut BuilderContext,
@@ -716,25 +1171,77 @@ fn lower_binary_arith(
     let result = match ic {
         IcSnapshot::Arithmetic(ArithmeticType::Int32) => {
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardInt32 { val: r, deopt }, pc);
             let raw = match op {
-                BinaryArithOp::Add => ctx.graph.push_instr(block, MirOp::AddI32 { lhs: gl, rhs: gr, deopt }, pc),
-                BinaryArithOp::Sub => ctx.graph.push_instr(block, MirOp::SubI32 { lhs: gl, rhs: gr, deopt }, pc),
-                BinaryArithOp::Mul => ctx.graph.push_instr(block, MirOp::MulI32 { lhs: gl, rhs: gr, deopt }, pc),
-                BinaryArithOp::Div => ctx.graph.push_instr(block, MirOp::DivI32 { lhs: gl, rhs: gr, deopt }, pc),
+                BinaryArithOp::Add => ctx.graph.push_instr(
+                    block,
+                    MirOp::AddI32 {
+                        lhs: gl,
+                        rhs: gr,
+                        deopt,
+                    },
+                    pc,
+                ),
+                BinaryArithOp::Sub => ctx.graph.push_instr(
+                    block,
+                    MirOp::SubI32 {
+                        lhs: gl,
+                        rhs: gr,
+                        deopt,
+                    },
+                    pc,
+                ),
+                BinaryArithOp::Mul => ctx.graph.push_instr(
+                    block,
+                    MirOp::MulI32 {
+                        lhs: gl,
+                        rhs: gr,
+                        deopt,
+                    },
+                    pc,
+                ),
+                BinaryArithOp::Div => ctx.graph.push_instr(
+                    block,
+                    MirOp::DivI32 {
+                        lhs: gl,
+                        rhs: gr,
+                        deopt,
+                    },
+                    pc,
+                ),
             };
             ctx.graph.push_instr(block, MirOp::BoxInt32(raw), pc)
         }
         IcSnapshot::Arithmetic(ArithmeticType::Number) => {
             let deopt = ctx.make_deopt(pc);
-            let gl = ctx.graph.push_instr(block, MirOp::GuardFloat64 { val: l, deopt }, pc);
-            let gr = ctx.graph.push_instr(block, MirOp::GuardFloat64 { val: r, deopt }, pc);
+            let gl = ctx
+                .graph
+                .push_instr(block, MirOp::GuardFloat64 { val: l, deopt }, pc);
+            let gr = ctx
+                .graph
+                .push_instr(block, MirOp::GuardFloat64 { val: r, deopt }, pc);
             let raw = match op {
-                BinaryArithOp::Add => ctx.graph.push_instr(block, MirOp::AddF64 { lhs: gl, rhs: gr }, pc),
-                BinaryArithOp::Sub => ctx.graph.push_instr(block, MirOp::SubF64 { lhs: gl, rhs: gr }, pc),
-                BinaryArithOp::Mul => ctx.graph.push_instr(block, MirOp::MulF64 { lhs: gl, rhs: gr }, pc),
-                BinaryArithOp::Div => ctx.graph.push_instr(block, MirOp::DivF64 { lhs: gl, rhs: gr }, pc),
+                BinaryArithOp::Add => {
+                    ctx.graph
+                        .push_instr(block, MirOp::AddF64 { lhs: gl, rhs: gr }, pc)
+                }
+                BinaryArithOp::Sub => {
+                    ctx.graph
+                        .push_instr(block, MirOp::SubF64 { lhs: gl, rhs: gr }, pc)
+                }
+                BinaryArithOp::Mul => {
+                    ctx.graph
+                        .push_instr(block, MirOp::MulF64 { lhs: gl, rhs: gr }, pc)
+                }
+                BinaryArithOp::Div => {
+                    ctx.graph
+                        .push_instr(block, MirOp::DivF64 { lhs: gl, rhs: gr }, pc)
+                }
             };
             ctx.graph.push_instr(block, MirOp::BoxFloat64(raw), pc)
         }
@@ -745,7 +1252,14 @@ fn lower_binary_arith(
                 BinaryArithOp::Mul => HelperKind::GenericMul,
                 BinaryArithOp::Div => HelperKind::GenericDiv,
             };
-            ctx.graph.push_instr(block, MirOp::HelperCall { kind, args: vec![l, r] }, pc)
+            ctx.graph.push_instr(
+                block,
+                MirOp::HelperCall {
+                    kind,
+                    args: vec![l, r],
+                },
+                pc,
+            )
         }
     };
 

@@ -1,5 +1,6 @@
 //! End-to-end codegen tests: bytecode → MIR → CLIF → machine code → execute.
 
+use otter_jit::BAILOUT_SENTINEL;
 use otter_jit::code_memory::{compile_clif_function, create_host_isa};
 use otter_jit::codegen::lower::lower_mir_to_clif;
 use otter_jit::codegen::value_repr;
@@ -7,7 +8,6 @@ use otter_jit::context::JitContext;
 use otter_jit::mir::graph::{DeoptInfo, MirGraph, ResumeMode};
 use otter_jit::mir::nodes::MirOp;
 use otter_jit::mir::verify::verify;
-use otter_jit::BAILOUT_SENTINEL;
 
 /// Build a minimal MIR graph by hand (no bytecode compiler needed).
 fn make_return_42_mir() -> MirGraph {
@@ -47,7 +47,15 @@ fn make_add_int32_mir() -> MirGraph {
         live_state: vec![],
         resume_mode: ResumeMode::ResumeAtPc,
     });
-    let v2 = graph.push_instr(entry, MirOp::AddI32 { lhs: v0, rhs: v1, deopt }, 2);
+    let v2 = graph.push_instr(
+        entry,
+        MirOp::AddI32 {
+            lhs: v0,
+            rhs: v1,
+            deopt,
+        },
+        2,
+    );
     // v3 = box_i32 v2
     let v3 = graph.push_instr(entry, MirOp::BoxInt32(v2), 3);
     // return v3
@@ -138,7 +146,11 @@ fn test_return_undefined_e2e() {
     assert!(verify(&graph).is_ok());
 
     let result = execute_mir(&graph);
-    assert!(is_undefined(result), "expected undefined, got 0x{:016x}", result);
+    assert!(
+        is_undefined(result),
+        "expected undefined, got 0x{:016x}",
+        result
+    );
 }
 
 #[test]

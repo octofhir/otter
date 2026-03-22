@@ -2405,6 +2405,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-vm"
+version = "0.1.0"
+
+[[package]]
 name = "otter-vm-bytecode"
 version = "0.1.0"
 dependencies = [

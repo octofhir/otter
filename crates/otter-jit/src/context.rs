@@ -78,11 +78,7 @@ macro_rules! assert_offset {
         const _: () = {
             assert!(
                 std::mem::offset_of!(JitContext, $field) == $expected,
-                concat!(
-                    "JitContext::",
-                    stringify!($field),
-                    " offset mismatch"
-                ),
+                concat!("JitContext::", stringify!($field), " offset mismatch"),
             );
         };
     };

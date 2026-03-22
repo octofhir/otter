@@ -32,10 +32,7 @@ impl MirType {
     pub fn is_gc_ref(self) -> bool {
         matches!(
             self,
-            MirType::ObjectRef
-                | MirType::StringRef
-                | MirType::FunctionRef
-                | MirType::ArrayRef
+            MirType::ObjectRef | MirType::StringRef | MirType::FunctionRef | MirType::ArrayRef
         )
     }
 

@@ -6,8 +6,8 @@
 //! These are cold exits — the JIT code calls them for operations that
 //! can't be inlined into native code.
 
-use crate::interpreter::Interpreter;
 use crate::context::VmContext;
+use crate::interpreter::Interpreter;
 use crate::value::Value;
 use otter_jit::context::JitContext;
 
@@ -89,8 +89,14 @@ fn numeric_lt(l: &Value, r: &Value) -> bool {
     if let (Some(li), Some(ri)) = (l.as_int32(), r.as_int32()) {
         return li < ri;
     }
-    let ln = l.as_number().or_else(|| l.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
-    let rn = r.as_number().or_else(|| r.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
+    let ln = l
+        .as_number()
+        .or_else(|| l.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
+    let rn = r
+        .as_number()
+        .or_else(|| r.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
     ln < rn
 }
 
@@ -108,8 +114,14 @@ pub extern "C" fn otter_jit_generic_le(_ctx: *mut JitContext, lhs: i64, rhs: i64
     if let (Some(li), Some(ri)) = (l.as_int32(), r.as_int32()) {
         return ret(Value::boolean(li <= ri));
     }
-    let ln = l.as_number().or_else(|| l.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
-    let rn = r.as_number().or_else(|| r.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
+    let ln = l
+        .as_number()
+        .or_else(|| l.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
+    let rn = r
+        .as_number()
+        .or_else(|| r.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
     ret(Value::boolean(ln <= rn))
 }
 
@@ -125,8 +137,14 @@ pub extern "C" fn otter_jit_generic_ge(_ctx: *mut JitContext, lhs: i64, rhs: i64
     if let (Some(li), Some(ri)) = (l.as_int32(), r.as_int32()) {
         return ret(Value::boolean(li >= ri));
     }
-    let ln = l.as_number().or_else(|| l.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
-    let rn = r.as_number().or_else(|| r.as_int32().map(|i| i as f64)).unwrap_or(f64::NAN);
+    let ln = l
+        .as_number()
+        .or_else(|| l.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
+    let rn = r
+        .as_number()
+        .or_else(|| r.as_int32().map(|i| i as f64))
+        .unwrap_or(f64::NAN);
     ret(Value::boolean(ln >= rn))
 }
 

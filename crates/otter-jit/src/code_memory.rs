@@ -4,17 +4,16 @@
 //! Each compilation produces a `CompiledFunction` that can be called
 //! via a function pointer.
 
-
+use cranelift_codegen::Context as ClifContext;
 use cranelift_codegen::ir::Function as ClifFunction;
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context as ClifContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
+use crate::JitError;
 use crate::abi::jit_function_signature;
 use crate::context::JitContext;
-use crate::JitError;
 
 /// A compiled function ready to execute.
 pub struct CompiledFunction {
@@ -54,8 +53,8 @@ pub fn create_host_isa() -> Result<OwnedTargetIsa, JitError> {
         .set("is_pic", "false")
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
-    let isa_builder = cranelift_native::builder()
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
+    let isa_builder =
+        cranelift_native::builder().map_err(|e| JitError::Cranelift(e.to_string()))?;
     let flags = settings::Flags::new(flag_builder);
     isa_builder
         .finish(flags)
@@ -71,10 +70,7 @@ pub fn compile_clif_function(
     isa: OwnedTargetIsa,
     helper_symbols: &[(&str, *const u8)],
 ) -> Result<CompiledFunction, JitError> {
-    let mut builder = JITBuilder::with_isa(
-        isa.clone(),
-        cranelift_module::default_libcall_names(),
-    );
+    let mut builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
 
     // Register helper function symbols so compiled code can call them.
     for &(name, ptr) in helper_symbols {
@@ -99,7 +95,8 @@ pub fn compile_clif_function(
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
     // Finalize — make the code executable.
-    module.finalize_definitions()
+    module
+        .finalize_definitions()
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
     let code_ptr = module.get_finalized_function(func_id);

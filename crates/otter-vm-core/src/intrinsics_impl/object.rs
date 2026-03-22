@@ -556,16 +556,31 @@ pub fn init_object_constructor(
                         match ci {
                             crate::typed_array_ops::CanonicalIndex::Int(idx) => {
                                 if !ta.is_detached() && idx < ta.length() {
-                                    if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, &pk) {
-                                        let obj_proto = get_builtin_proto(&ncx_inner.global(), "Object")
-                                            .map(Value::object)
-                                            .unwrap_or(Value::null());
+                                    if let Some(desc) =
+                                        crate::typed_array_ops::ta_get_own_property(&ta, &pk)
+                                    {
+                                        let obj_proto =
+                                            get_builtin_proto(&ncx_inner.global(), "Object")
+                                                .map(Value::object)
+                                                .unwrap_or(Value::null());
                                         let desc_obj = GcRef::new(JsObject::new(obj_proto));
-                                        if let PropertyDescriptor::Data { value, attributes } = &desc {
-                                            let _ = desc_obj.set(PropertyKey::string("value"), *value);
-                                            let _ = desc_obj.set(PropertyKey::string("writable"), Value::boolean(attributes.writable));
-                                            let _ = desc_obj.set(PropertyKey::string("enumerable"), Value::boolean(attributes.enumerable));
-                                            let _ = desc_obj.set(PropertyKey::string("configurable"), Value::boolean(attributes.configurable));
+                                        if let PropertyDescriptor::Data { value, attributes } =
+                                            &desc
+                                        {
+                                            let _ =
+                                                desc_obj.set(PropertyKey::string("value"), *value);
+                                            let _ = desc_obj.set(
+                                                PropertyKey::string("writable"),
+                                                Value::boolean(attributes.writable),
+                                            );
+                                            let _ = desc_obj.set(
+                                                PropertyKey::string("enumerable"),
+                                                Value::boolean(attributes.enumerable),
+                                            );
+                                            let _ = desc_obj.set(
+                                                PropertyKey::string("configurable"),
+                                                Value::boolean(attributes.configurable),
+                                            );
                                         }
                                         return Ok(Value::object(desc_obj));
                                     }
@@ -1345,7 +1360,10 @@ pub fn init_object_constructor(
                             if ta.kind().is_bigint() {
                                 // ToBigInt(value) — can throw
                                 let prim = if val.is_object() || val.as_object().is_some() {
-                                    ncx.to_primitive(&val, crate::interpreter::PreferredType::Number)?
+                                    ncx.to_primitive(
+                                        &val,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
                                 } else {
                                     val
                                 };

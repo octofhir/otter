@@ -139,10 +139,8 @@ impl<'a> NativeContext<'a> {
     ) -> crate::error::VmResult<crate::gc::GcRef<crate::object::JsObject>> {
         if let Some(nt) = self.new_target {
             if let Some(nt_obj) = nt.as_object() {
-                let proto_val = self.get_property(
-                    &nt_obj,
-                    &crate::object::PropertyKey::string("prototype"),
-                )?;
+                let proto_val =
+                    self.get_property(&nt_obj, &crate::object::PropertyKey::string("prototype"))?;
                 if let Some(proto_obj) = proto_val.as_object() {
                     return Ok(proto_obj);
                 }

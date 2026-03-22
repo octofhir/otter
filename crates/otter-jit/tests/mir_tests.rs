@@ -54,9 +54,8 @@ fn test_property_access() {
 
 #[test]
 fn test_conditional() {
-    let graph = compile_and_build_mir(
-        "function f(x) { if (x > 0) { return x; } else { return -x; } }",
-    );
+    let graph =
+        compile_and_build_mir("function f(x) { if (x > 0) { return x; } else { return -x; } }");
     println!("{}", graph);
     let result = verify(&graph);
     assert!(result.is_ok(), "verify errors: {:?}", result.err());
@@ -88,9 +87,8 @@ fn test_array_operations() {
 
 #[test]
 fn test_closure() {
-    let graph = compile_and_build_mir(
-        "function f() { let x = 10; return function() { return x; }; }",
-    );
+    let graph =
+        compile_and_build_mir("function f() { let x = 10; return function() { return x; }; }");
     println!("{}", graph);
     let result = verify(&graph);
     assert!(result.is_ok(), "verify errors: {:?}", result.err());
@@ -98,9 +96,7 @@ fn test_closure() {
 
 #[test]
 fn test_try_catch() {
-    let graph = compile_and_build_mir(
-        "function f() { try { return 1; } catch(e) { return 0; } }",
-    );
+    let graph = compile_and_build_mir("function f() { try { return 1; } catch(e) { return 0; } }");
     println!("{}", graph);
     let result = verify(&graph);
     assert!(result.is_ok(), "verify errors: {:?}", result.err());

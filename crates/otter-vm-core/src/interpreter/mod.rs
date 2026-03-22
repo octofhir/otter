@@ -59,8 +59,8 @@ pub(crate) enum PreferredType {
     String,
 }
 
-mod jit;
 pub(super) mod dispatch;
+mod jit;
 use jit::BackEdgeOsrOutcome;
 fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
     match instruction {
@@ -733,7 +733,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
+                        self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        )?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -744,7 +753,9 @@ impl Interpreter {
                         upvalues,
                     } => {
                         ctx.pop_frame_discard();
-                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
+                        self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        )?;
                     }
                     DispatchAction::Suspend { .. } => {
                         // Can't handle suspension in direct call, return undefined
@@ -1308,7 +1319,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        if let Err(e) = self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues) {
+                        if let Err(e) = self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        ) {
                             return VmExecutionResult::Error(e);
                         }
                     }
@@ -1322,7 +1342,9 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-                        if let Err(e) = self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues) {
+                        if let Err(e) = self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        ) {
                             return VmExecutionResult::Error(e);
                         }
                     }
@@ -1812,7 +1834,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
+                        self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        )?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -1824,7 +1855,9 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
+                        self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        )?;
                     }
                     DispatchAction::Suspend {
                         promise,
@@ -2097,7 +2130,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
+                        self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        )?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -2109,7 +2151,9 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
+                        self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        )?;
                     }
                     DispatchAction::Suspend {
                         promise,
@@ -2596,9 +2640,7 @@ impl Interpreter {
             Instruction::ThrowIfNotObject { src } => {
                 let value = *ctx.get_register(src.0);
                 if !value.is_object() && !value.is_proxy() && value.as_function().is_none() {
-                    return Err(VmError::type_error(
-                        "Iterator result is not an object",
-                    ));
+                    return Err(VmError::type_error("Iterator result is not an object"));
                 }
                 Ok(())
             }
@@ -5195,14 +5237,12 @@ impl Interpreter {
                     }
                     // Extra args beyond param_count — just copy
                     for i in param_count..argc {
-                            let extra_index = i - param_count;
-                            let val = if extra_index < extra_args_count {
-                                ctx.get_absolute_slot(
-                                    register_base + extra_args_offset + extra_index,
-                                )?
-                            } else {
-                                let offset = local_count + extra_index;
-                                ctx.get_local(offset as u16)?
+                        let extra_index = i - param_count;
+                        let val = if extra_index < extra_args_count {
+                            ctx.get_absolute_slot(register_base + extra_args_offset + extra_index)?
+                        } else {
+                            let offset = local_count + extra_index;
+                            ctx.get_local(offset as u16)?
                         };
                         let _ = args_obj.set(PropertyKey::index(i as u32), val);
                     }
@@ -5226,7 +5266,9 @@ impl Interpreter {
                         } else {
                             let extra_index = i - param_count;
                             if extra_index < extra_args_count {
-                                ctx.get_absolute_slot(register_base + extra_args_offset + extra_index)?
+                                ctx.get_absolute_slot(
+                                    register_base + extra_args_offset + extra_index,
+                                )?
                             } else {
                                 let offset = local_count + extra_index;
                                 ctx.get_local(offset as u16)?
@@ -5784,12 +5826,13 @@ impl Interpreter {
 
                 // TypedArray exotic [[Delete]] — §10.4.5.6
                 if let Some(ta) = object.as_typed_array() {
-                    let result = if let Some(del_result) = typed_array_ops::ta_delete(&ta, &prop_key) {
-                        del_result
-                    } else {
-                        // Not a numeric index — ordinary delete on ta.object
-                        ta.object.delete(&prop_key)
-                    };
+                    let result =
+                        if let Some(del_result) = typed_array_ops::ta_delete(&ta, &prop_key) {
+                            del_result
+                        } else {
+                            // Not a numeric index — ordinary delete on ta.object
+                            ta.object.delete(&prop_key)
+                        };
                     if !result {
                         let is_strict = ctx
                             .current_frame()
@@ -5919,8 +5962,15 @@ impl Interpreter {
                         None => {
                             // Not a canonical numeric index — fall through to OrdinaryGet on ta.object
                             let key = self.value_to_property_key(ctx, &key_value)?;
-                            let key_val_for_proxy = crate::proxy_operations::property_key_to_value_pub(&key);
-                            let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val_for_proxy, &object)?;
+                            let key_val_for_proxy =
+                                crate::proxy_operations::property_key_to_value_pub(&key);
+                            let value = self.get_with_proxy_chain(
+                                ctx,
+                                &ta.object,
+                                &key,
+                                key_val_for_proxy,
+                                &object,
+                            )?;
                             ctx.set_register(dst.0, value);
                             return Ok(());
                         }
@@ -6050,7 +6100,10 @@ impl Interpreter {
                             if ta.kind().is_bigint() {
                                 let prim = if val_val.is_object() || val_val.as_object().is_some() {
                                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                    ncx.to_primitive(
+                                        &val_val,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
                                 } else {
                                     val_val
                                 };
@@ -6075,7 +6128,10 @@ impl Interpreter {
                             if ta.kind().is_bigint() {
                                 let prim = if val_val.is_object() || val_val.as_object().is_some() {
                                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                    ncx.to_primitive(
+                                        &val_val,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
                                 } else {
                                     val_val
                                 };
@@ -6106,7 +6162,9 @@ impl Interpreter {
                         let mut found_ta = false;
                         let mut ta_valid_index = false;
                         for _ in 0..64 {
-                            if proto_val.is_null() || proto_val.is_undefined() { break; }
+                            if proto_val.is_null() || proto_val.is_undefined() {
+                                break;
+                            }
                             if let Some(ta) = proto_val.as_typed_array() {
                                 found_ta = true;
                                 match ci {
@@ -6123,7 +6181,9 @@ impl Interpreter {
                             }
                             if let Some(p) = proto_val.as_object() {
                                 proto_val = p.prototype();
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         if found_ta && !ta_valid_index {
                             // §10.4.5.5 step 2.b.ii: invalid index → return true (do nothing)
@@ -6402,7 +6462,8 @@ impl Interpreter {
                     // Non-numeric key: look up on ta.object (prototype chain)
                     let key = self.value_to_property_key(ctx, &index)?;
                     let key_val = crate::proxy_operations::property_key_to_value_pub(&key);
-                    let value = self.get_with_proxy_chain(ctx, &ta.object, &key, key_val, &array)?;
+                    let value =
+                        self.get_with_proxy_chain(ctx, &ta.object, &key, key_val, &array)?;
                     ctx.set_register(dst.0, value);
                     return Ok(());
                 }
@@ -6576,7 +6637,10 @@ impl Interpreter {
                             if ta.kind().is_bigint() {
                                 let prim = if val_val.is_object() || val_val.as_object().is_some() {
                                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                    ncx.to_primitive(
+                                        &val_val,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
                                 } else {
                                     val_val
                                 };
@@ -6601,7 +6665,10 @@ impl Interpreter {
                             if ta.kind().is_bigint() {
                                 let prim = if val_val.is_object() || val_val.as_object().is_some() {
                                     let mut ncx = crate::context::NativeContext::new(ctx, self);
-                                    ncx.to_primitive(&val_val, crate::interpreter::PreferredType::Number)?
+                                    ncx.to_primitive(
+                                        &val_val,
+                                        crate::interpreter::PreferredType::Number,
+                                    )?
                                 } else {
                                     val_val
                                 };
@@ -6773,7 +6840,9 @@ impl Interpreter {
                         let mut found_ta = false;
                         let mut ta_valid_index = false;
                         for _ in 0..64 {
-                            if proto_val.is_null() || proto_val.is_undefined() { break; }
+                            if proto_val.is_null() || proto_val.is_undefined() {
+                                break;
+                            }
                             if let Some(ta) = proto_val.as_typed_array() {
                                 found_ta = true;
                                 match ci {
@@ -6790,7 +6859,9 @@ impl Interpreter {
                             }
                             if let Some(p) = proto_val.as_object() {
                                 proto_val = p.prototype();
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         if found_ta && !ta_valid_index {
                             // §10.4.5.5 step 2.b.ii: invalid index → return true (do nothing)

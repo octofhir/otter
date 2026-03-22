@@ -1048,9 +1048,8 @@ impl Compiler {
                         });
                         self.codegen.free_reg(reg);
                     } else {
-                        self.codegen.emit(Instruction::LoadUndefined {
-                            dst: ret_val_reg,
-                        });
+                        self.codegen
+                            .emit(Instruction::LoadUndefined { dst: ret_val_reg });
                     }
                     // completion_type = 1 (return)
                     self.codegen.emit(Instruction::LoadInt8 {
@@ -1059,7 +1058,11 @@ impl Compiler {
                     });
                     let jump_idx = self.codegen.emit_jump();
                     // We need to re-borrow because emit_jump borrows self
-                    self.finally_stack.last_mut().unwrap().return_jumps.push(jump_idx);
+                    self.finally_stack
+                        .last_mut()
+                        .unwrap()
+                        .return_jumps
+                        .push(jump_idx);
                 } else {
                     if let Some(arg) = &ret.argument {
                         let reg = self.compile_expression(arg)?;
@@ -1296,8 +1299,8 @@ impl Compiler {
             Statement::LabeledStatement(stmt) => self.compile_labeled_statement(stmt),
             Statement::WithStatement(with_stmt) => {
                 // ES2023 §13.11.1: `with` is a SyntaxError in strict mode code.
-                let is_strict = self.codegen.current.flags.is_strict
-                    || self.literal_validator.is_strict_mode();
+                let is_strict =
+                    self.codegen.current.flags.is_strict || self.literal_validator.is_strict_mode();
                 if is_strict {
                     return Err(CompileError::syntax(
                         "Strict mode code may not include a with statement",
@@ -4220,13 +4223,15 @@ impl Compiler {
                 let return_label = self.codegen.current_index();
                 let return_offset = return_label as i32 - jump_if_return as i32;
                 self.codegen.patch_jump(jump_if_return, return_offset);
-                self.codegen
-                    .emit(Instruction::Return { src: return_value_reg });
+                self.codegen.emit(Instruction::Return {
+                    src: return_value_reg,
+                });
 
                 // Patch jump over return
                 let after_return = self.codegen.current_index();
                 let over_return_offset = after_return as i32 - jump_over_return as i32;
-                self.codegen.patch_jump(jump_over_return, over_return_offset);
+                self.codegen
+                    .patch_jump(jump_over_return, over_return_offset);
             }
 
             // 7. Jump over Exception Path
@@ -9501,12 +9506,16 @@ impl Compiler {
         // 6. Patch the default/end jump
         if let Some(default_idx) = default_case_idx {
             let default_label = case_body_starts[default_idx] as i32;
-            self.codegen
-                .patch_jump(jump_to_default_or_end, default_label - jump_to_default_or_end as i32);
+            self.codegen.patch_jump(
+                jump_to_default_or_end,
+                default_label - jump_to_default_or_end as i32,
+            );
         } else {
             let end_label = self.codegen.current_index() as i32;
-            self.codegen
-                .patch_jump(jump_to_default_or_end, end_label - jump_to_default_or_end as i32);
+            self.codegen.patch_jump(
+                jump_to_default_or_end,
+                end_label - jump_to_default_or_end as i32,
+            );
         }
 
         self.codegen.free_reg(discriminant);

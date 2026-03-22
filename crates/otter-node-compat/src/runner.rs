@@ -9,8 +9,7 @@ use futures::FutureExt;
 use otter_engine::{EngineBuilder, Otter};
 use otter_nodejs::{
     set_default_auto_select_family_attempt_timeout_override,
-    set_default_auto_select_family_override,
-    set_process_argv_override,
+    set_default_auto_select_family_override, set_process_argv_override,
     set_process_exec_argv_override,
 };
 use serde::{Deserialize, Serialize};
@@ -431,13 +430,12 @@ fn apply_test_runtime_overrides(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_net_flag_overrides, parse_test_metadata, NetFlagOverrides, TestMetadata};
+    use super::{NetFlagOverrides, TestMetadata, parse_net_flag_overrides, parse_test_metadata};
 
     #[test]
     fn parse_test_metadata_extracts_flags() {
-        let metadata = parse_test_metadata(
-            "'use strict';\n// Flags: --foo --bar=baz\nconst x = 1;\n",
-        );
+        let metadata =
+            parse_test_metadata("'use strict';\n// Flags: --foo --bar=baz\nconst x = 1;\n");
         assert_eq!(
             metadata,
             TestMetadata {

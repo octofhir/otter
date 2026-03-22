@@ -79,9 +79,9 @@ pub use generator::{
 pub use interpreter::{GeneratorResult, Interpreter};
 pub use intrinsics::Intrinsics;
 pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
+pub use jit_runtime::{JitHelperCallStat, JitRuntimeStats};
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
-pub use jit_runtime::{JitHelperCallStat, JitRuntimeStats};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;

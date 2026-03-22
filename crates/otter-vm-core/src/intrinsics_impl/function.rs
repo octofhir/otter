@@ -288,7 +288,11 @@ fn function_apply(
         for i in 0..len {
             // Indexed values on `arguments` and other array-like objects live in
             // element storage, so use ordinary object Get semantics here.
-            extracted.push(arr_obj.get(&PropertyKey::Index(i as u32)).unwrap_or_default());
+            extracted.push(
+                arr_obj
+                    .get(&PropertyKey::Index(i as u32))
+                    .unwrap_or_default(),
+            );
         }
         extracted
     } else {
@@ -506,7 +510,10 @@ fn contains_keyword_token(source: &str, keyword: &str) -> bool {
         // Check for keyword match
         if i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw_bytes {
             // Verify it's a standalone token (not part of a larger identifier)
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' && bytes[i - 1] != b'$';
+            let before_ok = i == 0
+                || !bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes[i - 1] != b'_'
+                    && bytes[i - 1] != b'$';
             let after_ok = i + kw_len >= bytes.len()
                 || !bytes[i + kw_len].is_ascii_alphanumeric()
                     && bytes[i + kw_len] != b'_'
@@ -577,7 +584,10 @@ fn create_dynamic_function_constructor(
         // §20.2.1.1.1 CreateDynamicFunction steps 28-29:
         // Check for yield/await in generator/async params
         let joined_params = params.join(",");
-        if matches!(kind, DynamicFunctionKind::Generator | DynamicFunctionKind::AsyncGenerator) {
+        if matches!(
+            kind,
+            DynamicFunctionKind::Generator | DynamicFunctionKind::AsyncGenerator
+        ) {
             if contains_keyword_token(&joined_params, "yield") {
                 return Err(VmError::SyntaxError(
                     "yield expression is not allowed in formal parameters of a generator function"
@@ -585,7 +595,10 @@ fn create_dynamic_function_constructor(
                 ));
             }
         }
-        if matches!(kind, DynamicFunctionKind::Async | DynamicFunctionKind::AsyncGenerator) {
+        if matches!(
+            kind,
+            DynamicFunctionKind::Async | DynamicFunctionKind::AsyncGenerator
+        ) {
             if contains_keyword_token(&joined_params, "await") {
                 return Err(VmError::SyntaxError(
                     "await expression is not allowed in formal parameters of an async function"

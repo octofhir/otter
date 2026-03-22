@@ -824,7 +824,16 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        if let Err(e) = self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues) {
+                        if let Err(e) = self.dispatch_call(
+                            ctx,
+                            func_index,
+                            module_id,
+                            argc,
+                            return_reg,
+                            is_construct,
+                            is_async,
+                            upvalues,
+                        ) {
                             generator.complete();
                             return GeneratorResult::Error(e);
                         }
@@ -839,7 +848,9 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-                        if let Err(e) = self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues) {
+                        if let Err(e) = self.dispatch_tail_call(
+                            ctx, func_index, module_id, argc, return_reg, is_async, upvalues,
+                        ) {
                             generator.complete();
                             return GeneratorResult::Error(e);
                         }

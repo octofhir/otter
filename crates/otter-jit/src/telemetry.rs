@@ -65,7 +65,7 @@ thread_local! {
 
 #[derive(Default)]
 struct TelemetryState {
-    helper_calls: [u64; 18], // indexed by HelperFamily as u8
+    helper_calls: [u64; 18],                      // indexed by HelperFamily as u8
     deopts: BTreeMap<(u64, u32, u8), DeoptEntry>, // (module_id, pc, reason) -> entry
     tier1_compile_times: Vec<u64>,
     tier2_compile_times: Vec<u64>,
@@ -89,12 +89,7 @@ pub fn record_helper_call(family: HelperFamily) {
 }
 
 /// Record a deoptimization event.
-pub fn record_deopt(
-    function_name: &str,
-    module_id: u64,
-    bytecode_pc: u32,
-    reason: BailoutReason,
-) {
+pub fn record_deopt(function_name: &str, module_id: u64, bytecode_pc: u32, reason: BailoutReason) {
     TELEMETRY.with(|t| {
         let mut state = t.borrow_mut();
         let key = (module_id, bytecode_pc, reason as u8);
@@ -250,10 +245,7 @@ impl TelemetrySnapshot {
             self.jit_entries,
             self.interpreter_entries,
         );
-        eprintln!(
-            "Total helper calls: {}",
-            self.total_helper_calls(),
-        );
+        eprintln!("Total helper calls: {}", self.total_helper_calls(),);
         eprintln!("Top 10 helper families:");
         for (family, count) in self.top_helper_families(10) {
             eprintln!("  {:?}: {}", family, count);

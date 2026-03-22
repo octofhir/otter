@@ -482,9 +482,7 @@ fn maybe_print_jit_stats() {
     let stats = otter_vm_core::jit_runtime_stats();
     eprintln!(
         "JIT stats: compiled={} compile_time_ns={} code_bytes={}",
-        stats.compiled_functions,
-        stats.total_compile_time_ns,
-        stats.total_code_bytes,
+        stats.compiled_functions, stats.total_compile_time_ns, stats.total_code_bytes,
     );
 }
 
@@ -797,8 +795,8 @@ async fn run_code(
             loop {
                 tokio::time::sleep(poll_interval).await;
 
-                let has_live_handles = event_loop.has_active_http_servers()
-                    || event_loop.has_pending_async_ops();
+                let has_live_handles =
+                    event_loop.has_active_http_servers() || event_loop.has_pending_async_ops();
 
                 if has_live_handles {
                     idle_since = std::time::Instant::now();

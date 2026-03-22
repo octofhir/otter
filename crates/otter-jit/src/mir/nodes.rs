@@ -32,17 +32,35 @@ pub enum MirOp {
     // Guards (deopt on failure)
     // ====================================================================
     /// Assert value is Int32, unbox it. Deopt if not.
-    GuardInt32 { val: ValueId, deopt: DeoptId },
+    GuardInt32 {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert value is Float64, unbox it. Deopt if not.
-    GuardFloat64 { val: ValueId, deopt: DeoptId },
+    GuardFloat64 {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert value is an object pointer, extract it. Deopt if not.
-    GuardObject { val: ValueId, deopt: DeoptId },
+    GuardObject {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert value is a string pointer, extract it. Deopt if not.
-    GuardString { val: ValueId, deopt: DeoptId },
+    GuardString {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert value is a function pointer, extract it. Deopt if not.
-    GuardFunction { val: ValueId, deopt: DeoptId },
+    GuardFunction {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert value is boolean, extract it. Deopt if not.
-    GuardBool { val: ValueId, deopt: DeoptId },
+    GuardBool {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert object has the expected shape. Deopt if not.
     GuardShape {
         obj: ValueId,
@@ -50,9 +68,15 @@ pub enum MirOp {
         deopt: DeoptId,
     },
     /// Assert prototype epoch hasn't changed. Deopt if not.
-    GuardProtoEpoch { epoch: u64, deopt: DeoptId },
+    GuardProtoEpoch {
+        epoch: u64,
+        deopt: DeoptId,
+    },
     /// Assert object is a dense array. Deopt if not.
-    GuardArrayDense { obj: ValueId, deopt: DeoptId },
+    GuardArrayDense {
+        obj: ValueId,
+        deopt: DeoptId,
+    },
     /// Assert array index is in bounds. Deopt if not.
     GuardBoundsCheck {
         arr: ValueId,
@@ -60,7 +84,10 @@ pub enum MirOp {
         deopt: DeoptId,
     },
     /// Assert value is not a hole (sparse array sentinel). Deopt if not.
-    GuardNotHole { val: ValueId, deopt: DeoptId },
+    GuardNotHole {
+        val: ValueId,
+        deopt: DeoptId,
+    },
 
     // ====================================================================
     // Boxing / Unboxing
@@ -106,34 +133,76 @@ pub enum MirOp {
         deopt: DeoptId,
     },
     /// i32 increment (add 1) with overflow check.
-    IncI32 { val: ValueId, deopt: DeoptId },
+    IncI32 {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// i32 decrement (sub 1) with overflow check.
-    DecI32 { val: ValueId, deopt: DeoptId },
+    DecI32 {
+        val: ValueId,
+        deopt: DeoptId,
+    },
     /// i32 negation with overflow check (INT_MIN).
-    NegI32 { val: ValueId, deopt: DeoptId },
+    NegI32 {
+        val: ValueId,
+        deopt: DeoptId,
+    },
 
     /// f64 addition.
-    AddF64 { lhs: ValueId, rhs: ValueId },
+    AddF64 {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// f64 subtraction.
-    SubF64 { lhs: ValueId, rhs: ValueId },
+    SubF64 {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// f64 multiplication.
-    MulF64 { lhs: ValueId, rhs: ValueId },
+    MulF64 {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// f64 division.
-    DivF64 { lhs: ValueId, rhs: ValueId },
+    DivF64 {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// f64 modulo.
-    ModF64 { lhs: ValueId, rhs: ValueId },
+    ModF64 {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// f64 negation.
     NegF64(ValueId),
 
     // ====================================================================
     // Bitwise Operations (always i32)
     // ====================================================================
-    BitAnd { lhs: ValueId, rhs: ValueId },
-    BitOr { lhs: ValueId, rhs: ValueId },
-    BitXor { lhs: ValueId, rhs: ValueId },
-    Shl { lhs: ValueId, rhs: ValueId },
-    Shr { lhs: ValueId, rhs: ValueId },
-    Ushr { lhs: ValueId, rhs: ValueId },
+    BitAnd {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    BitOr {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    BitXor {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    Shl {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    Shr {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    Ushr {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     BitNot(ValueId),
 
     // ====================================================================
@@ -152,9 +221,15 @@ pub enum MirOp {
         rhs: ValueId,
     },
     /// Boxed strict equality (`===`).
-    CmpStrictEq { lhs: ValueId, rhs: ValueId },
+    CmpStrictEq {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// Boxed strict inequality (`!==`).
-    CmpStrictNe { lhs: ValueId, rhs: ValueId },
+    CmpStrictNe {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// Logical NOT on boolean.
     LogicalNot(ValueId),
 
@@ -202,13 +277,19 @@ pub enum MirOp {
         ic_index: u16,
     },
     /// Delete property.
-    DeleteProp { obj: ValueId, key: ValueId },
+    DeleteProp {
+        obj: ValueId,
+        key: ValueId,
+    },
 
     // ====================================================================
     // Array Access
     // ====================================================================
     /// Dense array element load (after GuardArrayDense + GuardBoundsCheck).
-    GetElemDense { arr: ValueId, idx: ValueId },
+    GetElemDense {
+        arr: ValueId,
+        idx: ValueId,
+    },
     /// Dense array element store (after GuardArrayDense + GuardBoundsCheck).
     SetElemDense {
         arr: ValueId,
@@ -218,7 +299,10 @@ pub enum MirOp {
     /// Array length (after GuardArrayDense).
     ArrayLength(ValueId),
     /// Array push (after GuardArrayDense). Returns new length as Int32.
-    ArrayPush { arr: ValueId, val: ValueId },
+    ArrayPush {
+        arr: ValueId,
+        val: ValueId,
+    },
     /// Generic element access (cold helper call).
     GetElemGeneric {
         obj: ValueId,
@@ -273,15 +357,24 @@ pub enum MirOp {
     /// Load a local variable (from register window).
     LoadLocal(u16),
     /// Store a local variable.
-    StoreLocal { idx: u16, val: ValueId },
+    StoreLocal {
+        idx: u16,
+        val: ValueId,
+    },
     /// Load a scratch register value.
     LoadRegister(u16),
     /// Store to a scratch register.
-    StoreRegister { idx: u16, val: ValueId },
+    StoreRegister {
+        idx: u16,
+        val: ValueId,
+    },
     /// Load an upvalue (closure capture).
     LoadUpvalue(u16),
     /// Store an upvalue.
-    StoreUpvalue { idx: u16, val: ValueId },
+    StoreUpvalue {
+        idx: u16,
+        val: ValueId,
+    },
     /// Close an upvalue (convert from open to closed).
     CloseUpvalue(u16),
     /// Load the `this` value.
@@ -291,7 +384,10 @@ pub enum MirOp {
     // Globals
     // ====================================================================
     /// Get a global variable by name constant index.
-    GetGlobal { name_idx: u32, ic_index: u16 },
+    GetGlobal {
+        name_idx: u32,
+        ic_index: u16,
+    },
     /// Set a global variable.
     SetGlobal {
         name_idx: u32,
@@ -305,9 +401,13 @@ pub enum MirOp {
     /// Allocate a new empty object.
     NewObject,
     /// Allocate a new array with given length hint.
-    NewArray { len: u16 },
+    NewArray {
+        len: u16,
+    },
     /// Create a closure from a function index.
-    CreateClosure { func_idx: u32 },
+    CreateClosure {
+        func_idx: u32,
+    },
     /// Create arguments object.
     CreateArguments,
     /// Define a property on an object.
@@ -317,7 +417,10 @@ pub enum MirOp {
         val: ValueId,
     },
     /// Set prototype of object.
-    SetPrototype { obj: ValueId, proto: ValueId },
+    SetPrototype {
+        obj: ValueId,
+        proto: ValueId,
+    },
 
     // ====================================================================
     // Type Operations
@@ -367,7 +470,9 @@ pub enum MirOp {
     // Exception Handling
     // ====================================================================
     /// Push a try handler (cold helper).
-    TryStart { catch_block: BlockId },
+    TryStart {
+        catch_block: BlockId,
+    },
     /// Pop the current try handler.
     TryEnd,
     /// Throw a value.
@@ -389,7 +494,9 @@ pub enum MirOp {
     // GC
     // ====================================================================
     /// GC safepoint. Lists all live values that may contain GC references.
-    Safepoint { live: Vec<ValueId> },
+    Safepoint {
+        live: Vec<ValueId>,
+    },
     /// Write barrier for heap stores (after SetPropShaped, SetElemDense, etc.).
     WriteBarrier(ValueId),
 

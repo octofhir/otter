@@ -9,7 +9,7 @@ use std::time::Instant;
 use otter_vm_bytecode::Function;
 
 use crate::code_cache;
-use crate::code_memory::{compile_clif_function, create_host_isa, CompiledFunction};
+use crate::code_memory::{CompiledFunction, compile_clif_function, create_host_isa};
 use crate::codegen::lower::lower_mir_to_clif;
 use crate::config::JIT_CONFIG;
 use crate::context::JitContext;
@@ -92,8 +92,11 @@ pub fn ensure_compiled(function: &Function) -> bool {
         }
         Err(_e) => {
             if JIT_CONFIG.dump_mir || JIT_CONFIG.dump_asm {
-                eprintln!("[otter-jit] compile failed for {:?}: {}",
-                    function.name.as_deref().unwrap_or("<anon>"), _e);
+                eprintln!(
+                    "[otter-jit] compile failed for {:?}: {}",
+                    function.name.as_deref().unwrap_or("<anon>"),
+                    _e
+                );
             }
             false
         }

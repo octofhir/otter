@@ -7,8 +7,8 @@
 //! The snapshot is taken once before compilation starts. If IC state
 //! changes after this, the function will deopt and be recompiled.
 
-use otter_vm_bytecode::function::{ArithmeticType, InlineCacheState, TypeFlags};
 use otter_vm_bytecode::Function;
+use otter_vm_bytecode::function::{ArithmeticType, InlineCacheState, TypeFlags};
 
 /// A compile-time snapshot of IC state for one feedback slot.
 #[derive(Debug, Clone)]
@@ -82,10 +82,7 @@ impl FeedbackSnapshot {
 
     /// Whether a property IC slot is monomorphic for own-property access.
     pub fn is_mono_own_prop(&self, index: u16) -> bool {
-        matches!(
-            self.ic(index),
-            IcSnapshot::MonoProp { depth: 0, .. }
-        )
+        matches!(self.ic(index), IcSnapshot::MonoProp { depth: 0, .. })
     }
 
     /// Whether an arithmetic IC slot suggests Int32 specialization.
@@ -133,10 +130,7 @@ fn convert_ic_state(state: &InlineCacheState) -> IcSnapshot {
             IcSnapshot::PolyProp { entries: es }
         }
         InlineCacheState::Megamorphic => IcSnapshot::Megamorphic,
-        InlineCacheState::MonoCall {
-            func_id,
-            jit_entry,
-        } => IcSnapshot::MonoCall {
+        InlineCacheState::MonoCall { func_id, jit_entry } => IcSnapshot::MonoCall {
             func_id: *func_id,
             jit_entry: *jit_entry,
         },

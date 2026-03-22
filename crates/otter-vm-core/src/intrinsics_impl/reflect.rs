@@ -111,7 +111,8 @@ fn is_constructor_value(value: &Value) -> bool {
     // like %TypedArray% set this flag but their concrete subclasses should
     // still be constructable.
     if let Some(obj) = value.as_object()
-        && let Some(desc) = obj.get_own_property_descriptor(&PropertyKey::string("__non_constructor"))
+        && let Some(desc) =
+            obj.get_own_property_descriptor(&PropertyKey::string("__non_constructor"))
         && desc.value().and_then(|v| v.as_boolean()) == Some(true)
     {
         return false;
@@ -280,9 +281,8 @@ pub fn ordinary_set_with_receiver(
         }
         if let Some(proxy) = current.as_proxy() {
             let key_value = crate::proxy_operations::property_key_to_value_pub(key);
-            let success = crate::proxy_operations::proxy_set(
-                ncx, proxy, key, key_value, value, *receiver,
-            )?;
+            let success =
+                crate::proxy_operations::proxy_set(ncx, proxy, key, key_value, value, *receiver)?;
             return Ok(Value::boolean(success));
         }
         // TypedArray in prototype chain: delegate to TA's exotic [[Set]]
@@ -306,8 +306,7 @@ pub fn ordinary_set_with_receiver(
                                 } else {
                                     value
                                 };
-                                let n =
-                                    crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                let n = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
                                 if !ta.is_detached() && idx < ta.length() {
                                     ta.set_bigint(idx, n);
                                 }
@@ -330,8 +329,7 @@ pub fn ordinary_set_with_receiver(
                                 } else {
                                     value
                                 };
-                                let _ =
-                                    crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
+                                let _ = crate::intrinsics_impl::typed_array::to_bigint_i64(&prim)?;
                             } else {
                                 let _ = ncx.to_number_value(&value)?;
                             }
@@ -423,9 +421,8 @@ fn ordinary_set_on_receiver(
                 configurable: true,
             },
         );
-        let success = crate::proxy_operations::proxy_define_property(
-            ncx, proxy, key, key_value, &desc,
-        )?;
+        let success =
+            crate::proxy_operations::proxy_define_property(ncx, proxy, key, key_value, &desc)?;
         return Ok(Value::boolean(success));
     }
 
@@ -816,9 +813,7 @@ fn reflect_get_own_property_descriptor(
             return match ci {
                 crate::typed_array_ops::CanonicalIndex::Int(idx) => {
                     if !ta.is_detached() && idx < ta.length() {
-                        if let Some(desc) =
-                            crate::typed_array_ops::ta_get_own_property(&ta, &key)
-                        {
+                        if let Some(desc) = crate::typed_array_ops::ta_get_own_property(&ta, &key) {
                             return Ok(descriptor_to_value(desc, ncx));
                         }
                     }

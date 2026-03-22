@@ -96,23 +96,9 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let newly_hot =
-                                func.record_back_edge_with_threshold(
-                                    otter_vm_exec::jit_hot_threshold(),
-                                );
+                            let newly_hot = func.record_back_edge();
                             if newly_hot {
                                 func.mark_hot();
-                                if otter_vm_exec::is_jit_enabled() {
-                                    otter_vm_exec::enqueue_hot_function(
-                                        &current_module,
-                                        eval_func_index,
-                                        func,
-                                    );
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                    otter_vm_exec::record_back_edge_compilation();
-                                }
                             }
                         }
                         ctx.jump(offset);

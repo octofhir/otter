@@ -131,3 +131,32 @@ pub fn nodejs_extensions() -> Vec<Box<dyn OtterExtension>> {
         test_ext::node_test_extension(),
     ]
 }
+
+// Stubs for node-compat overrides (used by test runner)
+use std::cell::RefCell;
+
+thread_local! {
+    static PROCESS_EXEC_ARGV: RefCell<Option<Vec<String>>> = RefCell::new(None);
+    static AUTO_SELECT_FAMILY: RefCell<Option<bool>> = RefCell::new(None);
+    static AUTO_SELECT_FAMILY_TIMEOUT: RefCell<Option<u64>> = RefCell::new(None);
+}
+
+/// Override process.execArgv for test runner.
+pub fn set_process_exec_argv_override(argv: Option<Vec<String>>) {
+    PROCESS_EXEC_ARGV.with(|v| *v.borrow_mut() = argv);
+}
+
+/// Get the process.execArgv override.
+pub fn get_process_exec_argv_override() -> Option<Vec<String>> {
+    PROCESS_EXEC_ARGV.with(|v| v.borrow().clone())
+}
+
+/// Override net.setDefaultAutoSelectFamily for test runner.
+pub fn set_default_auto_select_family_override(val: Option<bool>) {
+    AUTO_SELECT_FAMILY.with(|v| *v.borrow_mut() = val);
+}
+
+/// Override net.setDefaultAutoSelectFamilyAttemptTimeout for test runner.
+pub fn set_default_auto_select_family_attempt_timeout_override(val: Option<u64>) {
+    AUTO_SELECT_FAMILY_TIMEOUT.with(|v| *v.borrow_mut() = val);
+}

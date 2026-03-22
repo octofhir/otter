@@ -2,9 +2,8 @@
 resolver = "2"
 members = [
     "crates/otter-vm-bytecode",
-    "crates/otter-vm-exec",
     "crates/otter-vm-core",
-    "crates/otter-vm-jit",
+    "crates/otter-jit",
     "crates/otter-vm-compiler",
     "crates/otter-vm-gc",
     "crates/otter-vm-runtime",
@@ -29,7 +28,7 @@ thiserror = "2"
 lto = "thin"           # Link-time optimization (improves code layout)
 codegen-units = 1      # Single codegen unit (better inlining, worse compile time)
 strip = false          # Keep symbols for profiling
-debug = true           # Include debug info for flamegraph
+# debug = true           # Include debug info for flamegraph
 panic = "abort"        # No unwinding (smaller binary)
 opt-level = 3          # Maximum optimization
 

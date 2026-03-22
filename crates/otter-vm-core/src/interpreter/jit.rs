@@ -1,3 +1,8 @@
+//! Interpreter ↔ JIT bridge — stub during JIT rebuild.
+//!
+//! IC updates and quickening remain functional (they're interpreter features).
+//! JIT compilation and execution are disabled pending new otter-jit integration.
+
 use super::*;
 
 pub(super) enum BackEdgeOsrOutcome {
@@ -32,13 +37,24 @@ impl Interpreter {
         right: &Value,
     ) {
         if let Some(frame) = ctx.current_frame() {
-            let function = ctx.module_table.get(frame.module_id).function(frame.function_index).unwrap();
-            Self::update_arithmetic_ic_on_function(ctx, function, feedback_index, left, right, Some(frame.pc));
+            let function = ctx
+                .module_table
+                .get(frame.module_id)
+                .function(frame.function_index)
+                .unwrap();
+            Self::update_arithmetic_ic_on_function(
+                ctx,
+                function,
+                feedback_index,
+                left,
+                right,
+                Some(frame.pc),
+            );
         }
     }
 
     pub(crate) fn update_arithmetic_ic_on_function(
-        ctx: &VmContext,
+        _ctx: &VmContext,
         func: &otter_vm_bytecode::Function,
         feedback_index: u16,
         left: &Value,
@@ -70,7 +86,7 @@ impl Interpreter {
                 ic.ic_state = otter_vm_bytecode::function::InlineCacheState::Megamorphic;
             }
 
-            // Quickening: after enough consistent observations, specialize the instruction
+            // Quickening
             ic.hit_count = ic.hit_count.saturating_add(1);
             if ic.hit_count >= otter_vm_bytecode::function::QUICKENING_WARMUP {
                 if let Some(pc) = pc {
@@ -87,20 +103,14 @@ impl Interpreter {
         func: &otter_vm_bytecode::Function,
         is_construct: bool,
         is_async: bool,
-        argc: u8,
+        _argc: u8,
     ) -> bool {
-        otter_vm_exec::is_jit_enabled()
-            && func.is_hot_function()
-            && !func.is_deoptimized()
+        otter_jit::pipeline::should_jit(func)
             && !is_construct
             && !is_async
-            && !func.flags.has_rest
-            && !func.flags.uses_arguments
-            && !func.flags.uses_eval
-            && argc <= func.param_count
     }
 
-    /// Attempt to quicken a property access instruction based on IC state.
+    /// Property access quickening (interpreter feature, not JIT).
     #[inline]
     pub(super) fn try_quicken_property_access(
         func: &otter_vm_bytecode::Function,
@@ -154,7 +164,7 @@ impl Interpreter {
         }
     }
 
-    /// Attempt to quicken an arithmetic instruction based on type observations.
+    /// Arithmetic quickening (interpreter feature, not JIT).
     #[inline]
     pub(crate) fn try_quicken_arithmetic(
         func: &otter_vm_bytecode::Function,
@@ -248,182 +258,25 @@ impl Interpreter {
             _ => None,
         };
 
-        if let Some(new_instr) = quickened {
-            func.quicken_instruction(pc, new_instr);
+        if let Some(q) = quickened {
+            func.quicken_instruction(pc, q);
         }
     }
-    #[cfg(test)]
-    pub(super) fn has_backward_jump(function: &otter_vm_bytecode::Function) -> bool {
-        function
-            .instructions
-            .read()
-            .iter()
-            .any(|instruction| match instruction {
-                Instruction::Jump { offset }
-                | Instruction::JumpIfTrue { offset, .. }
-                | Instruction::JumpIfFalse { offset, .. }
-                | Instruction::JumpIfNullish { offset, .. }
-                | Instruction::JumpIfNotNullish { offset, .. }
-                | Instruction::ForInNext { offset, .. } => offset.0 < 0,
-                _ => false,
-            })
-    }
-    #[cfg(test)]
-    pub(super) fn is_static_jit_candidate(function: &otter_vm_bytecode::Function) -> bool {
-        !function.flags.is_async
-            && !function.flags.has_rest
-            && !function.flags.uses_arguments
-            && !function.flags.uses_eval
-    }
-    /// Handle a backward jump (back-edge) for loop-hot function detection and OSR.
-    ///
-    /// **Stage 1 — Back-edge counting:** Increments the function's back-edge
-    /// counter. When the counter crosses the hot threshold, the function is
-    /// marked hot and synchronously compiled by the JIT.
-    ///
-    /// **Stage 2 — True OSR:** If JIT code is already available, enters JIT at
-    /// the loop header with the interpreter's full frame state (all locals +
-    /// registers). Unlike the old full-restart approach, setup code before the
-    /// loop is NOT re-executed.
-    ///
-    /// `target_pc` is the bytecode PC of the backward jump target (loop header).
-    ///
-    /// Returns:
-    /// - `Returned(value)` if OSR completed the function in JIT
-    /// - `ContinueAtDeoptPc` when JIT bailed out with precise resume state
-    /// - `ContinueWithJump` for normal interpreter jump handling
-    #[inline]
+
+    /// OSR disabled during JIT rebuild. Still records back-edge heat for profiling.
     pub(super) fn try_back_edge_osr(
         &self,
         ctx: &mut VmContext,
-        module: &Arc<Module>,
-        func: &otter_vm_bytecode::Function,
-        target_pc: usize,
+        _offset: i32,
     ) -> BackEdgeOsrOutcome {
-        // ---- Stage 1: back-edge counting + JIT enqueue ----
-        let newly_hot = func.record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
-        if newly_hot {
-            func.mark_hot();
-            if otter_vm_exec::is_jit_enabled() {
-                let Some(frame) = ctx.current_frame() else {
-                    return BackEdgeOsrOutcome::ContinueWithJump;
-                };
-                let func_index = frame.function_index;
-                otter_vm_exec::enqueue_hot_function(module, func_index, func);
-                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-                otter_vm_exec::record_back_edge_compilation();
+        // Record back-edge for profiling even without JIT.
+        if let Some(frame) = ctx.current_frame() {
+            let module = ctx.module_table.get(frame.module_id);
+            if let Some(func) = module.function(frame.function_index) {
+                func.record_back_edge();
+                func.mark_hot();
             }
         }
-
-        // ---- Stage 2: True OSR at loop header ----
-        if !otter_vm_exec::is_jit_enabled()
-            || !func.is_hot_function()
-            || func.is_deoptimized()
-            || func.flags.has_rest
-            || func.flags.uses_arguments
-            || func.flags.uses_eval
-        {
-            return BackEdgeOsrOutcome::ContinueWithJump;
-        }
-
-        // Extract all needed state from the frame in one borrow.
-        let Some(frame) = ctx.current_frame() else {
-            return BackEdgeOsrOutcome::ContinueWithJump;
-        };
-        if frame.flags.is_construct() || frame.flags.is_async() {
-            return BackEdgeOsrOutcome::ContinueWithJump;
-        }
-        let func_index = frame.function_index;
-        let this_value = frame.this_value;
-        let home_object = frame.home_object;
-        let upvalues = frame.upvalues.clone();
-        // frame borrow ends here
-
-        // IC-driven recompilation: if a JIT helper detected IC transitions
-        // (Uninitialized → Monomorphic) after the function was compiled,
-        // it cleared the JIT entry and set the recompilation flag. Recompile
-        // synchronously (not via background worker) so the result is available
-        // for immediate OSR re-entry.
-        if func.take_ic_recompilation_needed() && otter_vm_exec::is_jit_enabled() {
-            otter_vm_exec::enqueue_hot_function(module, func_index, func);
-            otter_vm_exec::compile_one_pending_request_sync(crate::jit_runtime::runtime_helpers());
-        }
-
-        // Background JIT may have compiled code in the runtime cache while
-        // function-local entry pointer is still not populated.
-        if !otter_vm_exec::hydrate_jit_entry_ptr(module.module_id, func_index, func) {
-            return BackEdgeOsrOutcome::ContinueWithJump;
-        }
-
-        // Extract ALL locals and registers for true OSR.
-        let local_count = func.local_count as usize;
-        let reg_count = func.register_count as usize;
-        let locals: Vec<Value> = (0..local_count)
-            .map(|i| {
-                ctx.get_local(i as u16)
-                    .unwrap_or_else(|_| Value::undefined())
-            })
-            .collect();
-        let registers: Vec<Value> = (0..reg_count)
-            .map(|i| *ctx.get_register(i as u16))
-            .collect();
-
-        // Build args from parameter locals (for JIT context argv, though OSR
-        // loads from deopt buffers instead).
-        let param_count = func.param_count as usize;
-        let Some(frame) = ctx.current_frame() else {
-            return BackEdgeOsrOutcome::ContinueWithJump;
-        };
-        let argc = param_count.min(frame.argc as usize);
-        let args: Vec<Value> = (0..argc)
-            .map(|i| {
-                ctx.get_local(i as u16)
-                    .unwrap_or_else(|_| Value::undefined())
-            })
-            .collect();
-
-        // Set up pending state for the JIT context.
-        ctx.set_pending_this(this_value);
-        if let Some(home_obj) = home_object {
-            ctx.set_pending_home_object(home_obj);
-        }
-
-        otter_vm_exec::record_osr_attempt();
-
-        let osr_state = crate::jit_runtime::OsrState {
-            entry_pc: target_pc as u32,
-            locals,
-            registers,
-        };
-
-        let jit_interp: *const Self = self;
-        let jit_ctx_ptr: *mut VmContext = ctx;
-        match crate::jit_runtime::try_execute_jit(
-            module.module_id,
-            func_index,
-            func,
-            &args,
-            ctx.cached_proto_epoch,
-            jit_interp,
-            jit_ctx_ptr,
-            &module.constants as *const _,
-            &upvalues,
-            Some(osr_state),
-        ) {
-            crate::jit_runtime::JitCallResult::Ok(value) => {
-                otter_vm_exec::record_osr_success();
-                BackEdgeOsrOutcome::Returned(value)
-            }
-            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                crate::jit_resume::resume_in_place(ctx, &state);
-                BackEdgeOsrOutcome::ContinueAtDeoptPc
-            }
-            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                otter_vm_exec::enqueue_hot_function(module, func_index, func);
-                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-                BackEdgeOsrOutcome::ContinueWithJump
-            }
-            _ => BackEdgeOsrOutcome::ContinueWithJump,
-        }
+        BackEdgeOsrOutcome::ContinueWithJump
     }
 }

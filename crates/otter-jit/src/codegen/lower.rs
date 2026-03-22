@@ -1,0 +1,424 @@
+//! MIR → Cranelift IR translation.
+//!
+//! Translates each MIR instruction into one or more Cranelift IR instructions.
+//! If any instruction cannot be lowered, compilation fails with `JitError`
+//! and the function stays in the interpreter.
+
+use std::collections::HashMap;
+
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types;
+use cranelift_codegen::ir::{
+    Block, Function as ClifFunction, InstBuilder, MemFlags, Value,
+};
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+use crate::abi::jit_function_signature;
+use crate::context::offsets;
+use crate::mir::graph::{BlockId, MirGraph, ValueId};
+use crate::mir::nodes::MirOp;
+use crate::mir::types::CmpOp;
+use crate::codegen::value_repr;
+use crate::{BAILOUT_SENTINEL, JitError};
+
+/// Lower a complete MIR graph into a Cranelift IR function.
+pub fn lower_mir_to_clif(
+    graph: &MirGraph,
+    isa: &dyn TargetIsa,
+) -> Result<ClifFunction, JitError> {
+    let call_conv = isa.default_call_conv();
+    let pointer_type = isa.pointer_type();
+
+    let sig = jit_function_signature(call_conv, pointer_type);
+    let mut func = ClifFunction::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, 0),
+        sig,
+    );
+
+    let mut func_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+
+    let mut block_map: HashMap<BlockId, Block> = HashMap::new();
+    for mir_block in &graph.blocks {
+        let clif_block = builder.create_block();
+        block_map.insert(mir_block.id, clif_block);
+    }
+
+    let entry_clif_block = block_map[&graph.entry_block];
+    builder.append_block_params_for_function_params(entry_clif_block);
+    builder.switch_to_block(entry_clif_block);
+    builder.seal_block(entry_clif_block);
+
+    let ctx_ptr = builder.block_params(entry_clif_block)[0];
+
+    let mut value_map: HashMap<ValueId, Value> = HashMap::new();
+
+    let mut lowerer = OpLowerer {
+        ctx_ptr,
+        pointer_type,
+        value_map: &mut value_map,
+        block_map: &block_map,
+        graph,
+    };
+
+    for (block_idx, mir_block) in graph.blocks.iter().enumerate() {
+        let clif_block = block_map[&mir_block.id];
+
+        if block_idx > 0 {
+            builder.switch_to_block(clif_block);
+            builder.seal_block(clif_block);
+        }
+
+        // Track if current block has been terminated (by a guard's deopt/continue
+        // split or by an unsupported op that we turned into a bailout).
+        let mut block_terminated = false;
+
+        for instr in &mir_block.instrs {
+            if block_terminated {
+                // After a terminator, skip remaining instructions in this MIR block.
+                // They'll be dead code (the MIR builder handles this via Deopt).
+                break;
+            }
+
+            let result = lowerer.lower_op(&mut builder, &instr.op)?;
+
+            if let Some(clif_val) = result {
+                lowerer.value_map.insert(instr.value, clif_val);
+            }
+
+            // Check if we just emitted a terminator
+            if instr.op.is_terminator() {
+                block_terminated = true;
+            }
+        }
+    }
+
+    builder.finalize();
+    Ok(func)
+}
+
+/// Holds state for lowering operations.
+struct OpLowerer<'a> {
+    ctx_ptr: Value,
+    pointer_type: types::Type,
+    value_map: &'a mut HashMap<ValueId, Value>,
+    block_map: &'a HashMap<BlockId, Block>,
+    graph: &'a MirGraph,
+}
+
+impl<'a> OpLowerer<'a> {
+    /// Get the CLIF Value for a MIR ValueId.
+    fn v(&self, id: &ValueId) -> Result<Value, JitError> {
+        self.value_map.get(id).copied().ok_or_else(|| {
+            JitError::Internal(format!("MIR value {} not available in current CLIF block", id))
+        })
+    }
+
+    /// Get CLIF Block for a MIR BlockId.
+    fn b(&self, id: &BlockId) -> Block {
+        self.block_map[id]
+    }
+
+    /// Lower a single MIR operation.
+    fn lower_op(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        op: &MirOp,
+    ) -> Result<Option<Value>, JitError> {
+        let ctx_ptr = self.ctx_ptr;
+        let pointer_type = self.pointer_type;
+
+        match op {
+            // ---- Constants ----
+            MirOp::Const(bits) => Ok(Some(builder.ins().iconst(types::I64, *bits as i64))),
+            MirOp::Undefined => Ok(Some(value_repr::emit_undefined(builder))),
+            MirOp::Null => Ok(Some(value_repr::emit_null(builder))),
+            MirOp::True => Ok(Some(value_repr::emit_true(builder))),
+            MirOp::False => Ok(Some(value_repr::emit_false(builder))),
+            MirOp::ConstInt32(n) => Ok(Some(builder.ins().iconst(types::I32, *n as i64))),
+            MirOp::ConstFloat64(n) => Ok(Some(builder.ins().f64const(*n))),
+
+            // ---- Boxing ----
+            MirOp::BoxInt32(val) => Ok(Some(value_repr::emit_box_int32(builder, self.v(val)?))),
+            MirOp::BoxFloat64(val) => Ok(Some(value_repr::emit_box_float64(builder, self.v(val)?))),
+            MirOp::BoxBool(val) => Ok(Some(value_repr::emit_box_bool(builder, self.v(val)?))),
+            MirOp::UnboxInt32(val) => Ok(Some(value_repr::emit_unbox_int32(builder, self.v(val)?))),
+            MirOp::UnboxFloat64(val) => Ok(Some(value_repr::emit_unbox_float64(builder, self.v(val)?))),
+            MirOp::Int32ToFloat64(val) => {
+                Ok(Some(builder.ins().fcvt_from_sint(types::F64, self.v(val)?)))
+            }
+
+            // ---- Guards ----
+            MirOp::GuardInt32 { val, deopt } => {
+                let boxed = self.v(val)?;
+                let is_int = value_repr::emit_is_int32(builder, boxed);
+                self.emit_guard(builder, is_int, deopt)?;
+                Ok(Some(value_repr::emit_unbox_int32(builder, boxed)))
+            }
+            MirOp::GuardFloat64 { val, deopt } => {
+                let boxed = self.v(val)?;
+                let is_f64 = value_repr::emit_is_float64(builder, boxed);
+                self.emit_guard(builder, is_f64, deopt)?;
+                Ok(Some(value_repr::emit_unbox_float64(builder, boxed)))
+            }
+            MirOp::GuardObject { val, deopt } => {
+                let boxed = self.v(val)?;
+                let is_obj = value_repr::emit_is_object(builder, boxed);
+                self.emit_guard(builder, is_obj, deopt)?;
+                Ok(Some(value_repr::emit_extract_pointer(builder, boxed)))
+            }
+            MirOp::GuardShape { .. } | MirOp::GuardProtoEpoch { .. }
+            | MirOp::GuardArrayDense { .. } | MirOp::GuardBoundsCheck { .. }
+            | MirOp::GuardNotHole { .. } | MirOp::GuardString { .. }
+            | MirOp::GuardFunction { .. } | MirOp::GuardBool { .. } => {
+                // TODO: implement these guards properly
+                Ok(None)
+            }
+
+            // ---- Int32 Arithmetic (overflow → deopt) ----
+            MirOp::AddI32 { lhs, rhs, deopt } => {
+                let (result, overflow) = builder.ins().sadd_overflow(self.v(lhs)?, self.v(rhs)?);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+            MirOp::SubI32 { lhs, rhs, deopt } => {
+                let (result, overflow) = builder.ins().ssub_overflow(self.v(lhs)?, self.v(rhs)?);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+            MirOp::MulI32 { lhs, rhs, deopt } => {
+                let (result, overflow) = builder.ins().smul_overflow(self.v(lhs)?, self.v(rhs)?);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+            MirOp::DivI32 { lhs, rhs, deopt } => {
+                let l = self.v(lhs)?;
+                let r = self.v(rhs)?;
+                let zero = builder.ins().iconst(types::I32, 0);
+                let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
+                // Deopt on div-by-zero (overflow=true means deopt)
+                self.emit_overflow_guard(builder, is_zero, deopt)?;
+                Ok(Some(builder.ins().sdiv(l, r)))
+            }
+            MirOp::IncI32 { val, deopt } => {
+                let one = builder.ins().iconst(types::I32, 1);
+                let (result, overflow) = builder.ins().sadd_overflow(self.v(val)?, one);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+            MirOp::DecI32 { val, deopt } => {
+                let one = builder.ins().iconst(types::I32, 1);
+                let (result, overflow) = builder.ins().ssub_overflow(self.v(val)?, one);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+            MirOp::NegI32 { val, deopt } => {
+                let zero = builder.ins().iconst(types::I32, 0);
+                let (result, overflow) = builder.ins().ssub_overflow(zero, self.v(val)?);
+                self.emit_overflow_guard(builder, overflow, deopt)?;
+                Ok(Some(result))
+            }
+
+            // ---- Float64 Arithmetic ----
+            MirOp::AddF64 { lhs, rhs } => Ok(Some(builder.ins().fadd(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::SubF64 { lhs, rhs } => Ok(Some(builder.ins().fsub(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::MulF64 { lhs, rhs } => Ok(Some(builder.ins().fmul(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::DivF64 { lhs, rhs } => Ok(Some(builder.ins().fdiv(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::ModF64 { .. } => Err(JitError::UnsupportedInstruction("ModF64 (needs libcall)".into())),
+            MirOp::NegF64(val) => Ok(Some(builder.ins().fneg(self.v(val)?))),
+
+            // ---- Bitwise ----
+            MirOp::BitAnd { lhs, rhs } => Ok(Some(builder.ins().band(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::BitOr { lhs, rhs } => Ok(Some(builder.ins().bor(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::BitXor { lhs, rhs } => Ok(Some(builder.ins().bxor(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::Shl { lhs, rhs } => Ok(Some(builder.ins().ishl(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::Shr { lhs, rhs } => Ok(Some(builder.ins().sshr(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::Ushr { lhs, rhs } => Ok(Some(builder.ins().ushr(self.v(lhs)?, self.v(rhs)?))),
+            MirOp::BitNot(val) => Ok(Some(builder.ins().bnot(self.v(val)?))),
+
+            // ---- Comparisons ----
+            MirOp::CmpI32 { op, lhs, rhs } => {
+                Ok(Some(builder.ins().icmp(cmp_to_intcc(op), self.v(lhs)?, self.v(rhs)?)))
+            }
+            MirOp::CmpF64 { op, lhs, rhs } => {
+                Ok(Some(builder.ins().fcmp(cmp_to_floatcc(op), self.v(lhs)?, self.v(rhs)?)))
+            }
+            MirOp::CmpStrictEq { lhs, rhs } => {
+                Ok(Some(builder.ins().icmp(IntCC::Equal, self.v(lhs)?, self.v(rhs)?)))
+            }
+            MirOp::CmpStrictNe { lhs, rhs } => {
+                Ok(Some(builder.ins().icmp(IntCC::NotEqual, self.v(lhs)?, self.v(rhs)?)))
+            }
+            MirOp::LogicalNot(val) => {
+                let zero = builder.ins().iconst(types::I8, 0);
+                Ok(Some(builder.ins().icmp(IntCC::Equal, self.v(val)?, zero)))
+            }
+            MirOp::IsTruthy(val) => {
+                let v = self.v(val)?;
+                let false_bits = builder.ins().iconst(types::I64, value_repr::TAG_FALSE as i64);
+                let undef_bits = builder.ins().iconst(types::I64, value_repr::TAG_UNDEFINED as i64);
+                let null_bits = builder.ins().iconst(types::I64, value_repr::TAG_NULL as i64);
+                let zero_bits = builder.ins().iconst(types::I64, value_repr::TAG_INT32 as i64);
+
+                let not_false = builder.ins().icmp(IntCC::NotEqual, v, false_bits);
+                let not_undef = builder.ins().icmp(IntCC::NotEqual, v, undef_bits);
+                let not_null = builder.ins().icmp(IntCC::NotEqual, v, null_bits);
+                let not_zero = builder.ins().icmp(IntCC::NotEqual, v, zero_bits);
+
+                let a = builder.ins().band(not_false, not_undef);
+                let b = builder.ins().band(a, not_null);
+                Ok(Some(builder.ins().band(b, not_zero)))
+            }
+
+            // ---- Variables ----
+            MirOp::LoadLocal(idx) => {
+                let base = builder.ins().load(pointer_type, MemFlags::trusted(), ctx_ptr, offsets::REGISTERS_BASE);
+                let offset = (*idx as i32) * 8;
+                Ok(Some(builder.ins().load(types::I64, MemFlags::trusted(), base, offset)))
+            }
+            MirOp::StoreLocal { idx, val } => {
+                let base = builder.ins().load(pointer_type, MemFlags::trusted(), ctx_ptr, offsets::REGISTERS_BASE);
+                let offset = (*idx as i32) * 8;
+                builder.ins().store(MemFlags::trusted(), self.v(val)?, base, offset);
+                Ok(None)
+            }
+            MirOp::LoadRegister(idx) => {
+                let base = builder.ins().load(pointer_type, MemFlags::trusted(), ctx_ptr, offsets::REGISTERS_BASE);
+                let local_count = builder.ins().load(types::I32, MemFlags::trusted(), ctx_ptr, offsets::LOCAL_COUNT);
+                let local_count_64 = builder.ins().uextend(types::I64, local_count);
+                let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                let total_idx = builder.ins().iadd(local_count_64, idx_val);
+                let byte_offset = builder.ins().imul_imm(total_idx, 8);
+                let addr = builder.ins().iadd(base, byte_offset);
+                Ok(Some(builder.ins().load(types::I64, MemFlags::trusted(), addr, 0)))
+            }
+            MirOp::StoreRegister { idx, val } => {
+                let base = builder.ins().load(pointer_type, MemFlags::trusted(), ctx_ptr, offsets::REGISTERS_BASE);
+                let local_count = builder.ins().load(types::I32, MemFlags::trusted(), ctx_ptr, offsets::LOCAL_COUNT);
+                let local_count_64 = builder.ins().uextend(types::I64, local_count);
+                let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                let total_idx = builder.ins().iadd(local_count_64, idx_val);
+                let byte_offset = builder.ins().imul_imm(total_idx, 8);
+                let addr = builder.ins().iadd(base, byte_offset);
+                builder.ins().store(MemFlags::trusted(), self.v(val)?, addr, 0);
+                Ok(None)
+            }
+            MirOp::LoadThis => {
+                Ok(Some(builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, offsets::THIS_RAW)))
+            }
+
+            // ---- Control Flow ----
+            MirOp::Jump(target) => {
+                builder.ins().jump(self.b(target), &[]);
+                Ok(None)
+            }
+            MirOp::Branch { cond, true_block, false_block } => {
+                builder.ins().brif(self.v(cond)?, self.b(true_block), &[], self.b(false_block), &[]);
+                Ok(None)
+            }
+            MirOp::Return(val) => {
+                builder.ins().return_(&[self.v(val)?]);
+                Ok(None)
+            }
+            MirOp::ReturnUndefined => {
+                let undef = value_repr::emit_undefined(builder);
+                builder.ins().return_(&[undef]);
+                Ok(None)
+            }
+            MirOp::Deopt(deopt) => {
+                let deopt_info = &self.graph.deopts[deopt.0 as usize];
+                emit_bailout(builder, ctx_ptr, deopt_info.bytecode_pc);
+                Ok(None)
+            }
+
+            // ---- Void operations (no codegen needed) ----
+            MirOp::CloseUpvalue(_) | MirOp::Safepoint { .. }
+            | MirOp::WriteBarrier(_) | MirOp::TryStart { .. } | MirOp::TryEnd => {
+                Ok(None)
+            }
+
+            // ---- Everything else: cannot lower → compilation fails ----
+            _ => {
+                let op_name = format!("{:?}", op);
+                // Truncate for readability
+                let short = if op_name.len() > 60 { &op_name[..60] } else { &op_name };
+                Err(JitError::UnsupportedInstruction(short.to_string()))
+            }
+        }
+    }
+
+    /// Emit a type guard: if `condition` is false, deopt.
+    /// Switches builder to a fresh continue_block.
+    fn emit_guard(
+        &self,
+        builder: &mut FunctionBuilder,
+        condition: Value,
+        deopt: &crate::mir::graph::DeoptId,
+    ) -> Result<(), JitError> {
+        let deopt_info = &self.graph.deopts[deopt.0 as usize];
+        let continue_block = builder.create_block();
+        let deopt_block = builder.create_block();
+
+        builder.ins().brif(condition, continue_block, &[], deopt_block, &[]);
+
+        builder.switch_to_block(deopt_block);
+        builder.seal_block(deopt_block);
+        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc);
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+        Ok(())
+    }
+
+    /// Emit an overflow guard: if `overflow` is true, deopt.
+    fn emit_overflow_guard(
+        &self,
+        builder: &mut FunctionBuilder,
+        overflow: Value,
+        deopt: &crate::mir::graph::DeoptId,
+    ) -> Result<(), JitError> {
+        let deopt_info = &self.graph.deopts[deopt.0 as usize];
+        let continue_block = builder.create_block();
+        let deopt_block = builder.create_block();
+
+        builder.ins().brif(overflow, deopt_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(deopt_block);
+        builder.seal_block(deopt_block);
+        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc);
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+        Ok(())
+    }
+}
+
+fn emit_bailout(builder: &mut FunctionBuilder, ctx_ptr: Value, bytecode_pc: u32) {
+    let pc_val = builder.ins().iconst(types::I32, bytecode_pc as i64);
+    builder.ins().store(MemFlags::trusted(), pc_val, ctx_ptr, offsets::BAILOUT_PC);
+    let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL as i64);
+    builder.ins().return_(&[sentinel]);
+}
+
+fn cmp_to_intcc(op: &CmpOp) -> IntCC {
+    match op {
+        CmpOp::Eq => IntCC::Equal,
+        CmpOp::Ne => IntCC::NotEqual,
+        CmpOp::Lt => IntCC::SignedLessThan,
+        CmpOp::Le => IntCC::SignedLessThanOrEqual,
+        CmpOp::Gt => IntCC::SignedGreaterThan,
+        CmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+    }
+}
+
+fn cmp_to_floatcc(op: &CmpOp) -> FloatCC {
+    match op {
+        CmpOp::Eq => FloatCC::Equal,
+        CmpOp::Ne => FloatCC::NotEqual,
+        CmpOp::Lt => FloatCC::LessThan,
+        CmpOp::Le => FloatCC::LessThanOrEqual,
+        CmpOp::Gt => FloatCC::GreaterThan,
+        CmpOp::Ge => FloatCC::GreaterThanOrEqual,
+    }
+}

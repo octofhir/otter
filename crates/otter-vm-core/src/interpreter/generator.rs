@@ -229,66 +229,6 @@ impl Interpreter {
         let this_value = generator.take_initial_this();
         let argc = args.len() as u16;
 
-        // Attempt JIT execution for the generator body (bail-on-yield strategy).
-        // This must happen before set_pending_args/this since those consume the values.
-        if otter_vm_exec::is_jit_enabled() && func.jit_entry_ptr() != 0 && !func.is_deoptimized() {
-            let jit_interp: *const Self = self;
-            let jit_ctx_ptr: *mut VmContext = ctx;
-            let upvalues = generator.upvalues.clone();
-            ctx.set_pending_this(this_value);
-            match crate::jit_runtime::try_execute_jit(
-                generator.module.module_id,
-                generator.function_index,
-                func,
-                &args,
-                ctx.cached_proto_epoch,
-                jit_interp,
-                jit_ctx_ptr,
-                &generator.module.constants as *const _,
-                &upvalues,
-                None,
-            ) {
-                crate::jit_runtime::JitCallResult::Ok(value) => {
-                    generator.complete();
-                    return GeneratorResult::Returned(value);
-                }
-                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                    let try_stack = Self::reconstruct_try_stack(
-                        func,
-                        state.bailout_pc as usize,
-                        ctx.stack_depth() + 1,
-                    );
-                    if let Some(resume) = crate::jit_resume::try_materialize_generator_yield(
-                        ctx,
-                        &state,
-                        func,
-                        generator.function_index,
-                        Arc::clone(&generator.module),
-                        upvalues,
-                        try_stack,
-                        this_value,
-                        generator.is_construct(),
-                        argc,
-                    ) {
-                        generator.suspend_with_frame(resume.frame);
-                        return GeneratorResult::Yielded(resume.yielded_value);
-                    }
-                }
-                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                    otter_vm_exec::enqueue_hot_function(
-                        &generator.module,
-                        generator.function_index,
-                        func,
-                    );
-                    otter_vm_exec::compile_one_pending_request(
-                        crate::jit_runtime::runtime_helpers(),
-                    );
-                }
-                crate::jit_runtime::JitCallResult::BailoutRestart
-                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-            }
-        }
-
         // Set up pending args and push initial frame
         ctx.set_pending_realm_id(generator.realm_id);
         ctx.set_pending_args_from_vec(args);
@@ -549,127 +489,19 @@ impl Interpreter {
     /// Returns `None` to continue interpreting.
     fn try_generator_osr(
         &self,
-        ctx: &mut VmContext,
-        generator: &GcRef<JsGenerator>,
-        module: &Arc<Module>,
+        _ctx: &mut VmContext,
+        _generator: &GcRef<JsGenerator>,
+        _module: &Arc<Module>,
         func: &otter_vm_bytecode::Function,
-        target_pc: usize,
-        initial_depth: usize,
+        _target_pc: usize,
+        _initial_depth: usize,
     ) -> Option<GeneratorResult> {
-        let newly_hot = func.record_back_edge_with_threshold(otter_vm_exec::jit_hot_threshold());
+        // JIT disabled during rebuild — just record the back-edge for profiling
+        let newly_hot = func.record_back_edge();
         if newly_hot {
             func.mark_hot();
-            if otter_vm_exec::is_jit_enabled() {
-                let func_index = ctx.current_frame()?.function_index;
-                otter_vm_exec::enqueue_hot_function(module, func_index, func);
-                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-                otter_vm_exec::record_back_edge_compilation();
-            }
         }
-
-        if !otter_vm_exec::is_jit_enabled()
-            || !func.is_hot_function()
-            || func.is_deoptimized()
-            || func.jit_entry_ptr() == 0
-            || func.flags.has_rest
-            || func.flags.uses_arguments
-            || func.flags.uses_eval
-        {
-            return None;
-        }
-
-        let frame = ctx.current_frame()?;
-        if frame.flags.is_construct() || frame.flags.is_async() {
-            return None;
-        }
-        let func_index = frame.function_index;
-        let this_value = frame.this_value;
-        let home_object = frame.home_object;
-        let upvalues = frame.upvalues.clone();
-        let argc = frame.argc;
-
-        let local_count = func.local_count as usize;
-        let reg_count = func.register_count as usize;
-        let locals: Vec<Value> = (0..local_count)
-            .map(|i| {
-                ctx.get_local(i as u16)
-                    .unwrap_or_else(|_| Value::undefined())
-            })
-            .collect();
-        let registers: Vec<Value> = (0..reg_count)
-            .map(|i| *ctx.get_register(i as u16))
-            .collect();
-
-        let param_count = func.param_count as usize;
-        let arg_count = param_count.min(argc as usize);
-        let args: Vec<Value> = (0..arg_count)
-            .map(|i| {
-                ctx.get_local(i as u16)
-                    .unwrap_or_else(|_| Value::undefined())
-            })
-            .collect();
-
-        ctx.set_pending_this(this_value);
-        if let Some(home_obj) = home_object {
-            ctx.set_pending_home_object(home_obj);
-        }
-
-        otter_vm_exec::record_osr_attempt();
-
-        let osr_state = crate::jit_runtime::OsrState {
-            entry_pc: target_pc as u32,
-            locals,
-            registers,
-        };
-
-        let jit_interp: *const Self = self;
-        let jit_ctx_ptr: *mut VmContext = ctx;
-        match crate::jit_runtime::try_execute_jit(
-            module.module_id,
-            func_index,
-            func,
-            &args,
-            ctx.cached_proto_epoch,
-            jit_interp,
-            jit_ctx_ptr,
-            &module.constants as *const _,
-            &upvalues,
-            Some(osr_state),
-        ) {
-            crate::jit_runtime::JitCallResult::Ok(value) => {
-                otter_vm_exec::record_osr_success();
-                Some(GeneratorResult::Returned(value))
-            }
-            crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                let try_stack =
-                    Self::reconstruct_try_stack(func, state.bailout_pc as usize, initial_depth + 1);
-                if let Some(resume) = crate::jit_resume::try_materialize_generator_yield(
-                    ctx,
-                    &state,
-                    func,
-                    func_index,
-                    Arc::clone(module),
-                    upvalues,
-                    try_stack,
-                    this_value,
-                    generator.is_construct(),
-                    argc,
-                ) {
-                    generator.suspend_with_frame(resume.frame);
-                    ctx.pop_frame_discard();
-                    return Some(GeneratorResult::Yielded(resume.yielded_value));
-                }
-                crate::jit_resume::resume_in_place(ctx, &state);
-                None
-            }
-            crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                otter_vm_exec::enqueue_hot_function(module, func_index, func);
-                otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-                None
-            }
-            crate::jit_runtime::JitCallResult::BailoutRestart
-            | crate::jit_runtime::JitCallResult::NotCompiled => None,
-        }
+        None
     }
 
     /// Run the generator execution loop until yield, return, or error
@@ -873,7 +705,7 @@ impl Interpreter {
                                     }
                                 }
                             } else {
-                                match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                                match self.try_back_edge_osr(ctx, offset) {
                                     BackEdgeOsrOutcome::Returned(osr_value) => {
                                         // Inner function call completed via OSR — treat as return
                                         let return_reg = ctx
@@ -992,61 +824,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info with scoped borrow (no Arc clone)
-                        let (local_count, has_rest, param_count) = {
-                            let m = ctx.module_table.get(module_id);
-                            match m.function(func_index) {
-                                Some(f) => {
-                                    (f.local_count, f.flags.has_rest, f.param_count as usize)
-                                }
-                                None => {
-                                    generator.complete();
-                                    return GeneratorResult::Error(VmError::internal(format!(
-                                        "callee not found (func_index={}, function_count={})",
-                                        func_index,
-                                        m.function_count()
-                                    )));
-                                }
-                            }
-                        };
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-
-                        if let Err(e) = ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        ) {
+                        if let Err(e) = self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues) {
                             generator.complete();
                             return GeneratorResult::Error(e);
                         }
@@ -1061,58 +839,7 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-
-                        let (local_count, has_rest, param_count) = {
-                            let m = ctx.module_table.get(module_id);
-                            match m.function(func_index) {
-                                Some(f) => {
-                                    (f.local_count, f.flags.has_rest, f.param_count as usize)
-                                }
-                                None => {
-                                    generator.complete();
-                                    return GeneratorResult::Error(VmError::internal(format!(
-                                        "callee not found (func_index={}, function_count={})",
-                                        func_index,
-                                        m.function_count()
-                                    )));
-                                }
-                            }
-                        };
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-
-                        if let Err(e) = ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        ) {
+                        if let Err(e) = self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues) {
                             generator.complete();
                             return GeneratorResult::Error(e);
                         }

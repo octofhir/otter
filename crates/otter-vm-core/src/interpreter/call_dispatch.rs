@@ -249,23 +249,9 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let newly_hot =
-                                func.record_back_edge_with_threshold(
-                                    otter_vm_exec::jit_hot_threshold(),
-                                );
+                            let newly_hot = func.record_back_edge();
                             if newly_hot {
                                 func.mark_hot();
-                                if otter_vm_exec::is_jit_enabled() {
-                                    otter_vm_exec::enqueue_hot_function(
-                                        &current_module,
-                                        construct_func_index,
-                                        func,
-                                    );
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                    otter_vm_exec::record_back_edge_compilation();
-                                }
                             }
                         }
                         ctx.jump(offset);
@@ -311,85 +297,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info with scoped borrow (no Arc clone on hot path)
-                        let (local_count, became_hot, can_try_jit) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m
-                                .function(func_index)
-                                .ok_or_else(|| VmError::internal("function not found"))?;
-                            let hot =
-                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                            let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (f.local_count, hot, jit)
-                        };
-
-                        // JIT paths (cold) — clone Arc only when needed
-                        if became_hot && otter_vm_exec::is_jit_enabled() {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                            otter_vm_exec::compile_one_pending_request(
-                                crate::jit_runtime::runtime_helpers(),
-                            );
-                        }
-                        if can_try_jit {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module_id,
-                                func_index,
-                                f,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &m.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module_id,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as u16,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-
-                        // Hot path: push frame (no Arc clone)
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -400,22 +308,7 @@ impl Interpreter {
                         upvalues,
                     } => {
                         ctx.pop_frame_discard();
-                        let local_count = {
-                            let m = ctx.module_table.get(module_id);
-                            m.function(func_index)
-                                .ok_or_else(|| VmError::internal("function not found"))?
-                                .local_count
-                        };
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
                     }
                     DispatchAction::Suspend { .. } => {
                         // Can't handle suspension in direct call, return undefined

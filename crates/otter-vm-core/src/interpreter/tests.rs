@@ -1902,37 +1902,7 @@ fn test_hot_function_detection_call_count() {
     assert!(func.get_call_count() >= HOT_FUNCTION_THRESHOLD);
     assert!(func.is_hot_function());
 }
-#[test]
-fn test_jit_loop_candidate_detection() {
-    let loop_func = Function::builder()
-        .name("loop_func")
-        .register_count(1)
-        .instruction(Instruction::LoadTrue { dst: Register(0) })
-        .instruction(Instruction::JumpIfTrue {
-            cond: Register(0),
-            offset: otter_vm_bytecode::JumpOffset(-1),
-        })
-        .build();
-
-    assert!(Interpreter::has_backward_jump(&loop_func));
-    assert!(Interpreter::is_static_jit_candidate(&loop_func));
-
-    let non_loop = Function::builder()
-        .name("non_loop")
-        .instruction(Instruction::ReturnUndefined)
-        .build();
-    assert!(!Interpreter::has_backward_jump(&non_loop));
-
-    let non_candidate = Function::builder()
-        .name("non_candidate")
-        .flags(otter_vm_bytecode::function::FunctionFlags {
-            uses_arguments: true,
-            ..Default::default()
-        })
-        .instruction(Instruction::ReturnUndefined)
-        .build();
-    assert!(!Interpreter::is_static_jit_candidate(&non_candidate));
-}
+// test_jit_loop_candidate_detection removed — old JIT functions deleted during rebuild
 
 #[test]
 fn test_hot_function_detection_record_call() {

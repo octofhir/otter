@@ -1,0 +1,20 @@
+[package]
+name = "otter-jit"
+version = "0.1.0"
+edition = "2024"
+description = "JIT compilation pipeline for Otter VM — Cranelift-based, cross-platform"
+license = "MIT"
+
+[dependencies]
+otter-vm-bytecode = { path = "../otter-vm-bytecode" }
+otter-vm-gc = { path = "../otter-vm-gc" }
+thiserror.workspace = true
+cranelift-codegen = "0.129.1"
+cranelift-frontend = "0.129.1"
+cranelift-jit = "0.129.1"
+cranelift-module = "0.129.1"
+cranelift-native = "0.129.1"
+smallvec = "1"
+
+[dev-dependencies]
+otter-vm-compiler = { path = "../otter-vm-compiler" }

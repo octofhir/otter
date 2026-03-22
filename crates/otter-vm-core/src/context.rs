@@ -1665,6 +1665,19 @@ impl VmContext {
     /// Register indices are offset by `local_count` in the shared window:
     /// `registers[register_base + local_count + index]`.
     #[inline]
+    /// Get a raw mutable pointer to the register pool base.
+    /// Used by the JIT to pass register window to compiled code.
+    #[inline]
+    pub fn registers_mut_ptr(&mut self) -> *mut Value {
+        self.registers.as_mut_ptr()
+    }
+
+    /// Get the current register base offset (absolute index into register pool).
+    #[inline]
+    pub fn current_register_base(&self) -> usize {
+        self.current_frame().map(|f| f.register_base).unwrap_or(0)
+    }
+
     pub fn get_register(&self, index: u16) -> &Value {
         #[cfg(not(debug_assertions))]
         {

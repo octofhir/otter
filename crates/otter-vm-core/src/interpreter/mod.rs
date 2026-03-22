@@ -60,6 +60,7 @@ pub(crate) enum PreferredType {
 }
 
 mod jit;
+pub(super) mod dispatch;
 use jit::BackEdgeOsrOutcome;
 fn trace_modified_register_indices(instruction: &Instruction) -> Vec<u16> {
     match instruction {
@@ -237,17 +238,7 @@ impl Interpreter {
             .entry_function()
             .ok_or_else(|| VmError::internal("no entry function"))?;
         // Record the function call for hot function detection
-        let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-        if became_hot {
-            {
-                if otter_vm_exec::is_jit_enabled() {
-                    otter_vm_exec::enqueue_hot_function(&module, module.entry_point, entry_func);
-                    otter_vm_exec::compile_one_pending_request(
-                        crate::jit_runtime::runtime_helpers(),
-                    );
-                }
-            }
-        }
+        entry_func.record_call();
 
         // Top-level scripts should have globalThis as `this`.
         ctx.set_pending_this(Value::object(ctx.global()));
@@ -349,17 +340,7 @@ impl Interpreter {
             None => return VmExecutionResult::Error(VmError::internal("no entry function")),
         };
         // Record the function call for hot function detection
-        let became_hot = entry_func.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-        if became_hot {
-            {
-                if otter_vm_exec::is_jit_enabled() {
-                    otter_vm_exec::enqueue_hot_function(&module, module.entry_point, entry_func);
-                    otter_vm_exec::compile_one_pending_request(
-                        crate::jit_runtime::runtime_helpers(),
-                    );
-                }
-            }
-        }
+        entry_func.record_call();
 
         // Top-level scripts should have globalThis as `this`.
         ctx.set_pending_this(Value::object(ctx.global()));
@@ -558,58 +539,8 @@ impl Interpreter {
             .function(closure.function_index)
             .ok_or_else(|| VmError::internal("function not found"))?;
 
-        // Record call hotness for direct/native->JS closure calls too.
-        // Without this, closures invoked via JIT helpers stay interpreter-only.
-        let became_hot = func_info.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-        if became_hot && otter_vm_exec::is_jit_enabled() {
-            otter_vm_exec::enqueue_hot_function(&closure.module, closure.function_index, func_info);
-            otter_vm_exec::compile_one_pending_request(crate::jit_runtime::runtime_helpers());
-        }
-
-        let can_try_jit = Self::can_jit(
-            func_info,
-            false, // not construct
-            closure.is_async || closure.is_generator,
-            args.len() as u8,
-        );
-        if can_try_jit {
-            ctx.set_pending_this(this_value);
-            if let Some(ref home_obj) = closure.home_object {
-                ctx.set_pending_home_object(*home_obj);
-            }
-            ctx.set_pending_callee_value(*func);
-            let jit_interp: *const Self = self;
-            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-            match crate::jit_runtime::try_execute_jit(
-                closure.module.module_id,
-                closure.function_index,
-                func_info,
-                args,
-                ctx.cached_proto_epoch,
-                jit_interp,
-                jit_ctx_ptr,
-                &closure.module.constants as *const _,
-                &closure.upvalues,
-                None,
-            ) {
-                crate::jit_runtime::JitCallResult::Ok(value) => {
-                    return Ok(value);
-                }
-                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                    otter_vm_exec::enqueue_hot_function(
-                        &closure.module,
-                        closure.function_index,
-                        func_info,
-                    );
-                    otter_vm_exec::compile_one_pending_request(
-                        crate::jit_runtime::runtime_helpers(),
-                    );
-                }
-                crate::jit_runtime::JitCallResult::BailoutResume(_)
-                | crate::jit_runtime::JitCallResult::BailoutRestart
-                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-            }
-        }
+        // Record call hotness
+        func_info.record_call();
 
         // Set up the call — handle rest parameters
         let mut call_args: SmallVec<[Value; 8]> = SmallVec::from_slice(args);
@@ -737,10 +668,7 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
-                                + offset as i64)
-                                as usize;
-                            match self.try_back_edge_osr(ctx, &current_module, func, target_pc) {
+                            match self.try_back_edge_osr(ctx, offset) {
                                 BackEdgeOsrOutcome::Returned(osr_value) => {
                                     let return_reg = ctx
                                         .current_frame()
@@ -805,114 +733,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info from module table (borrow scoped, no Arc clone)
-                        let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m
-                                .function(func_index)
-                                .ok_or_else(|| VmError::internal("function not found"))?;
-                            let hot =
-                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                            let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (
-                                f.local_count,
-                                f.flags.has_rest,
-                                f.param_count as usize,
-                                hot,
-                                jit,
-                            )
-                        };
-
-                        // JIT paths (cold) — clone Arc only when needed
-                        if became_hot && otter_vm_exec::is_jit_enabled() {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                            otter_vm_exec::compile_one_pending_request(
-                                crate::jit_runtime::runtime_helpers(),
-                            );
-                        }
-                        if can_try_jit {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module_id,
-                                func_index,
-                                f,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &m.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module_id,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as u16,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        // Hot path: push frame (no Arc clone)
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -923,22 +744,7 @@ impl Interpreter {
                         upvalues,
                     } => {
                         ctx.pop_frame_discard();
-                        let local_count = {
-                            let m = ctx.module_table.get(module_id);
-                            m.function(func_index)
-                                .ok_or_else(|| VmError::internal("function not found"))?
-                                .local_count
-                        };
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
                     }
                     DispatchAction::Suspend { .. } => {
                         // Can't handle suspension in direct call, return undefined
@@ -1389,10 +1195,7 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
-                                + offset as i64)
-                                as usize;
-                            match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                            match self.try_back_edge_osr(ctx, offset) {
                                 BackEdgeOsrOutcome::Returned(osr_value) => {
                                     if ctx.stack_depth() == 1 {
                                         ctx.set_running(false);
@@ -1505,124 +1308,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info with scoped borrow (no Arc clone on hot path)
-                        let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = match m.function(func_index) {
-                                Some(f) => f,
-                                None => {
-                                    return VmExecutionResult::Error(VmError::internal(format!(
-                                        "callee not found (func_index={}, function_count={})",
-                                        func_index,
-                                        m.function_count()
-                                    )));
-                                }
-                            };
-                            let hot =
-                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                            let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (
-                                f.local_count,
-                                f.flags.has_rest,
-                                f.param_count as usize,
-                                hot,
-                                jit,
-                            )
-                        };
-
-                        // JIT paths (cold) — clone Arc only when needed
-                        if became_hot && otter_vm_exec::is_jit_enabled() {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                            otter_vm_exec::compile_one_pending_request(
-                                crate::jit_runtime::runtime_helpers(),
-                            );
-                        }
-                        if can_try_jit {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module_id,
-                                func_index,
-                                f,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &m.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    ctx.set_pending_upvalues(upvalues);
-                                    if let Err(e) = ctx.push_frame(
-                                        func_index,
-                                        module_id,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as u16,
-                                    ) {
-                                        return VmExecutionResult::Error(e);
-                                    }
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-
-                        // Handle rest parameters
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        // Hot path: push frame (no Arc clone)
-                        ctx.set_pending_upvalues(upvalues);
-                        if let Err(e) = ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        ) {
+                        if let Err(e) = self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues) {
                             return VmExecutionResult::Error(e);
                         }
                     }
@@ -1636,55 +1322,7 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-
-                        let (local_count, has_rest, param_count) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = match m.function(func_index) {
-                                Some(f) => f,
-                                None => {
-                                    return VmExecutionResult::Error(VmError::internal(format!(
-                                        "callee not found (func_index={}, function_count={})",
-                                        func_index,
-                                        m.function_count()
-                                    )));
-                                }
-                            };
-                            (f.local_count, f.flags.has_rest, f.param_count as usize)
-                        };
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-                        if let Err(e) = ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        ) {
+                        if let Err(e) = self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues) {
                             return VmExecutionResult::Error(e);
                         }
                     }
@@ -2064,10 +1702,7 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
-                                + offset as i64)
-                                as usize;
-                            match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                            match self.try_back_edge_osr(ctx, offset) {
                                 BackEdgeOsrOutcome::Returned(osr_value) => {
                                     if ctx.stack_depth() == 1 {
                                         return Ok(osr_value);
@@ -2177,119 +1812,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info with scoped borrow (no Arc clone on hot path)
-                        let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m.function(func_index).ok_or_else(|| {
-                                VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                ))
-                            })?;
-                            let hot =
-                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                            let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (
-                                f.local_count,
-                                f.flags.has_rest,
-                                f.param_count as usize,
-                                hot,
-                                jit,
-                            )
-                        };
-
-                        // JIT paths (cold) — clone Arc only when needed
-                        if became_hot && otter_vm_exec::is_jit_enabled() {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                            otter_vm_exec::compile_one_pending_request(
-                                crate::jit_runtime::runtime_helpers(),
-                            );
-                        }
-                        if can_try_jit {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module_id,
-                                func_index,
-                                f,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &m.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module_id,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as u16,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-
-                        // Handle rest parameters
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        // Hot path: push frame (no Arc clone)
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -2301,52 +1824,7 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-
-                        let (local_count, has_rest, param_count) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m.function(func_index).ok_or_else(|| {
-                                VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                ))
-                            })?;
-                            (f.local_count, f.flags.has_rest, f.param_count as usize)
-                        };
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
                     }
                     DispatchAction::Suspend {
                         promise,
@@ -2527,10 +2005,7 @@ impl Interpreter {
                 match action {
                     DispatchAction::Jump(offset) => {
                         if offset < 0 {
-                            let target_pc = (ctx.current_frame().map(|f| f.pc).unwrap_or(0) as i64
-                                + offset as i64)
-                                as usize;
-                            match self.try_back_edge_osr(ctx, module_ref, func, target_pc) {
+                            match self.try_back_edge_osr(ctx, offset) {
                                 BackEdgeOsrOutcome::Returned(osr_value) => {
                                     if ctx.stack_depth() == 1 {
                                         return Ok(osr_value);
@@ -2622,117 +2097,7 @@ impl Interpreter {
                         is_async,
                         upvalues,
                     } => {
-                        ctx.advance_pc();
-                        // Extract func info with scoped borrow (no Arc clone on hot path)
-                        let (local_count, has_rest, param_count, became_hot, can_try_jit) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m.function(func_index).ok_or_else(|| {
-                                VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                ))
-                            })?;
-                            let hot =
-                                f.record_call_with_threshold(otter_vm_exec::jit_hot_threshold());
-                            let jit = Self::can_jit(f, is_construct, is_async, argc);
-                            (
-                                f.local_count,
-                                f.flags.has_rest,
-                                f.param_count as usize,
-                                hot,
-                                jit,
-                            )
-                        };
-
-                        // JIT paths (cold) — clone Arc only when needed
-                        if became_hot && otter_vm_exec::is_jit_enabled() {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                            otter_vm_exec::compile_one_pending_request(
-                                crate::jit_runtime::runtime_helpers(),
-                            );
-                        }
-                        if can_try_jit {
-                            let m = Arc::clone(ctx.module_table.get(module_id));
-                            let f = m.function(func_index).unwrap();
-                            let jit_interp: *const Self = self;
-                            let jit_ctx_ptr: *mut crate::context::VmContext = ctx;
-                            match crate::jit_runtime::try_execute_jit(
-                                module_id,
-                                func_index,
-                                f,
-                                ctx.pending_args(),
-                                ctx.cached_proto_epoch,
-                                jit_interp,
-                                jit_ctx_ptr,
-                                &m.constants as *const _,
-                                &upvalues,
-                                None,
-                            ) {
-                                crate::jit_runtime::JitCallResult::Ok(value) => {
-                                    ctx.set_register(return_reg, value);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutResume(state) => {
-                                    ctx.set_pending_upvalues(upvalues);
-                                    ctx.push_frame(
-                                        func_index,
-                                        module_id,
-                                        local_count,
-                                        Some(return_reg),
-                                        is_construct,
-                                        is_async,
-                                        argc as u16,
-                                    )?;
-                                    crate::jit_resume::resume_in_place(ctx, &state);
-                                    continue;
-                                }
-                                crate::jit_runtime::JitCallResult::NeedsRecompilation => {
-                                    otter_vm_exec::enqueue_hot_function(&m, func_index, f);
-                                    otter_vm_exec::compile_one_pending_request(
-                                        crate::jit_runtime::runtime_helpers(),
-                                    );
-                                }
-                                crate::jit_runtime::JitCallResult::BailoutRestart
-                                | crate::jit_runtime::JitCallResult::NotCompiled => {}
-                            }
-                        }
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            is_construct,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_call(ctx, func_index, module_id, argc, return_reg, is_construct, is_async, upvalues)?;
                     }
                     DispatchAction::TailCall {
                         func_index,
@@ -2744,52 +2109,7 @@ impl Interpreter {
                     } => {
                         ctx.pop_frame_discard();
                         cached_frame_id = u32::MAX;
-
-                        let (local_count, has_rest, param_count) = {
-                            let m = ctx.module_table.get(module_id);
-                            let f = m.function(func_index).ok_or_else(|| {
-                                VmError::internal(format!(
-                                    "callee not found (func_index={}, function_count={})",
-                                    func_index,
-                                    m.function_count()
-                                ))
-                            })?;
-                            (f.local_count, f.flags.has_rest, f.param_count as usize)
-                        };
-
-                        if has_rest {
-                            let mut args = ctx.take_pending_args();
-                            let rest_args: Vec<Value> = if args.len() > param_count {
-                                args.drain(param_count..).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            let rest_arr = GcRef::new(JsObject::array(rest_args.len()));
-                            if let Some(array_obj) =
-                                ctx.get_global("Array").and_then(|v| v.as_object())
-                                && let Some(array_proto) = array_obj
-                                    .get(&PropertyKey::string("prototype"))
-                                    .and_then(|v| v.as_object())
-                            {
-                                rest_arr.set_prototype(Value::object(array_proto));
-                            }
-                            for (i, arg) in rest_args.into_iter().enumerate() {
-                                let _ = rest_arr.set(PropertyKey::Index(i as u32), arg);
-                            }
-                            args.push(Value::object(rest_arr));
-                            ctx.set_pending_args(args);
-                        }
-
-                        ctx.set_pending_upvalues(upvalues);
-                        ctx.push_frame(
-                            func_index,
-                            module_id,
-                            local_count,
-                            Some(return_reg),
-                            false,
-                            is_async,
-                            argc as u16,
-                        )?;
+                        self.dispatch_tail_call(ctx, func_index, module_id, argc, return_reg, is_async, upvalues)?;
                     }
                     DispatchAction::Suspend {
                         promise,

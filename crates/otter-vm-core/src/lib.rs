@@ -38,7 +38,6 @@ pub mod isolate;
 mod jit_helpers;
 mod jit_resume;
 mod jit_runtime;
-#[allow(dead_code)]
 mod jit_stubs;
 pub mod map_data;
 pub mod memory;
@@ -82,7 +81,7 @@ pub use intrinsics::Intrinsics;
 pub use isolate::{Isolate, IsolateConfig, IsolateGuard, IsolateHandle};
 pub use memory::MemoryManager;
 pub use object::{JsObject, PropertyKey, SetPropertyError};
-pub use otter_vm_exec::{JitHelperCallStat, JitRuntimeStats};
+pub use jit_runtime::{JitHelperCallStat, JitRuntimeStats};
 pub use promise::{JsPromise, PromiseState, PromiseWithResolvers};
 pub use proxy::{JsProxy, RevocableProxy};
 pub use runtime::VmRuntime;
@@ -98,5 +97,5 @@ pub use value::{NativeFn, Symbol, Value};
 pub use convert::{FromValue, IntoValue};
 /// Return a snapshot of JIT runtime counters.
 pub fn jit_runtime_stats() -> JitRuntimeStats {
-    otter_vm_exec::stats_snapshot()
+    jit_runtime::stats_snapshot()
 }

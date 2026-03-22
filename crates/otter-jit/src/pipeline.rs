@@ -2,6 +2,8 @@
 //!
 //! This is the main entry point for compiling and executing JIT code.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use otter_vm_bytecode::Function;
@@ -9,7 +11,6 @@ use otter_vm_bytecode::Function;
 use crate::code_cache;
 use crate::code_memory::{compile_clif_function, create_host_isa, CompiledFunction};
 use crate::codegen::lower::lower_mir_to_clif;
-use crate::codegen::value_repr;
 use crate::config::JIT_CONFIG;
 use crate::context::JitContext;
 use crate::mir::builder::build_mir;
@@ -26,6 +27,43 @@ pub enum JitExecResult {
     /// Function not eligible or compilation failed.
     NotCompiled,
 }
+
+// ============================================================
+// Helper symbol registration
+// ============================================================
+
+thread_local! {
+    /// Helper symbols as Vec for JITBuilder registration.
+    static HELPER_SYMBOLS: RefCell<Vec<(&'static str, *const u8)>> = const { RefCell::new(Vec::new()) };
+    /// Helper address lookup: name → address. O(1).
+    static HELPER_ADDRS: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
+}
+
+/// Register runtime helper symbols for JIT compilation.
+/// Called once by `otter-vm-core` during initialization.
+pub fn register_helper_symbols(symbols: Vec<(&'static str, *const u8)>) {
+    HELPER_ADDRS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for &(name, ptr) in &symbols {
+            map.insert(name, ptr as usize);
+        }
+    });
+    HELPER_SYMBOLS.with(|s| *s.borrow_mut() = symbols);
+}
+
+fn get_helper_symbols() -> Vec<(&'static str, *const u8)> {
+    HELPER_SYMBOLS.with(|s| s.borrow().clone())
+}
+
+/// Look up a helper function address by symbol name. O(1).
+pub fn lookup_helper_address(name: &str) -> Option<usize> {
+    HELPER_ADDRS.with(|m| m.borrow().get(name).copied())
+}
+
+// ============================================================
+// Compilation & Execution API
+// ============================================================
 
 /// Check if a function should be JIT-compiled.
 pub fn should_jit(function: &Function) -> bool {
@@ -53,9 +91,9 @@ pub fn ensure_compiled(function: &Function) -> bool {
             true
         }
         Err(_e) => {
-            #[cfg(debug_assertions)]
-            if JIT_CONFIG.dump_mir {
-                eprintln!("[otter-jit] compile failed: {}", _e);
+            if JIT_CONFIG.dump_mir || JIT_CONFIG.dump_asm {
+                eprintln!("[otter-jit] compile failed for {:?}: {}",
+                    function.name.as_deref().unwrap_or("<anon>"), _e);
             }
             false
         }
@@ -97,7 +135,6 @@ pub unsafe fn try_execute(
         None => return JitExecResult::NotCompiled,
     };
 
-    // Set up JitContext
     let mut ctx = JitContext {
         registers_base,
         local_count,
@@ -118,7 +155,6 @@ pub unsafe fn try_execute(
         secondary_result: 0,
     };
 
-    // Call the compiled code
     let jit_fn: unsafe extern "C" fn(*mut JitContext) -> u64 =
         unsafe { std::mem::transmute(entry) };
     let result = unsafe { jit_fn(&mut ctx) };
@@ -154,7 +190,10 @@ fn compile_function(function: &Function) -> Result<CompiledFunction, JitError> {
 
     let isa = create_host_isa()?;
     let clif_func = lower_mir_to_clif(&graph, isa.as_ref())?;
-    let compiled = compile_clif_function(clif_func, isa)?;
+
+    let helpers = get_helper_symbols();
+    let helper_refs: Vec<(&str, *const u8)> = helpers.iter().map(|&(n, p)| (n, p)).collect();
+    let compiled = compile_clif_function(clif_func, isa, &helper_refs)?;
 
     let duration_ns = start.elapsed().as_nanos() as u64;
     telemetry::record_compile_time(true, duration_ns);

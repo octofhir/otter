@@ -1,18 +1,32 @@
 //! Unified dispatch helpers for DispatchAction::Call and TailCall.
 //!
 //! All run_loops delegate here instead of duplicating call/rest-array logic.
-//! JIT check happens in ONE place — dispatch_call.
+//! JIT check happens in ONE place — dispatch_call, AFTER push_frame.
 
 use super::*;
+
+/// Outcome of a JIT execution attempt.
+enum JitOutcome {
+    /// JIT completed, here's the return value.
+    Executed(Value),
+    /// JIT bailed out, interpreter should resume at this bytecode PC.
+    BailoutResume { bytecode_pc: u32 },
+    /// JIT not available, interpret normally.
+    Fallthrough,
+}
 
 impl Interpreter {
     /// Handle DispatchAction::Call — the ONE dispatch point for all function calls.
     ///
-    /// 1. Advance PC
+    /// Flow:
+    /// 1. Advance caller's PC past the Call instruction
     /// 2. Look up function, record call
-    /// 3. Try JIT execution (if hot)
-    /// 4. Handle rest params
-    /// 5. Push interpreter frame
+    /// 3. Handle rest params
+    /// 4. Push interpreter frame (initializes locals from pending_args)
+    /// 5. Try JIT on the now-active frame
+    /// 6. On JIT success → pop frame, write result to caller
+    /// 7. On JIT bailout → set PC, interpreter resumes from bailout point
+    /// 8. On fallthrough → interpreter runs from PC 0
     pub(super) fn dispatch_call(
         &self,
         ctx: &mut VmContext,
@@ -26,8 +40,8 @@ impl Interpreter {
     ) -> VmResult<()> {
         ctx.advance_pc();
 
-        // Extract function info (scoped borrow, no Arc clone)
-        let (local_count, has_rest, param_count, func_ptr) = {
+        // Extract function info (scoped borrow, no Arc clone).
+        let (local_count, has_rest, param_count) = {
             let m = ctx.module_table.get(module_id);
             let f = m.function(func_index).ok_or_else(|| {
                 VmError::internal(format!(
@@ -37,35 +51,16 @@ impl Interpreter {
                 ))
             })?;
             f.record_call();
-            (
-                f.local_count,
-                f.flags.has_rest,
-                f.param_count as usize,
-                f as *const otter_vm_bytecode::Function,
-            )
+            (f.local_count, f.flags.has_rest, f.param_count as usize)
         };
 
-        // JIT: try compiled execution for hot functions
-        if !is_construct {
-            // SAFETY: func_ptr is valid — it points into Arc<Module> which is
-            // alive in ctx.module_table for the entire VM lifetime.
-            let f = unsafe { &*func_ptr };
-            if Self::can_jit(f, is_construct, is_async, argc) {
-                match self.try_jit_call(ctx, f, module_id, &upvalues) {
-                    JitOutcome::Executed(value) => {
-                        ctx.set_register(return_reg, value);
-                        let _ = ctx.take_pending_args();
-                        return Ok(());
-                    }
-                    JitOutcome::Fallthrough => {}
-                }
-            }
-        }
-
+        // Handle rest parameters (modifies pending_args before push_frame consumes them).
         if has_rest {
             self.setup_rest_params(ctx, param_count);
         }
 
+        // Push the frame. This consumes pending_args into local slots,
+        // sets up the register window, and makes the callee the current frame.
         ctx.set_pending_upvalues(upvalues);
         ctx.push_frame(
             func_index,
@@ -75,7 +70,42 @@ impl Interpreter {
             is_construct,
             is_async,
             argc as u16,
-        )
+        )?;
+
+        // Now the frame is live. Locals are initialized from args.
+        // Try JIT execution on the fully set-up frame.
+        if !is_construct && !is_async {
+            let jit_eligible = {
+                let m = ctx.module_table.get(module_id);
+                let f = m.function(func_index).unwrap();
+                Self::can_jit(f, is_construct, is_async, argc)
+            };
+
+            if jit_eligible {
+                match self.try_jit_call(ctx, module_id, func_index) {
+                    JitOutcome::Executed(value) => {
+                        // JIT ran successfully. Pop the callee frame
+                        // and write result into the caller's return register.
+                        ctx.pop_frame_discard();
+                        ctx.set_register(return_reg, value);
+                        return Ok(());
+                    }
+                    JitOutcome::BailoutResume { bytecode_pc } => {
+                        // JIT bailed out. Frame stays pushed.
+                        // Set PC to bailout point; interpreter resumes there.
+                        if let Some(frame) = ctx.current_frame_mut() {
+                            frame.pc = bytecode_pc as usize;
+                        }
+                        return Ok(());
+                    }
+                    JitOutcome::Fallthrough => {
+                        // JIT unavailable. Interpreter runs from PC 0.
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle DispatchAction::TailCall.
@@ -141,51 +171,59 @@ impl Interpreter {
         args.push(Value::object(rest_arr));
         ctx.set_pending_args(args);
     }
-}
 
-/// Outcome of a JIT execution attempt.
-enum JitOutcome {
-    /// JIT ran successfully, here's the return value.
-    Executed(Value),
-    /// JIT unavailable or bailed out, fall through to interpreter.
-    Fallthrough,
-}
-
-impl Interpreter {
-    /// Try to execute a function via the new otter-jit pipeline.
+    /// Try to execute a function via JIT on the CURRENT (already pushed) frame.
     ///
-    /// Called from dispatch_call when can_jit is true.
+    /// The frame's locals are already initialized from args.
+    /// register_base points to the callee's window.
     fn try_jit_call(
         &self,
         ctx: &mut VmContext,
-        func: &otter_vm_bytecode::Function,
         module_id: u64,
-        upvalues: &[UpvalueCell],
+        func_index: u32,
     ) -> JitOutcome {
-        // Snapshot values before mutable borrow
-        let this_val = ctx
-            .pending_this_to_trace()
-            .cloned()
+        // Read frame state — frame is already pushed and active.
+        let this_val = ctx.current_frame()
+            .map(|f| f.this_value)
             .unwrap_or_else(Value::undefined);
-        let callee_raw = ctx
-            .pending_callee_to_trace()
+        let callee_raw = ctx.current_frame()
+            .and_then(|f| f.callee_value)
             .map(|v| v.to_jit_bits() as u64)
             .unwrap_or(otter_jit::codegen::value_repr::TAG_UNDEFINED);
-        let home_obj_raw = ctx
-            .pending_home_object_to_trace()
-            .map(|ho| Value::object(*ho).to_jit_bits() as u64)
+        let home_obj_raw = ctx.current_frame()
+            .and_then(|f| f.home_object)
+            .map(|ho| Value::object(ho).to_jit_bits() as u64)
             .unwrap_or(otter_jit::codegen::value_repr::TAG_UNDEFINED);
         let reg_base = ctx.current_register_base();
         let epoch = ctx.cached_proto_epoch;
 
-        // Get constant pool pointer (scoped borrow)
-        let const_ptr = {
+        // Get function and constant pool (scoped borrow).
+        let func_ptr: *const otter_vm_bytecode::Function;
+        let const_ptr: *const otter_vm_bytecode::ConstantPool;
+        {
             let m = ctx.module_table.get(module_id);
-            &m.constants as *const _ as *const otter_vm_bytecode::ConstantPool
-        };
+            let f = m.function(func_index).unwrap();
+            func_ptr = f as *const _;
+            const_ptr = &m.constants as *const _;
+        }
 
-        // Now safe to take mutable borrow for registers
+        // Get upvalues from the current frame.
+        let upvalues_ptr: *const ();
+        let upvalue_count: u32;
+        {
+            let frame = ctx.current_frame().unwrap();
+            if frame.upvalues.is_empty() {
+                upvalues_ptr = std::ptr::null();
+                upvalue_count = 0;
+            } else {
+                upvalues_ptr = frame.upvalues.as_ptr() as *const ();
+                upvalue_count = frame.upvalues.len() as u32;
+            }
+        }
+
+        // Now safe to take mutable borrow for registers.
         let regs_ptr = ctx.registers_mut_ptr();
+        let func = unsafe { &*func_ptr };
 
         match crate::jit_runtime::try_execute_jit(
             func,
@@ -195,15 +233,18 @@ impl Interpreter {
             const_ptr,
             self as *const _ as *const crate::interpreter::Interpreter,
             ctx as *mut _ as *mut crate::context::VmContext,
-            upvalues,
+            // Pass empty upvalues slice — upvalues_ptr/count are in JitContext directly.
+            &[],
             callee_raw,
             home_obj_raw,
             epoch,
             std::ptr::null(),
         ) {
             crate::jit_runtime::JitCallResult::Ok(value) => JitOutcome::Executed(value),
-            crate::jit_runtime::JitCallResult::Bailout { .. }
-            | crate::jit_runtime::JitCallResult::NotCompiled => JitOutcome::Fallthrough,
+            crate::jit_runtime::JitCallResult::Bailout { bytecode_pc } => {
+                JitOutcome::BailoutResume { bytecode_pc }
+            }
+            crate::jit_runtime::JitCallResult::NotCompiled => JitOutcome::Fallthrough,
         }
     }
 }

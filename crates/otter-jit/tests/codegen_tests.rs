@@ -75,7 +75,7 @@ fn make_add_f64_mir() -> MirGraph {
 fn execute_mir(graph: &MirGraph) -> u64 {
     let isa = create_host_isa().expect("failed to create ISA");
     let clif_func = lower_mir_to_clif(graph, isa.as_ref()).expect("lowering failed");
-    let compiled = compile_clif_function(clif_func, isa).expect("compilation failed");
+    let compiled = compile_clif_function(clif_func, isa, &[]).expect("compilation failed");
 
     // Create a minimal JitContext (most fields unused for these simple tests).
     let mut registers = vec![0u64; 16];

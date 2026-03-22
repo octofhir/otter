@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    Block, Function as ClifFunction, InstBuilder, MemFlags, Value,
+    AbiParam, Block, Function as ClifFunction, InstBuilder, MemFlags, Signature, Value,
 };
-use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use crate::abi::jit_function_signature;
@@ -338,10 +338,15 @@ impl<'a> OpLowerer<'a> {
                 Ok(None)
             }
 
+            // ---- Helper calls (cold exits to runtime) ----
+            MirOp::HelperCall { kind, args } => {
+                let helper_name = helper_kind_to_symbol(kind);
+                self.emit_helper_call(builder, helper_name, args)
+            }
+
             // ---- Everything else: cannot lower → compilation fails ----
             _ => {
                 let op_name = format!("{:?}", op);
-                // Truncate for readability
                 let short = if op_name.len() > 60 { &op_name[..60] } else { &op_name };
                 Err(JitError::UnsupportedInstruction(short.to_string()))
             }
@@ -392,6 +397,48 @@ impl<'a> OpLowerer<'a> {
         builder.seal_block(continue_block);
         Ok(())
     }
+
+    /// Emit a call to a runtime helper function.
+    ///
+    /// All helpers have signature: `extern "C" fn(*mut JitContext, i64...) -> i64`
+    /// The ctx_ptr is always passed as the first argument.
+    fn emit_helper_call(
+        &self,
+        builder: &mut FunctionBuilder,
+        symbol_name: &str,
+        args: &[ValueId],
+    ) -> Result<Option<Value>, JitError> {
+        let call_conv = builder.func.signature.call_conv;
+
+        // Build the helper signature: (ptr, i64, i64, ...) -> i64
+        let mut sig = Signature::new(call_conv);
+        sig.params.push(AbiParam::new(self.pointer_type)); // ctx
+        for _ in args {
+            sig.params.push(AbiParam::new(types::I64)); // NaN-boxed args
+        }
+        sig.returns.push(AbiParam::new(types::I64)); // NaN-boxed result
+
+        let sig_ref = builder.import_signature(sig);
+
+        // Look up the helper function address from registered symbols.
+        let addr = crate::pipeline::lookup_helper_address(symbol_name)
+            .ok_or_else(|| JitError::Internal(
+                format!("helper symbol '{}' not registered", symbol_name)
+            ))?;
+
+        let addr_val = builder.ins().iconst(self.pointer_type, addr as i64);
+
+        // Build arguments: [ctx_ptr, arg0, arg1, ...]
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        call_args.push(self.ctx_ptr);
+        for arg_id in args {
+            call_args.push(self.v(arg_id)?);
+        }
+
+        let call = builder.ins().call_indirect(sig_ref, addr_val, &call_args);
+        let result = builder.inst_results(call)[0];
+        Ok(Some(result))
+    }
 }
 
 fn emit_bailout(builder: &mut FunctionBuilder, ctx_ptr: Value, bytecode_pc: u32) {
@@ -420,5 +467,30 @@ fn cmp_to_floatcc(op: &CmpOp) -> FloatCC {
         CmpOp::Le => FloatCC::LessThanOrEqual,
         CmpOp::Gt => FloatCC::GreaterThan,
         CmpOp::Ge => FloatCC::GreaterThanOrEqual,
+    }
+}
+
+/// Map MIR HelperKind to the extern "C" symbol name.
+fn helper_kind_to_symbol(kind: &crate::mir::nodes::HelperKind) -> &'static str {
+    use crate::mir::nodes::HelperKind;
+    match kind {
+        HelperKind::GenericAdd => "otter_jit_generic_add",
+        HelperKind::GenericSub => "otter_jit_generic_sub",
+        HelperKind::GenericMul => "otter_jit_generic_mul",
+        HelperKind::GenericDiv => "otter_jit_generic_div",
+        HelperKind::GenericMod => "otter_jit_generic_mod",
+        HelperKind::GenericNeg => "otter_jit_generic_neg",
+        HelperKind::GenericInc => "otter_jit_generic_inc",
+        HelperKind::GenericDec => "otter_jit_generic_dec",
+        HelperKind::GenericEq => "otter_jit_generic_eq",
+        HelperKind::GenericStrictEq => "otter_jit_generic_eq", // reuse for now
+        HelperKind::GenericLt => "otter_jit_generic_lt",
+        HelperKind::GenericLe => "otter_jit_generic_le",
+        HelperKind::GenericGt => "otter_jit_generic_gt",
+        HelperKind::GenericGe => "otter_jit_generic_ge",
+        HelperKind::Pow => "otter_jit_generic_pow",
+        // These don't have helpers yet — will cause UnsupportedInstruction
+        // at a higher level (the MIR ops that use them are not HelperCall).
+        _ => "otter_jit_unsupported",
     }
 }

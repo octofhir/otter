@@ -300,7 +300,7 @@ impl Interpreter {
     /// Convert primitive value to number (small ToNumber subset).
     /// Does NOT handle objects - for objects, use `to_number_value()` which
     /// invokes ToPrimitive first per ES2023 §7.1.4.
-    pub(super) fn to_number(&self, value: &Value) -> f64 {
+    pub(crate) fn to_number(&self, value: &Value) -> f64 {
         if let Some(n) = value.as_number() {
             return n;
         }

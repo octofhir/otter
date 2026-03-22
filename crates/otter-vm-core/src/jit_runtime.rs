@@ -89,6 +89,12 @@ pub struct JitHelperCallStat {
     pub calls: u64,
 }
 
+/// Initialize JIT helpers. Call once during VM startup.
+pub fn init_jit_helpers() {
+    let symbols = crate::jit_helpers::collect_helper_symbols();
+    otter_jit::pipeline::register_helper_symbols(symbols);
+}
+
 /// Returns JIT stats from the new pipeline.
 pub fn stats_snapshot() -> JitRuntimeStats {
     let snap = otter_jit::telemetry::snapshot();

@@ -133,6 +133,9 @@ impl Isolate {
         let runtime = VmRuntime::with_config(runtime_config);
         let memory_manager = runtime.memory_manager().clone();
 
+        // Initialize JIT helper function pointers.
+        crate::jit_runtime::init_jit_helpers();
+
         // Create context via the runtime (sets up intrinsics, realm, etc.)
         let context = runtime.create_context();
 

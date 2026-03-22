@@ -63,14 +63,23 @@ pub fn create_host_isa() -> Result<OwnedTargetIsa, JitError> {
 }
 
 /// Compile a Cranelift IR function into executable machine code.
+///
+/// `helper_symbols` are (name, fn_ptr) pairs registered in the JITModule
+/// so that compiled code can call runtime helpers.
 pub fn compile_clif_function(
     clif_func: ClifFunction,
     isa: OwnedTargetIsa,
+    helper_symbols: &[(&str, *const u8)],
 ) -> Result<CompiledFunction, JitError> {
-    let builder = JITBuilder::with_isa(
+    let mut builder = JITBuilder::with_isa(
         isa.clone(),
         cranelift_module::default_libcall_names(),
     );
+
+    // Register helper function symbols so compiled code can call them.
+    for &(name, ptr) in helper_symbols {
+        builder.symbol(name, ptr);
+    }
 
     let mut module = JITModule::new(builder);
 

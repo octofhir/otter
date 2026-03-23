@@ -20,10 +20,20 @@ Fresh VM backend for Otter.
 - `src/frame.rs`: frame and register-window layout
 - `src/interpreter.rs`: interpreter entry points
 - `src/jit_abi.rs`: JIT-facing ABI boundary
+- `src/object.rs`: minimal object heap and inline-cache state
+- `src/lowering.rs`: tiny structured-subset lowering bridge
 - `src/module.rs`: executable module container
+- `src/property.rs`: property-name side tables
+- `src/value.rs`: minimal register value representation
 
 ## Growth Policy
 
 When a module starts combining unrelated responsibilities, split it.
 
 Do not wait for a file to become large before decomposing it.
+
+## Smoke Command
+
+Use the smallest end-to-end validation path during iteration:
+
+`cargo run -p otter-vm --example smoke_runner`

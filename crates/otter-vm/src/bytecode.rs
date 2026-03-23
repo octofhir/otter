@@ -1,6 +1,9 @@
 //! Compact immutable bytecode for the new VM.
 
+use crate::closure::UpvalueId;
 use crate::frame::{FrameLayout, RegisterIndex};
+use crate::property::PropertyNameId;
+use crate::string::StringId;
 
 /// Program counter type for the new VM bytecode.
 pub type ProgramCounter = u32;
@@ -61,6 +64,14 @@ pub enum Opcode {
     LoadTrue = 0x03,
     /// Load boolean `false`.
     LoadFalse = 0x04,
+    /// Allocate a plain object.
+    NewObject = 0x05,
+    /// Load a string literal from the current function side table.
+    LoadString = 0x06,
+    /// Allocate a dense array.
+    NewArray = 0x07,
+    /// Allocate a closure from the current function closure side table.
+    NewClosure = 0x08,
     /// Integer-or-number addition.
     Add = 0x10,
     /// Integer-or-number subtraction.
@@ -73,6 +84,18 @@ pub enum Opcode {
     Eq = 0x20,
     /// Less-than comparison.
     Lt = 0x21,
+    /// Load a named property from an object.
+    GetProperty = 0x22,
+    /// Store a named property on an object.
+    SetProperty = 0x23,
+    /// Load an indexed element from an array or string.
+    GetIndex = 0x24,
+    /// Store an indexed element on an array.
+    SetIndex = 0x25,
+    /// Load an upvalue from the current closure context.
+    GetUpvalue = 0x26,
+    /// Store an upvalue on the current closure context.
+    SetUpvalue = 0x27,
     /// Unconditional jump.
     Jump = 0x30,
     /// Jump if the condition is truthy.
@@ -81,6 +104,10 @@ pub enum Opcode {
     JumpIfFalse = 0x32,
     /// Return a register value.
     Return = 0x40,
+    /// Call a direct callee with an explicit contiguous argument window.
+    CallDirect = 0x41,
+    /// Call a closure value with an explicit contiguous argument window.
+    CallClosure = 0x42,
 }
 
 impl Opcode {
@@ -93,16 +120,28 @@ impl Opcode {
             0x02 => Some(Self::LoadI32),
             0x03 => Some(Self::LoadTrue),
             0x04 => Some(Self::LoadFalse),
+            0x05 => Some(Self::NewObject),
+            0x06 => Some(Self::LoadString),
+            0x07 => Some(Self::NewArray),
+            0x08 => Some(Self::NewClosure),
             0x10 => Some(Self::Add),
             0x11 => Some(Self::Sub),
             0x12 => Some(Self::Mul),
             0x13 => Some(Self::Div),
             0x20 => Some(Self::Eq),
             0x21 => Some(Self::Lt),
+            0x22 => Some(Self::GetProperty),
+            0x23 => Some(Self::SetProperty),
+            0x24 => Some(Self::GetIndex),
+            0x25 => Some(Self::SetIndex),
+            0x26 => Some(Self::GetUpvalue),
+            0x27 => Some(Self::SetUpvalue),
             0x30 => Some(Self::Jump),
             0x31 => Some(Self::JumpIfTrue),
             0x32 => Some(Self::JumpIfFalse),
             0x40 => Some(Self::Return),
+            0x41 => Some(Self::CallDirect),
+            0x42 => Some(Self::CallClosure),
             _ => None,
         }
     }
@@ -167,6 +206,50 @@ impl Instruction {
         )
     }
 
+    /// Encodes an object allocation.
+    #[must_use]
+    pub const fn new_object(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::NewObject,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a string-literal load.
+    #[must_use]
+    pub const fn load_string(dst: BytecodeRegister, string: StringId) -> Self {
+        Self::encode_abc(
+            Opcode::LoadString,
+            dst,
+            BytecodeRegister::new(string.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a dense-array allocation.
+    #[must_use]
+    pub const fn new_array(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::NewArray,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a closure allocation using a contiguous capture window.
+    #[must_use]
+    pub const fn new_closure(dst: BytecodeRegister, capture_start: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::NewClosure,
+            dst,
+            capture_start,
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// Encodes an addition.
     #[must_use]
     pub const fn add(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
@@ -203,6 +286,78 @@ impl Instruction {
         Self::encode_abc(Opcode::Lt, dst, lhs, rhs)
     }
 
+    /// Encodes a named property load.
+    #[must_use]
+    pub const fn get_property(
+        dst: BytecodeRegister,
+        object: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::GetProperty,
+            dst,
+            object,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Encodes a named property store.
+    #[must_use]
+    pub const fn set_property(
+        object: BytecodeRegister,
+        src: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetProperty,
+            object,
+            src,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Encodes an indexed load.
+    #[must_use]
+    pub const fn get_index(
+        dst: BytecodeRegister,
+        target: BytecodeRegister,
+        index: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::GetIndex, dst, target, index)
+    }
+
+    /// Encodes an indexed store.
+    #[must_use]
+    pub const fn set_index(
+        target: BytecodeRegister,
+        index: BytecodeRegister,
+        src: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::SetIndex, target, index, src)
+    }
+
+    /// Encodes an upvalue load.
+    #[must_use]
+    pub const fn get_upvalue(dst: BytecodeRegister, upvalue: UpvalueId) -> Self {
+        Self::encode_abc(
+            Opcode::GetUpvalue,
+            dst,
+            BytecodeRegister::new(upvalue.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes an upvalue store.
+    #[must_use]
+    pub const fn set_upvalue(src: BytecodeRegister, upvalue: UpvalueId) -> Self {
+        Self::encode_abc(
+            Opcode::SetUpvalue,
+            src,
+            BytecodeRegister::new(upvalue.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// Encodes an unconditional jump.
     #[must_use]
     pub const fn jump(offset: JumpOffset) -> Self {
@@ -230,6 +385,22 @@ impl Instruction {
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes a direct call using the argument window starting at `arg_start`.
+    #[must_use]
+    pub const fn call_direct(dst: BytecodeRegister, arg_start: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::CallDirect, dst, arg_start, BytecodeRegister::new(0))
+    }
+
+    /// Encodes a closure call.
+    #[must_use]
+    pub const fn call_closure(
+        dst: BytecodeRegister,
+        callee: BytecodeRegister,
+        arg_start: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::CallClosure, dst, callee, arg_start)
     }
 
     /// Returns the decoded opcode.
@@ -367,7 +538,10 @@ impl From<Vec<Instruction>> for Bytecode {
 
 #[cfg(test)]
 mod tests {
+    use crate::closure::UpvalueId;
     use crate::frame::FrameLayout;
+    use crate::property::PropertyNameId;
+    use crate::string::StringId;
 
     use super::{Bytecode, BytecodeRegister, Instruction, JumpOffset, Opcode};
 
@@ -389,13 +563,95 @@ mod tests {
     fn immediate_instruction_round_trips() {
         let load = Instruction::load_i32(BytecodeRegister::new(4), -17);
         let jump = Instruction::jump(JumpOffset::new(-9));
+        let object = Instruction::new_object(BytecodeRegister::new(6));
+        let string = Instruction::load_string(BytecodeRegister::new(7), StringId(11));
+        let array = Instruction::new_array(BytecodeRegister::new(8));
+        let closure = Instruction::new_closure(BytecodeRegister::new(9), BytecodeRegister::new(10));
+        let call = Instruction::call_direct(BytecodeRegister::new(9), BytecodeRegister::new(10));
 
         assert_eq!(load.opcode(), Opcode::LoadI32);
         assert_eq!(load.a(), 4);
         assert_eq!(load.immediate_i32(), -17);
+        assert_eq!(object.opcode(), Opcode::NewObject);
+        assert_eq!(object.a(), 6);
+        assert_eq!(string.opcode(), Opcode::LoadString);
+        assert_eq!(string.a(), 7);
+        assert_eq!(string.b(), 11);
+        assert_eq!(array.opcode(), Opcode::NewArray);
+        assert_eq!(array.a(), 8);
+        assert_eq!(closure.opcode(), Opcode::NewClosure);
+        assert_eq!(closure.a(), 9);
+        assert_eq!(closure.b(), 10);
+        assert_eq!(call.opcode(), Opcode::CallDirect);
+        assert_eq!(call.a(), 9);
+        assert_eq!(call.b(), 10);
 
         assert_eq!(jump.opcode(), Opcode::Jump);
         assert_eq!(jump.immediate_i32(), -9);
+    }
+
+    #[test]
+    fn property_instructions_round_trip() {
+        let get = Instruction::get_property(
+            BytecodeRegister::new(2),
+            BytecodeRegister::new(0),
+            PropertyNameId(7),
+        );
+        let set = Instruction::set_property(
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(1),
+            PropertyNameId(7),
+        );
+        let get_index = Instruction::get_index(
+            BytecodeRegister::new(3),
+            BytecodeRegister::new(4),
+            BytecodeRegister::new(5),
+        );
+        let set_index = Instruction::set_index(
+            BytecodeRegister::new(4),
+            BytecodeRegister::new(5),
+            BytecodeRegister::new(6),
+        );
+        let get_upvalue = Instruction::get_upvalue(BytecodeRegister::new(7), UpvalueId(8));
+        let set_upvalue = Instruction::set_upvalue(BytecodeRegister::new(9), UpvalueId(10));
+        let call_closure = Instruction::call_closure(
+            BytecodeRegister::new(11),
+            BytecodeRegister::new(12),
+            BytecodeRegister::new(13),
+        );
+
+        assert_eq!(get.opcode(), Opcode::GetProperty);
+        assert_eq!(get.a(), 2);
+        assert_eq!(get.b(), 0);
+        assert_eq!(get.c(), 7);
+
+        assert_eq!(set.opcode(), Opcode::SetProperty);
+        assert_eq!(set.a(), 0);
+        assert_eq!(set.b(), 1);
+        assert_eq!(set.c(), 7);
+
+        assert_eq!(get_index.opcode(), Opcode::GetIndex);
+        assert_eq!(get_index.a(), 3);
+        assert_eq!(get_index.b(), 4);
+        assert_eq!(get_index.c(), 5);
+
+        assert_eq!(set_index.opcode(), Opcode::SetIndex);
+        assert_eq!(set_index.a(), 4);
+        assert_eq!(set_index.b(), 5);
+        assert_eq!(set_index.c(), 6);
+
+        assert_eq!(get_upvalue.opcode(), Opcode::GetUpvalue);
+        assert_eq!(get_upvalue.a(), 7);
+        assert_eq!(get_upvalue.b(), 8);
+
+        assert_eq!(set_upvalue.opcode(), Opcode::SetUpvalue);
+        assert_eq!(set_upvalue.a(), 9);
+        assert_eq!(set_upvalue.b(), 10);
+
+        assert_eq!(call_closure.opcode(), Opcode::CallClosure);
+        assert_eq!(call_closure.a(), 11);
+        assert_eq!(call_closure.b(), 12);
+        assert_eq!(call_closure.c(), 13);
     }
 
     #[test]

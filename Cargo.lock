@@ -2488,6 +2488,7 @@ dependencies = [
  "dunce",
  "otter-macros",
  "otter-profiler",
+ "otter-vm",
  "otter-vm-bytecode",
  "otter-vm-compiler",
  "otter-vm-core",

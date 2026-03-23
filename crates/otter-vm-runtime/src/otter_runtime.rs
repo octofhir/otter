@@ -459,6 +459,8 @@ pub struct Otter {
     env_store: Arc<IsolatedEnvStore>,
     /// Capabilities (permissions)
     capabilities: Capabilities,
+    /// Selected execution backend for module-level routing.
+    vm_backend: VmBackend,
     /// Interrupt flag for timeout/cancellation
     interrupt_flag: Arc<AtomicBool>,
     /// Debug snapshot for watchdogs
@@ -478,6 +480,16 @@ pub struct Otter {
 struct RealmSlot {
     id: RealmId,
     ctx: VmContext,
+}
+
+/// Selected execution backend for module-level routing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VmBackend {
+    /// Existing bytecode VM and compiler pipeline.
+    #[default]
+    Legacy,
+    /// New `otter-vm` backend for the narrow structured subset.
+    Next,
 }
 
 impl Otter {
@@ -512,6 +524,7 @@ impl Otter {
             active_servers,
             env_store: Arc::new(IsolatedEnvStore::default()),
             capabilities: Capabilities::none(),
+            vm_backend: VmBackend::Legacy,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
             debug_snapshot_updates_enabled: true,
@@ -565,6 +578,17 @@ impl Otter {
     /// Clear the interrupt flag (call before re-using the engine)
     pub fn clear_interrupt(&self) {
         self.interrupt_flag.store(false, Ordering::Relaxed);
+    }
+
+    /// Select the execution backend used by this runtime.
+    pub fn set_vm_backend(&mut self, backend: VmBackend) {
+        self.vm_backend = backend;
+    }
+
+    /// Returns the currently selected execution backend.
+    #[must_use]
+    pub const fn vm_backend(&self) -> VmBackend {
+        self.vm_backend
     }
 
     /// Reset the default realm for test isolation.
@@ -767,6 +791,7 @@ impl Otter {
         code: &str,
         source_url: Option<&str>,
     ) -> Result<Value, OtterError> {
+        self.ensure_legacy_source_execution()?;
         let source_url = source_url.unwrap_or("main.js");
         // 0. Clear interrupt flag before starting (in case of re-use)
         self.clear_interrupt();
@@ -1222,6 +1247,7 @@ impl Otter {
 
     /// Execute JavaScript code without async event loop
     pub fn eval_sync(&mut self, code: &str) -> Result<Value, OtterError> {
+        self.ensure_legacy_source_execution()?;
         // Clear interrupt flag before starting
         self.clear_interrupt();
 
@@ -2167,6 +2193,7 @@ impl Otter {
 
     /// Execute JS code in an existing context (no context creation/teardown).
     pub fn eval_in_context(&self, ctx: &mut VmContext, code: &str) -> Result<Value, OtterError> {
+        self.ensure_legacy_source_execution()?;
         self.clear_interrupt();
         let compiler = Compiler::new();
         let module = compiler
@@ -2184,6 +2211,29 @@ impl Otter {
         self.drain_microtasks(ctx)?;
 
         Ok(result)
+    }
+
+    /// Execute a pre-lowered `otter-vm` module when the new backend is selected.
+    pub fn execute_next_module(
+        &self,
+        module: &otter_vm::Module,
+    ) -> Result<otter_vm::RegisterValue, OtterError> {
+        self.ensure_next_backend()?;
+        let result = otter_vm::Interpreter::new()
+            .execute(module)
+            .map_err(|error| OtterError::Runtime(error.to_string()))?;
+        Ok(result.return_value())
+    }
+
+    /// Lower and execute the tiny structured subset on the new backend.
+    pub fn execute_next_program(
+        &self,
+        program: &otter_vm::lowering::Program,
+    ) -> Result<otter_vm::RegisterValue, OtterError> {
+        self.ensure_next_backend()?;
+        let module = otter_vm::lowering::compile_module(program)
+            .map_err(|error| OtterError::Compile(error.to_string()))?;
+        self.execute_next_module(&module)
     }
 
     /// Drains all pending microtasks until the queue is empty.
@@ -2900,6 +2950,27 @@ impl Otter {
         }
     }
 
+    fn ensure_legacy_source_execution(&self) -> Result<(), OtterError> {
+        if self.vm_backend == VmBackend::Next {
+            return Err(OtterError::Runtime(
+                "selected backend does not support JS/TS source execution yet; use execute_next_program or execute_next_module".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_next_backend(&self) -> Result<(), OtterError> {
+        if self.vm_backend != VmBackend::Next {
+            return Err(OtterError::Runtime(
+                "selected backend is legacy; enable VmBackend::Next to execute otter-vm modules"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Configure the eval compiler callback on a VmContext so that `eval()`
     /// and `CallEval` bytecode can compile code at runtime.
     /// The interpreter handles execution with proper stack depth tracking.
@@ -3290,6 +3361,8 @@ impl std::error::Error for OtterError {}
 
 #[cfg(test)]
 mod tests {
+    use otter_vm::lowering::{BinaryOp, Expr, LocalId, Program, Statement};
+
     use super::*;
 
     #[test]
@@ -3361,6 +3434,47 @@ mod tests {
         assert!(result.is_ok());
         // Note: Each eval_sync creates a new context, so globals don't persist
         // This tests that the runtime can execute code that modifies globals
+    }
+
+    #[test]
+    fn test_next_backend_executes_lowered_program() {
+        let runtime = crate::builder::OtterBuilder::new()
+            .vm_backend(VmBackend::Next)
+            .build();
+        let acc = LocalId::new(0);
+
+        let program = Program::new(
+            Some("next-backend-smoke"),
+            1,
+            vec![
+                Statement::assign(acc, Expr::i32(1)),
+                Statement::assign(
+                    acc,
+                    Expr::binary(BinaryOp::Add, Expr::local(acc), Expr::i32(2)),
+                ),
+                Statement::ret(Expr::local(acc)),
+            ],
+        );
+
+        let result = runtime
+            .execute_next_program(&program)
+            .expect("next backend should execute lowered program");
+
+        assert_eq!(result, otter_vm::RegisterValue::from_i32(3));
+    }
+
+    #[test]
+    fn test_next_backend_rejects_source_eval() {
+        let mut runtime = crate::builder::OtterBuilder::new()
+            .vm_backend(VmBackend::Next)
+            .build();
+
+        let error = runtime
+            .eval_sync("1 + 1")
+            .expect_err("next backend should reject source eval");
+
+        assert!(matches!(error, OtterError::Runtime(_)));
+        assert!(error.to_string().contains("execute_next_program"));
     }
 
     #[test]

@@ -290,6 +290,12 @@ impl FrameMetadata {
     }
 }
 
+impl Default for FrameMetadata {
+    fn default() -> Self {
+        Self::new(0, FrameFlags::empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FrameFlags, FrameLayout, FrameLayoutError, FrameMetadata};

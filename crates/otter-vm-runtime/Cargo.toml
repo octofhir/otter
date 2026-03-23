@@ -9,6 +9,7 @@ license = "MIT"
 profiling = ["dep:otter-profiler", "otter-vm-core/profiling"]
 
 [dependencies]
+otter-vm = { path = "../otter-vm" }
 otter-vm-core = { path = "../otter-vm-core" }
 otter-vm-gc = { path = "../otter-vm-gc" }
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }

@@ -34,6 +34,15 @@ pub mod timers_ext;
 pub mod worker;
 pub mod worker_ext;
 
+/// Re-exports for the new `otter-vm` backend integration surface.
+pub mod next_vm {
+    pub use otter_vm::RegisterValue;
+    pub use otter_vm::lowering::{
+        BinaryOp, Expr, LocalId, LoweringError, Program, Statement, compile_module,
+    };
+    pub use otter_vm::{Function as VmFunction, Interpreter as VmInterpreter, Module as VmModule};
+}
+
 // Re-export main types
 pub use async_runtime::{AsyncRuntime, TokioRuntime};
 pub use builder::OtterBuilder;
@@ -49,7 +58,7 @@ pub use module_loader::{
 pub use module_provider::{
     MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
-pub use otter_runtime::{Otter, OtterError};
+pub use otter_runtime::{Otter, OtterError, VmBackend};
 pub use otter_vm_core::isolate::IsolateConfig;
 
 // Native extension system

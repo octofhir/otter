@@ -53,6 +53,7 @@ pub use loader::{
 // ============================================================================
 
 // Re-export runtime types (main entry points)
+pub use otter_vm_runtime::next_vm;
 pub use otter_vm_runtime::{
     // Event loop
     ActiveServerCount,
@@ -90,6 +91,7 @@ pub use otter_vm_runtime::{
     Promise,
     Timer,
     TimerId,
+    VmBackend,
     // Workers
     Worker,
     WorkerContext,

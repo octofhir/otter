@@ -13,8 +13,14 @@ pub mod abi;
 pub mod bridge;
 /// Runtime bytecode model.
 pub mod bytecode;
+/// Call-site side tables for direct calls.
+pub mod call;
+/// Closure creation metadata and upvalue identifiers.
+pub mod closure;
 /// Deoptimization metadata and handoff types.
 pub mod deopt;
+/// Exception table metadata.
+pub mod exception;
 /// Feedback and profiling side-table layout.
 pub mod feedback;
 /// Frame and register-window layout.
@@ -23,13 +29,28 @@ pub mod frame;
 pub mod interpreter;
 /// JIT-facing ABI surface.
 pub mod jit_abi;
+/// Tiny lowering bridge from structured subset to bytecode/module form.
+pub mod lowering;
 /// Executable module and function containers.
 pub mod module;
+/// Minimal object heap for the new VM.
+pub mod object;
+/// Property side tables for named access.
+pub mod property;
+/// Small smoke harness for iterative validation.
+pub mod smoke;
+/// Source-location metadata.
+pub mod source_map;
+/// String-literal side tables for functions.
+pub mod string;
+/// Minimal register value representation.
+pub mod value;
 
 pub use abi::VmAbiVersion;
 pub use frame::FrameLayout;
 pub use interpreter::Interpreter;
-pub use module::Module;
+pub use module::{Function, FunctionIndex, Module, ModuleError};
+pub use value::RegisterValue;
 
 /// Returns the current execution ABI version of the new VM.
 #[must_use]

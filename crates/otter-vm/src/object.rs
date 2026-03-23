@@ -185,6 +185,25 @@ impl ObjectHeap {
         }
     }
 
+    /// Compares two register values with the current strict-equality semantics.
+    pub fn strict_eq(&self, lhs: RegisterValue, rhs: RegisterValue) -> Result<bool, ObjectError> {
+        if lhs == rhs {
+            return Ok(true);
+        }
+
+        let Some(lhs_handle) = lhs.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+        let Some(rhs_handle) = rhs.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+
+        match (self.object(lhs_handle)?, self.object(rhs_handle)?) {
+            (HeapValue::String { value: lhs }, HeapValue::String { value: rhs }) => Ok(lhs == rhs),
+            _ => Ok(false),
+        }
+    }
+
     /// Loads an indexed element from an array or string.
     pub fn get_index(
         &mut self,
@@ -557,6 +576,17 @@ mod tests {
             heap.set_property(array, PropertyNameId(0), RegisterValue::from_i32(1)),
             Err(ObjectError::InvalidKind)
         );
+    }
+
+    #[test]
+    fn strict_equality_compares_string_contents() {
+        let mut heap = ObjectHeap::new();
+        let lhs = RegisterValue::from_object_handle(heap.alloc_string("otter").0);
+        let rhs = RegisterValue::from_object_handle(heap.alloc_string("otter").0);
+        let other = RegisterValue::from_object_handle(heap.alloc_string("vm").0);
+
+        assert_eq!(heap.strict_eq(lhs, rhs), Ok(true));
+        assert_eq!(heap.strict_eq(lhs, other), Ok(false));
     }
 
     #[test]

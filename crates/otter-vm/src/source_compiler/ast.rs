@@ -1,0 +1,139 @@
+use super::*;
+
+pub(super) fn collect_var_names(statements: &[AstStatement<'_>]) -> Vec<String> {
+    let mut names = Vec::new();
+    for statement in statements {
+        collect_var_names_from_statement(statement, &mut names);
+    }
+    names
+}
+
+fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Vec<String>) {
+    match statement {
+        AstStatement::VariableDeclaration(declaration)
+            if declaration.kind == VariableDeclarationKind::Var =>
+        {
+            for declarator in &declaration.declarations {
+                if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                    && !names
+                        .iter()
+                        .any(|existing| existing == identifier.name.as_str())
+                {
+                    names.push(identifier.name.to_string());
+                }
+            }
+        }
+        AstStatement::BlockStatement(block) => {
+            for statement in &block.body {
+                collect_var_names_from_statement(statement, names);
+            }
+        }
+        AstStatement::IfStatement(if_statement) => {
+            collect_var_names_from_statement(&if_statement.consequent, names);
+            if let Some(alternate) = &if_statement.alternate {
+                collect_var_names_from_statement(alternate, names);
+            }
+        }
+        AstStatement::WhileStatement(while_statement) => {
+            collect_var_names_from_statement(&while_statement.body, names);
+        }
+        AstStatement::DoWhileStatement(do_while_statement) => {
+            collect_var_names_from_statement(&do_while_statement.body, names);
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn collect_function_declarations<'a>(
+    statements: &'a [AstStatement<'a>],
+    functions: &mut Vec<&'a Function<'a>>,
+) {
+    for statement in statements {
+        collect_function_declarations_from_statement(statement, functions);
+    }
+}
+
+fn collect_function_declarations_from_statement<'a>(
+    statement: &'a AstStatement<'a>,
+    functions: &mut Vec<&'a Function<'a>>,
+) {
+    match statement {
+        AstStatement::FunctionDeclaration(function) => functions.push(function),
+        AstStatement::BlockStatement(block) => {
+            for statement in &block.body {
+                collect_function_declarations_from_statement(statement, functions);
+            }
+        }
+        AstStatement::IfStatement(if_statement) => {
+            collect_function_declarations_from_statement(&if_statement.consequent, functions);
+            if let Some(alternate) = &if_statement.alternate {
+                collect_function_declarations_from_statement(alternate, functions);
+            }
+        }
+        AstStatement::WhileStatement(while_statement) => {
+            collect_function_declarations_from_statement(&while_statement.body, functions);
+        }
+        AstStatement::DoWhileStatement(do_while_statement) => {
+            collect_function_declarations_from_statement(&do_while_statement.body, functions);
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn extract_function_params<'a>(
+    function: &'a Function<'a>,
+) -> Result<Vec<&'a str>, SourceLoweringError> {
+    let mut params = Vec::new();
+    for param in &function.params.items {
+        match &param.pattern {
+            BindingPattern::BindingIdentifier(identifier) => params.push(identifier.name.as_str()),
+            _ => {
+                return Err(SourceLoweringError::Unsupported(
+                    "non-identifier parameters".to_string(),
+                ));
+            }
+        }
+    }
+    if function.params.rest.is_some() {
+        return Err(SourceLoweringError::Unsupported(
+            "rest parameters".to_string(),
+        ));
+    }
+    Ok(params)
+}
+
+pub(super) fn non_computed_property_key_name(key: &PropertyKey<'_>) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+        PropertyKey::Identifier(identifier) => Some(identifier.name.to_string()),
+        PropertyKey::StringLiteral(literal) => Some(literal.value.to_string()),
+        PropertyKey::NumericLiteral(literal) => Some(literal.value.to_string()),
+        PropertyKey::BooleanLiteral(literal) => Some(if literal.value {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        PropertyKey::NullLiteral(_) => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+pub(super) fn is_test262_failure_throw(expression: &Expression<'_>) -> bool {
+    let Expression::NewExpression(new_expression) = expression else {
+        return false;
+    };
+    let Expression::Identifier(identifier) = &new_expression.callee else {
+        return false;
+    };
+    identifier.name == "Test262Error"
+}
+
+pub(super) fn is_test262_assert_same_value_call(call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return false;
+    };
+    let Expression::Identifier(object) = &member.object else {
+        return false;
+    };
+    object.name == "assert" && member.property.name == "sameValue"
+}

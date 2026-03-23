@@ -56,6 +56,13 @@ pub enum Expr {
     Null,
     /// Boolean negation.
     Not(Box<Expr>),
+    /// Assign a value and yield the assigned result.
+    Assign {
+        /// Local to update.
+        target: LocalId,
+        /// Assigned value expression.
+        value: Box<Expr>,
+    },
     /// Binary expression.
     Binary {
         /// Operation to apply.
@@ -102,6 +109,15 @@ impl Expr {
     #[must_use]
     pub fn logical_not(value: Self) -> Self {
         Self::Not(Box::new(value))
+    }
+
+    /// Creates an assignment expression.
+    #[must_use]
+    pub fn assign(target: LocalId, value: Self) -> Self {
+        Self::Assign {
+            target,
+            value: Box::new(value),
+        }
     }
 
     /// Creates a binary expression.
@@ -432,6 +448,16 @@ impl LoweringContext {
                     .push(Instruction::not(register, value.register));
                 Ok(ValueLocation::temp(register))
             }
+            Expr::Assign { target, value } => {
+                let target = self.local_register(*target)?;
+                let value = self.lower_expr(value)?;
+                if value.register != target {
+                    self.instructions
+                        .push(Instruction::move_(target, value.register));
+                }
+                self.release(value);
+                Ok(ValueLocation::local(target))
+            }
             Expr::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),
         }
     }
@@ -443,6 +469,7 @@ impl LoweringContext {
         rhs: &Expr,
     ) -> Result<ValueLocation, LoweringError> {
         let lhs = self.lower_expr(lhs)?;
+        let lhs = self.materialize_value(lhs);
         let rhs = self.lower_expr(rhs)?;
 
         let result = if rhs.is_temp {
@@ -473,6 +500,17 @@ impl LoweringContext {
         }
 
         Ok(result)
+    }
+
+    fn materialize_value(&mut self, value: ValueLocation) -> ValueLocation {
+        if value.is_temp {
+            return value;
+        }
+
+        let register = self.alloc_temp();
+        self.instructions
+            .push(Instruction::move_(register, value.register));
+        ValueLocation::temp(register)
     }
 
     fn local_register(&self, local: LocalId) -> Result<BytecodeRegister, LoweringError> {

@@ -41,6 +41,8 @@ pub mod property;
 pub mod smoke;
 /// Tiny JS source lowering for the first new-VM migration slice.
 pub mod source;
+/// Primary JS source compiler for the new VM source path.
+pub(crate) mod source_compiler;
 /// Source-location metadata.
 pub mod source_map;
 /// String-literal side tables for functions.

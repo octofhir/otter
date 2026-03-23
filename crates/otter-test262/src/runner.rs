@@ -19,8 +19,29 @@ use otter_vm_core::IsolateConfig;
 use crate::harness::TestHarnessState;
 use crate::metadata::{ErrorPhase, ExecutionMode, TestMetadata};
 
-// Skip features are now configured exclusively via test262_config.toml.
-// No hardcoded defaults — the config file is the single source of truth.
+const NATIVE_TEST262_BASIC_FILES: &[&str] = &[
+    "test/built-ins/Array/S15.4.5.2_A2_T1.js",
+    "test/language/expressions/addition/S11.6.1_A2.4_T1.js",
+    "test/language/expressions/array/11.1.4-0.js",
+    "test/language/expressions/object/S11.1.5_A4.3.js",
+    "test/language/statements/do-while/S12.6.1_A1.js",
+    "test/language/function-code/S10.2.1_A1.js",
+    "test/language/function-code/S10.2.1_A3.js",
+    "test/language/function-code/S10.4_A1.1_T1.js",
+    "test/language/function-code/S10.4A1.1_T2.js",
+    "test/language/statements/if/S12.5_A1.1_T1.js",
+    "test/language/statements/if/S12.5_A1.1_T2.js",
+    "test/language/statements/if/S12.5_A1_T1.js",
+    "test/language/statements/if/S12.5_A1_T2.js",
+    "test/language/statements/if/S12.5_A12_T1.js",
+    "test/language/statements/if/S12.5_A12_T2.js",
+    "test/language/statements/if/S12.5_A12_T3.js",
+    "test/language/statements/if/S12.5_A12_T4.js",
+    "test/language/statements/while/S12.6.2_A1.js",
+    "test/language/types/string/S8.4_A3.js",
+    "test/language/types/string/S8.4_A4.js",
+    "test/language/types/string/S8.4_A6.1.js",
+];
 
 /// Test262 test runner
 pub struct Test262Runner {
@@ -601,13 +622,7 @@ impl Test262Runner {
             return None;
         }
 
-        if !matches!(
-            relative_path,
-            "test/language/statements/if/S12.5_A1_T1.js"
-                | "test/language/statements/if/S12.5_A1_T2.js"
-                | "test/language/statements/while/S12.6.2_A1.js"
-                | "test/language/statements/do-while/S12.6.1_A1.js"
-        ) {
+        if !NATIVE_TEST262_BASIC_FILES.contains(&relative_path) {
             return None;
         }
 

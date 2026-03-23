@@ -672,7 +672,11 @@ impl Interpreter {
             Opcode::Eq => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                activation.write_bytecode_register(function, instruction.a(), lhs.eq(rhs))?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(runtime.objects.strict_eq(lhs, rhs)?),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }

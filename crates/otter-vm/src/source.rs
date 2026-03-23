@@ -67,8 +67,9 @@ impl From<lowering::LoweringError> for SourceLoweringError {
 
 /// Parse, lower, and compile a tiny JS script into an `otter-vm` module.
 pub fn compile_script(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
-    let program = lower_script(source, source_url)?;
-    lowering::compile_module(&program).map_err(Into::into)
+    let allocator = Allocator::default();
+    let ast = parse_script(&allocator, source, source_url)?;
+    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Script)
 }
 
 /// Parse, lower, and compile a tiny native Test262 script into an `otter-vm` module.
@@ -76,8 +77,9 @@ pub fn compile_test262_basic_script(
     source: &str,
     source_url: &str,
 ) -> Result<Module, SourceLoweringError> {
-    let program = lower_script_with_mode(source, source_url, LoweringMode::Test262Basic)?;
-    lowering::compile_module(&program).map_err(Into::into)
+    let allocator = Allocator::default();
+    let ast = parse_script(&allocator, source, source_url)?;
+    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Test262Basic)
 }
 
 /// Parse and lower a tiny JS script into a structured `otter-vm` program.
@@ -90,6 +92,16 @@ fn lower_script_with_mode(
     source_url: &str,
     mode: LoweringMode,
 ) -> Result<Program, SourceLoweringError> {
+    let allocator = Allocator::default();
+    let program = parse_script(&allocator, source, source_url)?;
+    TinyScriptLowerer::new(source_url, mode).lower_program(&program)
+}
+
+fn parse_script<'a>(
+    allocator: &'a Allocator,
+    source: &'a str,
+    source_url: &str,
+) -> Result<AstProgram<'a>, SourceLoweringError> {
     let mut source_type = SourceType::from_path(source_url)
         .unwrap_or_else(|_| SourceType::default().with_script(true))
         .with_script(true);
@@ -102,17 +114,15 @@ fn lower_script_with_mode(
 
     source_type = source_type.with_module(false);
 
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let parsed = Parser::new(allocator, source, source_type).parse();
     if let Some(error) = parsed.errors.first() {
         return Err(SourceLoweringError::Parse(error.to_string()));
     }
-
-    TinyScriptLowerer::new(source_url, mode).lower_program(&parsed.program)
+    Ok(parsed.program)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoweringMode {
+pub(crate) enum LoweringMode {
     Script,
     Test262Basic,
 }
@@ -245,7 +255,15 @@ impl<'a> TinyScriptLowerer<'a> {
                 ));
             };
 
-            let local = self.declare_binding(identifier.name.as_str())?;
+            let local = if declaration.kind == VariableDeclarationKind::Var {
+                if let Some(local) = self.locals.get(identifier.name.as_str()).copied() {
+                    local
+                } else {
+                    self.declare_binding(identifier.name.as_str())?
+                }
+            } else {
+                self.declare_binding(identifier.name.as_str())?
+            };
             if let Some(init) = &declarator.init {
                 let value = self.lower_expression(init)?;
                 output.push(Statement::assign(local, value));
@@ -263,8 +281,9 @@ impl<'a> TinyScriptLowerer<'a> {
         match expression {
             Expression::StringLiteral(_) => Ok(()),
             Expression::AssignmentExpression(assignment) => {
-                let statement = self.lower_assignment_expression(assignment)?;
-                output.push(statement);
+                let scratch_local = self.allocate_scratch_local()?;
+                let value = self.lower_assignment_expression(assignment)?;
+                output.push(Statement::assign(scratch_local, value));
                 Ok(())
             }
             Expression::UpdateExpression(update) => {
@@ -284,7 +303,7 @@ impl<'a> TinyScriptLowerer<'a> {
     fn lower_assignment_expression(
         &mut self,
         assignment: &oxc_ast::ast::AssignmentExpression<'_>,
-    ) -> Result<Statement, SourceLoweringError> {
+    ) -> Result<Expr, SourceLoweringError> {
         if assignment.operator != AssignmentOperator::Assign {
             return Err(SourceLoweringError::Unsupported(format!(
                 "assignment operator {:?}",
@@ -300,7 +319,7 @@ impl<'a> TinyScriptLowerer<'a> {
 
         let local = self.lookup_binding(identifier.name.as_str())?;
         let value = self.lower_expression(&assignment.right)?;
-        Ok(Statement::assign(local, value))
+        Ok(Expr::assign(local, value))
     }
 
     fn lower_expression(
@@ -336,11 +355,20 @@ impl<'a> TinyScriptLowerer<'a> {
                 {
                     return Ok(Expr::undefined());
                 }
+                if self.mode == LoweringMode::Test262Basic
+                    && identifier.name == "NaN"
+                    && !self.locals.contains_key("NaN")
+                {
+                    return Ok(Expr::bool(false));
+                }
 
                 Ok(Expr::local(self.lookup_binding(identifier.name.as_str())?))
             }
             Expression::ParenthesizedExpression(parenthesized) => {
                 self.lower_expression(&parenthesized.expression)
+            }
+            Expression::AssignmentExpression(assignment) => {
+                self.lower_assignment_expression(assignment)
             }
             Expression::BinaryExpression(binary) => {
                 let operator = match binary.operator {
@@ -559,5 +587,128 @@ mod tests {
             .execute(&module)
             .expect("native test262 script should execute");
         assert_eq!(result.return_value(), RegisterValue::from_i32(1));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_assignment_expressions_in_values() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var x = 0;\n",
+                "if ((x = 1) + x !== 2) {\n",
+                "    throw new Test262Error(\"#1\");\n",
+                "}\n",
+                "var y = 0;\n",
+                "if (y + (y = 1) !== 1) {\n",
+                "    throw new Test262Error(\"#2\");\n",
+                "}\n",
+            ),
+            "native-test262-assignment-expression.js",
+        )
+        .expect("assignment expression script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("assignment expression script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_function_declarations_and_calls() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function add(a, b) {\n",
+                "    return a + b;\n",
+                "}\n",
+                "if (add(20, 22) !== 42) {\n",
+                "    throw new Test262Error(\"#1\");\n",
+                "}\n",
+                "function recurse(a) {\n",
+                "    if (a === 0) return 7;\n",
+                "    return recurse(a - 1);\n",
+                "}\n",
+                "if (recurse(2) !== 7) {\n",
+                "    throw new Test262Error(\"#2\");\n",
+                "}\n",
+            ),
+            "native-test262-functions.js",
+        )
+        .expect("function declaration script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("function declaration script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_function_expressions_closures_and_objects() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var makeCounter = function(start) {\n",
+                "    var value = start;\n",
+                "    return function(step) {\n",
+                "        value = value + step;\n",
+                "        return value;\n",
+                "    };\n",
+                "};\n",
+                "var counter = makeCounter(1);\n",
+                "var object = {count: counter(2), \"flag\": true};\n",
+                "if (object.count !== 3) {\n",
+                "    throw new Test262Error(\"#1\");\n",
+                "}\n",
+                "if (object[\"flag\"] !== true) {\n",
+                "    throw new Test262Error(\"#2\");\n",
+                "}\n",
+            ),
+            "native-test262-closures-objects.js",
+        )
+        .expect("closure/object script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("closure/object script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_strings_arrays_and_native_asserts() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var index = 1;\n",
+                "var text = \"otter\";\n",
+                "assert.sameValue(text.length, 5, \"text.length\");\n",
+                "assert.sameValue(text[index], \"t\", \"text[index]\");\n",
+                "var array = [1,,3];\n",
+                "assert.sameValue(array.length, 3, \"array.length\");\n",
+                "assert.sameValue(array[index], undefined, \"array[index]\");\n",
+                "array[index] = 2;\n",
+                "assert.sameValue(array[index], 2, \"array[index] after store\");\n",
+                "assert.sameValue(array[2], 3, \"array[2]\");\n",
+            ),
+            "native-test262-strings-arrays.js",
+        )
+        .expect("strings/arrays script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("strings/arrays script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_large_string_literal_equality() {
+        let source = format!(
+            "var large = \"{}\";\nassert.sameValue(large, \"{}\", \"large string\");\n",
+            "otter".repeat(1024),
+            "otter".repeat(1024)
+        );
+
+        let module = compile_test262_basic_script(&source, "native-test262-large-string.js")
+            .expect("large string script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("large string script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
     }
 }

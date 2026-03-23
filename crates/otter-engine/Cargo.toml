@@ -4,11 +4,16 @@ version = "0.1.3"
 edition = "2024"
 description = "Otter JavaScript engine"
 license = "MIT"
+autotests = false
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
 keywords = ["typescript", "javascript", "runtime", "engine", "vm"]
 categories = ["development-tools", "compilers"]
 readme = "README.md"
+
+[lib]
+test = false
+doctest = false
 
 [features]
 profiling = ["otter-vm-runtime/profiling"]

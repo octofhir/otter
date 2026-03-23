@@ -40,6 +40,7 @@ pub mod next_vm {
     pub use otter_vm::lowering::{
         BinaryOp, Expr, LocalId, LoweringError, Program, Statement, compile_module,
     };
+    pub use otter_vm::source::{compile_script, compile_test262_basic_script};
     pub use otter_vm::{Function as VmFunction, Interpreter as VmInterpreter, Module as VmModule};
 }
 
@@ -58,7 +59,7 @@ pub use module_loader::{
 pub use module_provider::{
     MediaType, ModuleProvider, ModuleResolution, ModuleSource, ModuleType, ProviderRegistry,
 };
-pub use otter_runtime::{Otter, OtterError, VmBackend};
+pub use otter_runtime::{Otter, OtterError};
 pub use otter_vm_core::isolate::IsolateConfig;
 
 // Native extension system

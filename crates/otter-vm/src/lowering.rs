@@ -50,6 +50,12 @@ pub enum Expr {
     I32(i32),
     /// Inline boolean constant.
     Bool(bool),
+    /// Inline `undefined`.
+    Undefined,
+    /// Inline `null`.
+    Null,
+    /// Boolean negation.
+    Not(Box<Expr>),
     /// Binary expression.
     Binary {
         /// Operation to apply.
@@ -78,6 +84,24 @@ impl Expr {
     #[must_use]
     pub const fn bool(value: bool) -> Self {
         Self::Bool(value)
+    }
+
+    /// Creates an `undefined` literal.
+    #[must_use]
+    pub const fn undefined() -> Self {
+        Self::Undefined
+    }
+
+    /// Creates a `null` literal.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self::Null
+    }
+
+    /// Creates a logical negation expression.
+    #[must_use]
+    pub fn logical_not(value: Self) -> Self {
+        Self::Not(Box::new(value))
     }
 
     /// Creates a binary expression.
@@ -117,6 +141,13 @@ pub enum Statement {
         /// Loop body.
         body: Box<[Statement]>,
     },
+    /// Loop body once, then continue while the condition stays truthy.
+    DoWhile {
+        /// Condition expression.
+        condition: Expr,
+        /// Loop body.
+        body: Box<[Statement]>,
+    },
     /// Return a value.
     Return(Expr),
 }
@@ -142,6 +173,15 @@ impl Statement {
     #[must_use]
     pub fn while_(condition: Expr, body: Vec<Statement>) -> Self {
         Self::While {
+            condition,
+            body: body.into_boxed_slice(),
+        }
+    }
+
+    /// Creates a `do...while` statement.
+    #[must_use]
+    pub fn do_while(condition: Expr, body: Vec<Statement>) -> Self {
+        Self::DoWhile {
             condition,
             body: body.into_boxed_slice(),
         }
@@ -330,6 +370,19 @@ impl LoweringContext {
                 self.patch_jump(exit_jump, self.instructions.len())?;
                 Ok(false)
             }
+            Statement::DoWhile { condition, body } => {
+                let loop_start = self.instructions.len();
+                if self.lower_block(body)? {
+                    return Ok(true);
+                }
+
+                let condition = self.lower_expr(condition)?;
+                let back_jump =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, condition.register);
+                self.release(condition);
+                self.patch_jump(back_jump, loop_start)?;
+                Ok(false)
+            }
             Statement::Return(value) => {
                 let value = self.lower_expr(value)?;
                 self.instructions.push(Instruction::ret(value.register));
@@ -355,6 +408,28 @@ impl LoweringContext {
                 } else {
                     Instruction::load_false(register)
                 });
+                Ok(ValueLocation::temp(register))
+            }
+            Expr::Undefined => {
+                let register = self.alloc_temp();
+                self.instructions
+                    .push(Instruction::load_undefined(register));
+                Ok(ValueLocation::temp(register))
+            }
+            Expr::Null => {
+                let register = self.alloc_temp();
+                self.instructions.push(Instruction::load_null(register));
+                Ok(ValueLocation::temp(register))
+            }
+            Expr::Not(value) => {
+                let value = self.lower_expr(value)?;
+                let register = if value.is_temp {
+                    value.register
+                } else {
+                    ValueLocation::temp(self.alloc_temp()).register
+                };
+                self.instructions
+                    .push(Instruction::not(register, value.register));
                 Ok(ValueLocation::temp(register))
             }
             Expr::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),

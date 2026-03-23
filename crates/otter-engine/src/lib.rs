@@ -91,7 +91,6 @@ pub use otter_vm_runtime::{
     Promise,
     Timer,
     TimerId,
-    VmBackend,
     // Workers
     Worker,
     WorkerContext,

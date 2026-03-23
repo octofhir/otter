@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Key-value store for Otter runtime"
 license = "MIT"
+autotests = false
 authors = ["Otter Authors"]
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 

@@ -4,16 +4,21 @@ version = "0.1.0"
 edition = "2024"
 description = "JavaScript/TypeScript to bytecode compiler for Otter VM"
 license = "MIT"
+autotests = false
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
-oxc = { version = "0.117", features = ["full"] }
-oxc_allocator = "0.117"
-oxc_parser = "0.117"
-oxc_ast = "0.117"
-oxc_span = "0.117"
-oxc_syntax = "0.117"
-oxc_regular_expression = "0.117"
+oxc = { version = "0.122", features = ["full"] }
+oxc_allocator = "0.122"
+oxc_parser = "0.122"
+oxc_ast = "0.122"
+oxc_span = "0.122"
+oxc_syntax = "0.122"
+oxc_regular_expression = "0.122"
 thiserror.workspace = true
 regex = "1.0"
 

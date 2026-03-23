@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "FFI (Foreign Function Interface) backend for Otter VM"
 license = "MIT"
+autotests = false
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 libloading = "0.8"

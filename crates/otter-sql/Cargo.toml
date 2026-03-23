@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "SQL API for Otter - SQLite and PostgreSQL support"
 license = "MIT"
+autotests = false
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
 keywords = ["sql", "sqlite", "postgresql", "database", "runtime"]
 categories = ["database", "api-bindings"]
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 # SQLite

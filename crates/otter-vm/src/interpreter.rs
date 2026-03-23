@@ -609,6 +609,34 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::LoadUndefined => {
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::undefined(),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::LoadNull => {
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::null(),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::Not => {
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(!value.is_truthy()),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::Add => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;

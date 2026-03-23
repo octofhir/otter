@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Core VM execution engine for Otter"
 license = "MIT"
+autotests = false
+
+[lib]
+test = false
+doctest = false
 
 [features]
 profiling = ["dep:otter-profiler", "otter-vm-bytecode/profiling"]

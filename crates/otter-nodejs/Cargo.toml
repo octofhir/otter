@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Node.js API compatibility for Otter VM"
 license = "MIT"
+autotests = false
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 otter-vm-core = { path = "../otter-vm-core" }

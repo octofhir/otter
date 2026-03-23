@@ -13,7 +13,7 @@ use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use otter_engine::{EngineBuilder, Otter, OtterError, Value};
+use otter_engine::{EngineBuilder, Otter, OtterError, Value, next_vm};
 use otter_vm_core::IsolateConfig;
 
 use crate::harness::TestHarnessState;
@@ -501,6 +501,7 @@ impl Test262Runner {
         self.rebuild_engine();
 
         let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
+        let relative_path_str = relative_path.to_string_lossy().replace('\\', "/");
         let test_name = format!("{} ({})", relative_path.to_string_lossy(), mode);
 
         // Configure trace for this test
@@ -557,6 +558,16 @@ impl Test262Runner {
             .find("---*/")
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
+
+        if let Some(native_source) =
+            self.build_native_test262_basic_source(&relative_path_str, test_content, metadata, mode)
+        {
+            self.harness_state.clear();
+            return self
+                .execute_native_test262_basic(&native_source, &test_name, &relative_path_str)
+                .await;
+        }
+
         test_source.push_str(test_content);
 
         // Clear harness state before running the test
@@ -570,6 +581,83 @@ impl Test262Runner {
             self.execute_test(&test_source, metadata, &test_name, timeout)
                 .await
         }
+    }
+
+    fn build_native_test262_basic_source(
+        &self,
+        relative_path: &str,
+        test_content: &str,
+        metadata: &TestMetadata,
+        mode: ExecutionMode,
+    ) -> Option<String> {
+        if mode == ExecutionMode::Module
+            || metadata.is_async()
+            || metadata.is_raw()
+            || metadata.expects_early_error()
+            || metadata.expects_resolution_error()
+            || metadata.expects_runtime_error()
+            || !metadata.includes.is_empty()
+        {
+            return None;
+        }
+
+        if !matches!(
+            relative_path,
+            "test/language/statements/if/S12.5_A1_T1.js"
+                | "test/language/statements/if/S12.5_A1_T2.js"
+                | "test/language/statements/while/S12.6.2_A1.js"
+                | "test/language/statements/do-while/S12.6.1_A1.js"
+        ) {
+            return None;
+        }
+
+        let mut source = String::new();
+        if mode == ExecutionMode::Strict {
+            source.push_str("\"use strict\";\n");
+        }
+        source.push_str(test_content);
+        Some(source)
+    }
+
+    async fn execute_native_test262_basic(
+        &mut self,
+        source: &str,
+        test_name: &str,
+        source_url: &str,
+    ) -> (TestOutcome, Option<String>) {
+        let module = match next_vm::compile_test262_basic_script(source, source_url) {
+            Ok(module) => module,
+            Err(error) => {
+                let outcome = (TestOutcome::Fail, Some(format!("Compile error: {}", error)));
+                self.save_conditional_trace(test_name, outcome.0);
+                return outcome;
+            }
+        };
+
+        let outcome = match self.engine().execute_next_module(&module) {
+            Ok(value) => match value.as_i32() {
+                Some(0) => (TestOutcome::Pass, None),
+                Some(1) => (
+                    TestOutcome::Fail,
+                    Some("Native Test262 harness reported a failing assertion".to_string()),
+                ),
+                Some(code) => (
+                    TestOutcome::Fail,
+                    Some(format!(
+                        "Native Test262 harness returned unexpected status code {}",
+                        code
+                    )),
+                ),
+                None => (
+                    TestOutcome::Fail,
+                    Some("Native Test262 harness returned a non-integer value".to_string()),
+                ),
+            },
+            Err(error) => (TestOutcome::Fail, Some(error.to_string())),
+        };
+
+        self.save_conditional_trace(test_name, outcome.0);
+        outcome
     }
 
     /// Execute a test and return (outcome, error_message)

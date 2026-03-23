@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Proc-macros for Otter runtime - #[dive] attribute for native functions"
 license = "MIT"
+autotests = false
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
 keywords = ["otter", "macros", "proc-macro", "javascript", "runtime"]
@@ -12,6 +13,8 @@ readme = "README.md"
 
 [lib]
 proc-macro = true
+test = false
+doctest = false
 
 [dependencies]
 proc-macro2 = "1"

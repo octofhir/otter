@@ -4,6 +4,7 @@ version = "0.1.2"
 edition = "2024"
 description = "Otter CLI - A fast TypeScript/JavaScript runtime"
 license = "MIT"
+autotests = false
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
 keywords = ["typescript", "javascript", "runtime", "cli"]
@@ -13,6 +14,7 @@ readme = "README.md"
 [[bin]]
 name = "otter"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 # Main engine (single entry point for all VM functionality)

@@ -72,6 +72,12 @@ pub enum Opcode {
     NewArray = 0x07,
     /// Allocate a closure from the current function closure side table.
     NewClosure = 0x08,
+    /// Load `undefined`.
+    LoadUndefined = 0x09,
+    /// Load `null`.
+    LoadNull = 0x0A,
+    /// Boolean negation.
+    Not = 0x0B,
     /// Integer-or-number addition.
     Add = 0x10,
     /// Integer-or-number subtraction.
@@ -124,6 +130,9 @@ impl Opcode {
             0x06 => Some(Self::LoadString),
             0x07 => Some(Self::NewArray),
             0x08 => Some(Self::NewClosure),
+            0x09 => Some(Self::LoadUndefined),
+            0x0A => Some(Self::LoadNull),
+            0x0B => Some(Self::Not),
             0x10 => Some(Self::Add),
             0x11 => Some(Self::Sub),
             0x12 => Some(Self::Mul),
@@ -248,6 +257,34 @@ impl Instruction {
             capture_start,
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes an `undefined` load.
+    #[must_use]
+    pub const fn load_undefined(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadUndefined,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a `null` load.
+    #[must_use]
+    pub const fn load_null(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadNull,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a boolean negation.
+    #[must_use]
+    pub const fn not(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Not, dst, src, BytecodeRegister::new(0))
     }
 
     /// Encodes an addition.

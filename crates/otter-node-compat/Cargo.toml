@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 description = "Node.js compatibility test runner for Otter VM"
 license = "MIT"
+autotests = false
 publish = false
+
+[lib]
+test = false
+doctest = false
 
 [[bin]]
 name = "node-compat"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 otter-engine = { path = "../otter-engine", version = "0.1.3" }

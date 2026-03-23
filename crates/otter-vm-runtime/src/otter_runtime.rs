@@ -459,8 +459,6 @@ pub struct Otter {
     env_store: Arc<IsolatedEnvStore>,
     /// Capabilities (permissions)
     capabilities: Capabilities,
-    /// Selected execution backend for module-level routing.
-    vm_backend: VmBackend,
     /// Interrupt flag for timeout/cancellation
     interrupt_flag: Arc<AtomicBool>,
     /// Debug snapshot for watchdogs
@@ -480,16 +478,6 @@ pub struct Otter {
 struct RealmSlot {
     id: RealmId,
     ctx: VmContext,
-}
-
-/// Selected execution backend for module-level routing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum VmBackend {
-    /// Existing bytecode VM and compiler pipeline.
-    #[default]
-    Legacy,
-    /// New `otter-vm` backend for the narrow structured subset.
-    Next,
 }
 
 impl Otter {
@@ -524,7 +512,6 @@ impl Otter {
             active_servers,
             env_store: Arc::new(IsolatedEnvStore::default()),
             capabilities: Capabilities::none(),
-            vm_backend: VmBackend::Legacy,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             debug_snapshot: Arc::new(parking_lot::Mutex::new(VmContextSnapshot::default())),
             debug_snapshot_updates_enabled: true,
@@ -578,17 +565,6 @@ impl Otter {
     /// Clear the interrupt flag (call before re-using the engine)
     pub fn clear_interrupt(&self) {
         self.interrupt_flag.store(false, Ordering::Relaxed);
-    }
-
-    /// Select the execution backend used by this runtime.
-    pub fn set_vm_backend(&mut self, backend: VmBackend) {
-        self.vm_backend = backend;
-    }
-
-    /// Returns the currently selected execution backend.
-    #[must_use]
-    pub const fn vm_backend(&self) -> VmBackend {
-        self.vm_backend
     }
 
     /// Reset the default realm for test isolation.
@@ -775,12 +751,9 @@ impl Otter {
 
     /// Compile and execute JavaScript/TypeScript code.
     ///
-    /// Code is compiled as an ES module (allowing top-level await) and executed
-    /// directly in the global scope — no async IIFE wrapper. This preserves:
-    /// - `var` declarations creating global properties
-    /// - `function` declarations creating global properties
-    /// - Correct `this` binding (global object for scripts)
-    /// - Top-level `await` via the interpreter's suspension machinery
+    /// The runtime is pinned to the new VM path and currently accepts only the
+    /// supported source subset exposed by `otter_vm::source`; unsupported source
+    /// returns an explicit compile error and does not fall back to the legacy VM.
     ///
     /// When `source_url` is `Some`, relative `require()` / `import` paths
     /// resolve from that file location. Pass an absolute file path
@@ -791,177 +764,8 @@ impl Otter {
         code: &str,
         source_url: Option<&str>,
     ) -> Result<Value, OtterError> {
-        self.ensure_legacy_source_execution()?;
         let source_url = source_url.unwrap_or("main.js");
-        // 0. Clear interrupt flag before starting (in case of re-use)
-        self.clear_interrupt();
-
-        // 1. Setup capabilities for security checks in ops
-        let _caps_guard =
-            crate::capabilities_context::CapabilitiesGuard::new(self.capabilities.clone());
-
-        // 2. Setup HTTP event receiver if not already done
-        if let Some(rx) = self.http_rx.take() {
-            self.event_loop.set_http_receiver(rx);
-        }
-        if let Some(rx) = self.ws_rx.take() {
-            self.event_loop.set_ws_receiver(rx);
-        }
-
-        // 3. Create execution context with globals and interrupt flag
-        let mut ctx = self.isolate.runtime().create_context();
-        ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
-        if self.debug_snapshot_updates_enabled {
-            ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
-        } else {
-            ctx.set_debug_snapshot_target(None);
-        }
-
-        // Apply trace configuration if enabled
-        if let Some(ref trace_config) = self.trace_config {
-            ctx.set_trace_config(trace_config.clone());
-        }
-
-        self.configure_eval(&mut ctx);
-        Self::configure_js_job_queue(&mut ctx, &self.event_loop);
-        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
-        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
-        Self::configure_timer_roots(&mut ctx, &self.event_loop);
-        Self::configure_module_namespace_roots(&mut ctx, &self.loader);
-
-        // 4. Register extension ops as global native functions
-        self.register_ops_in_context(&mut ctx);
-
-        // 4b. Bootstrap v2 native extensions (no JS compilation needed)
-        self.bootstrap_native_extensions(&ctx)?;
-
-        // 5. Execute setup JS from extensions (using pre-compiled modules if available)
-        let compiled_modules = self.extensions.all_compiled_js();
-        if !compiled_modules.is_empty() {
-            for module in compiled_modules {
-                if let Err(e) = self
-                    .isolate
-                    .runtime()
-                    .execute_module_with_context(&module, &mut ctx)
-                {
-                    eprintln!("Extension setup failed: {}", e);
-                    return Err(OtterError::Runtime(e.to_string()));
-                }
-                // ES spec: Drain microtasks after each module evaluation
-                self.drain_microtasks(&mut ctx)?;
-            }
-        } else {
-            // Fallback to source compilation if no pre-compiled modules
-            for js in self.extensions.all_js() {
-                self.execute_js(&mut ctx, js, "setup.js")?;
-                self.drain_microtasks(&mut ctx)?;
-            }
-        }
-
-        // ES spec: Drain microtasks after extension setup JS execution
-        self.drain_microtasks(&mut ctx)?;
-
-        // 5b. If source_url is a real file path, re-scope global require
-        if source_url != "main.js" {
-            let referrer_lit =
-                serde_json::to_string(source_url).unwrap_or_else(|_| "\"main.js\"".to_string());
-            let rescope = format!(
-                "globalThis.require = globalThis.__createRequire({0});\
-                 globalThis.module = globalThis.module || {{ exports: {{}} }};\
-                 globalThis.module.filename = {0};\
-                 globalThis.exports = globalThis.module.exports;\
-                 globalThis.require.main = globalThis.module;",
-                referrer_lit
-            );
-            let _ = self.execute_js(&mut ctx, &rescope, "<require-scope>");
-        }
-
-        // 6. Set top-level `this` to the global object per ES2023 §19.2.1.
-        ctx.set_pending_this(Value::object(ctx.global()));
-
-        // 7. Load, link and execute as module
-        let main_url = source_url;
-
-        let bytecode = match self.loader.compile_source(code, main_url, false) {
-            Ok(b) => b,
-            Err(e) => return Err(OtterError::Compile(e.to_string())),
-        };
-
-        // Link the module (resolves all imports)
-        if let Err(e) = self.loader.link(main_url) {
-            return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
-        }
-
-        // Build the dependency graph and execute modules in order
-        let order = match self.loader.build_graph(main_url) {
-            Ok(o) => o,
-            Err(e) => return Err(OtterError::Runtime(e.to_string())),
-        };
-
-        // Execute all dependencies first (excluding main), with suspension support
-        let normalized_main_url = self.loader.normalize_url(main_url);
-        for url in &order {
-            if url == main_url || url == &normalized_main_url {
-                continue;
-            }
-            let m = self.loader.get(url).unwrap();
-            let (dep_bytecode_arc, already_evaluated) = {
-                let guard = m.read().unwrap();
-                (
-                    Arc::clone(&guard.bytecode),
-                    guard.state == crate::module_loader::ModuleState::Evaluated,
-                )
-            };
-
-            // Skip native modules that are already evaluated (v2 extensions)
-            if already_evaluated {
-                continue;
-            }
-
-            // Resolve imports for this dependency
-            let dep_locals = self.resolve_module_imports(&dep_bytecode_arc, url)?;
-
-            // Execute dependency module with unified event loop (handles TLA)
-            let dep_promise = JsPromise::new();
-            let dep_exec_result = self.execute_with_suspension(
-                &mut ctx,
-                dep_bytecode_arc,
-                dep_promise,
-                if dep_locals.is_empty() {
-                    None
-                } else {
-                    Some(dep_locals)
-                },
-            )?;
-            self.run_event_loop(&mut ctx, Some(dep_exec_result), dep_promise)
-                .await?;
-
-            // Populate namespace
-            self.loader.update_namespace(url, &ctx);
-        }
-
-        // Resolve imports for the main module
-        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
-        let locals_opt = if initial_locals.is_empty() {
-            None
-        } else {
-            Some(initial_locals)
-        };
-
-        // Now execute the main module with suspension support
-        let result_promise = JsPromise::new();
-        let exec_result =
-            self.execute_with_suspension(&mut ctx, bytecode, result_promise, locals_opt)?;
-
-        // After main execution starts, update its namespace
-        self.loader.update_namespace(main_url, &ctx);
-
-        // 8. Unified event loop: TLA suspend/resume + HTTP/WS + timers + immediates
-        let final_value = self
-            .run_event_loop(&mut ctx, Some(exec_result), result_promise)
-            .await?;
-
-        Ok(final_value)
+        self.execute_next_source(code, source_url)
     }
 
     /// Unified event loop: handles TLA suspension/resume, HTTP/WS dispatch,
@@ -1247,127 +1051,7 @@ impl Otter {
 
     /// Execute JavaScript code without async event loop
     pub fn eval_sync(&mut self, code: &str) -> Result<Value, OtterError> {
-        self.ensure_legacy_source_execution()?;
-        // Clear interrupt flag before starting
-        self.clear_interrupt();
-
-        // Set up capabilities for security checks in ops
-        let _caps_guard =
-            crate::capabilities_context::CapabilitiesGuard::new(self.capabilities.clone());
-
-        // Create execution context with interrupt flag
-        let mut ctx = self.isolate.runtime().create_context();
-        ctx.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
-        if self.debug_snapshot_updates_enabled {
-            ctx.set_debug_snapshot_target(Some(Arc::clone(&self.debug_snapshot)));
-        } else {
-            ctx.set_debug_snapshot_target(None);
-        }
-
-        // Apply trace configuration if enabled
-        if let Some(ref trace_config) = self.trace_config {
-            ctx.set_trace_config(trace_config.clone());
-        }
-
-        self.configure_eval(&mut ctx);
-        Self::configure_js_job_queue(&mut ctx, &self.event_loop);
-        Self::configure_next_tick_queue(&mut ctx, &self.event_loop);
-        Self::configure_pending_async_ops(&mut ctx, &self.event_loop);
-
-        // Register extension ops as global native functions
-        self.register_ops_in_context(&mut ctx);
-
-        // Bootstrap v2 native extensions (no JS compilation needed)
-        self.bootstrap_native_extensions(&ctx)?;
-
-        // Execute setup JS from extensions
-        for js in self.extensions.all_js() {
-            self.execute_js(&mut ctx, js, "setup.js")?;
-            self.drain_microtasks(&mut ctx)?;
-        }
-
-        // Set top-level `this` to global object
-        ctx.set_pending_this(Value::object(ctx.global()));
-
-        // Detect ESM via AST: check for import/export declarations or top-level await.
-        // Uses the oxc parser so strings like 'import foo' don't cause false positives.
-        let main_url = if otter_vm_compiler::has_module_syntax(code) {
-            "main.mjs"
-        } else {
-            "main.js"
-        };
-        let bytecode = match self.loader.compile_source(code, main_url, true) {
-            Ok(b) => b,
-            Err(e) => return Err(OtterError::Compile(e.to_string())),
-        };
-
-        if let Err(e) = self.loader.link(main_url) {
-            return Err(OtterError::Runtime(format!("Module linking failed: {}", e)));
-        }
-
-        // Execute dependencies
-        let order = match self.loader.build_graph(main_url) {
-            Ok(o) => o,
-            Err(e) => return Err(OtterError::Runtime(e.to_string())),
-        };
-
-        let normalized_main_url = self.loader.normalize_url(main_url);
-        for url in &order {
-            if url == main_url || url == &normalized_main_url {
-                continue;
-            }
-            let m = self.loader.get(url).unwrap();
-            let (module_bytecode, already_evaluated) = {
-                let guard = m.read().unwrap();
-                (
-                    Arc::clone(&guard.bytecode),
-                    guard.state == crate::module_loader::ModuleState::Evaluated,
-                )
-            };
-
-            // Skip native modules that are already evaluated (v2 extensions)
-            if already_evaluated {
-                continue;
-            }
-
-            // Resolve imports for this dependency
-            let dep_locals = self.resolve_module_imports(&module_bytecode, url)?;
-
-            self.isolate
-                .runtime()
-                .execute_module_with_context_and_locals(
-                    &module_bytecode,
-                    &mut ctx,
-                    if dep_locals.is_empty() {
-                        None
-                    } else {
-                        Some(dep_locals)
-                    },
-                )
-                .map_err(|e: otter_vm_core::VmError| OtterError::Runtime(e.to_string()))?;
-
-            self.loader.update_namespace(url, &ctx);
-        }
-
-        // Resolve imports for main module
-        let initial_locals = self.resolve_module_imports(&bytecode, main_url)?;
-        let result = self
-            .isolate
-            .runtime()
-            .execute_module_with_context_and_locals(
-                &bytecode,
-                &mut ctx,
-                if initial_locals.is_empty() {
-                    None
-                } else {
-                    Some(initial_locals)
-                },
-            )
-            .map_err(|e: otter_vm_core::VmError| OtterError::Runtime(e.to_string()))?;
-
-        self.loader.update_namespace(main_url, &ctx);
-
-        Ok(result)
+        self.execute_next_source(code, "main.js")
     }
 
     /// Resolve import bindings for a module into initial locals map.
@@ -2192,25 +1876,10 @@ impl Otter {
     }
 
     /// Execute JS code in an existing context (no context creation/teardown).
-    pub fn eval_in_context(&self, ctx: &mut VmContext, code: &str) -> Result<Value, OtterError> {
-        self.ensure_legacy_source_execution()?;
-        self.clear_interrupt();
-        let compiler = Compiler::new();
-        let module = compiler
-            .compile_eval(code, "eval.js", false)
-            .map_err(|e| OtterError::Compile(e.to_string()))?;
-
-        // Execute in provided context
-        let result = self
-            .isolate
-            .runtime()
-            .execute_module_with_context(&module, ctx)
-            .map_err(|e| OtterError::Runtime(e.to_string()))?;
-
-        // ES spec: Drain microtasks after script execution
-        self.drain_microtasks(ctx)?;
-
-        Ok(result)
+    pub fn eval_in_context(&self, _ctx: &mut VmContext, _code: &str) -> Result<Value, OtterError> {
+        Err(OtterError::Runtime(
+            "eval_in_context is not supported on the new VM path yet".to_string(),
+        ))
     }
 
     /// Execute a pre-lowered `otter-vm` module when the new backend is selected.
@@ -2218,7 +1887,6 @@ impl Otter {
         &self,
         module: &otter_vm::Module,
     ) -> Result<otter_vm::RegisterValue, OtterError> {
-        self.ensure_next_backend()?;
         let result = otter_vm::Interpreter::new()
             .execute(module)
             .map_err(|error| OtterError::Runtime(error.to_string()))?;
@@ -2230,10 +1898,35 @@ impl Otter {
         &self,
         program: &otter_vm::lowering::Program,
     ) -> Result<otter_vm::RegisterValue, OtterError> {
-        self.ensure_next_backend()?;
         let module = otter_vm::lowering::compile_module(program)
             .map_err(|error| OtterError::Compile(error.to_string()))?;
         self.execute_next_module(&module)
+    }
+
+    fn execute_next_source(&self, code: &str, source_url: &str) -> Result<Value, OtterError> {
+        let module = otter_vm::source::compile_script(code, source_url)
+            .map_err(|error| OtterError::Compile(error.to_string()))?;
+        let result = self.execute_next_module(&module)?;
+        Self::next_register_value_to_value(result)
+    }
+
+    fn next_register_value_to_value(value: otter_vm::RegisterValue) -> Result<Value, OtterError> {
+        if let Some(number) = value.as_number() {
+            return Ok(Value::number(number));
+        }
+        if let Some(boolean) = value.as_bool() {
+            return Ok(Value::boolean(boolean));
+        }
+        if value == otter_vm::RegisterValue::undefined() {
+            return Ok(Value::undefined());
+        }
+        if value == otter_vm::RegisterValue::null() {
+            return Ok(Value::null());
+        }
+
+        Err(OtterError::Runtime(
+            "new VM returned a value that the source bridge does not expose yet".to_string(),
+        ))
     }
 
     /// Drains all pending microtasks until the queue is empty.
@@ -2950,27 +2643,6 @@ impl Otter {
         }
     }
 
-    fn ensure_legacy_source_execution(&self) -> Result<(), OtterError> {
-        if self.vm_backend == VmBackend::Next {
-            return Err(OtterError::Runtime(
-                "selected backend does not support JS/TS source execution yet; use execute_next_program or execute_next_module".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn ensure_next_backend(&self) -> Result<(), OtterError> {
-        if self.vm_backend != VmBackend::Next {
-            return Err(OtterError::Runtime(
-                "selected backend is legacy; enable VmBackend::Next to execute otter-vm modules"
-                    .to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Configure the eval compiler callback on a VmContext so that `eval()`
     /// and `CallEval` bytecode can compile code at runtime.
     /// The interpreter handles execution with proper stack depth tracking.
@@ -3438,9 +3110,7 @@ mod tests {
 
     #[test]
     fn test_next_backend_executes_lowered_program() {
-        let runtime = crate::builder::OtterBuilder::new()
-            .vm_backend(VmBackend::Next)
-            .build();
+        let runtime = crate::builder::OtterBuilder::new().build();
         let acc = LocalId::new(0);
 
         let program = Program::new(
@@ -3464,17 +3134,19 @@ mod tests {
     }
 
     #[test]
-    fn test_next_backend_rejects_source_eval() {
-        let mut runtime = crate::builder::OtterBuilder::new()
-            .vm_backend(VmBackend::Next)
-            .build();
+    fn test_next_backend_executes_tiny_source_eval() {
+        let mut runtime = crate::builder::OtterBuilder::new().build();
 
-        let error = runtime
-            .eval_sync("1 + 1")
-            .expect_err("next backend should reject source eval");
+        let result = runtime
+            .eval_sync(
+                r#"
+                let x = 1;
+                x = x + 1;
+                "#,
+            )
+            .expect("next backend should execute supported source");
 
-        assert!(matches!(error, OtterError::Runtime(_)));
-        assert!(error.to_string().contains("execute_next_program"));
+        assert_eq!(result, Value::undefined());
     }
 
     #[test]

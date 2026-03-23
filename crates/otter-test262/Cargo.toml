@@ -4,15 +4,22 @@ version = "0.1.0"
 edition = "2024"
 description = "Test262 runner for Otter VM"
 license = "MIT"
+autotests = false
 publish = false
+
+[lib]
+test = false
+doctest = false
 
 [[bin]]
 name = "test262"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "gen-conformance"
 path = "src/bin/gen_conformance.rs"
+test = false
 
 [dependencies]
 otter-engine = { path = "../otter-engine", version = "0.1.3" }

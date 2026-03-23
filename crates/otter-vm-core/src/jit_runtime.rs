@@ -66,7 +66,7 @@ pub(crate) fn try_execute_jit(
                 JitCallResult::NotCompiled
             }
         }
-        otter_jit::pipeline::JitExecResult::Bailout { bytecode_pc } => {
+        otter_jit::pipeline::JitExecResult::Bailout { bytecode_pc, .. } => {
             JitCallResult::Bailout { bytecode_pc }
         }
         otter_jit::pipeline::JitExecResult::NotCompiled => JitCallResult::NotCompiled,

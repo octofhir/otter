@@ -39,6 +39,8 @@ pub mod object;
 pub mod property;
 /// Small smoke harness for iterative validation.
 pub mod smoke;
+/// Tiny JS source lowering for the first new-VM migration slice.
+pub mod source;
 /// Source-location metadata.
 pub mod source_map;
 /// String-literal side tables for functions.

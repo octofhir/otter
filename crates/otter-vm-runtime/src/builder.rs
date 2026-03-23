@@ -13,7 +13,7 @@ use crate::capabilities::Capabilities;
 use crate::env_store::{EnvStoreBuilder, IsolatedEnvStore};
 
 use crate::extension::Extension;
-use crate::otter_runtime::{Otter, VmBackend};
+use crate::otter_runtime::Otter;
 
 /// Builder for embedded runtime
 ///
@@ -50,7 +50,6 @@ pub struct OtterBuilder {
     env_store: Option<Arc<IsolatedEnvStore>>,
     capabilities: Option<Capabilities>,
     isolate_config: Option<IsolateConfig>,
-    vm_backend: VmBackend,
 }
 
 impl OtterBuilder {
@@ -63,7 +62,6 @@ impl OtterBuilder {
             env_store: None,
             capabilities: None,
             isolate_config: None,
-            vm_backend: VmBackend::Legacy,
         }
     }
 
@@ -81,12 +79,6 @@ impl OtterBuilder {
     /// If not set, uses `IsolateConfig::default()`.
     pub fn isolate_config(mut self, config: IsolateConfig) -> Self {
         self.isolate_config = Some(config);
-        self
-    }
-
-    /// Select the execution backend used by this runtime.
-    pub fn vm_backend(mut self, backend: VmBackend) -> Self {
-        self.vm_backend = backend;
         self
     }
 
@@ -154,7 +146,6 @@ impl OtterBuilder {
     /// Build the runtime
     pub fn build(self) -> Otter {
         let mut runtime = Otter::with_isolate_config(self.isolate_config.unwrap_or_default());
-        runtime.set_vm_backend(self.vm_backend);
 
         // Set env store (defaults to empty/secure)
         let env_store = self
@@ -213,7 +204,6 @@ mod tests {
         let runtime = OtterBuilder::new().build();
         assert!(runtime.capabilities().fs_read.is_none());
         assert!(runtime.capabilities().net.is_none());
-        assert_eq!(runtime.vm_backend(), VmBackend::Legacy);
     }
 
     #[test]
@@ -262,12 +252,5 @@ mod tests {
             Some("production".to_string())
         );
         assert!(runtime.capabilities().can_net("any.host.com"));
-    }
-
-    #[test]
-    fn test_builder_with_next_backend() {
-        let runtime = OtterBuilder::new().vm_backend(VmBackend::Next).build();
-
-        assert_eq!(runtime.vm_backend(), VmBackend::Next);
     }
 }

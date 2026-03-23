@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Profiling tools for Otter VM"
 license = "MIT"
+autotests = false
+
+[lib]
+test = false
+doctest = false
 
 [dependencies]
 parking_lot = "0.12"

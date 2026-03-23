@@ -72,15 +72,15 @@ impl JitConfig {
         if let Ok(v) = std::env::var("OTTER_JIT") {
             cfg.enabled = v != "0";
         }
-        if let Ok(v) = std::env::var("OTTER_JIT_THRESHOLD") {
-            if let Ok(n) = v.parse::<u32>() {
-                cfg.tier1_threshold = n;
-            }
+        if let Ok(v) = std::env::var("OTTER_JIT_THRESHOLD")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            cfg.tier1_threshold = n;
         }
-        if let Ok(v) = std::env::var("OTTER_JIT_TIER2_THRESHOLD") {
-            if let Ok(n) = v.parse::<u32>() {
-                cfg.tier2_threshold = n;
-            }
+        if let Ok(v) = std::env::var("OTTER_JIT_TIER2_THRESHOLD")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            cfg.tier2_threshold = n;
         }
         if let Ok(v) = std::env::var("OTTER_JIT_TIER1_ONLY") {
             cfg.tier1_only = v == "1";
@@ -91,15 +91,15 @@ impl JitConfig {
         if let Ok(v) = std::env::var("OTTER_JIT_DUMP_ASM") {
             cfg.dump_asm = v == "1";
         }
-        if let Ok(v) = std::env::var("OTTER_JIT_CODE_CACHE_MB") {
-            if let Ok(n) = v.parse::<usize>() {
-                cfg.code_cache_limit_bytes = n * 1024 * 1024;
-            }
+        if let Ok(v) = std::env::var("OTTER_JIT_CODE_CACHE_MB")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            cfg.code_cache_limit_bytes = n * 1024 * 1024;
         }
-        if let Ok(v) = std::env::var("OTTER_JIT_MAX_RECOMPILE") {
-            if let Ok(n) = v.parse::<u32>() {
-                cfg.max_recompilations = n;
-            }
+        if let Ok(v) = std::env::var("OTTER_JIT_MAX_RECOMPILE")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            cfg.max_recompilations = n;
         }
 
         cfg

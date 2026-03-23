@@ -331,6 +331,28 @@ impl ObjectHeap {
         Ok(Some((value, cache)))
     }
 
+    /// Returns a shaped property value when the shape and slot still match.
+    pub fn get_shaped(
+        &self,
+        handle: ObjectHandle,
+        shape_id: ObjectShapeId,
+        slot_index: u16,
+    ) -> Result<Option<RegisterValue>, ObjectError> {
+        let object = self.object(handle)?;
+        let HeapValue::Object {
+            shape_id: object_shape_id,
+            values,
+            ..
+        } = object
+        else {
+            return Err(ObjectError::InvalidKind);
+        };
+        if *object_shape_id != shape_id {
+            return Ok(None);
+        }
+        Ok(values.get(usize::from(slot_index)).copied())
+    }
+
     /// Writes a property through the monomorphic cache when it still matches.
     pub fn set_cached(
         &mut self,
@@ -405,6 +427,33 @@ impl ObjectHeap {
         *object_shape_id = shape_id;
         let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
         Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
+    }
+
+    /// Writes a shaped property value when the shape and slot still match.
+    pub fn set_shaped(
+        &mut self,
+        handle: ObjectHandle,
+        shape_id: ObjectShapeId,
+        slot_index: u16,
+        value: RegisterValue,
+    ) -> Result<bool, ObjectError> {
+        let object = self.object_mut(handle)?;
+        let HeapValue::Object {
+            shape_id: object_shape_id,
+            values,
+            ..
+        } = object
+        else {
+            return Err(ObjectError::InvalidKind);
+        };
+        if *object_shape_id != shape_id {
+            return Ok(false);
+        }
+        let Some(slot) = values.get_mut(usize::from(slot_index)) else {
+            return Ok(false);
+        };
+        *slot = value;
+        Ok(true)
     }
 
     fn object(&self, handle: ObjectHandle) -> Result<&HeapValue, ObjectError> {

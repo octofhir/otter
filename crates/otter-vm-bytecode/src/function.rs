@@ -110,6 +110,7 @@ pub enum InlineCacheState {
     },
     /// Polymorphic call targets
     PolyCall {
+        /// Number of cached call targets (1-4)
         count: u8,
         /// Array of (func_id, jit_entry)
         entries: [(u64, u64); 4],

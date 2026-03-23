@@ -2243,6 +2243,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "otter-vm",
  "otter-vm-bytecode",
  "otter-vm-compiler",
  "otter-vm-gc",

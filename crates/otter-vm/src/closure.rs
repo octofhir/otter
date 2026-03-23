@@ -59,6 +59,18 @@ impl ClosureTable {
         Self::new(Vec::new())
     }
 
+    /// Returns the number of stored closure templates.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Returns `true` when the table has no templates.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+
     /// Returns the closure template for the given bytecode PC.
     #[must_use]
     pub fn get(&self, pc: ProgramCounter) -> Option<ClosureTemplate> {

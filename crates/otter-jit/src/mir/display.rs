@@ -140,25 +140,27 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         // Property access
         MirOp::GetPropShaped {
             obj,
+            shape_id,
             offset,
             inline,
         } => {
             write!(
                 f,
-                "get_prop_shaped {} offset={} inline={}",
-                obj, offset, inline
+                "get_prop_shaped {} shape={} offset={} inline={}",
+                obj, shape_id, offset, inline
             )
         }
         MirOp::SetPropShaped {
             obj,
+            shape_id,
             offset,
             val,
             inline,
         } => {
             write!(
                 f,
-                "set_prop_shaped {} offset={} {} inline={}",
-                obj, offset, val, inline
+                "set_prop_shaped {} shape={} offset={} {} inline={}",
+                obj, shape_id, offset, val, inline
             )
         }
         MirOp::GetPropGeneric { obj, key, ic_index } => {

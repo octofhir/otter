@@ -105,6 +105,8 @@ fn execute_mir(graph: &MirGraph) -> u64 {
         bailout_reason: 0,
         bailout_pc: 0,
         secondary_result: 0,
+        next_module: std::ptr::null(),
+        next_runtime: std::ptr::null_mut(),
     };
 
     unsafe { compiled.call(&mut ctx) }

@@ -69,6 +69,12 @@ pub struct JitContext {
     /// Secondary return value for multi-result operations
     /// (e.g., IteratorNext done flag).
     pub secondary_result: u64,
+
+    /// Pointer to the active new-VM module for specialized tier1 execution.
+    pub next_module: *const (),
+
+    /// Pointer to the active new-VM runtime state for specialized tier1 execution.
+    pub next_runtime: *mut (),
 }
 
 // Compile-time offset verification. These constants are used by codegen to
@@ -101,6 +107,8 @@ assert_offset!(proto_epoch, 96);
 assert_offset!(bailout_reason, 104);
 assert_offset!(bailout_pc, 108);
 assert_offset!(secondary_result, 112);
+assert_offset!(next_module, 120);
+assert_offset!(next_runtime, 128);
 
 /// Byte offset constants for use in Cranelift IR codegen.
 pub mod offsets {
@@ -121,6 +129,8 @@ pub mod offsets {
     pub const BAILOUT_REASON: i32 = 104;
     pub const BAILOUT_PC: i32 = 108;
     pub const SECONDARY_RESULT: i32 = 112;
+    pub const NEXT_MODULE: i32 = 120;
+    pub const NEXT_RUNTIME: i32 = 128;
 }
 
 #[cfg(test)]
@@ -129,7 +139,6 @@ mod tests {
 
     #[test]
     fn jit_context_size() {
-        // 112 (secondary_result offset) + 8 (u64 size) = 120 bytes
-        assert_eq!(std::mem::size_of::<JitContext>(), 120);
+        assert_eq!(std::mem::size_of::<JitContext>(), 136);
     }
 }

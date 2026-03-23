@@ -6,6 +6,7 @@ description = "JIT compilation pipeline for Otter VM — Cranelift-based, cross-
 license = "MIT"
 
 [dependencies]
+otter-vm = { path = "../otter-vm" }
 otter-vm-bytecode = { path = "../otter-vm-bytecode" }
 otter-vm-gc = { path = "../otter-vm-gc" }
 thiserror.workspace = true

@@ -48,8 +48,9 @@ pub mod value;
 
 pub use abi::VmAbiVersion;
 pub use frame::FrameLayout;
-pub use interpreter::Interpreter;
+pub use interpreter::{Interpreter, RuntimeState};
 pub use module::{Function, FunctionIndex, Module, ModuleError};
+pub use object::{ObjectShapeId, PropertyInlineCache};
 pub use value::RegisterValue;
 
 /// Returns the current execution ABI version of the new VM.

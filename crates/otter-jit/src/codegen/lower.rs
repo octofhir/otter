@@ -11,7 +11,7 @@ use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     AbiParam, Block, Function as ClifFunction, InstBuilder, MemFlags, Signature, Value,
 };
-use cranelift_codegen::isa::{CallConv, TargetIsa};
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use crate::abi::jit_function_signature;
@@ -48,12 +48,14 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
     let ctx_ptr = builder.block_params(entry_clif_block)[0];
 
     let mut value_map: HashMap<ValueId, Value> = HashMap::new();
+    let mut emitted_predecessors: HashMap<BlockId, usize> = HashMap::new();
 
     let mut lowerer = OpLowerer {
         ctx_ptr,
         pointer_type,
         value_map: &mut value_map,
         block_map: &block_map,
+        emitted_predecessors: &mut emitted_predecessors,
         graph,
     };
 
@@ -62,7 +64,9 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
 
         if block_idx > 0 {
             builder.switch_to_block(clif_block);
-            builder.seal_block(clif_block);
+            if mir_block.predecessors.is_empty() {
+                builder.seal_block(clif_block);
+            }
         }
 
         // Track if current block has been terminated (by a guard's deopt/continue
@@ -76,7 +80,7 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
                 break;
             }
 
-            let result = lowerer.lower_op(&mut builder, &instr.op)?;
+            let result = lowerer.lower_op(&mut builder, &instr.op, instr.bytecode_pc)?;
 
             if let Some(clif_val) = result {
                 lowerer.value_map.insert(instr.value, clif_val);
@@ -99,6 +103,7 @@ struct OpLowerer<'a> {
     pointer_type: types::Type,
     value_map: &'a mut HashMap<ValueId, Value>,
     block_map: &'a HashMap<BlockId, Block>,
+    emitted_predecessors: &'a mut HashMap<BlockId, usize>,
     graph: &'a MirGraph,
 }
 
@@ -118,11 +123,20 @@ impl<'a> OpLowerer<'a> {
         self.block_map[id]
     }
 
+    fn register_edge(&mut self, builder: &mut FunctionBuilder, target: BlockId) {
+        let count = self.emitted_predecessors.entry(target).or_insert(0);
+        *count += 1;
+        if *count == self.graph.block(target).predecessors.len() {
+            builder.seal_block(self.b(&target));
+        }
+    }
+
     /// Lower a single MIR operation.
     fn lower_op(
         &mut self,
         builder: &mut FunctionBuilder,
         op: &MirOp,
+        bytecode_pc: u32,
     ) -> Result<Option<Value>, JitError> {
         let ctx_ptr = self.ctx_ptr;
         let pointer_type = self.pointer_type;
@@ -153,19 +167,34 @@ impl<'a> OpLowerer<'a> {
             MirOp::GuardInt32 { val, deopt } => {
                 let boxed = self.v(val)?;
                 let is_int = value_repr::emit_is_int32(builder, boxed);
-                self.emit_guard(builder, is_int, deopt)?;
+                self.emit_guard(
+                    builder,
+                    is_int,
+                    deopt,
+                    crate::BailoutReason::TypeGuardFailed,
+                )?;
                 Ok(Some(value_repr::emit_unbox_int32(builder, boxed)))
             }
             MirOp::GuardFloat64 { val, deopt } => {
                 let boxed = self.v(val)?;
                 let is_f64 = value_repr::emit_is_float64(builder, boxed);
-                self.emit_guard(builder, is_f64, deopt)?;
+                self.emit_guard(
+                    builder,
+                    is_f64,
+                    deopt,
+                    crate::BailoutReason::TypeGuardFailed,
+                )?;
                 Ok(Some(value_repr::emit_unbox_float64(builder, boxed)))
             }
             MirOp::GuardObject { val, deopt } => {
                 let boxed = self.v(val)?;
                 let is_obj = value_repr::emit_is_object(builder, boxed);
-                self.emit_guard(builder, is_obj, deopt)?;
+                self.emit_guard(
+                    builder,
+                    is_obj,
+                    deopt,
+                    crate::BailoutReason::TypeGuardFailed,
+                )?;
                 Ok(Some(value_repr::emit_extract_pointer(builder, boxed)))
             }
             MirOp::GuardShape { .. }
@@ -183,17 +212,17 @@ impl<'a> OpLowerer<'a> {
             // ---- Int32 Arithmetic (overflow → deopt) ----
             MirOp::AddI32 { lhs, rhs, deopt } => {
                 let (result, overflow) = builder.ins().sadd_overflow(self.v(lhs)?, self.v(rhs)?);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
             MirOp::SubI32 { lhs, rhs, deopt } => {
                 let (result, overflow) = builder.ins().ssub_overflow(self.v(lhs)?, self.v(rhs)?);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
             MirOp::MulI32 { lhs, rhs, deopt } => {
                 let (result, overflow) = builder.ins().smul_overflow(self.v(lhs)?, self.v(rhs)?);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
             MirOp::DivI32 { lhs, rhs, deopt } => {
@@ -202,25 +231,25 @@ impl<'a> OpLowerer<'a> {
                 let zero = builder.ins().iconst(types::I32, 0);
                 let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
                 // Deopt on div-by-zero (overflow=true means deopt)
-                self.emit_overflow_guard(builder, is_zero, deopt)?;
+                self.emit_overflow_guard(builder, is_zero, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(builder.ins().sdiv(l, r)))
             }
             MirOp::IncI32 { val, deopt } => {
                 let one = builder.ins().iconst(types::I32, 1);
                 let (result, overflow) = builder.ins().sadd_overflow(self.v(val)?, one);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
             MirOp::DecI32 { val, deopt } => {
                 let one = builder.ins().iconst(types::I32, 1);
                 let (result, overflow) = builder.ins().ssub_overflow(self.v(val)?, one);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
             MirOp::NegI32 { val, deopt } => {
                 let zero = builder.ins().iconst(types::I32, 0);
                 let (result, overflow) = builder.ins().ssub_overflow(zero, self.v(val)?);
-                self.emit_overflow_guard(builder, overflow, deopt)?;
+                self.emit_overflow_guard(builder, overflow, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(result))
             }
 
@@ -377,9 +406,50 @@ impl<'a> OpLowerer<'a> {
                 offsets::THIS_RAW,
             ))),
 
+            // ---- New-VM property fast paths ----
+            MirOp::GetPropShaped {
+                obj,
+                shape_id,
+                offset,
+                ..
+            } => {
+                let obj = self.to_i64(builder, self.v(obj)?);
+                let shape = builder.ins().iconst(types::I64, *shape_id as i64);
+                let offset = builder.ins().iconst(types::I64, i64::from(*offset));
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::next_helpers::otter_next_get_prop_shaped as *const () as usize,
+                    &[obj, shape, offset, pc],
+                );
+                let result = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(Some(result))
+            }
+            MirOp::SetPropShaped {
+                obj,
+                shape_id,
+                offset,
+                val,
+                ..
+            } => {
+                let obj = self.to_i64(builder, self.v(obj)?);
+                let shape = builder.ins().iconst(types::I64, *shape_id as i64);
+                let offset = builder.ins().iconst(types::I64, i64::from(*offset));
+                let value = self.to_i64(builder, self.v(val)?);
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::next_helpers::otter_next_set_prop_shaped as *const () as usize,
+                    &[obj, shape, offset, value, pc],
+                );
+                let _ = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(None)
+            }
+
             // ---- Control Flow ----
             MirOp::Jump(target) => {
                 builder.ins().jump(self.b(target), &[]);
+                self.register_edge(builder, *target);
                 Ok(None)
             }
             MirOp::Branch {
@@ -394,6 +464,8 @@ impl<'a> OpLowerer<'a> {
                     self.b(false_block),
                     &[],
                 );
+                self.register_edge(builder, *true_block);
+                self.register_edge(builder, *false_block);
                 Ok(None)
             }
             MirOp::Return(val) => {
@@ -405,18 +477,54 @@ impl<'a> OpLowerer<'a> {
                 builder.ins().return_(&[undef]);
                 Ok(None)
             }
+            MirOp::CallDirect { target, args } => {
+                let callee_index = self.to_i64(builder, self.v(target)?);
+                let argc = builder
+                    .ins()
+                    .iconst(types::I64, i64::try_from(args.len()).unwrap_or(i64::MAX));
+                let undefined = builder.ins().iconst(
+                    types::I64,
+                    otter_vm::RegisterValue::undefined().raw_bits() as i64,
+                );
+                let mut call_args = vec![
+                    callee_index,
+                    builder.ins().iconst(types::I64, i64::from(bytecode_pc)),
+                    argc,
+                ];
+                for arg in args.iter().take(8) {
+                    call_args.push(self.to_i64(builder, self.v(arg)?));
+                }
+                while call_args.len() < 11 {
+                    call_args.push(undefined);
+                }
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::next_helpers::otter_next_call_direct as *const () as usize,
+                    &call_args,
+                );
+                let result = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(Some(result))
+            }
             MirOp::Deopt(deopt) => {
                 let deopt_info = &self.graph.deopts[deopt.0 as usize];
-                emit_bailout(builder, ctx_ptr, deopt_info.bytecode_pc);
+                emit_bailout(
+                    builder,
+                    ctx_ptr,
+                    deopt_info.bytecode_pc,
+                    crate::BailoutReason::Unsupported,
+                );
                 Ok(None)
             }
 
             // ---- Void operations (no codegen needed) ----
             MirOp::CloseUpvalue(_)
-            | MirOp::Safepoint { .. }
             | MirOp::WriteBarrier(_)
             | MirOp::TryStart { .. }
             | MirOp::TryEnd => Ok(None),
+            MirOp::Safepoint { .. } => {
+                self.emit_safepoint(builder, bytecode_pc);
+                Ok(None)
+            }
 
             // ---- Helper calls (cold exits to runtime) ----
             MirOp::HelperCall { kind, args } => {
@@ -444,6 +552,7 @@ impl<'a> OpLowerer<'a> {
         builder: &mut FunctionBuilder,
         condition: Value,
         deopt: &crate::mir::graph::DeoptId,
+        reason: crate::BailoutReason,
     ) -> Result<(), JitError> {
         let deopt_info = &self.graph.deopts[deopt.0 as usize];
         let continue_block = builder.create_block();
@@ -455,7 +564,7 @@ impl<'a> OpLowerer<'a> {
 
         builder.switch_to_block(deopt_block);
         builder.seal_block(deopt_block);
-        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc);
+        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc, reason);
 
         builder.switch_to_block(continue_block);
         builder.seal_block(continue_block);
@@ -468,6 +577,7 @@ impl<'a> OpLowerer<'a> {
         builder: &mut FunctionBuilder,
         overflow: Value,
         deopt: &crate::mir::graph::DeoptId,
+        reason: crate::BailoutReason,
     ) -> Result<(), JitError> {
         let deopt_info = &self.graph.deopts[deopt.0 as usize];
         let continue_block = builder.create_block();
@@ -479,11 +589,111 @@ impl<'a> OpLowerer<'a> {
 
         builder.switch_to_block(deopt_block);
         builder.seal_block(deopt_block);
-        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc);
+        emit_bailout(builder, self.ctx_ptr, deopt_info.bytecode_pc, reason);
 
         builder.switch_to_block(continue_block);
         builder.seal_block(continue_block);
         Ok(())
+    }
+
+    fn emit_safepoint(&self, builder: &mut FunctionBuilder, bytecode_pc: u32) {
+        let flag_ptr = builder.ins().load(
+            self.pointer_type,
+            MemFlags::trusted(),
+            self.ctx_ptr,
+            offsets::INTERRUPT_FLAG,
+        );
+        let null_ptr = builder.ins().iconst(self.pointer_type, 0);
+        let ptr_is_null = builder.ins().icmp(IntCC::Equal, flag_ptr, null_ptr);
+
+        let continue_block = builder.create_block();
+        let poll_block = builder.create_block();
+        let deopt_block = builder.create_block();
+
+        builder
+            .ins()
+            .brif(ptr_is_null, continue_block, &[], poll_block, &[]);
+
+        builder.switch_to_block(poll_block);
+        builder.seal_block(poll_block);
+        let raw = builder
+            .ins()
+            .load(types::I8, MemFlags::trusted(), flag_ptr, 0);
+        let zero = builder.ins().iconst(types::I8, 0);
+        let is_set = builder.ins().icmp(IntCC::NotEqual, raw, zero);
+        builder
+            .ins()
+            .brif(is_set, deopt_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(deopt_block);
+        builder.seal_block(deopt_block);
+        emit_bailout(
+            builder,
+            self.ctx_ptr,
+            bytecode_pc,
+            crate::BailoutReason::Interrupted,
+        );
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+    }
+
+    fn to_i64(&self, builder: &mut FunctionBuilder, value: Value) -> Value {
+        match builder.func.dfg.value_type(value) {
+            types::I64 => value,
+            types::I32 | types::I8 | types::I16 => builder.ins().uextend(types::I64, value),
+            ty if ty == self.pointer_type => {
+                debug_assert_eq!(self.pointer_type, types::I64);
+                value
+            }
+            _ => value,
+        }
+    }
+
+    fn emit_direct_host_call(
+        &self,
+        builder: &mut FunctionBuilder,
+        addr: usize,
+        args: &[Value],
+    ) -> Value {
+        let call_conv = builder.func.signature.call_conv;
+        let mut sig = Signature::new(call_conv);
+        sig.params.push(AbiParam::new(self.pointer_type));
+        for _ in args {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        let sig_ref = builder.import_signature(sig);
+        let addr_val = builder.ins().iconst(self.pointer_type, addr as i64);
+
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        call_args.push(self.ctx_ptr);
+        call_args.extend_from_slice(args);
+
+        let call = builder.ins().call_indirect(sig_ref, addr_val, &call_args);
+        builder.inst_results(call)[0]
+    }
+
+    fn emit_return_if_bailout_sentinel(
+        &self,
+        builder: &mut FunctionBuilder,
+        result: Value,
+    ) -> Value {
+        let continue_block = builder.create_block();
+        let bailout_block = builder.create_block();
+        let sentinel = builder.ins().iconst(types::I64, BAILOUT_SENTINEL as i64);
+        let is_bailout = builder.ins().icmp(IntCC::Equal, result, sentinel);
+        builder
+            .ins()
+            .brif(is_bailout, bailout_block, &[], continue_block, &[]);
+
+        builder.switch_to_block(bailout_block);
+        builder.seal_block(bailout_block);
+        builder.ins().return_(&[sentinel]);
+
+        builder.switch_to_block(continue_block);
+        builder.seal_block(continue_block);
+        result
     }
 
     /// Emit a call to a runtime helper function.
@@ -528,7 +738,19 @@ impl<'a> OpLowerer<'a> {
     }
 }
 
-fn emit_bailout(builder: &mut FunctionBuilder, ctx_ptr: Value, bytecode_pc: u32) {
+fn emit_bailout(
+    builder: &mut FunctionBuilder,
+    ctx_ptr: Value,
+    bytecode_pc: u32,
+    reason: crate::BailoutReason,
+) {
+    let reason_val = builder.ins().iconst(types::I32, reason as i64);
+    builder.ins().store(
+        MemFlags::trusted(),
+        reason_val,
+        ctx_ptr,
+        offsets::BAILOUT_REASON,
+    );
     let pc_val = builder.ins().iconst(types::I32, bytecode_pc as i64);
     builder
         .ins()

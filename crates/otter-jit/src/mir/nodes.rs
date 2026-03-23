@@ -240,12 +240,14 @@ pub enum MirOp {
     /// `inline` = true if offset < INLINE_PROPERTY_COUNT (8).
     GetPropShaped {
         obj: ValueId,
+        shape_id: u64,
         offset: u32,
         inline: bool,
     },
     /// Shape-guarded property store (after GuardShape).
     SetPropShaped {
         obj: ValueId,
+        shape_id: u64,
         offset: u32,
         val: ValueId,
         inline: bool,

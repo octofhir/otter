@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use otter_vm as next_vm;
 use otter_vm_bytecode::Function;
 
 use crate::code_cache;
@@ -14,16 +15,21 @@ use crate::codegen::lower::lower_mir_to_clif;
 use crate::config::JIT_CONFIG;
 use crate::context::JitContext;
 use crate::mir::builder::build_mir;
+use crate::mir::next_builder::build_next_mir;
 use crate::mir::verify::verify;
 use crate::telemetry;
 use crate::{BAILOUT_SENTINEL, JitError};
 
 /// Result of attempting JIT execution.
+#[derive(Debug)]
 pub enum JitExecResult {
     /// JIT code ran successfully, return value is NaN-boxed u64.
     Ok(u64),
     /// JIT code bailed out — resume interpreter at this bytecode PC.
-    Bailout { bytecode_pc: u32 },
+    Bailout {
+        bytecode_pc: u32,
+        reason: crate::BailoutReason,
+    },
     /// Function not eligible or compilation failed.
     NotCompiled,
 }
@@ -156,6 +162,8 @@ pub unsafe fn try_execute(
         bailout_reason: 0,
         bailout_pc: 0,
         secondary_result: 0,
+        next_module: std::ptr::null(),
+        next_runtime: std::ptr::null_mut(),
     };
 
     let jit_fn: unsafe extern "C" fn(*mut JitContext) -> u64 =
@@ -167,6 +175,8 @@ pub unsafe fn try_execute(
     if result == BAILOUT_SENTINEL {
         JitExecResult::Bailout {
             bytecode_pc: ctx.bailout_pc,
+            reason: crate::BailoutReason::from_raw(ctx.bailout_reason)
+                .unwrap_or(crate::BailoutReason::Unsupported),
         }
     } else {
         JitExecResult::Ok(result)
@@ -211,4 +221,157 @@ fn compile_function(function: &Function) -> Result<CompiledFunction, JitError> {
     }
 
     Ok(compiled)
+}
+
+/// Compile a new-VM function into machine code for the Tier 1 subset.
+pub fn compile_next_function(function: &next_vm::Function) -> Result<CompiledFunction, JitError> {
+    compile_next_function_profiled(function, &[])
+}
+
+/// Compile a profiled new-VM function into machine code for the Tier 1 subset.
+pub fn compile_next_function_profiled(
+    function: &next_vm::Function,
+    property_profile: &[Option<next_vm::PropertyInlineCache>],
+) -> Result<CompiledFunction, JitError> {
+    let start = Instant::now();
+    let graph = build_next_mir(
+        function,
+        (!property_profile.is_empty()).then_some(property_profile),
+    )?;
+
+    #[cfg(debug_assertions)]
+    {
+        if let Err(errors) = verify(&graph) {
+            let msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            return Err(JitError::MirVerification(msgs.join("; ")));
+        }
+    }
+
+    let isa = create_host_isa()?;
+    let clif_func = lower_mir_to_clif(&graph, isa.as_ref())?;
+    let compiled = compile_clif_function(clif_func, isa, &[])?;
+
+    let duration_ns = start.elapsed().as_nanos() as u64;
+    telemetry::record_compile_time(true, duration_ns);
+    Ok(compiled)
+}
+
+/// Execute a new-VM function through the Tier 1 JIT path.
+pub fn execute_next_function(
+    function: &next_vm::Function,
+    registers: &mut [next_vm::RegisterValue],
+) -> Result<JitExecResult, JitError> {
+    execute_next_function_with_interrupt(function, registers, std::ptr::null())
+}
+
+/// Execute a new-VM function through the Tier 1 JIT path with an explicit interrupt flag.
+pub fn execute_next_function_with_interrupt(
+    function: &next_vm::Function,
+    registers: &mut [next_vm::RegisterValue],
+    interrupt_flag: *const u8,
+) -> Result<JitExecResult, JitError> {
+    let required_len = usize::from(function.frame_layout().register_count());
+    if registers.len() < required_len {
+        return Err(JitError::Internal(format!(
+            "register slice too small for new-vm function: need {}, got {}",
+            required_len,
+            registers.len()
+        )));
+    }
+
+    let compiled = compile_next_function(function)?;
+    let register_count = u32::try_from(required_len)
+        .map_err(|_| JitError::Internal("register count does not fit into u32".to_string()))?;
+
+    let mut ctx = JitContext {
+        registers_base: registers.as_mut_ptr().cast::<u64>(),
+        local_count: register_count,
+        register_count,
+        constants: std::ptr::null(),
+        this_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        interrupt_flag,
+        interpreter: std::ptr::null(),
+        vm_ctx: std::ptr::null_mut(),
+        function_ptr: std::ptr::null(),
+        upvalues_ptr: std::ptr::null(),
+        upvalue_count: 0,
+        callee_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        home_object_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        proto_epoch: 0,
+        bailout_reason: 0,
+        bailout_pc: 0,
+        secondary_result: 0,
+        next_module: std::ptr::null(),
+        next_runtime: std::ptr::null_mut(),
+    };
+
+    let result = unsafe { compiled.call(&mut ctx) };
+    if result == BAILOUT_SENTINEL {
+        Ok(JitExecResult::Bailout {
+            bytecode_pc: ctx.bailout_pc,
+            reason: crate::BailoutReason::from_raw(ctx.bailout_reason)
+                .unwrap_or(crate::BailoutReason::Unsupported),
+        })
+    } else {
+        Ok(JitExecResult::Ok(result))
+    }
+}
+
+/// Execute a profiled new-VM function with access to the shared new-VM runtime state.
+pub fn execute_next_function_profiled_with_runtime(
+    module: &next_vm::Module,
+    function_index: next_vm::FunctionIndex,
+    registers: &mut [next_vm::RegisterValue],
+    runtime: &mut next_vm::RuntimeState,
+    property_profile: &[Option<next_vm::PropertyInlineCache>],
+    interrupt_flag: *const u8,
+) -> Result<JitExecResult, JitError> {
+    let function = module
+        .function(function_index)
+        .ok_or_else(|| JitError::Internal("new-vm function index is out of bounds".to_string()))?;
+    let required_len = usize::from(function.frame_layout().register_count());
+    if registers.len() < required_len {
+        return Err(JitError::Internal(format!(
+            "register slice too small for new-vm function: need {}, got {}",
+            required_len,
+            registers.len()
+        )));
+    }
+
+    let compiled = compile_next_function_profiled(function, property_profile)?;
+    let register_count = u32::try_from(required_len)
+        .map_err(|_| JitError::Internal("register count does not fit into u32".to_string()))?;
+
+    let mut ctx = JitContext {
+        registers_base: registers.as_mut_ptr().cast::<u64>(),
+        local_count: register_count,
+        register_count,
+        constants: std::ptr::null(),
+        this_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        interrupt_flag,
+        interpreter: std::ptr::null(),
+        vm_ctx: std::ptr::null_mut(),
+        function_ptr: std::ptr::null(),
+        upvalues_ptr: std::ptr::null(),
+        upvalue_count: 0,
+        callee_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        home_object_raw: next_vm::RegisterValue::undefined().raw_bits(),
+        proto_epoch: 0,
+        bailout_reason: 0,
+        bailout_pc: 0,
+        secondary_result: 0,
+        next_module: module as *const next_vm::Module as *const (),
+        next_runtime: runtime as *mut next_vm::RuntimeState as *mut (),
+    };
+
+    let result = unsafe { compiled.call(&mut ctx) };
+    if result == BAILOUT_SENTINEL {
+        Ok(JitExecResult::Bailout {
+            bytecode_pc: ctx.bailout_pc,
+            reason: crate::BailoutReason::from_raw(ctx.bailout_reason)
+                .unwrap_or(crate::BailoutReason::Unsupported),
+        })
+    } else {
+        Ok(JitExecResult::Ok(result))
+    }
 }

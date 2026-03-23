@@ -194,10 +194,28 @@ impl Activation {
         self.pc
     }
 
+    /// Overwrites the current program counter explicitly.
+    pub fn set_pc(&mut self, pc: ProgramCounter) {
+        self.pc = pc;
+    }
+
     /// Returns the immutable register slice.
     #[must_use]
     pub fn registers(&self) -> &[RegisterValue] {
         &self.registers
+    }
+
+    /// Copies an existing register window into the activation.
+    pub fn copy_registers_from_slice(
+        &mut self,
+        values: &[RegisterValue],
+    ) -> Result<(), InterpreterError> {
+        if values.len() > self.registers.len() {
+            return Err(InterpreterError::RegisterOutOfBounds);
+        }
+
+        self.registers[..values.len()].copy_from_slice(values);
+        Ok(())
     }
 
     /// Reads a raw register value.
@@ -280,16 +298,36 @@ enum StepOutcome {
     Return(RegisterValue),
 }
 
+/// Shared execution runtime for one interpreter/JIT run.
 #[derive(Debug, Clone, PartialEq)]
-struct RuntimeState {
+pub struct RuntimeState {
     objects: ObjectHeap,
 }
 
 impl RuntimeState {
-    fn new() -> Self {
+    /// Creates a fresh runtime state with an empty object heap.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             objects: ObjectHeap::new(),
         }
+    }
+
+    /// Returns the current object heap.
+    #[must_use]
+    pub fn objects(&self) -> &ObjectHeap {
+        &self.objects
+    }
+
+    /// Returns the mutable object heap.
+    pub fn objects_mut(&mut self) -> &mut ObjectHeap {
+        &mut self.objects
+    }
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -367,6 +405,89 @@ impl Interpreter {
     ) -> Result<ExecutionResult, InterpreterError> {
         let mut runtime = RuntimeState::new();
         self.run_with_runtime(module, activation, &mut runtime)
+    }
+
+    /// Executes one function on an existing runtime from a prepared register window.
+    pub fn execute_with_runtime(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        registers: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<ExecutionResult, InterpreterError> {
+        self.resume_with_runtime(module, function_index, 0, registers, runtime)
+    }
+
+    /// Resumes one function from an explicit PC and pre-materialized register window.
+    pub fn resume(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        resume_pc: ProgramCounter,
+        registers: &[RegisterValue],
+    ) -> Result<ExecutionResult, InterpreterError> {
+        let function = module
+            .function(function_index)
+            .ok_or(InterpreterError::InvalidCallTarget)?;
+        let mut activation =
+            Activation::new(function_index, function.frame_layout().register_count());
+        activation.copy_registers_from_slice(registers)?;
+        activation.set_pc(resume_pc);
+
+        let mut runtime = RuntimeState::new();
+        self.run_with_runtime(module, &mut activation, &mut runtime)
+    }
+
+    /// Resumes one function on an existing runtime from an explicit PC.
+    pub fn resume_with_runtime(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        resume_pc: ProgramCounter,
+        registers: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<ExecutionResult, InterpreterError> {
+        let function = module
+            .function(function_index)
+            .ok_or(InterpreterError::InvalidCallTarget)?;
+        let mut activation =
+            Activation::new(function_index, function.frame_layout().register_count());
+        activation.copy_registers_from_slice(registers)?;
+        activation.set_pc(resume_pc);
+
+        self.run_with_runtime(module, &mut activation, runtime)
+    }
+
+    /// Profiles monomorphic property caches for one function on a fresh runtime.
+    pub fn profile_property_caches(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        registers: &[RegisterValue],
+    ) -> Result<Box<[Option<PropertyInlineCache>]>, InterpreterError> {
+        let function = module
+            .function(function_index)
+            .ok_or(InterpreterError::InvalidCallTarget)?;
+        let mut activation =
+            Activation::new(function_index, function.frame_layout().register_count());
+        activation.copy_registers_from_slice(registers)?;
+        let mut runtime = RuntimeState::new();
+        let mut frame_runtime = FrameRuntimeState::new(function);
+
+        loop {
+            match self.step(
+                function,
+                module,
+                &mut activation,
+                &mut runtime,
+                &mut frame_runtime,
+            )? {
+                StepOutcome::Continue => {}
+                StepOutcome::Return(_) => {
+                    return Ok(frame_runtime.property_feedback);
+                }
+            }
+        }
     }
 
     fn run_with_runtime(

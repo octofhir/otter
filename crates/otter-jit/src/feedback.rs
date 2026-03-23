@@ -54,8 +54,7 @@ impl FeedbackSnapshot {
         let mut slots = Vec::with_capacity(len);
         let mut type_flags_vec = Vec::with_capacity(len);
 
-        for i in 0..len {
-            let entry = &feedback[i];
+        for entry in feedback.iter().take(len) {
             let ic = convert_ic_state(&entry.ic_state);
             slots.push(ic);
             type_flags_vec.push(entry.type_observations);
@@ -123,8 +122,7 @@ fn convert_ic_state(state: &InlineCacheState) -> IcSnapshot {
         },
         InlineCacheState::Polymorphic { count, entries } => {
             let mut es = Vec::with_capacity(*count as usize);
-            for i in 0..*count as usize {
-                let (sid, _psid, depth, offset) = entries[i];
+            for (sid, _psid, depth, offset) in entries.iter().take(*count as usize).copied() {
                 es.push((sid, offset, depth));
             }
             IcSnapshot::PolyProp { entries: es }
@@ -136,8 +134,8 @@ fn convert_ic_state(state: &InlineCacheState) -> IcSnapshot {
         },
         InlineCacheState::PolyCall { count, entries } => {
             let mut es = Vec::with_capacity(*count as usize);
-            for i in 0..*count as usize {
-                es.push(entries[i]);
+            for entry in entries.iter().take(*count as usize).copied() {
+                es.push(entry);
             }
             IcSnapshot::PolyCall { entries: es }
         }

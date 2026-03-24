@@ -19,6 +19,8 @@ pub mod call;
 pub mod closure;
 /// Deoptimization metadata and handoff types.
 pub mod deopt;
+/// Descriptor layer shared by proc-macros and future builders.
+pub mod descriptors;
 /// Exception table metadata.
 pub mod exception;
 /// Feedback and profiling side-table layout.
@@ -27,6 +29,8 @@ pub mod feedback;
 pub mod frame;
 /// Bytecode interpreter entry points.
 pub mod interpreter;
+/// Runtime-owned intrinsic registry and root model.
+pub mod intrinsics;
 /// JIT-facing ABI surface.
 pub mod jit_abi;
 /// Tiny lowering bridge from structured subset to bytecode/module form.
@@ -51,8 +55,13 @@ pub mod string;
 pub mod value;
 
 pub use abi::VmAbiVersion;
+pub use descriptors::{
+    NativeBindingDescriptor, NativeBindingTarget, NativeDescriptorConsumer, NativeEntrypointKind,
+    NativeFunctionDescriptor, NativeSlotKind, VmNativeCallError, VmNativeFunction,
+};
 pub use frame::FrameLayout;
 pub use interpreter::{Interpreter, RuntimeState};
+pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
 pub use module::{Function, FunctionIndex, Module, ModuleError};
 pub use object::{ObjectShapeId, PropertyInlineCache};
 pub use value::RegisterValue;

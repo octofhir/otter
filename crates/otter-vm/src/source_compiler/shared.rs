@@ -3,10 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Binding {
     Register(BytecodeRegister),
-    Function {
-        function: FunctionIndex,
-        closure_register: BytecodeRegister,
-    },
+    Function { closure_register: BytecodeRegister },
     Upvalue(UpvalueId),
 }
 
@@ -81,6 +78,21 @@ pub(super) struct CompiledFunction {
     pub(super) captures: Vec<CaptureSource>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct FinallyScope {
+    pub(super) return_flag_register: BytecodeRegister,
+    pub(super) return_value_register: BytecodeRegister,
+    pub(super) return_jumps: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LoopScope {
+    pub(super) continue_target: Option<usize>,
+    pub(super) break_jumps: Vec<usize>,
+    pub(super) continue_jumps: Vec<usize>,
+    pub(super) iterator_register: Option<BytecodeRegister>,
+}
+
 pub(super) struct FunctionCompiler<'a> {
     pub(super) mode: LoweringMode,
     pub(super) function_name: Option<String>,
@@ -98,8 +110,11 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) string_ids: BTreeMap<String, StringId>,
     pub(super) closure_templates: Vec<Option<ClosureTemplate>>,
     pub(super) call_sites: Vec<Option<CallSite>>,
+    pub(super) exception_handlers: Vec<ExceptionHandler>,
     pub(super) captures: Vec<CaptureSource>,
     pub(super) capture_ids: BTreeMap<String, UpvalueId>,
     pub(super) hoisted_functions: Vec<PendingFunction>,
+    pub(super) finally_stack: Vec<FinallyScope>,
+    pub(super) loop_stack: Vec<LoopScope>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

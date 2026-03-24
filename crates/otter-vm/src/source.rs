@@ -671,6 +671,29 @@ mod tests {
     }
 
     #[test]
+    fn compile_test262_basic_script_supports_method_calls_and_this() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var object = {\n",
+                "  base: 40,\n",
+                "  inc: function(step) {\n",
+                "    return this.base + step;\n",
+                "  }\n",
+                "};\n",
+                "assert.sameValue(object.inc(2), 42, \"static member call\");\n",
+                "assert.sameValue(object[\"inc\"](3), 43, \"computed member call\");\n",
+            ),
+            "native-test262-method-calls-this.js",
+        )
+        .expect("method call script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("method call script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
     fn compile_test262_basic_script_supports_strings_arrays_and_native_asserts() {
         let module = compile_test262_basic_script(
             concat!(
@@ -710,5 +733,120 @@ mod tests {
             .execute(&module)
             .expect("large string script should execute");
         assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_try_catch_and_finally() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var caught = 0;\n",
+                "var finalized = 0;\n",
+                "try {\n",
+                "  throw 7;\n",
+                "} catch (e) {\n",
+                "  assert.sameValue(e, 7, \"caught value\");\n",
+                "  caught = 1;\n",
+                "} finally {\n",
+                "  finalized = 1;\n",
+                "}\n",
+                "assert.sameValue(caught, 1, \"caught\");\n",
+                "assert.sameValue(finalized, 1, \"finalized\");\n",
+            ),
+            "native-test262-try-catch-finally.js",
+        )
+        .expect("try/catch/finally script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("try/catch/finally script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_finally_return_override() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function f() {\n",
+                "  try {\n",
+                "    return 1;\n",
+                "  } finally {\n",
+                "    return 2;\n",
+                "  }\n",
+                "}\n",
+                "assert.sameValue(f(), 2, \"finally return override\");\n",
+            ),
+            "native-test262-finally-return.js",
+        )
+        .expect("finally return script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("finally return script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_for_of_over_arrays_and_strings() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var total = 0;\n",
+                "for (var value of [1, 2, 3]) {\n",
+                "  total = total + value;\n",
+                "}\n",
+                "assert.sameValue(total, 6, \"array total\");\n",
+                "var seen = 0;\n",
+                "for (var ch of 'a\\ud801\\udc28b') {\n",
+                "  seen = seen + 1;\n",
+                "}\n",
+                "assert.sameValue(seen, 3, \"string iteration count\");\n",
+            ),
+            "native-test262-for-of-array-string.js",
+        )
+        .expect("for-of array/string script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for-of array/string script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_for_of_loop_control() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var total = 0;\n",
+                "var current = 0;\n",
+                "for (current of [1, 2, 3]) {\n",
+                "  if (current === 2) {\n",
+                "    continue;\n",
+                "  }\n",
+                "  total = total + current;\n",
+                "  if (current === 3) {\n",
+                "    break;\n",
+                "  }\n",
+                "}\n",
+                "assert.sameValue(total, 4, \"loop control total\");\n",
+                "assert.sameValue(current, 3, \"loop assignment target\");\n",
+            ),
+            "native-test262-for-of-loop-control.js",
+        )
+        .expect("for-of loop control script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for-of loop control script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_script_reports_uncaught_throw() {
+        let module = compile_script("throw 9;", "next-throw.js").expect("script should compile");
+        let error = Interpreter::new()
+            .execute(&module)
+            .expect_err("top-level throw should propagate");
+        assert!(
+            error.to_string().contains("uncaught throw"),
+            "unexpected error: {error}"
+        );
     }
 }

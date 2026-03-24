@@ -2,11 +2,12 @@
 
 use core::fmt;
 
-use crate::bytecode::{Instruction, Opcode, ProgramCounter};
+use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
 use crate::closure::{ClosureTemplate, UpvalueId};
 use crate::feedback::{FeedbackKind, FeedbackSlotId};
-use crate::frame::{FrameMetadata, RegisterIndex};
+use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
+use crate::intrinsics::VmIntrinsics;
 use crate::module::{Function, FunctionIndex, Module};
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap, PropertyInlineCache};
 use crate::property::PropertyNameId;
@@ -14,7 +15,7 @@ use crate::string::StringId;
 use crate::value::{RegisterValue, ValueError};
 
 /// Errors produced by the new interpreter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InterpreterError {
     /// The bytecode referenced a register outside the current frame layout.
     RegisterOutOfBounds,
@@ -44,6 +45,10 @@ pub enum InterpreterError {
     InvalidHeapSlot,
     /// The heap value kind does not support the requested operation.
     InvalidHeapValueKind,
+    /// The current handler path expected a pending exception value.
+    MissingPendingException,
+    /// Execution finished with an uncaught thrown value.
+    UncaughtThrow(RegisterValue),
 }
 
 impl fmt::Display for InterpreterError {
@@ -83,6 +88,10 @@ impl fmt::Display for InterpreterError {
             Self::InvalidHeapValueKind => {
                 f.write_str("operation is not supported for this heap value kind")
             }
+            Self::MissingPendingException => {
+                f.write_str("handler expected a pending exception value")
+            }
+            Self::UncaughtThrow(value) => write!(f, "uncaught throw: {:?}", value),
         }
     }
 }
@@ -131,6 +140,7 @@ pub struct Activation {
     function_index: FunctionIndex,
     metadata: FrameMetadata,
     closure_handle: Option<ObjectHandle>,
+    pending_exception: Option<RegisterValue>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
 }
@@ -164,6 +174,7 @@ impl Activation {
             function_index,
             metadata,
             closure_handle,
+            pending_exception: None,
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
                 .into_boxed_slice(),
@@ -188,6 +199,12 @@ impl Activation {
         self.closure_handle
     }
 
+    /// Returns the pending exception value, if one exists.
+    #[must_use]
+    pub const fn pending_exception(&self) -> Option<RegisterValue> {
+        self.pending_exception
+    }
+
     /// Returns the current program counter.
     #[must_use]
     pub const fn pc(&self) -> ProgramCounter {
@@ -199,10 +216,37 @@ impl Activation {
         self.pc = pc;
     }
 
+    fn set_pending_exception(&mut self, value: RegisterValue) {
+        self.pending_exception = Some(value);
+    }
+
+    fn take_pending_exception(&mut self) -> Option<RegisterValue> {
+        self.pending_exception.take()
+    }
+
     /// Returns the immutable register slice.
     #[must_use]
     pub fn registers(&self) -> &[RegisterValue] {
         &self.registers
+    }
+
+    fn receiver_slot(&self, function: &Function) -> Result<RegisterIndex, InterpreterError> {
+        function
+            .frame_layout()
+            .receiver_slot()
+            .ok_or(InterpreterError::RegisterOutOfBounds)
+    }
+
+    fn receiver(&self, function: &Function) -> Result<RegisterValue, InterpreterError> {
+        self.register(self.receiver_slot(function)?)
+    }
+
+    fn set_receiver(
+        &mut self,
+        function: &Function,
+        value: RegisterValue,
+    ) -> Result<(), InterpreterError> {
+        self.set_register(self.receiver_slot(function)?, value)
     }
 
     /// Copies an existing register window into the activation.
@@ -296,11 +340,19 @@ impl Activation {
 enum StepOutcome {
     Continue,
     Return(RegisterValue),
+    Throw(RegisterValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Completion {
+    Return(RegisterValue),
+    Throw(RegisterValue),
 }
 
 /// Shared execution runtime for one interpreter/JIT run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeState {
+    intrinsics: VmIntrinsics,
     objects: ObjectHeap,
 }
 
@@ -308,9 +360,33 @@ impl RuntimeState {
     /// Creates a fresh runtime state with an empty object heap.
     #[must_use]
     pub fn new() -> Self {
+        let mut objects = ObjectHeap::new();
+        let mut intrinsics = VmIntrinsics::allocate(&mut objects);
+        intrinsics
+            .wire_prototype_chains(&mut objects)
+            .expect("intrinsic prototype wiring should bootstrap cleanly");
+        intrinsics
+            .init_core(&mut objects)
+            .expect("intrinsic core init should bootstrap cleanly");
+        intrinsics
+            .install_on_global(&mut objects)
+            .expect("intrinsic global install should bootstrap cleanly");
+
         Self {
-            objects: ObjectHeap::new(),
+            intrinsics,
+            objects,
         }
+    }
+
+    /// Returns the intrinsic registry owned by the runtime.
+    #[must_use]
+    pub fn intrinsics(&self) -> &VmIntrinsics {
+        &self.intrinsics
+    }
+
+    /// Returns the mutable intrinsic registry owned by the runtime.
+    pub fn intrinsics_mut(&mut self) -> &mut VmIntrinsics {
+        &mut self.intrinsics
     }
 
     /// Returns the current object heap.
@@ -387,7 +463,13 @@ impl Interpreter {
     pub fn prepare_entry(module: &Module) -> Activation {
         let function = module.entry_function();
         let register_count = function.frame_layout().register_count();
-        Activation::new(module.entry(), register_count)
+        let mut activation = Activation::new(module.entry(), register_count);
+        if function.frame_layout().receiver_slot().is_some() {
+            activation
+                .set_receiver(function, RegisterValue::undefined())
+                .expect("entry receiver slot must exist when reserved");
+        }
+        activation
     }
 
     /// Executes a module from its entry function.
@@ -486,6 +568,9 @@ impl Interpreter {
                 StepOutcome::Return(_) => {
                     return Ok(frame_runtime.property_feedback);
                 }
+                StepOutcome::Throw(value) => {
+                    return Err(InterpreterError::UncaughtThrow(value));
+                }
             }
         }
     }
@@ -496,6 +581,18 @@ impl Interpreter {
         activation: &mut Activation,
         runtime: &mut RuntimeState,
     ) -> Result<ExecutionResult, InterpreterError> {
+        match self.run_completion_with_runtime(module, activation, runtime)? {
+            Completion::Return(return_value) => Ok(ExecutionResult::new(return_value)),
+            Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
+        }
+    }
+
+    fn run_completion_with_runtime(
+        &self,
+        module: &Module,
+        activation: &mut Activation,
+        runtime: &mut RuntimeState,
+    ) -> Result<Completion, InterpreterError> {
         let function = module
             .function(activation.function_index())
             .expect("activation function index must be valid");
@@ -505,10 +602,31 @@ impl Interpreter {
             match self.step(function, module, activation, runtime, &mut frame_runtime)? {
                 StepOutcome::Continue => {}
                 StepOutcome::Return(return_value) => {
-                    return Ok(ExecutionResult::new(return_value));
+                    return Ok(Completion::Return(return_value));
+                }
+                StepOutcome::Throw(value) => {
+                    if self.transfer_exception(function, activation, value) {
+                        continue;
+                    }
+                    return Ok(Completion::Throw(value));
                 }
             }
         }
+    }
+
+    fn transfer_exception(
+        &self,
+        function: &Function,
+        activation: &mut Activation,
+        value: RegisterValue,
+    ) -> bool {
+        let Some(handler) = function.exceptions().find_handler(activation.pc()) else {
+            return false;
+        };
+
+        activation.set_pending_exception(value);
+        activation.set_pc(handler.handler_pc());
+        true
     }
 
     fn step(
@@ -624,6 +742,32 @@ impl Interpreter {
                     instruction.a(),
                     RegisterValue::null(),
                 )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::LoadException => {
+                let value = activation
+                    .take_pending_exception()
+                    .ok_or(InterpreterError::MissingPendingException)?;
+                activation.write_bytecode_register(function, instruction.a(), value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::LoadCurrentClosure => {
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(closure.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::LoadThis => {
+                let receiver = activation.receiver(function)?;
+                activation.write_bytecode_register(function, instruction.a(), receiver)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -772,6 +916,35 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::GetIterator => {
+                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let iterator = runtime.objects.alloc_iterator(handle)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(iterator.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::IteratorNext => {
+                let iterator = Self::read_object_handle(activation, function, instruction.c())?;
+                let step = runtime.objects.iterator_next(iterator)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(step.is_done()),
+                )?;
+                activation.write_bytecode_register(function, instruction.b(), step.value())?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::IteratorClose => {
+                let iterator = Self::read_object_handle(activation, function, instruction.a())?;
+                runtime.objects.iterator_close(iterator)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::GetUpvalue => {
                 let upvalue =
                     Self::resolve_upvalue_cell(activation, runtime, UpvalueId(instruction.b()))?;
@@ -792,14 +965,14 @@ impl Interpreter {
                 let call = Self::resolve_direct_call(function, activation.pc())?;
                 let mut callee_activation =
                     Self::prepare_direct_call(module, function, activation, instruction.b(), call)?;
-                let result = self.run_with_runtime(module, &mut callee_activation, runtime)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    result.return_value(),
-                )?;
-                activation.advance();
-                Ok(StepOutcome::Continue)
+                match self.run_completion_with_runtime(module, &mut callee_activation, runtime)? {
+                    Completion::Return(value) => {
+                        activation.write_bytecode_register(function, instruction.a(), value)?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
+                }
             }
             Opcode::CallClosure => {
                 let call = Self::resolve_closure_call(function, activation.pc())?;
@@ -811,14 +984,14 @@ impl Interpreter {
                     instruction.c(),
                     call,
                 )?;
-                let result = self.run_with_runtime(module, &mut callee_activation, runtime)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    result.return_value(),
-                )?;
-                activation.advance();
-                Ok(StepOutcome::Continue)
+                match self.run_completion_with_runtime(module, &mut callee_activation, runtime)? {
+                    Completion::Return(value) => {
+                        activation.write_bytecode_register(function, instruction.a(), value)?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
+                }
             }
             Opcode::Jump => {
                 activation.jump_relative(instruction.immediate_i32())?;
@@ -845,6 +1018,10 @@ impl Interpreter {
             Opcode::Return => {
                 let value = activation.read_bytecode_register(function, instruction.a())?;
                 Ok(StepOutcome::Return(value))
+            }
+            Opcode::Throw => {
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                Ok(StepOutcome::Throw(value))
             }
         }
     }
@@ -979,6 +1156,15 @@ impl Interpreter {
             activation.set_register(parameter_range.start().saturating_add(offset), value)?;
         }
 
+        Self::initialize_receiver(
+            caller_function,
+            caller_activation,
+            callee,
+            &mut activation,
+            call.flags(),
+            call.receiver(),
+        )?;
+
         Ok(activation)
     }
 
@@ -1022,7 +1208,42 @@ impl Interpreter {
             activation.set_register(parameter_range.start().saturating_add(offset), value)?;
         }
 
+        Self::initialize_receiver(
+            caller_function,
+            caller_activation,
+            callee,
+            &mut activation,
+            call.flags(),
+            call.receiver(),
+        )?;
+
         Ok(activation)
+    }
+
+    fn initialize_receiver(
+        caller_function: &Function,
+        caller_activation: &Activation,
+        callee_function: &Function,
+        callee_activation: &mut Activation,
+        flags: FrameFlags,
+        receiver_register: Option<BytecodeRegister>,
+    ) -> Result<(), InterpreterError> {
+        let receiver = match receiver_register {
+            Some(receiver_register) => caller_activation
+                .read_bytecode_register(caller_function, receiver_register.index())?,
+            None if flags.has_receiver()
+                || callee_function.frame_layout().receiver_slot().is_some() =>
+            {
+                RegisterValue::undefined()
+            }
+            None => return Ok(()),
+        };
+
+        if callee_function.frame_layout().receiver_slot().is_some() {
+            callee_activation.set_receiver(callee_function, receiver)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1041,7 +1262,7 @@ mod tests {
     use crate::string::StringTable;
     use crate::value::{RegisterValue, ValueError};
 
-    use super::{ExecutionResult, Interpreter, InterpreterError};
+    use super::{Activation, ExecutionResult, Interpreter, InterpreterError, RuntimeState};
 
     #[test]
     fn interpreter_executes_nop_then_return() {
@@ -1445,6 +1666,178 @@ mod tests {
         assert_eq!(
             result.map(ExecutionResult::return_value),
             Ok(RegisterValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn interpreter_ordinary_calls_default_this_to_undefined() {
+        let entry_layout = FrameLayout::new(0, 0, 0, 2).expect("frame layout should be valid");
+        let helper_layout = FrameLayout::new(1, 0, 0, 1).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            entry_layout,
+            Bytecode::from(vec![
+                Instruction::call_direct(BytecodeRegister::new(0), BytecodeRegister::new(0)),
+                Instruction::ret(BytecodeRegister::new(0)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::default(),
+                    StringTable::default(),
+                    ClosureTable::default(),
+                    CallTable::new(vec![
+                        Some(CallSite::Direct(DirectCall::new(
+                            FunctionIndex(1),
+                            0,
+                            FrameFlags::empty(),
+                        ))),
+                        None,
+                    ]),
+                ),
+                FeedbackTableLayout::new(vec![
+                    FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Call),
+                ]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let helper = Function::with_bytecode(
+            Some("helper"),
+            helper_layout,
+            Bytecode::from(vec![
+                Instruction::load_this(BytecodeRegister::new(0)),
+                Instruction::ret(BytecodeRegister::new(0)),
+            ]),
+        );
+        let module = Module::new(Some("ordinary-this"), vec![entry, helper], FunctionIndex(0))
+            .expect("module should be valid");
+
+        let result = Interpreter::new().execute(&module);
+
+        assert_eq!(
+            result.map(ExecutionResult::return_value),
+            Ok(RegisterValue::undefined())
+        );
+    }
+
+    #[test]
+    fn interpreter_method_calls_preserve_receiver_in_hidden_slot() {
+        let entry_layout = FrameLayout::new(0, 0, 0, 3).expect("frame layout should be valid");
+        let closure_layout = FrameLayout::new(1, 0, 0, 1).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            entry_layout,
+            Bytecode::from(vec![
+                Instruction::new_object(BytecodeRegister::new(0)),
+                Instruction::new_closure(BytecodeRegister::new(1), BytecodeRegister::new(0)),
+                Instruction::call_closure(
+                    BytecodeRegister::new(2),
+                    BytecodeRegister::new(1),
+                    BytecodeRegister::new(0),
+                ),
+                Instruction::ret(BytecodeRegister::new(2)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::default(),
+                    StringTable::default(),
+                    ClosureTable::new(vec![
+                        None,
+                        Some(ClosureTemplate::new(FunctionIndex(1), 0)),
+                        None,
+                        None,
+                    ]),
+                    CallTable::new(vec![
+                        None,
+                        None,
+                        Some(CallSite::Closure(ClosureCall::new_with_receiver(
+                            0,
+                            FrameFlags::new(false, true, false),
+                            BytecodeRegister::new(0),
+                        ))),
+                        None,
+                    ]),
+                ),
+                FeedbackTableLayout::new(vec![
+                    FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(2), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(3), FeedbackKind::Call),
+                ]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let closure = Function::with_bytecode(
+            Some("closure"),
+            closure_layout,
+            Bytecode::from(vec![
+                Instruction::load_this(BytecodeRegister::new(0)),
+                Instruction::ret(BytecodeRegister::new(0)),
+            ]),
+        );
+        let module = Module::new(Some("method-this"), vec![entry, closure], FunctionIndex(0))
+            .expect("module should be valid");
+
+        let result = Interpreter::new().execute(&module);
+
+        let value = result.expect("method call should execute").return_value();
+        assert!(
+            value.as_object_handle().is_some(),
+            "expected object receiver"
+        );
+    }
+
+    #[test]
+    fn prepare_direct_call_preserves_construct_flag_and_receiver() {
+        let entry_layout = FrameLayout::new(0, 0, 0, 1).expect("frame layout should be valid");
+        let helper_layout = FrameLayout::new(1, 0, 0, 0).expect("frame layout should be valid");
+        let entry = Function::with_bytecode(Some("entry"), entry_layout, Bytecode::default());
+        let helper = Function::with_bytecode(Some("helper"), helper_layout, Bytecode::default());
+        let module = Module::new(Some("construct"), vec![entry, helper], FunctionIndex(0))
+            .expect("module should be valid");
+        let caller_function = module.function(FunctionIndex(0)).expect("entry must exist");
+        let callee_function = module
+            .function(FunctionIndex(1))
+            .expect("helper must exist");
+        let mut caller_activation = Activation::new(
+            FunctionIndex(0),
+            caller_function.frame_layout().register_count(),
+        );
+        let mut runtime = RuntimeState::new();
+        let receiver = runtime.objects.alloc_object();
+        caller_activation
+            .write_bytecode_register(
+                caller_function,
+                BytecodeRegister::new(0).index(),
+                RegisterValue::from_object_handle(receiver.0),
+            )
+            .expect("caller receiver register should exist");
+
+        let callee_activation = Interpreter::prepare_direct_call(
+            &module,
+            caller_function,
+            &caller_activation,
+            0,
+            DirectCall::new_with_receiver(
+                FunctionIndex(1),
+                0,
+                FrameFlags::new(true, true, false),
+                BytecodeRegister::new(0),
+            ),
+        )
+        .expect("direct call setup should succeed");
+
+        assert!(callee_activation.metadata().flags().is_construct());
+        assert!(callee_activation.metadata().flags().has_receiver());
+        assert_eq!(
+            callee_activation
+                .receiver(callee_function)
+                .expect("callee receiver must exist"),
+            RegisterValue::from_object_handle(receiver.0)
         );
     }
 

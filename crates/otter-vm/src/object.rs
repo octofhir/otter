@@ -65,6 +65,39 @@ pub enum HeapValueKind {
     Closure,
     /// Mutable cell used to back one captured upvalue.
     UpvalueCell,
+    /// Internal iterator used by the new VM iteration lowering.
+    Iterator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IteratorStep {
+    done: bool,
+    value: RegisterValue,
+}
+
+impl IteratorStep {
+    #[must_use]
+    pub const fn done() -> Self {
+        Self {
+            done: true,
+            value: RegisterValue::undefined(),
+        }
+    }
+
+    #[must_use]
+    pub const fn yield_value(value: RegisterValue) -> Self {
+        Self { done: false, value }
+    }
+
+    #[must_use]
+    pub const fn is_done(self) -> bool {
+        self.done
+    }
+
+    #[must_use]
+    pub const fn value(self) -> RegisterValue {
+        self.value
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +119,16 @@ enum HeapValue {
     },
     UpvalueCell {
         value: RegisterValue,
+    },
+    ArrayIterator {
+        iterable: ObjectHandle,
+        next_index: usize,
+        closed: bool,
+    },
+    StringIterator {
+        iterable: ObjectHandle,
+        next_index: usize,
+        closed: bool,
     },
 }
 
@@ -162,6 +205,9 @@ impl ObjectHeap {
             HeapValue::String { .. } => Ok(HeapValueKind::String),
             HeapValue::Closure { .. } => Ok(HeapValueKind::Closure),
             HeapValue::UpvalueCell { .. } => Ok(HeapValueKind::UpvalueCell),
+            HeapValue::ArrayIterator { .. } | HeapValue::StringIterator { .. } => {
+                Ok(HeapValueKind::Iterator)
+            }
         }
     }
 
@@ -174,7 +220,9 @@ impl ObjectHeap {
         match self.object(handle)? {
             HeapValue::Object { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::UpvalueCell { .. } => Ok(None),
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Ok(None),
             HeapValue::Array { elements } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
             )),
@@ -227,7 +275,9 @@ impl ObjectHeap {
             }
             HeapValue::Object { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::UpvalueCell { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -249,7 +299,94 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::UpvalueCell { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Allocates an internal iterator for a supported iterable.
+    pub fn alloc_iterator(&mut self, iterable: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
+        let iterator = match self.object(iterable)? {
+            HeapValue::Array { .. } => HeapValue::ArrayIterator {
+                iterable,
+                next_index: 0,
+                closed: false,
+            },
+            HeapValue::String { .. } => HeapValue::StringIterator {
+                iterable,
+                next_index: 0,
+                closed: false,
+            },
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
+        self.objects.push(iterator);
+        Ok(handle)
+    }
+
+    /// Advances an internal iterator by one step.
+    pub fn iterator_next(&mut self, handle: ObjectHandle) -> Result<IteratorStep, ObjectError> {
+        enum IteratorKind {
+            Array,
+            String,
+        }
+
+        let (iterable, next_index, closed, kind) = match self.object(handle)? {
+            HeapValue::ArrayIterator {
+                iterable,
+                next_index,
+                closed,
+            } => (*iterable, *next_index, *closed, IteratorKind::Array),
+            HeapValue::StringIterator {
+                iterable,
+                next_index,
+                closed,
+            } => (*iterable, *next_index, *closed, IteratorKind::String),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        if closed {
+            return Ok(IteratorStep::done());
+        }
+
+        let step = match kind {
+            IteratorKind::Array | IteratorKind::String => {
+                match self.get_index(iterable, next_index)? {
+                    Some(value) => IteratorStep::yield_value(value),
+                    None => IteratorStep::done(),
+                }
+            }
+        };
+
+        match self.object_mut(handle)? {
+            HeapValue::ArrayIterator {
+                next_index, closed, ..
+            }
+            | HeapValue::StringIterator {
+                next_index, closed, ..
+            } => {
+                if step.is_done() {
+                    *closed = true;
+                } else {
+                    *next_index = next_index.saturating_add(1);
+                }
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        }
+
+        Ok(step)
+    }
+
+    /// Closes an internal iterator.
+    pub fn iterator_close(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::ArrayIterator { closed, .. } | HeapValue::StringIterator { closed, .. } => {
+                *closed = true;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -416,7 +553,9 @@ impl ObjectHeap {
             HeapValue::Array { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::UpvalueCell { .. } => {
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -506,7 +645,7 @@ mod tests {
     use crate::property::PropertyNameId;
     use crate::value::RegisterValue;
 
-    use super::{HeapValueKind, ObjectError, ObjectHeap, PropertyInlineCache};
+    use super::{HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyInlineCache};
 
     #[test]
     fn object_heap_supports_generic_and_cached_property_access() {
@@ -608,6 +747,51 @@ mod tests {
         assert_eq!(
             heap.closure_upvalue(closure, 1),
             Err(ObjectError::InvalidIndex)
+        );
+    }
+
+    #[test]
+    fn object_heap_supports_internal_iterators() {
+        let mut heap = ObjectHeap::new();
+        let array = heap.alloc_array();
+        let text = heap.alloc_string("a𐐨");
+
+        heap.set_index(array, 0, RegisterValue::from_i32(7))
+            .expect("array store should succeed");
+        heap.set_index(array, 1, RegisterValue::from_i32(9))
+            .expect("array store should succeed");
+
+        let array_iterator = heap
+            .alloc_iterator(array)
+            .expect("array iterator should allocate");
+        assert_eq!(heap.kind(array_iterator), Ok(HeapValueKind::Iterator));
+        assert_eq!(
+            heap.iterator_next(array_iterator),
+            Ok(IteratorStep::yield_value(RegisterValue::from_i32(7)))
+        );
+        heap.iterator_close(array_iterator)
+            .expect("iterator close should succeed");
+        assert_eq!(heap.iterator_next(array_iterator), Ok(IteratorStep::done()));
+
+        let string_iterator = heap
+            .alloc_iterator(text)
+            .expect("string iterator should allocate");
+        let first = heap
+            .iterator_next(string_iterator)
+            .expect("string iterator should yield")
+            .value();
+        let second = heap
+            .iterator_next(string_iterator)
+            .expect("string iterator should yield")
+            .value();
+        let ascii = RegisterValue::from_object_handle(heap.alloc_string("a").0);
+        let astral = RegisterValue::from_object_handle(heap.alloc_string("𐐨").0);
+
+        assert_eq!(heap.strict_eq(first, ascii), Ok(true));
+        assert_eq!(heap.strict_eq(second, astral), Ok(true));
+        assert_eq!(
+            heap.iterator_next(string_iterator),
+            Ok(IteratorStep::done())
         );
     }
 }

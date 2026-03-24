@@ -82,6 +82,9 @@ pub struct FrameLayout {
 }
 
 impl FrameLayout {
+    /// Hidden-slot index reserved for the current receiver / `this` value.
+    pub const RECEIVER_HIDDEN_SLOT: RegisterIndex = 0;
+
     /// Empty frame layout with no hidden, parameter, local, or temporary slots.
     pub const EMPTY: Self = Self {
         hidden_count: 0,
@@ -165,6 +168,16 @@ impl FrameLayout {
     #[must_use]
     pub const fn hidden_range(self) -> RegisterRange {
         RegisterRange::new(0, self.hidden_count)
+    }
+
+    /// Returns the hidden-slot index that stores the current receiver, if reserved.
+    #[must_use]
+    pub const fn receiver_slot(self) -> Option<RegisterIndex> {
+        if self.hidden_count > Self::RECEIVER_HIDDEN_SLOT {
+            Some(Self::RECEIVER_HIDDEN_SLOT)
+        } else {
+            None
+        }
     }
 
     /// Returns the parameter-slot range.
@@ -306,6 +319,7 @@ mod tests {
 
         assert_eq!(layout.hidden_range().start(), 0);
         assert_eq!(layout.hidden_range().end(), 2);
+        assert_eq!(layout.receiver_slot(), Some(0));
         assert_eq!(layout.parameter_range().start(), 2);
         assert_eq!(layout.parameter_range().end(), 5);
         assert_eq!(layout.local_range().start(), 5);

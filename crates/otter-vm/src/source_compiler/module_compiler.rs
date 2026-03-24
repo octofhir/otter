@@ -1,6 +1,12 @@
 use super::shared::{CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind};
 use super::*;
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct FunctionIdentity {
+    pub(super) debug_name: Option<String>,
+    pub(super) self_binding_name: Option<String>,
+}
+
 pub(super) struct ModuleCompiler<'a> {
     source_url: &'a str,
     mode: LoweringMode,
@@ -23,7 +29,10 @@ impl<'a> ModuleCompiler<'a> {
         let entry = self.reserve_function();
         let compiled = self.compile_function_from_statements(
             entry,
-            Some(self.source_url.to_string()),
+            FunctionIdentity {
+                debug_name: Some(self.source_url.to_string()),
+                self_binding_name: None,
+            },
             &program.body,
             &[],
             FunctionKind::Script,
@@ -59,15 +68,22 @@ impl<'a> ModuleCompiler<'a> {
     pub(super) fn compile_function_from_statements(
         &mut self,
         function_index: FunctionIndex,
-        name: Option<String>,
+        identity: FunctionIdentity,
         statements: &[AstStatement<'_>],
         params: &[&str],
         kind: FunctionKind,
         parent_env: Option<CompileEnv>,
     ) -> Result<CompiledFunction, SourceLoweringError> {
-        let mut compiler = FunctionCompiler::new(self.mode, name.clone(), kind, parent_env);
+        let mut compiler =
+            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
         compiler.declare_parameters(params)?;
+        if let Some(self_binding_name) = identity.self_binding_name.as_deref() {
+            let closure_register = compiler.declare_function_binding(self_binding_name)?;
+            compiler
+                .instructions
+                .push(Instruction::load_current_closure(closure_register));
+        }
         compiler.predeclare_function_scope(statements, self)?;
         compiler.emit_hoisted_function_initializers()?;
         let terminated = compiler.compile_statements(statements, self)?;
@@ -75,7 +91,7 @@ impl<'a> ModuleCompiler<'a> {
             compiler.emit_implicit_return()?;
         }
 
-        compiler.finish(function_index, name.as_deref())
+        compiler.finish(function_index, identity.debug_name.as_deref())
     }
 
     pub(super) fn set_function(&mut self, index: FunctionIndex, function: VmFunction) {

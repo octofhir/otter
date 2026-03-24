@@ -1,5 +1,6 @@
 //! Call-site side tables for the new VM.
 
+use crate::bytecode::BytecodeRegister;
 use crate::bytecode::ProgramCounter;
 use crate::frame::{FrameFlags, RegisterIndex};
 use crate::module::FunctionIndex;
@@ -10,6 +11,7 @@ pub struct DirectCall {
     callee: FunctionIndex,
     argument_count: RegisterIndex,
     flags: FrameFlags,
+    receiver: Option<BytecodeRegister>,
 }
 
 impl DirectCall {
@@ -24,6 +26,23 @@ impl DirectCall {
             callee,
             argument_count,
             flags,
+            receiver: None,
+        }
+    }
+
+    /// Creates direct-call metadata with an explicit receiver register.
+    #[must_use]
+    pub const fn new_with_receiver(
+        callee: FunctionIndex,
+        argument_count: RegisterIndex,
+        flags: FrameFlags,
+        receiver: BytecodeRegister,
+    ) -> Self {
+        Self {
+            callee,
+            argument_count,
+            flags,
+            receiver: Some(receiver),
         }
     }
 
@@ -44,6 +63,12 @@ impl DirectCall {
     pub const fn flags(self) -> FrameFlags {
         self.flags
     }
+
+    /// Returns the caller-visible receiver register, if one is attached.
+    #[must_use]
+    pub const fn receiver(self) -> Option<BytecodeRegister> {
+        self.receiver
+    }
 }
 
 /// Closure-call metadata attached to a bytecode call site.
@@ -51,6 +76,7 @@ impl DirectCall {
 pub struct ClosureCall {
     argument_count: RegisterIndex,
     flags: FrameFlags,
+    receiver: Option<BytecodeRegister>,
 }
 
 impl ClosureCall {
@@ -60,6 +86,21 @@ impl ClosureCall {
         Self {
             argument_count,
             flags,
+            receiver: None,
+        }
+    }
+
+    /// Creates closure-call metadata with an explicit receiver register.
+    #[must_use]
+    pub const fn new_with_receiver(
+        argument_count: RegisterIndex,
+        flags: FrameFlags,
+        receiver: BytecodeRegister,
+    ) -> Self {
+        Self {
+            argument_count,
+            flags,
+            receiver: Some(receiver),
         }
     }
 
@@ -73,6 +114,12 @@ impl ClosureCall {
     #[must_use]
     pub const fn flags(self) -> FrameFlags {
         self.flags
+    }
+
+    /// Returns the caller-visible receiver register, if one is attached.
+    #[must_use]
+    pub const fn receiver(self) -> Option<BytecodeRegister> {
+        self.receiver
     }
 }
 
@@ -151,6 +198,7 @@ impl Default for CallTable {
 
 #[cfg(test)]
 mod tests {
+    use crate::bytecode::BytecodeRegister;
     use crate::frame::FrameFlags;
 
     use super::{CallSite, CallTable, ClosureCall, DirectCall};
@@ -170,5 +218,25 @@ mod tests {
         assert_eq!(table.get_direct(1), Some(direct_call));
         assert_eq!(table.get_closure(2), Some(closure_call));
         assert_eq!(table.get(3), None);
+    }
+
+    #[test]
+    fn call_metadata_keeps_receiver_registers() {
+        let direct_call = DirectCall::new_with_receiver(
+            crate::module::FunctionIndex(3),
+            2,
+            FrameFlags::new(false, true, false),
+            BytecodeRegister::new(7),
+        );
+        let closure_call = ClosureCall::new_with_receiver(
+            1,
+            FrameFlags::new(false, true, false),
+            BytecodeRegister::new(4),
+        );
+
+        assert_eq!(direct_call.receiver(), Some(BytecodeRegister::new(7)));
+        assert_eq!(closure_call.receiver(), Some(BytecodeRegister::new(4)));
+        assert!(direct_call.flags().has_receiver());
+        assert!(closure_call.flags().has_receiver());
     }
 }

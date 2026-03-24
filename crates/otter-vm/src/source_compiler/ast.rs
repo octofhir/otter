@@ -40,6 +40,37 @@ fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Ve
         AstStatement::DoWhileStatement(do_while_statement) => {
             collect_var_names_from_statement(&do_while_statement.body, names);
         }
+        AstStatement::ForOfStatement(for_of_statement) => {
+            if let ForStatementLeft::VariableDeclaration(declaration) = &for_of_statement.left
+                && declaration.kind == VariableDeclarationKind::Var
+            {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                        && !names
+                            .iter()
+                            .any(|existing| existing == identifier.name.as_str())
+                    {
+                        names.push(identifier.name.to_string());
+                    }
+                }
+            }
+            collect_var_names_from_statement(&for_of_statement.body, names);
+        }
+        AstStatement::TryStatement(try_statement) => {
+            for statement in &try_statement.block.body {
+                collect_var_names_from_statement(statement, names);
+            }
+            if let Some(handler) = &try_statement.handler {
+                for statement in &handler.body.body {
+                    collect_var_names_from_statement(statement, names);
+                }
+            }
+            if let Some(finalizer) = &try_statement.finalizer {
+                for statement in &finalizer.body {
+                    collect_var_names_from_statement(statement, names);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -75,6 +106,24 @@ fn collect_function_declarations_from_statement<'a>(
         }
         AstStatement::DoWhileStatement(do_while_statement) => {
             collect_function_declarations_from_statement(&do_while_statement.body, functions);
+        }
+        AstStatement::ForOfStatement(for_of_statement) => {
+            collect_function_declarations_from_statement(&for_of_statement.body, functions);
+        }
+        AstStatement::TryStatement(try_statement) => {
+            for statement in &try_statement.block.body {
+                collect_function_declarations_from_statement(statement, functions);
+            }
+            if let Some(handler) = &try_statement.handler {
+                for statement in &handler.body.body {
+                    collect_function_declarations_from_statement(statement, functions);
+                }
+            }
+            if let Some(finalizer) = &try_statement.finalizer {
+                for statement in &finalizer.body {
+                    collect_function_declarations_from_statement(statement, functions);
+                }
+            }
         }
         _ => {}
     }

@@ -78,6 +78,12 @@ pub enum Opcode {
     LoadNull = 0x0A,
     /// Boolean negation.
     Not = 0x0B,
+    /// Load the current pending exception into a register.
+    LoadException = 0x0C,
+    /// Load the current closure object into a register.
+    LoadCurrentClosure = 0x0D,
+    /// Load the current receiver / `this` value into a register.
+    LoadThis = 0x0E,
     /// Integer-or-number addition.
     Add = 0x10,
     /// Integer-or-number subtraction.
@@ -102,6 +108,12 @@ pub enum Opcode {
     GetUpvalue = 0x26,
     /// Store an upvalue on the current closure context.
     SetUpvalue = 0x27,
+    /// Create an internal iterator for a supported iterable.
+    GetIterator = 0x28,
+    /// Advance an internal iterator, producing `done` and `value`.
+    IteratorNext = 0x29,
+    /// Close an internal iterator.
+    IteratorClose = 0x2A,
     /// Unconditional jump.
     Jump = 0x30,
     /// Jump if the condition is truthy.
@@ -114,6 +126,8 @@ pub enum Opcode {
     CallDirect = 0x41,
     /// Call a closure value with an explicit contiguous argument window.
     CallClosure = 0x42,
+    /// Throw the value stored in a register.
+    Throw = 0x43,
 }
 
 impl Opcode {
@@ -133,6 +147,9 @@ impl Opcode {
             0x09 => Some(Self::LoadUndefined),
             0x0A => Some(Self::LoadNull),
             0x0B => Some(Self::Not),
+            0x0C => Some(Self::LoadException),
+            0x0D => Some(Self::LoadCurrentClosure),
+            0x0E => Some(Self::LoadThis),
             0x10 => Some(Self::Add),
             0x11 => Some(Self::Sub),
             0x12 => Some(Self::Mul),
@@ -145,12 +162,16 @@ impl Opcode {
             0x25 => Some(Self::SetIndex),
             0x26 => Some(Self::GetUpvalue),
             0x27 => Some(Self::SetUpvalue),
+            0x28 => Some(Self::GetIterator),
+            0x29 => Some(Self::IteratorNext),
+            0x2A => Some(Self::IteratorClose),
             0x30 => Some(Self::Jump),
             0x31 => Some(Self::JumpIfTrue),
             0x32 => Some(Self::JumpIfFalse),
             0x40 => Some(Self::Return),
             0x41 => Some(Self::CallDirect),
             0x42 => Some(Self::CallClosure),
+            0x43 => Some(Self::Throw),
             _ => None,
         }
     }
@@ -281,6 +302,39 @@ impl Instruction {
         )
     }
 
+    /// Encodes a pending-exception load.
+    #[must_use]
+    pub const fn load_exception(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadException,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a current-closure load.
+    #[must_use]
+    pub const fn load_current_closure(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadCurrentClosure,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a current-receiver / `this` load.
+    #[must_use]
+    pub const fn load_this(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadThis,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// Encodes a boolean negation.
     #[must_use]
     pub const fn not(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
@@ -373,6 +427,33 @@ impl Instruction {
         Self::encode_abc(Opcode::SetIndex, target, index, src)
     }
 
+    /// Encodes an iterator allocation.
+    #[must_use]
+    pub const fn get_iterator(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::GetIterator, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes one iterator step.
+    #[must_use]
+    pub const fn iterator_next(
+        done_dst: BytecodeRegister,
+        value_dst: BytecodeRegister,
+        iter: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::IteratorNext, done_dst, value_dst, iter)
+    }
+
+    /// Encodes an iterator close.
+    #[must_use]
+    pub const fn iterator_close(iter: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::IteratorClose,
+            iter,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// Encodes an upvalue load.
     #[must_use]
     pub const fn get_upvalue(dst: BytecodeRegister, upvalue: UpvalueId) -> Self {
@@ -438,6 +519,17 @@ impl Instruction {
         arg_start: BytecodeRegister,
     ) -> Self {
         Self::encode_abc(Opcode::CallClosure, dst, callee, arg_start)
+    }
+
+    /// Encodes a throw instruction.
+    #[must_use]
+    pub const fn throw(src: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::Throw,
+            src,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Returns the decoded opcode.
@@ -605,6 +697,18 @@ mod tests {
         let array = Instruction::new_array(BytecodeRegister::new(8));
         let closure = Instruction::new_closure(BytecodeRegister::new(9), BytecodeRegister::new(10));
         let call = Instruction::call_direct(BytecodeRegister::new(9), BytecodeRegister::new(10));
+        let exception = Instruction::load_exception(BytecodeRegister::new(12));
+        let current_closure = Instruction::load_current_closure(BytecodeRegister::new(13));
+        let current_this = Instruction::load_this(BytecodeRegister::new(14));
+        let throw = Instruction::throw(BytecodeRegister::new(15));
+        let iterator =
+            Instruction::get_iterator(BytecodeRegister::new(16), BytecodeRegister::new(17));
+        let iterator_next = Instruction::iterator_next(
+            BytecodeRegister::new(18),
+            BytecodeRegister::new(19),
+            BytecodeRegister::new(16),
+        );
+        let iterator_close = Instruction::iterator_close(BytecodeRegister::new(16));
 
         assert_eq!(load.opcode(), Opcode::LoadI32);
         assert_eq!(load.a(), 4);
@@ -622,6 +726,23 @@ mod tests {
         assert_eq!(call.opcode(), Opcode::CallDirect);
         assert_eq!(call.a(), 9);
         assert_eq!(call.b(), 10);
+        assert_eq!(exception.opcode(), Opcode::LoadException);
+        assert_eq!(exception.a(), 12);
+        assert_eq!(current_closure.opcode(), Opcode::LoadCurrentClosure);
+        assert_eq!(current_closure.a(), 13);
+        assert_eq!(current_this.opcode(), Opcode::LoadThis);
+        assert_eq!(current_this.a(), 14);
+        assert_eq!(throw.opcode(), Opcode::Throw);
+        assert_eq!(throw.a(), 15);
+        assert_eq!(iterator.opcode(), Opcode::GetIterator);
+        assert_eq!(iterator.a(), 16);
+        assert_eq!(iterator.b(), 17);
+        assert_eq!(iterator_next.opcode(), Opcode::IteratorNext);
+        assert_eq!(iterator_next.a(), 18);
+        assert_eq!(iterator_next.b(), 19);
+        assert_eq!(iterator_next.c(), 16);
+        assert_eq!(iterator_close.opcode(), Opcode::IteratorClose);
+        assert_eq!(iterator_close.a(), 16);
 
         assert_eq!(jump.opcode(), Opcode::Jump);
         assert_eq!(jump.immediate_i32(), -9);

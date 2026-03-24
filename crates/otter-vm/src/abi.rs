@@ -61,6 +61,7 @@ pub struct FrameAbiRequirements {
     flat_register_file: bool,
     contiguous_argument_window: bool,
     user_visible_registers_contiguous: bool,
+    receiver_in_hidden_slot: bool,
 }
 
 impl FrameAbiRequirements {
@@ -72,6 +73,7 @@ impl FrameAbiRequirements {
             flat_register_file: true,
             contiguous_argument_window: true,
             user_visible_registers_contiguous: true,
+            receiver_in_hidden_slot: layout.receiver_slot().is_some(),
         }
     }
 
@@ -97,6 +99,12 @@ impl FrameAbiRequirements {
     #[must_use]
     pub const fn user_visible_registers_contiguous(self) -> bool {
         self.user_visible_registers_contiguous
+    }
+
+    /// Returns whether the frame reserves a hidden receiver / `this` slot.
+    #[must_use]
+    pub const fn receiver_in_hidden_slot(self) -> bool {
+        self.receiver_in_hidden_slot
     }
 }
 
@@ -173,6 +181,7 @@ mod tests {
         assert!(abi.flat_register_file());
         assert!(abi.contiguous_argument_window());
         assert!(abi.user_visible_registers_contiguous());
+        assert!(abi.receiver_in_hidden_slot());
     }
 
     #[test]

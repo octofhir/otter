@@ -82,10 +82,56 @@ impl ExceptionTable {
     pub fn handlers(&self) -> &[ExceptionHandler] {
         &self.handlers
     }
+
+    /// Resolves the innermost handler covering the given program counter.
+    #[must_use]
+    pub fn find_handler(&self, pc: ProgramCounter) -> Option<ExceptionHandler> {
+        let mut selected: Option<ExceptionHandler> = None;
+        let mut selected_span = u32::MAX;
+
+        for handler in self.handlers.iter().copied() {
+            if !(handler.try_start() <= pc && pc < handler.try_end()) {
+                continue;
+            }
+
+            let span = handler.try_end().saturating_sub(handler.try_start());
+            let replace = match selected {
+                None => true,
+                Some(current) => {
+                    span < selected_span
+                        || (span == selected_span && handler.try_start() >= current.try_start())
+                }
+            };
+
+            if replace {
+                selected = Some(handler);
+                selected_span = span;
+            }
+        }
+
+        selected
+    }
 }
 
 impl Default for ExceptionTable {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExceptionHandler, ExceptionTable};
+
+    #[test]
+    fn exception_table_prefers_innermost_covering_handler() {
+        let outer = ExceptionHandler::new(0, 10, 100);
+        let inner = ExceptionHandler::new(2, 5, 200);
+        let table = ExceptionTable::new(vec![inner, outer]);
+
+        assert_eq!(table.find_handler(1), Some(outer));
+        assert_eq!(table.find_handler(3), Some(inner));
+        assert_eq!(table.find_handler(9), Some(outer));
+        assert_eq!(table.find_handler(10), None);
     }
 }

@@ -1,7 +1,7 @@
 use super::ast::{
     extract_function_params, is_test262_assert_same_value_call, non_computed_property_key_name,
 };
-use super::module_compiler::ModuleCompiler;
+use super::module_compiler::{FunctionIdentity, ModuleCompiler};
 use super::shared::{Binding, FunctionCompiler, FunctionKind, ValueLocation};
 use super::*;
 
@@ -18,6 +18,7 @@ impl<'a> FunctionCompiler<'a> {
             Expression::StringLiteral(literal) => {
                 self.compile_string_literal(literal.value.as_str())
             }
+            Expression::ThisExpression(_) => self.compile_this_expression(),
             Expression::ArrayExpression(array) => self.compile_array_expression(array, module),
             Expression::Identifier(identifier) => self.compile_identifier(identifier.name.as_str()),
             Expression::ParenthesizedExpression(parenthesized) => {
@@ -78,6 +79,12 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(register))
     }
 
+    fn compile_this_expression(&mut self) -> Result<ValueLocation, SourceLoweringError> {
+        let register = self.alloc_temp();
+        self.instructions.push(Instruction::load_this(register));
+        Ok(ValueLocation::temp(register))
+    }
+
     fn compile_identifier(&mut self, name: &str) -> Result<ValueLocation, SourceLoweringError> {
         if name == "undefined" && !self.env.bindings.contains_key(name) {
             return self.load_undefined();
@@ -108,39 +115,70 @@ impl<'a> FunctionCompiler<'a> {
         assignment: &oxc_ast::ast::AssignmentExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        if assignment.operator != AssignmentOperator::Assign {
-            return Err(SourceLoweringError::Unsupported(format!(
+        match assignment.operator {
+            AssignmentOperator::Assign => match &assignment.left {
+                AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                    let value = self.compile_expression(&assignment.right, module)?;
+                    self.assign_to_name(identifier.name.as_str(), value)
+                }
+                AssignmentTarget::ComputedMemberExpression(member) => {
+                    let object = self.compile_expression(&member.object, module)?;
+                    let value = self.compile_expression(&assignment.right, module)?;
+                    self.store_computed_member(object, module, member, value)?;
+                    Ok(value)
+                }
+                AssignmentTarget::StaticMemberExpression(member) => {
+                    let object = self.compile_expression(&member.object, module)?;
+                    let value = self.compile_expression(&assignment.right, module)?;
+                    let property = self.intern_property_name(member.property.name.as_str())?;
+                    self.instructions.push(Instruction::set_property(
+                        object.register,
+                        value.register,
+                        property,
+                    ));
+                    self.release(object);
+                    Ok(value)
+                }
+                _ => Err(SourceLoweringError::Unsupported(
+                    "unsupported assignment target".to_string(),
+                )),
+            },
+            AssignmentOperator::Addition => match &assignment.left {
+                AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                    let current = self.compile_identifier(identifier.name.as_str())?;
+                    let current = self.materialize_value(current);
+                    let rhs = self.compile_expression(&assignment.right, module)?;
+                    let result = if rhs.is_temp {
+                        rhs
+                    } else if current.is_temp {
+                        current
+                    } else {
+                        ValueLocation::temp(self.alloc_temp())
+                    };
+
+                    self.instructions.push(Instruction::add(
+                        result.register,
+                        current.register,
+                        rhs.register,
+                    ));
+
+                    if result.register != current.register {
+                        self.release(current);
+                    }
+                    if result.register != rhs.register {
+                        self.release(rhs);
+                    }
+
+                    self.assign_to_name(identifier.name.as_str(), result)
+                }
+                _ => Err(SourceLoweringError::Unsupported(
+                    "compound assignment target".to_string(),
+                )),
+            },
+            _ => Err(SourceLoweringError::Unsupported(format!(
                 "assignment operator {:?}",
                 assignment.operator
-            )));
-        }
-
-        match &assignment.left {
-            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                let value = self.compile_expression(&assignment.right, module)?;
-                self.assign_to_name(identifier.name.as_str(), value)
-            }
-            AssignmentTarget::ComputedMemberExpression(member) => {
-                let object = self.compile_expression(&member.object, module)?;
-                let value = self.compile_expression(&assignment.right, module)?;
-                self.store_computed_member(object, module, member, value)?;
-                Ok(value)
-            }
-            AssignmentTarget::StaticMemberExpression(member) => {
-                let object = self.compile_expression(&member.object, module)?;
-                let value = self.compile_expression(&assignment.right, module)?;
-                let property = self.intern_property_name(member.property.name.as_str())?;
-                self.instructions.push(Instruction::set_property(
-                    object.register,
-                    value.register,
-                    property,
-                ));
-                self.release(object);
-                Ok(value)
-            }
-            _ => Err(SourceLoweringError::Unsupported(
-                "unsupported assignment target".to_string(),
-            )),
+            ))),
         }
     }
 
@@ -357,6 +395,8 @@ impl<'a> FunctionCompiler<'a> {
             return self.compile_test262_assert_same_value(call, module);
         }
 
+        let (callee, receiver) = self.compile_call_target(&call.callee, module)?;
+
         let argument_count = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::TooManyLocals)?;
         let arg_start = if argument_count == 0 {
@@ -387,61 +427,102 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        let result = ValueLocation::temp(self.alloc_temp());
-        match &call.callee {
-            Expression::Identifier(identifier) => match self
-                .resolve_binding(identifier.name.as_str())?
-            {
-                Binding::Function { function, .. } => {
-                    let pc = self.instructions.len();
-                    self.instructions
-                        .push(Instruction::call_direct(result.register, arg_start));
-                    self.record_call_site(
-                        pc,
-                        CallSite::Direct(DirectCall::new(
-                            function,
-                            argument_count,
-                            FrameFlags::empty(),
-                        )),
-                    );
-                }
-                _ => {
-                    let callee = self.compile_expression(&call.callee, module)?;
-                    let callee = self.materialize_value(callee);
-                    let pc = self.instructions.len();
-                    self.instructions.push(Instruction::call_closure(
-                        result.register,
-                        callee.register,
-                        arg_start,
-                    ));
-                    self.record_call_site(
-                        pc,
-                        CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::empty())),
-                    );
-                    self.release(callee);
-                }
-            },
-            _ => {
-                let callee = self.compile_expression(&call.callee, module)?;
-                let callee = self.materialize_value(callee);
-                let pc = self.instructions.len();
-                self.instructions.push(Instruction::call_closure(
-                    result.register,
-                    callee.register,
-                    arg_start,
-                ));
-                self.record_call_site(
-                    pc,
-                    CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::empty())),
-                );
-                self.release(callee);
-            }
-        }
+        let result = if receiver.is_some_and(|receiver| receiver.is_temp) {
+            receiver.expect("receiver must exist when reusing receiver temp")
+        } else if callee.is_temp {
+            callee
+        } else {
+            ValueLocation::temp(self.alloc_temp())
+        };
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            result.register,
+            callee.register,
+            arg_start,
+        ));
+        let call_site = match receiver {
+            Some(receiver) => CallSite::Closure(ClosureCall::new_with_receiver(
+                argument_count,
+                FrameFlags::new(false, true, false),
+                receiver.register,
+            )),
+            None => CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::empty())),
+        };
+        self.record_call_site(pc, call_site);
 
         if argument_count != 0 {
             self.release_temp_window(argument_count);
         }
+        if callee.register != result.register {
+            self.release(callee);
+        }
+        if let Some(receiver) = receiver
+            && receiver.register != result.register
+        {
+            self.release(receiver);
+        }
         Ok(result)
+    }
+
+    fn compile_call_target(
+        &mut self,
+        callee: &Expression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(ValueLocation, Option<ValueLocation>), SourceLoweringError> {
+        match callee {
+            Expression::Identifier(identifier) => {
+                match self.resolve_binding(identifier.name.as_str())? {
+                    Binding::Function {
+                        closure_register, ..
+                    } => Ok((ValueLocation::local(closure_register), None)),
+                    _ => {
+                        let callee = self.compile_expression(callee, module)?;
+                        Ok((self.materialize_value(callee), None))
+                    }
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                let receiver = self.compile_expression(&member.object, module)?;
+                let callee_register = self.alloc_temp();
+                let property = self.intern_property_name(member.property.name.as_str())?;
+                self.instructions.push(Instruction::get_property(
+                    callee_register,
+                    receiver.register,
+                    property,
+                ));
+                Ok((ValueLocation::temp(callee_register), Some(receiver)))
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let receiver = self.compile_expression(&member.object, module)?;
+                let callee_register = self.alloc_temp();
+
+                match &member.expression {
+                    Expression::StringLiteral(literal) => {
+                        let property = self.intern_property_name(literal.value.as_str())?;
+                        self.instructions.push(Instruction::get_property(
+                            callee_register,
+                            receiver.register,
+                            property,
+                        ));
+                    }
+                    _ => {
+                        let index = self.compile_expression(&member.expression, module)?;
+                        self.instructions.push(Instruction::get_index(
+                            callee_register,
+                            receiver.register,
+                            index.register,
+                        ));
+                        self.release(index);
+                    }
+                }
+
+                Ok((ValueLocation::temp(callee_register), Some(receiver)))
+            }
+            _ => {
+                let callee = self.compile_expression(callee, module)?;
+                Ok((self.materialize_value(callee), None))
+            }
+        }
     }
 
     fn compile_test262_assert_same_value(
@@ -453,6 +534,9 @@ impl<'a> FunctionCompiler<'a> {
         let mut expected = None;
 
         for (index, argument) in call.arguments.iter().enumerate() {
+            if index > 1 {
+                continue;
+            }
             let value = match argument {
                 Argument::SpreadElement(_) => {
                     return Err(SourceLoweringError::Unsupported(
@@ -470,7 +554,7 @@ impl<'a> FunctionCompiler<'a> {
             match index {
                 0 => actual = Some(value),
                 1 => expected = Some(value),
-                _ => self.release(value),
+                _ => unreachable!("additional assert.sameValue args are skipped"),
             }
         }
 
@@ -533,9 +617,13 @@ impl<'a> FunctionCompiler<'a> {
         let params = extract_function_params(function)?;
         let compiled = module.compile_function_from_statements(
             reserved,
-            self.function_name
-                .as_ref()
-                .map(|name| format!("{name}::<anonymous>")),
+            FunctionIdentity {
+                debug_name: self
+                    .function_name
+                    .as_ref()
+                    .map(|name| format!("{name}::<anonymous>")),
+                self_binding_name: None,
+            },
             function
                 .body
                 .as_ref()
@@ -684,7 +772,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
-    fn store_computed_member(
+    pub(super) fn store_computed_member(
         &mut self,
         object: ValueLocation,
         module: &mut ModuleCompiler<'a>,

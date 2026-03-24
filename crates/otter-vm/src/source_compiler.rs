@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 
 use oxc_ast::ast::{
     Argument, AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern,
-    ComputedMemberExpression, Expression, Function, LogicalOperator, ObjectPropertyKind,
-    Program as AstProgram, PropertyKey, PropertyKind, SimpleAssignmentTarget,
+    ComputedMemberExpression, Expression, ForStatementLeft, Function, LogicalOperator,
+    ObjectPropertyKind, Program as AstProgram, PropertyKey, PropertyKind, SimpleAssignmentTarget,
     Statement as AstStatement, StaticMemberExpression, UnaryOperator, UpdateOperator,
     VariableDeclarationKind,
 };
 
 use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset, Opcode};
-use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
+use crate::call::{CallSite, CallTable, ClosureCall};
 use crate::closure::{ClosureTable, ClosureTemplate, UpvalueId};
 use crate::deopt::DeoptTable;
-use crate::exception::ExceptionTable;
+use crate::exception::{ExceptionHandler, ExceptionTable};
 use crate::feedback::FeedbackTableLayout;
 use crate::frame::{FrameFlags, FrameLayout, RegisterIndex};
 use crate::module::{

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use otter_macros::{js_class, js_method, js_static};
+use otter_macros::{legacy_js_class, legacy_js_method, legacy_js_static};
 use otter_vm_core::builtin_builder::BuiltInBuilder;
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
@@ -147,14 +147,14 @@ fn create_buffer_from_bytes(bytes: &[u8], ncx: &NativeContext) -> Value {
 // Buffer class methods via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "Buffer")]
+#[legacy_js_class(name = "Buffer")]
 pub struct Buffer;
 
-#[js_class]
+#[legacy_js_class]
 impl Buffer {
     // --- Static methods ---
 
-    #[js_static(name = "alloc", length = 1)]
+    #[legacy_js_static(name = "alloc", length = 1)]
     pub fn alloc(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let size = args
             .first()
@@ -171,7 +171,7 @@ impl Buffer {
         Ok(create_buffer_from_bytes(&bytes, ncx))
     }
 
-    #[js_static(name = "allocUnsafe", length = 1)]
+    #[legacy_js_static(name = "allocUnsafe", length = 1)]
     pub fn alloc_unsafe(
         _this: &Value,
         args: &[Value],
@@ -192,7 +192,7 @@ impl Buffer {
         Ok(create_buffer_from_bytes(&bytes, ncx))
     }
 
-    #[js_static(name = "from", length = 1)]
+    #[legacy_js_static(name = "from", length = 1)]
     pub fn from(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let source = args.first().cloned().unwrap_or(Value::undefined());
 
@@ -244,7 +244,7 @@ impl Buffer {
         ))
     }
 
-    #[js_static(name = "isBuffer", length = 1)]
+    #[legacy_js_static(name = "isBuffer", length = 1)]
     pub fn is_buffer(
         _this: &Value,
         args: &[Value],
@@ -259,7 +259,7 @@ impl Buffer {
         Ok(Value::boolean(is_buf))
     }
 
-    #[js_static(name = "byteLength", length = 1)]
+    #[legacy_js_static(name = "byteLength", length = 1)]
     pub fn byte_length_static(
         _this: &Value,
         args: &[Value],
@@ -284,7 +284,7 @@ impl Buffer {
         Ok(Value::number(0.0))
     }
 
-    #[js_static(name = "concat", length = 1)]
+    #[legacy_js_static(name = "concat", length = 1)]
     pub fn concat(
         _this: &Value,
         args: &[Value],
@@ -320,7 +320,7 @@ impl Buffer {
         Ok(create_buffer_from_bytes(&all_bytes, ncx))
     }
 
-    #[js_static(name = "isEncoding", length = 1)]
+    #[legacy_js_static(name = "isEncoding", length = 1)]
     pub fn is_encoding(
         _this: &Value,
         args: &[Value],
@@ -346,7 +346,7 @@ impl Buffer {
         Ok(Value::boolean(is_valid))
     }
 
-    #[js_static(name = "compare", length = 2)]
+    #[legacy_js_static(name = "compare", length = 2)]
     pub fn compare_static(
         _this: &Value,
         args: &[Value],
@@ -371,7 +371,7 @@ impl Buffer {
 
     // --- Instance methods ---
 
-    #[js_method(name = "toString", length = 0)]
+    #[legacy_js_method(name = "toString", length = 0)]
     pub fn to_string_method(
         this: &Value,
         args: &[Value],
@@ -396,7 +396,7 @@ impl Buffer {
         Ok(Value::string(JsString::new_gc(&result)))
     }
 
-    #[js_method(name = "write", length = 1)]
+    #[legacy_js_method(name = "write", length = 1)]
     pub fn write(this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         let ta = this
             .as_typed_array()
@@ -430,7 +430,7 @@ impl Buffer {
         Ok(Value::number(write_len as f64))
     }
 
-    #[js_method(name = "copy", length = 1)]
+    #[legacy_js_method(name = "copy", length = 1)]
     pub fn copy(this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         let src = this
             .as_typed_array()
@@ -462,7 +462,7 @@ impl Buffer {
         Ok(Value::number(actual_copy as f64))
     }
 
-    #[js_method(name = "fill", length = 1)]
+    #[legacy_js_method(name = "fill", length = 1)]
     pub fn fill_method(
         this: &Value,
         args: &[Value],
@@ -496,7 +496,7 @@ impl Buffer {
         Ok(this.clone())
     }
 
-    #[js_method(name = "slice", length = 0)]
+    #[legacy_js_method(name = "slice", length = 0)]
     pub fn slice(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let bytes = get_buffer_bytes(this)
             .ok_or_else(|| VmError::type_error("Buffer.prototype.slice: not a Buffer"))?;
@@ -525,7 +525,7 @@ impl Buffer {
         Ok(create_buffer_from_bytes(slice_bytes, ncx))
     }
 
-    #[js_method(name = "indexOf", length = 1)]
+    #[legacy_js_method(name = "indexOf", length = 1)]
     pub fn index_of(
         this: &Value,
         args: &[Value],
@@ -568,7 +568,7 @@ impl Buffer {
         Ok(Value::number(-1.0))
     }
 
-    #[js_method(name = "lastIndexOf", length = 1)]
+    #[legacy_js_method(name = "lastIndexOf", length = 1)]
     pub fn last_index_of(
         this: &Value,
         args: &[Value],
@@ -623,7 +623,7 @@ impl Buffer {
         Ok(Value::number(-1.0))
     }
 
-    #[js_method(name = "includes", length = 1)]
+    #[legacy_js_method(name = "includes", length = 1)]
     pub fn includes(
         this: &Value,
         args: &[Value],
@@ -659,7 +659,7 @@ impl Buffer {
         Ok(Value::boolean(false))
     }
 
-    #[js_method(name = "compare", length = 1)]
+    #[legacy_js_method(name = "compare", length = 1)]
     pub fn compare(
         this: &Value,
         args: &[Value],
@@ -680,7 +680,7 @@ impl Buffer {
         }))
     }
 
-    #[js_method(name = "equals", length = 1)]
+    #[legacy_js_method(name = "equals", length = 1)]
     pub fn equals(
         this: &Value,
         args: &[Value],
@@ -696,7 +696,7 @@ impl Buffer {
         Ok(Value::boolean(a == b))
     }
 
-    #[js_method(name = "toJSON", length = 0)]
+    #[legacy_js_method(name = "toJSON", length = 0)]
     pub fn to_json(
         this: &Value,
         _args: &[Value],

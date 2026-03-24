@@ -55,7 +55,7 @@ impl SmokeCase {
 }
 
 /// Error produced by the smoke harness.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SmokeError {
     /// The smoke module could not be constructed.
     InvalidModule(ModuleError),

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use otter_macros::{js_class, js_method, js_static};
+use otter_macros::{legacy_js_class, legacy_js_method, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -139,17 +139,17 @@ fn check_max_listeners(this: &Value, event: &PropertyKey, count: usize) {
 // EventEmitter class methods
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "EventEmitter")]
+#[legacy_js_class(name = "EventEmitter")]
 pub struct EventEmitter;
 
-#[js_class]
+#[legacy_js_class]
 impl EventEmitter {
-    #[js_method(name = "on", length = 2)]
+    #[legacy_js_method(name = "on", length = 2)]
     pub fn on(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         Self::add_listener_internal(this, args, ncx, false, false)
     }
 
-    #[js_method(name = "addListener", length = 2)]
+    #[legacy_js_method(name = "addListener", length = 2)]
     pub fn add_listener(
         this: &Value,
         args: &[Value],
@@ -158,7 +158,7 @@ impl EventEmitter {
         Self::add_listener_internal(this, args, ncx, false, false)
     }
 
-    #[js_method(name = "prependListener", length = 2)]
+    #[legacy_js_method(name = "prependListener", length = 2)]
     pub fn prepend_listener(
         this: &Value,
         args: &[Value],
@@ -167,12 +167,12 @@ impl EventEmitter {
         Self::add_listener_internal(this, args, ncx, false, true)
     }
 
-    #[js_method(name = "once", length = 2)]
+    #[legacy_js_method(name = "once", length = 2)]
     pub fn once(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         Self::add_listener_internal(this, args, ncx, true, false)
     }
 
-    #[js_method(name = "prependOnceListener", length = 2)]
+    #[legacy_js_method(name = "prependOnceListener", length = 2)]
     pub fn prepend_once_listener(
         this: &Value,
         args: &[Value],
@@ -181,12 +181,12 @@ impl EventEmitter {
         Self::add_listener_internal(this, args, ncx, true, true)
     }
 
-    #[js_method(name = "off", length = 2)]
+    #[legacy_js_method(name = "off", length = 2)]
     pub fn off(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         Self::remove_listener_impl(this, args, ncx)
     }
 
-    #[js_method(name = "removeListener", length = 2)]
+    #[legacy_js_method(name = "removeListener", length = 2)]
     pub fn remove_listener(
         this: &Value,
         args: &[Value],
@@ -195,7 +195,7 @@ impl EventEmitter {
         Self::remove_listener_impl(this, args, ncx)
     }
 
-    #[js_method(name = "removeAllListeners", length = 0)]
+    #[legacy_js_method(name = "removeAllListeners", length = 0)]
     pub fn remove_all_listeners(
         this: &Value,
         args: &[Value],
@@ -217,7 +217,7 @@ impl EventEmitter {
         Ok(this.clone())
     }
 
-    #[js_method(name = "emit", length = 1)]
+    #[legacy_js_method(name = "emit", length = 1)]
     pub fn emit(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let event = event_key(args)?;
         let map = get_listeners_map(this, ncx)?;
@@ -308,7 +308,7 @@ impl EventEmitter {
         Ok(Value::boolean(true))
     }
 
-    #[js_method(name = "listeners", length = 1)]
+    #[legacy_js_method(name = "listeners", length = 1)]
     pub fn listeners(
         this: &Value,
         args: &[Value],
@@ -337,7 +337,7 @@ impl EventEmitter {
         Ok(Value::object(result))
     }
 
-    #[js_method(name = "rawListeners", length = 1)]
+    #[legacy_js_method(name = "rawListeners", length = 1)]
     pub fn raw_listeners(
         this: &Value,
         args: &[Value],
@@ -348,7 +348,7 @@ impl EventEmitter {
         Self::listeners(this, args, ncx)
     }
 
-    #[js_method(name = "listenerCount", length = 1)]
+    #[legacy_js_method(name = "listenerCount", length = 1)]
     pub fn listener_count(
         this: &Value,
         args: &[Value],
@@ -370,7 +370,7 @@ impl EventEmitter {
         Ok(Value::number(count as f64))
     }
 
-    #[js_method(name = "eventNames", length = 0)]
+    #[legacy_js_method(name = "eventNames", length = 0)]
     pub fn event_names(
         this: &Value,
         _args: &[Value],
@@ -403,7 +403,7 @@ impl EventEmitter {
         Ok(Value::object(result))
     }
 
-    #[js_method(name = "setMaxListeners", length = 1)]
+    #[legacy_js_method(name = "setMaxListeners", length = 1)]
     pub fn set_max_listeners(
         this: &Value,
         args: &[Value],
@@ -427,7 +427,7 @@ impl EventEmitter {
         Ok(this.clone())
     }
 
-    #[js_method(name = "getMaxListeners", length = 0)]
+    #[legacy_js_method(name = "getMaxListeners", length = 0)]
     pub fn get_max_listeners_method(
         this: &Value,
         _args: &[Value],
@@ -438,7 +438,7 @@ impl EventEmitter {
 
     // --- Static methods ---
 
-    #[js_static(name = "listenerCount", length = 2)]
+    #[legacy_js_static(name = "listenerCount", length = 2)]
     pub fn static_listener_count(
         _this: &Value,
         args: &[Value],

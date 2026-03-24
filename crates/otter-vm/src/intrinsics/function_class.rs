@@ -1,0 +1,133 @@
+use crate::builders::ClassBuilder;
+use crate::descriptors::{
+    JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
+    VmNativeCallError,
+};
+use crate::object::{HeapValueKind, ObjectHandle};
+use crate::value::RegisterValue;
+
+use super::{
+    IntrinsicsError, VmIntrinsics,
+    install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+};
+
+pub(super) static FUNCTION_INTRINSIC: FunctionIntrinsic = FunctionIntrinsic;
+
+pub(super) struct FunctionIntrinsic;
+
+impl IntrinsicInstaller for FunctionIntrinsic {
+    fn init(
+        &self,
+        intrinsics: &mut VmIntrinsics,
+        cx: &mut IntrinsicInstallContext<'_>,
+    ) -> Result<(), IntrinsicsError> {
+        let descriptor = function_class_descriptor();
+        let plan = ClassBuilder::from_descriptor(&descriptor)
+            .expect("Function class descriptors should normalize")
+            .build();
+
+        let constructor = if let Some(descriptor) = plan.constructor() {
+            let host_function = cx.native_functions.register(descriptor.clone());
+            cx.heap.alloc_host_function(host_function)
+        } else {
+            cx.heap.alloc_object()
+        };
+
+        intrinsics.function_constructor = constructor;
+        install_class_plan(
+            intrinsics.function_prototype(),
+            intrinsics.function_constructor(),
+            &plan,
+            cx,
+        )?;
+
+        Ok(())
+    }
+
+    fn install_on_global(
+        &self,
+        intrinsics: &VmIntrinsics,
+        cx: &mut IntrinsicInstallContext<'_>,
+    ) -> Result<(), IntrinsicsError> {
+        cx.install_global_value(
+            intrinsics,
+            "Function",
+            RegisterValue::from_object_handle(intrinsics.function_constructor().0),
+        )
+    }
+}
+
+fn function_class_descriptor() -> JsClassDescriptor {
+    JsClassDescriptor::new("Function")
+        .with_constructor(NativeFunctionDescriptor::constructor(
+            "Function",
+            1,
+            function_constructor,
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("isCallable", 1, function_is_callable),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toString", 0, function_to_string),
+        ))
+}
+
+fn function_constructor(
+    _this: &RegisterValue,
+    _args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    Err(VmNativeCallError::Internal(
+        "Function constructor is not implemented in otter-vm bootstrap".into(),
+    ))
+}
+
+fn function_is_callable(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let is_callable = args
+        .first()
+        .copied()
+        .and_then(RegisterValue::as_object_handle)
+        .map(ObjectHandle)
+        .map(|handle| {
+            matches!(
+                runtime.objects().kind(handle),
+                Ok(HeapValueKind::HostFunction | HeapValueKind::Closure)
+            )
+        })
+        .unwrap_or(false);
+    Ok(RegisterValue::from_bool(is_callable))
+}
+
+fn function_to_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Function.prototype.toString requires callable receiver".into())
+    })?;
+
+    let text = match runtime.objects().kind(receiver) {
+        Ok(HeapValueKind::HostFunction) => "function () { [native code] }",
+        Ok(HeapValueKind::Closure) => "function () { [bytecode] }",
+        Ok(_) => {
+            return Err(VmNativeCallError::Internal(
+                "Function.prototype.toString requires callable receiver".into(),
+            ));
+        }
+        Err(error) => {
+            return Err(VmNativeCallError::Internal(
+                format!("Function.prototype.toString failed: {error:?}").into(),
+            ));
+        }
+    };
+
+    let string = runtime.objects_mut().alloc_string(text);
+    Ok(RegisterValue::from_object_handle(string.0))
+}

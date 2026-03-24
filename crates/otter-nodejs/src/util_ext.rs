@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use otter_macros::{js_class, js_static};
+use otter_macros::{legacy_js_class, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -100,12 +100,12 @@ pub fn node_util_extension() -> Box<dyn OtterExtension> {
 // Util functions via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "Util")]
+#[legacy_js_class(name = "Util")]
 pub struct Util;
 
-#[js_class]
+#[legacy_js_class]
 impl Util {
-    #[js_static(name = "format", length = 1)]
+    #[legacy_js_static(name = "format", length = 1)]
     pub fn format(
         _this: &Value,
         args: &[Value],
@@ -207,7 +207,7 @@ impl Util {
         Ok(Value::string(JsString::new_gc(&result)))
     }
 
-    #[js_static(name = "inspect", length = 1)]
+    #[legacy_js_static(name = "inspect", length = 1)]
     pub fn inspect(
         _this: &Value,
         args: &[Value],
@@ -218,7 +218,7 @@ impl Util {
         Ok(Value::string(JsString::new_gc(&s)))
     }
 
-    #[js_static(name = "isPrimitive", length = 1)]
+    #[legacy_js_static(name = "isPrimitive", length = 1)]
     pub fn is_primitive(
         _this: &Value,
         args: &[Value],
@@ -234,7 +234,7 @@ impl Util {
         Ok(Value::boolean(is_prim))
     }
 
-    #[js_static(name = "isDeepStrictEqual", length = 2)]
+    #[legacy_js_static(name = "isDeepStrictEqual", length = 2)]
     pub fn is_deep_strict_equal(
         _this: &Value,
         args: &[Value],
@@ -245,7 +245,7 @@ impl Util {
         Ok(Value::boolean(deep_strict_equal(&a, &b, 0)))
     }
 
-    #[js_static(name = "stripVTControlCharacters", length = 1)]
+    #[legacy_js_static(name = "stripVTControlCharacters", length = 1)]
     pub fn strip_vt_control_characters(
         _this: &Value,
         args: &[Value],
@@ -260,7 +260,7 @@ impl Util {
         Ok(Value::string(JsString::new_gc(&stripped)))
     }
 
-    #[js_static(name = "getCallSites", length = 0)]
+    #[legacy_js_static(name = "getCallSites", length = 0)]
     pub fn get_call_sites(
         _this: &Value,
         _args: &[Value],
@@ -275,12 +275,12 @@ impl Util {
 // util.types via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "UtilTypes")]
+#[legacy_js_class(name = "UtilTypes")]
 pub struct UtilTypes;
 
-#[js_class]
+#[legacy_js_class]
 impl UtilTypes {
-    #[js_static(name = "isArray", length = 1)]
+    #[legacy_js_static(name = "isArray", length = 1)]
     pub fn is_array(
         _this: &Value,
         args: &[Value],
@@ -292,7 +292,7 @@ impl UtilTypes {
         ))
     }
 
-    #[js_static(name = "isDate", length = 1)]
+    #[legacy_js_static(name = "isDate", length = 1)]
     pub fn is_date(
         _this: &Value,
         args: &[Value],
@@ -304,7 +304,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isMap", length = 1)]
+    #[legacy_js_static(name = "isMap", length = 1)]
     pub fn is_map(
         _this: &Value,
         args: &[Value],
@@ -318,7 +318,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isSet", length = 1)]
+    #[legacy_js_static(name = "isSet", length = 1)]
     pub fn is_set(
         _this: &Value,
         args: &[Value],
@@ -332,7 +332,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isWeakMap", length = 1)]
+    #[legacy_js_static(name = "isWeakMap", length = 1)]
     pub fn is_weak_map(
         _this: &Value,
         args: &[Value],
@@ -344,7 +344,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isWeakSet", length = 1)]
+    #[legacy_js_static(name = "isWeakSet", length = 1)]
     pub fn is_weak_set(
         _this: &Value,
         args: &[Value],
@@ -356,7 +356,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isRegExp", length = 1)]
+    #[legacy_js_static(name = "isRegExp", length = 1)]
     pub fn is_reg_exp(
         _this: &Value,
         args: &[Value],
@@ -366,7 +366,7 @@ impl UtilTypes {
         Ok(Value::boolean(val.as_regex().is_some()))
     }
 
-    #[js_static(name = "isPromise", length = 1)]
+    #[legacy_js_static(name = "isPromise", length = 1)]
     pub fn is_promise(
         _this: &Value,
         args: &[Value],
@@ -376,7 +376,7 @@ impl UtilTypes {
         Ok(Value::boolean(val.as_promise().is_some()))
     }
 
-    #[js_static(name = "isProxy", length = 1)]
+    #[legacy_js_static(name = "isProxy", length = 1)]
     pub fn is_proxy(
         _this: &Value,
         args: &[Value],
@@ -386,7 +386,7 @@ impl UtilTypes {
         Ok(Value::boolean(val.as_proxy().is_some()))
     }
 
-    #[js_static(name = "isTypedArray", length = 1)]
+    #[legacy_js_static(name = "isTypedArray", length = 1)]
     pub fn is_typed_array(
         _this: &Value,
         args: &[Value],
@@ -396,7 +396,7 @@ impl UtilTypes {
         Ok(Value::boolean(val.is_typed_array()))
     }
 
-    #[js_static(name = "isArrayBuffer", length = 1)]
+    #[legacy_js_static(name = "isArrayBuffer", length = 1)]
     pub fn is_array_buffer(
         _this: &Value,
         args: &[Value],
@@ -406,7 +406,7 @@ impl UtilTypes {
         Ok(Value::boolean(val.is_array_buffer()))
     }
 
-    #[js_static(name = "isNativeError", length = 1)]
+    #[legacy_js_static(name = "isNativeError", length = 1)]
     pub fn is_native_error(
         _this: &Value,
         args: &[Value],
@@ -419,7 +419,7 @@ impl UtilTypes {
         })))
     }
 
-    #[js_static(name = "isGeneratorFunction", length = 1)]
+    #[legacy_js_static(name = "isGeneratorFunction", length = 1)]
     pub fn is_generator_function(
         _this: &Value,
         _args: &[Value],
@@ -429,7 +429,7 @@ impl UtilTypes {
         Ok(Value::boolean(false))
     }
 
-    #[js_static(name = "isAsyncFunction", length = 1)]
+    #[legacy_js_static(name = "isAsyncFunction", length = 1)]
     pub fn is_async_function(
         _this: &Value,
         _args: &[Value],

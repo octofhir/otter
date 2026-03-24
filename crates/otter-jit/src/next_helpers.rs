@@ -2,7 +2,7 @@
 
 use crate::context::JitContext;
 use crate::{BAILOUT_SENTINEL, BailoutReason};
-use otter_vm::object::ObjectHandle;
+use otter_vm::object::{ObjectHandle, PropertyValue};
 use otter_vm::{FunctionIndex, Module, ObjectShapeId, RegisterValue, RuntimeState};
 
 const MAX_DIRECT_CALL_ARGS: usize = 8;
@@ -46,7 +46,10 @@ pub extern "C" fn otter_next_get_prop_shaped(
         return write_bailout(ctx, BailoutReason::ShapeGuardFailed, bytecode_pc as u32) as i64;
     };
     match runtime.objects().get_shaped(handle, shape_id, slot_index) {
-        Ok(Some(value)) => value.raw_bits() as i64,
+        Ok(Some(PropertyValue::Data(value))) => value.raw_bits() as i64,
+        Ok(Some(PropertyValue::Accessor { .. })) => {
+            write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64
+        }
         Ok(None) => write_bailout(ctx, BailoutReason::ShapeGuardFailed, bytecode_pc as u32) as i64,
         Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
     }

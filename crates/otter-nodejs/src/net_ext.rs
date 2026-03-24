@@ -10,7 +10,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, ToSocketAddrs}
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use otter_macros::{js_class, js_constructor, js_method};
+use otter_macros::{legacy_js_class, legacy_js_constructor, legacy_js_method};
 use otter_vm_core::context::{JsJobQueueTrait, NativeContext};
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -352,12 +352,12 @@ pub fn node_net_extension() -> Box<dyn OtterExtension> {
     Box::new(NodeNetExtension)
 }
 
-#[js_class(name = "Socket")]
+#[legacy_js_class(name = "Socket")]
 pub struct Socket;
 
-#[js_class]
+#[legacy_js_class]
 impl Socket {
-    #[js_constructor(name = "Socket", length = 1)]
+    #[legacy_js_constructor(name = "Socket", length = 1)]
     pub fn constructor(
         this: &Value,
         args: &[Value],
@@ -438,7 +438,7 @@ impl Socket {
         Ok(Value::undefined())
     }
 
-    #[js_method(name = "connect", length = 0)]
+    #[legacy_js_method(name = "connect", length = 0)]
     pub fn connect(
         this: &Value,
         args: &[Value],
@@ -506,7 +506,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "destroy", length = 0)]
+    #[legacy_js_method(name = "destroy", length = 0)]
     pub fn destroy(
         this: &Value,
         _args: &[Value],
@@ -528,7 +528,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "write", length = 1)]
+    #[legacy_js_method(name = "write", length = 1)]
     pub fn write(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let callback = args.iter().rev().find(|v| v.is_callable()).cloned();
         if socket_id_of(this)
@@ -554,7 +554,7 @@ impl Socket {
         Ok(Value::boolean(true))
     }
 
-    #[js_method(name = "end", length = 0)]
+    #[legacy_js_method(name = "end", length = 0)]
     pub fn end(this: &Value, _args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let socket_id = socket_id_of(this)?;
         if let Some(runtime) = get_socket_runtime(socket_id) {
@@ -574,7 +574,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "setNoDelay", length = 0)]
+    #[legacy_js_method(name = "setNoDelay", length = 0)]
     pub fn set_no_delay(
         this: &Value,
         _args: &[Value],
@@ -583,7 +583,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "setKeepAlive", length = 0)]
+    #[legacy_js_method(name = "setKeepAlive", length = 0)]
     pub fn set_keep_alive(
         this: &Value,
         _args: &[Value],
@@ -592,7 +592,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "pause", length = 0)]
+    #[legacy_js_method(name = "pause", length = 0)]
     pub fn pause(
         this: &Value,
         _args: &[Value],
@@ -601,7 +601,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "resume", length = 0)]
+    #[legacy_js_method(name = "resume", length = 0)]
     pub fn resume(
         this: &Value,
         _args: &[Value],
@@ -610,7 +610,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "setEncoding", length = 1)]
+    #[legacy_js_method(name = "setEncoding", length = 1)]
     pub fn set_encoding(
         this: &Value,
         _args: &[Value],
@@ -619,7 +619,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "address", length = 0)]
+    #[legacy_js_method(name = "address", length = 0)]
     pub fn address(
         this: &Value,
         _args: &[Value],
@@ -651,12 +651,12 @@ impl Socket {
         Ok(Value::object(out))
     }
 
-    #[js_method(name = "cork", length = 0)]
+    #[legacy_js_method(name = "cork", length = 0)]
     pub fn cork(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         Ok(this.clone())
     }
 
-    #[js_method(name = "uncork", length = 0)]
+    #[legacy_js_method(name = "uncork", length = 0)]
     pub fn uncork(
         this: &Value,
         _args: &[Value],
@@ -665,7 +665,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "ref", length = 0)]
+    #[legacy_js_method(name = "ref", length = 0)]
     pub fn ref_socket(
         this: &Value,
         _args: &[Value],
@@ -682,7 +682,7 @@ impl Socket {
         Ok(this.clone())
     }
 
-    #[js_method(name = "unref", length = 0)]
+    #[legacy_js_method(name = "unref", length = 0)]
     pub fn unref_socket(
         this: &Value,
         _args: &[Value],
@@ -700,12 +700,12 @@ impl Socket {
     }
 }
 
-#[js_class(name = "Server")]
+#[legacy_js_class(name = "Server")]
 pub struct Server;
 
-#[js_class]
+#[legacy_js_class]
 impl Server {
-    #[js_constructor(name = "Server", length = 1)]
+    #[legacy_js_constructor(name = "Server", length = 1)]
     pub fn constructor(
         this: &Value,
         args: &[Value],
@@ -760,7 +760,7 @@ impl Server {
         Ok(Value::undefined())
     }
 
-    #[js_method(name = "listen", length = 0)]
+    #[legacy_js_method(name = "listen", length = 0)]
     pub fn listen(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let obj = this
             .as_object()
@@ -842,7 +842,7 @@ impl Server {
         Ok(this.clone())
     }
 
-    #[js_method(name = "close", length = 0)]
+    #[legacy_js_method(name = "close", length = 0)]
     pub fn close(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         if let Some(cb) = args.first().filter(|v| v.is_callable()).cloned() {
             add_once_listener(this, "close", cb, ncx)?;
@@ -875,7 +875,7 @@ impl Server {
         Ok(this.clone())
     }
 
-    #[js_method(name = "address", length = 0)]
+    #[legacy_js_method(name = "address", length = 0)]
     pub fn address(
         this: &Value,
         _args: &[Value],
@@ -906,7 +906,7 @@ impl Server {
         Ok(Value::object(address))
     }
 
-    #[js_method(name = "ref", length = 0)]
+    #[legacy_js_method(name = "ref", length = 0)]
     pub fn ref_server(
         this: &Value,
         _args: &[Value],
@@ -923,7 +923,7 @@ impl Server {
         Ok(this.clone())
     }
 
-    #[js_method(name = "unref", length = 0)]
+    #[legacy_js_method(name = "unref", length = 0)]
     pub fn unref_server(
         this: &Value,
         _args: &[Value],

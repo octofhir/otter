@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use otter_macros::{js_class, js_method};
+use otter_macros::{legacy_js_class, legacy_js_method};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -20,12 +20,12 @@ use otter_vm_runtime::registration::RegistrationContext;
 // Classes
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "Readable")]
+#[legacy_js_class(name = "Readable")]
 pub struct Readable;
 
-#[js_class]
+#[legacy_js_class]
 impl Readable {
-    #[js_method(name = "push", length = 1)]
+    #[legacy_js_method(name = "push", length = 1)]
     pub fn push(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let chunk = args.first().cloned().unwrap_or(Value::undefined());
         if chunk.is_null() {
@@ -37,19 +37,19 @@ impl Readable {
     }
 }
 
-#[js_class(name = "Writable")]
+#[legacy_js_class(name = "Writable")]
 pub struct Writable;
 
-#[js_class]
+#[legacy_js_class]
 impl Writable {
-    #[js_method(name = "write", length = 1)]
+    #[legacy_js_method(name = "write", length = 1)]
     pub fn write(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let chunk = args.first().cloned().unwrap_or(Value::undefined());
         emit_event(this, "data", &[chunk], ncx)?;
         Ok(Value::boolean(true))
     }
 
-    #[js_method(name = "end", length = 0)]
+    #[legacy_js_method(name = "end", length = 0)]
     pub fn end(this: &Value, _args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         emit_event(this, "finish", &[], ncx)?;
         Ok(this.clone())

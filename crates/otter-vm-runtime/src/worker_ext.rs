@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use otter_macros::{js_class, js_constructor, js_method};
+use otter_macros::{legacy_js_class, legacy_js_constructor, legacy_js_method};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -93,13 +93,13 @@ pub fn worker_extension() -> Box<dyn OtterExtension> {
 // ---------------------------------------------------------------------------
 
 #[allow(missing_docs)]
-#[js_class(name = "Worker")]
+#[legacy_js_class(name = "Worker")]
 pub struct JsWorker;
 
-#[js_class]
+#[legacy_js_class]
 impl JsWorker {
     /// `new Worker(scriptURL)` — create a new worker thread.
-    #[js_constructor(name = "Worker", length = 1)]
+    #[legacy_js_constructor(name = "Worker", length = 1)]
     pub fn constructor(
         this: &Value,
         args: &[Value],
@@ -160,7 +160,7 @@ impl JsWorker {
     }
 
     /// `worker.postMessage(data)` — send a message to the worker.
-    #[js_method(name = "postMessage", length = 1)]
+    #[legacy_js_method(name = "postMessage", length = 1)]
     pub fn post_message(
         this: &Value,
         args: &[Value],
@@ -184,7 +184,7 @@ impl JsWorker {
     }
 
     /// `worker.terminate()` — terminate the worker.
-    #[js_method(name = "terminate", length = 0)]
+    #[legacy_js_method(name = "terminate", length = 0)]
     pub fn terminate(
         this: &Value,
         _args: &[Value],

@@ -10,7 +10,7 @@ use crate::gc::GcRef;
 use crate::object::{JsObject, PropertyKey};
 use crate::string::JsString;
 use crate::value::Value;
-use otter_macros::{js_class, js_method, js_static};
+use otter_macros::{legacy_js_class, legacy_js_method, legacy_js_static};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -25,18 +25,18 @@ const SIGNAL_KEY: &str = "__signal";
 // AbortSignal
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "AbortSignal")]
+#[legacy_js_class(name = "AbortSignal")]
 pub struct AbortSignal;
 
-#[js_class]
+#[legacy_js_class]
 impl AbortSignal {
-    #[js_static(name = "abort", length = 1)]
+    #[legacy_js_static(name = "abort", length = 1)]
     pub fn abort(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let reason = args.first().cloned().unwrap_or(Value::undefined());
         create_signal_object(ncx, true, reason)
     }
 
-    #[js_static(name = "timeout", length = 1)]
+    #[legacy_js_static(name = "timeout", length = 1)]
     pub fn timeout(
         _this: &Value,
         args: &[Value],
@@ -83,7 +83,7 @@ impl AbortSignal {
         Ok(signal)
     }
 
-    #[js_method(name = "aborted", kind = "getter")]
+    #[legacy_js_method(name = "aborted", kind = "getter")]
     pub fn aborted(
         this: &Value,
         _args: &[Value],
@@ -92,7 +92,7 @@ impl AbortSignal {
         get_property(this, ABORTED_KEY).map(|v| v.unwrap_or(Value::boolean(false)))
     }
 
-    #[js_method(name = "reason", kind = "getter")]
+    #[legacy_js_method(name = "reason", kind = "getter")]
     pub fn reason(
         this: &Value,
         _args: &[Value],
@@ -101,7 +101,7 @@ impl AbortSignal {
         get_property(this, REASON_KEY).map(|v| v.unwrap_or(Value::undefined()))
     }
 
-    #[js_method(name = "throwIfAborted", length = 0)]
+    #[legacy_js_method(name = "throwIfAborted", length = 0)]
     pub fn throw_if_aborted(
         this: &Value,
         _args: &[Value],
@@ -115,7 +115,7 @@ impl AbortSignal {
         Ok(Value::undefined())
     }
 
-    #[js_method(name = "onabort", kind = "getter")]
+    #[legacy_js_method(name = "onabort", kind = "getter")]
     pub fn get_onabort(
         this: &Value,
         _args: &[Value],
@@ -124,7 +124,7 @@ impl AbortSignal {
         get_property(this, ONABORT_KEY).map(|v| v.unwrap_or(Value::undefined()))
     }
 
-    #[js_method(name = "onabort", kind = "setter")]
+    #[legacy_js_method(name = "onabort", kind = "setter")]
     pub fn set_onabort(
         this: &Value,
         args: &[Value],
@@ -159,12 +159,12 @@ fn create_signal_object(
 // AbortController
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "AbortController")]
+#[legacy_js_class(name = "AbortController")]
 pub struct AbortController;
 
-#[js_class]
+#[legacy_js_class]
 impl AbortController {
-    #[js_method(constructor)]
+    #[legacy_js_method(constructor)]
     pub fn constructor(
         this: &Value,
         _args: &[Value],
@@ -175,7 +175,7 @@ impl AbortController {
         Ok(*this)
     }
 
-    #[js_method(name = "signal", kind = "getter")]
+    #[legacy_js_method(name = "signal", kind = "getter")]
     pub fn signal(
         this: &Value,
         _args: &[Value],
@@ -184,7 +184,7 @@ impl AbortController {
         get_property(this, SIGNAL_KEY).map(|v| v.unwrap_or(Value::undefined()))
     }
 
-    #[js_method(name = "abort", length = 0)]
+    #[legacy_js_method(name = "abort", length = 0)]
     pub fn abort(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let reason = args.first().cloned().unwrap_or(Value::undefined());
 

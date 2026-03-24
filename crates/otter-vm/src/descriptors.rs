@@ -4,8 +4,6 @@
 //! runtime/bootstrap state directly. Builders and intrinsic installers consume
 //! these descriptors and perform the actual object/property installation.
 
-use std::sync::Arc;
-
 use crate::interpreter::RuntimeState;
 use crate::value::RegisterValue;
 
@@ -30,15 +28,14 @@ impl core::fmt::Display for VmNativeCallError {
 impl std::error::Error for VmNativeCallError {}
 
 /// Runtime ABI of a native host function exposed through the new VM.
-pub type VmNativeFunction = Arc<
-    dyn Fn(
-            &RegisterValue,
-            &[RegisterValue],
-            &mut RuntimeState,
-        ) -> Result<RegisterValue, VmNativeCallError>
-        + Send
-        + Sync,
->;
+///
+/// New-VM descriptors are pure static metadata, so the callback shape stays a
+/// plain function pointer instead of a heap-allocated shared closure.
+pub type VmNativeFunction = fn(
+    &RegisterValue,
+    &[RegisterValue],
+    &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError>;
 
 /// Whether a native entrypoint executes synchronously or represents an async-capable hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -232,17 +229,88 @@ pub trait NativeDescriptorConsumer {
     fn register_native(&mut self, descriptor: NativeBindingDescriptor);
 }
 
+/// Pure metadata for one JS-visible class in the new VM.
+///
+/// This intentionally separates class metadata from runtime installation. A
+/// builder can consume the descriptor, install the constructor callback (if
+/// present), then map each binding to prototype-vs-constructor property
+/// installation based on [`NativeBindingTarget`].
+#[derive(Clone, Default)]
+pub struct JsClassDescriptor {
+    js_name: Box<str>,
+    constructor: Option<NativeFunctionDescriptor>,
+    bindings: Vec<NativeBindingDescriptor>,
+}
+
+impl JsClassDescriptor {
+    /// Creates an empty class descriptor for the given JS-visible class name.
+    #[must_use]
+    pub fn new(js_name: impl Into<Box<str>>) -> Self {
+        Self {
+            js_name: js_name.into(),
+            constructor: None,
+            bindings: Vec::new(),
+        }
+    }
+
+    /// Attaches constructor metadata for the class.
+    #[must_use]
+    pub fn with_constructor(mut self, constructor: NativeFunctionDescriptor) -> Self {
+        self.constructor = Some(constructor);
+        self
+    }
+
+    /// Adds one prototype/static binding to the class descriptor.
+    #[must_use]
+    pub fn with_binding(mut self, binding: NativeBindingDescriptor) -> Self {
+        self.bindings.push(binding);
+        self
+    }
+
+    /// Returns the JS-visible class name.
+    #[must_use]
+    pub fn js_name(&self) -> &str {
+        &self.js_name
+    }
+
+    /// Returns the constructor metadata if the class exposes one.
+    #[must_use]
+    pub const fn constructor(&self) -> Option<&NativeFunctionDescriptor> {
+        self.constructor.as_ref()
+    }
+
+    /// Returns the class bindings that should be installed on the prototype or constructor object.
+    #[must_use]
+    pub fn bindings(&self) -> &[NativeBindingDescriptor] {
+        &self.bindings
+    }
+}
+
+/// Contract that future class builders should implement to consume macro-generated class descriptors.
+pub trait ClassDescriptorConsumer {
+    /// Registers one class descriptor for later installation.
+    fn register_class(&mut self, descriptor: JsClassDescriptor);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeBindingDescriptor, NativeBindingTarget, NativeDescriptorConsumer,
-        NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind, VmNativeCallError,
-        VmNativeFunction,
+        ClassDescriptorConsumer, JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget,
+        NativeDescriptorConsumer, NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
+        VmNativeCallError, VmNativeFunction,
     };
     use crate::value::RegisterValue;
 
     fn passthrough_callback() -> VmNativeFunction {
-        std::sync::Arc::new(|this, _args, _runtime| Ok(*this))
+        passthrough
+    }
+
+    fn passthrough(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        _runtime: &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        Ok(*this)
     }
 
     #[test]
@@ -302,5 +370,66 @@ mod tests {
 
         assert!(thrown.to_string().contains("threw"));
         assert_eq!(internal.to_string(), "native setup failed");
+    }
+
+    #[test]
+    fn js_class_descriptor_keeps_constructor_and_bindings() {
+        let descriptor = JsClassDescriptor::new("Thing")
+            .with_constructor(NativeFunctionDescriptor::constructor(
+                "Thing",
+                1,
+                passthrough_callback(),
+            ))
+            .with_binding(NativeBindingDescriptor::new(
+                NativeBindingTarget::Prototype,
+                NativeFunctionDescriptor::method("valueOf", 0, passthrough_callback()),
+            ))
+            .with_binding(NativeBindingDescriptor::new(
+                NativeBindingTarget::Constructor,
+                NativeFunctionDescriptor::getter("version", passthrough_callback()),
+            ));
+
+        assert_eq!(descriptor.js_name(), "Thing");
+        assert_eq!(
+            descriptor
+                .constructor()
+                .map(NativeFunctionDescriptor::js_name),
+            Some("Thing")
+        );
+        assert_eq!(descriptor.bindings().len(), 2);
+        assert_eq!(
+            descriptor.bindings()[0].target(),
+            NativeBindingTarget::Prototype
+        );
+        assert_eq!(
+            descriptor.bindings()[1].function().slot_kind(),
+            NativeSlotKind::Getter
+        );
+    }
+
+    #[test]
+    fn class_descriptor_consumer_receives_class_metadata() {
+        #[derive(Default)]
+        struct TestConsumer {
+            seen: Vec<JsClassDescriptor>,
+        }
+
+        impl ClassDescriptorConsumer for TestConsumer {
+            fn register_class(&mut self, descriptor: JsClassDescriptor) {
+                self.seen.push(descriptor);
+            }
+        }
+
+        let mut consumer = TestConsumer::default();
+        consumer.register_class(JsClassDescriptor::new("Counter").with_binding(
+            NativeBindingDescriptor::new(
+                NativeBindingTarget::Prototype,
+                NativeFunctionDescriptor::method("inc", 0, passthrough_callback()),
+            ),
+        ));
+
+        assert_eq!(consumer.seen.len(), 1);
+        assert_eq!(consumer.seen[0].js_name(), "Counter");
+        assert_eq!(consumer.seen[0].bindings()[0].function().js_name(), "inc");
     }
 }

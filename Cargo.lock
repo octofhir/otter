@@ -2268,6 +2268,7 @@ dependencies = [
 name = "otter-macros"
 version = "0.1.0"
 dependencies = [
+ "otter-vm",
  "otter-vm-core",
  "otter-vm-runtime",
  "proc-macro2",

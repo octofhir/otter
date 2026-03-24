@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use otter_macros::{js_class, js_static};
+use otter_macros::{legacy_js_class, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -87,17 +87,17 @@ pub fn node_assert_extension() -> Box<dyn OtterExtension> {
 // Assert methods via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "Assert")]
+#[legacy_js_class(name = "Assert")]
 pub struct Assert;
 
-#[js_class]
+#[legacy_js_class]
 impl Assert {
-    #[js_static(name = "ok", length = 1)]
+    #[legacy_js_static(name = "ok", length = 1)]
     pub fn ok(_this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         assert_ok_impl(args)
     }
 
-    #[js_static(name = "equal", length = 2)]
+    #[legacy_js_static(name = "equal", length = 2)]
     pub fn equal(
         _this: &Value,
         args: &[Value],
@@ -112,7 +112,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "notEqual", length = 2)]
+    #[legacy_js_static(name = "notEqual", length = 2)]
     pub fn not_equal(
         _this: &Value,
         args: &[Value],
@@ -127,7 +127,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "strictEqual", length = 2)]
+    #[legacy_js_static(name = "strictEqual", length = 2)]
     pub fn strict_equal_fn(
         _this: &Value,
         args: &[Value],
@@ -142,7 +142,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "notStrictEqual", length = 2)]
+    #[legacy_js_static(name = "notStrictEqual", length = 2)]
     pub fn not_strict_equal(
         _this: &Value,
         args: &[Value],
@@ -157,7 +157,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "deepEqual", length = 2)]
+    #[legacy_js_static(name = "deepEqual", length = 2)]
     pub fn deep_equal(
         _this: &Value,
         args: &[Value],
@@ -177,7 +177,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "notDeepEqual", length = 2)]
+    #[legacy_js_static(name = "notDeepEqual", length = 2)]
     pub fn not_deep_equal(
         _this: &Value,
         args: &[Value],
@@ -197,7 +197,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "deepStrictEqual", length = 2)]
+    #[legacy_js_static(name = "deepStrictEqual", length = 2)]
     pub fn deep_strict_equal_fn(
         _this: &Value,
         args: &[Value],
@@ -217,7 +217,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "notDeepStrictEqual", length = 2)]
+    #[legacy_js_static(name = "notDeepStrictEqual", length = 2)]
     pub fn not_deep_strict_equal(
         _this: &Value,
         args: &[Value],
@@ -237,7 +237,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "throws", length = 1)]
+    #[legacy_js_static(name = "throws", length = 1)]
     pub fn throws(
         _this: &Value,
         args: &[Value],
@@ -261,7 +261,7 @@ impl Assert {
         }
     }
 
-    #[js_static(name = "doesNotThrow", length = 1)]
+    #[legacy_js_static(name = "doesNotThrow", length = 1)]
     pub fn does_not_throw(
         _this: &Value,
         args: &[Value],
@@ -284,7 +284,7 @@ impl Assert {
         }
     }
 
-    #[js_static(name = "match", length = 2)]
+    #[legacy_js_static(name = "match", length = 2)]
     pub fn match_fn(
         _this: &Value,
         args: &[Value],
@@ -347,7 +347,7 @@ impl Assert {
         }
     }
 
-    #[js_static(name = "doesNotMatch", length = 2)]
+    #[legacy_js_static(name = "doesNotMatch", length = 2)]
     pub fn does_not_match(
         _this: &Value,
         args: &[Value],
@@ -410,7 +410,7 @@ impl Assert {
         }
     }
 
-    #[js_static(name = "ifError", length = 1)]
+    #[legacy_js_static(name = "ifError", length = 1)]
     pub fn if_error(
         _this: &Value,
         args: &[Value],
@@ -423,7 +423,7 @@ impl Assert {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "fail", length = 1)]
+    #[legacy_js_static(name = "fail", length = 1)]
     pub fn fail(_this: &Value, args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         let msg = args
             .first()

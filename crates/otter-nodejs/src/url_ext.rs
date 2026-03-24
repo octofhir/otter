@@ -4,7 +4,7 @@
 //! current official compatibility tests exercise directly.
 
 use idna::{domain_to_ascii, domain_to_unicode};
-use otter_macros::{js_class, js_method, js_static};
+use otter_macros::{legacy_js_class, legacy_js_method, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -123,12 +123,12 @@ pub fn node_url_extension() -> Box<dyn OtterExtension> {
 // WHATWG URL class
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "URL")]
+#[legacy_js_class(name = "URL")]
 pub struct JsUrl;
 
-#[js_class]
+#[legacy_js_class]
 impl JsUrl {
-    #[js_method(constructor)]
+    #[legacy_js_method(constructor)]
     pub fn constructor(
         this: &Value,
         args: &[Value],
@@ -150,12 +150,12 @@ impl JsUrl {
         Ok(Value::undefined())
     }
 
-    #[js_method(name = "href", kind = "getter")]
+    #[legacy_js_method(name = "href", kind = "getter")]
     pub fn href(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         url_prop(this, HREF_KEY)
     }
 
-    #[js_method(name = "protocol", kind = "getter")]
+    #[legacy_js_method(name = "protocol", kind = "getter")]
     pub fn protocol(
         this: &Value,
         _args: &[Value],
@@ -164,7 +164,7 @@ impl JsUrl {
         url_prop(this, PROTOCOL_KEY)
     }
 
-    #[js_method(name = "username", kind = "getter")]
+    #[legacy_js_method(name = "username", kind = "getter")]
     pub fn username(
         this: &Value,
         _args: &[Value],
@@ -173,7 +173,7 @@ impl JsUrl {
         url_prop(this, USERNAME_KEY)
     }
 
-    #[js_method(name = "password", kind = "getter")]
+    #[legacy_js_method(name = "password", kind = "getter")]
     pub fn password(
         this: &Value,
         _args: &[Value],
@@ -182,12 +182,12 @@ impl JsUrl {
         url_prop(this, PASSWORD_KEY)
     }
 
-    #[js_method(name = "host", kind = "getter")]
+    #[legacy_js_method(name = "host", kind = "getter")]
     pub fn host(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         url_prop(this, HOST_KEY)
     }
 
-    #[js_method(name = "hostname", kind = "getter")]
+    #[legacy_js_method(name = "hostname", kind = "getter")]
     pub fn hostname(
         this: &Value,
         _args: &[Value],
@@ -196,12 +196,12 @@ impl JsUrl {
         url_prop(this, HOSTNAME_KEY)
     }
 
-    #[js_method(name = "port", kind = "getter")]
+    #[legacy_js_method(name = "port", kind = "getter")]
     pub fn port(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         url_prop(this, PORT_KEY)
     }
 
-    #[js_method(name = "pathname", kind = "getter")]
+    #[legacy_js_method(name = "pathname", kind = "getter")]
     pub fn pathname(
         this: &Value,
         _args: &[Value],
@@ -210,7 +210,7 @@ impl JsUrl {
         url_prop(this, PATHNAME_KEY)
     }
 
-    #[js_method(name = "search", kind = "getter")]
+    #[legacy_js_method(name = "search", kind = "getter")]
     pub fn search(
         this: &Value,
         _args: &[Value],
@@ -219,12 +219,12 @@ impl JsUrl {
         url_prop(this, SEARCH_KEY)
     }
 
-    #[js_method(name = "hash", kind = "getter")]
+    #[legacy_js_method(name = "hash", kind = "getter")]
     pub fn hash(this: &Value, _args: &[Value], _ncx: &mut NativeContext) -> Result<Value, VmError> {
         url_prop(this, HASH_KEY)
     }
 
-    #[js_method(name = "origin", kind = "getter")]
+    #[legacy_js_method(name = "origin", kind = "getter")]
     pub fn origin(
         this: &Value,
         _args: &[Value],
@@ -233,7 +233,7 @@ impl JsUrl {
         url_prop(this, ORIGIN_KEY)
     }
 
-    #[js_method(name = "toString", length = 0)]
+    #[legacy_js_method(name = "toString", length = 0)]
     pub fn to_string(
         this: &Value,
         _args: &[Value],
@@ -242,7 +242,7 @@ impl JsUrl {
         url_prop(this, HREF_KEY)
     }
 
-    #[js_method(name = "toJSON", length = 0)]
+    #[legacy_js_method(name = "toJSON", length = 0)]
     pub fn to_json(
         this: &Value,
         _args: &[Value],
@@ -251,7 +251,7 @@ impl JsUrl {
         url_prop(this, HREF_KEY)
     }
 
-    #[js_static(name = "revokeObjectURL", length = 1)]
+    #[legacy_js_static(name = "revokeObjectURL", length = 1)]
     pub fn revoke_object_url(
         _this: &Value,
         args: &[Value],
@@ -305,12 +305,12 @@ fn build_url_class(ctx: &RegistrationContext) -> Value {
 // Legacy node:url surface
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "Url")]
+#[legacy_js_class(name = "Url")]
 pub struct LegacyUrl;
 
-#[js_class]
+#[legacy_js_class]
 impl LegacyUrl {
-    #[js_method(constructor)]
+    #[legacy_js_method(constructor)]
     pub fn constructor(
         this: &Value,
         _args: &[Value],
@@ -323,7 +323,7 @@ impl LegacyUrl {
         Ok(Value::undefined())
     }
 
-    #[js_method(name = "resolve", length = 1)]
+    #[legacy_js_method(name = "resolve", length = 1)]
     pub fn resolve(
         this: &Value,
         args: &[Value],
@@ -337,7 +337,7 @@ impl LegacyUrl {
         )))
     }
 
-    #[js_method(name = "resolveObject", length = 1)]
+    #[legacy_js_method(name = "resolveObject", length = 1)]
     pub fn resolve_object(
         this: &Value,
         args: &[Value],
@@ -360,12 +360,12 @@ fn build_legacy_url_class(ctx: &RegistrationContext) -> Value {
         .build()
 }
 
-#[js_class(name = "NodeUrlModule")]
+#[legacy_js_class(name = "NodeUrlModule")]
 pub struct NodeUrlModule;
 
-#[js_class]
+#[legacy_js_class]
 impl NodeUrlModule {
-    #[js_static(name = "resolve", length = 2)]
+    #[legacy_js_static(name = "resolve", length = 2)]
     pub fn resolve(
         _this: &Value,
         args: &[Value],
@@ -381,7 +381,7 @@ impl NodeUrlModule {
         ))))
     }
 
-    #[js_static(name = "resolveObject", length = 2)]
+    #[legacy_js_static(name = "resolveObject", length = 2)]
     pub fn resolve_object(
         _this: &Value,
         args: &[Value],
@@ -402,7 +402,7 @@ impl NodeUrlModule {
         )
     }
 
-    #[js_static(name = "pathToFileURL", length = 1)]
+    #[legacy_js_static(name = "pathToFileURL", length = 1)]
     pub fn path_to_file_url(
         _this: &Value,
         args: &[Value],
@@ -421,7 +421,7 @@ impl NodeUrlModule {
         )
     }
 
-    #[js_static(name = "fileURLToPath", length = 1)]
+    #[legacy_js_static(name = "fileURLToPath", length = 1)]
     pub fn file_url_to_path(
         _this: &Value,
         args: &[Value],
@@ -443,7 +443,7 @@ impl NodeUrlModule {
         Ok(Value::string(JsString::new_gc(&path)))
     }
 
-    #[js_static(name = "urlToHttpOptions", length = 1)]
+    #[legacy_js_static(name = "urlToHttpOptions", length = 1)]
     pub fn url_to_http_options(
         _this: &Value,
         args: &[Value],
@@ -559,7 +559,7 @@ impl NodeUrlModule {
         Ok(Value::object(out))
     }
 
-    #[js_static(name = "format", length = 1)]
+    #[legacy_js_static(name = "format", length = 1)]
     pub fn format(
         _this: &Value,
         args: &[Value],
@@ -595,7 +595,7 @@ impl NodeUrlModule {
         Ok(Value::string(JsString::new_gc(&formatted)))
     }
 
-    #[js_static(name = "domainToASCII", length = 1)]
+    #[legacy_js_static(name = "domainToASCII", length = 1)]
     pub fn domain_to_ascii_fn(
         _this: &Value,
         args: &[Value],
@@ -606,7 +606,7 @@ impl NodeUrlModule {
         Ok(Value::string(JsString::new_gc(&output)))
     }
 
-    #[js_static(name = "domainToUnicode", length = 1)]
+    #[legacy_js_static(name = "domainToUnicode", length = 1)]
     pub fn domain_to_unicode_fn(
         _this: &Value,
         args: &[Value],
@@ -617,7 +617,7 @@ impl NodeUrlModule {
         Ok(Value::string(JsString::new_gc(&output)))
     }
 
-    #[js_static(name = "parse", length = 1)]
+    #[legacy_js_static(name = "parse", length = 1)]
     pub fn parse(_this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> {
         let input = primitive_string_arg(args.first(), "url")?;
         let parse_query = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
@@ -632,12 +632,12 @@ impl NodeUrlModule {
     }
 }
 
-#[js_class(name = "InternalUrlModule")]
+#[legacy_js_class(name = "InternalUrlModule")]
 pub struct InternalUrlModule;
 
-#[js_class]
+#[legacy_js_class]
 impl InternalUrlModule {
-    #[js_static(name = "isURL", length = 1)]
+    #[legacy_js_static(name = "isURL", length = 1)]
     pub fn is_url(
         _this: &Value,
         args: &[Value],

@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
-use otter_macros::{js_class, js_static};
+use otter_macros::{legacy_js_class, legacy_js_static};
 use otter_vm_core::MemoryManager;
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::{ThrownValue, VmError};
@@ -118,12 +118,12 @@ pub fn node_test_extension() -> Box<dyn OtterExtension> {
 // TestContext — passed as `t` to test callbacks
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "TestContext")]
+#[legacy_js_class(name = "TestContext")]
 pub struct TestContext;
 
-#[js_class]
+#[legacy_js_class]
 impl TestContext {
-    #[js_static(name = "skip", length = 0)]
+    #[legacy_js_static(name = "skip", length = 0)]
     pub fn skip(
         _this: &Value,
         _args: &[Value],
@@ -132,7 +132,7 @@ impl TestContext {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "todo", length = 0)]
+    #[legacy_js_static(name = "todo", length = 0)]
     pub fn todo(
         _this: &Value,
         _args: &[Value],
@@ -141,7 +141,7 @@ impl TestContext {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "plan", length = 1)]
+    #[legacy_js_static(name = "plan", length = 1)]
     pub fn plan(
         _this: &Value,
         _args: &[Value],
@@ -150,7 +150,7 @@ impl TestContext {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "diagnostic", length = 1)]
+    #[legacy_js_static(name = "diagnostic", length = 1)]
     pub fn diagnostic(
         _this: &Value,
         _args: &[Value],
@@ -159,7 +159,7 @@ impl TestContext {
         Ok(Value::undefined())
     }
 
-    #[js_static(name = "test", length = 1)]
+    #[legacy_js_static(name = "test", length = 1)]
     pub fn subtest(
         _this: &Value,
         args: &[Value],
@@ -1166,12 +1166,12 @@ fn describe_impl(
 // Lifecycle hooks (before, after, beforeEach, afterEach) — stubs
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "TestHooks")]
+#[legacy_js_class(name = "TestHooks")]
 pub struct TestHooks;
 
-#[js_class]
+#[legacy_js_class]
 impl TestHooks {
-    #[js_static(name = "before", length = 1)]
+    #[legacy_js_static(name = "before", length = 1)]
     pub fn before(
         _this: &Value,
         args: &[Value],
@@ -1180,7 +1180,7 @@ impl TestHooks {
         register_lifecycle_hook(args, LifecycleHookType::Before)
     }
 
-    #[js_static(name = "after", length = 1)]
+    #[legacy_js_static(name = "after", length = 1)]
     pub fn after(
         _this: &Value,
         args: &[Value],
@@ -1189,7 +1189,7 @@ impl TestHooks {
         register_lifecycle_hook(args, LifecycleHookType::After)
     }
 
-    #[js_static(name = "beforeEach", length = 1)]
+    #[legacy_js_static(name = "beforeEach", length = 1)]
     pub fn before_each(
         _this: &Value,
         args: &[Value],
@@ -1198,7 +1198,7 @@ impl TestHooks {
         register_lifecycle_hook(args, LifecycleHookType::BeforeEach)
     }
 
-    #[js_static(name = "afterEach", length = 1)]
+    #[legacy_js_static(name = "afterEach", length = 1)]
     pub fn after_each(
         _this: &Value,
         args: &[Value],

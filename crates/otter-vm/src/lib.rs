@@ -11,6 +11,8 @@
 pub mod abi;
 /// Engine/runtime integration boundary.
 pub mod bridge;
+/// Builder-side adapters for descriptor-driven bootstrap.
+pub mod builders;
 /// Runtime bytecode model.
 pub mod bytecode;
 /// Call-site side tables for direct calls.
@@ -27,6 +29,8 @@ pub mod exception;
 pub mod feedback;
 /// Frame and register-window layout.
 pub mod frame;
+/// Runtime host-function registry for native callbacks.
+pub mod host;
 /// Bytecode interpreter entry points.
 pub mod interpreter;
 /// Runtime-owned intrinsic registry and root model.
@@ -55,11 +59,18 @@ pub mod string;
 pub mod value;
 
 pub use abi::VmAbiVersion;
+pub use builders::{
+    ClassAccessorPlan, ClassBuilder, ClassBuilderError, ClassInstallPlan, ClassMemberPlan,
+    ConstructorBuilder, GlobalBuilder, NamespaceBuilder, ObjectAccessorPlan, ObjectBuilderError,
+    ObjectInstallPlan, ObjectMemberPlan, PrototypeBuilder,
+};
 pub use descriptors::{
-    NativeBindingDescriptor, NativeBindingTarget, NativeDescriptorConsumer, NativeEntrypointKind,
-    NativeFunctionDescriptor, NativeSlotKind, VmNativeCallError, VmNativeFunction,
+    ClassDescriptorConsumer, JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget,
+    NativeDescriptorConsumer, NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
+    VmNativeCallError, VmNativeFunction,
 };
 pub use frame::FrameLayout;
+pub use host::{HostFunctionId, NativeFunctionRegistry};
 pub use interpreter::{Interpreter, RuntimeState};
 pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
 pub use module::{Function, FunctionIndex, Module, ModuleError};

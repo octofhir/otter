@@ -1,5 +1,6 @@
 //! Minimal object heap and inline-cache support for the new VM.
 
+use crate::host::HostFunctionId;
 use crate::module::FunctionIndex;
 use crate::property::PropertyNameId;
 use crate::value::RegisterValue;
@@ -57,6 +58,8 @@ pub enum ObjectError {
 pub enum HeapValueKind {
     /// Plain object with named properties.
     Object,
+    /// Host-callable native function object.
+    HostFunction,
     /// Dense array with indexed elements.
     Array,
     /// String storage with indexed character access.
@@ -100,12 +103,29 @@ impl IteratorStep {
     }
 }
 
+/// Property slot stored on ordinary or host-function objects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropertyValue {
+    Data(RegisterValue),
+    Accessor {
+        getter: Option<ObjectHandle>,
+        setter: Option<ObjectHandle>,
+    },
+}
+
+impl PropertyValue {
+    #[must_use]
+    pub const fn data(value: RegisterValue) -> Self {
+        Self::Data(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum HeapValue {
     Object {
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
-        values: Vec<RegisterValue>,
+        values: Vec<PropertyValue>,
     },
     Array {
         elements: Vec<RegisterValue>,
@@ -116,6 +136,12 @@ enum HeapValue {
     Closure {
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
+    },
+    HostFunction {
+        function: HostFunctionId,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
     },
     UpvalueCell {
         value: RegisterValue,
@@ -197,10 +223,24 @@ impl ObjectHeap {
         handle
     }
 
+    /// Allocates a host-callable native function object.
+    pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
+        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
+        let shape_id = self.allocate_shape();
+        self.objects.push(HeapValue::HostFunction {
+            function,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+        });
+        handle
+    }
+
     /// Returns the heap-value kind for the given handle.
     pub fn kind(&self, handle: ObjectHandle) -> Result<HeapValueKind, ObjectError> {
         match self.object(handle)? {
             HeapValue::Object { .. } => Ok(HeapValueKind::Object),
+            HeapValue::HostFunction { .. } => Ok(HeapValueKind::HostFunction),
             HeapValue::Array { .. } => Ok(HeapValueKind::Array),
             HeapValue::String { .. } => Ok(HeapValueKind::String),
             HeapValue::Closure { .. } => Ok(HeapValueKind::Closure),
@@ -219,6 +259,7 @@ impl ObjectHeap {
     ) -> Result<Option<RegisterValue>, ObjectError> {
         match self.object(handle)? {
             HeapValue::Object { .. }
+            | HeapValue::HostFunction { .. }
             | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
@@ -274,6 +315,7 @@ impl ObjectHeap {
                 }
             }
             HeapValue::Object { .. }
+            | HeapValue::HostFunction { .. }
             | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
@@ -299,6 +341,7 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
@@ -398,6 +441,23 @@ impl ObjectHeap {
         }
     }
 
+    /// Returns the host-function id stored in a host-function object, if any.
+    pub fn host_function(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<HostFunctionId>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::HostFunction { function, .. } => Ok(Some(*function)),
+            HeapValue::Object { .. }
+            | HeapValue::Array { .. }
+            | HeapValue::String { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Ok(None),
+        }
+    }
+
     /// Returns the captured upvalue handle for a closure slot.
     pub fn closure_upvalue(
         &self,
@@ -442,15 +502,21 @@ impl ObjectHeap {
         handle: ObjectHandle,
         property: PropertyNameId,
         cache: PropertyInlineCache,
-    ) -> Result<Option<RegisterValue>, ObjectError> {
+    ) -> Result<Option<PropertyValue>, ObjectError> {
         let object = self.object(handle)?;
-        let HeapValue::Object {
-            shape_id,
-            keys,
-            values,
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id,
+                keys,
+                values,
+            }
+            | HeapValue::HostFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            } => (shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         if *shape_id != cache.shape_id() {
             return Ok(None);
@@ -469,15 +535,21 @@ impl ObjectHeap {
         &self,
         handle: ObjectHandle,
         property: PropertyNameId,
-    ) -> Result<Option<(RegisterValue, PropertyInlineCache)>, ObjectError> {
+    ) -> Result<Option<(PropertyValue, PropertyInlineCache)>, ObjectError> {
         let object = self.object(handle)?;
-        let HeapValue::Object {
-            shape_id,
-            keys,
-            values,
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id,
+                keys,
+                values,
+            }
+            | HeapValue::HostFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            } => (shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -493,15 +565,20 @@ impl ObjectHeap {
         handle: ObjectHandle,
         shape_id: ObjectShapeId,
         slot_index: u16,
-    ) -> Result<Option<RegisterValue>, ObjectError> {
+    ) -> Result<Option<PropertyValue>, ObjectError> {
         let object = self.object(handle)?;
-        let HeapValue::Object {
-            shape_id: object_shape_id,
-            values,
-            ..
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (object_shape_id, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                values,
+                ..
+            } => (object_shape_id, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         if *object_shape_id != shape_id {
             return Ok(None);
@@ -518,13 +595,19 @@ impl ObjectHeap {
         cache: PropertyInlineCache,
     ) -> Result<bool, ObjectError> {
         let object = self.object_mut(handle)?;
-        let HeapValue::Object {
-            shape_id,
-            keys,
-            values,
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id,
+                keys,
+                values,
+            }
+            | HeapValue::HostFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            } => (shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         if *shape_id != cache.shape_id() {
             return Ok(false);
@@ -534,7 +617,7 @@ impl ObjectHeap {
         if keys.get(slot_index) == Some(&property)
             && let Some(slot) = values.get_mut(slot_index)
         {
-            *slot = value;
+            *slot = PropertyValue::data(value);
             return Ok(true);
         }
 
@@ -550,6 +633,7 @@ impl ObjectHeap {
     ) -> Result<PropertyInlineCache, ObjectError> {
         if let Some(slot_index) = match self.object(handle)? {
             HeapValue::Object { keys, .. } => property_slot(keys, property),
+            HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
@@ -560,28 +644,37 @@ impl ObjectHeap {
             }
         } {
             let object = self.object_mut(handle)?;
-            let HeapValue::Object {
-                shape_id, values, ..
-            } = object
-            else {
-                return Err(ObjectError::InvalidKind);
+            let (shape_id, values) = match object {
+                HeapValue::Object {
+                    shape_id, values, ..
+                }
+                | HeapValue::HostFunction {
+                    shape_id, values, ..
+                } => (shape_id, values),
+                _ => return Err(ObjectError::InvalidKind),
             };
-            values[usize::from(slot_index)] = value;
+            values[usize::from(slot_index)] = PropertyValue::data(value);
             return Ok(PropertyInlineCache::new(*shape_id, slot_index));
         }
 
         let shape_id = self.allocate_shape();
         let object = self.object_mut(handle)?;
-        let HeapValue::Object {
-            shape_id: object_shape_id,
-            keys,
-            values,
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                keys,
+                values,
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } => (object_shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         keys.push(property);
-        values.push(value);
+        values.push(PropertyValue::data(value));
         *object_shape_id = shape_id;
         let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
         Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
@@ -596,13 +689,18 @@ impl ObjectHeap {
         value: RegisterValue,
     ) -> Result<bool, ObjectError> {
         let object = self.object_mut(handle)?;
-        let HeapValue::Object {
-            shape_id: object_shape_id,
-            values,
-            ..
-        } = object
-        else {
-            return Err(ObjectError::InvalidKind);
+        let (object_shape_id, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                values,
+                ..
+            } => (object_shape_id, values),
+            _ => return Err(ObjectError::InvalidKind),
         };
         if *object_shape_id != shape_id {
             return Ok(false);
@@ -610,8 +708,65 @@ impl ObjectHeap {
         let Some(slot) = values.get_mut(usize::from(slot_index)) else {
             return Ok(false);
         };
-        *slot = value;
+        *slot = PropertyValue::data(value);
         Ok(true)
+    }
+
+    /// Defines or replaces an accessor property.
+    pub fn define_accessor(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        getter: Option<ObjectHandle>,
+        setter: Option<ObjectHandle>,
+    ) -> Result<PropertyInlineCache, ObjectError> {
+        let accessor = PropertyValue::Accessor { getter, setter };
+
+        if let Some(slot_index) = match self.object(handle)? {
+            HeapValue::Object { keys, .. } => property_slot(keys, property),
+            HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::Array { .. }
+            | HeapValue::String { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+        } {
+            let object = self.object_mut(handle)?;
+            let (shape_id, values) = match object {
+                HeapValue::Object {
+                    shape_id, values, ..
+                }
+                | HeapValue::HostFunction {
+                    shape_id, values, ..
+                } => (shape_id, values),
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            values[usize::from(slot_index)] = accessor;
+            return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+        }
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                keys,
+                values,
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } => (object_shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        keys.push(property);
+        values.push(accessor);
+        *object_shape_id = shape_id;
+        let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
     }
 
     fn object(&self, handle: ObjectHandle) -> Result<&HeapValue, ObjectError> {
@@ -641,11 +796,14 @@ fn property_slot(keys: &[PropertyNameId], property: PropertyNameId) -> Option<u1
 
 #[cfg(test)]
 mod tests {
+    use crate::host::HostFunctionId;
     use crate::module::FunctionIndex;
     use crate::property::PropertyNameId;
     use crate::value::RegisterValue;
 
-    use super::{HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyInlineCache};
+    use super::{
+        HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyInlineCache, PropertyValue,
+    };
 
     #[test]
     fn object_heap_supports_generic_and_cached_property_access() {
@@ -659,7 +817,7 @@ mod tests {
         assert_eq!(
             heap.get_cached(handle, property, cache)
                 .expect("cache lookup should succeed"),
-            Some(RegisterValue::from_i32(7))
+            Some(PropertyValue::Data(RegisterValue::from_i32(7)))
         );
 
         assert!(
@@ -671,7 +829,12 @@ mod tests {
             .get_property(handle, property)
             .expect("generic lookup should succeed");
         assert_eq!(
-            generic,
+            generic.map(|(value, cache)| {
+                let PropertyValue::Data(value) = value else {
+                    panic!("expected data property");
+                };
+                (value, cache)
+            }),
             Some((
                 RegisterValue::from_i32(9),
                 PropertyInlineCache::new(cache.shape_id(), cache.slot_index())
@@ -747,6 +910,24 @@ mod tests {
         assert_eq!(
             heap.closure_upvalue(closure, 1),
             Err(ObjectError::InvalidIndex)
+        );
+    }
+
+    #[test]
+    fn object_heap_supports_host_function_objects() {
+        let mut heap = ObjectHeap::new();
+        let function = heap.alloc_host_function(HostFunctionId(7));
+        let property = PropertyNameId(0);
+
+        assert_eq!(heap.kind(function), Ok(HeapValueKind::HostFunction));
+        assert_eq!(heap.host_function(function), Ok(Some(HostFunctionId(7))));
+        heap.set_property(function, property, RegisterValue::from_i32(9))
+            .expect("host function property store should succeed");
+        assert_eq!(
+            heap.get_property(function, property)
+                .expect("host function property lookup should succeed")
+                .map(|entry| entry.0),
+            Some(PropertyValue::Data(RegisterValue::from_i32(9)))
         );
     }
 

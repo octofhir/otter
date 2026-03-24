@@ -3,7 +3,7 @@
 //! Provides minimal exports needed by Node.js test harness (`common/tmpdir.js`):
 //! `spawnSync`, `execSync`, `spawn`, `exec`, `fork`.
 
-use otter_macros::{js_class, js_static};
+use otter_macros::{legacy_js_class, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -85,12 +85,12 @@ pub fn node_child_process_extension() -> Box<dyn OtterExtension> {
 // Stub functions via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "ChildProcessStub")]
+#[legacy_js_class(name = "ChildProcessStub")]
 pub struct ChildProcessStub;
 
-#[js_class]
+#[legacy_js_class]
 impl ChildProcessStub {
-    #[js_static(name = "spawnSync", length = 1)]
+    #[legacy_js_static(name = "spawnSync", length = 1)]
     pub fn spawn_sync(
         _this: &Value,
         _args: &[Value],
@@ -112,7 +112,7 @@ impl ChildProcessStub {
         Ok(Value::object(result))
     }
 
-    #[js_static(name = "execSync", length = 1)]
+    #[legacy_js_static(name = "execSync", length = 1)]
     pub fn exec_sync(
         _this: &Value,
         _args: &[Value],
@@ -123,7 +123,7 @@ impl ChildProcessStub {
         ))
     }
 
-    #[js_static(name = "spawn", length = 1)]
+    #[legacy_js_static(name = "spawn", length = 1)]
     pub fn spawn(
         _this: &Value,
         _args: &[Value],
@@ -134,7 +134,7 @@ impl ChildProcessStub {
         ))
     }
 
-    #[js_static(name = "exec", length = 1)]
+    #[legacy_js_static(name = "exec", length = 1)]
     pub fn exec(
         _this: &Value,
         _args: &[Value],
@@ -145,7 +145,7 @@ impl ChildProcessStub {
         ))
     }
 
-    #[js_static(name = "fork", length = 1)]
+    #[legacy_js_static(name = "fork", length = 1)]
     pub fn fork(
         _this: &Value,
         _args: &[Value],

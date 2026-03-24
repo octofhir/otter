@@ -820,7 +820,30 @@ pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let item_clone = item.clone();
     if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
-        return expand_js_class_impl(i);
+        return expand_new_js_class_impl(i);
+    }
+
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "Expected struct or impl block",
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// Legacy JS class macro retained only for old VM/core callsites.
+#[proc_macro_attribute]
+pub fn legacy_js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as JsClassArgs);
+
+    let item_clone = item.clone();
+    if let Ok(s) = syn::parse::<ItemStruct>(item_clone) {
+        return expand_js_class_struct(s, args);
+    }
+
+    let item_clone = item.clone();
+    if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
+        return expand_legacy_js_class_impl(i);
     }
 
     syn::Error::new(
@@ -899,27 +922,93 @@ fn expand_js_class_struct(input: ItemStruct, args: JsClassArgs) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// Parse `name` and `length` from a `#[js_*(...)]` attribute's arguments.
-///
-/// Handles: `#[js_method]` (no args), `#[js_method(name = "on")]`,
-/// `#[js_method(name = "on", length = 2)]`, `#[js_method(length = 2)]`.
-fn parse_js_attr_args(attr: &syn::Attribute) -> (Option<String>, Option<u32>) {
-    let mut name = None;
-    let mut length = None;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsMemberKind {
+    Constructor,
+    Method,
+    Static,
+    Getter,
+    Setter,
+}
+
+impl JsMemberKind {
+    fn default_length(self) -> u32 {
+        match self {
+            Self::Constructor | Self::Method | Self::Static | Self::Getter => 0,
+            Self::Setter => 1,
+        }
+    }
+}
+
+struct JsMemberAttr {
+    kind: JsMemberKind,
+    name: Option<String>,
+    length: Option<u32>,
+}
+
+fn parse_js_member_attr(attr: &syn::Attribute) -> syn::Result<Option<JsMemberAttr>> {
+    let mut parsed = if attr.path().is_ident("js_constructor") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Constructor,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("js_method") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Method,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("js_static") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Static,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("js_getter") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Getter,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("js_setter") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Setter,
+            name: None,
+            length: None,
+        })
+    } else {
+        None
+    };
+
+    let Some(ref mut parsed_attr) = parsed else {
+        return Ok(None);
+    };
 
     if let syn::Meta::List(list) = &attr.meta {
-        let _ = syn::parse::Parser::parse2(
+        syn::parse::Parser::parse2(
             |input: ParseStream| {
                 while !input.is_empty() {
                     let ident: Ident = input.parse()?;
-                    input.parse::<Token![=]>()?;
-
-                    if ident == "name" {
-                        let lit: LitStr = input.parse()?;
-                        name = Some(lit.value());
-                    } else if ident == "length" {
-                        let lit: LitInt = input.parse()?;
-                        length = Some(lit.base10_parse()?);
+                    match ident.to_string().as_str() {
+                        "name" => {
+                            input.parse::<Token![=]>()?;
+                            let lit: LitStr = input.parse()?;
+                            parsed_attr.name = Some(lit.value());
+                        }
+                        "length" => {
+                            input.parse::<Token![=]>()?;
+                            let lit: LitInt = input.parse()?;
+                            parsed_attr.length = Some(lit.base10_parse()?);
+                        }
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                ident,
+                                format!(
+                                    "Unknown js_class member option '{other}'. Expected name or length."
+                                ),
+                            ));
+                        }
                     }
 
                     if input.peek(Token![,]) {
@@ -929,23 +1018,416 @@ fn parse_js_attr_args(attr: &syn::Attribute) -> (Option<String>, Option<u32>) {
                 Ok(())
             },
             list.tokens.clone(),
-        );
+        )?;
     }
 
-    (name, length)
+    Ok(parsed)
 }
 
-fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
-    let self_ty = &input.self_ty;
+fn parse_legacy_js_member_attr(attr: &syn::Attribute) -> syn::Result<Option<JsMemberAttr>> {
+    let mut parsed = if attr.path().is_ident("legacy_js_constructor") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Constructor,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("legacy_js_method") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Method,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("legacy_js_static") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Static,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("legacy_js_getter") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Getter,
+            name: None,
+            length: None,
+        })
+    } else if attr.path().is_ident("legacy_js_setter") {
+        Some(JsMemberAttr {
+            kind: JsMemberKind::Setter,
+            name: None,
+            length: None,
+        })
+    } else {
+        None
+    };
 
-    // Metadata lists (backward compatible)
+    let Some(ref mut parsed_attr) = parsed else {
+        return Ok(None);
+    };
+
+    if let syn::Meta::List(list) = &attr.meta {
+        syn::parse::Parser::parse2(
+            |input: ParseStream| {
+                while !input.is_empty() {
+                    let ident: Ident = input.parse()?;
+                    match ident.to_string().as_str() {
+                        "name" => {
+                            input.parse::<Token![=]>()?;
+                            let lit: LitStr = input.parse()?;
+                            parsed_attr.name = Some(lit.value());
+                        }
+                        "length" => {
+                            input.parse::<Token![=]>()?;
+                            let lit: LitInt = input.parse()?;
+                            parsed_attr.length = Some(lit.base10_parse()?);
+                        }
+                        "constructor" => {
+                            parsed_attr.kind = JsMemberKind::Constructor;
+                        }
+                        "kind" => {
+                            input.parse::<Token![=]>()?;
+                            let lit: LitStr = input.parse()?;
+                            parsed_attr.kind = match lit.value().as_str() {
+                                "method" => JsMemberKind::Method,
+                                "getter" => JsMemberKind::Getter,
+                                "setter" => JsMemberKind::Setter,
+                                "static" => JsMemberKind::Static,
+                                other => {
+                                    return Err(syn::Error::new_spanned(
+                                        lit,
+                                        format!(
+                                            "Unknown legacy_js_class member kind '{other}'. Expected method, getter, setter, or static."
+                                        ),
+                                    ));
+                                }
+                            };
+                        }
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                ident,
+                                format!(
+                                    "Unknown legacy_js_class member option '{other}'. Expected name, length, constructor, or kind."
+                                ),
+                            ));
+                        }
+                    }
+
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                }
+                Ok(())
+            },
+            list.tokens.clone(),
+        )?;
+    }
+
+    Ok(parsed)
+}
+
+fn is_type_named(ty: &Type, expected: &str) -> bool {
+    match ty {
+        Type::Path(type_path) => type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == expected),
+        _ => false,
+    }
+}
+
+fn is_register_value_ref(arg: &FnArg) -> bool {
+    let FnArg::Typed(pat_type) = arg else {
+        return false;
+    };
+
+    if let Type::Reference(type_ref) = &*pat_type.ty {
+        return is_type_named(&type_ref.elem, "RegisterValue");
+    }
+
+    false
+}
+
+fn is_register_value_slice(arg: &FnArg) -> bool {
+    let FnArg::Typed(pat_type) = arg else {
+        return false;
+    };
+
+    if let Type::Reference(type_ref) = &*pat_type.ty
+        && let Type::Slice(type_slice) = &*type_ref.elem
+    {
+        return is_type_named(&type_slice.elem, "RegisterValue");
+    }
+
+    false
+}
+
+fn is_runtime_state_ref(arg: &FnArg) -> bool {
+    let FnArg::Typed(pat_type) = arg else {
+        return false;
+    };
+
+    if let Type::Reference(type_ref) = &*pat_type.ty {
+        return type_ref.mutability.is_some() && is_type_named(&type_ref.elem, "RuntimeState");
+    }
+
+    false
+}
+
+fn is_new_vm_js_class_method(method: &syn::ImplItemFn) -> bool {
+    let params: Vec<_> = method.sig.inputs.iter().collect();
+    params.len() == 3
+        && is_register_value_ref(params[0])
+        && is_register_value_slice(params[1])
+        && is_runtime_state_ref(params[2])
+}
+
+fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
+    let self_ty = &input.self_ty;
+    let mut errors = Vec::new();
+
     let mut constructors = Vec::new();
     let mut methods = Vec::new();
     let mut static_methods = Vec::new();
     let mut js_getters = Vec::new();
     let mut js_setters = Vec::new();
 
-    // Info for _decl() generation
+    struct DescriptorInfo {
+        rust_ident: Ident,
+        js_name: String,
+        length: u32,
+        kind: JsMemberKind,
+    }
+    let mut descriptor_members: Vec<DescriptorInfo> = Vec::new();
+    let mut descriptor_constructor: Option<DescriptorInfo> = None;
+
+    for item in &input.items {
+        if let syn::ImplItem::Fn(method) = item {
+            let rust_ident = method.sig.ident.clone();
+            let rust_name = rust_ident.to_string();
+            let mut member_attr = None;
+
+            for attr in &method.attrs {
+                match parse_js_member_attr(attr) {
+                    Ok(Some(parsed_attr)) => {
+                        if member_attr.is_some() {
+                            errors.push(
+                                syn::Error::new_spanned(
+                                    attr,
+                                    "Expected at most one js_class member attribute per method.",
+                                )
+                                .to_compile_error(),
+                            );
+                            continue;
+                        }
+                        member_attr = Some(parsed_attr);
+                    }
+                    Ok(None) => {}
+                    Err(error) => errors.push(error.to_compile_error()),
+                }
+            }
+
+            let Some(member_attr) = member_attr else {
+                continue;
+            };
+
+            let js_name = member_attr.name.unwrap_or_else(|| rust_name.clone());
+            let length = member_attr
+                .length
+                .unwrap_or_else(|| member_attr.kind.default_length());
+
+            match member_attr.kind {
+                JsMemberKind::Constructor => constructors.push(rust_name.clone()),
+                JsMemberKind::Method => methods.push(rust_name.clone()),
+                JsMemberKind::Static => static_methods.push(rust_name.clone()),
+                JsMemberKind::Getter => js_getters.push(rust_name.clone()),
+                JsMemberKind::Setter => js_setters.push(rust_name.clone()),
+            }
+
+            if !is_new_vm_js_class_method(method) {
+                errors.push(
+                    syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "js_class only supports new-VM methods with signature fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>.",
+                    )
+                    .to_compile_error(),
+                );
+                continue;
+            }
+
+            let info = DescriptorInfo {
+                rust_ident: rust_ident.clone(),
+                js_name,
+                length,
+                kind: member_attr.kind,
+            };
+
+            if info.kind == JsMemberKind::Constructor {
+                if descriptor_constructor.is_some() {
+                    errors.push(
+                        syn::Error::new_spanned(
+                            &method.sig.ident,
+                            "Expected at most one js_class constructor for new-VM metadata.",
+                        )
+                        .to_compile_error(),
+                    );
+                } else {
+                    descriptor_constructor = Some(info);
+                }
+            } else {
+                descriptor_members.push(info);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return quote! {
+            #(#errors)*
+            #input
+        }
+        .into();
+    }
+
+    let descriptor_fns: Vec<_> = descriptor_members
+        .iter()
+        .chain(descriptor_constructor.iter())
+        .map(|info| {
+            let descriptor_fn_name = format_ident!("{}_descriptor", info.rust_ident);
+            let rust_ident = &info.rust_ident;
+            let js_name = &info.js_name;
+            let length = info.length;
+
+            let descriptor_ctor = match info.kind {
+                JsMemberKind::Constructor => {
+                    quote! {
+                        ::otter_vm::NativeFunctionDescriptor::constructor(
+                            #js_name,
+                            #length as u16,
+                            callback,
+                        )
+                    }
+                }
+                JsMemberKind::Method | JsMemberKind::Static => {
+                    quote! {
+                        ::otter_vm::NativeFunctionDescriptor::method(
+                            #js_name,
+                            #length as u16,
+                            callback,
+                        )
+                    }
+                }
+                JsMemberKind::Getter => {
+                    quote! {
+                        ::otter_vm::NativeFunctionDescriptor::getter(#js_name, callback)
+                    }
+                }
+                JsMemberKind::Setter => {
+                    quote! {
+                        ::otter_vm::NativeFunctionDescriptor::setter(#js_name, callback)
+                    }
+                }
+            };
+
+            quote! {
+                /// New-VM descriptor for this js_class member.
+                pub fn #descriptor_fn_name() -> ::otter_vm::NativeFunctionDescriptor {
+                    let callback = Self::#rust_ident as ::otter_vm::VmNativeFunction;
+                    #descriptor_ctor
+                }
+            }
+        })
+        .collect();
+
+    let class_descriptor_fn = if descriptor_constructor.is_some() || !descriptor_members.is_empty()
+    {
+        let constructor_binding = descriptor_constructor.as_ref().map(|info| {
+            let descriptor_fn_name = format_ident!("{}_descriptor", info.rust_ident);
+            quote! {
+                descriptor = descriptor.with_constructor(Self::#descriptor_fn_name());
+            }
+        });
+
+        let binding_pushes: Vec<_> = descriptor_members
+            .iter()
+            .map(|info| {
+                let descriptor_fn_name = format_ident!("{}_descriptor", info.rust_ident);
+                let target = match info.kind {
+                    JsMemberKind::Static => quote!(::otter_vm::NativeBindingTarget::Constructor),
+                    JsMemberKind::Method | JsMemberKind::Getter | JsMemberKind::Setter => {
+                        quote!(::otter_vm::NativeBindingTarget::Prototype)
+                    }
+                    JsMemberKind::Constructor => {
+                        quote!(::otter_vm::NativeBindingTarget::Constructor)
+                    }
+                };
+
+                quote! {
+                    descriptor = descriptor.with_binding(::otter_vm::NativeBindingDescriptor::new(
+                        #target,
+                        Self::#descriptor_fn_name(),
+                    ));
+                }
+            })
+            .collect();
+
+        quote! {
+            /// Aggregate new-VM class descriptor emitted by #[js_class].
+            pub fn js_class_descriptor() -> ::otter_vm::JsClassDescriptor {
+                let mut descriptor = ::otter_vm::JsClassDescriptor::new(Self::JS_CLASS_NAME);
+                #constructor_binding
+                #(#binding_pushes)*
+                descriptor
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let expanded = quote! {
+        #input
+
+        impl #self_ty {
+            /// Get JS constructor names
+            pub fn js_constructors() -> &'static [&'static str] {
+                &[#(#constructors),*]
+            }
+
+            /// Get JS method names
+            pub fn js_methods() -> &'static [&'static str] {
+                &[#(#methods),*]
+            }
+
+            /// Get JS static method names
+            pub fn js_static_methods() -> &'static [&'static str] {
+                &[#(#static_methods),*]
+            }
+
+            /// Get JS getter names
+            pub fn js_getters() -> &'static [&'static str] {
+                &[#(#js_getters),*]
+            }
+
+            /// Get JS setter names
+            pub fn js_setters() -> &'static [&'static str] {
+                &[#(#js_setters),*]
+            }
+
+            #(#descriptor_fns)*
+            #class_descriptor_fn
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+fn expand_legacy_js_class_impl(input: ItemImpl) -> TokenStream {
+    let self_ty = &input.self_ty;
+    let mut errors = Vec::new();
+
+    let mut constructors = Vec::new();
+    let mut methods = Vec::new();
+    let mut static_methods = Vec::new();
+    let mut js_getters = Vec::new();
+    let mut js_setters = Vec::new();
+
     struct DeclInfo {
         rust_ident: Ident,
         js_name: String,
@@ -957,51 +1439,61 @@ fn expand_js_class_impl(input: ItemImpl) -> TokenStream {
         if let syn::ImplItem::Fn(method) = item {
             let rust_ident = method.sig.ident.clone();
             let rust_name = rust_ident.to_string();
+            let mut member_attr = None;
 
             for attr in &method.attrs {
-                let (attr_name, attr_length) = if attr.path().is_ident("js_constructor")
-                    || attr.path().is_ident("js_method")
-                    || attr.path().is_ident("js_static")
-                    || attr.path().is_ident("js_getter")
-                    || attr.path().is_ident("js_setter")
-                {
-                    parse_js_attr_args(attr)
-                } else {
-                    continue;
-                };
-
-                // Only generate _decl() when the attribute has explicit args
-                // (name or length), signaling the method has NativeFn-compatible
-                // signature: (this: &Value, args: &[Value], ncx: &mut NativeContext)
-                let has_explicit_args = attr_name.is_some() || attr_length.is_some();
-
-                let js_name = attr_name.unwrap_or_else(|| rust_name.clone());
-                let length = attr_length.unwrap_or(0);
-
-                if attr.path().is_ident("js_constructor") {
-                    constructors.push(rust_name.clone());
-                } else if attr.path().is_ident("js_method") {
-                    methods.push(rust_name.clone());
-                } else if attr.path().is_ident("js_static") {
-                    static_methods.push(rust_name.clone());
-                } else if attr.path().is_ident("js_getter") {
-                    js_getters.push(rust_name.clone());
-                } else if attr.path().is_ident("js_setter") {
-                    js_setters.push(rust_name.clone());
-                }
-
-                if has_explicit_args {
-                    all_decls.push(DeclInfo {
-                        rust_ident: rust_ident.clone(),
-                        js_name,
-                        length,
-                    });
+                match parse_legacy_js_member_attr(attr) {
+                    Ok(Some(parsed_attr)) => {
+                        if member_attr.is_some() {
+                            errors.push(
+                                syn::Error::new_spanned(
+                                    attr,
+                                    "Expected at most one legacy_js_class member attribute per method.",
+                                )
+                                .to_compile_error(),
+                            );
+                            continue;
+                        }
+                        member_attr = Some(parsed_attr);
+                    }
+                    Ok(None) => {}
+                    Err(error) => errors.push(error.to_compile_error()),
                 }
             }
+
+            let Some(member_attr) = member_attr else {
+                continue;
+            };
+
+            let js_name = member_attr.name.unwrap_or_else(|| rust_name.clone());
+            let length = member_attr
+                .length
+                .unwrap_or_else(|| member_attr.kind.default_length());
+
+            match member_attr.kind {
+                JsMemberKind::Constructor => constructors.push(rust_name.clone()),
+                JsMemberKind::Method => methods.push(rust_name.clone()),
+                JsMemberKind::Static => static_methods.push(rust_name.clone()),
+                JsMemberKind::Getter => js_getters.push(rust_name.clone()),
+                JsMemberKind::Setter => js_setters.push(rust_name.clone()),
+            }
+
+            all_decls.push(DeclInfo {
+                rust_ident: rust_ident.clone(),
+                js_name,
+                length,
+            });
         }
     }
 
-    // Generate _decl() functions: each returns (&str, NativeFn, u32)
+    if !errors.is_empty() {
+        return quote! {
+            #(#errors)*
+            #input
+        }
+        .into();
+    }
+
     let decl_fns: Vec<_> = all_decls
         .iter()
         .map(|info| {
@@ -1126,6 +1618,36 @@ pub fn js_getter(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a method as JS setter
 #[proc_macro_attribute]
 pub fn js_setter(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a legacy old-VM method as JS constructor
+#[proc_macro_attribute]
+pub fn legacy_js_constructor(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a legacy old-VM method as JS instance method
+#[proc_macro_attribute]
+pub fn legacy_js_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a legacy old-VM method as JS static method
+#[proc_macro_attribute]
+pub fn legacy_js_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a legacy old-VM method as JS getter
+#[proc_macro_attribute]
+pub fn legacy_js_getter(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+/// Mark a legacy old-VM method as JS setter
+#[proc_macro_attribute]
+pub fn legacy_js_setter(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 

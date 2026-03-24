@@ -3,7 +3,7 @@
 //! Provides minimal exports needed by Node.js test harness (`common/index.js`):
 //! `isMainThread`, `parentPort`, `workerData`, `threadId`, `Worker`.
 
-use otter_macros::{js_class, js_static};
+use otter_macros::{legacy_js_class, legacy_js_static};
 use otter_vm_core::context::NativeContext;
 use otter_vm_core::error::VmError;
 use otter_vm_core::gc::GcRef;
@@ -68,12 +68,12 @@ pub fn node_worker_threads_extension() -> Box<dyn OtterExtension> {
 // Stub functions via #[js_class]
 // ---------------------------------------------------------------------------
 
-#[js_class(name = "WorkerThreadsStub")]
+#[legacy_js_class(name = "WorkerThreadsStub")]
 pub struct WorkerThreadsStub;
 
-#[js_class]
+#[legacy_js_class]
 impl WorkerThreadsStub {
-    #[js_static(name = "Worker", length = 1)]
+    #[legacy_js_static(name = "Worker", length = 1)]
     pub fn worker(
         _this: &Value,
         _args: &[Value],

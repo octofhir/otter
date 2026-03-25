@@ -1,17 +1,21 @@
 //! Interpreter entry points for the new VM.
 
+use core::any::Any;
 use core::fmt;
 
 use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
 use crate::closure::{ClosureTemplate, UpvalueId};
-use crate::descriptors::VmNativeCallError;
+use crate::descriptors::{NativeSlotKind, VmNativeCallError};
 use crate::feedback::{FeedbackKind, FeedbackSlotId};
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::host::{HostFunctionId, NativeFunctionRegistry};
 use crate::intrinsics::VmIntrinsics;
 use crate::module::{Function, FunctionIndex, Module};
-use crate::object::{ObjectError, ObjectHandle, ObjectHeap, PropertyInlineCache, PropertyValue};
+use crate::object::{
+    HeapValueKind, ObjectError, ObjectHandle, ObjectHeap, PropertyInlineCache, PropertyValue,
+};
+use crate::payload::{NativePayloadError, NativePayloadRegistry, VmTrace, VmValueTracer};
 use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::string::StringId;
 use crate::value::{RegisterValue, ValueError};
@@ -360,6 +364,7 @@ pub struct RuntimeState {
     objects: ObjectHeap,
     property_names: PropertyNameRegistry,
     native_functions: NativeFunctionRegistry,
+    native_payloads: NativePayloadRegistry,
 }
 
 impl RuntimeState {
@@ -385,6 +390,7 @@ impl RuntimeState {
             objects,
             property_names,
             native_functions,
+            native_payloads: NativePayloadRegistry::new(),
         }
     }
 
@@ -437,12 +443,381 @@ impl RuntimeState {
         &mut self.native_functions
     }
 
+    /// Returns the runtime-owned native payload registry.
+    #[must_use]
+    pub fn native_payloads(&self) -> &NativePayloadRegistry {
+        &self.native_payloads
+    }
+
+    /// Returns the mutable runtime-owned native payload registry.
+    pub fn native_payloads_mut(&mut self) -> &mut NativePayloadRegistry {
+        &mut self.native_payloads
+    }
+
     /// Registers one host-callable native function in the runtime registry.
     pub fn register_native_function(
         &mut self,
         descriptor: crate::descriptors::NativeFunctionDescriptor,
     ) -> HostFunctionId {
         self.native_functions.register(descriptor)
+    }
+
+    /// Allocates one ordinary object with the runtime default prototype.
+    pub fn alloc_object(&mut self) -> ObjectHandle {
+        let prototype = self.intrinsics.object_prototype();
+        let handle = self.objects.alloc_object();
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("ordinary object prototype should exist");
+        handle
+    }
+
+    /// Allocates one ordinary object with an explicit prototype.
+    pub fn alloc_object_with_prototype(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
+        let handle = self.objects.alloc_object();
+        self.objects
+            .set_prototype(handle, prototype)
+            .expect("explicit object prototype should be valid");
+        handle
+    }
+
+    /// Allocates one ordinary object that carries a Rust-owned native payload.
+    pub fn alloc_native_object<T>(&mut self, payload: T) -> ObjectHandle
+    where
+        T: VmTrace + Any,
+    {
+        let prototype = self.intrinsics.object_prototype();
+        self.alloc_native_object_with_prototype(Some(prototype), payload)
+    }
+
+    /// Allocates one payload-bearing object with an explicit prototype.
+    pub fn alloc_native_object_with_prototype<T>(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+        payload: T,
+    ) -> ObjectHandle
+    where
+        T: VmTrace + Any,
+    {
+        let payload = self.native_payloads.insert(payload);
+        let handle = self.objects.alloc_native_object(payload);
+        self.objects
+            .set_prototype(handle, prototype)
+            .expect("explicit native object prototype should be valid");
+        handle
+    }
+
+    /// Allocates one dense array with the runtime default prototype.
+    pub fn alloc_array(&mut self) -> ObjectHandle {
+        let prototype = self.intrinsics.array_prototype();
+        let handle = self.objects.alloc_array();
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("array prototype should exist");
+        handle
+    }
+
+    /// Allocates one string object with the runtime default prototype.
+    pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
+        let prototype = self.intrinsics.string_prototype();
+        let handle = self.objects.alloc_string(value);
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("string prototype should exist");
+        handle
+    }
+
+    /// Allocates one host-callable function with the runtime default prototype.
+    pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
+        let prototype = self.intrinsics.function_prototype();
+        let handle = self.objects.alloc_host_function(function);
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("function prototype should exist");
+        handle
+    }
+
+    /// Allocates one bytecode closure with the runtime default function prototype.
+    pub fn alloc_closure(
+        &mut self,
+        callee: FunctionIndex,
+        upvalues: Vec<ObjectHandle>,
+    ) -> ObjectHandle {
+        let prototype = self.intrinsics.function_prototype();
+        let handle = self.objects.alloc_closure(callee, upvalues);
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("function prototype should exist");
+        let prototype_property = self.intern_property_name("prototype");
+        let constructor_property = self.intern_property_name("constructor");
+        let instance_prototype = self.alloc_object();
+        self.objects
+            .set_property(
+                handle,
+                prototype_property,
+                RegisterValue::from_object_handle(instance_prototype.0),
+            )
+            .expect("closure prototype object should install");
+        self.objects
+            .set_property(
+                instance_prototype,
+                constructor_property,
+                RegisterValue::from_object_handle(handle.0),
+            )
+            .expect("closure prototype.constructor should install");
+        handle
+    }
+
+    /// Resolves one native payload from a payload-bearing object.
+    pub fn native_payload<T>(&self, handle: ObjectHandle) -> Result<&T, NativePayloadError>
+    where
+        T: Any,
+    {
+        let payload = self
+            .objects
+            .native_payload_id(handle)?
+            .ok_or(NativePayloadError::MissingPayload)?;
+        self.native_payloads.get::<T>(payload)
+    }
+
+    /// Resolves one mutable native payload from a payload-bearing object.
+    pub fn native_payload_mut<T>(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<&mut T, NativePayloadError>
+    where
+        T: Any,
+    {
+        let payload = self
+            .objects
+            .native_payload_id(handle)?
+            .ok_or(NativePayloadError::MissingPayload)?;
+        self.native_payloads.get_mut::<T>(payload)
+    }
+
+    /// Resolves one native payload from a JS-visible receiver value.
+    pub fn native_payload_from_value<T>(
+        &self,
+        value: &RegisterValue,
+    ) -> Result<&T, NativePayloadError>
+    where
+        T: Any,
+    {
+        let handle = value
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or(NativePayloadError::ExpectedObjectValue)?;
+        self.native_payload::<T>(handle)
+    }
+
+    /// Resolves one mutable native payload from a JS-visible receiver value.
+    pub fn native_payload_mut_from_value<T>(
+        &mut self,
+        value: &RegisterValue,
+    ) -> Result<&mut T, NativePayloadError>
+    where
+        T: Any,
+    {
+        let handle = value
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or(NativePayloadError::ExpectedObjectValue)?;
+        self.native_payload_mut::<T>(handle)
+    }
+
+    /// Traces GC-visible values stored inside native payload-bearing objects.
+    pub fn trace_native_payload_roots(
+        &self,
+        tracer: &mut dyn VmValueTracer,
+    ) -> Result<(), NativePayloadError> {
+        let mut result = Ok(());
+        self.objects
+            .trace_native_payload_links(&mut |_handle, payload| {
+                if result.is_ok() {
+                    result = self.native_payloads.trace_payload(payload, tracer);
+                }
+            });
+        result
+    }
+
+    /// Converts a JS-visible property key value into the runtime property-name id.
+    pub fn property_name_from_value(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<PropertyNameId, VmNativeCallError> {
+        let handle = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+            VmNativeCallError::Internal("property key must be a string object".into())
+        })?;
+        let key = self
+            .objects
+            .string_value(handle)
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("property key lookup failed: {error:?}").into())
+            })?
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("property key must be a string object".into())
+            })?
+            .to_owned();
+        Ok(self.intern_property_name(&key))
+    }
+
+    /// Executes ordinary named-property `[[Get]]` with an explicit receiver.
+    pub fn ordinary_get(
+        &mut self,
+        target: ObjectHandle,
+        property: PropertyNameId,
+        receiver: ObjectHandle,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        match self
+            .objects
+            .get_property(target, property)
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("ordinary get failed: {error:?}").into())
+            })? {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Data(value) => Ok(value),
+                PropertyValue::Accessor { getter, .. } => self.call_host_function(
+                    getter,
+                    RegisterValue::from_object_handle(receiver.0),
+                    &[],
+                ),
+            },
+            None => Ok(RegisterValue::undefined()),
+        }
+    }
+
+    /// Executes ordinary named-property `[[Set]]` with an explicit receiver.
+    pub fn ordinary_set(
+        &mut self,
+        target: ObjectHandle,
+        property: PropertyNameId,
+        receiver: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(), VmNativeCallError> {
+        match self
+            .objects
+            .get_property(target, property)
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("ordinary set failed: {error:?}").into())
+            })? {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Data(_) if lookup.owner() == receiver => {
+                    let cache = lookup.cache().ok_or_else(|| {
+                        VmNativeCallError::Internal(
+                            "receiver own-property lookup must carry cache metadata".into(),
+                        )
+                    })?;
+                    let updated = self
+                        .objects
+                        .set_cached(receiver, property, value, cache)
+                        .map_err(|error| {
+                            VmNativeCallError::Internal(
+                                format!("ordinary set receiver update failed: {error:?}").into(),
+                            )
+                        })?;
+                    if !updated {
+                        self.objects
+                            .set_property(receiver, property, value)
+                            .map_err(|error| {
+                                VmNativeCallError::Internal(
+                                    format!("ordinary set receiver fallback failed: {error:?}")
+                                        .into(),
+                                )
+                            })?;
+                    }
+                    Ok(())
+                }
+                PropertyValue::Data(_) => {
+                    self.objects
+                        .set_property(receiver, property, value)
+                        .map_err(|error| {
+                            VmNativeCallError::Internal(
+                                format!("ordinary set receiver define failed: {error:?}").into(),
+                            )
+                        })?;
+                    Ok(())
+                }
+                PropertyValue::Accessor { setter, .. } => {
+                    let _ = self.call_host_function(
+                        setter,
+                        RegisterValue::from_object_handle(receiver.0),
+                        &[value],
+                    )?;
+                    Ok(())
+                }
+            },
+            None => {
+                self.objects
+                    .set_property(receiver, property, value)
+                    .map_err(|error| {
+                        VmNativeCallError::Internal(
+                            format!("ordinary set receiver create failed: {error:?}").into(),
+                        )
+                    })?;
+                Ok(())
+            }
+        }
+    }
+
+    fn call_host_function(
+        &mut self,
+        callable: Option<ObjectHandle>,
+        receiver: RegisterValue,
+        arguments: &[RegisterValue],
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let Some(callable) = callable else {
+            return Ok(RegisterValue::undefined());
+        };
+        let host_function = self
+            .objects
+            .host_function(callable)
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("native callable lookup failed: {error:?}").into(),
+                )
+            })?
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("native callable is not a host function".into())
+            })?;
+        let descriptor = self
+            .native_functions
+            .get(host_function)
+            .cloned()
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("host function descriptor is missing".into())
+            })?;
+
+        match (descriptor.callback())(&receiver, arguments, self) {
+            Ok(value) => Ok(value),
+            Err(VmNativeCallError::Thrown(value)) => Err(VmNativeCallError::Thrown(value)),
+            Err(VmNativeCallError::Internal(message)) => Err(VmNativeCallError::Internal(message)),
+        }
+    }
+
+    fn js_typeof(&mut self, value: RegisterValue) -> Result<RegisterValue, InterpreterError> {
+        let kind = if value == RegisterValue::undefined() {
+            "undefined"
+        } else if value == RegisterValue::null() {
+            "object"
+        } else if value.as_bool().is_some() {
+            "boolean"
+        } else if value.as_number().is_some() {
+            "number"
+        } else if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            match self.objects.kind(handle)? {
+                HeapValueKind::String => "string",
+                HeapValueKind::HostFunction | HeapValueKind::Closure => "function",
+                HeapValueKind::Object
+                | HeapValueKind::Array
+                | HeapValueKind::UpvalueCell
+                | HeapValueKind::Iterator => "object",
+            }
+        } else {
+            "undefined"
+        };
+
+        let string = self.alloc_string(kind);
+        Ok(RegisterValue::from_object_handle(string.0))
     }
 }
 
@@ -521,6 +896,11 @@ impl Interpreter {
     pub fn execute(&self, module: &Module) -> Result<ExecutionResult, InterpreterError> {
         let mut activation = Self::prepare_entry(module);
         let mut runtime = RuntimeState::new();
+        let function = module.entry_function();
+        if function.frame_layout().receiver_slot().is_some() {
+            let global = runtime.intrinsics().global_object();
+            activation.set_receiver(function, RegisterValue::from_object_handle(global.0))?;
+        }
         self.run_with_runtime(module, &mut activation, &mut runtime)
     }
 
@@ -722,7 +1102,7 @@ impl Interpreter {
                 Ok(StepOutcome::Continue)
             }
             Opcode::NewObject => {
-                let handle = runtime.objects.alloc_object();
+                let handle = runtime.alloc_object();
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -733,7 +1113,7 @@ impl Interpreter {
             }
             Opcode::LoadString => {
                 let string = Self::resolve_string_literal(function, instruction.b())?;
-                let handle = runtime.objects.alloc_string(string);
+                let handle = runtime.alloc_string(string);
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -743,7 +1123,7 @@ impl Interpreter {
                 Ok(StepOutcome::Continue)
             }
             Opcode::NewArray => {
-                let handle = runtime.objects.alloc_array();
+                let handle = runtime.alloc_array();
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -763,7 +1143,7 @@ impl Interpreter {
                     upvalues.push(runtime.objects.alloc_upvalue(value));
                 }
 
-                let handle = runtime.objects.alloc_closure(template.callee(), upvalues);
+                let handle = runtime.alloc_closure(template.callee(), upvalues);
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -813,6 +1193,13 @@ impl Interpreter {
             Opcode::LoadThis => {
                 let receiver = activation.receiver(function)?;
                 activation.write_bytecode_register(function, instruction.a(), receiver)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::TypeOf => {
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let type_of = runtime.js_typeof(value)?;
+                activation.write_bytecode_register(function, instruction.a(), type_of)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -1060,6 +1447,7 @@ impl Interpreter {
 
                 if let Some(host_function) = runtime.objects.host_function(callee)? {
                     match Self::invoke_host_function(
+                        callee,
                         caller_function,
                         activation,
                         runtime,
@@ -1075,20 +1463,49 @@ impl Interpreter {
                         Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
                     }
                 } else {
-                    let mut callee_activation = Self::prepare_closure_call(
-                        module,
-                        activation,
-                        runtime,
-                        instruction.b(),
-                        instruction.c(),
-                        call,
-                    )?;
+                    let (mut callee_activation, construct_receiver) = if call.flags().is_construct()
+                    {
+                        let (activation, receiver) = Self::prepare_construct_closure_call(
+                            module,
+                            activation,
+                            runtime,
+                            instruction.b(),
+                            instruction.c(),
+                            call,
+                        )?;
+                        (activation, Some(receiver))
+                    } else {
+                        (
+                            Self::prepare_closure_call(
+                                module,
+                                activation,
+                                runtime,
+                                instruction.b(),
+                                instruction.c(),
+                                call,
+                            )?,
+                            None,
+                        )
+                    };
                     match self.run_completion_with_runtime(
                         module,
                         &mut callee_activation,
                         runtime,
                     )? {
                         Completion::Return(value) => {
+                            let value = if let Some(default_receiver) = construct_receiver {
+                                match Self::apply_construct_return_override(
+                                    Completion::Return(value),
+                                    default_receiver,
+                                ) {
+                                    Completion::Return(value) => value,
+                                    Completion::Throw(_) => {
+                                        unreachable!("return override cannot throw")
+                                    }
+                                }
+                            } else {
+                                value
+                            };
                             activation.write_bytecode_register(function, instruction.a(), value)?;
                             activation.advance();
                             Ok(StepOutcome::Continue)
@@ -1203,13 +1620,16 @@ impl Interpreter {
         property: PropertyNameId,
     ) -> Result<RegisterValue, InterpreterError> {
         match runtime.objects.get_property(handle, property)? {
-            Some((PropertyValue::Data(value), cache)) => {
-                frame_runtime.update_property_cache(function, pc, cache);
-                Ok(value)
-            }
-            Some((PropertyValue::Accessor { getter, .. }, cache)) => {
-                frame_runtime.update_property_cache(function, pc, cache);
-                Self::invoke_accessor_getter(runtime, handle, getter)
+            Some(lookup) => {
+                if let Some(cache) = lookup.cache() {
+                    frame_runtime.update_property_cache(function, pc, cache);
+                }
+                match lookup.value() {
+                    PropertyValue::Data(value) => Ok(value),
+                    PropertyValue::Accessor { getter, .. } => {
+                        Self::invoke_accessor_getter(runtime, handle, getter)
+                    }
+                }
             }
             None => Ok(RegisterValue::undefined()),
         }
@@ -1225,14 +1645,23 @@ impl Interpreter {
         value: RegisterValue,
     ) -> Result<bool, InterpreterError> {
         match runtime.objects.get_property(handle, property)? {
-            Some((PropertyValue::Data(_), cache)) => {
-                frame_runtime.update_property_cache(function, pc, cache);
-                Ok(runtime.objects.set_cached(handle, property, value, cache)?)
-            }
-            Some((PropertyValue::Accessor { setter, .. }, cache)) => {
-                frame_runtime.update_property_cache(function, pc, cache);
-                Self::invoke_accessor_setter(runtime, handle, setter, value)?;
-                Ok(true)
+            Some(lookup) => {
+                if let Some(cache) = lookup.cache() {
+                    frame_runtime.update_property_cache(function, pc, cache);
+                }
+                match lookup.value() {
+                    PropertyValue::Data(_) if lookup.owner() == handle => {
+                        let cache = lookup
+                            .cache()
+                            .expect("own-property lookup should yield a receiver cache");
+                        Ok(runtime.objects.set_cached(handle, property, value, cache)?)
+                    }
+                    PropertyValue::Data(_) => Ok(false),
+                    PropertyValue::Accessor { setter, .. } => {
+                        Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                        Ok(true)
+                    }
+                }
             }
             None => Ok(false),
         }
@@ -1294,6 +1723,7 @@ impl Interpreter {
             &mut activation,
             call.flags(),
             call.receiver(),
+            None,
         )?;
 
         Ok(activation)
@@ -1346,12 +1776,64 @@ impl Interpreter {
             &mut activation,
             call.flags(),
             call.receiver(),
+            None,
         )?;
 
         Ok(activation)
     }
 
+    fn prepare_construct_closure_call(
+        module: &Module,
+        caller_activation: &Activation,
+        runtime: &mut RuntimeState,
+        callee_register: RegisterIndex,
+        arg_start: RegisterIndex,
+        call: ClosureCall,
+    ) -> Result<(Activation, RegisterValue), InterpreterError> {
+        let caller_function = module
+            .function(caller_activation.function_index())
+            .expect("activation function index must be valid");
+        let closure = caller_activation
+            .read_bytecode_register(caller_function, callee_register)?
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or(InterpreterError::InvalidObjectValue)?;
+        let callee_index = runtime.objects.closure_callee(closure)?;
+        let callee = module
+            .function(callee_index)
+            .ok_or(InterpreterError::InvalidCallTarget)?;
+        let default_receiver = Self::allocate_construct_receiver(runtime, closure)?;
+        let default_receiver_value = RegisterValue::from_object_handle(default_receiver.0);
+        let mut activation = Activation::with_context(
+            callee_index,
+            callee.frame_layout().register_count(),
+            FrameMetadata::new(call.argument_count(), call.flags()),
+            Some(closure),
+        );
+        let parameter_range = callee.frame_layout().parameter_range();
+        let copy_count = call.argument_count().min(parameter_range.len());
+
+        for offset in 0..copy_count {
+            let value = caller_activation
+                .read_bytecode_register(caller_function, arg_start.saturating_add(offset))?;
+            activation.set_register(parameter_range.start().saturating_add(offset), value)?;
+        }
+
+        Self::initialize_receiver(
+            caller_function,
+            caller_activation,
+            callee,
+            &mut activation,
+            call.flags(),
+            call.receiver(),
+            Some(default_receiver_value),
+        )?;
+
+        Ok((activation, default_receiver_value))
+    }
+
     fn invoke_host_function(
+        callable: ObjectHandle,
         caller_function: &Function,
         caller_activation: &Activation,
         runtime: &mut RuntimeState,
@@ -1359,11 +1841,22 @@ impl Interpreter {
         arg_start: RegisterIndex,
         call: ClosureCall,
     ) -> Result<Completion, InterpreterError> {
+        let construct_receiver = if call.flags().is_construct() {
+            if !Self::is_host_function_constructible(runtime, host_function)? {
+                return Err(InterpreterError::InvalidCallTarget);
+            }
+            Some(RegisterValue::from_object_handle(
+                Self::allocate_construct_receiver(runtime, callable)?.0,
+            ))
+        } else {
+            None
+        };
         let receiver = Self::resolve_call_receiver(
             caller_function,
             caller_activation,
             call.flags(),
             call.receiver(),
+            construct_receiver,
         )?;
         let arguments = Self::read_call_arguments(
             caller_function,
@@ -1371,7 +1864,16 @@ impl Interpreter {
             arg_start,
             call.argument_count(),
         )?;
-        Self::invoke_registered_host_function(runtime, host_function, receiver, &arguments)
+        let completion =
+            Self::invoke_registered_host_function(runtime, host_function, receiver, &arguments)?;
+        if let Some(default_receiver) = construct_receiver {
+            Ok(Self::apply_construct_return_override(
+                completion,
+                default_receiver,
+            ))
+        } else {
+            Ok(completion)
+        }
     }
 
     fn read_call_arguments(
@@ -1394,10 +1896,14 @@ impl Interpreter {
         caller_activation: &Activation,
         flags: FrameFlags,
         receiver_register: Option<BytecodeRegister>,
+        construct_receiver: Option<RegisterValue>,
     ) -> Result<RegisterValue, InterpreterError> {
         match receiver_register {
             Some(receiver_register) => {
                 caller_activation.read_bytecode_register(caller_function, receiver_register.index())
+            }
+            None if flags.is_construct() => {
+                Ok(construct_receiver.unwrap_or_else(RegisterValue::undefined))
             }
             None if flags.has_receiver() => Ok(RegisterValue::undefined()),
             None => Ok(RegisterValue::undefined()),
@@ -1484,10 +1990,14 @@ impl Interpreter {
         callee_activation: &mut Activation,
         flags: FrameFlags,
         receiver_register: Option<BytecodeRegister>,
+        construct_receiver: Option<RegisterValue>,
     ) -> Result<(), InterpreterError> {
         let receiver = match receiver_register {
             Some(receiver_register) => caller_activation
                 .read_bytecode_register(caller_function, receiver_register.index())?,
+            None if flags.is_construct() => {
+                construct_receiver.unwrap_or_else(RegisterValue::undefined)
+            }
             None if flags.has_receiver()
                 || callee_function.frame_layout().receiver_slot().is_some() =>
             {
@@ -1502,6 +2012,58 @@ impl Interpreter {
 
         Ok(())
     }
+
+    fn allocate_construct_receiver(
+        runtime: &mut RuntimeState,
+        constructor: ObjectHandle,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let prototype_property = runtime.intern_property_name("prototype");
+        let default_prototype = runtime.intrinsics().object_prototype();
+        let prototype = match runtime
+            .objects()
+            .get_property(constructor, prototype_property)?
+        {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Data(value) => value
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .unwrap_or(default_prototype),
+                PropertyValue::Accessor { getter, .. } => {
+                    let value = Self::invoke_accessor_getter(runtime, constructor, getter)?;
+                    value
+                        .as_object_handle()
+                        .map(ObjectHandle)
+                        .unwrap_or(default_prototype)
+                }
+            },
+            None => default_prototype,
+        };
+        Ok(runtime.alloc_object_with_prototype(Some(prototype)))
+    }
+
+    fn is_host_function_constructible(
+        runtime: &RuntimeState,
+        host_function: HostFunctionId,
+    ) -> Result<bool, InterpreterError> {
+        let descriptor = runtime
+            .native_functions()
+            .get(host_function)
+            .ok_or(InterpreterError::InvalidCallTarget)?;
+        Ok(descriptor.slot_kind() == NativeSlotKind::Constructor)
+    }
+
+    fn apply_construct_return_override(
+        completion: Completion,
+        default_receiver: RegisterValue,
+    ) -> Completion {
+        match completion {
+            Completion::Return(value) if value.as_object_handle().is_some() => {
+                Completion::Return(value)
+            }
+            Completion::Return(_) => Completion::Return(default_receiver),
+            Completion::Throw(value) => Completion::Throw(value),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1510,16 +2072,271 @@ mod tests {
     use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
     use crate::closure::{ClosureTable, ClosureTemplate, UpvalueId};
     use crate::deopt::DeoptTable;
+    use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::exception::ExceptionTable;
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
     use crate::frame::{FrameFlags, FrameLayout};
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};
+    use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
+    use crate::payload::{VmTrace, VmValueTracer};
     use crate::property::PropertyNameTable;
     use crate::source_map::SourceMap;
     use crate::string::StringTable;
     use crate::value::{RegisterValue, ValueError};
 
     use super::{Activation, ExecutionResult, Interpreter, InterpreterError, RuntimeState};
+
+    fn inherited_accessor_getter(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let receiver = this
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| VmNativeCallError::Internal("expected object receiver".into()))?;
+        let backing = runtime.intern_property_name("__backing");
+        match runtime.objects().get_property(receiver, backing) {
+            Ok(Some(lookup)) => match lookup.value() {
+                PropertyValue::Data(value) => Ok(value),
+                PropertyValue::Accessor { .. } => Ok(RegisterValue::undefined()),
+            },
+            Ok(None) => Ok(RegisterValue::undefined()),
+            Err(error) => Err(VmNativeCallError::Internal(
+                format!("getter lookup failed: {error:?}").into(),
+            )),
+        }
+    }
+
+    fn inherited_accessor_setter(
+        this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let receiver = this
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| VmNativeCallError::Internal("expected object receiver".into()))?;
+        let backing = runtime.intern_property_name("__backing");
+        let value = args
+            .first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        runtime
+            .objects_mut()
+            .set_property(receiver, backing, value)
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("setter store failed: {error:?}").into())
+            })?;
+        Ok(RegisterValue::undefined())
+    }
+
+    fn host_constructor_returns_primitive(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let receiver = this
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| VmNativeCallError::Internal("expected construct receiver".into()))?;
+        let value = runtime.intern_property_name("value");
+        runtime
+            .objects_mut()
+            .set_property(receiver, value, RegisterValue::from_i32(7))
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("constructor store failed: {error:?}").into())
+            })?;
+        Ok(RegisterValue::from_i32(1))
+    }
+
+    fn host_constructor_returns_object(
+        _this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let object = runtime.alloc_object();
+        let value = runtime.intern_property_name("value");
+        runtime
+            .objects_mut()
+            .set_property(object, value, RegisterValue::from_i32(9))
+            .map_err(|error| {
+                VmNativeCallError::Internal(format!("constructor store failed: {error:?}").into())
+            })?;
+        Ok(RegisterValue::from_object_handle(object.0))
+    }
+
+    fn host_plain_method(
+        _this: &RegisterValue,
+        _args: &[RegisterValue],
+        _runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        Ok(RegisterValue::undefined())
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct NativeCounterPayload {
+        root: RegisterValue,
+        shadow: Option<ObjectHandle>,
+        calls: i32,
+    }
+
+    impl VmTrace for NativeCounterPayload {
+        fn trace(&self, tracer: &mut dyn VmValueTracer) {
+            self.root.trace(tracer);
+            self.shadow.trace(tracer);
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingTracer {
+        values: Vec<RegisterValue>,
+    }
+
+    impl VmValueTracer for CollectingTracer {
+        fn mark_value(&mut self, value: RegisterValue) {
+            self.values.push(value);
+        }
+    }
+
+    fn native_payload_reads_root(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let payload = runtime
+            .native_payload_from_value::<NativeCounterPayload>(this)
+            .map_err(|error| VmNativeCallError::Internal(error.to_string().into()))?;
+        Ok(payload.root)
+    }
+
+    fn native_payload_allocates_then_throws(
+        this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let shadow = runtime.alloc_object();
+        {
+            let payload = runtime
+                .native_payload_mut_from_value::<NativeCounterPayload>(this)
+                .map_err(|error| VmNativeCallError::Internal(error.to_string().into()))?;
+            payload.calls = payload.calls.saturating_add(1);
+            payload.shadow = Some(shadow);
+        }
+
+        for index in 0..64 {
+            let _ = runtime.alloc_string(format!("payload-temp-{index}"));
+            let _ = runtime.alloc_object();
+        }
+
+        Err(VmNativeCallError::Thrown(
+            args.first()
+                .copied()
+                .unwrap_or_else(RegisterValue::undefined),
+        ))
+    }
+
+    #[test]
+    fn runtime_native_objects_expose_typed_payload_access() {
+        let mut runtime = RuntimeState::new();
+        let root = runtime.alloc_string("payload-root");
+        let instance = runtime.alloc_native_object(NativeCounterPayload {
+            root: RegisterValue::from_object_handle(root.0),
+            shadow: None,
+            calls: 0,
+        });
+
+        let payload = runtime
+            .native_payload::<NativeCounterPayload>(instance)
+            .expect("payload should downcast");
+        assert_eq!(payload.root, RegisterValue::from_object_handle(root.0));
+        assert_eq!(payload.calls, 0);
+
+        let method = runtime.register_native_function(NativeFunctionDescriptor::method(
+            "readRoot",
+            0,
+            native_payload_reads_root,
+        ));
+        let descriptor = runtime
+            .native_functions()
+            .get(method)
+            .cloned()
+            .expect("native descriptor should exist");
+        let value = (descriptor.callback())(
+            &RegisterValue::from_object_handle(instance.0),
+            &[],
+            &mut runtime,
+        )
+        .expect("native payload method should succeed");
+
+        assert!(
+            runtime
+                .objects()
+                .native_payload_id(instance)
+                .expect("native payload lookup should succeed")
+                .is_some()
+        );
+        assert_eq!(runtime.objects().kind(instance), Ok(HeapValueKind::Object));
+        assert_eq!(
+            runtime
+                .objects()
+                .strict_eq(value, RegisterValue::from_object_handle(root.0)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn runtime_native_payload_tracing_survives_allocation_and_throw_pressure() {
+        let mut runtime = RuntimeState::new();
+        let root = runtime.alloc_string("root");
+        let instance = runtime.alloc_native_object(NativeCounterPayload {
+            root: RegisterValue::from_object_handle(root.0),
+            shadow: None,
+            calls: 0,
+        });
+
+        let thrower = runtime.register_native_function(NativeFunctionDescriptor::method(
+            "explode",
+            1,
+            native_payload_allocates_then_throws,
+        ));
+        let descriptor = runtime
+            .native_functions()
+            .get(thrower)
+            .cloned()
+            .expect("throwing descriptor should exist");
+        let thrown = RegisterValue::from_i32(9);
+        let error = (descriptor.callback())(
+            &RegisterValue::from_object_handle(instance.0),
+            &[thrown],
+            &mut runtime,
+        )
+        .expect_err("throwing callback should propagate abrupt completion");
+        assert_eq!(error, VmNativeCallError::Thrown(thrown));
+
+        let payload = runtime
+            .native_payload::<NativeCounterPayload>(instance)
+            .expect("payload should still be readable after throw");
+        assert_eq!(payload.calls, 1);
+        let shadow = payload
+            .shadow
+            .expect("throwing callback should store shadow root");
+
+        let mut tracer = CollectingTracer::default();
+        runtime
+            .trace_native_payload_roots(&mut tracer)
+            .expect("payload trace should succeed");
+        assert!(
+            tracer
+                .values
+                .contains(&RegisterValue::from_object_handle(root.0))
+        );
+        assert!(
+            tracer
+                .values
+                .contains(&RegisterValue::from_object_handle(shadow.0))
+        );
+    }
 
     #[test]
     fn interpreter_executes_nop_then_return() {
@@ -2153,7 +2970,7 @@ mod tests {
 
     #[test]
     fn interpreter_calls_bootstrap_installed_object_static_and_prototype_methods() {
-        let layout = FrameLayout::new(0, 0, 0, 8).expect("frame layout should be valid");
+        let layout = FrameLayout::new(0, 0, 0, 7).expect("frame layout should be valid");
         let entry = Function::new(
             Some("entry"),
             layout,
@@ -2175,29 +2992,24 @@ mod tests {
                 ),
                 Instruction::get_property(
                     BytecodeRegister::new(4),
-                    BytecodeRegister::new(1),
+                    BytecodeRegister::new(3),
                     crate::property::PropertyNameId(2),
                 ),
-                Instruction::get_property(
+                Instruction::call_closure(
                     BytecodeRegister::new(5),
                     BytecodeRegister::new(4),
-                    crate::property::PropertyNameId(3),
-                ),
-                Instruction::call_closure(
-                    BytecodeRegister::new(6),
-                    BytecodeRegister::new(5),
                     BytecodeRegister::new(3),
                 ),
                 Instruction::eq(
-                    BytecodeRegister::new(7),
                     BytecodeRegister::new(6),
+                    BytecodeRegister::new(5),
                     BytecodeRegister::new(3),
                 ),
-                Instruction::ret(BytecodeRegister::new(7)),
+                Instruction::ret(BytecodeRegister::new(6)),
             ]),
             FunctionTables::new(
                 FunctionSideTables::new(
-                    PropertyNameTable::new(vec!["Object", "create", "prototype", "valueOf"]),
+                    PropertyNameTable::new(vec!["Object", "create", "valueOf"]),
                     StringTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
@@ -2209,13 +3021,11 @@ mod tests {
                             BytecodeRegister::new(1),
                         ))),
                         None,
-                        None,
                         Some(CallSite::Closure(ClosureCall::new_with_receiver(
                             0,
                             FrameFlags::new(false, true, false),
                             BytecodeRegister::new(3),
                         ))),
-                        None,
                         None,
                     ]),
                 ),
@@ -2224,10 +3034,8 @@ mod tests {
                     FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Property),
                     FeedbackSlotLayout::new(FeedbackSlotId(2), FeedbackKind::Call),
                     FeedbackSlotLayout::new(FeedbackSlotId(3), FeedbackKind::Property),
-                    FeedbackSlotLayout::new(FeedbackSlotId(4), FeedbackKind::Property),
-                    FeedbackSlotLayout::new(FeedbackSlotId(5), FeedbackKind::Call),
-                    FeedbackSlotLayout::new(FeedbackSlotId(6), FeedbackKind::Comparison),
-                    FeedbackSlotLayout::new(FeedbackSlotId(7), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(4), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(5), FeedbackKind::Comparison),
                 ]),
                 DeoptTable::default(),
                 ExceptionTable::default(),
@@ -2255,7 +3063,7 @@ mod tests {
 
     #[test]
     fn interpreter_calls_bootstrap_installed_function_static_and_prototype_methods() {
-        let layout = FrameLayout::new(0, 0, 0, 11).expect("frame layout should be valid");
+        let layout = FrameLayout::new(0, 0, 0, 10).expect("frame layout should be valid");
         let entry = Function::new(
             Some("entry"),
             layout,
@@ -2288,28 +3096,23 @@ mod tests {
                 Instruction::jump_if_false(BytecodeRegister::new(5), JumpOffset::new(6)),
                 Instruction::get_property(
                     BytecodeRegister::new(6),
-                    BytecodeRegister::new(3),
+                    BytecodeRegister::new(2),
                     crate::property::PropertyNameId(4),
                 ),
-                Instruction::get_property(
+                Instruction::call_closure(
                     BytecodeRegister::new(7),
                     BytecodeRegister::new(6),
-                    crate::property::PropertyNameId(5),
+                    BytecodeRegister::new(2),
                 ),
-                Instruction::call_closure(
-                    BytecodeRegister::new(8),
-                    BytecodeRegister::new(7),
-                    BytecodeRegister::new(0),
-                ),
-                Instruction::load_string(BytecodeRegister::new(9), crate::string::StringId(0)),
+                Instruction::load_string(BytecodeRegister::new(8), crate::string::StringId(0)),
                 Instruction::eq(
-                    BytecodeRegister::new(10),
-                    BytecodeRegister::new(8),
                     BytecodeRegister::new(9),
+                    BytecodeRegister::new(7),
+                    BytecodeRegister::new(8),
                 ),
-                Instruction::ret(BytecodeRegister::new(10)),
-                Instruction::load_false(BytecodeRegister::new(10)),
-                Instruction::ret(BytecodeRegister::new(10)),
+                Instruction::ret(BytecodeRegister::new(9)),
+                Instruction::load_false(BytecodeRegister::new(9)),
+                Instruction::ret(BytecodeRegister::new(9)),
             ]),
             FunctionTables::new(
                 FunctionSideTables::new(
@@ -2318,7 +3121,6 @@ mod tests {
                         "abs",
                         "Function",
                         "isCallable",
-                        "prototype",
                         "toString",
                     ]),
                     StringTable::new(vec!["function () { [native code] }"]),
@@ -2335,14 +3137,11 @@ mod tests {
                         ))),
                         None,
                         None,
-                        None,
                         Some(CallSite::Closure(ClosureCall::new_with_receiver(
                             0,
                             FrameFlags::new(false, true, false),
                             BytecodeRegister::new(2),
                         ))),
-                        None,
-                        None,
                         None,
                         None,
                         None,
@@ -2355,9 +3154,8 @@ mod tests {
                     FeedbackSlotLayout::new(FeedbackSlotId(3), FeedbackKind::Property),
                     FeedbackSlotLayout::new(FeedbackSlotId(4), FeedbackKind::Call),
                     FeedbackSlotLayout::new(FeedbackSlotId(5), FeedbackKind::Property),
-                    FeedbackSlotLayout::new(FeedbackSlotId(6), FeedbackKind::Property),
-                    FeedbackSlotLayout::new(FeedbackSlotId(7), FeedbackKind::Call),
-                    FeedbackSlotLayout::new(FeedbackSlotId(8), FeedbackKind::Comparison),
+                    FeedbackSlotLayout::new(FeedbackSlotId(6), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(7), FeedbackKind::Comparison),
                 ]),
                 DeoptTable::default(),
                 ExceptionTable::default(),
@@ -2381,6 +3179,357 @@ mod tests {
             result.map(ExecutionResult::return_value),
             Ok(RegisterValue::from_bool(true))
         );
+    }
+
+    #[test]
+    fn interpreter_set_property_creates_own_data_slot_when_property_is_inherited() {
+        let layout = FrameLayout::new(0, 0, 0, 3).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            layout,
+            Bytecode::from(vec![
+                Instruction::load_i32(BytecodeRegister::new(1), 7),
+                Instruction::set_property(
+                    BytecodeRegister::new(0),
+                    BytecodeRegister::new(1),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::get_property(
+                    BytecodeRegister::new(2),
+                    BytecodeRegister::new(0),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::ret(BytecodeRegister::new(2)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::new(vec!["value"]),
+                    StringTable::default(),
+                    ClosureTable::default(),
+                    CallTable::default(),
+                ),
+                FeedbackTableLayout::new(vec![
+                    FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Property),
+                    FeedbackSlotLayout::new(FeedbackSlotId(2), FeedbackKind::Property),
+                ]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let module = Module::new(Some("inherited-data-set"), vec![entry], FunctionIndex(0))
+            .expect("module should be valid");
+        let mut runtime = RuntimeState::new();
+        let prototype = runtime.alloc_object();
+        let object = runtime.alloc_object_with_prototype(Some(prototype));
+        let property = runtime.intern_property_name("value");
+        runtime
+            .objects_mut()
+            .set_property(prototype, property, RegisterValue::from_i32(1))
+            .expect("prototype data property should install");
+        let registers = [RegisterValue::from_object_handle(object.0)];
+
+        let result = Interpreter::new().execute_with_runtime(
+            &module,
+            FunctionIndex(0),
+            &registers,
+            &mut runtime,
+        );
+
+        assert_eq!(
+            result.map(ExecutionResult::return_value),
+            Ok(RegisterValue::from_i32(7))
+        );
+        let object_lookup = runtime
+            .objects()
+            .get_property(object, property)
+            .expect("receiver lookup should succeed")
+            .expect("receiver value should exist");
+        assert_eq!(object_lookup.owner(), object);
+        assert_eq!(
+            object_lookup.value(),
+            PropertyValue::Data(RegisterValue::from_i32(7))
+        );
+        let prototype_lookup = runtime
+            .objects()
+            .get_property(prototype, property)
+            .expect("prototype lookup should succeed")
+            .expect("prototype value should exist");
+        assert_eq!(prototype_lookup.owner(), prototype);
+        assert_eq!(
+            prototype_lookup.value(),
+            PropertyValue::Data(RegisterValue::from_i32(1))
+        );
+    }
+
+    #[test]
+    fn interpreter_set_property_invokes_inherited_accessor_setter() {
+        let layout = FrameLayout::new(0, 0, 0, 3).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            layout,
+            Bytecode::from(vec![
+                Instruction::load_i32(BytecodeRegister::new(1), 7),
+                Instruction::set_property(
+                    BytecodeRegister::new(0),
+                    BytecodeRegister::new(1),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::get_property(
+                    BytecodeRegister::new(2),
+                    BytecodeRegister::new(0),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::ret(BytecodeRegister::new(2)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::new(vec!["value"]),
+                    StringTable::default(),
+                    ClosureTable::default(),
+                    CallTable::default(),
+                ),
+                FeedbackTableLayout::new(vec![
+                    FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Property),
+                    FeedbackSlotLayout::new(FeedbackSlotId(2), FeedbackKind::Property),
+                    FeedbackSlotLayout::new(FeedbackSlotId(3), FeedbackKind::Call),
+                ]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let module = Module::new(
+            Some("inherited-accessor-set"),
+            vec![entry],
+            FunctionIndex(0),
+        )
+        .expect("module should be valid");
+        let mut runtime = RuntimeState::new();
+        let prototype = runtime.alloc_object();
+        let object = runtime.alloc_object_with_prototype(Some(prototype));
+        let property = runtime.intern_property_name("value");
+        let getter = runtime.register_native_function(NativeFunctionDescriptor::getter(
+            "value",
+            inherited_accessor_getter,
+        ));
+        let setter = runtime.register_native_function(NativeFunctionDescriptor::setter(
+            "value",
+            inherited_accessor_setter,
+        ));
+        let getter = runtime.alloc_host_function(getter);
+        let setter = runtime.alloc_host_function(setter);
+        runtime
+            .objects_mut()
+            .define_accessor(prototype, property, Some(getter), Some(setter))
+            .expect("prototype accessor should install");
+        let registers = [RegisterValue::from_object_handle(object.0)];
+
+        let result = Interpreter::new().execute_with_runtime(
+            &module,
+            FunctionIndex(0),
+            &registers,
+            &mut runtime,
+        );
+
+        assert_eq!(
+            result.map(ExecutionResult::return_value),
+            Ok(RegisterValue::from_i32(7))
+        );
+        let lookup = runtime
+            .objects()
+            .get_property(object, property)
+            .expect("receiver accessor lookup should succeed")
+            .expect("receiver accessor should resolve");
+        assert_eq!(lookup.owner(), prototype);
+        let backing = runtime.intern_property_name("__backing");
+        let backing_lookup = runtime
+            .objects()
+            .get_property(object, backing)
+            .expect("receiver backing lookup should succeed")
+            .expect("setter should have created receiver backing slot");
+        assert_eq!(backing_lookup.owner(), object);
+        assert_eq!(
+            backing_lookup.value(),
+            PropertyValue::Data(RegisterValue::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn interpreter_constructs_host_function_with_return_override_rules() {
+        let layout = FrameLayout::new(0, 0, 0, 9).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            layout,
+            Bytecode::from(vec![
+                Instruction::call_closure(
+                    BytecodeRegister::new(2),
+                    BytecodeRegister::new(0),
+                    BytecodeRegister::new(8),
+                ),
+                Instruction::get_property(
+                    BytecodeRegister::new(3),
+                    BytecodeRegister::new(2),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::call_closure(
+                    BytecodeRegister::new(4),
+                    BytecodeRegister::new(1),
+                    BytecodeRegister::new(8),
+                ),
+                Instruction::get_property(
+                    BytecodeRegister::new(5),
+                    BytecodeRegister::new(4),
+                    crate::property::PropertyNameId(0),
+                ),
+                Instruction::load_i32(BytecodeRegister::new(6), 7),
+                Instruction::eq(
+                    BytecodeRegister::new(6),
+                    BytecodeRegister::new(3),
+                    BytecodeRegister::new(6),
+                ),
+                Instruction::jump_if_false(BytecodeRegister::new(6), JumpOffset::new(4)),
+                Instruction::load_i32(BytecodeRegister::new(7), 9),
+                Instruction::eq(
+                    BytecodeRegister::new(7),
+                    BytecodeRegister::new(5),
+                    BytecodeRegister::new(7),
+                ),
+                Instruction::ret(BytecodeRegister::new(7)),
+                Instruction::load_false(BytecodeRegister::new(7)),
+                Instruction::ret(BytecodeRegister::new(7)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::new(vec!["value"]),
+                    StringTable::default(),
+                    ClosureTable::default(),
+                    CallTable::new(vec![
+                        Some(CallSite::Closure(ClosureCall::new(
+                            0,
+                            FrameFlags::new(true, true, false),
+                        ))),
+                        None,
+                        Some(CallSite::Closure(ClosureCall::new(
+                            0,
+                            FrameFlags::new(true, true, false),
+                        ))),
+                        None,
+                        None,
+                        None,
+                        Some(CallSite::Closure(ClosureCall::new(
+                            0,
+                            FrameFlags::new(false, true, false),
+                        ))),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ]),
+                ),
+                FeedbackTableLayout::new(vec![
+                    FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(1), FeedbackKind::Property),
+                    FeedbackSlotLayout::new(FeedbackSlotId(2), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(3), FeedbackKind::Property),
+                    FeedbackSlotLayout::new(FeedbackSlotId(4), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(5), FeedbackKind::Comparison),
+                    FeedbackSlotLayout::new(FeedbackSlotId(6), FeedbackKind::Call),
+                    FeedbackSlotLayout::new(FeedbackSlotId(7), FeedbackKind::Comparison),
+                ]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let module = Module::new(Some("host-construct"), vec![entry], FunctionIndex(0))
+            .expect("module should be valid");
+        let mut runtime = RuntimeState::new();
+
+        let primitive_constructor =
+            runtime.register_native_function(NativeFunctionDescriptor::constructor(
+                "PrimitiveCtor",
+                0,
+                host_constructor_returns_primitive,
+            ));
+        let object_constructor = runtime.register_native_function(
+            NativeFunctionDescriptor::constructor("ObjectCtor", 0, host_constructor_returns_object),
+        );
+        let primitive_constructor = runtime.alloc_host_function(primitive_constructor);
+        let object_constructor = runtime.alloc_host_function(object_constructor);
+        let registers = [
+            RegisterValue::from_object_handle(primitive_constructor.0),
+            RegisterValue::from_object_handle(object_constructor.0),
+        ];
+
+        let result = Interpreter::new().execute_with_runtime(
+            &module,
+            FunctionIndex(0),
+            &registers,
+            &mut runtime,
+        );
+
+        assert_eq!(
+            result.map(ExecutionResult::return_value),
+            Ok(RegisterValue::from_bool(true))
+        );
+    }
+
+    #[test]
+    fn interpreter_rejects_construct_on_non_constructible_host_function() {
+        let layout = FrameLayout::new(0, 0, 0, 2).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            layout,
+            Bytecode::from(vec![
+                Instruction::call_closure(
+                    BytecodeRegister::new(1),
+                    BytecodeRegister::new(0),
+                    BytecodeRegister::new(1),
+                ),
+                Instruction::ret(BytecodeRegister::new(1)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::default(),
+                    StringTable::default(),
+                    ClosureTable::default(),
+                    CallTable::new(vec![
+                        Some(CallSite::Closure(ClosureCall::new(
+                            0,
+                            FrameFlags::new(true, true, false),
+                        ))),
+                        None,
+                    ]),
+                ),
+                FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+                    FeedbackSlotId(0),
+                    FeedbackKind::Call,
+                )]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let module = Module::new(Some("bad-construct"), vec![entry], FunctionIndex(0))
+            .expect("module should be valid");
+        let mut runtime = RuntimeState::new();
+        let method = runtime.register_native_function(NativeFunctionDescriptor::method(
+            "plain",
+            0,
+            host_plain_method,
+        ));
+        let method = runtime.alloc_host_function(method);
+        let registers = [RegisterValue::from_object_handle(method.0)];
+
+        let error = Interpreter::new()
+            .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+            .expect_err("constructing a plain host method should fail");
+
+        assert_eq!(error, InterpreterError::InvalidCallTarget);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::harness::TestHarnessState;
 use crate::metadata::{ErrorPhase, ExecutionMode, TestMetadata};
 
 const NATIVE_TEST262_BASIC_FILES: &[&str] = &[
+    "test/built-ins/Array/S15.4.1_A2.1_T1.js",
     "test/built-ins/Array/S15.4.5.2_A2_T1.js",
     "test/language/expressions/addition/S11.6.1_A2.4_T1.js",
     "test/language/expressions/array/11.1.4-0.js",

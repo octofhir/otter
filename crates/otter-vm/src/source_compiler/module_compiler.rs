@@ -78,6 +78,9 @@ impl<'a> ModuleCompiler<'a> {
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
         compiler.declare_parameters(params)?;
+        if kind == FunctionKind::Script && self.mode == LoweringMode::Test262Basic {
+            compiler.declare_test262_intrinsic_globals()?;
+        }
         if let Some(self_binding_name) = identity.self_binding_name.as_deref() {
             let closure_register = compiler.declare_function_binding(self_binding_name)?;
             compiler

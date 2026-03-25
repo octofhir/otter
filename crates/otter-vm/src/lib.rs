@@ -43,6 +43,8 @@ pub mod lowering;
 pub mod module;
 /// Minimal object heap for the new VM.
 pub mod object;
+/// Native payload storage and tracing contracts for JS-visible host objects.
+pub mod payload;
 /// Property side tables for named access.
 pub mod property;
 /// Small smoke harness for iterative validation.
@@ -65,9 +67,9 @@ pub use builders::{
     ObjectInstallPlan, ObjectMemberPlan, PrototypeBuilder,
 };
 pub use descriptors::{
-    ClassDescriptorConsumer, JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget,
-    NativeDescriptorConsumer, NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
-    VmNativeCallError, VmNativeFunction,
+    ClassDescriptorConsumer, JsClassDescriptor, JsNamespaceDescriptor, NamespaceDescriptorConsumer,
+    NativeBindingDescriptor, NativeBindingTarget, NativeDescriptorConsumer, NativeEntrypointKind,
+    NativeFunctionDescriptor, NativeSlotKind, VmNativeCallError, VmNativeFunction,
 };
 pub use frame::FrameLayout;
 pub use host::{HostFunctionId, NativeFunctionRegistry};
@@ -75,6 +77,10 @@ pub use interpreter::{Interpreter, RuntimeState};
 pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
 pub use module::{Function, FunctionIndex, Module, ModuleError};
 pub use object::{ObjectShapeId, PropertyInlineCache};
+pub use payload::{
+    NativePayloadError, NativePayloadId, NativePayloadRegistry, VmNativePayload, VmTrace,
+    VmValueTracer,
+};
 pub use value::RegisterValue;
 
 /// Returns the current execution ABI version of the new VM.

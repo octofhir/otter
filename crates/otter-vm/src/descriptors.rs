@@ -229,6 +229,52 @@ pub trait NativeDescriptorConsumer {
     fn register_native(&mut self, descriptor: NativeBindingDescriptor);
 }
 
+/// Pure metadata for one JS-visible namespace in the new VM.
+///
+/// Unlike classes, namespaces install onto one object target only and do not
+/// carry constructor/prototype semantics.
+#[derive(Clone, Default)]
+pub struct JsNamespaceDescriptor {
+    js_name: Box<str>,
+    bindings: Vec<NativeBindingDescriptor>,
+}
+
+impl JsNamespaceDescriptor {
+    /// Creates an empty namespace descriptor for the given JS-visible name.
+    #[must_use]
+    pub fn new(js_name: impl Into<Box<str>>) -> Self {
+        Self {
+            js_name: js_name.into(),
+            bindings: Vec::new(),
+        }
+    }
+
+    /// Adds one namespace binding.
+    #[must_use]
+    pub fn with_binding(mut self, binding: NativeBindingDescriptor) -> Self {
+        self.bindings.push(binding);
+        self
+    }
+
+    /// Returns the JS-visible namespace name.
+    #[must_use]
+    pub fn js_name(&self) -> &str {
+        &self.js_name
+    }
+
+    /// Returns the namespace bindings that should install onto the namespace object.
+    #[must_use]
+    pub fn bindings(&self) -> &[NativeBindingDescriptor] {
+        &self.bindings
+    }
+}
+
+/// Contract that future namespace builders should implement to consume macro-generated metadata.
+pub trait NamespaceDescriptorConsumer {
+    /// Registers one namespace descriptor for later installation.
+    fn register_namespace(&mut self, descriptor: JsNamespaceDescriptor);
+}
+
 /// Pure metadata for one JS-visible class in the new VM.
 ///
 /// This intentionally separates class metadata from runtime installation. A
@@ -295,7 +341,8 @@ pub trait ClassDescriptorConsumer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClassDescriptorConsumer, JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget,
+        ClassDescriptorConsumer, JsClassDescriptor, JsNamespaceDescriptor,
+        NamespaceDescriptorConsumer, NativeBindingDescriptor, NativeBindingTarget,
         NativeDescriptorConsumer, NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
         VmNativeCallError, VmNativeFunction,
     };
@@ -373,6 +420,23 @@ mod tests {
     }
 
     #[test]
+    fn js_namespace_descriptor_keeps_bindings() {
+        let descriptor =
+            JsNamespaceDescriptor::new("Reflect").with_binding(NativeBindingDescriptor::new(
+                NativeBindingTarget::Namespace,
+                NativeFunctionDescriptor::method("get", 2, passthrough_callback()),
+            ));
+
+        assert_eq!(descriptor.js_name(), "Reflect");
+        assert_eq!(descriptor.bindings().len(), 1);
+        assert_eq!(
+            descriptor.bindings()[0].target(),
+            NativeBindingTarget::Namespace
+        );
+        assert_eq!(descriptor.bindings()[0].function().js_name(), "get");
+    }
+
+    #[test]
     fn js_class_descriptor_keeps_constructor_and_bindings() {
         let descriptor = JsClassDescriptor::new("Thing")
             .with_constructor(NativeFunctionDescriptor::constructor(
@@ -431,5 +495,31 @@ mod tests {
         assert_eq!(consumer.seen.len(), 1);
         assert_eq!(consumer.seen[0].js_name(), "Counter");
         assert_eq!(consumer.seen[0].bindings()[0].function().js_name(), "inc");
+    }
+
+    #[test]
+    fn namespace_descriptor_consumer_receives_namespace_metadata() {
+        #[derive(Default)]
+        struct TestConsumer {
+            seen: Vec<JsNamespaceDescriptor>,
+        }
+
+        impl NamespaceDescriptorConsumer for TestConsumer {
+            fn register_namespace(&mut self, descriptor: JsNamespaceDescriptor) {
+                self.seen.push(descriptor);
+            }
+        }
+
+        let mut consumer = TestConsumer::default();
+        consumer.register_namespace(JsNamespaceDescriptor::new("JSON").with_binding(
+            NativeBindingDescriptor::new(
+                NativeBindingTarget::Namespace,
+                NativeFunctionDescriptor::method("parse", 1, passthrough_callback()),
+            ),
+        ));
+
+        assert_eq!(consumer.seen.len(), 1);
+        assert_eq!(consumer.seen[0].js_name(), "JSON");
+        assert_eq!(consumer.seen[0].bindings()[0].function().js_name(), "parse");
     }
 }

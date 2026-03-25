@@ -27,9 +27,9 @@ impl IntrinsicInstaller for ObjectIntrinsic {
 
         let constructor = if let Some(descriptor) = plan.constructor() {
             let host_function = cx.native_functions.register(descriptor.clone());
-            cx.heap.alloc_host_function(host_function)
+            cx.alloc_intrinsic_host_function(host_function, intrinsics.function_prototype())?
         } else {
-            cx.heap.alloc_object()
+            cx.alloc_intrinsic_object(Some(intrinsics.object_prototype()))?
         };
 
         intrinsics.object_constructor = constructor;
@@ -37,6 +37,7 @@ impl IntrinsicInstaller for ObjectIntrinsic {
             intrinsics.object_prototype(),
             intrinsics.object_constructor(),
             &plan,
+            intrinsics.function_prototype(),
             cx,
         )?;
 
@@ -74,7 +75,7 @@ fn object_class_descriptor() -> JsClassDescriptor {
 }
 
 fn object_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -84,7 +85,11 @@ fn object_constructor(
         return Ok(value);
     }
 
-    let object = runtime.objects_mut().alloc_object();
+    if this.as_object_handle().is_some() {
+        return Ok(*this);
+    }
+
+    let object = runtime.alloc_object();
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
@@ -98,9 +103,14 @@ fn object_value_of(
 
 fn object_create(
     _this: &RegisterValue,
-    _args: &[RegisterValue],
+    args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let object = runtime.objects_mut().alloc_object();
+    let prototype = match args.first().copied() {
+        None => Some(runtime.intrinsics().object_prototype()),
+        Some(value) if value == RegisterValue::null() => None,
+        Some(value) => value.as_object_handle().map(crate::object::ObjectHandle),
+    };
+    let object = runtime.alloc_object_with_prototype(prototype);
     Ok(RegisterValue::from_object_handle(object.0))
 }

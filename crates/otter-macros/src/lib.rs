@@ -62,6 +62,8 @@ use syn::{
     punctuated::Punctuated,
 };
 
+mod js_namespace;
+
 // =============================================================================
 // #[dive] macro
 // =============================================================================
@@ -844,6 +846,29 @@ pub fn legacy_js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_clone = item.clone();
     if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
         return expand_legacy_js_class_impl(i);
+    }
+
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "Expected struct or impl block",
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// Mark a struct or impl block as a JavaScript namespace in the new VM.
+#[proc_macro_attribute]
+pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as JsClassArgs);
+
+    let item_clone = item.clone();
+    if let Ok(s) = syn::parse::<ItemStruct>(item_clone) {
+        return js_namespace::expand_js_namespace_struct(s, args);
+    }
+
+    let item_clone = item.clone();
+    if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
+        return js_namespace::expand_js_namespace_impl(i);
     }
 
     syn::Error::new(

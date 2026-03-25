@@ -62,6 +62,13 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    pub(super) fn declare_test262_intrinsic_globals(&mut self) -> Result<(), SourceLoweringError> {
+        for name in ["Object", "Function", "Math", "Array", "Reflect", "String"] {
+            self.declare_intrinsic_global_binding(name)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn predeclare_function_scope(
         &mut self,
         statements: &[AstStatement<'_>],
@@ -1044,6 +1051,24 @@ impl<'a> FunctionCompiler<'a> {
         if value.is_temp {
             self.next_temp = self.next_temp.saturating_sub(1);
         }
+    }
+
+    fn declare_intrinsic_global_binding(&mut self, name: &str) -> Result<(), SourceLoweringError> {
+        if self.env.bindings.contains_key(name) {
+            return Ok(());
+        }
+
+        let global = self.alloc_temp();
+        self.instructions.push(Instruction::load_this(global));
+        let binding = self.allocate_local()?;
+        let property = self.intern_property_name(name)?;
+        self.instructions
+            .push(Instruction::get_property(binding, global, property));
+        self.release(ValueLocation::temp(global));
+        self.env
+            .bindings
+            .insert(name.to_string(), Binding::Register(binding));
+        Ok(())
     }
 
     pub(super) fn materialize_value(&mut self, value: ValueLocation) -> ValueLocation {

@@ -5,10 +5,12 @@
 //! stable root set, tracks lifecycle staging, and exposes explicit root
 //! enumeration for future GC integration and builder-driven bootstrap.
 
+mod array_class;
 mod function_class;
 mod install;
 mod math;
 mod object_class;
+mod reflect;
 
 use crate::host::NativeFunctionRegistry;
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap};
@@ -105,9 +107,11 @@ pub struct VmIntrinsics {
     function_prototype: ObjectHandle,
     object_constructor: ObjectHandle,
     function_constructor: ObjectHandle,
+    array_constructor: ObjectHandle,
     array_prototype: ObjectHandle,
     string_prototype: ObjectHandle,
     namespace_roots: Vec<ObjectHandle>,
+    reflect_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 4],
 }
 
@@ -119,6 +123,7 @@ impl VmIntrinsics {
         let function_prototype = heap.alloc_object();
         let object_constructor = heap.alloc_object();
         let function_constructor = heap.alloc_object();
+        let array_constructor = heap.alloc_object();
         let array_prototype = heap.alloc_object();
         let string_prototype = heap.alloc_object();
 
@@ -130,9 +135,11 @@ impl VmIntrinsics {
             function_prototype,
             object_constructor,
             function_constructor,
+            array_constructor,
             array_prototype,
             string_prototype,
             namespace_roots: Vec::new(),
+            reflect_namespace: None,
             well_known_symbols: [
                 WellKnownSymbol::Iterator,
                 WellKnownSymbol::AsyncIterator,
@@ -143,10 +150,18 @@ impl VmIntrinsics {
     }
 
     /// Performs prototype-chain wiring for the allocated intrinsic objects.
-    pub fn wire_prototype_chains(&mut self, _heap: &mut ObjectHeap) -> Result<(), IntrinsicsError> {
+    pub fn wire_prototype_chains(&mut self, heap: &mut ObjectHeap) -> Result<(), IntrinsicsError> {
         if self.stage != IntrinsicsStage::Allocated {
             return Err(IntrinsicsError::InvalidLifecycleStage);
         }
+        heap.set_prototype(self.global_object, Some(self.object_prototype))?;
+        heap.set_prototype(self.object_prototype, None)?;
+        heap.set_prototype(self.function_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.object_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.function_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.array_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.array_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.string_prototype, Some(self.object_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -227,6 +242,12 @@ impl VmIntrinsics {
         self.function_constructor
     }
 
+    /// Returns `%Array%`.
+    #[must_use]
+    pub const fn array_constructor(&self) -> ObjectHandle {
+        self.array_constructor
+    }
+
     /// Returns `%Array.prototype%`.
     #[must_use]
     pub const fn array_prototype(&self) -> ObjectHandle {
@@ -253,6 +274,15 @@ impl VmIntrinsics {
         self.math_namespace
     }
 
+    pub(super) fn set_reflect_namespace(&mut self, handle: ObjectHandle) {
+        self.reflect_namespace = Some(handle);
+        self.register_namespace_root(handle);
+    }
+
+    pub(super) fn reflect_namespace(&self) -> Option<ObjectHandle> {
+        self.reflect_namespace
+    }
+
     /// Returns the additional namespace roots.
     #[must_use]
     pub fn namespace_roots(&self) -> &[ObjectHandle] {
@@ -273,6 +303,7 @@ impl VmIntrinsics {
             self.function_prototype,
             self.object_constructor,
             self.function_constructor,
+            self.array_constructor,
             self.array_prototype,
             self.string_prototype,
         ] {
@@ -289,11 +320,13 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 3] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 5] {
     [
+        &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
 
@@ -344,16 +377,33 @@ mod tests {
             heap.kind(intrinsics.function_constructor()),
             Ok(HeapValueKind::HostFunction)
         );
+        assert_eq!(
+            heap.kind(intrinsics.array_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
 
-        assert_eq!(intrinsics.namespace_roots().len(), 1);
-        assert_eq!(native_functions.len(), 9);
+        assert_eq!(intrinsics.namespace_roots().len(), 2);
+        assert_eq!(native_functions.len(), 14);
+        assert_eq!(
+            heap.get_prototype(intrinsics.global_object()),
+            Ok(Some(intrinsics.object_prototype()))
+        );
+        assert_eq!(heap.get_prototype(intrinsics.object_prototype()), Ok(None));
+        assert_eq!(
+            heap.get_prototype(intrinsics.function_prototype()),
+            Ok(Some(intrinsics.object_prototype()))
+        );
+        assert_eq!(
+            heap.get_prototype(intrinsics.array_constructor()),
+            Ok(Some(intrinsics.function_prototype()))
+        );
 
         let math_property = property_names.intern("Math");
         let math_namespace = heap
             .get_property(intrinsics.global_object(), math_property)
             .expect("global Math lookup should succeed")
-            .expect("Math namespace should be installed")
-            .0;
+            .expect("Math namespace should be installed");
+        let math_namespace = math_namespace.value();
         let PropertyValue::Data(math_namespace) = math_namespace else {
             panic!("expected Math to be a data property");
         };
@@ -367,8 +417,8 @@ mod tests {
         let abs = heap
             .get_property(math_namespace, abs_property)
             .expect("Math.abs lookup should succeed")
-            .expect("Math.abs should be installed")
-            .0;
+            .expect("Math.abs should be installed");
+        let abs = abs.value();
         let PropertyValue::Data(abs) = abs else {
             panic!("expected Math.abs to be a data property");
         };
@@ -377,13 +427,23 @@ mod tests {
             .map(crate::object::ObjectHandle)
             .expect("Math.abs should be an object");
         assert_eq!(heap.kind(abs), Ok(HeapValueKind::HostFunction));
+        assert_eq!(
+            heap.get_prototype(abs),
+            Ok(Some(intrinsics.function_prototype()))
+        );
+        let to_string_property = property_names.intern("toString");
+        let to_string = heap
+            .get_property(abs, to_string_property)
+            .expect("Function.prototype.toString lookup should succeed")
+            .expect("Function.prototype.toString should be inherited");
+        assert_eq!(to_string.owner(), intrinsics.function_prototype());
 
         let object_property = property_names.intern("Object");
         let object_constructor = heap
             .get_property(intrinsics.global_object(), object_property)
             .expect("global Object lookup should succeed")
-            .expect("Object constructor should be installed")
-            .0;
+            .expect("Object constructor should be installed");
+        let object_constructor = object_constructor.value();
         let PropertyValue::Data(object_constructor) = object_constructor else {
             panic!("expected Object to be a data property");
         };
@@ -401,8 +461,8 @@ mod tests {
         let prototype = heap
             .get_property(object_constructor, prototype_property)
             .expect("Object.prototype lookup should succeed")
-            .expect("Object.prototype should be installed")
-            .0;
+            .expect("Object.prototype should be installed");
+        let prototype = prototype.value();
         let PropertyValue::Data(prototype) = prototype else {
             panic!("expected Object.prototype to be a data property");
         };
@@ -416,8 +476,8 @@ mod tests {
         let function_constructor = heap
             .get_property(intrinsics.global_object(), function_property)
             .expect("global Function lookup should succeed")
-            .expect("Function constructor should be installed")
-            .0;
+            .expect("Function constructor should be installed");
+        let function_constructor = function_constructor.value();
         let PropertyValue::Data(function_constructor) = function_constructor else {
             panic!("expected Function to be a data property");
         };
@@ -434,8 +494,8 @@ mod tests {
         let function_prototype = heap
             .get_property(function_constructor, prototype_property)
             .expect("Function.prototype lookup should succeed")
-            .expect("Function.prototype should be installed")
-            .0;
+            .expect("Function.prototype should be installed");
+        let function_prototype = function_prototype.value();
         let PropertyValue::Data(function_prototype) = function_prototype else {
             panic!("expected Function.prototype to be a data property");
         };
@@ -444,6 +504,65 @@ mod tests {
             .map(crate::object::ObjectHandle)
             .expect("Function.prototype should be an object");
         assert_eq!(function_prototype, intrinsics.function_prototype());
+
+        let array_property = property_names.intern("Array");
+        let array_constructor = heap
+            .get_property(intrinsics.global_object(), array_property)
+            .expect("global Array lookup should succeed")
+            .expect("Array constructor should be installed");
+        let array_constructor = array_constructor.value();
+        let PropertyValue::Data(array_constructor) = array_constructor else {
+            panic!("expected Array to be a data property");
+        };
+        let array_constructor = array_constructor
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Array should be an object");
+        assert_eq!(array_constructor, intrinsics.array_constructor());
+
+        let array_prototype = heap
+            .get_property(array_constructor, prototype_property)
+            .expect("Array.prototype lookup should succeed")
+            .expect("Array.prototype should be installed");
+        let array_prototype = array_prototype.value();
+        let PropertyValue::Data(array_prototype) = array_prototype else {
+            panic!("expected Array.prototype to be a data property");
+        };
+        let array_prototype = array_prototype
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Array.prototype should be an object");
+        assert_eq!(array_prototype, intrinsics.array_prototype());
+
+        let push_property = property_names.intern("push");
+        let push = heap
+            .get_property(array_prototype, push_property)
+            .expect("Array.prototype.push lookup should succeed")
+            .expect("Array.prototype.push should be installed");
+        let push = push.value();
+        let PropertyValue::Data(push) = push else {
+            panic!("expected Array.prototype.push to be a data property");
+        };
+        let push = push
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Array.prototype.push should be an object");
+        assert_eq!(heap.kind(push), Ok(HeapValueKind::HostFunction));
+
+        let reflect_property = property_names.intern("Reflect");
+        let reflect_namespace = heap
+            .get_property(intrinsics.global_object(), reflect_property)
+            .expect("global Reflect lookup should succeed")
+            .expect("Reflect namespace should be installed");
+        let reflect_namespace = reflect_namespace.value();
+        let PropertyValue::Data(reflect_namespace) = reflect_namespace else {
+            panic!("expected Reflect to be a data property");
+        };
+        let reflect_namespace = reflect_namespace
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Reflect should be an object");
+        assert_eq!(heap.kind(reflect_namespace), Ok(HeapValueKind::Object));
     }
 
     #[test]

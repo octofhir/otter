@@ -402,6 +402,9 @@ impl<'a> TinyScriptLowerer<'a> {
                     self.lower_expression(&unary.argument)?,
                 )),
                 UnaryOperator::UnaryPlus => self.lower_expression(&unary.argument),
+                UnaryOperator::Typeof => Err(SourceLoweringError::Unsupported(
+                    "unary operator Typeof".to_string(),
+                )),
                 UnaryOperator::LogicalNot => {
                     Ok(Expr::logical_not(self.lower_expression(&unary.argument)?))
                 }
@@ -694,6 +697,33 @@ mod tests {
     }
 
     #[test]
+    fn compile_test262_basic_script_supports_new_and_constructor_return_override() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function Box(value) {\n",
+                "  this.value = value;\n",
+                "  return 1;\n",
+                "}\n",
+                "function Override() {\n",
+                "  return { value: 9 };\n",
+                "}\n",
+                "var box = new Box(7);\n",
+                "var override = new Override();\n",
+                "assert.sameValue(box.value, 7, \"primitive return falls back to receiver\");\n",
+                "assert.sameValue(override.value, 9, \"object return overrides receiver\");\n",
+                "assert.sameValue(box.constructor, Box, \"closure prototype constructor link\");\n",
+            ),
+            "native-test262-new-constructors.js",
+        )
+        .expect("constructor script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("constructor script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
     fn compile_test262_basic_script_supports_strings_arrays_and_native_asserts() {
         let module = compile_test262_basic_script(
             concat!(
@@ -715,6 +745,64 @@ mod tests {
         let result = Interpreter::new()
             .execute(&module)
             .expect("strings/arrays script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_array_and_reflect_intrinsics() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var array = new Array(1, 2);\n",
+                "assert.sameValue(Array.isArray(array), true, \"Array.isArray\");\n",
+                "assert.sameValue(array.push(3), 3, \"push returns new length\");\n",
+                "assert.sameValue(array[2], 3, \"push stores appended value\");\n",
+                "var proto = { value: 7 };\n",
+                "var child = Object.create(proto);\n",
+                "assert.sameValue(Reflect.get(child, \"value\"), 7, \"Reflect.get walks prototypes\");\n",
+                "assert.sameValue(Reflect.set(child, \"value\", 9), true, \"Reflect.set reports success\");\n",
+                "assert.sameValue(child.value, 9, \"Reflect.set writes onto receiver\");\n",
+                "assert.sameValue(proto.value, 7, \"Reflect.set keeps prototype slot intact\");\n",
+            ),
+            "native-test262-array-reflect.js",
+        )
+        .expect("array/reflect script should compile");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let result = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect("array/reflect script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_typeof_for_runtime_values() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function Box() {}\n",
+                "assert.sameValue(typeof undefined, \"undefined\", \"typeof undefined\");\n",
+                "assert.sameValue(typeof null, \"object\", \"typeof null\");\n",
+                "assert.sameValue(typeof true, \"boolean\", \"typeof true\");\n",
+                "assert.sameValue(typeof 1, \"number\", \"typeof 1\");\n",
+                "assert.sameValue(typeof \"otter\", \"string\", \"typeof string literal\");\n",
+                "assert.sameValue(typeof Box, \"function\", \"typeof closure\");\n",
+                "assert.sameValue(typeof Array, \"function\", \"typeof Array\");\n",
+                "assert.sameValue(typeof [], \"object\", \"typeof array literal\");\n",
+                "assert.sameValue(typeof new Array(), \"object\", \"typeof constructed array\");\n",
+            ),
+            "native-test262-typeof.js",
+        )
+        .expect("typeof script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("typeof script should execute");
         assert_eq!(result.return_value(), RegisterValue::from_i32(0));
     }
 

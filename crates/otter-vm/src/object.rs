@@ -2,6 +2,7 @@
 
 use crate::host::HostFunctionId;
 use crate::module::FunctionIndex;
+use crate::payload::NativePayloadId;
 use crate::property::PropertyNameId;
 use crate::value::RegisterValue;
 
@@ -40,6 +41,44 @@ impl PropertyInlineCache {
     #[must_use]
     pub const fn slot_index(self) -> u16 {
         self.slot_index
+    }
+}
+
+/// Result of an ordinary named-property lookup.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropertyLookup {
+    owner: ObjectHandle,
+    value: PropertyValue,
+    cache: Option<PropertyInlineCache>,
+}
+
+impl PropertyLookup {
+    #[must_use]
+    pub const fn new(
+        owner: ObjectHandle,
+        value: PropertyValue,
+        cache: Option<PropertyInlineCache>,
+    ) -> Self {
+        Self {
+            owner,
+            value,
+            cache,
+        }
+    }
+
+    #[must_use]
+    pub const fn owner(self) -> ObjectHandle {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn value(self) -> PropertyValue {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn cache(self) -> Option<PropertyInlineCache> {
+        self.cache
     }
 }
 
@@ -123,22 +162,37 @@ impl PropertyValue {
 #[derive(Debug, Clone, PartialEq)]
 enum HeapValue {
     Object {
+        prototype: Option<ObjectHandle>,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
     },
+    NativeObject {
+        prototype: Option<ObjectHandle>,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        payload: NativePayloadId,
+    },
     Array {
+        prototype: Option<ObjectHandle>,
         elements: Vec<RegisterValue>,
     },
     String {
+        prototype: Option<ObjectHandle>,
         value: Box<str>,
     },
     Closure {
+        prototype: Option<ObjectHandle>,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
     },
     HostFunction {
         function: HostFunctionId,
+        prototype: Option<ObjectHandle>,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
@@ -180,9 +234,24 @@ impl ObjectHeap {
         let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         let shape_id = self.allocate_shape();
         self.objects.push(HeapValue::Object {
+            prototype: None,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
+        });
+        handle
+    }
+
+    /// Allocates an ordinary object that carries one native payload link.
+    pub fn alloc_native_object(&mut self, payload: NativePayloadId) -> ObjectHandle {
+        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
+        let shape_id = self.allocate_shape();
+        self.objects.push(HeapValue::NativeObject {
+            prototype: None,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            payload,
         });
         handle
     }
@@ -191,6 +260,7 @@ impl ObjectHeap {
     pub fn alloc_array(&mut self) -> ObjectHandle {
         let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         self.objects.push(HeapValue::Array {
+            prototype: None,
             elements: Vec::new(),
         });
         handle
@@ -200,6 +270,7 @@ impl ObjectHeap {
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
         let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         self.objects.push(HeapValue::String {
+            prototype: None,
             value: value.into(),
         });
         handle
@@ -219,7 +290,15 @@ impl ObjectHeap {
         upvalues: Vec<ObjectHandle>,
     ) -> ObjectHandle {
         let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::Closure { callee, upvalues });
+        let shape_id = self.allocate_shape();
+        self.objects.push(HeapValue::Closure {
+            prototype: None,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            callee,
+            upvalues,
+        });
         handle
     }
 
@@ -229,6 +308,7 @@ impl ObjectHeap {
         let shape_id = self.allocate_shape();
         self.objects.push(HeapValue::HostFunction {
             function,
+            prototype: None,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
@@ -240,6 +320,7 @@ impl ObjectHeap {
     pub fn kind(&self, handle: ObjectHandle) -> Result<HeapValueKind, ObjectError> {
         match self.object(handle)? {
             HeapValue::Object { .. } => Ok(HeapValueKind::Object),
+            HeapValue::NativeObject { .. } => Ok(HeapValueKind::Object),
             HeapValue::HostFunction { .. } => Ok(HeapValueKind::HostFunction),
             HeapValue::Array { .. } => Ok(HeapValueKind::Array),
             HeapValue::String { .. } => Ok(HeapValueKind::String),
@@ -251,6 +332,59 @@ impl ObjectHeap {
         }
     }
 
+    /// Returns the direct prototype link for the given heap value.
+    pub fn get_prototype(&self, handle: ObjectHandle) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { prototype, .. }
+            | HeapValue::NativeObject { prototype, .. }
+            | HeapValue::Array { prototype, .. }
+            | HeapValue::String { prototype, .. }
+            | HeapValue::Closure { prototype, .. }
+            | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
+            HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Updates the direct prototype link for the given heap value.
+    pub fn set_prototype(
+        &mut self,
+        handle: ObjectHandle,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<(), ObjectError> {
+        if let Some(prototype) = prototype {
+            self.object(prototype)?;
+        }
+
+        match self.object_mut(handle)? {
+            HeapValue::Object {
+                prototype: slot, ..
+            }
+            | HeapValue::NativeObject {
+                prototype: slot, ..
+            }
+            | HeapValue::Array {
+                prototype: slot, ..
+            }
+            | HeapValue::String {
+                prototype: slot, ..
+            }
+            | HeapValue::Closure {
+                prototype: slot, ..
+            }
+            | HeapValue::HostFunction {
+                prototype: slot, ..
+            } => {
+                *slot = prototype;
+                Ok(())
+            }
+            HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Returns a built-in fast-path property value when one exists.
     pub fn get_builtin_property(
         &self,
@@ -259,15 +393,16 @@ impl ObjectHeap {
     ) -> Result<Option<RegisterValue>, ObjectError> {
         match self.object(handle)? {
             HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. } => Ok(None),
-            HeapValue::Array { elements } if property_name == "length" => Ok(Some(
+            HeapValue::Closure { .. } => Ok(None),
+            HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
             )),
-            HeapValue::String { value } if property_name == "length" => Ok(Some(
+            HeapValue::String { value, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(value.chars().count()).unwrap_or(i32::MAX)),
             )),
             HeapValue::Array { .. } | HeapValue::String { .. } => Ok(None),
@@ -288,7 +423,9 @@ impl ObjectHeap {
         };
 
         match (self.object(lhs_handle)?, self.object(rhs_handle)?) {
-            (HeapValue::String { value: lhs }, HeapValue::String { value: rhs }) => Ok(lhs == rhs),
+            (HeapValue::String { value: lhs, .. }, HeapValue::String { value: rhs, .. }) => {
+                Ok(lhs == rhs)
+            }
             _ => Ok(false),
         }
     }
@@ -300,8 +437,8 @@ impl ObjectHeap {
         index: usize,
     ) -> Result<Option<RegisterValue>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::Array { elements } => Ok(elements.get(index).copied()),
-            HeapValue::String { value } => {
+            HeapValue::Array { elements, .. } => Ok(elements.get(index).copied()),
+            HeapValue::String { value, .. } => {
                 let character = value
                     .chars()
                     .nth(index)
@@ -315,6 +452,7 @@ impl ObjectHeap {
                 }
             }
             HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
@@ -331,7 +469,7 @@ impl ObjectHeap {
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
-            HeapValue::Array { elements } => {
+            HeapValue::Array { elements, .. } => {
                 if index >= elements.len() {
                     elements.resize(index.saturating_add(1), RegisterValue::undefined());
                 }
@@ -339,6 +477,7 @@ impl ObjectHeap {
                 Ok(())
             }
             HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
@@ -449,9 +588,40 @@ impl ObjectHeap {
         match self.object(handle)? {
             HeapValue::HostFunction { function, .. } => Ok(Some(*function)),
             HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
             | HeapValue::Array { .. }
             | HeapValue::String { .. }
             | HeapValue::Closure { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Ok(None),
+        }
+    }
+
+    /// Returns the dense element length for arrays.
+    pub fn array_length(&self, handle: ObjectHandle) -> Result<Option<usize>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Array { elements, .. } => Ok(Some(elements.len())),
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::String { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Ok(None),
+        }
+    }
+
+    /// Returns the borrowed string contents for string heap values.
+    pub fn string_value(&self, handle: ObjectHandle) -> Result<Option<&str>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => Ok(Some(value)),
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Array { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. } => Ok(None),
@@ -470,6 +640,38 @@ impl ObjectHeap {
                 .copied()
                 .ok_or(ObjectError::InvalidIndex),
             _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the payload link stored on a native object, if any.
+    pub fn native_payload_id(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<NativePayloadId>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::NativeObject { payload, .. } => Ok(Some(*payload)),
+            HeapValue::Object { .. }
+            | HeapValue::Array { .. }
+            | HeapValue::String { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Ok(None),
+        }
+    }
+
+    /// Visits every live native payload link stored in the heap.
+    pub fn trace_native_payload_links(
+        &self,
+        tracer: &mut dyn FnMut(ObjectHandle, NativePayloadId),
+    ) {
+        for (index, object) in self.objects.iter().enumerate() {
+            let HeapValue::NativeObject { payload, .. } = object else {
+                continue;
+            };
+            let handle = ObjectHandle(u32::try_from(index).unwrap_or(u32::MAX));
+            tracer(handle, *payload);
         }
     }
 
@@ -509,6 +711,19 @@ impl ObjectHeap {
                 shape_id,
                 keys,
                 values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id,
+                keys,
+                values,
+                ..
             }
             | HeapValue::HostFunction {
                 shape_id,
@@ -530,33 +745,21 @@ impl ObjectHeap {
         Ok(None)
     }
 
-    /// Returns a property value through the generic lookup path.
+    /// Returns a property value through ordinary prototype traversal.
     pub fn get_property(
         &self,
         handle: ObjectHandle,
         property: PropertyNameId,
-    ) -> Result<Option<(PropertyValue, PropertyInlineCache)>, ObjectError> {
-        let object = self.object(handle)?;
-        let (shape_id, keys, values) = match object {
-            HeapValue::Object {
-                shape_id,
-                keys,
-                values,
+    ) -> Result<Option<PropertyLookup>, ObjectError> {
+        let mut current = Some(handle);
+        while let Some(owner) = current {
+            if let Some((value, cache)) = self.get_own_property(owner, property)? {
+                let cache = (owner == handle).then_some(cache);
+                return Ok(Some(PropertyLookup::new(owner, value, cache)));
             }
-            | HeapValue::HostFunction {
-                shape_id,
-                keys,
-                values,
-                ..
-            } => (shape_id, keys, values),
-            _ => return Err(ObjectError::InvalidKind),
-        };
-        let Some(slot_index) = property_slot(keys, property) else {
-            return Ok(None);
-        };
-        let value = values[usize::from(slot_index)];
-        let cache = PropertyInlineCache::new(*shape_id, slot_index);
-        Ok(Some((value, cache)))
+            current = self.property_traversal_prototype(owner)?;
+        }
+        Ok(None)
     }
 
     /// Returns a shaped property value when the shape and slot still match.
@@ -569,6 +772,16 @@ impl ObjectHeap {
         let object = self.object(handle)?;
         let (object_shape_id, values) = match object {
             HeapValue::Object {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
                 shape_id: object_shape_id,
                 values,
                 ..
@@ -600,6 +813,19 @@ impl ObjectHeap {
                 shape_id,
                 keys,
                 values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id,
+                keys,
+                values,
+                ..
             }
             | HeapValue::HostFunction {
                 shape_id,
@@ -633,10 +859,11 @@ impl ObjectHeap {
     ) -> Result<PropertyInlineCache, ObjectError> {
         if let Some(slot_index) = match self.object(handle)? {
             HeapValue::Object { keys, .. } => property_slot(keys, property),
+            HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
+            HeapValue::Closure { keys, .. } => property_slot(keys, property),
             HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
-            | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. } => {
@@ -646,6 +873,12 @@ impl ObjectHeap {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
                 HeapValue::Object {
+                    shape_id, values, ..
+                }
+                | HeapValue::NativeObject {
+                    shape_id, values, ..
+                }
+                | HeapValue::Closure {
                     shape_id, values, ..
                 }
                 | HeapValue::HostFunction {
@@ -664,6 +897,19 @@ impl ObjectHeap {
                 shape_id: object_shape_id,
                 keys,
                 values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
             }
             | HeapValue::HostFunction {
                 shape_id: object_shape_id,
@@ -691,6 +937,16 @@ impl ObjectHeap {
         let object = self.object_mut(handle)?;
         let (object_shape_id, values) = match object {
             HeapValue::Object {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
                 shape_id: object_shape_id,
                 values,
                 ..
@@ -724,10 +980,11 @@ impl ObjectHeap {
 
         if let Some(slot_index) = match self.object(handle)? {
             HeapValue::Object { keys, .. } => property_slot(keys, property),
+            HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
+            HeapValue::Closure { keys, .. } => property_slot(keys, property),
             HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
-            | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
@@ -735,6 +992,12 @@ impl ObjectHeap {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
                 HeapValue::Object {
+                    shape_id, values, ..
+                }
+                | HeapValue::NativeObject {
+                    shape_id, values, ..
+                }
+                | HeapValue::Closure {
                     shape_id, values, ..
                 }
                 | HeapValue::HostFunction {
@@ -753,6 +1016,19 @@ impl ObjectHeap {
                 shape_id: object_shape_id,
                 keys,
                 values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
             }
             | HeapValue::HostFunction {
                 shape_id: object_shape_id,
@@ -786,6 +1062,69 @@ impl ObjectHeap {
         self.next_shape_id = self.next_shape_id.saturating_add(1);
         shape_id
     }
+
+    fn get_own_property(
+        &self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<Option<(PropertyValue, PropertyInlineCache)>, ObjectError> {
+        let object = self.object(handle)?;
+        let (shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            } => (shape_id, keys, values),
+            HeapValue::Array { .. } | HeapValue::String { .. } => {
+                return Ok(None);
+            }
+            HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+        };
+        let Some(slot_index) = property_slot(keys, property) else {
+            return Ok(None);
+        };
+        let value = values[usize::from(slot_index)];
+        let cache = PropertyInlineCache::new(*shape_id, slot_index);
+        Ok(Some((value, cache)))
+    }
+
+    fn property_traversal_prototype(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { prototype, .. }
+            | HeapValue::NativeObject { prototype, .. }
+            | HeapValue::Array { prototype, .. }
+            | HeapValue::String { prototype, .. }
+            | HeapValue::Closure { prototype, .. }
+            | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
+            HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+        }
+    }
 }
 
 fn property_slot(keys: &[PropertyNameId], property: PropertyNameId) -> Option<u16> {
@@ -800,6 +1139,8 @@ mod tests {
     use crate::module::FunctionIndex;
     use crate::property::PropertyNameId;
     use crate::value::RegisterValue;
+
+    use crate::payload::NativePayloadId;
 
     use super::{
         HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyInlineCache, PropertyValue,
@@ -829,16 +1170,43 @@ mod tests {
             .get_property(handle, property)
             .expect("generic lookup should succeed");
         assert_eq!(
-            generic.map(|(value, cache)| {
-                let PropertyValue::Data(value) = value else {
+            generic.map(|lookup| {
+                let PropertyValue::Data(value) = lookup.value() else {
                     panic!("expected data property");
                 };
-                (value, cache)
+                (value, lookup.cache())
             }),
             Some((
                 RegisterValue::from_i32(9),
-                PropertyInlineCache::new(cache.shape_id(), cache.slot_index())
+                Some(PropertyInlineCache::new(
+                    cache.shape_id(),
+                    cache.slot_index()
+                ))
             ))
+        );
+    }
+
+    #[test]
+    fn object_heap_traverses_prototype_chain_for_named_properties() {
+        let mut heap = ObjectHeap::new();
+        let prototype = heap.alloc_object();
+        let object = heap.alloc_object();
+        let property = PropertyNameId(0);
+
+        heap.set_prototype(object, Some(prototype))
+            .expect("prototype link should install");
+        heap.set_property(prototype, property, RegisterValue::from_i32(7))
+            .expect("prototype property store should succeed");
+
+        let lookup = heap
+            .get_property(object, property)
+            .expect("prototype lookup should succeed")
+            .expect("inherited property should resolve");
+        assert_eq!(lookup.owner(), prototype);
+        assert_eq!(lookup.cache(), None);
+        assert_eq!(
+            lookup.value(),
+            PropertyValue::Data(RegisterValue::from_i32(7))
         );
     }
 
@@ -926,9 +1294,36 @@ mod tests {
         assert_eq!(
             heap.get_property(function, property)
                 .expect("host function property lookup should succeed")
-                .map(|entry| entry.0),
+                .map(|entry| entry.value()),
             Some(PropertyValue::Data(RegisterValue::from_i32(9)))
         );
+    }
+
+    #[test]
+    fn object_heap_supports_native_objects_with_payload_links() {
+        let mut heap = ObjectHeap::new();
+        let payload = NativePayloadId(3);
+        let prototype = heap.alloc_object();
+        let object = heap.alloc_native_object(payload);
+        let property = PropertyNameId(0);
+
+        heap.set_prototype(object, Some(prototype))
+            .expect("prototype link should install");
+        heap.set_property(object, property, RegisterValue::from_i32(11))
+            .expect("native object property store should succeed");
+
+        assert_eq!(heap.kind(object), Ok(HeapValueKind::Object));
+        assert_eq!(heap.native_payload_id(object), Ok(Some(payload)));
+        assert_eq!(
+            heap.get_property(object, property)
+                .expect("native object lookup should succeed")
+                .map(|entry| entry.value()),
+            Some(PropertyValue::Data(RegisterValue::from_i32(11)))
+        );
+
+        let mut seen = Vec::new();
+        heap.trace_native_payload_links(&mut |handle, payload_id| seen.push((handle, payload_id)));
+        assert_eq!(seen, vec![(object, payload)]);
     }
 
     #[test]

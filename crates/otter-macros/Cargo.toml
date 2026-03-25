@@ -29,3 +29,7 @@ otter-vm-runtime = { path = "../otter-vm-runtime" }
 [[test]]
 name = "js_class_descriptor"
 path = "tests/js_class_descriptor.rs"
+
+[[test]]
+name = "js_namespace_descriptor"
+path = "tests/js_namespace_descriptor.rs"

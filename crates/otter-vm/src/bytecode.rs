@@ -84,6 +84,8 @@ pub enum Opcode {
     LoadCurrentClosure = 0x0D,
     /// Load the current receiver / `this` value into a register.
     LoadThis = 0x0E,
+    /// JavaScript `typeof`.
+    TypeOf = 0x0F,
     /// Integer-or-number addition.
     Add = 0x10,
     /// Integer-or-number subtraction.
@@ -150,6 +152,7 @@ impl Opcode {
             0x0C => Some(Self::LoadException),
             0x0D => Some(Self::LoadCurrentClosure),
             0x0E => Some(Self::LoadThis),
+            0x0F => Some(Self::TypeOf),
             0x10 => Some(Self::Add),
             0x11 => Some(Self::Sub),
             0x12 => Some(Self::Mul),
@@ -333,6 +336,12 @@ impl Instruction {
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes JavaScript `typeof`.
+    #[must_use]
+    pub const fn type_of(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::TypeOf, dst, src, BytecodeRegister::new(0))
     }
 
     /// Encodes a boolean negation.
@@ -700,15 +709,16 @@ mod tests {
         let exception = Instruction::load_exception(BytecodeRegister::new(12));
         let current_closure = Instruction::load_current_closure(BytecodeRegister::new(13));
         let current_this = Instruction::load_this(BytecodeRegister::new(14));
-        let throw = Instruction::throw(BytecodeRegister::new(15));
+        let type_of = Instruction::type_of(BytecodeRegister::new(15), BytecodeRegister::new(14));
+        let throw = Instruction::throw(BytecodeRegister::new(16));
         let iterator =
-            Instruction::get_iterator(BytecodeRegister::new(16), BytecodeRegister::new(17));
+            Instruction::get_iterator(BytecodeRegister::new(17), BytecodeRegister::new(18));
         let iterator_next = Instruction::iterator_next(
-            BytecodeRegister::new(18),
             BytecodeRegister::new(19),
-            BytecodeRegister::new(16),
+            BytecodeRegister::new(20),
+            BytecodeRegister::new(17),
         );
-        let iterator_close = Instruction::iterator_close(BytecodeRegister::new(16));
+        let iterator_close = Instruction::iterator_close(BytecodeRegister::new(17));
 
         assert_eq!(load.opcode(), Opcode::LoadI32);
         assert_eq!(load.a(), 4);
@@ -732,17 +742,20 @@ mod tests {
         assert_eq!(current_closure.a(), 13);
         assert_eq!(current_this.opcode(), Opcode::LoadThis);
         assert_eq!(current_this.a(), 14);
+        assert_eq!(type_of.opcode(), Opcode::TypeOf);
+        assert_eq!(type_of.a(), 15);
+        assert_eq!(type_of.b(), 14);
         assert_eq!(throw.opcode(), Opcode::Throw);
-        assert_eq!(throw.a(), 15);
+        assert_eq!(throw.a(), 16);
         assert_eq!(iterator.opcode(), Opcode::GetIterator);
-        assert_eq!(iterator.a(), 16);
-        assert_eq!(iterator.b(), 17);
+        assert_eq!(iterator.a(), 17);
+        assert_eq!(iterator.b(), 18);
         assert_eq!(iterator_next.opcode(), Opcode::IteratorNext);
-        assert_eq!(iterator_next.a(), 18);
-        assert_eq!(iterator_next.b(), 19);
-        assert_eq!(iterator_next.c(), 16);
+        assert_eq!(iterator_next.a(), 19);
+        assert_eq!(iterator_next.b(), 20);
+        assert_eq!(iterator_next.c(), 17);
         assert_eq!(iterator_close.opcode(), Opcode::IteratorClose);
-        assert_eq!(iterator_close.a(), 16);
+        assert_eq!(iterator_close.a(), 17);
 
         assert_eq!(jump.opcode(), Opcode::Jump);
         assert_eq!(jump.immediate_i32(), -9);

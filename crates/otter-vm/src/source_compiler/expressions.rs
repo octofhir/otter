@@ -34,6 +34,9 @@ impl<'a> FunctionCompiler<'a> {
             Expression::UnaryExpression(unary) => self.compile_unary_expression(unary, module),
             Expression::UpdateExpression(update) => self.compile_update_expression(update),
             Expression::CallExpression(call) => self.compile_call_expression(call, module),
+            Expression::NewExpression(new_expression) => {
+                self.compile_new_expression(new_expression, module)
+            }
             Expression::FunctionExpression(function) => {
                 self.compile_function_expression(function, module)
             }
@@ -337,6 +340,17 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(result)
             }
             UnaryOperator::UnaryPlus => self.compile_expression(&unary.argument, module),
+            UnaryOperator::Typeof => {
+                let value = self.compile_expression(&unary.argument, module)?;
+                let result = if value.is_temp {
+                    value
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                self.instructions
+                    .push(Instruction::type_of(result.register, value.register));
+                Ok(result)
+            }
             UnaryOperator::LogicalNot => {
                 let value = self.compile_expression(&unary.argument, module)?;
                 let result = if value.is_temp {
@@ -464,6 +478,76 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
+    fn compile_new_expression(
+        &mut self,
+        new_expression: &oxc_ast::ast::NewExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let (callee, cleanup) = self.compile_construct_target(&new_expression.callee, module)?;
+        let arguments = &new_expression.arguments;
+        let argument_count = RegisterIndex::try_from(arguments.len())
+            .map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let arg_start = if argument_count == 0 {
+            BytecodeRegister::new(self.next_local + self.next_temp)
+        } else {
+            self.reserve_temp_window(argument_count)?
+        };
+
+        for (offset, argument) in arguments.iter().enumerate() {
+            let value = match argument {
+                Argument::SpreadElement(_) => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "spread arguments".to_string(),
+                    ));
+                }
+                _ => self.compile_expression(
+                    argument.as_expression().ok_or_else(|| {
+                        SourceLoweringError::Unsupported("unsupported call argument".to_string())
+                    })?,
+                    module,
+                )?,
+            };
+            let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
+            if value.register != destination {
+                self.instructions
+                    .push(Instruction::move_(destination, value.register));
+                self.release(value);
+            }
+        }
+
+        let result = if callee.is_temp {
+            callee
+        } else {
+            ValueLocation::temp(self.alloc_temp())
+        };
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            result.register,
+            callee.register,
+            arg_start,
+        ));
+        self.record_call_site(
+            pc,
+            CallSite::Closure(ClosureCall::new(
+                argument_count,
+                FrameFlags::new(true, true, false),
+            )),
+        );
+
+        if argument_count != 0 {
+            self.release_temp_window(argument_count);
+        }
+        if callee.register != result.register {
+            self.release(callee);
+        }
+        if let Some(value) = cleanup
+            && value.register != result.register
+        {
+            self.release(value);
+        }
+        Ok(result)
+    }
+
     fn compile_call_target(
         &mut self,
         callee: &Expression<'_>,
@@ -522,6 +606,53 @@ impl<'a> FunctionCompiler<'a> {
                 let callee = self.compile_expression(callee, module)?;
                 Ok((self.materialize_value(callee), None))
             }
+        }
+    }
+
+    fn compile_construct_target(
+        &mut self,
+        callee: &Expression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(ValueLocation, Option<ValueLocation>), SourceLoweringError> {
+        match callee {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let callee_register = self.alloc_temp();
+                let property = self.intern_property_name(member.property.name.as_str())?;
+                self.instructions.push(Instruction::get_property(
+                    callee_register,
+                    object.register,
+                    property,
+                ));
+                Ok((ValueLocation::temp(callee_register), Some(object)))
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let callee_register = self.alloc_temp();
+
+                match &member.expression {
+                    Expression::StringLiteral(literal) => {
+                        let property = self.intern_property_name(literal.value.as_str())?;
+                        self.instructions.push(Instruction::get_property(
+                            callee_register,
+                            object.register,
+                            property,
+                        ));
+                    }
+                    _ => {
+                        let index = self.compile_expression(&member.expression, module)?;
+                        self.instructions.push(Instruction::get_index(
+                            callee_register,
+                            object.register,
+                            index.register,
+                        ));
+                        self.release(index);
+                    }
+                }
+
+                Ok((ValueLocation::temp(callee_register), Some(object)))
+            }
+            _ => Ok((self.compile_expression(callee, module)?, None)),
         }
     }
 

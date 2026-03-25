@@ -28,9 +28,9 @@ impl IntrinsicInstaller for FunctionIntrinsic {
 
         let constructor = if let Some(descriptor) = plan.constructor() {
             let host_function = cx.native_functions.register(descriptor.clone());
-            cx.heap.alloc_host_function(host_function)
+            cx.alloc_intrinsic_host_function(host_function, intrinsics.function_prototype())?
         } else {
-            cx.heap.alloc_object()
+            cx.alloc_intrinsic_object(Some(intrinsics.object_prototype()))?
         };
 
         intrinsics.function_constructor = constructor;
@@ -38,6 +38,7 @@ impl IntrinsicInstaller for FunctionIntrinsic {
             intrinsics.function_prototype(),
             intrinsics.function_constructor(),
             &plan,
+            intrinsics.function_prototype(),
             cx,
         )?;
 
@@ -128,6 +129,6 @@ fn function_to_string(
         }
     };
 
-    let string = runtime.objects_mut().alloc_string(text);
+    let string = runtime.alloc_string(text);
     Ok(RegisterValue::from_object_handle(string.0))
 }

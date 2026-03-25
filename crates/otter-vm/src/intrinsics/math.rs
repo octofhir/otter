@@ -20,11 +20,16 @@ impl IntrinsicInstaller for MathIntrinsic {
         intrinsics: &mut VmIntrinsics,
         cx: &mut IntrinsicInstallContext<'_>,
     ) -> Result<(), IntrinsicsError> {
-        let math_namespace = cx.heap.alloc_object();
+        let math_namespace = cx.alloc_intrinsic_object(Some(intrinsics.object_prototype()))?;
         let math_plan = NamespaceBuilder::from_bindings(&math_namespace_bindings())
             .expect("Math namespace descriptors should normalize")
             .build();
-        install_object_plan(math_namespace, &math_plan, cx)?;
+        install_object_plan(
+            math_namespace,
+            &math_plan,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
         intrinsics.set_math_namespace(math_namespace);
         Ok(())
     }
@@ -86,8 +91,10 @@ fn math_memory_getter(
     })?;
     let backing = runtime.intern_property_name("__memory");
     match runtime.objects().get_property(receiver, backing) {
-        Ok(Some((PropertyValue::Data(value), _))) => Ok(value),
-        Ok(Some((PropertyValue::Accessor { .. }, _))) => Ok(RegisterValue::undefined()),
+        Ok(Some(lookup)) => match lookup.value() {
+            PropertyValue::Data(value) => Ok(value),
+            PropertyValue::Accessor { .. } => Ok(RegisterValue::undefined()),
+        },
         Ok(None) => Ok(RegisterValue::undefined()),
         Err(error) => Err(VmNativeCallError::Internal(
             format!("Math.memory getter failed: {error:?}").into(),

@@ -19,44 +19,6 @@ use otter_vm_core::IsolateConfig;
 use crate::harness::TestHarnessState;
 use crate::metadata::{ErrorPhase, ExecutionMode, TestMetadata};
 
-const NATIVE_TEST262_BASIC_FILES: &[&str] = &[
-    "test/built-ins/Array/S15.4.1_A2.1_T1.js",
-    "test/built-ins/Array/S15.4.5.2_A2_T1.js",
-    "test/language/expressions/addition/S11.6.1_A2.4_T1.js",
-    "test/language/expressions/array/11.1.4-0.js",
-    "test/language/expressions/object/S11.1.5_A4.3.js",
-    "test/language/statements/do-while/S12.6.1_A1.js",
-    "test/language/function-code/S10.2.1_A1.js",
-    "test/language/function-code/S10.2.1_A3.js",
-    "test/language/function-code/S10.4_A1.1_T1.js",
-    "test/language/function-code/S10.4A1.1_T2.js",
-    "test/language/statements/if/S12.5_A1.1_T1.js",
-    "test/language/statements/if/S12.5_A1.1_T2.js",
-    "test/language/statements/if/S12.5_A1_T1.js",
-    "test/language/statements/if/S12.5_A1_T2.js",
-    "test/language/statements/if/S12.5_A12_T1.js",
-    "test/language/statements/if/S12.5_A12_T2.js",
-    "test/language/statements/if/S12.5_A12_T3.js",
-    "test/language/statements/if/S12.5_A12_T4.js",
-    "test/language/statements/for-of/array.js",
-    "test/language/statements/for-of/head-lhs-cover.js",
-    "test/language/statements/for-of/head-var-bound-names-in-stmt.js",
-    "test/language/statements/for-of/string-astral.js",
-    "test/language/statements/for-of/string-bmp.js",
-    "test/language/statements/try/12.14-10.js",
-    "test/language/statements/try/12.14-11.js",
-    "test/language/statements/try/12.14-12.js",
-    "test/language/statements/try/12.14-4.js",
-    "test/language/statements/try/12.14-6.js",
-    "test/language/statements/try/12.14-8.js",
-    "test/language/statements/try/12.14-9.js",
-    "test/language/statements/try/S12.14_A7_T1.js",
-    "test/language/statements/while/S12.6.2_A1.js",
-    "test/language/types/string/S8.4_A3.js",
-    "test/language/types/string/S8.4_A4.js",
-    "test/language/types/string/S8.4_A6.1.js",
-];
-
 /// Test262 test runner
 pub struct Test262Runner {
     /// Path to test262 directory
@@ -594,8 +556,7 @@ impl Test262Runner {
             .map(|i| &content[i + 5..])
             .unwrap_or(content);
 
-        if let Some(native_source) =
-            self.build_native_test262_basic_source(&relative_path_str, test_content, metadata, mode)
+        if let Some(native_source) = self.build_next_vm_test262_source(test_content, metadata, mode)
         {
             self.harness_state.clear();
             return self
@@ -618,9 +579,8 @@ impl Test262Runner {
         }
     }
 
-    fn build_native_test262_basic_source(
+    fn build_next_vm_test262_source(
         &self,
-        relative_path: &str,
         test_content: &str,
         metadata: &TestMetadata,
         mode: ExecutionMode,
@@ -633,10 +593,6 @@ impl Test262Runner {
             || metadata.expects_runtime_error()
             || !metadata.includes.is_empty()
         {
-            return None;
-        }
-
-        if !NATIVE_TEST262_BASIC_FILES.contains(&relative_path) {
             return None;
         }
 

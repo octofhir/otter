@@ -96,7 +96,7 @@ impl<'a> FunctionCompiler<'a> {
             && name == "NaN"
             && !self.env.bindings.contains_key(name)
         {
-            return self.compile_bool(false);
+            return self.load_nan();
         }
 
         match self.resolve_binding(name)? {
@@ -515,7 +515,7 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        let result = if callee.is_temp {
+        let mut result = if callee.is_temp {
             callee
         } else {
             ValueLocation::temp(self.alloc_temp())
@@ -535,7 +535,14 @@ impl<'a> FunctionCompiler<'a> {
         );
 
         if argument_count != 0 {
-            self.release_temp_window(argument_count);
+            let stable_register =
+                BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
+            if result.register != stable_register {
+                self.instructions
+                    .push(Instruction::move_(stable_register, result.register));
+                result = ValueLocation::temp(stable_register);
+            }
+            self.release_temp_window(argument_count.saturating_sub(1));
         }
         if callee.register != result.register {
             self.release(callee);
@@ -700,13 +707,7 @@ impl<'a> FunctionCompiler<'a> {
             )
         })?;
 
-        let comparison = if actual.is_temp {
-            actual
-        } else if expected.is_temp {
-            expected
-        } else {
-            ValueLocation::temp(self.alloc_temp())
-        };
+        let comparison = ValueLocation::temp(self.alloc_temp());
         self.instructions.push(Instruction::eq(
             comparison.register,
             actual.register,
@@ -715,11 +716,50 @@ impl<'a> FunctionCompiler<'a> {
         let jump_to_end =
             self.emit_conditional_placeholder(Opcode::JumpIfTrue, comparison.register);
 
+        let actual_is_nan =
+            if comparison.register != actual.register && comparison.register != expected.register {
+                comparison
+            } else {
+                ValueLocation::temp(self.alloc_temp())
+            };
+        self.instructions.push(Instruction::eq(
+            actual_is_nan.register,
+            actual.register,
+            actual.register,
+        ));
+        self.instructions.push(Instruction::not(
+            actual_is_nan.register,
+            actual_is_nan.register,
+        ));
+        let jump_to_failure =
+            self.emit_conditional_placeholder(Opcode::JumpIfFalse, actual_is_nan.register);
+
+        let expected_is_nan = if actual_is_nan.register != expected.register {
+            actual_is_nan
+        } else {
+            ValueLocation::temp(self.alloc_temp())
+        };
+        self.instructions.push(Instruction::eq(
+            expected_is_nan.register,
+            expected.register,
+            expected.register,
+        ));
+        self.instructions.push(Instruction::not(
+            expected_is_nan.register,
+            expected_is_nan.register,
+        ));
+        let jump_past_failure =
+            self.emit_conditional_placeholder(Opcode::JumpIfTrue, expected_is_nan.register);
+
+        let failure_pc = self.instructions.len();
         let failure = self.load_i32(1)?;
         self.instructions.push(Instruction::ret(failure.register));
         self.release(failure);
 
-        self.patch_jump(jump_to_end, self.instructions.len())?;
+        let success_pc = self.instructions.len();
+        self.patch_jump(jump_to_failure, failure_pc)?;
+        self.patch_jump(jump_to_end, success_pc)?;
+        self.patch_jump(jump_past_failure, success_pc)?;
         if comparison.register != actual.register {
             self.release(actual);
         }
@@ -728,6 +768,12 @@ impl<'a> FunctionCompiler<'a> {
         }
         if comparison.is_temp {
             self.release(comparison);
+        }
+        if actual_is_nan.register != comparison.register && actual_is_nan.is_temp {
+            self.release(actual_is_nan);
+        }
+        if expected_is_nan.register != actual_is_nan.register && expected_is_nan.is_temp {
+            self.release(expected_is_nan);
         }
 
         self.load_undefined()

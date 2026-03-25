@@ -794,6 +794,99 @@ impl RuntimeState {
         }
     }
 
+    fn string_wrapper_data(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, InterpreterError> {
+        let backing = self.intern_property_name("__otter_string_data__");
+        let Some(lookup) = self.objects.get_property(handle, backing)? else {
+            return Ok(None);
+        };
+        let PropertyValue::Data(value) = lookup.value() else {
+            return Ok(None);
+        };
+        Ok(value.as_object_handle().map(ObjectHandle))
+    }
+
+    fn js_to_string(&mut self, value: RegisterValue) -> Result<Box<str>, InterpreterError> {
+        if value == RegisterValue::undefined() {
+            return Ok("undefined".into());
+        }
+        if value == RegisterValue::null() {
+            return Ok("null".into());
+        }
+        if let Some(boolean) = value.as_bool() {
+            return Ok(if boolean { "true" } else { "false" }.into());
+        }
+        if let Some(number) = value.as_number() {
+            let text = if number.is_nan() {
+                "NaN".to_string()
+            } else if number.is_infinite() {
+                if number.is_sign_positive() {
+                    "Infinity".to_string()
+                } else {
+                    "-Infinity".to_string()
+                }
+            } else if number == 0.0 {
+                "0".to_string()
+            } else if number.fract() == 0.0 {
+                format!("{number:.0}")
+            } else {
+                number.to_string()
+            };
+            return Ok(text.into_boxed_str());
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            if let Some(string) = self.objects.string_value(handle)? {
+                return Ok(string.to_string().into_boxed_str());
+            }
+            if let Some(primitive) = self.string_wrapper_data(handle)?
+                && let Some(string) = self.objects.string_value(primitive)?
+            {
+                return Ok(string.to_string().into_boxed_str());
+            }
+            return Ok("[object Object]".into());
+        }
+
+        Ok(String::new().into_boxed_str())
+    }
+
+    fn js_add(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let lhs_is_string = lhs
+            .as_object_handle()
+            .map(ObjectHandle)
+            .map(|handle| {
+                matches!(self.objects.kind(handle), Ok(HeapValueKind::String))
+                    || matches!(self.string_wrapper_data(handle), Ok(Some(_)))
+            })
+            .unwrap_or(false);
+        let rhs_is_string = rhs
+            .as_object_handle()
+            .map(ObjectHandle)
+            .map(|handle| {
+                matches!(self.objects.kind(handle), Ok(HeapValueKind::String))
+                    || matches!(self.string_wrapper_data(handle), Ok(Some(_)))
+            })
+            .unwrap_or(false);
+
+        if lhs_is_string || rhs_is_string {
+            let mut text = self.js_to_string(lhs)?.into_string();
+            text.push_str(&self.js_to_string(rhs)?);
+            let value = self.alloc_string(text);
+            return Ok(RegisterValue::from_object_handle(value.0));
+        }
+
+        if let (Some(lhs_number), Some(rhs_number)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(lhs_number + rhs_number));
+        }
+
+        lhs.add_i32(rhs).map_err(InterpreterError::InvalidValue)
+    }
+
     fn js_typeof(&mut self, value: RegisterValue) -> Result<RegisterValue, InterpreterError> {
         let kind = if value == RegisterValue::undefined() {
             "undefined"
@@ -1101,6 +1194,15 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::LoadNaN => {
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(f64::NAN),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::NewObject => {
                 let handle = runtime.alloc_object();
                 activation.write_bytecode_register(
@@ -1216,7 +1318,7 @@ impl Interpreter {
             Opcode::Add => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let value = lhs.add_i32(rhs)?;
+                let value = runtime.js_add(lhs, rhs)?;
                 activation.write_bytecode_register(function, instruction.a(), value)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)

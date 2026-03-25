@@ -508,6 +508,24 @@ mod tests {
     use crate::source::{compile_script, compile_test262_basic_script, lower_script};
     use crate::value::RegisterValue;
 
+    fn execute_test262_basic(source: &str, source_url: &str) -> RegisterValue {
+        let module = compile_test262_basic_script(source, source_url)
+            .expect("test262 basic script compiles");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect("test262 basic script executes")
+            .return_value()
+    }
+
     #[test]
     fn lowers_basic_loop_script() {
         let program = lower_script(
@@ -779,6 +797,176 @@ mod tests {
             )
             .expect("array/reflect script should execute");
         assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_primitive_wrapper_intrinsics() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var text = String(\"otter\");\n",
+                "assert.sameValue(text, \"otter\", \"String() returns a string primitive value\");\n",
+                "var wrappedText = new String(\"otter\");\n",
+                "assert.sameValue(wrappedText.valueOf(), \"otter\", \"String wrapper delegates through prototype\");\n",
+                "assert.sameValue(String.prototype.valueOf(), \"\", \"String.prototype carries empty string data\");\n",
+                "assert.sameValue(Object(\"otter\").valueOf(), \"otter\", \"Object boxes string primitives\");\n",
+                "assert.sameValue(wrappedText.constructor, String, \"string wrapper constructor link\");\n",
+                "assert.sameValue(String.prototype.constructor, String, \"String.prototype.constructor\");\n",
+                "assert.sameValue(Number(\"7\"), 7, \"Number coerces string input\");\n",
+                "var wrappedNumber = new Number(true);\n",
+                "assert.sameValue((new Number()).valueOf(), 0, \"Number wrapper defaults to +0\");\n",
+                "assert.sameValue((new Number(0)).valueOf(), 0, \"Number wrapper preserves zero\");\n",
+                "assert.sameValue((new Number(-1)).valueOf(), -1, \"Number wrapper preserves negatives\");\n",
+                "assert.sameValue(wrappedNumber.valueOf(), 1, \"Number wrapper stores primitive value\");\n",
+                "assert.sameValue(Number.prototype.valueOf(), 0, \"Number.prototype stores default numeric data\");\n",
+                "assert.sameValue(Object(7).valueOf(), 7, \"Object boxes numeric primitives\");\n",
+                "assert.sameValue((new Number(NaN)).valueOf(), NaN, \"Number wrapper preserves NaN under sameValue\");\n",
+                "assert.sameValue(Number.prototype.constructor, Number, \"Number.prototype.constructor\");\n",
+                "assert.sameValue(Boolean(\"\"), false, \"Boolean coerces empty string\");\n",
+                "var wrappedBoolean = new Boolean(1);\n",
+                "assert.sameValue((new Boolean()).valueOf(), false, \"Boolean wrapper defaults to false\");\n",
+                "assert.sameValue((new Boolean(0)).valueOf(), false, \"Boolean wrapper preserves falsy numbers\");\n",
+                "assert.sameValue((new Boolean(-1)).valueOf(), true, \"Boolean wrapper preserves truthy numbers\");\n",
+                "assert.sameValue(wrappedBoolean.valueOf(), true, \"Boolean wrapper stores primitive value\");\n",
+                "assert.sameValue(Boolean.prototype.valueOf(), false, \"Boolean.prototype stores default boolean data\");\n",
+                "assert.sameValue(Object(true).valueOf(), true, \"Object boxes boolean primitives\");\n",
+                "assert.sameValue((new Boolean(new Object())).valueOf(), true, \"Boolean wrapper treats objects as truthy\");\n",
+                "assert.sameValue(Boolean.prototype.constructor, Boolean, \"Boolean.prototype.constructor\");\n",
+            ),
+            "native-test262-primitive-wrapper-intrinsics.js",
+        )
+        .expect("primitive wrapper intrinsic script should compile");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let result = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect("primitive wrapper intrinsic script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_number_prototype_value_of() {
+        let result = execute_test262_basic(
+            "assert.sameValue(Number.prototype.valueOf(), 0, \"Number.prototype.valueOf()\");\n",
+            "native-test262-number-prototype-valueof.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_new_number_value_of() {
+        let result = execute_test262_basic(
+            "assert.sameValue((new Number()).valueOf(), 0, \"(new Number()).valueOf()\");\n",
+            "native-test262-new-number-valueof.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_new_number_boolean_argument() {
+        let result = execute_test262_basic(
+            "assert.sameValue((new Number(true)).valueOf(), 1, \"(new Number(true)).valueOf()\");\n",
+            "native-test262-new-number-boolean-argument.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_new_number_negative_argument() {
+        let result = execute_test262_basic(
+            "assert.sameValue((new Number(-1)).valueOf(), -1, \"(new Number(-1)).valueOf()\");\n",
+            "native-test262-new-number-negative-argument.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_new_number_nan_argument() {
+        let result = execute_test262_basic(
+            "assert.sameValue((new Number(NaN)).valueOf(), NaN, \"(new Number(NaN)).valueOf()\");\n",
+            "native-test262-new-number-nan-argument.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_boolean_prototype_value_of() {
+        let result = execute_test262_basic(
+            "assert.sameValue(Boolean.prototype.valueOf(), false, \"Boolean.prototype.valueOf()\");\n",
+            "native-test262-boolean-prototype-valueof.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_boolean_prototype_to_string() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(Boolean.prototype.toString(), \"false\", \"Boolean.prototype.toString()\");\n",
+                "assert.sameValue((new Boolean()).toString(), \"false\", \"(new Boolean()).toString()\");\n",
+                "assert.sameValue((new Boolean(false)).toString(), \"false\", \"(new Boolean(false)).toString()\");\n",
+                "assert.sameValue((new Boolean(true)).toString(), \"true\", \"(new Boolean(true)).toString()\");\n",
+                "assert.sameValue((new Boolean(1)).toString(), \"true\", \"(new Boolean(1)).toString()\");\n",
+                "assert.sameValue((new Boolean(0)).toString(), \"false\", \"(new Boolean(0)).toString()\");\n",
+                "assert.sameValue((new Boolean(new Object())).toString(), \"true\", \"(new Boolean(new Object())).toString()\");\n",
+            ),
+            "native-test262-boolean-prototype-tostring.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_number_boxing() {
+        let result = execute_test262_basic(
+            "assert.sameValue(Object(7).valueOf(), 7, \"Object(7).valueOf()\");\n",
+            "native-test262-object-number-boxing.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_boolean_boxing() {
+        let result = execute_test262_basic(
+            "assert.sameValue(Object(true).valueOf(), true, \"Object(true).valueOf()\");\n",
+            "native-test262-object-boolean-boxing.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_boolean_wrapper_truthy_object() {
+        let result = execute_test262_basic(
+            "assert.sameValue((new Boolean(new Object())).valueOf(), true, \"new Boolean(new Object()).valueOf()\");\n",
+            "native-test262-boolean-wrapper-truthy-object.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_function_prototype_call_on_string_value_of() {
+        let result = execute_test262_basic(
+            concat!(
+                "var valueOf = String.prototype.valueOf;\n",
+                "assert.sameValue(valueOf.call(new String(\"str\")), \"str\", \"valueOf.call(new String(...))\");\n",
+            ),
+            "native-test262-function-call-string-valueof.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_string_wrapper_concatenation() {
+        let result = execute_test262_basic(
+            "assert.sameValue(\"a\" + new String(\"b\"), \"ab\", \"string wrapper concatenation\");\n",
+            "native-test262-string-wrapper-concat.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
     }
 
     #[test]

@@ -63,7 +63,7 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     pub(super) fn declare_test262_intrinsic_globals(&mut self) -> Result<(), SourceLoweringError> {
-        for name in ["Object", "Function", "Math", "Array", "Reflect", "String"] {
+        for name in crate::intrinsics::CORE_INTRINSIC_GLOBAL_NAMES {
             self.declare_intrinsic_global_binding(name)?;
         }
         Ok(())
@@ -816,6 +816,12 @@ impl<'a> FunctionCompiler<'a> {
         let register = self.alloc_temp();
         self.instructions
             .push(Instruction::load_i32(register, value));
+        Ok(ValueLocation::temp(register))
+    }
+
+    pub(super) fn load_nan(&mut self) -> Result<ValueLocation, SourceLoweringError> {
+        let register = self.alloc_temp();
+        self.instructions.push(Instruction::load_nan(register));
         Ok(ValueLocation::temp(register))
     }
 

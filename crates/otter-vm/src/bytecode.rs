@@ -64,36 +64,38 @@ pub enum Opcode {
     LoadTrue = 0x03,
     /// Load boolean `false`.
     LoadFalse = 0x04,
+    /// Load canonical `NaN`.
+    LoadNaN = 0x05,
     /// Allocate a plain object.
-    NewObject = 0x05,
+    NewObject = 0x06,
     /// Load a string literal from the current function side table.
-    LoadString = 0x06,
+    LoadString = 0x07,
     /// Allocate a dense array.
-    NewArray = 0x07,
+    NewArray = 0x08,
     /// Allocate a closure from the current function closure side table.
-    NewClosure = 0x08,
+    NewClosure = 0x09,
     /// Load `undefined`.
-    LoadUndefined = 0x09,
+    LoadUndefined = 0x0A,
     /// Load `null`.
-    LoadNull = 0x0A,
+    LoadNull = 0x0B,
     /// Boolean negation.
-    Not = 0x0B,
+    Not = 0x0C,
     /// Load the current pending exception into a register.
-    LoadException = 0x0C,
+    LoadException = 0x0D,
     /// Load the current closure object into a register.
-    LoadCurrentClosure = 0x0D,
+    LoadCurrentClosure = 0x0E,
     /// Load the current receiver / `this` value into a register.
-    LoadThis = 0x0E,
+    LoadThis = 0x0F,
     /// JavaScript `typeof`.
-    TypeOf = 0x0F,
+    TypeOf = 0x10,
     /// Integer-or-number addition.
-    Add = 0x10,
+    Add = 0x11,
     /// Integer-or-number subtraction.
-    Sub = 0x11,
+    Sub = 0x12,
     /// Integer-or-number multiplication.
-    Mul = 0x12,
+    Mul = 0x13,
     /// Integer-or-number division.
-    Div = 0x13,
+    Div = 0x14,
     /// Equality comparison.
     Eq = 0x20,
     /// Less-than comparison.
@@ -142,21 +144,22 @@ impl Opcode {
             0x02 => Some(Self::LoadI32),
             0x03 => Some(Self::LoadTrue),
             0x04 => Some(Self::LoadFalse),
-            0x05 => Some(Self::NewObject),
-            0x06 => Some(Self::LoadString),
-            0x07 => Some(Self::NewArray),
-            0x08 => Some(Self::NewClosure),
-            0x09 => Some(Self::LoadUndefined),
-            0x0A => Some(Self::LoadNull),
-            0x0B => Some(Self::Not),
-            0x0C => Some(Self::LoadException),
-            0x0D => Some(Self::LoadCurrentClosure),
-            0x0E => Some(Self::LoadThis),
-            0x0F => Some(Self::TypeOf),
-            0x10 => Some(Self::Add),
-            0x11 => Some(Self::Sub),
-            0x12 => Some(Self::Mul),
-            0x13 => Some(Self::Div),
+            0x05 => Some(Self::LoadNaN),
+            0x06 => Some(Self::NewObject),
+            0x07 => Some(Self::LoadString),
+            0x08 => Some(Self::NewArray),
+            0x09 => Some(Self::NewClosure),
+            0x0A => Some(Self::LoadUndefined),
+            0x0B => Some(Self::LoadNull),
+            0x0C => Some(Self::Not),
+            0x0D => Some(Self::LoadException),
+            0x0E => Some(Self::LoadCurrentClosure),
+            0x0F => Some(Self::LoadThis),
+            0x10 => Some(Self::TypeOf),
+            0x11 => Some(Self::Add),
+            0x12 => Some(Self::Sub),
+            0x13 => Some(Self::Mul),
+            0x14 => Some(Self::Div),
             0x20 => Some(Self::Eq),
             0x21 => Some(Self::Lt),
             0x22 => Some(Self::GetProperty),
@@ -233,6 +236,17 @@ impl Instruction {
     pub const fn load_false(dst: BytecodeRegister) -> Self {
         Self::encode_abc(
             Opcode::LoadFalse,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a `NaN` load.
+    #[must_use]
+    pub const fn load_nan(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadNaN,
             dst,
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),

@@ -3,11 +3,15 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
+use crate::object::{HeapValueKind, ObjectHandle};
 use crate::value::RegisterValue;
 
 use super::{
     IntrinsicsError, VmIntrinsics,
+    boolean_class::box_boolean_object,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+    number_class::box_number_object,
+    string_class::box_string_object,
 };
 
 pub(super) static OBJECT_INTRINSIC: ObjectIntrinsic = ObjectIntrinsic;
@@ -79,10 +83,32 @@ fn object_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    if let Some(value) = args.first().copied()
-        && value.as_object_handle().is_some()
-    {
-        return Ok(value);
+    if let Some(value) = args.first().copied() {
+        if value == RegisterValue::undefined() || value == RegisterValue::null() {
+            if this.as_object_handle().is_some() {
+                return Ok(*this);
+            }
+            let object = runtime.alloc_object();
+            return Ok(RegisterValue::from_object_handle(object.0));
+        }
+
+        if let Some(boolean) = value.as_bool() {
+            return box_boolean_object(RegisterValue::from_bool(boolean), runtime);
+        }
+
+        if let Some(number) = value.as_number() {
+            return box_number_object(RegisterValue::from_number(number), runtime);
+        }
+
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            return match runtime.objects().kind(handle) {
+                Ok(HeapValueKind::String) => box_string_object(handle, runtime),
+                Ok(_) => Ok(value),
+                Err(error) => Err(VmNativeCallError::Internal(
+                    format!("Object constructor kind lookup failed: {error:?}").into(),
+                )),
+            };
+        }
     }
 
     if this.as_object_handle().is_some() {

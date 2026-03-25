@@ -66,6 +66,10 @@ fn function_class_descriptor() -> JsClassDescriptor {
             function_constructor,
         ))
         .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("call", 1, function_call),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("isCallable", 1, function_is_callable),
         ))
@@ -103,6 +107,38 @@ fn function_is_callable(
         })
         .unwrap_or(false);
     Ok(RegisterValue::from_bool(is_callable))
+}
+
+fn function_call(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let callable = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Function.prototype.call requires callable receiver".into())
+    })?;
+    let receiver = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let forwarded = if args.len() > 1 { &args[1..] } else { &[] };
+
+    let Some(host_function) = runtime.objects().host_function(callable).map_err(|error| {
+        VmNativeCallError::Internal(format!("Function.prototype.call failed: {error:?}").into())
+    })?
+    else {
+        return Err(VmNativeCallError::Internal(
+            "Function.prototype.call only supports host functions in otter-vm bootstrap".into(),
+        ));
+    };
+
+    let descriptor = runtime
+        .native_functions()
+        .get(host_function)
+        .cloned()
+        .ok_or_else(|| VmNativeCallError::Internal("host function descriptor is missing".into()))?;
+
+    (descriptor.callback())(&receiver, forwarded, runtime)
 }
 
 fn function_to_string(

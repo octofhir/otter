@@ -6,11 +6,14 @@
 //! enumeration for future GC integration and builder-driven bootstrap.
 
 mod array_class;
+mod boolean_class;
 mod function_class;
 mod install;
 mod math;
+mod number_class;
 mod object_class;
 mod reflect;
+mod string_class;
 
 use crate::host::NativeFunctionRegistry;
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap};
@@ -56,6 +59,11 @@ pub enum IntrinsicRoot {
     Object(ObjectHandle),
     Symbol(WellKnownSymbol),
 }
+
+/// Shared list of ECMAScript globals installed by the new-VM intrinsic bootstrap.
+pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
+    "Object", "Function", "Array", "String", "Number", "Boolean", "Math", "Reflect",
+];
 
 /// Lifecycle stage of the intrinsic registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,11 +113,16 @@ pub struct VmIntrinsics {
     math_namespace: Option<ObjectHandle>,
     object_prototype: ObjectHandle,
     function_prototype: ObjectHandle,
+    string_constructor: ObjectHandle,
+    number_constructor: ObjectHandle,
+    boolean_constructor: ObjectHandle,
     object_constructor: ObjectHandle,
     function_constructor: ObjectHandle,
     array_constructor: ObjectHandle,
     array_prototype: ObjectHandle,
     string_prototype: ObjectHandle,
+    number_prototype: ObjectHandle,
+    boolean_prototype: ObjectHandle,
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 4],
@@ -121,11 +134,16 @@ impl VmIntrinsics {
         let global_object = heap.alloc_object();
         let object_prototype = heap.alloc_object();
         let function_prototype = heap.alloc_object();
+        let string_constructor = heap.alloc_object();
+        let number_constructor = heap.alloc_object();
+        let boolean_constructor = heap.alloc_object();
         let object_constructor = heap.alloc_object();
         let function_constructor = heap.alloc_object();
         let array_constructor = heap.alloc_object();
         let array_prototype = heap.alloc_object();
         let string_prototype = heap.alloc_object();
+        let number_prototype = heap.alloc_object();
+        let boolean_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -133,11 +151,16 @@ impl VmIntrinsics {
             math_namespace: None,
             object_prototype,
             function_prototype,
+            string_constructor,
+            number_constructor,
+            boolean_constructor,
             object_constructor,
             function_constructor,
             array_constructor,
             array_prototype,
             string_prototype,
+            number_prototype,
+            boolean_prototype,
             namespace_roots: Vec::new(),
             reflect_namespace: None,
             well_known_symbols: [
@@ -157,11 +180,16 @@ impl VmIntrinsics {
         heap.set_prototype(self.global_object, Some(self.object_prototype))?;
         heap.set_prototype(self.object_prototype, None)?;
         heap.set_prototype(self.function_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.string_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.number_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.boolean_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.object_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.function_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.string_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.number_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.boolean_prototype, Some(self.object_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -230,6 +258,24 @@ impl VmIntrinsics {
         self.function_prototype
     }
 
+    /// Returns `%String%`.
+    #[must_use]
+    pub const fn string_constructor(&self) -> ObjectHandle {
+        self.string_constructor
+    }
+
+    /// Returns `%Number%`.
+    #[must_use]
+    pub const fn number_constructor(&self) -> ObjectHandle {
+        self.number_constructor
+    }
+
+    /// Returns `%Boolean%`.
+    #[must_use]
+    pub const fn boolean_constructor(&self) -> ObjectHandle {
+        self.boolean_constructor
+    }
+
     /// Returns `%Object%`.
     #[must_use]
     pub const fn object_constructor(&self) -> ObjectHandle {
@@ -258,6 +304,18 @@ impl VmIntrinsics {
     #[must_use]
     pub const fn string_prototype(&self) -> ObjectHandle {
         self.string_prototype
+    }
+
+    /// Returns `%Number.prototype%`.
+    #[must_use]
+    pub const fn number_prototype(&self) -> ObjectHandle {
+        self.number_prototype
+    }
+
+    /// Returns `%Boolean.prototype%`.
+    #[must_use]
+    pub const fn boolean_prototype(&self) -> ObjectHandle {
+        self.boolean_prototype
     }
 
     /// Registers an additional namespace root owned by the intrinsic registry.
@@ -301,11 +359,16 @@ impl VmIntrinsics {
             self.global_object,
             self.object_prototype,
             self.function_prototype,
+            self.string_constructor,
+            self.number_constructor,
+            self.boolean_constructor,
             self.object_constructor,
             self.function_constructor,
             self.array_constructor,
             self.array_prototype,
             self.string_prototype,
+            self.number_prototype,
+            self.boolean_prototype,
         ] {
             tracer(IntrinsicRoot::Object(handle));
         }
@@ -320,13 +383,16 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 5] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 8] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
+        &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
+        &number_class::NUMBER_INTRINSIC as &dyn IntrinsicInstaller,
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
 
@@ -366,9 +432,23 @@ mod tests {
             intrinsics.function_prototype(),
             intrinsics.array_prototype(),
             intrinsics.string_prototype(),
+            intrinsics.number_prototype(),
+            intrinsics.boolean_prototype(),
         ] {
             assert_eq!(heap.kind(handle), Ok(HeapValueKind::Object));
         }
+        assert_eq!(
+            heap.kind(intrinsics.string_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
+            heap.kind(intrinsics.number_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
+            heap.kind(intrinsics.boolean_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
         assert_eq!(
             heap.kind(intrinsics.object_constructor()),
             Ok(HeapValueKind::HostFunction)
@@ -383,7 +463,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 14);
+        assert_eq!(native_functions.len(), 23);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))
@@ -395,6 +475,10 @@ mod tests {
         );
         assert_eq!(
             heap.get_prototype(intrinsics.array_constructor()),
+            Ok(Some(intrinsics.function_prototype()))
+        );
+        assert_eq!(
+            heap.get_prototype(intrinsics.string_constructor()),
             Ok(Some(intrinsics.function_prototype()))
         );
 
@@ -548,6 +632,72 @@ mod tests {
             .map(crate::object::ObjectHandle)
             .expect("Array.prototype.push should be an object");
         assert_eq!(heap.kind(push), Ok(HeapValueKind::HostFunction));
+
+        let string_property = property_names.intern("String");
+        let string_constructor = heap
+            .get_property(intrinsics.global_object(), string_property)
+            .expect("global String lookup should succeed")
+            .expect("String constructor should be installed");
+        let string_constructor = string_constructor.value();
+        let PropertyValue::Data(string_constructor) = string_constructor else {
+            panic!("expected String to be a data property");
+        };
+        let string_constructor = string_constructor
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("String should be an object");
+        assert_eq!(string_constructor, intrinsics.string_constructor());
+
+        let string_prototype = heap
+            .get_property(string_constructor, prototype_property)
+            .expect("String.prototype lookup should succeed")
+            .expect("String.prototype should be installed");
+        let string_prototype = string_prototype.value();
+        let PropertyValue::Data(string_prototype) = string_prototype else {
+            panic!("expected String.prototype to be a data property");
+        };
+        let string_prototype = string_prototype
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("String.prototype should be an object");
+        assert_eq!(string_prototype, intrinsics.string_prototype());
+
+        let string_value_of_property = property_names.intern("valueOf");
+        let string_value_of = heap
+            .get_property(string_prototype, string_value_of_property)
+            .expect("String.prototype.valueOf lookup should succeed")
+            .expect("String.prototype.valueOf should be installed");
+        assert_eq!(string_value_of.owner(), intrinsics.string_prototype());
+
+        let number_property = property_names.intern("Number");
+        let number_constructor = heap
+            .get_property(intrinsics.global_object(), number_property)
+            .expect("global Number lookup should succeed")
+            .expect("Number constructor should be installed");
+        let number_constructor = number_constructor.value();
+        let PropertyValue::Data(number_constructor) = number_constructor else {
+            panic!("expected Number to be a data property");
+        };
+        let number_constructor = number_constructor
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Number should be an object");
+        assert_eq!(number_constructor, intrinsics.number_constructor());
+
+        let boolean_property = property_names.intern("Boolean");
+        let boolean_constructor = heap
+            .get_property(intrinsics.global_object(), boolean_property)
+            .expect("global Boolean lookup should succeed")
+            .expect("Boolean constructor should be installed");
+        let boolean_constructor = boolean_constructor.value();
+        let PropertyValue::Data(boolean_constructor) = boolean_constructor else {
+            panic!("expected Boolean to be a data property");
+        };
+        let boolean_constructor = boolean_constructor
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Boolean should be an object");
+        assert_eq!(boolean_constructor, intrinsics.boolean_constructor());
 
         let reflect_property = property_names.intern("Reflect");
         let reflect_namespace = heap

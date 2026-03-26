@@ -26,9 +26,11 @@ use crate::string::{StringId, StringTable};
 
 mod ast;
 mod compiler;
+mod destructuring;
 mod expressions;
 mod module_compiler;
 mod shared;
+mod statements;
 
 use module_compiler::ModuleCompiler;
 

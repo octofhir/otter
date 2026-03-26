@@ -3,7 +3,7 @@
 use crate::host::HostFunctionId;
 use crate::module::FunctionIndex;
 use crate::payload::NativePayloadId;
-use crate::property::PropertyNameId;
+use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::value::RegisterValue;
 
 /// Maximum prototype chain depth before aborting a lookup (defense in depth).
@@ -216,6 +216,10 @@ enum HeapValue {
         next_index: usize,
         closed: bool,
     },
+    PropertyIterator {
+        key_handles: Vec<ObjectHandle>,
+        next_index: usize,
+    },
 }
 
 /// Small object heap used by the early `otter-vm` interpreter.
@@ -332,9 +336,9 @@ impl ObjectHeap {
             HeapValue::String { .. } => Ok(HeapValueKind::String),
             HeapValue::Closure { .. } => Ok(HeapValueKind::Closure),
             HeapValue::UpvalueCell { .. } => Ok(HeapValueKind::UpvalueCell),
-            HeapValue::ArrayIterator { .. } | HeapValue::StringIterator { .. } => {
-                Ok(HeapValueKind::Iterator)
-            }
+            HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(HeapValueKind::Iterator),
         }
     }
 
@@ -349,7 +353,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -405,7 +410,8 @@ impl ObjectHeap {
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -421,7 +427,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Ok(None),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -481,7 +488,8 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -507,7 +515,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -596,6 +605,97 @@ impl ObjectHeap {
         }
     }
 
+    /// Creates a property key iterator for `for..in` enumeration.
+    /// Collects all enumerable string property keys from the object and its prototype chain,
+    /// and pre-allocates string handles for them.
+    /// Creates an empty property iterator (for null/undefined/primitives in for..in).
+    pub fn alloc_empty_property_iterator(&mut self) -> Result<ObjectHandle, ObjectError> {
+        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
+        self.objects.push(HeapValue::PropertyIterator {
+            key_handles: Vec::new(),
+            next_index: 0,
+        });
+        Ok(handle)
+    }
+
+    pub fn alloc_property_iterator(
+        &mut self,
+        object: ObjectHandle,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<ObjectHandle, ObjectError> {
+        let mut name_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(object);
+        while let Some(h) = current {
+            let (obj_keys, proto) = match self.object(h)? {
+                HeapValue::Object {
+                    keys, prototype, ..
+                }
+                | HeapValue::NativeObject {
+                    keys, prototype, ..
+                }
+                | HeapValue::Closure {
+                    keys, prototype, ..
+                }
+                | HeapValue::HostFunction {
+                    keys, prototype, ..
+                } => (keys.clone(), *prototype),
+                HeapValue::Array { prototype, .. } => {
+                    // for..in on arrays is unusual; skip indexed elements for now.
+                    (Vec::new(), *prototype)
+                }
+                _ => (Vec::new(), None),
+            };
+            for key in obj_keys {
+                if seen.insert(key) {
+                    name_ids.push(key);
+                }
+            }
+            current = proto;
+        }
+
+        // Pre-allocate string handles for all collected keys.
+        let key_handles: Vec<ObjectHandle> = name_ids
+            .iter()
+            .filter_map(|id| property_names.get(*id).map(|name| self.alloc_string(name)))
+            .collect();
+
+        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
+        self.objects.push(HeapValue::PropertyIterator {
+            key_handles,
+            next_index: 0,
+        });
+        Ok(handle)
+    }
+
+    /// Advances a property key iterator by one step.
+    pub fn property_iterator_next(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<IteratorStep, ObjectError> {
+        let (next, key_handle) = match self.object(handle)? {
+            HeapValue::PropertyIterator {
+                key_handles,
+                next_index,
+            } => {
+                if *next_index >= key_handles.len() {
+                    return Ok(IteratorStep::done());
+                }
+                (*next_index, key_handles[*next_index])
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        match self.object_mut(handle)? {
+            HeapValue::PropertyIterator { next_index, .. } => {
+                *next_index = next + 1;
+            }
+            _ => unreachable!(),
+        }
+        Ok(IteratorStep::yield_value(
+            RegisterValue::from_object_handle(key_handle.0),
+        ))
+    }
+
     /// Returns the callee stored in a closure object.
     pub fn closure_callee(&self, handle: ObjectHandle) -> Result<FunctionIndex, ObjectError> {
         match self.object(handle)? {
@@ -618,7 +718,8 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Ok(None),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(None),
         }
     }
 
@@ -633,7 +734,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Ok(None),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(None),
         }
     }
 
@@ -648,7 +750,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Ok(None),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(None),
         }
     }
 
@@ -681,7 +784,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Ok(None),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Ok(None),
         }
     }
 
@@ -895,7 +999,8 @@ impl ObjectHeap {
             | HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => {
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -970,7 +1075,8 @@ impl ObjectHeap {
             | HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
         };
 
         let Some(slot_index) = slot_index.map(usize::from) else {
@@ -1074,7 +1180,8 @@ impl ObjectHeap {
             | HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -1186,7 +1293,8 @@ impl ObjectHeap {
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -1209,7 +1317,8 @@ impl ObjectHeap {
             | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 }

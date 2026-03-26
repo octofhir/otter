@@ -64,6 +64,7 @@ impl ValueLocation {
 pub(super) enum FunctionKind {
     Script,
     Ordinary,
+    Arrow,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,7 @@ pub(super) struct LoopScope {
     pub(super) break_jumps: Vec<usize>,
     pub(super) continue_jumps: Vec<usize>,
     pub(super) iterator_register: Option<BytecodeRegister>,
+    pub(super) label: Option<String>,
 }
 
 pub(super) struct FunctionCompiler<'a> {
@@ -117,5 +119,6 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) hoisted_functions: Vec<PendingFunction>,
     pub(super) finally_stack: Vec<FinallyScope>,
     pub(super) loop_stack: Vec<LoopScope>,
+    pub(super) pending_loop_label: Option<String>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

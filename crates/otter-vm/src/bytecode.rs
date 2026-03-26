@@ -107,6 +107,18 @@ pub enum Opcode {
     Mod = 0x18,
     /// Load a float64 constant from the float table.
     LoadF64 = 0x19,
+    /// Bitwise AND.
+    BitAnd = 0x1A,
+    /// Bitwise OR.
+    BitOr = 0x1B,
+    /// Bitwise XOR.
+    BitXor = 0x1C,
+    /// Left shift.
+    Shl = 0x1D,
+    /// Signed right shift.
+    Shr = 0x1E,
+    /// Unsigned right shift.
+    UShr = 0x1F,
     /// Equality comparison.
     Eq = 0x20,
     /// Abstract equality comparison.
@@ -145,6 +157,12 @@ pub enum Opcode {
     JumpIfTrue = 0x31,
     /// Jump if the condition is falsy.
     JumpIfFalse = 0x32,
+    /// Store a value to a global variable by name.
+    SetGlobal = 0x33,
+    /// Create a property key iterator (for..in).
+    GetPropertyIterator = 0x34,
+    /// Advance a property key iterator; dst_done = bool, dst_key = string key.
+    PropertyIteratorNext = 0x35,
     /// Return a register value.
     Return = 0x40,
     /// Call a direct callee with an explicit contiguous argument window.
@@ -186,6 +204,12 @@ impl Opcode {
             0x17 => Some(Self::Lte),
             0x18 => Some(Self::Mod),
             0x19 => Some(Self::LoadF64),
+            0x1A => Some(Self::BitAnd),
+            0x1B => Some(Self::BitOr),
+            0x1C => Some(Self::BitXor),
+            0x1D => Some(Self::Shl),
+            0x1E => Some(Self::Shr),
+            0x1F => Some(Self::UShr),
             0x20 => Some(Self::Eq),
             0x21 => Some(Self::LooseEq),
             0x22 => Some(Self::Lt),
@@ -205,6 +229,9 @@ impl Opcode {
             0x30 => Some(Self::Jump),
             0x31 => Some(Self::JumpIfTrue),
             0x32 => Some(Self::JumpIfFalse),
+            0x33 => Some(Self::SetGlobal),
+            0x34 => Some(Self::GetPropertyIterator),
+            0x35 => Some(Self::PropertyIteratorNext),
             0x40 => Some(Self::Return),
             0x41 => Some(Self::CallDirect),
             0x42 => Some(Self::CallClosure),
@@ -443,6 +470,54 @@ impl Instruction {
         Self::encode_abc(Opcode::Mod, dst, lhs, rhs)
     }
 
+    /// Encodes a bitwise AND operation.
+    #[must_use]
+    pub const fn bit_and(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::BitAnd, dst, lhs, rhs)
+    }
+
+    /// Encodes a bitwise OR operation.
+    #[must_use]
+    pub const fn bit_or(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::BitOr, dst, lhs, rhs)
+    }
+
+    /// Encodes a bitwise XOR operation.
+    #[must_use]
+    pub const fn bit_xor(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::BitXor, dst, lhs, rhs)
+    }
+
+    /// Encodes a left shift operation.
+    #[must_use]
+    pub const fn shl(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Shl, dst, lhs, rhs)
+    }
+
+    /// Encodes a signed right shift operation.
+    #[must_use]
+    pub const fn shr(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Shr, dst, lhs, rhs)
+    }
+
+    /// Encodes an unsigned right shift operation.
+    #[must_use]
+    pub const fn ushr(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::UShr, dst, lhs, rhs)
+    }
+
     /// Encodes a float64 constant load from the float table.
     #[must_use]
     pub const fn load_f64(dst: BytecodeRegister, float_id: FloatId) -> Self {
@@ -577,6 +652,38 @@ impl Instruction {
             BytecodeRegister::new(property.0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes a global variable store.
+    #[must_use]
+    pub const fn set_global(src: BytecodeRegister, property: PropertyNameId) -> Self {
+        Self::encode_abc(
+            Opcode::SetGlobal,
+            src,
+            BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a property key iterator creation (for..in).
+    #[must_use]
+    pub const fn get_property_iterator(dst: BytecodeRegister, object: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::GetPropertyIterator,
+            dst,
+            object,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a property iterator advance: dst_done = done?, dst_key = next key.
+    #[must_use]
+    pub const fn property_iterator_next(
+        dst_done: BytecodeRegister,
+        dst_key: BytecodeRegister,
+        iterator: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::PropertyIteratorNext, dst_done, dst_key, iterator)
     }
 
     /// Encodes an `instanceof` check.

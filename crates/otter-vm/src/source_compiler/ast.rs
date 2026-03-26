@@ -1,5 +1,11 @@
 use super::*;
 
+/// Represents a single function parameter, possibly with a default value.
+pub(super) struct ParamInfo<'a> {
+    pub(super) name: &'a str,
+    pub(super) default: Option<&'a Expression<'a>>,
+}
+
 pub(super) fn collect_var_names(statements: &[AstStatement<'_>]) -> Vec<String> {
     let mut names = Vec::new();
     for statement in statements {
@@ -73,6 +79,25 @@ fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Ve
             }
             collect_var_names_from_statement(&for_of_statement.body, names);
         }
+        AstStatement::ForInStatement(for_in_statement) => {
+            if let ForStatementLeft::VariableDeclaration(declaration) = &for_in_statement.left
+                && declaration.kind == VariableDeclarationKind::Var
+            {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                        && !names
+                            .iter()
+                            .any(|existing| existing == identifier.name.as_str())
+                    {
+                        names.push(identifier.name.to_string());
+                    }
+                }
+            }
+            collect_var_names_from_statement(&for_in_statement.body, names);
+        }
+        AstStatement::LabeledStatement(labeled) => {
+            collect_var_names_from_statement(&labeled.body, names);
+        }
         AstStatement::TryStatement(try_statement) => {
             for statement in &try_statement.block.body {
                 collect_var_names_from_statement(statement, names);
@@ -130,6 +155,12 @@ fn collect_function_declarations_from_statement<'a>(
         AstStatement::ForOfStatement(for_of_statement) => {
             collect_function_declarations_from_statement(&for_of_statement.body, functions);
         }
+        AstStatement::ForInStatement(for_in_statement) => {
+            collect_function_declarations_from_statement(&for_in_statement.body, functions);
+        }
+        AstStatement::LabeledStatement(labeled) => {
+            collect_function_declarations_from_statement(&labeled.body, functions);
+        }
         AstStatement::TryStatement(try_statement) => {
             for statement in &try_statement.block.body {
                 collect_function_declarations_from_statement(statement, functions);
@@ -151,34 +182,35 @@ fn collect_function_declarations_from_statement<'a>(
 
 pub(super) fn extract_function_params<'a>(
     function: &'a Function<'a>,
-) -> Result<Vec<&'a str>, SourceLoweringError> {
-    let mut params = Vec::new();
-    for param in &function.params.items {
-        match &param.pattern {
-            BindingPattern::BindingIdentifier(identifier) => params.push(identifier.name.as_str()),
-            _ => {
-                return Err(SourceLoweringError::Unsupported(
-                    "non-identifier parameters".to_string(),
-                ));
-            }
-        }
-    }
-    if function.params.rest.is_some() {
-        return Err(SourceLoweringError::Unsupported(
-            "rest parameters".to_string(),
-        ));
-    }
-    Ok(params)
+) -> Result<Vec<ParamInfo<'a>>, SourceLoweringError> {
+    extract_function_params_from_formal(&function.params)
 }
 
 pub(super) fn extract_function_params_from_formal<'a>(
     params: &'a oxc_ast::ast::FormalParameters<'a>,
-) -> Result<Vec<&'a str>, SourceLoweringError> {
+) -> Result<Vec<ParamInfo<'a>>, SourceLoweringError> {
     let mut result = Vec::new();
     for param in &params.items {
         match &param.pattern {
             BindingPattern::BindingIdentifier(identifier) => {
-                result.push(identifier.name.as_str());
+                result.push(ParamInfo {
+                    name: identifier.name.as_str(),
+                    default: None,
+                });
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                let name = match &assignment.left {
+                    BindingPattern::BindingIdentifier(identifier) => identifier.name.as_str(),
+                    _ => {
+                        return Err(SourceLoweringError::Unsupported(
+                            "destructuring default parameters".to_string(),
+                        ));
+                    }
+                };
+                result.push(ParamInfo {
+                    name,
+                    default: Some(&assignment.right),
+                });
             }
             _ => {
                 return Err(SourceLoweringError::Unsupported(

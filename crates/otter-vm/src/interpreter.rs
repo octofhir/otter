@@ -443,6 +443,20 @@ impl RuntimeState {
         &mut self.property_names
     }
 
+    /// Creates a property key iterator (for..in) from an object and its prototype chain.
+    pub fn alloc_property_iterator(
+        &mut self,
+        object: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.objects
+            .alloc_property_iterator(object, &self.property_names)
+    }
+
+    /// Creates an empty property iterator (for null/undefined/primitives in for..in).
+    pub fn alloc_empty_property_iterator(&mut self) -> Result<ObjectHandle, ObjectError> {
+        self.objects.alloc_empty_property_iterator()
+    }
+
     /// Interns one property name into the runtime-wide registry.
     pub fn intern_property_name(&mut self, name: &str) -> PropertyNameId {
         self.property_names.intern(name)
@@ -980,6 +994,18 @@ impl RuntimeState {
             return Ok(f64::NAN);
         }
         Ok(f64::NAN)
+    }
+
+    /// ES spec 7.1.6 ToInt32 — converts a value to a signed 32-bit integer.
+    fn js_to_int32(&mut self, value: RegisterValue) -> Result<i32, InterpreterError> {
+        let n = self.js_to_number(value)?;
+        Ok(f64_to_int32(n))
+    }
+
+    /// ES spec 7.1.7 ToUint32 — converts a value to an unsigned 32-bit integer.
+    fn js_to_uint32(&mut self, value: RegisterValue) -> Result<u32, InterpreterError> {
+        let n = self.js_to_number(value)?;
+        Ok(f64_to_uint32(n))
     }
 
     /// ES spec 7.1.1 ToPrimitive with hint Number — converts an object to
@@ -1830,6 +1856,87 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::BitAnd => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_i32 = runtime.js_to_int32(lhs)?;
+                let rhs_i32 = runtime.js_to_int32(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_i32 & rhs_i32) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::BitOr => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_i32 = runtime.js_to_int32(lhs)?;
+                let rhs_i32 = runtime.js_to_int32(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_i32 | rhs_i32) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::BitXor => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_i32 = runtime.js_to_int32(lhs)?;
+                let rhs_i32 = runtime.js_to_int32(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_i32 ^ rhs_i32) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::Shl => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_i32 = runtime.js_to_int32(lhs)?;
+                let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                let shift = rhs_u32 & 0x1F;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_i32 << shift) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::Shr => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_i32 = runtime.js_to_int32(lhs)?;
+                let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                let shift = rhs_u32 & 0x1F;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_i32 >> shift) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::UShr => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_u32 = runtime.js_to_uint32(lhs)?;
+                let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                let shift = rhs_u32 & 0x1F;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number((lhs_u32 >> shift) as f64),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::GetProperty => {
                 let pc = activation.pc();
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
@@ -2011,6 +2118,57 @@ impl Interpreter {
                         )));
                     }
                 }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::SetGlobal => {
+                let property = Self::resolve_property_name(function, runtime, instruction.b())?;
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                let global = activation.receiver(function)?;
+                let global_handle = global
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                runtime
+                    .objects
+                    .set_property(global_handle, property, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::GetPropertyIterator => {
+                let object_val = activation.read_bytecode_register(function, instruction.b())?;
+                // ES spec 13.7.5.15: for-in on null/undefined produces no iterations.
+                // Primitives (number, bool) have no enumerable own properties.
+                let iter_handle = if object_val == RegisterValue::null()
+                    || object_val == RegisterValue::undefined()
+                {
+                    runtime.alloc_empty_property_iterator()?
+                } else if let Some(handle) = object_val.as_object_handle().map(ObjectHandle) {
+                    runtime.alloc_property_iterator(handle)?
+                } else {
+                    runtime.alloc_empty_property_iterator()?
+                };
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(iter_handle.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::PropertyIteratorNext => {
+                let iter_val = activation.read_bytecode_register(function, instruction.c())?;
+                let iter_handle = iter_val
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let step = runtime.objects.property_iterator_next(iter_handle)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(step.is_done()),
+                )?;
+                activation.write_bytecode_register(function, instruction.b(), step.value())?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -4458,6 +4616,34 @@ mod tests {
 }
 
 /// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
+/// ES spec 7.1.6 ToInt32(argument).
+fn f64_to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    // Step 3-5: modulo 2^32, then adjust to signed range.
+    let i = (n.trunc() % 4_294_967_296.0) as i64;
+    let i = if i < 0 { i + 4_294_967_296 } else { i };
+    if i >= 2_147_483_648 {
+        (i - 4_294_967_296) as i32
+    } else {
+        i as i32
+    }
+}
+
+/// ES spec 7.1.7 ToUint32(argument).
+fn f64_to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let i = (n.trunc() % 4_294_967_296.0) as i64;
+    if i < 0 {
+        (i + 4_294_967_296) as u32
+    } else {
+        i as u32
+    }
+}
+
 fn parse_string_to_number(s: &str) -> f64 {
     let trimmed = s.trim();
     if trimmed.is_empty() {

@@ -57,6 +57,9 @@ impl<'a> FunctionCompiler<'a> {
             Expression::TemplateLiteral(template) => {
                 self.compile_template_literal(template, module)
             }
+            Expression::SequenceExpression(sequence) => {
+                self.compile_sequence_expression(sequence, module)
+            }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
                 expression
@@ -115,12 +118,19 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn compile_this_expression(&mut self) -> Result<ValueLocation, SourceLoweringError> {
+        // Arrow functions capture `this` lexically — resolve via the "this" binding.
+        if self.kind == FunctionKind::Arrow {
+            return self.compile_identifier("this");
+        }
         let register = self.alloc_temp();
         self.instructions.push(Instruction::load_this(register));
         Ok(ValueLocation::temp(register))
     }
 
-    fn compile_identifier(&mut self, name: &str) -> Result<ValueLocation, SourceLoweringError> {
+    pub(super) fn compile_identifier(
+        &mut self,
+        name: &str,
+    ) -> Result<ValueLocation, SourceLoweringError> {
         // Global value identifiers — always available, not bindings.
         if !self.env.bindings.contains_key(name) {
             match name {
@@ -187,42 +197,138 @@ impl<'a> FunctionCompiler<'a> {
                     "unsupported assignment target".to_string(),
                 )),
             },
-            AssignmentOperator::Addition => match &assignment.left {
-                AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                    let current = self.compile_identifier(identifier.name.as_str())?;
-                    let current = self.materialize_value(current);
-                    let rhs = self.compile_expression(&assignment.right, module)?;
-                    let result = if current.is_temp {
-                        current
-                    } else if rhs.is_temp {
-                        rhs
-                    } else {
-                        ValueLocation::temp(self.alloc_temp())
-                    };
-
-                    self.instructions.push(Instruction::add(
-                        result.register,
-                        current.register,
-                        rhs.register,
-                    ));
-
-                    if result.register != current.register {
-                        self.release(current);
-                    }
-                    if result.register != rhs.register {
-                        self.release(rhs);
-                    }
-
-                    self.assign_to_name(identifier.name.as_str(), result)
-                }
-                _ => Err(SourceLoweringError::Unsupported(
-                    "compound assignment target".to_string(),
-                )),
-            },
+            AssignmentOperator::Addition
+            | AssignmentOperator::Subtraction
+            | AssignmentOperator::Multiplication
+            | AssignmentOperator::Division
+            | AssignmentOperator::Remainder
+            | AssignmentOperator::BitwiseAnd
+            | AssignmentOperator::BitwiseOR
+            | AssignmentOperator::BitwiseXOR
+            | AssignmentOperator::ShiftLeft
+            | AssignmentOperator::ShiftRight
+            | AssignmentOperator::ShiftRightZeroFill => {
+                self.compile_compound_assignment(assignment, module)
+            }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "assignment operator {:?}",
                 assignment.operator
             ))),
+        }
+    }
+
+    fn emit_compound_op(
+        &mut self,
+        op: AssignmentOperator,
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) {
+        let instr = match op {
+            AssignmentOperator::Addition => Instruction::add(dst, lhs, rhs),
+            AssignmentOperator::Subtraction => Instruction::sub(dst, lhs, rhs),
+            AssignmentOperator::Multiplication => Instruction::mul(dst, lhs, rhs),
+            AssignmentOperator::Division => Instruction::div(dst, lhs, rhs),
+            AssignmentOperator::Remainder => Instruction::mod_(dst, lhs, rhs),
+            AssignmentOperator::BitwiseAnd => Instruction::bit_and(dst, lhs, rhs),
+            AssignmentOperator::BitwiseOR => Instruction::bit_or(dst, lhs, rhs),
+            AssignmentOperator::BitwiseXOR => Instruction::bit_xor(dst, lhs, rhs),
+            AssignmentOperator::ShiftLeft => Instruction::shl(dst, lhs, rhs),
+            AssignmentOperator::ShiftRight => Instruction::shr(dst, lhs, rhs),
+            AssignmentOperator::ShiftRightZeroFill => Instruction::ushr(dst, lhs, rhs),
+            _ => unreachable!(),
+        };
+        self.instructions.push(instr);
+    }
+
+    fn compile_compound_assignment(
+        &mut self,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        match &assignment.left {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                let current = self.compile_identifier(identifier.name.as_str())?;
+                let current = self.materialize_value(current);
+                let rhs = self.compile_expression(&assignment.right, module)?;
+                let result = if current.is_temp {
+                    current
+                } else if rhs.is_temp {
+                    rhs
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                self.emit_compound_op(
+                    assignment.operator,
+                    result.register,
+                    current.register,
+                    rhs.register,
+                );
+                if result.register != current.register {
+                    self.release(current);
+                }
+                if result.register != rhs.register {
+                    self.release(rhs);
+                }
+                self.assign_to_name(identifier.name.as_str(), result)
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let object = self.materialize_value(object);
+                let property = self.intern_property_name(member.property.name.as_str())?;
+                let current = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::get_property(
+                    current.register,
+                    object.register,
+                    property,
+                ));
+                let rhs = self.compile_expression(&assignment.right, module)?;
+                self.emit_compound_op(
+                    assignment.operator,
+                    current.register,
+                    current.register,
+                    rhs.register,
+                );
+                self.release(rhs);
+                self.instructions.push(Instruction::set_property(
+                    object.register,
+                    current.register,
+                    property,
+                ));
+                self.release(object);
+                Ok(current)
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let object = self.materialize_value(object);
+                let index = self.compile_expression(&member.expression, module)?;
+                let index = self.materialize_value(index);
+                let current = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::get_index(
+                    current.register,
+                    object.register,
+                    index.register,
+                ));
+                let rhs = self.compile_expression(&assignment.right, module)?;
+                self.emit_compound_op(
+                    assignment.operator,
+                    current.register,
+                    current.register,
+                    rhs.register,
+                );
+                self.release(rhs);
+                self.instructions.push(Instruction::set_index(
+                    object.register,
+                    index.register,
+                    current.register,
+                ));
+                self.release(index);
+                self.release(object);
+                Ok(current)
+            }
+            _ => Err(SourceLoweringError::Unsupported(
+                "compound assignment target".to_string(),
+            )),
         }
     }
 
@@ -348,6 +454,48 @@ impl<'a> FunctionCompiler<'a> {
             }
             BinaryOperator::In => {
                 self.instructions.push(Instruction::has_property(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::BitwiseAnd => {
+                self.instructions.push(Instruction::bit_and(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::BitwiseOR => {
+                self.instructions.push(Instruction::bit_or(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::BitwiseXOR => {
+                self.instructions.push(Instruction::bit_xor(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::ShiftLeft => {
+                self.instructions.push(Instruction::shl(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::ShiftRight => {
+                self.instructions.push(Instruction::shr(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::ShiftRightZeroFill => {
+                self.instructions.push(Instruction::ushr(
                     result.register,
                     lhs.register,
                     rhs.register,
@@ -496,11 +644,33 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::not(result.register, value.register));
                 Ok(result)
             }
+            UnaryOperator::BitwiseNot => {
+                let value = self.compile_expression(&unary.argument, module)?;
+                let value = self.materialize_value(value);
+                let minus_one = self.load_i32(-1)?;
+                let result = if value.is_temp {
+                    value
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                // ~x === x ^ -1
+                self.instructions.push(Instruction::bit_xor(
+                    result.register,
+                    value.register,
+                    minus_one.register,
+                ));
+                self.release(minus_one);
+                if result.register != value.register {
+                    self.release(value);
+                }
+                Ok(result)
+            }
+            UnaryOperator::Void => {
+                let value = self.compile_expression(&unary.argument, module)?;
+                self.release(value);
+                self.load_undefined()
+            }
             UnaryOperator::Delete => self.compile_delete_expression(&unary.argument, module),
-            _ => Err(SourceLoweringError::Unsupported(format!(
-                "unary operator {:?}",
-                unary.operator
-            ))),
         }
     }
 
@@ -1193,7 +1363,7 @@ impl<'a> FunctionCompiler<'a> {
                 },
                 expression,
                 &params,
-                FunctionKind::Ordinary,
+                FunctionKind::Arrow,
                 Some(self.env.clone()),
             )?
         } else {
@@ -1208,7 +1378,7 @@ impl<'a> FunctionCompiler<'a> {
                 },
                 &arrow.body.statements,
                 &params,
-                FunctionKind::Ordinary,
+                FunctionKind::Arrow,
                 Some(self.env.clone()),
             )?
         };
@@ -1253,6 +1423,24 @@ impl<'a> FunctionCompiler<'a> {
         self.patch_jump(jump_to_end, self.instructions.len())?;
 
         Ok(result)
+    }
+
+    /// Sequence expression: `(a, b, c)` — evaluates all, returns last.
+    fn compile_sequence_expression(
+        &mut self,
+        sequence: &oxc_ast::ast::SequenceExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let mut result = None;
+        for expression in &sequence.expressions {
+            if let Some(prev) = result {
+                self.release(prev);
+            }
+            result = Some(self.compile_expression(expression, module)?);
+        }
+        result.ok_or_else(|| {
+            SourceLoweringError::Unsupported("empty sequence expression".to_string())
+        })
     }
 
     /// Template literal: `` `prefix${expr}mid${expr}suffix` ``

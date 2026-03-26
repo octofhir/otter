@@ -1,3 +1,4 @@
+use super::ast::ParamInfo;
 use super::shared::{CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind};
 use super::*;
 
@@ -70,14 +71,19 @@ impl<'a> ModuleCompiler<'a> {
         function_index: FunctionIndex,
         identity: FunctionIdentity,
         statements: &[AstStatement<'_>],
-        params: &[&str],
+        params: &[ParamInfo<'_>],
         kind: FunctionKind,
         parent_env: Option<CompileEnv>,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
-        compiler.declare_parameters(params)?;
+        let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+        compiler.declare_parameters(&param_names)?;
+        if kind != FunctionKind::Arrow {
+            compiler.declare_this_binding()?;
+        }
+        compiler.compile_default_params(params, self)?;
         if kind == FunctionKind::Script {
             compiler.declare_intrinsic_globals()?;
         }
@@ -102,14 +108,19 @@ impl<'a> ModuleCompiler<'a> {
         function_index: FunctionIndex,
         identity: FunctionIdentity,
         expression: &Expression<'_>,
-        params: &[&str],
+        params: &[ParamInfo<'_>],
         kind: FunctionKind,
         parent_env: Option<CompileEnv>,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
-        compiler.declare_parameters(params)?;
+        let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+        compiler.declare_parameters(&param_names)?;
+        if kind != FunctionKind::Arrow {
+            compiler.declare_this_binding()?;
+        }
+        compiler.compile_default_params(params, self)?;
         let value = compiler.compile_expression(expression, self)?;
         compiler.instructions.push(Instruction::ret(value.register));
         compiler.release(value);

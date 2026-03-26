@@ -233,11 +233,44 @@ impl RegisterValue {
         Self::from_bool(self == rhs)
     }
 
-    /// Compares two `i32` values with less-than semantics.
-    pub fn lt(self, rhs: Self) -> Result<Self, ValueError> {
-        let lhs = self.as_i32().ok_or(ValueError::ExpectedI32)?;
-        let rhs = rhs.as_i32().ok_or(ValueError::ExpectedI32)?;
-        Ok(Self::from_bool(lhs < rhs))
+    /// Compares two numeric values with less-than semantics.
+    #[must_use]
+    pub fn lt(self, rhs: Self) -> Self {
+        let lhs = self.as_number().unwrap_or(f64::NAN);
+        let rhs = rhs.as_number().unwrap_or(f64::NAN);
+        Self::from_bool(lhs < rhs)
+    }
+
+    /// Compares two numeric values with greater-than semantics.
+    #[must_use]
+    pub fn gt(self, rhs: Self) -> Self {
+        let lhs = self.as_number().unwrap_or(f64::NAN);
+        let rhs = rhs.as_number().unwrap_or(f64::NAN);
+        Self::from_bool(lhs > rhs)
+    }
+
+    /// Compares two numeric values with greater-than-or-equal semantics.
+    #[must_use]
+    pub fn gte(self, rhs: Self) -> Self {
+        let lhs = self.as_number().unwrap_or(f64::NAN);
+        let rhs = rhs.as_number().unwrap_or(f64::NAN);
+        Self::from_bool(lhs >= rhs)
+    }
+
+    /// Compares two numeric values with less-than-or-equal semantics.
+    #[must_use]
+    pub fn lte(self, rhs: Self) -> Self {
+        let lhs = self.as_number().unwrap_or(f64::NAN);
+        let rhs = rhs.as_number().unwrap_or(f64::NAN);
+        Self::from_bool(lhs <= rhs)
+    }
+
+    /// Computes the remainder of two numeric values.
+    #[must_use]
+    pub fn js_rem(self, rhs: Self) -> Self {
+        let lhs = self.as_number().unwrap_or(f64::NAN);
+        let rhs = rhs.as_number().unwrap_or(f64::NAN);
+        Self::from_number(lhs % rhs)
     }
 
     #[must_use]

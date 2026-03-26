@@ -6,6 +6,12 @@ use crate::payload::NativePayloadId;
 use crate::property::PropertyNameId;
 use crate::value::RegisterValue;
 
+/// Maximum prototype chain depth before aborting a lookup (defense in depth).
+const MAX_PROTOTYPE_DEPTH: usize = 45;
+
+/// Maximum prototype chain depth for cycle detection in `set_prototype`.
+const MAX_SET_PROTOTYPE_DEPTH: usize = 100;
+
 /// Stable object handle encoded in register values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectHandle(pub u32);
@@ -348,13 +354,31 @@ impl ObjectHeap {
     }
 
     /// Updates the direct prototype link for the given heap value.
+    /// Sets the prototype of an object, with cycle detection.
+    /// Returns `Ok(true)` if the prototype was set, `Ok(false)` if rejected
+    /// (cycle detected or depth exceeded).
     pub fn set_prototype(
         &mut self,
         handle: ObjectHandle,
         prototype: Option<ObjectHandle>,
-    ) -> Result<(), ObjectError> {
-        if let Some(prototype) = prototype {
-            self.object(prototype)?;
+    ) -> Result<bool, ObjectError> {
+        // Cycle detection: walk from new_prototype upward and check if we
+        // encounter `handle`.  This matches V8's OrdinarySetPrototypeOf and
+        // the mature VM's implementation.
+        if let Some(new_proto) = prototype {
+            self.object(new_proto)?;
+            let mut current = Some(new_proto);
+            let mut depth = 0;
+            while let Some(p) = current {
+                depth += 1;
+                if depth > MAX_SET_PROTOTYPE_DEPTH {
+                    return Ok(false);
+                }
+                if p == handle {
+                    return Ok(false); // cycle detected
+                }
+                current = self.property_traversal_prototype(p)?;
+            }
         }
 
         match self.object_mut(handle)? {
@@ -377,7 +401,7 @@ impl ObjectHeap {
                 prototype: slot, ..
             } => {
                 *slot = prototype;
-                Ok(())
+                Ok(true)
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
@@ -752,10 +776,15 @@ impl ObjectHeap {
         property: PropertyNameId,
     ) -> Result<Option<PropertyLookup>, ObjectError> {
         let mut current = Some(handle);
+        let mut depth = 0;
         while let Some(owner) = current {
             if let Some((value, cache)) = self.get_own_property(owner, property)? {
                 let cache = (owner == handle).then_some(cache);
                 return Ok(Some(PropertyLookup::new(owner, value, cache)));
+            }
+            depth += 1;
+            if depth > MAX_PROTOTYPE_DEPTH {
+                break;
             }
             current = self.property_traversal_prototype(owner)?;
         }
@@ -924,6 +953,64 @@ impl ObjectHeap {
         *object_shape_id = shape_id;
         let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
         Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
+    }
+
+    /// Deletes an own named property from one ordinary object-like heap value.
+    pub fn delete_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<bool, ObjectError> {
+        let slot_index = match self.object(handle)? {
+            HeapValue::Object { keys, .. } => property_slot(keys, property),
+            HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
+            HeapValue::Closure { keys, .. } => property_slot(keys, property),
+            HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::Array { .. }
+            | HeapValue::String { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. } => return Err(ObjectError::InvalidKind),
+        };
+
+        let Some(slot_index) = slot_index.map(usize::from) else {
+            return Ok(false);
+        };
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } => (object_shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        keys.remove(slot_index);
+        values.remove(slot_index);
+        *object_shape_id = shape_id;
+        Ok(true)
     }
 
     /// Writes a shaped property value when the shape and slot still match.

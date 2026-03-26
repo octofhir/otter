@@ -2,12 +2,15 @@
 
 use core::any::Any;
 use core::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
 use crate::closure::{ClosureTemplate, UpvalueId};
 use crate::descriptors::{NativeSlotKind, VmNativeCallError};
 use crate::feedback::{FeedbackKind, FeedbackSlotId};
+use crate::float::FloatId;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::host::{HostFunctionId, NativeFunctionRegistry};
 use crate::intrinsics::VmIntrinsics;
@@ -20,6 +23,10 @@ use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::string::StringId;
 use crate::value::{RegisterValue, ValueError};
 
+const STRING_DATA_SLOT: &str = "__otter_string_data__";
+const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
+const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
+
 /// Errors produced by the new interpreter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpreterError {
@@ -29,6 +36,12 @@ pub enum InterpreterError {
     UnexpectedEndOfBytecode,
     /// A branch jumped outside the valid bytecode range.
     InvalidJumpTarget,
+    /// A constant table index was out of bounds.
+    InvalidConstant,
+    /// Execution was interrupted by an external signal (e.g. timeout watchdog).
+    Interrupted,
+    /// A TypeError was thrown at runtime.
+    TypeError(Box<str>),
     /// Arithmetic or comparison failed because the inputs were invalid.
     InvalidValue(ValueError),
     /// The current register value is not an object handle.
@@ -71,6 +84,9 @@ impl fmt::Display for InterpreterError {
             Self::InvalidJumpTarget => {
                 f.write_str("branch target is outside the current function bytecode")
             }
+            Self::InvalidConstant => f.write_str("constant table index is out of bounds"),
+            Self::Interrupted => f.write_str("execution interrupted"),
+            Self::TypeError(msg) => write!(f, "TypeError: {msg}"),
             Self::InvalidValue(error) => error.fmt(f),
             Self::InvalidObjectValue => f.write_str("operation expected an object value"),
             Self::InvalidObjectHandle => f.write_str("object handle is outside the current heap"),
@@ -794,18 +810,99 @@ impl RuntimeState {
         }
     }
 
+    fn delete_named_property(
+        &mut self,
+        target: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<bool, InterpreterError> {
+        let _deleted = self.objects.delete_property(target, property)?;
+        Ok(true)
+    }
+
+    fn own_data_property(
+        &mut self,
+        handle: ObjectHandle,
+        slot_name: &str,
+    ) -> Result<Option<RegisterValue>, InterpreterError> {
+        let backing = self.intern_property_name(slot_name);
+        let Some(lookup) = self.objects.get_property(handle, backing)? else {
+            return Ok(None);
+        };
+        if lookup.owner() != handle {
+            return Ok(None);
+        }
+        let PropertyValue::Data(value) = lookup.value() else {
+            return Ok(None);
+        };
+        Ok(Some(value))
+    }
+
+    fn boxed_primitive_value(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Option<RegisterValue>, InterpreterError> {
+        if let Some(value) = self.own_data_property(handle, STRING_DATA_SLOT)?
+            && value.as_object_handle().is_some()
+        {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.own_data_property(handle, NUMBER_DATA_SLOT)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.own_data_property(handle, BOOLEAN_DATA_SLOT)? {
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
     fn string_wrapper_data(
         &mut self,
         handle: ObjectHandle,
     ) -> Result<Option<ObjectHandle>, InterpreterError> {
-        let backing = self.intern_property_name("__otter_string_data__");
-        let Some(lookup) = self.objects.get_property(handle, backing)? else {
-            return Ok(None);
+        Ok(self
+            .own_data_property(handle, STRING_DATA_SLOT)?
+            .and_then(|value| value.as_object_handle().map(ObjectHandle)))
+    }
+
+    fn js_loose_eq(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<bool, InterpreterError> {
+        if self.objects.strict_eq(lhs, rhs)? {
+            return Ok(true);
+        }
+        if (lhs == RegisterValue::undefined() && rhs == RegisterValue::null())
+            || (lhs == RegisterValue::null() && rhs == RegisterValue::undefined())
+        {
+            return Ok(true);
+        }
+
+        let coerced_lhs = self.coerce_loose_equality_primitive(lhs)?;
+        let coerced_rhs = self.coerce_loose_equality_primitive(rhs)?;
+        if coerced_lhs == coerced_rhs {
+            return Ok(true);
+        }
+        if coerced_lhs != lhs || coerced_rhs != rhs {
+            return self.js_loose_eq(coerced_lhs, coerced_rhs);
+        }
+
+        Ok(false)
+    }
+
+    fn coerce_loose_equality_primitive(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(value);
         };
-        let PropertyValue::Data(value) = lookup.value() else {
-            return Ok(None);
-        };
-        Ok(value.as_object_handle().map(ObjectHandle))
+
+        if let Some(primitive) = self.boxed_primitive_value(handle)? {
+            return Ok(primitive);
+        }
+
+        Ok(value)
     }
 
     fn js_to_string(&mut self, value: RegisterValue) -> Result<Box<str>, InterpreterError> {
@@ -849,6 +946,207 @@ impl RuntimeState {
         }
 
         Ok(String::new().into_boxed_str())
+    }
+
+    /// Infallible ToString — returns "" on any error.
+    pub fn js_to_string_infallible(&mut self, value: RegisterValue) -> Box<str> {
+        self.js_to_string(value).unwrap_or_default()
+    }
+
+    /// ES spec 7.1.4 ToNumber — converts a value to its numeric representation.
+    fn js_to_number(&mut self, value: RegisterValue) -> Result<f64, InterpreterError> {
+        if value == RegisterValue::undefined() {
+            return Ok(f64::NAN);
+        }
+        if value == RegisterValue::null() {
+            return Ok(0.0);
+        }
+        if let Some(boolean) = value.as_bool() {
+            return Ok(if boolean { 1.0 } else { 0.0 });
+        }
+        if let Some(number) = value.as_number() {
+            return Ok(number);
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            if let Some(string) = self.objects.string_value(handle)? {
+                return Ok(parse_string_to_number(string));
+            }
+            // ToPrimitive(value, number) for objects — try valueOf slot, then
+            // boxed primitive unwrap. Full spec valueOf/toString dispatch is
+            // not yet available, but this handles wrapper objects (Number, Boolean, String).
+            if let Some(primitive) = self.boxed_primitive_value(handle)? {
+                return self.js_to_number(primitive);
+            }
+            return Ok(f64::NAN);
+        }
+        Ok(f64::NAN)
+    }
+
+    /// ES spec 7.1.1 ToPrimitive with hint Number — converts an object to
+    /// a primitive value.  Returns the value unchanged for non-objects.
+    fn js_to_primitive_number(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(value);
+        };
+        // String heap values are already primitive-ish — extract the string.
+        if let Some(_string) = self.objects.string_value(handle)? {
+            return Ok(value);
+        }
+        // Boxed primitive wrappers (Number, Boolean, String constructors).
+        if let Some(primitive) = self.boxed_primitive_value(handle)? {
+            return Ok(primitive);
+        }
+        // Default for plain objects: NaN.
+        Ok(RegisterValue::from_number(f64::NAN))
+    }
+
+    /// ES spec 7.2.13 Abstract Relational Comparison.
+    /// Returns `Some(true)` for less-than, `Some(false)` for not less-than,
+    /// `None` for undefined (NaN involved).
+    fn js_abstract_relational_comparison(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+        left_first: bool,
+    ) -> Result<Option<bool>, InterpreterError> {
+        // 1-2. ToPrimitive with hint Number.
+        let (px, py) = if left_first {
+            let px = self.js_to_primitive_number(lhs)?;
+            let py = self.js_to_primitive_number(rhs)?;
+            (px, py)
+        } else {
+            let py = self.js_to_primitive_number(rhs)?;
+            let px = self.js_to_primitive_number(lhs)?;
+            (px, py)
+        };
+
+        // 3. If both are strings, compare lexicographically.
+        let px_is_string = self.value_is_string(px)?;
+        let py_is_string = self.value_is_string(py)?;
+        if px_is_string && py_is_string {
+            let sx = self.js_to_string(px)?;
+            let sy = self.js_to_string(py)?;
+            return Ok(Some(sx.as_ref() < sy.as_ref()));
+        }
+
+        // 4. Otherwise, coerce both to numbers.
+        let nx = self.js_to_number(px)?;
+        let ny = self.js_to_number(py)?;
+        // NaN comparisons return undefined (None).
+        if nx.is_nan() || ny.is_nan() {
+            return Ok(None);
+        }
+        Ok(Some(nx < ny))
+    }
+
+    /// ES spec 7.1.2 ToBoolean — runtime-aware truthiness check.
+    /// Unlike `RegisterValue::is_truthy()`, this correctly handles heap strings
+    /// (empty string "" is falsy).
+    fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        // Fast path: non-object values use the NaN-box check.
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(value.is_truthy());
+        };
+        // Heap strings: empty string is falsy, non-empty is truthy.
+        if let Some(s) = self.objects.string_value(handle)? {
+            return Ok(!s.is_empty());
+        }
+        // All other objects are truthy.
+        Ok(true)
+    }
+
+    /// ES spec §7.3.21 OrdinaryHasInstance — `value instanceof constructor`.
+    fn js_instance_of(
+        &mut self,
+        value: RegisterValue,
+        constructor: RegisterValue,
+    ) -> Result<bool, InterpreterError> {
+        // LHS must be an object.
+        let Some(obj_handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+        // RHS must be an object with a "prototype" property.
+        let Some(ctor_handle) = constructor.as_object_handle().map(ObjectHandle) else {
+            return Err(InterpreterError::TypeError(
+                "Right-hand side of instanceof is not an object".into(),
+            ));
+        };
+        let proto_prop = self.intern_property_name("prototype");
+        let proto_value = match self.objects.get_property(ctor_handle, proto_prop)? {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Data(v) => v,
+                PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+            },
+            None => RegisterValue::undefined(),
+        };
+        let Some(proto_handle) = proto_value.as_object_handle().map(ObjectHandle) else {
+            return Err(InterpreterError::TypeError(
+                "Function has non-object prototype in instanceof check".into(),
+            ));
+        };
+        // Walk the prototype chain of value.
+        let mut current = self.objects.get_prototype(obj_handle)?;
+        let mut depth = 0;
+        while let Some(p) = current {
+            if p == proto_handle {
+                return Ok(true);
+            }
+            depth += 1;
+            if depth > 45 {
+                break;
+            }
+            current = self.objects.get_prototype(p)?;
+        }
+        Ok(false)
+    }
+
+    /// `in` operator — check if a string property exists on an object.
+    fn js_has_property(
+        &mut self,
+        key: RegisterValue,
+        object: RegisterValue,
+    ) -> Result<bool, InterpreterError> {
+        let Some(obj_handle) = object.as_object_handle().map(ObjectHandle) else {
+            return Err(InterpreterError::TypeError(
+                "Cannot use 'in' operator to search for property in non-object".into(),
+            ));
+        };
+        let key_str = self.js_to_string(key)?;
+        let property = self.intern_property_name(&key_str);
+        Ok(self.objects.get_property(obj_handle, property)?.is_some())
+    }
+
+    /// Allocate an error object with the correct prototype chain.
+    fn alloc_reference_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
+        let prototype = self.intrinsics.reference_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let msg_handle = self.objects.alloc_string(message);
+        let msg_prop = self.intern_property_name("message");
+        self.objects.set_property(
+            handle,
+            msg_prop,
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
+        Ok(handle)
+    }
+
+    /// Checks whether a value is a string type (heap string or string wrapper).
+    fn value_is_string(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+        if self.objects.string_value(handle)?.is_some() {
+            return Ok(true);
+        }
+        if let Some(inner) = self.string_wrapper_data(handle)?
+            && self.objects.string_value(inner)?.is_some()
+        {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn js_add(
@@ -961,14 +1259,63 @@ impl FrameRuntimeState {
 }
 
 /// Minimal interpreter shell for the new VM backend.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Interpreter;
+#[derive(Debug, Clone)]
+pub struct Interpreter {
+    /// Cooperative interrupt flag — when set to `true` by an external thread
+    /// (e.g. a watchdog timer), the interpreter stops at the next back-edge.
+    /// This mirrors V8's `TerminateExecution` / JSC's `VMTraps::fireTrap()`
+    /// pattern: the flag is an `Arc<AtomicBool>` shared with the caller.
+    /// Checked only on backward jumps (loop back-edges), so the cost is one
+    /// `Relaxed` atomic load per loop iteration (~1-2 CPU cycles, branch
+    /// predicted not-taken >99.999% of the time).
+    interrupt_flag: Option<Arc<AtomicBool>>,
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Interpreter {
-    /// Creates a new interpreter instance.
+    /// Creates a new interpreter instance with no interrupt mechanism.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            interrupt_flag: None,
+        }
+    }
+
+    /// Sets a cooperative interrupt flag.  The caller retains a clone of the
+    /// `Arc<AtomicBool>` and can set it to `true` from any thread to request
+    /// termination.  The interpreter checks the flag on every backward jump
+    /// (loop back-edge) — one `Relaxed` atomic load per loop iteration.
+    #[must_use]
+    pub fn with_interrupt_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.interrupt_flag = Some(flag);
+        self
+    }
+
+    /// Returns a shareable interrupt flag, creating one if needed.
+    pub fn interrupt_flag(&mut self) -> Arc<AtomicBool> {
+        if let Some(ref flag) = self.interrupt_flag {
+            Arc::clone(flag)
+        } else {
+            let flag = Arc::new(AtomicBool::new(false));
+            self.interrupt_flag = Some(Arc::clone(&flag));
+            flag
+        }
+    }
+
+    /// Checks the interrupt flag and returns an error if it is set.
+    #[inline]
+    fn check_interrupt(&self) -> Result<(), InterpreterError> {
+        if let Some(ref flag) = self.interrupt_flag
+            && flag.load(Ordering::Relaxed)
+        {
+            return Err(InterpreterError::Interrupted);
+        }
+        Ok(())
     }
 
     /// Creates an entry activation for the module entry function.
@@ -1203,6 +1550,20 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::LoadF64 => {
+                let float_id = FloatId(instruction.b());
+                let value = function
+                    .float_constants()
+                    .get(float_id)
+                    .ok_or(InterpreterError::InvalidConstant)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(value),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::NewObject => {
                 let handle = runtime.alloc_object();
                 activation.write_bytecode_register(
@@ -1307,10 +1668,11 @@ impl Interpreter {
             }
             Opcode::Not => {
                 let value = activation.read_bytecode_register(function, instruction.b())?;
+                let truthy = runtime.js_to_boolean(value)?;
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
-                    RegisterValue::from_bool(!value.is_truthy()),
+                    RegisterValue::from_bool(!truthy),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -1326,24 +1688,39 @@ impl Interpreter {
             Opcode::Sub => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let value = lhs.sub_i32(rhs)?;
-                activation.write_bytecode_register(function, instruction.a(), value)?;
+                let lhs_num = runtime.js_to_number(lhs)?;
+                let rhs_num = runtime.js_to_number(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(lhs_num - rhs_num),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::Mul => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let value = lhs.mul_i32(rhs)?;
-                activation.write_bytecode_register(function, instruction.a(), value)?;
+                let lhs_num = runtime.js_to_number(lhs)?;
+                let rhs_num = runtime.js_to_number(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(lhs_num * rhs_num),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::Div => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let value = lhs.div_i32(rhs)?;
-                activation.write_bytecode_register(function, instruction.a(), value)?;
+                let lhs_num = runtime.js_to_number(lhs)?;
+                let rhs_num = runtime.js_to_number(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(lhs_num / rhs_num),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -1358,11 +1735,98 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::LooseEq => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(runtime.js_loose_eq(lhs, rhs)?),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // ES spec 7.2.13 Abstract Relational Comparison.
+            // Lt(a, b, c): a = (b < c)
             Opcode::Lt => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let value = lhs.lt(rhs)?;
-                activation.write_bytecode_register(function, instruction.a(), value)?;
+                // AbstractRelationalComparison(x, y, LeftFirst=true) → true means x < y
+                let result = runtime
+                    .js_abstract_relational_comparison(lhs, rhs, true)?
+                    .unwrap_or(false);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // Gt(a, b, c): a = (b > c) ≡ AbstractRelationalComparison(c, b, LeftFirst=false)
+            Opcode::Gt => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let result = runtime
+                    .js_abstract_relational_comparison(rhs, lhs, false)?
+                    .unwrap_or(false);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // Gte(a, b, c): a = (b >= c) ≡ !(c < b ... wait, no)
+            // ES spec: x >= y ≡ NOT AbstractRelationalComparison(x, y) where undefined → false
+            Opcode::Gte => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // x >= y: if AbstractRelationalComparison(x, y) is undefined or true → false
+                let less = runtime.js_abstract_relational_comparison(lhs, rhs, true)?;
+                let result = match less {
+                    None => false,       // undefined (NaN) → false
+                    Some(true) => false, // x < y → not >=
+                    Some(false) => true, // x >= y
+                };
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // Lte(a, b, c): a = (b <= c) ≡ NOT AbstractRelationalComparison(c, b, LeftFirst=false)
+            Opcode::Lte => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let greater = runtime.js_abstract_relational_comparison(rhs, lhs, false)?;
+                let result = match greater {
+                    None => false,
+                    Some(true) => false,
+                    Some(false) => true,
+                };
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // Mod uses ToNumber coercion.
+            Opcode::Mod => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let lhs_num = runtime.js_to_number(lhs)?;
+                let rhs_num = runtime.js_to_number(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(lhs_num % rhs_num),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -1459,6 +1923,18 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            Opcode::DeleteProperty => {
+                let property = Self::resolve_property_name(function, runtime, instruction.c())?;
+                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let deleted = runtime.delete_named_property(handle, property)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(deleted),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::GetIndex => {
                 let handle = Self::read_object_handle(activation, function, instruction.b())?;
                 let index = Self::read_index(activation, function, instruction.c())?;
@@ -1504,6 +1980,63 @@ impl Interpreter {
             Opcode::IteratorClose => {
                 let iterator = Self::read_object_handle(activation, function, instruction.a())?;
                 runtime.objects.iterator_close(iterator)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // V8-style LdaGlobal: load a global variable by name from the
+            // global object (receiver r0).  Throws if not found.
+            Opcode::GetGlobal => {
+                let property = Self::resolve_property_name(function, runtime, instruction.b())?;
+                let global = activation.receiver(function)?;
+                let global_handle = global
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let value = runtime.objects.get_property(global_handle, property)?;
+                match value {
+                    Some(lookup) => {
+                        let val = match lookup.value() {
+                            PropertyValue::Data(v) => v,
+                            PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+                        };
+                        activation.write_bytecode_register(function, instruction.a(), val)?;
+                    }
+                    None => {
+                        // Property not found → throw (ReferenceError semantics).
+                        let name = runtime.property_names().get(property).unwrap_or("?");
+                        let msg = format!("{name} is not defined");
+                        let error_obj = runtime.alloc_reference_error(&msg)?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error_obj.0,
+                        )));
+                    }
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // ES spec §7.3.21 OrdinaryHasInstance — `lhs instanceof rhs`.
+            Opcode::InstanceOf => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                let result = runtime.js_instance_of(lhs, rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // `in` operator — check if property exists on object.
+            Opcode::HasProperty => {
+                let key = activation.read_bytecode_register(function, instruction.b())?;
+                let object = activation.read_bytecode_register(function, instruction.c())?;
+                let result = runtime.js_has_property(key, object)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(result),
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -1617,13 +2150,21 @@ impl Interpreter {
                 }
             }
             Opcode::Jump => {
-                activation.jump_relative(instruction.immediate_i32())?;
+                let offset = instruction.immediate_i32();
+                if offset < 0 {
+                    self.check_interrupt()?;
+                }
+                activation.jump_relative(offset)?;
                 Ok(StepOutcome::Continue)
             }
             Opcode::JumpIfTrue => {
                 let condition = activation.read_bytecode_register(function, instruction.a())?;
-                if condition.is_truthy() {
-                    activation.jump_relative(instruction.immediate_i32())?;
+                if runtime.js_to_boolean(condition)? {
+                    let offset = instruction.immediate_i32();
+                    if offset < 0 {
+                        self.check_interrupt()?;
+                    }
+                    activation.jump_relative(offset)?;
                 } else {
                     activation.advance();
                 }
@@ -1631,10 +2172,14 @@ impl Interpreter {
             }
             Opcode::JumpIfFalse => {
                 let condition = activation.read_bytecode_register(function, instruction.a())?;
-                if condition.is_truthy() {
+                if runtime.js_to_boolean(condition)? {
                     activation.advance();
                 } else {
-                    activation.jump_relative(instruction.immediate_i32())?;
+                    let offset = instruction.immediate_i32();
+                    if offset < 0 {
+                        self.check_interrupt()?;
+                    }
+                    activation.jump_relative(offset)?;
                 }
                 Ok(StepOutcome::Continue)
             }
@@ -2177,6 +2722,7 @@ mod tests {
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::exception::ExceptionTable;
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+    use crate::float::FloatTable;
     use crate::frame::{FrameFlags, FrameLayout};
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};
     use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
@@ -2638,6 +3184,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["count"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -2676,6 +3223,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["count"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -2749,6 +3297,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["length"]),
                     StringTable::new(vec!["otter"]),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -2799,6 +3348,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::default(),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -2867,6 +3417,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["ignored", "shared"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -2907,6 +3458,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["shared"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -2963,6 +3515,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["Math", "abs"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -3036,6 +3589,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["Math", "memory"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -3113,6 +3667,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["Object", "create", "valueOf"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -3226,6 +3781,7 @@ mod tests {
                         "toString",
                     ]),
                     StringTable::new(vec!["function () { [native code] }"]),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -3307,6 +3863,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -3389,6 +3946,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),
@@ -3507,6 +4065,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Closure(ClosureCall::new(
@@ -3598,6 +4157,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::default(),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Closure(ClosureCall::new(
@@ -3649,6 +4209,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::default(),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Direct(DirectCall::new(
@@ -3708,6 +4269,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::default(),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::new(vec![
                         None,
                         Some(ClosureTemplate::new(FunctionIndex(1), 0)),
@@ -3834,6 +4396,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::default(),
                     StringTable::default(),
+                    FloatTable::default(),
                     ClosureTable::new(vec![
                         None,
                         Some(ClosureTemplate::new(FunctionIndex(1), 1)),
@@ -3891,5 +4454,18 @@ mod tests {
             result.map(ExecutionResult::return_value),
             Ok(RegisterValue::from_i32(43))
         );
+    }
+}
+
+/// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
+fn parse_string_to_number(s: &str) -> f64 {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    match trimmed {
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => trimmed.parse::<f64>().unwrap_or(f64::NAN),
     }
 }

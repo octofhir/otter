@@ -27,6 +27,8 @@ pub mod descriptors;
 pub mod exception;
 /// Feedback and profiling side-table layout.
 pub mod feedback;
+/// Float-constant side tables.
+pub mod float;
 /// Frame and register-window layout.
 pub mod frame;
 /// Runtime host-function registry for native callbacks.

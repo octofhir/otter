@@ -108,6 +108,7 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) property_name_ids: BTreeMap<String, PropertyNameId>,
     pub(super) string_literals: Vec<Box<str>>,
     pub(super) string_ids: BTreeMap<String, StringId>,
+    pub(super) float_constants: Vec<f64>,
     pub(super) closure_templates: Vec<Option<ClosureTemplate>>,
     pub(super) call_sites: Vec<Option<CallSite>>,
     pub(super) exception_handlers: Vec<ExceptionHandler>,

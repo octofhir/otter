@@ -7,6 +7,7 @@
 
 mod array_class;
 mod boolean_class;
+mod error_class;
 mod function_class;
 mod install;
 mod math;
@@ -62,7 +63,42 @@ pub enum IntrinsicRoot {
 
 /// Shared list of ECMAScript globals installed by the new-VM intrinsic bootstrap.
 pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
-    "Object", "Function", "Array", "String", "Number", "Boolean", "Math", "Reflect",
+    "Object",
+    "Function",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Math",
+    "Reflect",
+    "JSON",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "URIError",
+    "EvalError",
+    "Symbol",
+    "Date",
+    "RegExp",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Promise",
+    "Proxy",
+    "isNaN",
+    "isFinite",
+    "parseInt",
+    "parseFloat",
+    "eval",
+    "encodeURI",
+    "encodeURIComponent",
+    "decodeURI",
+    "decodeURIComponent",
+    "console",
+    "$262",
 ];
 
 /// Lifecycle stage of the intrinsic registry.
@@ -126,6 +162,17 @@ pub struct VmIntrinsics {
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 4],
+    // Error hierarchy
+    pub(crate) error_prototype: ObjectHandle,
+    pub(crate) error_constructor: ObjectHandle,
+    pub(crate) type_error_prototype: ObjectHandle,
+    pub(crate) type_error_constructor: ObjectHandle,
+    pub(crate) reference_error_prototype: ObjectHandle,
+    pub(crate) reference_error_constructor: ObjectHandle,
+    pub(crate) range_error_prototype: ObjectHandle,
+    pub(crate) range_error_constructor: ObjectHandle,
+    pub(crate) syntax_error_prototype: ObjectHandle,
+    pub(crate) syntax_error_constructor: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -144,6 +191,16 @@ impl VmIntrinsics {
         let string_prototype = heap.alloc_object();
         let number_prototype = heap.alloc_object();
         let boolean_prototype = heap.alloc_object();
+        let error_prototype = heap.alloc_object();
+        let error_constructor = heap.alloc_object();
+        let type_error_prototype = heap.alloc_object();
+        let type_error_constructor = heap.alloc_object();
+        let reference_error_prototype = heap.alloc_object();
+        let reference_error_constructor = heap.alloc_object();
+        let range_error_prototype = heap.alloc_object();
+        let range_error_constructor = heap.alloc_object();
+        let syntax_error_prototype = heap.alloc_object();
+        let syntax_error_constructor = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -169,6 +226,16 @@ impl VmIntrinsics {
                 WellKnownSymbol::ToStringTag,
                 WellKnownSymbol::Species,
             ],
+            error_prototype,
+            error_constructor,
+            type_error_prototype,
+            type_error_constructor,
+            reference_error_prototype,
+            reference_error_constructor,
+            range_error_prototype,
+            range_error_constructor,
+            syntax_error_prototype,
+            syntax_error_constructor,
         }
     }
 
@@ -190,6 +257,21 @@ impl VmIntrinsics {
         heap.set_prototype(self.string_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.number_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.boolean_prototype, Some(self.object_prototype))?;
+        // Error hierarchy: Error.prototype → Object.prototype,
+        // NativeError.prototype → Error.prototype
+        heap.set_prototype(self.error_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.type_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.type_error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.reference_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(
+            self.reference_error_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(self.range_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.range_error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.syntax_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.syntax_error_constructor, Some(self.function_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -383,10 +465,11 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 8] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 9] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
+        &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
         &number_class::NUMBER_INTRINSIC as &dyn IntrinsicInstaller,
@@ -463,7 +546,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 23);
+        assert_eq!(native_functions.len(), 30);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

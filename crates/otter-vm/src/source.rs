@@ -1115,6 +1115,235 @@ mod tests {
     }
 
     #[test]
+    fn compile_test262_basic_script_supports_ternary_expression() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "if ((false ? false : true) !== true) {\n",
+                "  throw new Test262Error('#1');\n",
+                "}\n",
+                "if ((true ? false : true) !== false) {\n",
+                "  throw new Test262Error('#2');\n",
+                "}\n",
+            ),
+            "native-test262-ternary.js",
+        )
+        .expect("ternary test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("ternary test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    // --- TASK-BASE-0007: for loops ---
+
+    #[test]
+    fn for_loop_basic_accumulation() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var sum = 0;\n",
+                "for (var i = 0; i < 5; i = i + 1) {\n",
+                "  sum = sum + i;\n",
+                "}\n",
+                "assert.sameValue(sum, 10, 'basic for accumulation');\n",
+            ),
+            "native-test262-for-basic.js",
+        )
+        .expect("for loop test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for loop test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn for_loop_null_init_test_update() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var count = 0;\n",
+                "for (;;) {\n",
+                "  count = count + 1;\n",
+                "  if (count === 3) break;\n",
+                "}\n",
+                "assert.sameValue(count, 3, 'infinite loop with break');\n",
+            ),
+            "native-test262-for-infinite.js",
+        )
+        .expect("for infinite loop test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for infinite loop test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn for_loop_break_and_continue() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var sum = 0;\n",
+                "for (var i = 0; i < 10; i = i + 1) {\n",
+                "  if (i === 7) break;\n",
+                "  if (i % 2 === 0) continue;\n",
+                "  sum = sum + i;\n",
+                "}\n",
+                "assert.sameValue(sum, 9, 'break+continue: 1+3+5');\n",
+            ),
+            "native-test262-for-break-continue.js",
+        )
+        .expect("for break/continue test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for break/continue test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    // --- TASK-BASE-0007: arrow functions ---
+
+    #[test]
+    fn arrow_function_expression_body() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var add = (a, b) => a + b;\n",
+                "assert.sameValue(add(2, 3), 5, 'arrow expression body');\n",
+            ),
+            "native-test262-arrow-expr.js",
+        )
+        .expect("arrow expression test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("arrow expression test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arrow_function_block_body() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var double = (x) => { return x + x; };\n",
+                "assert.sameValue(double(7), 14, 'arrow block body');\n",
+            ),
+            "native-test262-arrow-block.js",
+        )
+        .expect("arrow block body test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("arrow block body test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arrow_function_captures_upvalue() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var base = 100;\n",
+                "var addBase = (x) => x + base;\n",
+                "assert.sameValue(addBase(5), 105, 'arrow captures upvalue');\n",
+            ),
+            "native-test262-arrow-upvalue.js",
+        )
+        .expect("arrow upvalue test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("arrow upvalue test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    // --- TASK-BASE-0007: for-of with let/const ---
+
+    #[test]
+    fn for_of_with_const_declaration() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var sum = 0;\n",
+                "for (const x of [10, 20, 30]) {\n",
+                "  sum = sum + x;\n",
+                "}\n",
+                "assert.sameValue(sum, 60, 'for-of with const');\n",
+            ),
+            "native-test262-for-of-const.js",
+        )
+        .expect("for-of const test should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("for-of const test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn interrupt_flag_terminates_infinite_loop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let module =
+            compile_script("for (;;) {}", "infinite.js").expect("infinite loop should compile");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&flag);
+
+        // Set the flag immediately — the loop should stop on the first back-edge.
+        flag_clone.store(true, Ordering::Relaxed);
+
+        let result = Interpreter::new()
+            .with_interrupt_flag(flag)
+            .execute(&module);
+
+        assert!(result.is_err(), "infinite loop should be interrupted");
+        assert!(
+            result.unwrap_err().to_string().contains("interrupted"),
+            "error should mention interruption"
+        );
+    }
+
+    #[test]
+    fn harness_sta_js_compiles() {
+        let sta = include_str!("../../../tests/test262/harness/sta.js");
+        match compile_script(sta, "sta.js") {
+            Ok(_) => {}
+            Err(e) => panic!("sta.js failed to compile: {e}"),
+        }
+    }
+
+    #[test]
+    fn harness_assert_js_compiles() {
+        let sta = include_str!("../../../tests/test262/harness/sta.js");
+        let assert_js = include_str!("../../../tests/test262/harness/assert.js");
+        let combined = format!("{sta}\n{assert_js}");
+        match compile_script(&combined, "sta+assert.js") {
+            Ok(_) => {}
+            Err(e) => panic!("sta.js+assert.js failed to compile: {e}"),
+        }
+    }
+
+    #[test]
+    fn harness_plus_test_executes() {
+        let sta = include_str!("../../../tests/test262/harness/sta.js");
+        let assert_js = include_str!("../../../tests/test262/harness/assert.js");
+        let test_code = concat!(
+            "assert.sameValue(1 + 2, 3, 'basic addition');\n",
+            "assert.sameValue(true ? 1 : 2, 1, 'ternary true');\n",
+            "assert.sameValue('' ? 'yes' : 'no', 'no', 'empty string is falsy');\n",
+        );
+        let combined = format!("{sta}\n{assert_js}\n{test_code}");
+        let module =
+            compile_script(&combined, "harness+test.js").expect("harness+test should compile");
+
+        let result = Interpreter::new().execute(&module);
+        // Normal completion = pass (no Test262Error thrown).
+        assert!(
+            result.is_ok(),
+            "harness+test should pass: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn compile_script_reports_uncaught_throw() {
         let module = compile_script("throw 9;", "next-throw.js").expect("script should compile");
         let error = Interpreter::new()

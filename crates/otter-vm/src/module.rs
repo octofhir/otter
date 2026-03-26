@@ -8,6 +8,7 @@ use crate::closure::ClosureTable;
 use crate::deopt::DeoptTable;
 use crate::exception::ExceptionTable;
 use crate::feedback::FeedbackTableLayout;
+use crate::float::FloatTable;
 use crate::frame::FrameLayout;
 use crate::property::PropertyNameTable;
 use crate::source_map::SourceMap;
@@ -41,6 +42,7 @@ impl std::error::Error for ModuleError {}
 pub struct FunctionSideTables {
     property_names: PropertyNameTable,
     string_literals: StringTable,
+    float_constants: FloatTable,
     closures: ClosureTable,
     calls: CallTable,
 }
@@ -51,12 +53,14 @@ impl FunctionSideTables {
     pub fn new(
         property_names: PropertyNameTable,
         string_literals: StringTable,
+        float_constants: FloatTable,
         closures: ClosureTable,
         calls: CallTable,
     ) -> Self {
         Self {
             property_names,
             string_literals,
+            float_constants,
             closures,
             calls,
         }
@@ -68,6 +72,7 @@ impl Default for FunctionSideTables {
         Self::new(
             PropertyNameTable::default(),
             StringTable::default(),
+            FloatTable::default(),
             ClosureTable::default(),
             CallTable::default(),
         )
@@ -130,6 +135,7 @@ pub struct Function {
     bytecode: Bytecode,
     property_names: PropertyNameTable,
     string_literals: StringTable,
+    float_constants: FloatTable,
     closures: ClosureTable,
     calls: CallTable,
     feedback: FeedbackTableLayout,
@@ -153,6 +159,7 @@ impl Function {
             bytecode,
             property_names: tables.side_tables.property_names,
             string_literals: tables.side_tables.string_literals,
+            float_constants: tables.side_tables.float_constants,
             closures: tables.side_tables.closures,
             calls: tables.side_tables.calls,
             feedback: tables.feedback,
@@ -206,6 +213,12 @@ impl Function {
     #[must_use]
     pub fn string_literals(&self) -> &StringTable {
         &self.string_literals
+    }
+
+    /// Returns the float-constant side table.
+    #[must_use]
+    pub fn float_constants(&self) -> &FloatTable {
+        &self.float_constants
     }
 
     /// Returns the closure-creation side table.
@@ -317,6 +330,7 @@ mod tests {
     use crate::deopt::{DeoptId, DeoptSite, DeoptTable};
     use crate::exception::{ExceptionHandler, ExceptionTable};
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+    use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::property::PropertyNameTable;
     use crate::source_map::{SourceLocation, SourceMap, SourceMapEntry};
@@ -356,6 +370,7 @@ mod tests {
                 FunctionSideTables::new(
                     property_names,
                     string_literals,
+                    FloatTable::default(),
                     ClosureTable::default(),
                     calls,
                 ),

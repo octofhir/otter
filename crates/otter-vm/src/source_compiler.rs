@@ -14,6 +14,7 @@ use crate::closure::{ClosureTable, ClosureTemplate, UpvalueId};
 use crate::deopt::DeoptTable;
 use crate::exception::{ExceptionHandler, ExceptionTable};
 use crate::feedback::FeedbackTableLayout;
+use crate::float::{FloatId, FloatTable};
 use crate::frame::{FrameFlags, FrameLayout, RegisterIndex};
 use crate::module::{
     Function as VmFunction, FunctionIndex, FunctionSideTables, FunctionTables, Module,

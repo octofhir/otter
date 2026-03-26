@@ -1887,7 +1887,16 @@ impl Otter {
         &self,
         module: &otter_vm::Module,
     ) -> Result<otter_vm::RegisterValue, OtterError> {
-        let result = otter_vm::Interpreter::new()
+        self.execute_next_module_with(module, otter_vm::Interpreter::new())
+    }
+
+    /// Execute a new-VM module with a caller-provided interpreter configuration.
+    pub fn execute_next_module_with(
+        &self,
+        module: &otter_vm::Module,
+        interpreter: otter_vm::Interpreter,
+    ) -> Result<otter_vm::RegisterValue, OtterError> {
+        let result = interpreter
             .execute(module)
             .map_err(|error| OtterError::Runtime(error.to_string()))?;
         Ok(result.return_value())

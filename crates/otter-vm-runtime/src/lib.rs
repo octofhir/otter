@@ -41,7 +41,9 @@ pub mod next_vm {
         BinaryOp, Expr, LocalId, LoweringError, Program, Statement, compile_module,
     };
     pub use otter_vm::source::{compile_script, compile_test262_basic_script};
-    pub use otter_vm::{Function as VmFunction, Interpreter as VmInterpreter, Module as VmModule};
+    pub use otter_vm::{
+        Function as VmFunction, Interpreter, Interpreter as VmInterpreter, Module as VmModule,
+    };
 }
 
 // Re-export main types

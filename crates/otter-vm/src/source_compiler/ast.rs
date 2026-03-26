@@ -40,6 +40,23 @@ fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Ve
         AstStatement::DoWhileStatement(do_while_statement) => {
             collect_var_names_from_statement(&do_while_statement.body, names);
         }
+        AstStatement::ForStatement(for_statement) => {
+            if let Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration)) =
+                &for_statement.init
+                && declaration.kind == VariableDeclarationKind::Var
+            {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                        && !names
+                            .iter()
+                            .any(|existing| existing == identifier.name.as_str())
+                    {
+                        names.push(identifier.name.to_string());
+                    }
+                }
+            }
+            collect_var_names_from_statement(&for_statement.body, names);
+        }
         AstStatement::ForOfStatement(for_of_statement) => {
             if let ForStatementLeft::VariableDeclaration(declaration) = &for_of_statement.left
                 && declaration.kind == VariableDeclarationKind::Var
@@ -107,6 +124,9 @@ fn collect_function_declarations_from_statement<'a>(
         AstStatement::DoWhileStatement(do_while_statement) => {
             collect_function_declarations_from_statement(&do_while_statement.body, functions);
         }
+        AstStatement::ForStatement(for_statement) => {
+            collect_function_declarations_from_statement(&for_statement.body, functions);
+        }
         AstStatement::ForOfStatement(for_of_statement) => {
             collect_function_declarations_from_statement(&for_of_statement.body, functions);
         }
@@ -149,6 +169,30 @@ pub(super) fn extract_function_params<'a>(
         ));
     }
     Ok(params)
+}
+
+pub(super) fn extract_function_params_from_formal<'a>(
+    params: &'a oxc_ast::ast::FormalParameters<'a>,
+) -> Result<Vec<&'a str>, SourceLoweringError> {
+    let mut result = Vec::new();
+    for param in &params.items {
+        match &param.pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                result.push(identifier.name.as_str());
+            }
+            _ => {
+                return Err(SourceLoweringError::Unsupported(
+                    "non-identifier parameters".to_string(),
+                ));
+            }
+        }
+    }
+    if params.rest.is_some() {
+        return Err(SourceLoweringError::Unsupported(
+            "rest parameters".to_string(),
+        ));
+    }
+    Ok(result)
 }
 
 pub(super) fn non_computed_property_key_name(key: &PropertyKey<'_>) -> Option<String> {

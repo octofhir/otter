@@ -78,8 +78,8 @@ impl<'a> ModuleCompiler<'a> {
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
         compiler.declare_parameters(params)?;
-        if kind == FunctionKind::Script && self.mode == LoweringMode::Test262Basic {
-            compiler.declare_test262_intrinsic_globals()?;
+        if kind == FunctionKind::Script {
+            compiler.declare_intrinsic_globals()?;
         }
         if let Some(self_binding_name) = identity.self_binding_name.as_deref() {
             let closure_register = compiler.declare_function_binding(self_binding_name)?;
@@ -93,6 +93,26 @@ impl<'a> ModuleCompiler<'a> {
         if !terminated {
             compiler.emit_implicit_return()?;
         }
+
+        compiler.finish(function_index, identity.debug_name.as_deref())
+    }
+
+    pub(super) fn compile_function_from_expression(
+        &mut self,
+        function_index: FunctionIndex,
+        identity: FunctionIdentity,
+        expression: &Expression<'_>,
+        params: &[&str],
+        kind: FunctionKind,
+        parent_env: Option<CompileEnv>,
+    ) -> Result<CompiledFunction, SourceLoweringError> {
+        let mut compiler =
+            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
+
+        compiler.declare_parameters(params)?;
+        let value = compiler.compile_expression(expression, self)?;
+        compiler.instructions.push(Instruction::ret(value.register));
+        compiler.release(value);
 
         compiler.finish(function_index, identity.debug_name.as_deref())
     }

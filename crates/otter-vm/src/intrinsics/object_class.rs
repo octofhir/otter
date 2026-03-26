@@ -3,7 +3,7 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
-use crate::object::{HeapValueKind, ObjectHandle};
+use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
@@ -15,6 +15,12 @@ use super::{
 };
 
 pub(super) static OBJECT_INTRINSIC: ObjectIntrinsic = ObjectIntrinsic;
+
+const STRING_DATA_SLOT: &str = "__otter_string_data__";
+const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
+const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
+const OBJECT_IS_PROTOTYPE_OF_ERROR: &str =
+    "Object.prototype.isPrototypeOf requires an object receiver";
 
 pub(super) struct ObjectIntrinsic;
 
@@ -67,6 +73,14 @@ fn object_class_descriptor() -> JsClassDescriptor {
             "Object",
             1,
             object_constructor,
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toString", 0, object_to_string),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("isPrototypeOf", 1, object_is_prototype_of),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -127,6 +141,51 @@ fn object_value_of(
     Ok(*this)
 }
 
+fn object_to_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let tag = object_to_string_tag(*this, runtime)?;
+    let string = runtime.alloc_string(format!("[object {tag}]"));
+    Ok(RegisterValue::from_object_handle(string.0))
+}
+
+fn object_is_prototype_of(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let prototype = this
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal(OBJECT_IS_PROTOTYPE_OF_ERROR.into()))?;
+    let Some(mut candidate) = args
+        .first()
+        .copied()
+        .and_then(|value| value.as_object_handle().map(ObjectHandle))
+    else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+
+    while let Some(current) = runtime
+        .objects()
+        .get_prototype(candidate)
+        .map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("isPrototypeOf prototype lookup failed: {error:?}").into(),
+            )
+        })?
+    {
+        if current == prototype {
+            return Ok(RegisterValue::from_bool(true));
+        }
+        candidate = current;
+    }
+
+    Ok(RegisterValue::from_bool(false))
+}
+
 fn object_create(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -139,4 +198,73 @@ fn object_create(
     };
     let object = runtime.alloc_object_with_prototype(prototype);
     Ok(RegisterValue::from_object_handle(object.0))
+}
+
+fn object_to_string_tag(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<&'static str, VmNativeCallError> {
+    if value == RegisterValue::undefined() {
+        return Ok("Undefined");
+    }
+    if value == RegisterValue::null() {
+        return Ok("Null");
+    }
+    if value.as_bool().is_some() {
+        return Ok("Boolean");
+    }
+    if value.as_number().is_some() {
+        return Ok("Number");
+    }
+
+    let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+        return Ok("Object");
+    };
+
+    if matches!(runtime.objects().kind(handle), Ok(HeapValueKind::String)) {
+        return Ok("String");
+    }
+    if has_own_data_slot(handle, STRING_DATA_SLOT, runtime)? {
+        return Ok("String");
+    }
+    if has_own_data_slot(handle, NUMBER_DATA_SLOT, runtime)? {
+        return Ok("Number");
+    }
+    if has_own_data_slot(handle, BOOLEAN_DATA_SLOT, runtime)? {
+        return Ok("Boolean");
+    }
+
+    match runtime.objects().kind(handle).map_err(|error| {
+        VmNativeCallError::Internal(format!("toString kind lookup failed: {error:?}").into())
+    })? {
+        HeapValueKind::Array => Ok("Array"),
+        HeapValueKind::HostFunction | HeapValueKind::Closure => Ok("Function"),
+        HeapValueKind::Object
+        | HeapValueKind::String
+        | HeapValueKind::UpvalueCell
+        | HeapValueKind::Iterator => Ok("Object"),
+    }
+}
+
+fn has_own_data_slot(
+    handle: ObjectHandle,
+    slot_name: &str,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<bool, VmNativeCallError> {
+    let backing = runtime.intern_property_name(slot_name);
+    let Some(lookup) = runtime
+        .objects()
+        .get_property(handle, backing)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("data slot lookup failed: {error:?}").into())
+        })?
+    else {
+        return Ok(false);
+    };
+
+    if lookup.owner() != handle {
+        return Ok(false);
+    }
+
+    Ok(matches!(lookup.value(), PropertyValue::Data(_)))
 }

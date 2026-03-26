@@ -32,6 +32,7 @@ impl<'a> FunctionCompiler<'a> {
             property_name_ids: BTreeMap::new(),
             string_literals: Vec::new(),
             string_ids: BTreeMap::new(),
+            float_constants: Vec::new(),
             closure_templates: Vec::new(),
             call_sites: Vec::new(),
             exception_handlers: Vec::new(),
@@ -62,7 +63,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    pub(super) fn declare_test262_intrinsic_globals(&mut self) -> Result<(), SourceLoweringError> {
+    pub(super) fn declare_intrinsic_globals(&mut self) -> Result<(), SourceLoweringError> {
         for name in crate::intrinsics::CORE_INTRINSIC_GLOBAL_NAMES {
             self.declare_intrinsic_global_binding(name)?;
         }
@@ -153,6 +154,7 @@ impl<'a> FunctionCompiler<'a> {
             FunctionSideTables::new(
                 PropertyNameTable::new(self.property_names),
                 StringTable::new(self.string_literals),
+                FloatTable::new(self.float_constants),
                 ClosureTable::new(self.closure_templates),
                 CallTable::new(self.call_sites),
             ),
@@ -279,6 +281,9 @@ impl<'a> FunctionCompiler<'a> {
                 self.patch_loop_scope(loop_scope, self.instructions.len(), continue_target)?;
                 Ok(false)
             }
+            AstStatement::ForStatement(for_statement) => {
+                self.compile_for_statement(for_statement, module)
+            }
             AstStatement::ForOfStatement(for_of_statement) => {
                 self.compile_for_of_statement(for_of_statement, module)
             }
@@ -310,11 +315,93 @@ impl<'a> FunctionCompiler<'a> {
                 self.release(value);
                 Ok(true)
             }
+            AstStatement::SwitchStatement(switch) => self.compile_switch_statement(switch, module),
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "statement {:?}",
                 statement
             ))),
         }
+    }
+
+    fn compile_switch_statement(
+        &mut self,
+        switch: &oxc_ast::ast::SwitchStatement<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        let discriminant = self.compile_expression(&switch.discriminant, module)?;
+        let discriminant = self.materialize_value(discriminant);
+
+        // Each case: compare discriminant === test, jump to body if match.
+        // Fall-through between cases is the default JS behavior.
+        let mut case_body_starts: Vec<usize> = Vec::new();
+        let mut case_jumps: Vec<usize> = Vec::new();
+        let mut default_index: Option<usize> = None;
+
+        // Phase 1: emit comparison + conditional jumps for each case.
+        for (i, case) in switch.cases.iter().enumerate() {
+            if case.test.is_none() {
+                default_index = Some(i);
+                case_jumps.push(0); // placeholder, patched later
+                continue;
+            }
+            let test = self.compile_expression(case.test.as_ref().unwrap(), module)?;
+            let cmp_result = ValueLocation::temp(self.alloc_temp());
+            self.instructions.push(Instruction::eq(
+                cmp_result.register,
+                discriminant.register,
+                test.register,
+            ));
+            self.release(test);
+            let jump = self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp_result.register);
+            self.release(cmp_result);
+            case_jumps.push(jump);
+        }
+
+        // Jump to default or end if no case matched.
+        let jump_to_default_or_end = self.emit_jump_placeholder();
+        self.release(discriminant);
+
+        // Push a loop scope so `break` works inside switch.
+        self.loop_stack.push(LoopScope {
+            continue_target: None,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            iterator_register: None,
+        });
+
+        // Phase 2: emit case bodies with fall-through.
+        let mut terminated = false;
+        for (i, case) in switch.cases.iter().enumerate() {
+            let body_start = self.instructions.len();
+            case_body_starts.push(body_start);
+            // Patch the case's conditional jump to this body.
+            if case.test.is_some() {
+                self.patch_jump(case_jumps[i], body_start)?;
+            }
+            terminated = false;
+            for stmt in &case.consequent {
+                if terminated {
+                    break;
+                }
+                terminated = self.compile_statement(stmt, module)?;
+            }
+        }
+
+        // Patch default jump.
+        if let Some(idx) = default_index {
+            self.patch_jump(jump_to_default_or_end, case_body_starts[idx])?;
+        } else {
+            self.patch_jump(jump_to_default_or_end, self.instructions.len())?;
+        }
+
+        // Pop loop scope and patch break jumps.
+        let loop_scope = self.loop_stack.pop().expect("switch scope must exist");
+        let end = self.instructions.len();
+        for jump in loop_scope.break_jumps {
+            self.patch_jump(jump, end)?;
+        }
+
+        Ok(terminated)
     }
 
     pub(super) fn compile_variable_declaration(
@@ -402,6 +489,64 @@ impl<'a> FunctionCompiler<'a> {
         Ok(true)
     }
 
+    fn compile_for_statement(
+        &mut self,
+        for_statement: &oxc_ast::ast::ForStatement<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        if let Some(init) = &for_statement.init {
+            match init {
+                oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) => {
+                    self.compile_variable_declaration(declaration, module)?;
+                }
+                _ => {
+                    let expression = init.to_expression();
+                    let value = self.compile_expression(expression, module)?;
+                    self.release(value);
+                }
+            }
+        }
+
+        let loop_start = self.instructions.len();
+        let exit_jump = if let Some(test) = &for_statement.test {
+            let condition = self.compile_expression(test, module)?;
+            let jump = self.emit_conditional_placeholder(Opcode::JumpIfFalse, condition.register);
+            self.release(condition);
+            Some(jump)
+        } else {
+            None
+        };
+
+        self.loop_stack.push(LoopScope {
+            continue_target: None,
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            iterator_register: None,
+        });
+
+        let _ = self.compile_statement(&for_statement.body, module)?;
+
+        let continue_target = self.instructions.len();
+        if let Some(loop_scope) = self.loop_stack.last_mut() {
+            loop_scope.continue_target = Some(continue_target);
+        }
+
+        if let Some(update) = &for_statement.update {
+            let value = self.compile_expression(update, module)?;
+            self.release(value);
+        }
+
+        self.emit_relative_jump(loop_start)?;
+        let loop_end = self.instructions.len();
+        if let Some(exit_jump) = exit_jump {
+            self.patch_jump(exit_jump, loop_end)?;
+        }
+        let loop_scope = self.loop_stack.pop().expect("loop scope must exist");
+        self.patch_loop_scope(loop_scope, loop_end, continue_target)?;
+
+        Ok(false)
+    }
+
     fn compile_for_of_statement(
         &mut self,
         for_of_statement: &oxc_ast::ast::ForOfStatement<'_>,
@@ -477,11 +622,6 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<(), SourceLoweringError> {
         match left {
             ForStatementLeft::VariableDeclaration(declaration) => {
-                if declaration.kind != VariableDeclarationKind::Var {
-                    return Err(SourceLoweringError::Unsupported(
-                        "for..of lexical declarations".to_string(),
-                    ));
-                }
                 if declaration.declarations.len() != 1 {
                     return Err(SourceLoweringError::Unsupported(
                         "multiple for..of declarators".to_string(),

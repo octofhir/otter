@@ -142,6 +142,7 @@ mod tests {
     use crate::deopt::{DeoptId, DeoptSite, DeoptTable};
     use crate::exception::{ExceptionHandler, ExceptionTable};
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+    use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};
     use crate::property::PropertyNameTable;
@@ -169,6 +170,7 @@ mod tests {
                 FunctionSideTables::new(
                     PropertyNameTable::new(vec!["count"]),
                     StringTable::new(vec!["otter"]),
+                    FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                 ),

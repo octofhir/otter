@@ -1,6 +1,7 @@
 //! Compact immutable bytecode for the new VM.
 
 use crate::closure::UpvalueId;
+use crate::float::FloatId;
 use crate::frame::{FrameLayout, RegisterIndex};
 use crate::property::PropertyNameId;
 use crate::string::StringId;
@@ -96,28 +97,48 @@ pub enum Opcode {
     Mul = 0x13,
     /// Integer-or-number division.
     Div = 0x14,
+    /// Greater-than comparison.
+    Gt = 0x15,
+    /// Greater-than-or-equal comparison.
+    Gte = 0x16,
+    /// Less-than-or-equal comparison.
+    Lte = 0x17,
+    /// Integer-or-number remainder.
+    Mod = 0x18,
+    /// Load a float64 constant from the float table.
+    LoadF64 = 0x19,
     /// Equality comparison.
     Eq = 0x20,
+    /// Abstract equality comparison.
+    LooseEq = 0x21,
     /// Less-than comparison.
-    Lt = 0x21,
+    Lt = 0x22,
     /// Load a named property from an object.
-    GetProperty = 0x22,
+    GetProperty = 0x23,
     /// Store a named property on an object.
-    SetProperty = 0x23,
+    SetProperty = 0x24,
+    /// Delete a named property from an object.
+    DeleteProperty = 0x25,
     /// Load an indexed element from an array or string.
-    GetIndex = 0x24,
+    GetIndex = 0x26,
     /// Store an indexed element on an array.
-    SetIndex = 0x25,
+    SetIndex = 0x27,
     /// Load an upvalue from the current closure context.
-    GetUpvalue = 0x26,
+    GetUpvalue = 0x28,
     /// Store an upvalue on the current closure context.
-    SetUpvalue = 0x27,
+    SetUpvalue = 0x29,
     /// Create an internal iterator for a supported iterable.
-    GetIterator = 0x28,
+    GetIterator = 0x2A,
     /// Advance an internal iterator, producing `done` and `value`.
-    IteratorNext = 0x29,
+    IteratorNext = 0x2B,
     /// Close an internal iterator.
-    IteratorClose = 0x2A,
+    IteratorClose = 0x2C,
+    /// Load a global variable by name (throws if not found).
+    GetGlobal = 0x2D,
+    /// `instanceof` operator (ES spec OrdinaryHasInstance).
+    InstanceOf = 0x2E,
+    /// `in` operator — check if property exists on object.
+    HasProperty = 0x2F,
     /// Unconditional jump.
     Jump = 0x30,
     /// Jump if the condition is truthy.
@@ -160,17 +181,27 @@ impl Opcode {
             0x12 => Some(Self::Sub),
             0x13 => Some(Self::Mul),
             0x14 => Some(Self::Div),
+            0x15 => Some(Self::Gt),
+            0x16 => Some(Self::Gte),
+            0x17 => Some(Self::Lte),
+            0x18 => Some(Self::Mod),
+            0x19 => Some(Self::LoadF64),
             0x20 => Some(Self::Eq),
-            0x21 => Some(Self::Lt),
-            0x22 => Some(Self::GetProperty),
-            0x23 => Some(Self::SetProperty),
-            0x24 => Some(Self::GetIndex),
-            0x25 => Some(Self::SetIndex),
-            0x26 => Some(Self::GetUpvalue),
-            0x27 => Some(Self::SetUpvalue),
-            0x28 => Some(Self::GetIterator),
-            0x29 => Some(Self::IteratorNext),
-            0x2A => Some(Self::IteratorClose),
+            0x21 => Some(Self::LooseEq),
+            0x22 => Some(Self::Lt),
+            0x23 => Some(Self::GetProperty),
+            0x24 => Some(Self::SetProperty),
+            0x25 => Some(Self::DeleteProperty),
+            0x26 => Some(Self::GetIndex),
+            0x27 => Some(Self::SetIndex),
+            0x28 => Some(Self::GetUpvalue),
+            0x29 => Some(Self::SetUpvalue),
+            0x2A => Some(Self::GetIterator),
+            0x2B => Some(Self::IteratorNext),
+            0x2C => Some(Self::IteratorClose),
+            0x2D => Some(Self::GetGlobal),
+            0x2E => Some(Self::InstanceOf),
+            0x2F => Some(Self::HasProperty),
             0x30 => Some(Self::Jump),
             0x31 => Some(Self::JumpIfTrue),
             0x32 => Some(Self::JumpIfFalse),
@@ -388,10 +419,55 @@ impl Instruction {
         Self::encode_abc(Opcode::Div, dst, lhs, rhs)
     }
 
+    /// Encodes a greater-than comparison.
+    #[must_use]
+    pub const fn gt(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Gt, dst, lhs, rhs)
+    }
+
+    /// Encodes a greater-than-or-equal comparison.
+    #[must_use]
+    pub const fn gte(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Gte, dst, lhs, rhs)
+    }
+
+    /// Encodes a less-than-or-equal comparison.
+    #[must_use]
+    pub const fn lte(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Lte, dst, lhs, rhs)
+    }
+
+    /// Encodes a remainder/modulo operation.
+    #[must_use]
+    pub const fn mod_(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Mod, dst, lhs, rhs)
+    }
+
+    /// Encodes a float64 constant load from the float table.
+    #[must_use]
+    pub const fn load_f64(dst: BytecodeRegister, float_id: FloatId) -> Self {
+        Self::encode_abc(
+            Opcode::LoadF64,
+            dst,
+            BytecodeRegister::new(float_id.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// Encodes an equality comparison.
     #[must_use]
     pub const fn eq(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Eq, dst, lhs, rhs)
+    }
+
+    /// Encodes an abstract equality comparison.
+    #[must_use]
+    pub const fn loose_eq(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::LooseEq, dst, lhs, rhs)
     }
 
     /// Encodes a less-than comparison.
@@ -426,6 +502,21 @@ impl Instruction {
             Opcode::SetProperty,
             object,
             src,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Encodes a named property delete.
+    #[must_use]
+    pub const fn delete_property(
+        dst: BytecodeRegister,
+        object: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DeleteProperty,
+            dst,
+            object,
             BytecodeRegister::new(property.0),
         )
     }
@@ -475,6 +566,37 @@ impl Instruction {
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes a global variable load (V8's LdaGlobal equivalent).
+    #[must_use]
+    pub const fn get_global(dst: BytecodeRegister, property: PropertyNameId) -> Self {
+        Self::encode_abc(
+            Opcode::GetGlobal,
+            dst,
+            BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes an `instanceof` check.
+    #[must_use]
+    pub const fn instance_of(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::InstanceOf, dst, lhs, rhs)
+    }
+
+    /// Encodes an `in` operator check.
+    #[must_use]
+    pub const fn has_property(
+        dst: BytecodeRegister,
+        key: BytecodeRegister,
+        object: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::HasProperty, dst, key, object)
     }
 
     /// Encodes an upvalue load.
@@ -691,6 +813,7 @@ impl From<Vec<Instruction>> for Bytecode {
 #[cfg(test)]
 mod tests {
     use crate::closure::UpvalueId;
+    use crate::float::FloatId;
     use crate::frame::FrameLayout;
     use crate::property::PropertyNameId;
     use crate::string::StringId;
@@ -782,6 +905,11 @@ mod tests {
             BytecodeRegister::new(0),
             PropertyNameId(7),
         );
+        let delete = Instruction::delete_property(
+            BytecodeRegister::new(3),
+            BytecodeRegister::new(0),
+            PropertyNameId(7),
+        );
         let set = Instruction::set_property(
             BytecodeRegister::new(0),
             BytecodeRegister::new(1),
@@ -810,6 +938,11 @@ mod tests {
         assert_eq!(get.b(), 0);
         assert_eq!(get.c(), 7);
 
+        assert_eq!(delete.opcode(), Opcode::DeleteProperty);
+        assert_eq!(delete.a(), 3);
+        assert_eq!(delete.b(), 0);
+        assert_eq!(delete.c(), 7);
+
         assert_eq!(set.opcode(), Opcode::SetProperty);
         assert_eq!(set.a(), 0);
         assert_eq!(set.b(), 1);
@@ -837,6 +970,55 @@ mod tests {
         assert_eq!(call_closure.a(), 11);
         assert_eq!(call_closure.b(), 12);
         assert_eq!(call_closure.c(), 13);
+    }
+
+    #[test]
+    fn comparison_and_modulo_instructions_round_trip() {
+        let gt = Instruction::gt(
+            BytecodeRegister::new(5),
+            BytecodeRegister::new(3),
+            BytecodeRegister::new(4),
+        );
+        let gte = Instruction::gte(
+            BytecodeRegister::new(6),
+            BytecodeRegister::new(1),
+            BytecodeRegister::new(2),
+        );
+        let lte = Instruction::lte(
+            BytecodeRegister::new(7),
+            BytecodeRegister::new(8),
+            BytecodeRegister::new(9),
+        );
+        let mod_ = Instruction::mod_(
+            BytecodeRegister::new(10),
+            BytecodeRegister::new(11),
+            BytecodeRegister::new(12),
+        );
+        let load_f64 = Instruction::load_f64(BytecodeRegister::new(13), FloatId(42));
+
+        assert_eq!(gt.opcode(), Opcode::Gt);
+        assert_eq!(gt.a(), 5);
+        assert_eq!(gt.b(), 3);
+        assert_eq!(gt.c(), 4);
+
+        assert_eq!(gte.opcode(), Opcode::Gte);
+        assert_eq!(gte.a(), 6);
+        assert_eq!(gte.b(), 1);
+        assert_eq!(gte.c(), 2);
+
+        assert_eq!(lte.opcode(), Opcode::Lte);
+        assert_eq!(lte.a(), 7);
+        assert_eq!(lte.b(), 8);
+        assert_eq!(lte.c(), 9);
+
+        assert_eq!(mod_.opcode(), Opcode::Mod);
+        assert_eq!(mod_.a(), 10);
+        assert_eq!(mod_.b(), 11);
+        assert_eq!(mod_.c(), 12);
+
+        assert_eq!(load_f64.opcode(), Opcode::LoadF64);
+        assert_eq!(load_f64.a(), 13);
+        assert_eq!(load_f64.b(), 42);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::ast::{
-    extract_function_params, is_test262_assert_same_value_call, non_computed_property_key_name,
+    extract_function_params, extract_function_params_from_formal,
+    is_test262_assert_same_value_call, non_computed_property_key_name,
 };
 use super::module_compiler::{FunctionIdentity, ModuleCompiler};
 use super::shared::{Binding, FunctionCompiler, FunctionKind, ValueLocation};
@@ -47,6 +48,15 @@ impl<'a> FunctionCompiler<'a> {
             Expression::ComputedMemberExpression(member) => {
                 self.compile_computed_member_expression(member, module)
             }
+            Expression::ConditionalExpression(conditional) => {
+                self.compile_conditional_expression(conditional, module)
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.compile_arrow_function_expression(arrow, module)
+            }
+            Expression::TemplateLiteral(template) => {
+                self.compile_template_literal(template, module)
+            }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
                 expression
@@ -58,17 +68,39 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         value: f64,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        if !value.is_finite()
-            || value.fract() != 0.0
-            || value < i32::MIN as f64
-            || value > i32::MAX as f64
-        {
-            return Err(SourceLoweringError::Unsupported(format!(
-                "numeric literal {value}"
-            )));
+        // NaN is handled by a dedicated opcode.
+        if value.is_nan() {
+            let register = self.alloc_temp();
+            self.instructions.push(Instruction::load_nan(register));
+            return Ok(ValueLocation::temp(register));
         }
+        // Integers that fit in i32 use the compact LoadI32 encoding.
+        if value.is_finite()
+            && value.fract() == 0.0
+            && value >= i32::MIN as f64
+            && value <= i32::MAX as f64
+        {
+            return self.load_i32(value as i32);
+        }
+        // General float64 values go through the float constant table.
+        self.load_f64(value)
+    }
 
-        self.load_i32(value as i32)
+    fn load_f64(&mut self, value: f64) -> Result<ValueLocation, SourceLoweringError> {
+        let id = if let Some(pos) = self
+            .float_constants
+            .iter()
+            .position(|v| v.to_bits() == value.to_bits())
+        {
+            FloatId(pos as u16)
+        } else {
+            let id = FloatId(self.float_constants.len() as u16);
+            self.float_constants.push(value);
+            id
+        };
+        let register = self.alloc_temp();
+        self.instructions.push(Instruction::load_f64(register, id));
+        Ok(ValueLocation::temp(register))
     }
 
     fn compile_string_literal(
@@ -89,27 +121,36 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn compile_identifier(&mut self, name: &str) -> Result<ValueLocation, SourceLoweringError> {
-        if name == "undefined" && !self.env.bindings.contains_key(name) {
-            return self.load_undefined();
-        }
-        if self.mode == LoweringMode::Test262Basic
-            && name == "NaN"
-            && !self.env.bindings.contains_key(name)
-        {
-            return self.load_nan();
+        // Global value identifiers — always available, not bindings.
+        if !self.env.bindings.contains_key(name) {
+            match name {
+                "undefined" => return self.load_undefined(),
+                "NaN" => return self.load_nan(),
+                "Infinity" => return self.load_f64(f64::INFINITY),
+                _ => {}
+            }
         }
 
-        match self.resolve_binding(name)? {
-            Binding::Register(register) => Ok(ValueLocation::local(register)),
-            Binding::Function {
+        match self.resolve_binding(name) {
+            Ok(Binding::Register(register)) => Ok(ValueLocation::local(register)),
+            Ok(Binding::Function {
                 closure_register, ..
-            } => Ok(ValueLocation::local(closure_register)),
-            Binding::Upvalue(upvalue) => {
+            }) => Ok(ValueLocation::local(closure_register)),
+            Ok(Binding::Upvalue(upvalue)) => {
                 let register = self.alloc_temp();
                 self.instructions
                     .push(Instruction::get_upvalue(register, upvalue));
                 Ok(ValueLocation::temp(register))
             }
+            Err(SourceLoweringError::UnknownBinding(_)) => {
+                // Undeclared variable → runtime global lookup (V8's LdaGlobal).
+                let property = self.intern_property_name(name)?;
+                let register = self.alloc_temp();
+                self.instructions
+                    .push(Instruction::get_global(register, property));
+                Ok(ValueLocation::temp(register))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -151,10 +192,10 @@ impl<'a> FunctionCompiler<'a> {
                     let current = self.compile_identifier(identifier.name.as_str())?;
                     let current = self.materialize_value(current);
                     let rhs = self.compile_expression(&assignment.right, module)?;
-                    let result = if rhs.is_temp {
-                        rhs
-                    } else if current.is_temp {
+                    let result = if current.is_temp {
                         current
+                    } else if rhs.is_temp {
+                        rhs
                     } else {
                         ValueLocation::temp(self.alloc_temp())
                     };
@@ -194,10 +235,10 @@ impl<'a> FunctionCompiler<'a> {
         let lhs = self.materialize_value(lhs);
         let rhs = self.compile_expression(&binary.right, module)?;
 
-        let result = if rhs.is_temp {
-            rhs
-        } else if lhs.is_temp {
+        let result = if lhs.is_temp {
             lhs
+        } else if rhs.is_temp {
+            rhs
         } else {
             ValueLocation::temp(self.alloc_temp())
         };
@@ -238,14 +279,58 @@ impl<'a> FunctionCompiler<'a> {
                     rhs.register,
                 ));
             }
-            BinaryOperator::Equality | BinaryOperator::StrictEquality => {
+            BinaryOperator::GreaterThan => {
+                self.instructions.push(Instruction::gt(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::GreaterEqualThan => {
+                self.instructions.push(Instruction::gte(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::LessEqualThan => {
+                self.instructions.push(Instruction::lte(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::Remainder => {
+                self.instructions.push(Instruction::mod_(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::Equality => {
+                self.instructions.push(Instruction::loose_eq(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::StrictEquality => {
                 self.instructions.push(Instruction::eq(
                     result.register,
                     lhs.register,
                     rhs.register,
                 ));
             }
-            BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+            BinaryOperator::Inequality => {
+                self.instructions.push(Instruction::loose_eq(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+                self.instructions
+                    .push(Instruction::not(result.register, result.register));
+            }
+            BinaryOperator::StrictInequality => {
                 self.instructions.push(Instruction::eq(
                     result.register,
                     lhs.register,
@@ -253,6 +338,20 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 self.instructions
                     .push(Instruction::not(result.register, result.register));
+            }
+            BinaryOperator::Instanceof => {
+                self.instructions.push(Instruction::instance_of(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::In => {
+                self.instructions.push(Instruction::has_property(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
             }
             _ => {
                 return Err(SourceLoweringError::Unsupported(format!(
@@ -296,11 +395,46 @@ impl<'a> FunctionCompiler<'a> {
             LogicalOperator::Or => {
                 self.emit_conditional_placeholder(Opcode::JumpIfTrue, result.register)
             }
-            _ => {
-                return Err(SourceLoweringError::Unsupported(format!(
-                    "logical operator {:?}",
-                    logical.operator
-                )));
+            LogicalOperator::Coalesce => {
+                // ?? : short-circuit if LHS is not null/undefined.
+                let null_val = self.load_null()?;
+                let cmp = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::eq(
+                    cmp.register,
+                    result.register,
+                    null_val.register,
+                ));
+                self.release(null_val);
+                let jump_if_null =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp.register);
+
+                let undef_val = self.load_undefined()?;
+                self.instructions.push(Instruction::eq(
+                    cmp.register,
+                    result.register,
+                    undef_val.register,
+                ));
+                self.release(undef_val);
+                let jump_if_undef =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp.register);
+                self.release(cmp);
+
+                // Not nullish — skip RHS.
+                let skip_rhs = self.emit_jump_placeholder();
+
+                let rhs_start = self.instructions.len();
+                self.patch_jump(jump_if_null, rhs_start)?;
+                self.patch_jump(jump_if_undef, rhs_start)?;
+
+                let right = self.compile_expression(&logical.right, module)?;
+                if right.register != result.register {
+                    self.instructions
+                        .push(Instruction::move_(result.register, right.register));
+                    self.release(right);
+                }
+
+                self.patch_jump(skip_rhs, self.instructions.len())?;
+                return Ok(result);
             }
         };
 
@@ -362,6 +496,7 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::not(result.register, value.register));
                 Ok(result)
             }
+            UnaryOperator::Delete => self.compile_delete_expression(&unary.argument, module),
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "unary operator {:?}",
                 unary.operator
@@ -784,22 +919,19 @@ impl<'a> FunctionCompiler<'a> {
         function: &Function<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        if function.id.is_some() {
-            return Err(SourceLoweringError::Unsupported(
-                "named function expressions".to_string(),
-            ));
-        }
+        let fn_name = function.id.as_ref().map(|id| id.name.to_string());
 
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
         let compiled = module.compile_function_from_statements(
             reserved,
             FunctionIdentity {
-                debug_name: self
-                    .function_name
-                    .as_ref()
-                    .map(|name| format!("{name}::<anonymous>")),
-                self_binding_name: None,
+                debug_name: fn_name.clone().or_else(|| {
+                    self.function_name
+                        .as_ref()
+                        .map(|name| format!("{name}::<anonymous>"))
+                }),
+                self_binding_name: fn_name,
             },
             function
                 .body
@@ -977,5 +1109,216 @@ impl<'a> FunctionCompiler<'a> {
         }
         self.release(object);
         Ok(())
+    }
+
+    fn compile_delete_expression(
+        &mut self,
+        argument: &Expression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        match argument {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let result = if object.is_temp {
+                    object
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                let property = self.intern_property_name(member.property.name.as_str())?;
+                self.instructions.push(Instruction::delete_property(
+                    result.register,
+                    object.register,
+                    property,
+                ));
+                if result.register != object.register {
+                    self.release(object);
+                }
+                Ok(result)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let Expression::StringLiteral(literal) = &member.expression else {
+                    return Err(SourceLoweringError::Unsupported(
+                        "delete of non-string computed member".to_string(),
+                    ));
+                };
+                let object = self.compile_expression(&member.object, module)?;
+                let result = if object.is_temp {
+                    object
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                let property = self.intern_property_name(literal.value.as_str())?;
+                self.instructions.push(Instruction::delete_property(
+                    result.register,
+                    object.register,
+                    property,
+                ));
+                if result.register != object.register {
+                    self.release(object);
+                }
+                Ok(result)
+            }
+            _ => Err(SourceLoweringError::Unsupported(
+                "delete target".to_string(),
+            )),
+        }
+    }
+
+    fn compile_arrow_function_expression(
+        &mut self,
+        arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let reserved = module.reserve_function();
+        let params = extract_function_params_from_formal(&arrow.params)?;
+
+        let compiled = if arrow.expression {
+            let body_statements = &arrow.body.statements;
+            let expression = match body_statements.first() {
+                Some(AstStatement::ExpressionStatement(expr_stmt)) => &expr_stmt.expression,
+                _ => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "arrow expression body without expression statement".to_string(),
+                    ));
+                }
+            };
+            module.compile_function_from_expression(
+                reserved,
+                FunctionIdentity {
+                    debug_name: self
+                        .function_name
+                        .as_ref()
+                        .map(|name| format!("{name}::<arrow>")),
+                    self_binding_name: None,
+                },
+                expression,
+                &params,
+                FunctionKind::Ordinary,
+                Some(self.env.clone()),
+            )?
+        } else {
+            module.compile_function_from_statements(
+                reserved,
+                FunctionIdentity {
+                    debug_name: self
+                        .function_name
+                        .as_ref()
+                        .map(|name| format!("{name}::<arrow>")),
+                    self_binding_name: None,
+                },
+                &arrow.body.statements,
+                &params,
+                FunctionKind::Ordinary,
+                Some(self.env.clone()),
+            )?
+        };
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    fn compile_conditional_expression(
+        &mut self,
+        conditional: &oxc_ast::ast::ConditionalExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let test = self.compile_expression(&conditional.test, module)?;
+        let jump_to_alternate =
+            self.emit_conditional_placeholder(Opcode::JumpIfFalse, test.register);
+        self.release(test);
+
+        let consequent = self.compile_expression(&conditional.consequent, module)?;
+        let result = if consequent.is_temp {
+            consequent
+        } else {
+            let result = ValueLocation::temp(self.alloc_temp());
+            self.instructions
+                .push(Instruction::move_(result.register, consequent.register));
+            self.release(consequent);
+            result
+        };
+        let jump_to_end = self.emit_jump_placeholder();
+
+        self.patch_jump(jump_to_alternate, self.instructions.len())?;
+
+        let alternate = self.compile_expression(&conditional.alternate, module)?;
+        self.instructions
+            .push(Instruction::move_(result.register, alternate.register));
+        if alternate.register != result.register {
+            self.release(alternate);
+        }
+
+        self.patch_jump(jump_to_end, self.instructions.len())?;
+
+        Ok(result)
+    }
+
+    /// Template literal: `` `prefix${expr}mid${expr}suffix` ``
+    /// Compiles to a chain of string concatenations via Add.
+    fn compile_template_literal(
+        &mut self,
+        template: &oxc_ast::ast::TemplateLiteral<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // quasis[0] expr[0] quasis[1] expr[1] ... quasis[N]
+        // quasis always has one more element than expressions.
+        let first_quasi = &template.quasis[0];
+        let cooked = first_quasi
+            .value
+            .cooked
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let mut result = self.compile_string_literal(cooked)?;
+
+        for (i, expression) in template.expressions.iter().enumerate() {
+            let expr_val = self.compile_expression(expression, module)?;
+            let dst = if result.is_temp {
+                result
+            } else {
+                ValueLocation::temp(self.alloc_temp())
+            };
+            self.instructions.push(Instruction::add(
+                dst.register,
+                result.register,
+                expr_val.register,
+            ));
+            if dst.register != result.register {
+                self.release(result);
+            }
+            self.release(expr_val);
+            result = dst;
+
+            // Append the next quasi (string part after the expression).
+            let quasi = &template.quasis[i + 1];
+            let quasi_str = quasi
+                .value
+                .cooked
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if !quasi_str.is_empty() {
+                let str_val = self.compile_string_literal(quasi_str)?;
+                let dst = if result.is_temp {
+                    result
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                self.instructions.push(Instruction::add(
+                    dst.register,
+                    result.register,
+                    str_val.register,
+                ));
+                if dst.register != result.register {
+                    self.release(result);
+                }
+                self.release(str_val);
+                result = dst;
+            }
+        }
+
+        Ok(result)
     }
 }

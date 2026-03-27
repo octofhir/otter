@@ -867,14 +867,17 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<(ValueLocation, Option<ValueLocation>), SourceLoweringError> {
         match callee {
             Expression::Identifier(identifier) => {
-                match self.resolve_binding(identifier.name.as_str())? {
-                    Binding::Function {
+                match self.resolve_binding(identifier.name.as_str()) {
+                    Ok(Binding::Function {
                         closure_register, ..
-                    } => Ok((ValueLocation::local(closure_register), None)),
-                    _ => {
+                    }) => Ok((ValueLocation::local(closure_register), None)),
+                    Ok(_) | Err(SourceLoweringError::UnknownBinding(_)) => {
+                        // Known non-function binding or undeclared global →
+                        // compile as expression (which handles GetGlobal).
                         let callee = self.compile_expression(callee, module)?;
                         Ok((self.materialize_value(callee), None))
                     }
+                    Err(e) => Err(e),
                 }
             }
             Expression::StaticMemberExpression(member) => {

@@ -9,6 +9,10 @@
 
 /// Shared execution ABI.
 pub mod abi;
+/// Suspended async function context for await support.
+pub mod async_context;
+/// Console API with pluggable backend.
+pub mod console;
 /// Engine/runtime integration boundary.
 pub mod bridge;
 /// Builder-side adapters for descriptor-driven bootstrap.
@@ -23,6 +27,10 @@ pub mod closure;
 pub mod deopt;
 /// Descriptor layer shared by proc-macros and future builders.
 pub mod descriptors;
+/// Default tokio-powered event loop and timer registry.
+pub mod event_loop;
+/// Event loop host trait for async runtime abstraction.
+pub mod event_loop_host;
 /// Exception table metadata.
 pub mod exception;
 /// Feedback and profiling side-table layout.
@@ -41,12 +49,16 @@ pub mod intrinsics;
 pub mod jit_abi;
 /// Tiny lowering bridge from structured subset to bytecode/module form.
 pub mod lowering;
+/// VM-internal microtask queue (promise jobs, nextTick, queueMicrotask).
+pub mod microtask;
 /// Executable module and function containers.
 pub mod module;
 /// Minimal object heap for the new VM.
 pub mod object;
 /// Native payload storage and tracing contracts for JS-visible host objects.
 pub mod payload;
+/// Promise intrinsic — ES2024 §27.2 implementation.
+pub mod promise;
 /// Property side tables for named access.
 pub mod property;
 /// Small smoke harness for iterative validation.

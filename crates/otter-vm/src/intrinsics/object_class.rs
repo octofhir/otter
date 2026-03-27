@@ -242,7 +242,8 @@ fn object_to_string_tag(
         HeapValueKind::Object
         | HeapValueKind::String
         | HeapValueKind::UpvalueCell
-        | HeapValueKind::Iterator => Ok("Object"),
+        | HeapValueKind::Iterator
+        | HeapValueKind::Promise => Ok("Object"),
     }
 }
 

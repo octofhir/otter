@@ -1,0 +1,16 @@
+[package]
+name = "otter-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Public API and execution runtime for the Otter JS engine"
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+otter-vm = { path = "../otter-vm" }

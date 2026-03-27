@@ -117,6 +117,8 @@ pub enum HeapValueKind {
     UpvalueCell,
     /// Internal iterator used by the new VM iteration lowering.
     Iterator,
+    /// ES2024 Promise object.
+    Promise,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,6 +224,9 @@ enum HeapValue {
         key_handles: Vec<ObjectHandle>,
         next_index: usize,
     },
+    Promise {
+        promise: crate::promise::JsPromise,
+    },
 }
 
 /// Visit an ObjectHandle as a GcHandle for tracing.
@@ -299,6 +304,9 @@ impl Traceable for HeapValue {
                 for h in key_handles {
                     trace_handle(*h, visitor);
                 }
+            }
+            HeapValue::Promise { promise } => {
+                promise.trace_handles(visitor);
             }
         }
     }
@@ -429,6 +437,30 @@ impl ObjectHeap {
         ObjectHandle(h.0)
     }
 
+    /// Allocates a new pending promise.
+    pub fn alloc_promise(&mut self) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Promise {
+            promise: crate::promise::JsPromise::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Reads a reference to a JsPromise stored in the heap.
+    pub fn get_promise(&self, handle: ObjectHandle) -> Option<&crate::promise::JsPromise> {
+        match self.object(handle).ok()? {
+            HeapValue::Promise { promise } => Some(promise),
+            _ => None,
+        }
+    }
+
+    /// Reads a mutable reference to a JsPromise.
+    pub fn get_promise_mut(&mut self, handle: ObjectHandle) -> Option<&mut crate::promise::JsPromise> {
+        match self.object_mut(handle).ok()? {
+            HeapValue::Promise { promise } => Some(promise),
+            _ => None,
+        }
+    }
+
     /// Returns the heap-value kind for the given handle.
     pub fn kind(&self, handle: ObjectHandle) -> Result<HeapValueKind, ObjectError> {
         match self.object(handle)? {
@@ -442,6 +474,7 @@ impl ObjectHeap {
             HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. } => Ok(HeapValueKind::Iterator),
+            HeapValue::Promise { .. } => Ok(HeapValueKind::Promise),
         }
     }
 
@@ -457,7 +490,8 @@ impl ObjectHeap {
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -514,7 +548,8 @@ impl ObjectHeap {
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -531,7 +566,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Ok(None),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -592,7 +628,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -619,7 +656,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -819,7 +857,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Ok(None),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Ok(None),
         }
     }
 
@@ -835,7 +874,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Ok(None),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Ok(None),
         }
     }
 
@@ -851,7 +891,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Ok(None),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Ok(None),
         }
     }
 
@@ -885,7 +926,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Ok(None),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Ok(None),
         }
     }
 
@@ -1098,7 +1140,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => {
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -1174,7 +1217,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         };
 
         let Some(slot_index) = slot_index.map(usize::from) else {
@@ -1279,7 +1323,8 @@ impl ObjectHeap {
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -1412,7 +1457,8 @@ impl ObjectHeap {
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -1436,7 +1482,8 @@ impl ObjectHeap {
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
 }

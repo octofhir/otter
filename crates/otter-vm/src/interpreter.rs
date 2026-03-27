@@ -361,11 +361,19 @@ impl Activation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum StepOutcome {
     Continue,
     Return(RegisterValue),
     Throw(RegisterValue),
+    /// The interpreter should suspend at an `await` on a pending promise.
+    /// The caller captures the frame state and enqueues a resume job.
+    Suspend {
+        /// The promise being awaited.
+        awaited_promise: ObjectHandle,
+        /// The register where the await result should be written on resume.
+        resume_register: crate::frame::RegisterIndex,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -381,6 +389,9 @@ pub struct RuntimeState {
     property_names: PropertyNameRegistry,
     native_functions: NativeFunctionRegistry,
     native_payloads: NativePayloadRegistry,
+    microtasks: crate::microtask::MicrotaskQueue,
+    timers: crate::event_loop::TimerRegistry,
+    console_backend: Box<dyn crate::console::ConsoleBackend>,
 }
 
 impl RuntimeState {
@@ -407,6 +418,9 @@ impl RuntimeState {
             property_names,
             native_functions,
             native_payloads: NativePayloadRegistry::new(),
+            microtasks: crate::microtask::MicrotaskQueue::new(),
+            timers: crate::event_loop::TimerRegistry::new(),
+            console_backend: Box::new(crate::console::StdioConsoleBackend),
         }
     }
 
@@ -490,6 +504,63 @@ impl RuntimeState {
         descriptor: crate::descriptors::NativeFunctionDescriptor,
     ) -> HostFunctionId {
         self.native_functions.register(descriptor)
+    }
+
+    /// Returns the microtask queue.
+    #[must_use]
+    pub fn microtasks(&self) -> &crate::microtask::MicrotaskQueue {
+        &self.microtasks
+    }
+
+    /// Returns the mutable microtask queue.
+    pub fn microtasks_mut(&mut self) -> &mut crate::microtask::MicrotaskQueue {
+        &mut self.microtasks
+    }
+
+    /// Returns the console backend.
+    pub fn console(&self) -> &dyn crate::console::ConsoleBackend {
+        self.console_backend.as_ref()
+    }
+
+    /// Replaces the console backend. Used by embedders to route output.
+    pub fn set_console_backend(&mut self, backend: Box<dyn crate::console::ConsoleBackend>) {
+        self.console_backend = backend;
+    }
+
+    /// Returns the timer registry.
+    #[must_use]
+    pub fn timers(&self) -> &crate::event_loop::TimerRegistry {
+        &self.timers
+    }
+
+    /// Returns the mutable timer registry.
+    pub fn timers_mut(&mut self) -> &mut crate::event_loop::TimerRegistry {
+        &mut self.timers
+    }
+
+    /// Schedules a one-shot timer (setTimeout).
+    pub fn schedule_timeout(
+        &mut self,
+        callback: ObjectHandle,
+        delay: std::time::Duration,
+    ) -> crate::event_loop_host::TimerId {
+        self.timers
+            .set_timeout(callback, RegisterValue::undefined(), delay)
+    }
+
+    /// Schedules a repeating timer (setInterval).
+    pub fn schedule_interval(
+        &mut self,
+        callback: ObjectHandle,
+        interval: std::time::Duration,
+    ) -> crate::event_loop_host::TimerId {
+        self.timers
+            .set_interval(callback, RegisterValue::undefined(), interval)
+    }
+
+    /// Cancels a timer.
+    pub fn clear_timer(&mut self, id: crate::event_loop_host::TimerId) {
+        self.timers.clear(id);
     }
 
     /// GC safepoint — called at loop back-edges and function call boundaries.
@@ -1241,7 +1312,8 @@ impl RuntimeState {
                 HeapValueKind::Object
                 | HeapValueKind::Array
                 | HeapValueKind::UpvalueCell
-                | HeapValueKind::Iterator => "object",
+                | HeapValueKind::Iterator
+                | HeapValueKind::Promise => "object",
             }
         } else {
             "undefined"
@@ -1372,16 +1444,87 @@ impl Interpreter {
         activation
     }
 
-    /// Executes a module from its entry function.
+    /// Executes a module from its entry function with a fresh runtime.
     pub fn execute(&self, module: &Module) -> Result<ExecutionResult, InterpreterError> {
-        let mut activation = Self::prepare_entry(module);
         let mut runtime = RuntimeState::new();
+        self.execute_module(module, &mut runtime)
+    }
+
+    /// Executes a module using an existing runtime state.
+    /// Used by the event loop driver and embedders.
+    pub fn execute_module(
+        &self,
+        module: &Module,
+        runtime: &mut RuntimeState,
+    ) -> Result<ExecutionResult, InterpreterError> {
+        let mut activation = Self::prepare_entry(module);
         let function = module.entry_function();
         if function.frame_layout().receiver_slot().is_some() {
             let global = runtime.intrinsics().global_object();
             activation.set_receiver(function, RegisterValue::from_object_handle(global.0))?;
         }
-        self.run_with_runtime(module, &mut activation, &mut runtime)
+        self.run_with_runtime(module, &mut activation, runtime)
+    }
+
+    /// Calls a JS function (host function or closure) by ObjectHandle.
+    ///
+    /// This is the entry point for the event loop to invoke timer callbacks,
+    /// promise reaction handlers, and microtask callbacks. It handles both
+    /// native host functions and compiled closures.
+    pub fn call_function(
+        runtime: &mut RuntimeState,
+        module: &Module,
+        callable: ObjectHandle,
+        this_value: RegisterValue,
+        arguments: &[RegisterValue],
+    ) -> Result<RegisterValue, InterpreterError> {
+        let kind = runtime.objects.kind(callable)?;
+        match kind {
+            HeapValueKind::HostFunction => {
+                match Self::invoke_host_function_handle(runtime, callable, this_value, arguments)? {
+                    Completion::Return(value) => Ok(value),
+                    Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
+                }
+            }
+            HeapValueKind::Closure => {
+                let callee_index = runtime
+                    .objects
+                    .closure_callee(callable)?;
+                let callee_function = module
+                    .function(callee_index)
+                    .ok_or(InterpreterError::InvalidCallTarget)?;
+                let register_count = callee_function.frame_layout().register_count();
+                // Pass the closure handle so the activation can access upvalues.
+                let mut activation = Activation::with_context(
+                    callee_index,
+                    register_count,
+                    FrameMetadata::default(),
+                    Some(callable),
+                );
+
+                // Set up receiver.
+                if callee_function.frame_layout().receiver_slot().is_some() {
+                    activation.set_receiver(callee_function, this_value)?;
+                }
+
+                // Copy arguments into parameter slots.
+                let param_count = callee_function.frame_layout().parameter_count();
+                for (i, &arg) in arguments.iter().take(param_count as usize).enumerate() {
+                    let abs = callee_function
+                        .frame_layout()
+                        .resolve_user_visible(i as u16)
+                        .ok_or(InterpreterError::RegisterOutOfBounds)?;
+                    activation.set_register(abs, arg)?;
+                }
+
+                let interpreter = Interpreter::new();
+                let result = interpreter.run_with_runtime(module, &mut activation, runtime)?;
+                Ok(result.return_value())
+            }
+            _ => Err(InterpreterError::TypeError(
+                format!("{kind:?} is not a function").into(),
+            )),
+        }
     }
 
     /// Runs an existing activation until it returns or traps.
@@ -1476,6 +1619,12 @@ impl Interpreter {
                 StepOutcome::Throw(value) => {
                     return Err(InterpreterError::UncaughtThrow(value));
                 }
+                StepOutcome::Suspend { .. } => {
+                    // Suspension not supported in feedback-collection mode.
+                    return Err(InterpreterError::TypeError(
+                        "await is not supported in this execution mode".into(),
+                    ));
+                }
             }
         }
     }
@@ -1514,6 +1663,13 @@ impl Interpreter {
                         continue;
                     }
                     return Ok(Completion::Throw(value));
+                }
+                StepOutcome::Suspend { .. } => {
+                    // TODO: Capture SuspendedFrame and return to event loop.
+                    // For now, async functions are not fully wired — treat as
+                    // returning undefined (the result_promise will be settled
+                    // when the event loop integrates suspend/resume).
+                    return Ok(Completion::Return(RegisterValue::undefined()));
                 }
             }
         }
@@ -2365,6 +2521,51 @@ impl Interpreter {
             Opcode::Throw => {
                 let value = activation.read_bytecode_register(function, instruction.a())?;
                 Ok(StepOutcome::Throw(value))
+            }
+            Opcode::Await => {
+                let dst_reg = instruction.a();
+                let src_reg = instruction.b();
+                let value = activation.read_bytecode_register(function, src_reg)?;
+
+                // Check if the value is an already-settled promise.
+                // If it's an object handle, look it up as a JsPromise.
+                if let Some(handle_id) = value.as_object_handle() {
+                    let handle = ObjectHandle(handle_id);
+                    // Try to read as JsPromise from the typed heap.
+                    if let Some(promise) = runtime.objects().get_promise(handle) {
+                        match &promise.state {
+                            crate::promise::PromiseState::Fulfilled(result) => {
+                                // Already fulfilled — write result, continue.
+                                let result = *result;
+                                let abs = activation.resolve_bytecode_register(function, dst_reg)?;
+                                activation.set_register(abs, result)?;
+                                activation.advance();
+                                return Ok(StepOutcome::Continue);
+                            }
+                            crate::promise::PromiseState::Rejected(reason) => {
+                                // Already rejected — throw the reason.
+                                let reason = *reason;
+                                activation.advance();
+                                return Ok(StepOutcome::Throw(reason));
+                            }
+                            crate::promise::PromiseState::Pending => {
+                                // Pending — suspend.
+                                let abs = activation.resolve_bytecode_register(function, dst_reg)?;
+                                activation.advance();
+                                return Ok(StepOutcome::Suspend {
+                                    awaited_promise: handle,
+                                    resume_register: abs,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Not a promise — treat as immediately fulfilled with the value itself.
+                let abs = activation.resolve_bytecode_register(function, dst_reg)?;
+                activation.set_register(abs, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
             }
         }
     }

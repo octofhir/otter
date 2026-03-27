@@ -587,7 +587,6 @@ impl Test262Runner {
             .timeout_watchdog
             .arm(std::time::Duration::from_millis(100), flag);
 
-        // Execute directly — no need for the heavy Otter engine.
         let result = interpreter
             .execute(&module)
             .map_err(|e| OtterError::Runtime(e.to_string()));

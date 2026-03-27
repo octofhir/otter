@@ -1913,10 +1913,12 @@ impl Otter {
     }
 
     fn execute_next_source(&self, code: &str, source_url: &str) -> Result<Value, OtterError> {
-        let module = otter_vm::source::compile_script(code, source_url)
-            .map_err(|error| OtterError::Compile(error.to_string()))?;
-        let result = self.execute_next_module(&module)?;
-        Self::next_register_value_to_value(result)
+        let mut rt = otter_runtime::OtterRuntime::builder().build();
+        let result = rt.run_script(code, source_url).map_err(|e| match e {
+            otter_runtime::RunError::Compile(msg) => OtterError::Compile(msg),
+            otter_runtime::RunError::Runtime(msg) => OtterError::Runtime(msg),
+        })?;
+        Self::next_register_value_to_value(result.return_value())
     }
 
     fn next_register_value_to_value(value: otter_vm::RegisterValue) -> Result<Value, OtterError> {

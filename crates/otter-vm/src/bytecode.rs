@@ -171,6 +171,9 @@ pub enum Opcode {
     CallClosure = 0x42,
     /// Throw the value stored in a register.
     Throw = 0x43,
+    /// Await a value (async functions). `dst = await src`.
+    /// If the awaited promise is pending, the interpreter suspends.
+    Await = 0x44,
 }
 
 impl Opcode {
@@ -236,6 +239,7 @@ impl Opcode {
             0x41 => Some(Self::CallDirect),
             0x42 => Some(Self::CallClosure),
             0x43 => Some(Self::Throw),
+            0x44 => Some(Self::Await),
             _ => None,
         }
     }
@@ -782,6 +786,12 @@ impl Instruction {
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// Encodes an await instruction: `dst = await src`.
+    #[must_use]
+    pub const fn r#await(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Await, dst, src, BytecodeRegister::new(0))
     }
 
     /// Returns the decoded opcode.

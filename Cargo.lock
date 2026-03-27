@@ -2358,6 +2358,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-runtime"
+version = "0.1.0"
+dependencies = [
+ "otter-vm",
+]
+
+[[package]]
 name = "otter-sql"
 version = "0.1.0"
 dependencies = [
@@ -2419,6 +2426,7 @@ dependencies = [
  "oxc_ast",
  "oxc_parser",
  "oxc_span",
+ "tokio",
 ]
 
 [[package]]
@@ -2501,6 +2509,7 @@ dependencies = [
  "dunce",
  "otter-macros",
  "otter-profiler",
+ "otter-runtime",
  "otter-vm",
  "otter-vm-bytecode",
  "otter-vm-compiler",

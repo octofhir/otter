@@ -14,6 +14,7 @@ doctest = false
 profiling = ["dep:otter-profiler", "otter-vm-core/profiling"]
 
 [dependencies]
+otter-runtime = { path = "../otter-runtime" }
 otter-vm = { path = "../otter-vm" }
 otter-vm-core = { path = "../otter-vm-core" }
 otter-vm-gc = { path = "../otter-vm-gc" }

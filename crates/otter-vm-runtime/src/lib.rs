@@ -36,6 +36,7 @@ pub mod worker_ext;
 
 /// Re-exports for the new `otter-vm` backend integration surface.
 pub mod next_vm {
+    pub use otter_runtime::{OtterRuntime, RunError};
     pub use otter_vm::RegisterValue;
     pub use otter_vm::lowering::{
         BinaryOp, Expr, LocalId, LoweringError, Program, Statement, compile_module,

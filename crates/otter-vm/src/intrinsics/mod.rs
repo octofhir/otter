@@ -13,11 +13,14 @@ mod install;
 mod math;
 mod number_class;
 mod object_class;
+mod promise_class;
 mod reflect;
 mod string_class;
+pub(crate) mod timer_globals;
 
 use crate::host::NativeFunctionRegistry;
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap};
+use crate::value::RegisterValue;
 use crate::property::PropertyNameRegistry;
 use install::{IntrinsicInstallContext, IntrinsicInstaller};
 
@@ -173,6 +176,9 @@ pub struct VmIntrinsics {
     pub(crate) range_error_constructor: ObjectHandle,
     pub(crate) syntax_error_prototype: ObjectHandle,
     pub(crate) syntax_error_constructor: ObjectHandle,
+    // Promise
+    pub(crate) promise_constructor: ObjectHandle,
+    pub(crate) promise_prototype: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -201,6 +207,8 @@ impl VmIntrinsics {
         let range_error_constructor = heap.alloc_object();
         let syntax_error_prototype = heap.alloc_object();
         let syntax_error_constructor = heap.alloc_object();
+        let promise_constructor = heap.alloc_object();
+        let promise_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -236,6 +244,8 @@ impl VmIntrinsics {
             range_error_constructor,
             syntax_error_prototype,
             syntax_error_constructor,
+            promise_constructor,
+            promise_prototype,
         }
     }
 
@@ -272,6 +282,9 @@ impl VmIntrinsics {
         heap.set_prototype(self.range_error_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.syntax_error_prototype, Some(self.error_prototype))?;
         heap.set_prototype(self.syntax_error_constructor, Some(self.function_prototype))?;
+        // Promise: constructor → Function.prototype, prototype → Object.prototype
+        heap.set_prototype(self.promise_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.promise_prototype, Some(self.object_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -310,6 +323,42 @@ impl VmIntrinsics {
         let mut cx = IntrinsicInstallContext::new(heap, property_names, native_functions);
         for installer in core_installers() {
             installer.install_on_global(self, &mut cx)?;
+        }
+
+        // Install console object with log/warn/error/info/debug methods.
+        {
+            let console_obj = cx.alloc_intrinsic_object(Some(self.object_prototype))?;
+            for binding in crate::console::console_bindings() {
+                let function_desc = binding.function().clone();
+                let host_fn = cx.native_functions.register(function_desc.clone());
+                let handle =
+                    cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
+                let prop = cx.property_names.intern(function_desc.js_name());
+                cx.heap.set_property(
+                    console_obj,
+                    prop,
+                    RegisterValue::from_object_handle(handle.0),
+                )?;
+            }
+            let console_prop = cx.property_names.intern("console");
+            cx.heap.set_property(
+                self.global_object,
+                console_prop,
+                RegisterValue::from_object_handle(console_obj.0),
+            )?;
+        }
+
+        // Install timer/microtask globals (setTimeout, setInterval, etc.)
+        for binding in timer_globals::timer_global_bindings() {
+            let function_desc = binding.function().clone();
+            let host_fn = cx.native_functions.register(function_desc.clone());
+            let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
+            let prop = cx.property_names.intern(function_desc.js_name());
+            cx.heap.set_property(
+                self.global_object,
+                prop,
+                RegisterValue::from_object_handle(handle.0),
+            )?;
         }
 
         self.stage = IntrinsicsStage::Installed;
@@ -400,6 +449,18 @@ impl VmIntrinsics {
         self.boolean_prototype
     }
 
+    /// Returns `%Promise%`.
+    #[must_use]
+    pub const fn promise_constructor(&self) -> ObjectHandle {
+        self.promise_constructor
+    }
+
+    /// Returns `%Promise.prototype%`.
+    #[must_use]
+    pub const fn promise_prototype(&self) -> ObjectHandle {
+        self.promise_prototype
+    }
+
     /// Registers an additional namespace root owned by the intrinsic registry.
     pub fn register_namespace_root(&mut self, handle: ObjectHandle) {
         self.namespace_roots.push(handle);
@@ -462,6 +523,8 @@ impl VmIntrinsics {
             self.range_error_constructor,
             self.syntax_error_prototype,
             self.syntax_error_constructor,
+            self.promise_constructor,
+            self.promise_prototype,
         ]);
         if let Some(h) = self.math_namespace { roots.push(h); }
         if let Some(h) = self.reflect_namespace { roots.push(h); }
@@ -499,7 +562,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 9] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 10] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
@@ -508,6 +571,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 9] {
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
         &number_class::NUMBER_INTRINSIC as &dyn IntrinsicInstaller,
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &promise_class::PROMISE_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
     ]
@@ -580,7 +644,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 30);
+        assert_eq!(native_functions.len(), 46);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

@@ -3,6 +3,7 @@
 use crate::bytecode::ProgramCounter;
 use crate::frame::RegisterIndex;
 use crate::module::FunctionIndex;
+use crate::object::ClosureFlags;
 
 /// Stable upvalue identifier inside a closure object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,6 +14,7 @@ pub struct UpvalueId(pub u16);
 pub struct ClosureTemplate {
     callee: FunctionIndex,
     capture_count: RegisterIndex,
+    flags: ClosureFlags,
 }
 
 impl ClosureTemplate {
@@ -22,6 +24,21 @@ impl ClosureTemplate {
         Self {
             callee,
             capture_count,
+            flags: ClosureFlags::normal(),
+        }
+    }
+
+    /// Creates metadata for one closure-creation site with explicit flags.
+    #[must_use]
+    pub const fn with_flags(
+        callee: FunctionIndex,
+        capture_count: RegisterIndex,
+        flags: ClosureFlags,
+    ) -> Self {
+        Self {
+            callee,
+            capture_count,
+            flags,
         }
     }
 
@@ -35,6 +52,12 @@ impl ClosureTemplate {
     #[must_use]
     pub const fn capture_count(self) -> RegisterIndex {
         self.capture_count
+    }
+
+    /// Returns the closure function kind flags.
+    #[must_use]
+    pub const fn flags(self) -> ClosureFlags {
+        self.flags
     }
 }
 

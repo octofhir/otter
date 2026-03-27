@@ -41,6 +41,7 @@ impl<'a> FunctionCompiler<'a> {
             finally_stack: Vec::new(),
             loop_stack: Vec::new(),
             pending_loop_label: None,
+            arguments_local: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -539,6 +540,35 @@ impl<'a> FunctionCompiler<'a> {
         callee: FunctionIndex,
         explicit_captures: &[CaptureSource],
     ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::normal(),
+        )
+    }
+
+    pub(super) fn emit_new_closure_arrow(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::arrow(),
+        )
+    }
+
+    fn emit_new_closure_with_flags(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+        closure_flags: crate::object::ClosureFlags,
+    ) -> Result<(), SourceLoweringError> {
         let captures = if explicit_captures.is_empty() {
             self.captures.clone()
         } else {
@@ -572,7 +602,10 @@ impl<'a> FunctionCompiler<'a> {
         let pc = self.instructions.len();
         self.instructions
             .push(Instruction::new_closure(destination, capture_start));
-        self.record_closure_template(pc, ClosureTemplate::new(callee, capture_count));
+        self.record_closure_template(
+            pc,
+            ClosureTemplate::with_flags(callee, capture_count, closure_flags),
+        );
 
         if capture_count != 0 {
             self.release_temp_window(capture_count);
@@ -710,6 +743,24 @@ impl<'a> FunctionCompiler<'a> {
                 .bindings
                 .insert(name.to_string(), Binding::Upvalue(upvalue));
             return Ok(Binding::Upvalue(upvalue));
+        }
+
+        // ES2024 §10.4.4: `arguments` is implicitly available in non-arrow functions.
+        // Lazily allocate a local and emit CreateArguments on first access.
+        if name == "arguments" && self.kind != FunctionKind::Arrow {
+            let register = if let Some(reg) = self.arguments_local {
+                reg
+            } else {
+                let reg = self.allocate_local()?;
+                self.instructions
+                    .push(Instruction::create_arguments(reg));
+                self.arguments_local = Some(reg);
+                self.env
+                    .bindings
+                    .insert("arguments".to_string(), Binding::Register(reg));
+                reg
+            };
+            return Ok(Binding::Register(register));
         }
 
         Err(SourceLoweringError::UnknownBinding(name.to_string()))

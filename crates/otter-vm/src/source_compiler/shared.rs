@@ -120,5 +120,8 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) finally_stack: Vec<FinallyScope>,
     pub(super) loop_stack: Vec<LoopScope>,
     pub(super) pending_loop_label: Option<String>,
+    /// ES2024 §10.4.4: Lazily allocated local for `arguments` object.
+    /// `None` if `arguments` hasn't been referenced in this function body.
+    pub(super) arguments_local: Option<crate::bytecode::BytecodeRegister>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

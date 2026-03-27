@@ -361,4 +361,182 @@ mod tests {
             .expect("should run");
         assert_eq!(capture.text(), "42");
     }
+
+    #[test]
+    fn function_prototype_call_exists() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script("console.log(typeof Function.prototype.call)", "test.js")
+            .expect("should run");
+        assert_eq!(capture.text(), "function");
+    }
+
+    #[test]
+    fn function_prototype_bind_exists() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script("console.log(typeof Function.prototype.call.bind)", "test.js")
+            .expect("should run");
+        assert_eq!(capture.text(), "function");
+    }
+
+    #[test]
+    fn bound_function_is_callable() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "var bound = Function.prototype.call.bind(Array.prototype.join); console.log(typeof bound)",
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "function");
+    }
+
+    #[test]
+    fn bound_function_invocation() {
+        let (mut rt, capture) = rt_with_capture();
+        // First test: direct join works.
+        rt.run_script(
+            "var arr = [1,2,3]; console.log(arr.join('-'))",
+            "test.js",
+        )
+        .expect("direct join should work");
+        assert_eq!(capture.text(), "1-2-3");
+    }
+
+    #[test]
+    fn bound_function_call_bind() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "var __join = Function.prototype.call.bind(Array.prototype.join); var arr = [1,2,3]; console.log(__join(arr, '-'))",
+            "test.js",
+        )
+        .expect("bound call.bind(join) should work");
+        assert_eq!(capture.text(), "1-2-3");
+    }
+
+    #[test]
+    fn object_get_own_property_descriptor_basic() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "var d = Object.getOwnPropertyDescriptor(Math, 'abs'); console.log(typeof d, d.writable, d.enumerable, d.configurable)",
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "object true false true");
+    }
+
+    #[test]
+    fn full_verify_property_test() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let prop_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        // Step 1: sta.js alone
+        {
+            let mut rt = OtterRuntime::builder().build();
+            rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        }
+        // Step 2: sta + assert
+        {
+            let mut rt = OtterRuntime::builder().build();
+            let code = format!("{sta}\n{assert_js}");
+            rt.run_script(&code, "test.js").expect("sta+assert should load");
+        }
+        // Step 3: sta + assert + propertyHelper
+        {
+            let mut rt = OtterRuntime::builder().build();
+            let code = format!("{sta}\n{assert_js}\n{prop_helper}");
+            rt.run_script(&code, "test.js").expect("sta+assert+propHelper should load");
+        }
+        // Step 3.5: sta + assert + propertyHelper + minimal call
+        {
+            let mut rt = OtterRuntime::builder().build();
+            let code = format!("{sta}\n{assert_js}\n{prop_helper}\nvar d = Object.getOwnPropertyDescriptor(Math, 'abs'); console.log(typeof d);");
+            match rt.run_script(&code, "test.js") {
+                Ok(_) => {}
+                Err(e) => panic!("step 3.5 (GOPD after harness): {e}"),
+            }
+        }
+        // Step 4: full with verifyProperty
+        {
+            let (mut rt, capture) = rt_with_capture();
+            let test_code = "verifyProperty(Math, 'abs', { writable: true, enumerable: false, configurable: true }); console.log('PASS');";
+            let full = format!("{sta}\n{assert_js}\n{prop_helper}\n{test_code}");
+            match rt.run_script(&full, "test.js") {
+                Ok(_) => assert_eq!(capture.text(), "PASS"),
+                Err(e) => panic!("verifyProperty failed: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn arguments_object_basic() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "function f(a, b) { return arguments.length; } console.log(f(1, 2, 3))",
+            "test.js",
+        )
+        .expect("arguments.length should work");
+        assert_eq!(capture.text(), "3");
+    }
+
+    #[test]
+    fn arguments_indexed_access() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "function f(a) { return arguments[1]; } console.log(f(10, 20, 30))",
+            "test.js",
+        )
+        .expect("arguments[1] should work");
+        assert_eq!(capture.text(), "20");
+    }
+
+    #[test]
+    fn minimal_verify_property() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(r#"
+            var desc = Object.getOwnPropertyDescriptor(Math, "abs");
+            console.log(typeof desc);
+            console.log(desc.writable);
+            console.log(desc.enumerable);
+            console.log(desc.configurable);
+        "#, "test.js")
+        .expect("minimal verifyProperty");
+        assert_eq!(capture.text(), "object\ntrue\nfalse\ntrue");
+    }
+
+    #[test]
+    fn for_in_on_descriptor() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(r#"
+            var desc = { value: 1, writable: true, enumerable: false, configurable: true };
+            var names = Object.getOwnPropertyNames(desc);
+            console.log(names.join(","));
+        "#, "test.js")
+        .expect("for-in on descriptor");
+        assert_eq!(capture.text(), "value,writable,enumerable,configurable");
+    }
+
+    #[test]
+    fn property_helper_harness_loads() {
+        let mut rt = OtterRuntime::builder().build();
+        // Minimal propertyHelper.js preamble.
+        let result = rt.run_script(
+            concat!(
+                "var __isArray = Array.isArray;\n",
+                "var __defineProperty = Object.defineProperty;\n",
+                "var __getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;\n",
+                "var __getOwnPropertyNames = Object.getOwnPropertyNames;\n",
+                "var __join = Function.prototype.call.bind(Array.prototype.join);\n",
+                "var __push = Function.prototype.call.bind(Array.prototype.push);\n",
+                "var __hasOwnProperty = Function.prototype.call.bind(Object.prototype.hasOwnProperty);\n",
+                "var __propertyIsEnumerable = Function.prototype.call.bind(Object.prototype.propertyIsEnumerable);\n",
+                "console.log('ok');\n",
+            ),
+            "test.js",
+        );
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!("propertyHelper preamble failed: {e}"),
+        }
+    }
 }

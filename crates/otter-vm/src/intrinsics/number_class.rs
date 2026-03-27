@@ -164,32 +164,325 @@ fn initialize_number_prototype(
     Ok(())
 }
 
+/// ES2024 §21.1.2 Properties of the Number Constructor
 fn initialize_number_constructor(
     intrinsics: &VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let nan = cx.property_names.intern("NaN");
-    cx.heap.set_property(
-        intrinsics.number_constructor(),
-        nan,
-        RegisterValue::from_number(f64::NAN),
-    )?;
+    let ctor = intrinsics.number_constructor();
 
-    let positive_infinity = cx.property_names.intern("POSITIVE_INFINITY");
-    cx.heap.set_property(
-        intrinsics.number_constructor(),
-        positive_infinity,
-        RegisterValue::from_number(f64::INFINITY),
-    )?;
+    // §21.1.2.1  Number.EPSILON
+    // §21.1.2.2  Number.isFinite
+    // §21.1.2.3  Number.isInteger
+    // §21.1.2.4  Number.isNaN
+    // §21.1.2.5  Number.isSafeInteger
+    // §21.1.2.6  Number.MAX_SAFE_INTEGER
+    // §21.1.2.7  Number.MAX_VALUE
+    // §21.1.2.8  Number.MIN_SAFE_INTEGER
+    // §21.1.2.9  Number.MIN_VALUE
+    // §21.1.2.10 Number.NaN
+    // §21.1.2.11 Number.NEGATIVE_INFINITY
+    // §21.1.2.12 Number.parseFloat
+    // §21.1.2.13 Number.parseInt
+    // §21.1.2.14 Number.POSITIVE_INFINITY
 
-    let negative_infinity = cx.property_names.intern("NEGATIVE_INFINITY");
-    cx.heap.set_property(
-        intrinsics.number_constructor(),
-        negative_infinity,
-        RegisterValue::from_number(f64::NEG_INFINITY),
-    )?;
+    const CONSTANTS: &[(&str, f64)] = &[
+        ("EPSILON", f64::EPSILON),
+        ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0), // 2^53 - 1
+        ("MAX_VALUE", f64::MAX),
+        ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0), // -(2^53 - 1)
+        ("MIN_VALUE", f64::MIN_POSITIVE), // smallest positive subnormal ≈ 5e-324
+        ("NaN", f64::NAN),
+        ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+        ("POSITIVE_INFINITY", f64::INFINITY),
+    ];
+
+    // ES2024 §21.1.2: Number constructor value properties are {W:false, E:false, C:false}.
+    for &(name, value) in CONSTANTS {
+        let prop = cx.property_names.intern(name);
+        cx.heap.define_own_property(
+            ctor,
+            prop,
+            crate::object::PropertyValue::data_with_attrs(
+                RegisterValue::from_number(value),
+                crate::object::PropertyAttributes::constant(),
+            ),
+        )?;
+    }
+
+    // Static methods.
+    let static_methods: &[(&str, u16, crate::descriptors::VmNativeFunction)] = &[
+        ("isFinite", 1, number_is_finite),
+        ("isInteger", 1, number_is_integer),
+        ("isNaN", 1, number_is_nan),
+        ("isSafeInteger", 1, number_is_safe_integer),
+        ("parseFloat", 1, number_parse_float),
+        ("parseInt", 2, number_parse_int),
+    ];
+
+    for &(name, length, callback) in static_methods {
+        let descriptor = NativeFunctionDescriptor::method(name, length, callback);
+        let host_fn = cx.native_functions.register(descriptor);
+        let handle = cx.alloc_intrinsic_host_function(host_fn, intrinsics.function_prototype())?;
+        let prop = cx.property_names.intern(name);
+        cx.heap.set_property(
+            ctor,
+            prop,
+            RegisterValue::from_object_handle(handle.0),
+        )?;
+    }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Number static methods (ES2024 §21.1.2)
+// ---------------------------------------------------------------------------
+
+/// §21.1.2.2 Number.isFinite(number)
+fn number_is_finite(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    // If Type(number) is not Number, return false.
+    let Some(n) = arg.as_number() else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+    Ok(RegisterValue::from_bool(n.is_finite()))
+}
+
+/// §21.1.2.3 Number.isInteger(number)
+fn number_is_integer(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let Some(n) = arg.as_number() else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+    Ok(RegisterValue::from_bool(
+        n.is_finite() && n.trunc() == n,
+    ))
+}
+
+/// §21.1.2.4 Number.isNaN(number)
+fn number_is_nan(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let Some(n) = arg.as_number() else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+    Ok(RegisterValue::from_bool(n.is_nan()))
+}
+
+/// §21.1.2.5 Number.isSafeInteger(number)
+fn number_is_safe_integer(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let Some(n) = arg.as_number() else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+    Ok(RegisterValue::from_bool(
+        n.is_finite()
+            && n.trunc() == n
+            && n.abs() <= 9_007_199_254_740_991.0,
+    ))
+}
+
+/// §21.1.2.12 Number.parseFloat(string)
+fn number_parse_float(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let s = runtime.js_to_string_infallible(arg);
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return Ok(RegisterValue::from_number(f64::NAN));
+    }
+    // parseFloat accepts a prefix — find the longest valid float prefix.
+    let result = parse_float_prefix(trimmed);
+    Ok(RegisterValue::from_number(result))
+}
+
+/// §21.1.2.13 Number.parseInt(string, radix)
+fn number_parse_int(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let s = runtime.js_to_string_infallible(arg);
+    let radix_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+
+    let radix = if radix_arg == RegisterValue::undefined() {
+        0 // auto-detect
+    } else {
+        runtime
+            .js_to_int32(radix_arg)
+            .map_err(|e| VmNativeCallError::Internal(format!("parseInt radix: {e}").into()))?
+    };
+
+    let result = parse_int_impl(&s, radix);
+    Ok(RegisterValue::from_number(result))
+}
+
+/// §19.2 Global function bindings: isNaN, isFinite, parseFloat, parseInt.
+/// These are the *global* versions (coerce to Number first, unlike Number.isNaN).
+pub(super) fn global_number_function_bindings() -> Vec<NativeFunctionDescriptor> {
+    vec![
+        NativeFunctionDescriptor::method("isNaN", 1, global_is_nan),
+        NativeFunctionDescriptor::method("isFinite", 1, global_is_finite),
+        NativeFunctionDescriptor::method("parseFloat", 1, number_parse_float),
+        NativeFunctionDescriptor::method("parseInt", 2, number_parse_int),
+    ]
+}
+
+/// §19.2.3 globalThis.isNaN(number) — coerces to Number first.
+fn global_is_nan(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let n = runtime
+        .js_to_number(arg)
+        .map_err(|e| VmNativeCallError::Internal(format!("isNaN: {e}").into()))?;
+    Ok(RegisterValue::from_bool(n.is_nan()))
+}
+
+/// §19.2.2 globalThis.isFinite(number) — coerces to Number first.
+fn global_is_finite(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let n = runtime
+        .js_to_number(arg)
+        .map_err(|e| VmNativeCallError::Internal(format!("isFinite: {e}").into()))?;
+    Ok(RegisterValue::from_bool(n.is_finite()))
+}
+
+/// ES spec parseFloat prefix parsing — finds longest valid float prefix.
+fn parse_float_prefix(s: &str) -> f64 {
+    match s {
+        _ if s.starts_with("Infinity") || s.starts_with("+Infinity") => f64::INFINITY,
+        _ if s.starts_with("-Infinity") => f64::NEG_INFINITY,
+        _ => {
+            // Find the longest parseable prefix.
+            let mut end = 0;
+            let bytes = s.as_bytes();
+            let len = bytes.len();
+
+            // Optional sign.
+            if end < len && (bytes[end] == b'+' || bytes[end] == b'-') {
+                end += 1;
+            }
+            // Integer part.
+            while end < len && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            // Decimal point + fraction.
+            if end < len && bytes[end] == b'.' {
+                end += 1;
+                while end < len && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+            }
+            // Exponent.
+            if end < len && (bytes[end] == b'e' || bytes[end] == b'E') {
+                let save = end;
+                end += 1;
+                if end < len && (bytes[end] == b'+' || bytes[end] == b'-') {
+                    end += 1;
+                }
+                if end < len && bytes[end].is_ascii_digit() {
+                    while end < len && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                } else {
+                    end = save; // no exponent digits — revert
+                }
+            }
+
+            if end == 0 || (end == 1 && (bytes[0] == b'+' || bytes[0] == b'-')) {
+                f64::NAN
+            } else {
+                s[..end].parse::<f64>().unwrap_or(f64::NAN)
+            }
+        }
+    }
+}
+
+/// ES spec parseInt implementation.
+fn parse_int_impl(input: &str, radix: i32) -> f64 {
+    let s = input.trim_start();
+    if s.is_empty() {
+        return f64::NAN;
+    }
+
+    let mut chars = s.chars().peekable();
+    let sign: f64 = if chars.peek() == Some(&'-') {
+        chars.next();
+        -1.0
+    } else if chars.peek() == Some(&'+') {
+        chars.next();
+        1.0
+    } else {
+        1.0
+    };
+
+    let radix = if radix == 0 {
+        // Auto-detect: 0x → 16, else 10
+        if chars.clone().take(2).collect::<String>().to_ascii_lowercase() == "0x" {
+            chars.next(); // skip '0'
+            chars.next(); // skip 'x'
+            16
+        } else {
+            10
+        }
+    } else if !(2..=36).contains(&radix) {
+        return f64::NAN;
+    } else {
+        if radix == 16 {
+            // Strip 0x prefix if present
+            let rest: String = chars.clone().take(2).collect();
+            if rest.eq_ignore_ascii_case("0x") {
+                chars.next();
+                chars.next();
+            }
+        }
+        radix as u32
+    };
+
+    let mut result: f64 = 0.0;
+    let mut found_digit = false;
+
+    for ch in chars {
+        let digit = match ch.to_ascii_lowercase().to_digit(radix) {
+            Some(d) => d,
+            None => break, // stop at first invalid char
+        };
+        found_digit = true;
+        result = result * (radix as f64) + (digit as f64);
+    }
+
+    if !found_digit {
+        f64::NAN
+    } else {
+        sign * result
+    }
 }
 
 fn set_number_data(
@@ -224,7 +517,7 @@ fn number_data(
         return Ok(None);
     };
 
-    let PropertyValue::Data(value) = lookup.value() else {
+    let PropertyValue::Data { value, .. } = lookup.value() else {
         return Ok(None);
     };
 

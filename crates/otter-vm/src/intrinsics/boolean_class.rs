@@ -200,7 +200,7 @@ fn boolean_data(
         return Ok(None);
     };
 
-    let PropertyValue::Data(value) = lookup.value() else {
+    let PropertyValue::Data { value, .. } = lookup.value() else {
         return Ok(None);
     };
 

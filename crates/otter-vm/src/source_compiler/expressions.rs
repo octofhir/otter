@@ -1309,23 +1309,40 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(result)
             }
             Expression::ComputedMemberExpression(member) => {
-                let Expression::StringLiteral(literal) = &member.expression else {
-                    return Err(SourceLoweringError::Unsupported(
-                        "delete of non-string computed member".to_string(),
+                // Optimise: if the key is a string literal, use the named delete path.
+                if let Expression::StringLiteral(literal) = &member.expression {
+                    let object = self.compile_expression(&member.object, module)?;
+                    let result = if object.is_temp {
+                        object
+                    } else {
+                        ValueLocation::temp(self.alloc_temp())
+                    };
+                    let property = self.intern_property_name(literal.value.as_str())?;
+                    self.instructions.push(Instruction::delete_property(
+                        result.register,
+                        object.register,
+                        property,
                     ));
-                };
+                    if result.register != object.register {
+                        self.release(object);
+                    }
+                    return Ok(result);
+                }
+
+                // General case: dynamic key — emit DeleteComputed.
                 let object = self.compile_expression(&member.object, module)?;
+                let key = self.compile_expression(&member.expression, module)?;
                 let result = if object.is_temp {
                     object
                 } else {
                     ValueLocation::temp(self.alloc_temp())
                 };
-                let property = self.intern_property_name(literal.value.as_str())?;
-                self.instructions.push(Instruction::delete_property(
+                self.instructions.push(Instruction::delete_computed(
                     result.register,
                     object.register,
-                    property,
+                    key.register,
                 ));
+                self.release(key);
                 if result.register != object.register {
                     self.release(object);
                 }
@@ -1388,7 +1405,7 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
-        self.emit_new_closure(destination, reserved, &compiled.captures)?;
+        self.emit_new_closure_arrow(destination, reserved, &compiled.captures)?;
         Ok(ValueLocation::temp(destination))
     }
 

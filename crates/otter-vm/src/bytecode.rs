@@ -174,6 +174,12 @@ pub enum Opcode {
     /// Await a value (async functions). `dst = await src`.
     /// If the awaited promise is pending, the interpreter suspends.
     Await = 0x44,
+    /// Delete a computed (dynamic key) property from an object.
+    /// `dst = delete obj[key]` — key is coerced to string at runtime.
+    DeleteComputed = 0x45,
+    /// ES2024 §10.4.4 CreateArguments — create arguments exotic object from
+    /// the current activation's actual arguments (formal params + overflow).
+    CreateArguments = 0x46,
 }
 
 impl Opcode {
@@ -240,6 +246,8 @@ impl Opcode {
             0x42 => Some(Self::CallClosure),
             0x43 => Some(Self::Throw),
             0x44 => Some(Self::Await),
+            0x45 => Some(Self::DeleteComputed),
+            0x46 => Some(Self::CreateArguments),
             _ => None,
         }
     }
@@ -597,6 +605,27 @@ impl Instruction {
             dst,
             object,
             BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Encodes a computed property delete. `dst = delete obj[key]`.
+    #[must_use]
+    pub const fn delete_computed(
+        dst: BytecodeRegister,
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DeleteComputed, dst, object, key)
+    }
+
+    /// ES2024 §10.4.4 CreateArguments — `dst = arguments`.
+    #[must_use]
+    pub const fn create_arguments(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CreateArguments,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
         )
     }
 

@@ -113,6 +113,8 @@ pub enum HeapValueKind {
     String,
     /// Closure object with captured upvalue cells.
     Closure,
+    /// Bound function exotic object (§10.4.1).
+    BoundFunction,
     /// Mutable cell used to back one captured upvalue.
     UpvalueCell,
     /// Internal iterator used by the new VM iteration lowering.
@@ -152,20 +154,246 @@ impl IteratorStep {
     }
 }
 
+/// ES2024 §10.2 — Closure function kind flags.
+///
+/// Packed `u8` bitfield encoding whether a closure is an arrow function,
+/// method definition, generator, or async function. These flags determine
+/// `[[Construct]]` eligibility (§7.2.4 IsConstructor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClosureFlags(u8);
+
+const FLAG_ARROW: u8 = 0x01;
+const FLAG_METHOD: u8 = 0x02;
+const FLAG_GENERATOR: u8 = 0x04;
+const FLAG_ASYNC: u8 = 0x08;
+
+impl ClosureFlags {
+    /// Regular function declaration/expression — has `[[Construct]]`.
+    #[must_use]
+    pub const fn normal() -> Self {
+        Self(0)
+    }
+
+    /// Arrow function (§15.3) — no `[[Construct]]`, no own `this`.
+    #[must_use]
+    pub const fn arrow() -> Self {
+        Self(FLAG_ARROW)
+    }
+
+    /// Method definition (§15.4.4) — no `[[Construct]]`.
+    #[must_use]
+    pub const fn method() -> Self {
+        Self(FLAG_METHOD)
+    }
+
+    /// Generator function — no `[[Construct]]` (§15.5.1).
+    #[must_use]
+    pub const fn generator() -> Self {
+        Self(FLAG_GENERATOR)
+    }
+
+    /// Async function.
+    #[must_use]
+    pub const fn async_fn() -> Self {
+        Self(FLAG_ASYNC)
+    }
+
+    /// ES2024 §7.2.4 IsConstructor — true only for regular function declarations/expressions.
+    #[must_use]
+    pub const fn is_constructable(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
+    pub const fn is_arrow(self) -> bool {
+        self.0 & FLAG_ARROW != 0
+    }
+
+    #[must_use]
+    pub const fn is_method(self) -> bool {
+        self.0 & FLAG_METHOD != 0
+    }
+
+    #[must_use]
+    pub const fn is_generator(self) -> bool {
+        self.0 & FLAG_GENERATOR != 0
+    }
+
+    #[must_use]
+    pub const fn is_async(self) -> bool {
+        self.0 & FLAG_ASYNC != 0
+    }
+}
+
+impl Default for ClosureFlags {
+    fn default() -> Self {
+        Self::normal()
+    }
+}
+
+/// ES2024 §6.1.7.1 — Property Attributes.
+///
+/// Packed `u8` bitfield: bit 0 = writable, bit 1 = enumerable, bit 2 = configurable.
+/// Factory methods encode the attribute combinations mandated by the spec for
+/// different property origins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PropertyAttributes(u8);
+
+const ATTR_WRITABLE: u8 = 0x01;
+const ATTR_ENUMERABLE: u8 = 0x02;
+const ATTR_CONFIGURABLE: u8 = 0x04;
+
+impl PropertyAttributes {
+    /// User-assigned data properties (§10.1.9 OrdinarySet step 3.d).
+    /// { [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: true }
+    #[must_use]
+    pub const fn data() -> Self {
+        Self(ATTR_WRITABLE | ATTR_ENUMERABLE | ATTR_CONFIGURABLE)
+    }
+
+    /// Built-in prototype methods (§18 ECMAScript Standard Built-in Objects).
+    /// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }
+    #[must_use]
+    pub const fn builtin_method() -> Self {
+        Self(ATTR_WRITABLE | ATTR_CONFIGURABLE)
+    }
+
+    /// Function `.length` and `.name` properties (§10.2.8 SetFunctionLength).
+    /// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
+    #[must_use]
+    pub const fn function_length() -> Self {
+        Self(ATTR_CONFIGURABLE)
+    }
+
+    /// `prototype.constructor` link (§10.2.6 MakeConstructor step 8).
+    /// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }
+    #[must_use]
+    pub const fn constructor_link() -> Self {
+        Self(ATTR_WRITABLE | ATTR_CONFIGURABLE)
+    }
+
+    /// Non-writable, non-enumerable, non-configurable (§21.3.1 Math value properties).
+    /// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
+    #[must_use]
+    pub const fn constant() -> Self {
+        Self(0)
+    }
+
+    /// Frozen data property (§20.1.2.6 Object.freeze).
+    /// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
+    #[must_use]
+    pub const fn frozen() -> Self {
+        Self(0)
+    }
+
+    /// Built-in accessor properties (§10.4.1).
+    /// Accessors have no [[Writable]]; enumerable=false, configurable=true.
+    #[must_use]
+    pub const fn builtin_accessor() -> Self {
+        Self(ATTR_CONFIGURABLE)
+    }
+
+    /// Construct from individual flags.
+    #[must_use]
+    pub const fn from_flags(writable: bool, enumerable: bool, configurable: bool) -> Self {
+        let mut bits = 0u8;
+        if writable {
+            bits |= ATTR_WRITABLE;
+        }
+        if enumerable {
+            bits |= ATTR_ENUMERABLE;
+        }
+        if configurable {
+            bits |= ATTR_CONFIGURABLE;
+        }
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn writable(self) -> bool {
+        self.0 & ATTR_WRITABLE != 0
+    }
+
+    #[must_use]
+    pub const fn enumerable(self) -> bool {
+        self.0 & ATTR_ENUMERABLE != 0
+    }
+
+    #[must_use]
+    pub const fn configurable(self) -> bool {
+        self.0 & ATTR_CONFIGURABLE != 0
+    }
+
+    /// Returns a copy with writable set to `false`.
+    #[must_use]
+    pub const fn with_writable_false(self) -> Self {
+        Self(self.0 & !ATTR_WRITABLE)
+    }
+
+    /// Returns a copy with configurable set to `false`.
+    #[must_use]
+    pub const fn with_configurable_false(self) -> Self {
+        Self(self.0 & !ATTR_CONFIGURABLE)
+    }
+}
+
+impl Default for PropertyAttributes {
+    fn default() -> Self {
+        Self::data()
+    }
+}
+
 /// Property slot stored on ordinary or host-function objects.
+///
+/// Each property carries its own [`PropertyAttributes`] per ES2024 §6.1.7.1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PropertyValue {
-    Data(RegisterValue),
+    Data {
+        value: RegisterValue,
+        attributes: PropertyAttributes,
+    },
     Accessor {
         getter: Option<ObjectHandle>,
         setter: Option<ObjectHandle>,
+        attributes: PropertyAttributes,
     },
 }
 
 impl PropertyValue {
+    /// Creates a data property with default attributes (writable + enumerable + configurable).
     #[must_use]
     pub const fn data(value: RegisterValue) -> Self {
-        Self::Data(value)
+        Self::Data {
+            value,
+            attributes: PropertyAttributes::data(),
+        }
+    }
+
+    /// Creates a data property with explicit attributes.
+    #[must_use]
+    pub const fn data_with_attrs(value: RegisterValue, attributes: PropertyAttributes) -> Self {
+        Self::Data { value, attributes }
+    }
+
+    /// Creates an accessor property with default builtin accessor attributes.
+    #[must_use]
+    pub const fn accessor(
+        getter: Option<ObjectHandle>,
+        setter: Option<ObjectHandle>,
+    ) -> Self {
+        Self::Accessor {
+            getter,
+            setter,
+            attributes: PropertyAttributes::builtin_accessor(),
+        }
+    }
+
+    /// Returns the attributes of this property.
+    #[must_use]
+    pub const fn attributes(&self) -> PropertyAttributes {
+        match self {
+            Self::Data { attributes, .. } | Self::Accessor { attributes, .. } => *attributes,
+        }
     }
 }
 
@@ -173,12 +401,14 @@ impl PropertyValue {
 enum HeapValue {
     Object {
         prototype: Option<ObjectHandle>,
+        extensible: bool,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
     },
     NativeObject {
         prototype: Option<ObjectHandle>,
+        extensible: bool,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
@@ -186,6 +416,7 @@ enum HeapValue {
     },
     Array {
         prototype: Option<ObjectHandle>,
+        extensible: bool,
         elements: Vec<RegisterValue>,
     },
     String {
@@ -194,6 +425,8 @@ enum HeapValue {
     },
     Closure {
         prototype: Option<ObjectHandle>,
+        extensible: bool,
+        flags: ClosureFlags,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
@@ -203,9 +436,16 @@ enum HeapValue {
     HostFunction {
         function: HostFunctionId,
         prototype: Option<ObjectHandle>,
+        extensible: bool,
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
+    },
+    /// ES2024 §10.4.1 Bound Function Exotic Objects.
+    BoundFunction {
+        target: ObjectHandle,
+        bound_this: RegisterValue,
+        bound_args: Vec<RegisterValue>,
     },
     UpvalueCell {
         value: RegisterValue,
@@ -244,8 +484,8 @@ fn trace_register_value(value: RegisterValue, visitor: &mut dyn FnMut(GcHandle))
 /// Visit all GC pointers in a PropertyValue.
 fn trace_property_value(pv: &PropertyValue, visitor: &mut dyn FnMut(GcHandle)) {
     match pv {
-        PropertyValue::Data(value) => trace_register_value(*value, visitor),
-        PropertyValue::Accessor { getter, setter } => {
+        PropertyValue::Data { value, .. } => trace_register_value(*value, visitor),
+        PropertyValue::Accessor { getter, setter, .. } => {
             if let Some(g) = getter {
                 trace_handle(*g, visitor);
             }
@@ -280,7 +520,7 @@ impl Traceable for HeapValue {
                     trace_handle(*uv, visitor);
                 }
             }
-            HeapValue::Array { prototype, elements } => {
+            HeapValue::Array { prototype, elements, .. } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
                 }
@@ -291,6 +531,17 @@ impl Traceable for HeapValue {
             HeapValue::String { prototype, .. } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
+                }
+            }
+            HeapValue::BoundFunction {
+                target,
+                bound_this,
+                bound_args,
+            } => {
+                trace_handle(*target, visitor);
+                trace_register_value(*bound_this, visitor);
+                for arg in bound_args {
+                    trace_register_value(*arg, visitor);
                 }
             }
             HeapValue::UpvalueCell { value } => {
@@ -362,6 +613,7 @@ impl ObjectHeap {
         let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::Object {
             prototype: None,
+            extensible: true,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
@@ -374,6 +626,7 @@ impl ObjectHeap {
         let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::NativeObject {
             prototype: None,
+            extensible: true,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
@@ -386,6 +639,7 @@ impl ObjectHeap {
     pub fn alloc_array(&mut self) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::Array {
             prototype: None,
+            extensible: true,
             elements: Vec::new(),
         });
         ObjectHandle(h.0)
@@ -406,15 +660,18 @@ impl ObjectHeap {
         ObjectHandle(h.0)
     }
 
-    /// Allocates a closure object with captured upvalue cells.
+    /// Allocates a closure object with captured upvalue cells and function kind flags.
     pub fn alloc_closure(
         &mut self,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
+        flags: ClosureFlags,
     ) -> ObjectHandle {
         let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::Closure {
             prototype: None,
+            extensible: true,
+            flags,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
@@ -430,6 +687,7 @@ impl ObjectHeap {
         let h = self.heap.alloc(HeapValue::HostFunction {
             function,
             prototype: None,
+            extensible: true,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
@@ -470,6 +728,7 @@ impl ObjectHeap {
             HeapValue::Array { .. } => Ok(HeapValueKind::Array),
             HeapValue::String { .. } => Ok(HeapValueKind::String),
             HeapValue::Closure { .. } => Ok(HeapValueKind::Closure),
+            HeapValue::BoundFunction { .. } => Ok(HeapValueKind::BoundFunction),
             HeapValue::UpvalueCell { .. } => Ok(HeapValueKind::UpvalueCell),
             HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
@@ -491,6 +750,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -549,6 +809,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -567,6 +828,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
@@ -629,6 +891,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -657,7 +920,31 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Appends a value to an array's element list.
+    pub fn push_element(
+        &mut self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Array { elements, .. } => {
+                elements.push(value);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the elements of an array as a Vec.
+    pub fn array_elements(&self, handle: ObjectHandle) -> Result<Vec<RegisterValue>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Array { elements, .. } => Ok(elements.clone()),
+            _ => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -858,6 +1145,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
         }
     }
@@ -875,6 +1163,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
         }
     }
@@ -892,6 +1181,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
         }
     }
@@ -927,6 +1217,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
         }
     }
@@ -1141,6 +1432,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
@@ -1161,8 +1453,35 @@ impl ObjectHeap {
                 } => (shape_id, values),
                 _ => return Err(ObjectError::InvalidKind),
             };
-            values[usize::from(slot_index)] = PropertyValue::data(value);
+            // ES2024 §10.1.9 OrdinarySet step 3: reject if non-writable data property.
+            let slot = &mut values[usize::from(slot_index)];
+            match slot {
+                PropertyValue::Data { attributes, .. } if !attributes.writable() => {
+                    // Non-writable — silently fail (strict mode TypeError handled by caller).
+                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+                }
+                PropertyValue::Data { value: v, .. } => {
+                    *v = value;
+                }
+                PropertyValue::Accessor { .. } => {
+                    // Accessor — caller handles setter invocation; we don't overwrite here.
+                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+                }
+            }
             return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+        }
+
+        // ES2024 §10.1.9 OrdinarySet step 3.d: reject if not extensible.
+        if !self.is_extensible(handle)? {
+            // Non-extensible object — cannot add new properties.
+            let shape_id = match self.object(handle)? {
+                HeapValue::Object { shape_id, .. }
+                | HeapValue::NativeObject { shape_id, .. }
+                | HeapValue::Closure { shape_id, .. }
+                | HeapValue::HostFunction { shape_id, .. } => *shape_id,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            return Ok(PropertyInlineCache::new(shape_id, 0));
         }
 
         let shape_id = self.allocate_shape();
@@ -1218,12 +1537,28 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         };
 
         let Some(slot_index) = slot_index.map(usize::from) else {
-            return Ok(false);
+            // Property not found — deletion is vacuously true (ES2024 §10.1.10 step 2).
+            return Ok(true);
         };
+
+        // ES2024 §10.1.10 OrdinaryDelete step 3: reject if non-configurable.
+        {
+            let values = match self.object(handle)? {
+                HeapValue::Object { values, .. }
+                | HeapValue::NativeObject { values, .. }
+                | HeapValue::Closure { values, .. }
+                | HeapValue::HostFunction { values, .. } => values,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            if !values[slot_index].attributes().configurable() {
+                return Ok(false);
+            }
+        }
 
         let shape_id = self.allocate_shape();
         let object = self.object_mut(handle)?;
@@ -1257,6 +1592,100 @@ impl ObjectHeap {
 
         keys.remove(slot_index);
         values.remove(slot_index);
+        *object_shape_id = shape_id;
+        Ok(true)
+    }
+
+    /// ES2024 §10.1.6 `[[DefineOwnProperty]]` — defines or replaces a property
+    /// with full attribute control.
+    pub fn define_own_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyValue,
+    ) -> Result<bool, ObjectError> {
+        // Check if property already exists.
+        let existing_slot = match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            _ => None,
+        };
+
+        if let Some(slot_index) = existing_slot {
+            // §10.1.6.1 ValidateAndApplyPropertyDescriptor step 3-7:
+            // If existing is non-configurable, only value changes (if writable) are allowed.
+            let slot = usize::from(slot_index);
+            let existing_attrs = {
+                let values = match self.object(handle)? {
+                    HeapValue::Object { values, .. }
+                    | HeapValue::NativeObject { values, .. }
+                    | HeapValue::Closure { values, .. }
+                    | HeapValue::HostFunction { values, .. } => values,
+                    _ => return Err(ObjectError::InvalidKind),
+                };
+                values[slot].attributes()
+            };
+
+            if !existing_attrs.configurable() {
+                // Non-configurable — very limited changes allowed.
+                if desc.attributes().configurable() {
+                    return Ok(false); // Can't make configurable again
+                }
+                if desc.attributes().enumerable() != existing_attrs.enumerable() {
+                    return Ok(false); // Can't change enumerability
+                }
+            }
+
+            // Apply the new descriptor.
+            let values = match self.object_mut(handle)? {
+                HeapValue::Object { values, .. }
+                | HeapValue::NativeObject { values, .. }
+                | HeapValue::Closure { values, .. }
+                | HeapValue::HostFunction { values, .. } => values,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            values[slot] = desc;
+            return Ok(true);
+        }
+
+        // Property does not exist — create it (check extensibility).
+        if !self.is_extensible(handle)? {
+            return Ok(false);
+        }
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            } => (s, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        keys.push(property);
+        values.push(desc);
         *object_shape_id = shape_id;
         Ok(true)
     }
@@ -1311,7 +1740,7 @@ impl ObjectHeap {
         getter: Option<ObjectHandle>,
         setter: Option<ObjectHandle>,
     ) -> Result<PropertyInlineCache, ObjectError> {
-        let accessor = PropertyValue::Accessor { getter, setter };
+        let accessor = PropertyValue::accessor(getter, setter);
 
         if let Some(slot_index) = match self.object(handle)? {
             HeapValue::Object { keys, .. } => property_slot(keys, property),
@@ -1324,6 +1753,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
@@ -1394,6 +1824,180 @@ impl ObjectHeap {
             .ok_or(ObjectError::InvalidHandle)
     }
 
+    /// Returns all own property keys of an object-like heap value.
+    ///
+    /// For ordinary objects, returns named property keys in insertion order.
+    /// For arrays, returns numeric indices as strings followed by named properties.
+    pub fn own_keys(&self, handle: ObjectHandle) -> Result<Vec<PropertyNameId>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
+            HeapValue::Array { .. } => Ok(Vec::new()), // TODO: numeric index keys
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Checks if an object-like heap value has an own property with the given name.
+    pub fn has_own_property(
+        &self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => Ok(property_slot(keys, property).is_some()),
+            _ => Ok(false),
+        }
+    }
+
+    /// ES2024 §10.4.1.3 — Allocates a bound function exotic object.
+    pub fn alloc_bound_function(
+        &mut self,
+        target: ObjectHandle,
+        bound_this: RegisterValue,
+        bound_args: Vec<RegisterValue>,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::BoundFunction {
+            target,
+            bound_this,
+            bound_args,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the (target, bound_this, bound_args) for a bound function.
+    pub fn bound_function_parts(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(ObjectHandle, RegisterValue, Vec<RegisterValue>), ObjectError> {
+        match self.object(handle)? {
+            HeapValue::BoundFunction {
+                target,
+                bound_this,
+                bound_args,
+            } => Ok((*target, *bound_this, bound_args.clone())),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// ES2024 §7.2.3 IsCallable — returns true if the value has a `[[Call]]` internal method.
+    pub fn is_callable(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.kind(handle),
+            Ok(HeapValueKind::HostFunction | HeapValueKind::Closure | HeapValueKind::BoundFunction)
+        )
+    }
+
+    /// Returns the closure flags for a closure object.
+    pub fn closure_flags(&self, handle: ObjectHandle) -> Result<ClosureFlags, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure { flags, .. } => Ok(*flags),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// ES2024 §10.1.3 `[[IsExtensible]]()` — returns the extensibility of an object.
+    pub fn is_extensible(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { extensible, .. }
+            | HeapValue::NativeObject { extensible, .. }
+            | HeapValue::Array { extensible, .. }
+            | HeapValue::Closure { extensible, .. }
+            | HeapValue::HostFunction { extensible, .. } => Ok(*extensible),
+            // Strings, iterators, promises, upvalue cells are not extensible objects.
+            _ => Ok(false),
+        }
+    }
+
+    /// ES2024 §10.1.4 `[[PreventExtensions]]()` — marks an object as non-extensible.
+    pub fn prevent_extensions(&mut self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Object { extensible, .. }
+            | HeapValue::NativeObject { extensible, .. }
+            | HeapValue::Array { extensible, .. }
+            | HeapValue::Closure { extensible, .. }
+            | HeapValue::HostFunction { extensible, .. } => {
+                *extensible = false;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// ES2024 §20.1.2.6 `Object.freeze(O)` — sets configurable+writable to false on all own properties.
+    pub fn freeze(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        self.prevent_extensions(handle)?;
+        let keys = self.own_keys(handle)?;
+        for key in keys {
+            self.freeze_property(handle, key)?;
+        }
+        Ok(())
+    }
+
+    /// ES2024 §20.1.2.19 `Object.seal(O)` — sets configurable to false on all own properties.
+    pub fn seal(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        self.prevent_extensions(handle)?;
+        let keys = self.own_keys(handle)?;
+        for key in keys {
+            self.seal_property(handle, key)?;
+        }
+        Ok(())
+    }
+
+    /// Sets configurable=false and writable=false on a single property.
+    fn freeze_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<(), ObjectError> {
+        let (keys, values) = match self.object_mut(handle)? {
+            HeapValue::Object { keys, values, .. }
+            | HeapValue::NativeObject { keys, values, .. }
+            | HeapValue::Closure { keys, values, .. }
+            | HeapValue::HostFunction { keys, values, .. } => (keys, values),
+            _ => return Ok(()),
+        };
+        if let Some(slot) = property_slot(keys, property).map(usize::from) {
+            match &mut values[slot] {
+                PropertyValue::Data { attributes, .. } => {
+                    *attributes = attributes.with_writable_false().with_configurable_false();
+                }
+                PropertyValue::Accessor { attributes, .. } => {
+                    *attributes = attributes.with_configurable_false();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets configurable=false on a single property.
+    fn seal_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<(), ObjectError> {
+        let (keys, values) = match self.object_mut(handle)? {
+            HeapValue::Object { keys, values, .. }
+            | HeapValue::NativeObject { keys, values, .. }
+            | HeapValue::Closure { keys, values, .. }
+            | HeapValue::HostFunction { keys, values, .. } => (keys, values),
+            _ => return Ok(()),
+        };
+        if let Some(slot) = property_slot(keys, property).map(usize::from) {
+            match &mut values[slot] {
+                PropertyValue::Data { attributes, .. }
+                | PropertyValue::Accessor { attributes, .. } => {
+                    *attributes = attributes.with_configurable_false();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn allocate_shape(&mut self) -> ObjectShapeId {
         let shape_id = ObjectShapeId(self.next_shape_id);
         self.next_shape_id = self.next_shape_id.saturating_add(1);
@@ -1458,6 +2062,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         };
         let Some(slot_index) = property_slot(keys, property) else {
@@ -1483,6 +2088,7 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -1501,6 +2107,7 @@ mod tests {
     use crate::property::PropertyNameId;
     use crate::value::RegisterValue;
 
+    use super::ClosureFlags;
     use crate::payload::NativePayloadId;
 
     use super::{
@@ -1519,7 +2126,7 @@ mod tests {
         assert_eq!(
             heap.get_cached(handle, property, cache)
                 .expect("cache lookup should succeed"),
-            Some(PropertyValue::Data(RegisterValue::from_i32(7)))
+            Some(PropertyValue::data(RegisterValue::from_i32(7)))
         );
 
         assert!(
@@ -1532,7 +2139,7 @@ mod tests {
             .expect("generic lookup should succeed");
         assert_eq!(
             generic.map(|lookup| {
-                let PropertyValue::Data(value) = lookup.value() else {
+                let PropertyValue::Data { value, .. } = lookup.value() else {
                     panic!("expected data property");
                 };
                 (value, lookup.cache())
@@ -1567,7 +2174,7 @@ mod tests {
         assert_eq!(lookup.cache(), None);
         assert_eq!(
             lookup.value(),
-            PropertyValue::Data(RegisterValue::from_i32(7))
+            PropertyValue::data(RegisterValue::from_i32(7))
         );
     }
 
@@ -1624,7 +2231,7 @@ mod tests {
     fn object_heap_supports_closure_and_upvalue_cells() {
         let mut heap = ObjectHeap::new();
         let upvalue = heap.alloc_upvalue(RegisterValue::from_i32(1));
-        let closure = heap.alloc_closure(FunctionIndex(7), vec![upvalue]);
+        let closure = heap.alloc_closure(FunctionIndex(7), vec![upvalue], ClosureFlags::normal());
 
         assert_eq!(heap.kind(closure), Ok(HeapValueKind::Closure));
         assert_eq!(heap.kind(upvalue), Ok(HeapValueKind::UpvalueCell));
@@ -1656,7 +2263,7 @@ mod tests {
             heap.get_property(function, property)
                 .expect("host function property lookup should succeed")
                 .map(|entry| entry.value()),
-            Some(PropertyValue::Data(RegisterValue::from_i32(9)))
+            Some(PropertyValue::data(RegisterValue::from_i32(9)))
         );
     }
 
@@ -1679,7 +2286,7 @@ mod tests {
             heap.get_property(object, property)
                 .expect("native object lookup should succeed")
                 .map(|entry| entry.value()),
-            Some(PropertyValue::Data(RegisterValue::from_i32(11)))
+            Some(PropertyValue::data(RegisterValue::from_i32(11)))
         );
 
         let mut seen = Vec::new();

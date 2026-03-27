@@ -16,7 +16,8 @@ use crate::host::{HostFunctionId, NativeFunctionRegistry};
 use crate::intrinsics::VmIntrinsics;
 use crate::module::{Function, FunctionIndex, Module};
 use crate::object::{
-    HeapValueKind, ObjectError, ObjectHandle, ObjectHeap, PropertyInlineCache, PropertyValue,
+    ClosureFlags as ObjectClosureFlags, HeapValueKind, ObjectError, ObjectHandle, ObjectHeap,
+    PropertyAttributes, PropertyInlineCache, PropertyValue,
 };
 use crate::payload::{NativePayloadError, NativePayloadRegistry, VmTrace, VmValueTracer};
 use crate::property::{PropertyNameId, PropertyNameRegistry};
@@ -168,6 +169,10 @@ pub struct Activation {
     pending_exception: Option<RegisterValue>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
+    /// ES2024 §10.4.4 — Overflow arguments beyond formal parameter count.
+    /// Stored separately from the register file to avoid polluting the frame layout.
+    /// Used by `CreateArguments` to populate the arguments exotic object.
+    overflow_args: Vec<RegisterValue>,
 }
 
 impl Activation {
@@ -203,6 +208,7 @@ impl Activation {
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
                 .into_boxed_slice(),
+            overflow_args: Vec::new(),
         }
     }
 
@@ -632,6 +638,27 @@ impl RuntimeState {
         handle
     }
 
+    /// Allocates an array and populates it with initial elements.
+    pub fn alloc_array_with_elements(&mut self, elements: &[RegisterValue]) -> ObjectHandle {
+        let handle = self.alloc_array();
+        for &elem in elements {
+            self.objects
+                .push_element(handle, elem)
+                .expect("array push should succeed");
+        }
+        handle
+    }
+
+    /// Extracts elements from an array handle into a Vec of RegisterValues.
+    pub fn array_to_args(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<RegisterValue>, VmNativeCallError> {
+        self.objects.array_elements(handle).map_err(|e| {
+            VmNativeCallError::Internal(format!("array_to_args failed: {e:?}").into())
+        })
+    }
+
     /// Allocates one string object with the runtime default prototype.
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
         let prototype = self.intrinsics.string_prototype();
@@ -652,35 +679,100 @@ impl RuntimeState {
         handle
     }
 
+    /// Registers a native function and installs it as a property on the global object.
+    ///
+    /// This is the primary API for embedders to inject host-provided globals
+    /// (e.g., `print`, `$DONE`, `$262`) into the runtime.
+    pub fn install_native_global(
+        &mut self,
+        descriptor: crate::descriptors::NativeFunctionDescriptor,
+    ) -> ObjectHandle {
+        let host_fn = self.native_functions.register(descriptor);
+        let handle = self.alloc_host_function(host_fn);
+        let global = self.intrinsics.global_object();
+        let prop = self.property_names.intern(
+            self.native_functions
+                .get(host_fn)
+                .expect("just registered")
+                .js_name(),
+        );
+        self.objects
+            .set_property(global, prop, RegisterValue::from_object_handle(handle.0))
+            .expect("global property installation should succeed");
+        handle
+    }
+
+    /// Installs a value property on the global object.
+    pub fn install_global_value(&mut self, name: &str, value: RegisterValue) {
+        let global = self.intrinsics.global_object();
+        let prop = self.property_names.intern(name);
+        self.objects
+            .set_property(global, prop, value)
+            .expect("global property installation should succeed");
+    }
+
     /// Allocates one bytecode closure with the runtime default function prototype.
     pub fn alloc_closure(
         &mut self,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
+        flags: ObjectClosureFlags,
     ) -> ObjectHandle {
         let prototype = self.intrinsics.function_prototype();
-        let handle = self.objects.alloc_closure(callee, upvalues);
+        let handle = self.objects.alloc_closure(callee, upvalues, flags);
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
-        let prototype_property = self.intern_property_name("prototype");
-        let constructor_property = self.intern_property_name("constructor");
-        let instance_prototype = self.alloc_object();
-        self.objects
-            .set_property(
-                handle,
-                prototype_property,
-                RegisterValue::from_object_handle(instance_prototype.0),
-            )
-            .expect("closure prototype object should install");
-        self.objects
-            .set_property(
-                instance_prototype,
-                constructor_property,
-                RegisterValue::from_object_handle(handle.0),
-            )
-            .expect("closure prototype.constructor should install");
+        // Only constructable closures get a .prototype property (§10.2.6).
+        if flags.is_constructable() {
+            let prototype_property = self.intern_property_name("prototype");
+            let constructor_property = self.intern_property_name("constructor");
+            let instance_prototype = self.alloc_object();
+            self.objects
+                .define_own_property(
+                    handle,
+                    prototype_property,
+                    PropertyValue::data_with_attrs(
+                        RegisterValue::from_object_handle(instance_prototype.0),
+                        PropertyAttributes::frozen(),
+                    ),
+                )
+                .expect("closure prototype object should install");
+            self.objects
+                .define_own_property(
+                    instance_prototype,
+                    constructor_property,
+                    PropertyValue::data_with_attrs(
+                        RegisterValue::from_object_handle(handle.0),
+                        PropertyAttributes::constructor_link(),
+                    ),
+                )
+                .expect("closure prototype.constructor should install");
+        }
         handle
+    }
+
+    /// ES2024 §7.2.4 IsConstructor — checks if a value has `[[Construct]]`.
+    pub fn is_constructible(&self, handle: ObjectHandle) -> bool {
+        match self.objects.kind(handle) {
+            Ok(HeapValueKind::HostFunction) => {
+                // Host functions are constructors only if registered with Constructor slot kind.
+                if let Ok(Some(host_fn_id)) = self.objects.host_function(handle) {
+                    self.native_functions
+                        .get(host_fn_id)
+                        .is_some_and(|desc| {
+                            desc.slot_kind() == crate::descriptors::NativeSlotKind::Constructor
+                        })
+                } else {
+                    false
+                }
+            }
+            Ok(HeapValueKind::Closure) => self
+                .objects
+                .closure_flags(handle)
+                .is_ok_and(|f| f.is_constructable()),
+            _ => false,
+        }
     }
 
     /// Resolves one native payload from a payload-bearing object.
@@ -790,7 +882,7 @@ impl RuntimeState {
                 VmNativeCallError::Internal(format!("ordinary get failed: {error:?}").into())
             })? {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data(value) => Ok(value),
+                PropertyValue::Data { value, .. } => Ok(value),
                 PropertyValue::Accessor { getter, .. } => self.call_host_function(
                     getter,
                     RegisterValue::from_object_handle(receiver.0),
@@ -816,7 +908,7 @@ impl RuntimeState {
                 VmNativeCallError::Internal(format!("ordinary set failed: {error:?}").into())
             })? {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data(_) if lookup.owner() == receiver => {
+                PropertyValue::Data { .. } if lookup.owner() == receiver => {
                     let cache = lookup.cache().ok_or_else(|| {
                         VmNativeCallError::Internal(
                             "receiver own-property lookup must carry cache metadata".into(),
@@ -842,7 +934,7 @@ impl RuntimeState {
                     }
                     Ok(())
                 }
-                PropertyValue::Data(_) => {
+                PropertyValue::Data { .. } => {
                     self.objects
                         .set_property(receiver, property, value)
                         .map_err(|error| {
@@ -874,7 +966,7 @@ impl RuntimeState {
         }
     }
 
-    fn call_host_function(
+    pub fn call_host_function(
         &mut self,
         callable: Option<ObjectHandle>,
         receiver: RegisterValue,
@@ -883,6 +975,23 @@ impl RuntimeState {
         let Some(callable) = callable else {
             return Ok(RegisterValue::undefined());
         };
+
+        // ES2024 §10.4.1.1 [[Call]] — resolve bound function chain.
+        if let Ok(HeapValueKind::BoundFunction) = self.objects.kind(callable) {
+            let (target, bound_this, bound_args) = self
+                .objects
+                .bound_function_parts(callable)
+                .map_err(|e| {
+                    VmNativeCallError::Internal(
+                        format!("bound function resolution: {e:?}").into(),
+                    )
+                })?;
+            // Prepend bound_args to arguments.
+            let mut full_args = bound_args;
+            full_args.extend_from_slice(arguments);
+            return self.call_host_function(Some(target), bound_this, &full_args);
+        }
+
         let host_function = self
             .objects
             .host_function(callable)
@@ -930,7 +1039,7 @@ impl RuntimeState {
         if lookup.owner() != handle {
             return Ok(None);
         }
-        let PropertyValue::Data(value) = lookup.value() else {
+        let PropertyValue::Data { value, .. } = lookup.value() else {
             return Ok(None);
         };
         Ok(Some(value))
@@ -1053,7 +1162,7 @@ impl RuntimeState {
     }
 
     /// ES spec 7.1.4 ToNumber — converts a value to its numeric representation.
-    fn js_to_number(&mut self, value: RegisterValue) -> Result<f64, InterpreterError> {
+    pub fn js_to_number(&mut self, value: RegisterValue) -> Result<f64, InterpreterError> {
         if value == RegisterValue::undefined() {
             return Ok(f64::NAN);
         }
@@ -1082,13 +1191,13 @@ impl RuntimeState {
     }
 
     /// ES spec 7.1.6 ToInt32 — converts a value to a signed 32-bit integer.
-    fn js_to_int32(&mut self, value: RegisterValue) -> Result<i32, InterpreterError> {
+    pub fn js_to_int32(&mut self, value: RegisterValue) -> Result<i32, InterpreterError> {
         let n = self.js_to_number(value)?;
         Ok(f64_to_int32(n))
     }
 
     /// ES spec 7.1.7 ToUint32 — converts a value to an unsigned 32-bit integer.
-    fn js_to_uint32(&mut self, value: RegisterValue) -> Result<u32, InterpreterError> {
+    pub fn js_to_uint32(&mut self, value: RegisterValue) -> Result<u32, InterpreterError> {
         let n = self.js_to_number(value)?;
         Ok(f64_to_uint32(n))
     }
@@ -1188,7 +1297,7 @@ impl RuntimeState {
         let proto_prop = self.intern_property_name("prototype");
         let proto_value = match self.objects.get_property(ctor_handle, proto_prop)? {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data(v) => v,
+                PropertyValue::Data { value: v, .. } => v,
                 PropertyValue::Accessor { .. } => RegisterValue::undefined(),
             },
             None => RegisterValue::undefined(),
@@ -1308,7 +1417,9 @@ impl RuntimeState {
         } else if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             match self.objects.kind(handle)? {
                 HeapValueKind::String => "string",
-                HeapValueKind::HostFunction | HeapValueKind::Closure => "function",
+                HeapValueKind::HostFunction
+                | HeapValueKind::Closure
+                | HeapValueKind::BoundFunction => "function",
                 HeapValueKind::Object
                 | HeapValueKind::Array
                 | HeapValueKind::UpvalueCell
@@ -1516,6 +1627,14 @@ impl Interpreter {
                         .ok_or(InterpreterError::RegisterOutOfBounds)?;
                     activation.set_register(abs, arg)?;
                 }
+
+                // ES2024 §10.4.4: Preserve overflow arguments for CreateArguments.
+                if arguments.len() > param_count as usize {
+                    activation.overflow_args = arguments[param_count as usize..].to_vec();
+                }
+                // Store actual argument count in metadata.
+                activation.metadata =
+                    FrameMetadata::new(arguments.len() as RegisterIndex, FrameFlags::default());
 
                 let interpreter = Interpreter::new();
                 let result = interpreter.run_with_runtime(module, &mut activation, runtime)?;
@@ -1802,11 +1921,81 @@ impl Interpreter {
                     upvalues.push(runtime.objects.alloc_upvalue(value));
                 }
 
-                let handle = runtime.alloc_closure(template.callee(), upvalues);
+                let handle = runtime.alloc_closure(template.callee(), upvalues, template.flags());
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
                     RegisterValue::from_object_handle(handle.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // -----------------------------------------------------------------
+            // ES2024 §10.4.4 CreateArguments — creates the arguments exotic object.
+            //
+            // Collects formal parameter values from the activation register file
+            // and overflow arguments from `activation.overflow_args`, then builds
+            // an arguments object with:
+            //   - Indexed element access (§10.4.4.1 [[GetOwnProperty]])
+            //   - `length` property = actual argument count (§10.4.4.6 step 7)
+            //   - `callee` property = current closure (sloppy mode, §10.4.4.7 step 13)
+            //   - Prototype = %Object.prototype% (NOT Array.prototype)
+            // -----------------------------------------------------------------
+            Opcode::CreateArguments => {
+                let actual_argc = activation.metadata.argument_count();
+                let param_count = function.frame_layout().parameter_count();
+                let param_range = function.frame_layout().parameter_range();
+
+                // Collect all actual arguments: formal params from registers + overflow.
+                let mut all_args = Vec::with_capacity(usize::from(actual_argc));
+                let copy_from_regs = actual_argc.min(param_count);
+                for i in 0..copy_from_regs {
+                    let value = activation
+                        .read_bytecode_register(function, param_range.start().saturating_add(i))?;
+                    all_args.push(value);
+                }
+                for overflow_val in &activation.overflow_args {
+                    all_args.push(*overflow_val);
+                }
+
+                // Create arguments exotic object backed by an Array with Object.prototype.
+                let obj_proto = runtime.intrinsics().object_prototype();
+                let args_obj = runtime.alloc_array_with_elements(&all_args);
+                // §10.4.4.6 step 4: Set prototype to %Object.prototype% (not Array.prototype).
+                runtime
+                    .objects_mut()
+                    .set_prototype(args_obj, Some(obj_proto))
+                    .ok();
+
+                // §10.4.4.6 step 7: Install `length` as own data property {W:true, E:false, C:true}.
+                let length_key = runtime.intern_property_name("length");
+                runtime.objects_mut().define_own_property(
+                    args_obj,
+                    length_key,
+                    PropertyValue::data_with_attrs(
+                        RegisterValue::from_i32(i32::from(actual_argc)),
+                        PropertyAttributes::builtin_method(),
+                    ),
+                ).ok();
+
+                // §10.4.4.7 step 13: Install `callee` (sloppy mode only).
+                // For now, install if closure is available.
+                if let Some(closure) = activation.closure_handle() {
+                    let callee_key = runtime.intern_property_name("callee");
+                    runtime.objects_mut().define_own_property(
+                        args_obj,
+                        callee_key,
+                        PropertyValue::data_with_attrs(
+                            RegisterValue::from_object_handle(closure.0),
+                            PropertyAttributes::builtin_method(),
+                        ),
+                    ).ok();
+                }
+
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(args_obj.0),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -2127,7 +2316,7 @@ impl Interpreter {
 
                 let value = if let Some(cache) = frame_runtime.property_cache(function, pc) {
                     match runtime.objects.get_cached(handle, property, cache)? {
-                        Some(PropertyValue::Data(value)) => value,
+                        Some(PropertyValue::Data { value, .. }) => value,
                         Some(PropertyValue::Accessor { getter, .. }) => {
                             Self::invoke_accessor_getter(runtime, handle, getter)?
                         }
@@ -2163,7 +2352,7 @@ impl Interpreter {
 
                 let handled = if let Some(cache) = frame_runtime.property_cache(function, pc) {
                     match runtime.objects.get_cached(handle, property, cache)? {
-                        Some(PropertyValue::Data(_)) => {
+                        Some(PropertyValue::Data { .. }) => {
                             runtime.objects.set_cached(handle, property, value, cache)?
                         }
                         Some(PropertyValue::Accessor { setter, .. }) => {
@@ -2203,6 +2392,20 @@ impl Interpreter {
             Opcode::DeleteProperty => {
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
                 let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let deleted = runtime.delete_named_property(handle, property)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(deleted),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::DeleteComputed => {
+                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let key_value = activation.read_bytecode_register(function, instruction.c())?;
+                let key_str = runtime.js_to_string_infallible(key_value);
+                let property = runtime.intern_property_name(&key_str);
                 let deleted = runtime.delete_named_property(handle, property)?;
                 activation.write_bytecode_register(
                     function,
@@ -2273,7 +2476,7 @@ impl Interpreter {
                 match value {
                     Some(lookup) => {
                         let val = match lookup.value() {
-                            PropertyValue::Data(v) => v,
+                            PropertyValue::Data { value: v, .. } => v,
                             PropertyValue::Accessor { .. } => RegisterValue::undefined(),
                         };
                         activation.write_bytecode_register(function, instruction.a(), val)?;
@@ -2407,6 +2610,31 @@ impl Interpreter {
                     .as_object_handle()
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
+
+                // ES2024 §10.4.1.1 [[Call]] — resolve bound function before dispatch.
+                if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callee) {
+                    let receiver = Self::resolve_call_receiver(
+                        caller_function,
+                        activation,
+                        call.flags(),
+                        call.receiver(),
+                        None,
+                    )?;
+                    let arguments = Self::read_call_arguments(
+                        caller_function,
+                        activation,
+                        instruction.c(),
+                        call.argument_count(),
+                    )?;
+                    match Self::invoke_host_function_handle(runtime, callee, receiver, &arguments)? {
+                        Completion::Return(value) => {
+                            activation.write_bytecode_register(function, instruction.a(), value)?;
+                            activation.advance();
+                            return Ok(StepOutcome::Continue);
+                        }
+                        Completion::Throw(value) => return Ok(StepOutcome::Throw(value)),
+                    }
+                }
 
                 if let Some(host_function) = runtime.objects.host_function(callee)? {
                     match Self::invoke_host_function(
@@ -2648,7 +2876,7 @@ impl Interpreter {
                     frame_runtime.update_property_cache(function, pc, cache);
                 }
                 match lookup.value() {
-                    PropertyValue::Data(value) => Ok(value),
+                    PropertyValue::Data { value, .. } => Ok(value),
                     PropertyValue::Accessor { getter, .. } => {
                         Self::invoke_accessor_getter(runtime, handle, getter)
                     }
@@ -2673,13 +2901,13 @@ impl Interpreter {
                     frame_runtime.update_property_cache(function, pc, cache);
                 }
                 match lookup.value() {
-                    PropertyValue::Data(_) if lookup.owner() == handle => {
+                    PropertyValue::Data { .. } if lookup.owner() == handle => {
                         let cache = lookup
                             .cache()
                             .expect("own-property lookup should yield a receiver cache");
                         Ok(runtime.objects.set_cached(handle, property, value, cache)?)
                     }
-                    PropertyValue::Data(_) => Ok(false),
+                    PropertyValue::Data { .. } => Ok(false),
                     PropertyValue::Accessor { setter, .. } => {
                         Self::invoke_accessor_setter(runtime, handle, setter, value)?;
                         Ok(true)
@@ -2784,12 +3012,22 @@ impl Interpreter {
             .function(caller_activation.function_index())
             .expect("activation function index must be valid");
         let parameter_range = callee.frame_layout().parameter_range();
-        let copy_count = call.argument_count().min(parameter_range.len());
+        let actual_argc = call.argument_count();
+        let copy_count = actual_argc.min(parameter_range.len());
 
         for offset in 0..copy_count {
             let value = caller_activation
                 .read_bytecode_register(caller_function, arg_start.saturating_add(offset))?;
             activation.set_register(parameter_range.start().saturating_add(offset), value)?;
+        }
+
+        // ES2024 §10.4.4: Preserve overflow arguments for CreateArguments opcode.
+        if actual_argc > parameter_range.len() {
+            for offset in parameter_range.len()..actual_argc {
+                let value = caller_activation
+                    .read_bytecode_register(caller_function, arg_start.saturating_add(offset))?;
+                activation.overflow_args.push(value);
+            }
         }
 
         Self::initialize_receiver(
@@ -2980,6 +3218,16 @@ impl Interpreter {
         receiver: RegisterValue,
         arguments: &[RegisterValue],
     ) -> Result<Completion, InterpreterError> {
+        // ES2024 §10.4.1.1 [[Call]] — resolve bound function chain.
+        if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callable) {
+            let (target, bound_this, bound_args) = runtime
+                .objects
+                .bound_function_parts(callable)?;
+            let mut full_args = bound_args;
+            full_args.extend_from_slice(arguments);
+            return Self::invoke_host_function_handle(runtime, target, bound_this, &full_args);
+        }
+
         let host_function = runtime
             .objects
             .host_function(callable)?
@@ -3047,7 +3295,7 @@ impl Interpreter {
             .get_property(constructor, prototype_property)?
         {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data(value) => value
+                PropertyValue::Data { value, .. } => value
                     .as_object_handle()
                     .map(ObjectHandle)
                     .unwrap_or(default_prototype),
@@ -3122,7 +3370,7 @@ mod tests {
         let backing = runtime.intern_property_name("__backing");
         match runtime.objects().get_property(receiver, backing) {
             Ok(Some(lookup)) => match lookup.value() {
-                PropertyValue::Data(value) => Ok(value),
+                PropertyValue::Data { value, .. } => Ok(value),
                 PropertyValue::Accessor { .. } => Ok(RegisterValue::undefined()),
             },
             Ok(None) => Ok(RegisterValue::undefined()),
@@ -4284,7 +4532,7 @@ mod tests {
         assert_eq!(object_lookup.owner(), object);
         assert_eq!(
             object_lookup.value(),
-            PropertyValue::Data(RegisterValue::from_i32(7))
+            PropertyValue::data(RegisterValue::from_i32(7))
         );
         let prototype_lookup = runtime
             .objects()
@@ -4294,7 +4542,7 @@ mod tests {
         assert_eq!(prototype_lookup.owner(), prototype);
         assert_eq!(
             prototype_lookup.value(),
-            PropertyValue::Data(RegisterValue::from_i32(1))
+            PropertyValue::data(RegisterValue::from_i32(1))
         );
     }
 
@@ -4389,7 +4637,7 @@ mod tests {
         assert_eq!(backing_lookup.owner(), object);
         assert_eq!(
             backing_lookup.value(),
-            PropertyValue::Data(RegisterValue::from_i32(7))
+            PropertyValue::data(RegisterValue::from_i32(7))
         );
     }
 
@@ -4835,7 +5083,7 @@ mod tests {
 
 /// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
 /// ES spec 7.1.6 ToInt32(argument).
-fn f64_to_int32(n: f64) -> i32 {
+pub(crate) fn f64_to_int32(n: f64) -> i32 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }
@@ -4850,7 +5098,7 @@ fn f64_to_int32(n: f64) -> i32 {
 }
 
 /// ES spec 7.1.7 ToUint32(argument).
-fn f64_to_uint32(n: f64) -> u32 {
+pub(crate) fn f64_to_uint32(n: f64) -> u32 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }

@@ -13,6 +13,11 @@ doctest = false
 
 [[bin]]
 name = "test262"
+path = "src/bin/test262_new.rs"
+test = false
+
+[[bin]]
+name = "test262-legacy"
 path = "src/main.rs"
 test = false
 
@@ -23,6 +28,7 @@ test = false
 
 [dependencies]
 otter-engine = { path = "../otter-engine", version = "0.1.3" }
+otter-runtime = { path = "../otter-runtime", version = "0.1.0" }
 otter-vm-core = { path = "../otter-vm-core", version = "0.1.0" }
 # Supporting crates (for features not in engine)
 otter-kv = { path = "../otter-kv", version = "0.1.0" }

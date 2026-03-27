@@ -46,7 +46,7 @@ pub extern "C" fn otter_next_get_prop_shaped(
         return write_bailout(ctx, BailoutReason::ShapeGuardFailed, bytecode_pc as u32) as i64;
     };
     match runtime.objects().get_shaped(handle, shape_id, slot_index) {
-        Ok(Some(PropertyValue::Data(value))) => value.raw_bits() as i64,
+        Ok(Some(PropertyValue::Data { value, .. })) => value.raw_bits() as i64,
         Ok(Some(PropertyValue::Accessor { .. })) => {
             write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64
         }

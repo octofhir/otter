@@ -75,6 +75,14 @@ fn function_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("apply", 2, function_apply),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("bind", 1, function_bind),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("toString", 0, function_to_string),
         ))
 }
@@ -139,6 +147,59 @@ fn function_call(
         .ok_or_else(|| VmNativeCallError::Internal("host function descriptor is missing".into()))?;
 
     (descriptor.callback())(&receiver, forwarded, runtime)
+}
+
+/// ES2024 §20.2.3.1 Function.prototype.apply(thisArg, argArray)
+fn function_apply(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let callable = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Function.prototype.apply requires callable receiver".into())
+    })?;
+    let receiver = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // Extract args from argArray (second argument).
+    let call_args = if let Some(arg_array) = args.get(1).copied()
+        && let Some(handle) = arg_array.as_object_handle().map(ObjectHandle)
+    {
+        runtime.array_to_args(handle)?
+    } else {
+        Vec::new()
+    };
+
+    runtime.call_host_function(Some(callable), receiver, &call_args)
+}
+
+/// ES2024 §20.2.3.2 Function.prototype.bind(thisArg, ...args)
+///
+/// Creates a bound function that wraps the original with a fixed `this` and
+/// optional prepended arguments. The bound function is a new host function
+/// object that delegates to the original on invocation.
+fn function_bind(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Function.prototype.bind requires callable receiver".into())
+    })?;
+    let bound_this = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let bound_args: Vec<RegisterValue> = args.get(1..).unwrap_or(&[]).to_vec();
+
+    // ES2024 §10.4.1.3 BoundFunctionCreate — create a proper bound function exotic object.
+    let bound = runtime
+        .objects_mut()
+        .alloc_bound_function(target, bound_this, bound_args);
+
+    Ok(RegisterValue::from_object_handle(bound.0))
 }
 
 fn function_to_string(

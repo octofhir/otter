@@ -44,5 +44,8 @@ pub use runtime::{OtterRuntime, RunError};
 // Re-export commonly used types from otter-vm so users don't need to
 // depend on otter-vm directly.
 pub use otter_vm::console;
-pub use otter_vm::interpreter::ExecutionResult;
+pub use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError, VmNativeFunction};
+pub use otter_vm::interpreter::{ExecutionResult, RuntimeState};
+pub use otter_vm::object::ObjectHandle;
+pub use otter_vm::source;
 pub use otter_vm::value::RegisterValue;

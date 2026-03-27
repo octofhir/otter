@@ -1,6 +1,6 @@
 use crate::builders::{ClassInstallPlan, ClassMemberPlan, ObjectInstallPlan, ObjectMemberPlan};
 use crate::host::NativeFunctionRegistry;
-use crate::object::{ObjectHandle, ObjectHeap};
+use crate::object::{ObjectHandle, ObjectHeap, PropertyAttributes, PropertyValue};
 use crate::property::PropertyNameRegistry;
 use crate::value::RegisterValue;
 
@@ -82,11 +82,22 @@ pub(super) fn install_object_plan(
             ObjectMemberPlan::Method(function) => {
                 let host_function = cx.native_functions.register(function.clone());
                 let handle = cx.alloc_intrinsic_host_function(host_function, function_prototype)?;
+                // ES2024 §10.2.8 SetFunctionLength + §10.2.9 SetFunctionName
+                install_function_length_name(
+                    handle,
+                    function.length(),
+                    function.js_name(),
+                    cx,
+                )?;
                 let property = cx.property_names.intern(function.js_name());
-                cx.heap.set_property(
+                // ES2024 §18: built-in methods are {W:true, E:false, C:true}.
+                cx.heap.define_own_property(
                     target,
                     property,
-                    RegisterValue::from_object_handle(handle.0),
+                    PropertyValue::data_with_attrs(
+                        RegisterValue::from_object_handle(handle.0),
+                        PropertyAttributes::builtin_method(),
+                    ),
                 )?;
             }
             ObjectMemberPlan::Accessor(accessor) => {
@@ -125,18 +136,26 @@ pub(super) fn install_class_plan(
     install_class_members(prototype, plan.prototype_members(), function_prototype, cx)?;
     install_class_members(constructor, plan.static_members(), function_prototype, cx)?;
 
+    // ES2024 §10.2.6 step 7: Constructor.prototype = {W:false, E:false, C:false}.
     let prototype_property = cx.property_names.intern("prototype");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         constructor,
         prototype_property,
-        RegisterValue::from_object_handle(prototype.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(prototype.0),
+            PropertyAttributes::frozen(),
+        ),
     )?;
 
+    // ES2024 §10.2.6 step 8: prototype.constructor = {W:true, E:false, C:true}.
     let constructor_property = cx.property_names.intern("constructor");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         prototype,
         constructor_property,
-        RegisterValue::from_object_handle(constructor.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(constructor.0),
+            PropertyAttributes::constructor_link(),
+        ),
     )?;
 
     Ok(())
@@ -153,11 +172,16 @@ fn install_class_members(
             ClassMemberPlan::Method(function) => {
                 let host_function = cx.native_functions.register(function.clone());
                 let handle = cx.alloc_intrinsic_host_function(host_function, function_prototype)?;
+                install_function_length_name(handle, function.length(), function.js_name(), cx)?;
                 let property = cx.property_names.intern(function.js_name());
-                cx.heap.set_property(
+                // ES2024 §18: built-in methods are {W:true, E:false, C:true}.
+                cx.heap.define_own_property(
                     target,
                     property,
-                    RegisterValue::from_object_handle(handle.0),
+                    PropertyValue::data_with_attrs(
+                        RegisterValue::from_object_handle(handle.0),
+                        PropertyAttributes::builtin_method(),
+                    ),
                 )?;
             }
             ClassMemberPlan::Accessor(accessor) => {
@@ -183,6 +207,38 @@ fn install_class_members(
         }
     }
 
+    Ok(())
+}
+
+/// ES2024 §10.2.8 SetFunctionLength + §10.2.9 SetFunctionName.
+///
+/// Installs `.length` and `.name` as non-writable, non-enumerable, configurable
+/// data properties on a host function object.
+fn install_function_length_name(
+    handle: ObjectHandle,
+    length: u16,
+    name: &str,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let length_prop = cx.property_names.intern("length");
+    cx.heap.define_own_property(
+        handle,
+        length_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_i32(i32::from(length)),
+            PropertyAttributes::function_length(),
+        ),
+    )?;
+    let name_prop = cx.property_names.intern("name");
+    let name_handle = cx.heap.alloc_string(name);
+    cx.heap.define_own_property(
+        handle,
+        name_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(name_handle.0),
+            PropertyAttributes::function_length(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -255,7 +311,7 @@ mod tests {
             .get_property(intrinsics.global_object(), tools)
             .expect("global lookup should succeed")
             .expect("namespace should be installed");
-        let PropertyValue::Data(global_value) = global_lookup.value() else {
+        let PropertyValue::Data { value: global_value, .. } = global_lookup.value() else {
             panic!("namespace should install as a data property");
         };
         assert_eq!(global_value, RegisterValue::from_object_handle(namespace.0));
@@ -265,7 +321,7 @@ mod tests {
             .get_property(namespace, double)
             .expect("method lookup should succeed")
             .expect("namespace method should install");
-        let PropertyValue::Data(method) = method_lookup.value() else {
+        let PropertyValue::Data { value: method, .. } = method_lookup.value() else {
             panic!("namespace method should be a data property");
         };
         let method = method

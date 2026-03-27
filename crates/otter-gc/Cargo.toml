@@ -1,0 +1,16 @@
+[package]
+name = "otter-gc"
+version = "0.1.0"
+edition = "2024"
+description = "Page-based generational tracing garbage collector for the Otter JS runtime"
+license = "MIT"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+# No external dependencies. Page allocation uses std::alloc with Layout alignment
+# (maps to posix_memalign on Unix, _aligned_malloc on Windows).

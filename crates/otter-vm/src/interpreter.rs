@@ -492,6 +492,20 @@ impl RuntimeState {
         self.native_functions.register(descriptor)
     }
 
+    /// GC safepoint — called at loop back-edges and function call boundaries.
+    /// Collects roots from intrinsics and the provided register window,
+    /// then triggers collection if memory pressure warrants it.
+    pub fn gc_safepoint(&mut self, registers: &[RegisterValue]) {
+        let mut roots = self.intrinsics.gc_root_handles();
+        // Extract ObjectHandle roots from the current register window.
+        for reg in registers {
+            if let Some(handle) = reg.as_object_handle() {
+                roots.push(ObjectHandle(handle));
+            }
+        }
+        self.objects.maybe_collect_garbage(&roots);
+    }
+
     /// Allocates one ordinary object with the runtime default prototype.
     pub fn alloc_object(&mut self) -> ObjectHandle {
         let prototype = self.intrinsics.object_prototype();
@@ -2311,6 +2325,7 @@ impl Interpreter {
                 let offset = instruction.immediate_i32();
                 if offset < 0 {
                     self.check_interrupt()?;
+                    runtime.gc_safepoint(activation.registers());
                 }
                 activation.jump_relative(offset)?;
                 Ok(StepOutcome::Continue)
@@ -2321,6 +2336,7 @@ impl Interpreter {
                     let offset = instruction.immediate_i32();
                     if offset < 0 {
                         self.check_interrupt()?;
+                        runtime.gc_safepoint(activation.registers());
                     }
                     activation.jump_relative(offset)?;
                 } else {
@@ -2336,6 +2352,7 @@ impl Interpreter {
                     let offset = instruction.immediate_i32();
                     if offset < 0 {
                         self.check_interrupt()?;
+                        runtime.gc_safepoint(activation.registers());
                     }
                     activation.jump_relative(offset)?;
                 }

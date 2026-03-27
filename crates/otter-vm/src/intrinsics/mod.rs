@@ -435,6 +435,40 @@ impl VmIntrinsics {
         &self.well_known_symbols
     }
 
+    /// Collects all ObjectHandle roots owned by intrinsics for GC.
+    pub fn gc_root_handles(&self) -> Vec<ObjectHandle> {
+        let mut roots = Vec::with_capacity(20 + self.namespace_roots.len());
+        roots.extend_from_slice(&[
+            self.global_object,
+            self.object_prototype,
+            self.function_prototype,
+            self.string_constructor,
+            self.number_constructor,
+            self.boolean_constructor,
+            self.object_constructor,
+            self.function_constructor,
+            self.array_constructor,
+            self.array_prototype,
+            self.string_prototype,
+            self.number_prototype,
+            self.boolean_prototype,
+            self.error_prototype,
+            self.error_constructor,
+            self.type_error_prototype,
+            self.type_error_constructor,
+            self.reference_error_prototype,
+            self.reference_error_constructor,
+            self.range_error_prototype,
+            self.range_error_constructor,
+            self.syntax_error_prototype,
+            self.syntax_error_constructor,
+        ]);
+        if let Some(h) = self.math_namespace { roots.push(h); }
+        if let Some(h) = self.reflect_namespace { roots.push(h); }
+        roots.extend_from_slice(&self.namespace_roots);
+        roots
+    }
+
     /// Enumerates all roots owned by the intrinsic registry.
     pub fn trace_roots(&self, tracer: &mut dyn FnMut(IntrinsicRoot)) {
         for handle in [

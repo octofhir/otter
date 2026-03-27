@@ -1,5 +1,7 @@
 //! Minimal object heap and inline-cache support for the new VM.
 
+use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
+
 use crate::host::HostFunctionId;
 use crate::module::FunctionIndex;
 use crate::payload::NativePayloadId;
@@ -222,11 +224,119 @@ enum HeapValue {
     },
 }
 
-/// Small object heap used by the early `otter-vm` interpreter.
-#[derive(Debug, Default, Clone, PartialEq)]
+/// Visit an ObjectHandle as a GcHandle for tracing.
+fn trace_handle(handle: ObjectHandle, visitor: &mut dyn FnMut(GcHandle)) {
+    visitor(GcHandle(handle.0));
+}
+
+/// Visit a RegisterValue that may contain an object handle.
+fn trace_register_value(value: RegisterValue, visitor: &mut dyn FnMut(GcHandle)) {
+    if let Some(handle) = value.as_object_handle() {
+        visitor(GcHandle(handle));
+    }
+}
+
+/// Visit all GC pointers in a PropertyValue.
+fn trace_property_value(pv: &PropertyValue, visitor: &mut dyn FnMut(GcHandle)) {
+    match pv {
+        PropertyValue::Data(value) => trace_register_value(*value, visitor),
+        PropertyValue::Accessor { getter, setter } => {
+            if let Some(g) = getter {
+                trace_handle(*g, visitor);
+            }
+            if let Some(s) = setter {
+                trace_handle(*s, visitor);
+            }
+        }
+    }
+}
+
+impl Traceable for HeapValue {
+    fn trace_handles(&self, visitor: &mut dyn FnMut(GcHandle)) {
+        match self {
+            HeapValue::Object { prototype, values, .. }
+            | HeapValue::NativeObject { prototype, values, .. }
+            | HeapValue::HostFunction { prototype, values, .. } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+            }
+            HeapValue::Closure { prototype, values, upvalues, .. } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+                for uv in upvalues {
+                    trace_handle(*uv, visitor);
+                }
+            }
+            HeapValue::Array { prototype, elements } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for elem in elements {
+                    trace_register_value(*elem, visitor);
+                }
+            }
+            HeapValue::String { prototype, .. } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+            }
+            HeapValue::UpvalueCell { value } => {
+                trace_register_value(*value, visitor);
+            }
+            HeapValue::ArrayIterator { iterable, .. }
+            | HeapValue::StringIterator { iterable, .. } => {
+                trace_handle(*iterable, visitor);
+            }
+            HeapValue::PropertyIterator { key_handles, .. } => {
+                for h in key_handles {
+                    trace_handle(*h, visitor);
+                }
+            }
+        }
+    }
+}
+
+/// Object heap backed by the otter-gc TypedHeap for automatic collection.
 pub struct ObjectHeap {
-    objects: Vec<HeapValue>,
+    heap: TypedHeap,
     next_shape_id: u64,
+}
+
+impl std::fmt::Debug for ObjectHeap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectHeap")
+            .field("live_count", &self.heap.live_count())
+            .field("next_shape_id", &self.next_shape_id)
+            .finish()
+    }
+}
+
+impl Default for ObjectHeap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for ObjectHeap {
+    fn eq(&self, _other: &Self) -> bool {
+        false // Heaps are never structurally equal
+    }
+}
+
+impl Clone for ObjectHeap {
+    fn clone(&self) -> Self {
+        // ObjectHeap is not meaningfully clonable — return a fresh heap.
+        // This exists only to satisfy derived trait bounds on parent structs.
+        Self::new()
+    }
 }
 
 impl ObjectHeap {
@@ -234,63 +344,58 @@ impl ObjectHeap {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            objects: Vec::new(),
+            heap: TypedHeap::new(),
             next_shape_id: 1,
         }
     }
 
     /// Allocates a plain empty object.
     pub fn alloc_object(&mut self) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         let shape_id = self.allocate_shape();
-        self.objects.push(HeapValue::Object {
+        let h = self.heap.alloc(HeapValue::Object {
             prototype: None,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Allocates an ordinary object that carries one native payload link.
     pub fn alloc_native_object(&mut self, payload: NativePayloadId) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         let shape_id = self.allocate_shape();
-        self.objects.push(HeapValue::NativeObject {
+        let h = self.heap.alloc(HeapValue::NativeObject {
             prototype: None,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
             payload,
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Allocates an empty dense array.
     pub fn alloc_array(&mut self) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::Array {
+        let h = self.heap.alloc(HeapValue::Array {
             prototype: None,
             elements: Vec::new(),
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Allocates a string value.
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::String {
+        let h = self.heap.alloc(HeapValue::String {
             prototype: None,
             value: value.into(),
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Allocates a mutable upvalue cell.
     pub fn alloc_upvalue(&mut self, value: RegisterValue) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::UpvalueCell { value });
-        handle
+        let h = self.heap.alloc(HeapValue::UpvalueCell { value });
+        ObjectHandle(h.0)
     }
 
     /// Allocates a closure object with captured upvalue cells.
@@ -299,9 +404,8 @@ impl ObjectHeap {
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
     ) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         let shape_id = self.allocate_shape();
-        self.objects.push(HeapValue::Closure {
+        let h = self.heap.alloc(HeapValue::Closure {
             prototype: None,
             shape_id,
             keys: Vec::new(),
@@ -309,21 +413,20 @@ impl ObjectHeap {
             callee,
             upvalues,
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Allocates a host-callable native function object.
     pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
         let shape_id = self.allocate_shape();
-        self.objects.push(HeapValue::HostFunction {
+        let h = self.heap.alloc(HeapValue::HostFunction {
             function,
             prototype: None,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
         });
-        handle
+        ObjectHandle(h.0)
     }
 
     /// Returns the heap-value kind for the given handle.
@@ -536,9 +639,8 @@ impl ObjectHeap {
             _ => return Err(ObjectError::InvalidKind),
         };
 
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(iterator);
-        Ok(handle)
+        let h = self.heap.alloc(iterator);
+        Ok(ObjectHandle(h.0))
     }
 
     /// Advances an internal iterator by one step.
@@ -610,12 +712,11 @@ impl ObjectHeap {
     /// and pre-allocates string handles for them.
     /// Creates an empty property iterator (for null/undefined/primitives in for..in).
     pub fn alloc_empty_property_iterator(&mut self) -> Result<ObjectHandle, ObjectError> {
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::PropertyIterator {
+        let h = self.heap.alloc(HeapValue::PropertyIterator {
             key_handles: Vec::new(),
             next_index: 0,
         });
-        Ok(handle)
+        Ok(ObjectHandle(h.0))
     }
 
     pub fn alloc_property_iterator(
@@ -660,12 +761,11 @@ impl ObjectHeap {
             .filter_map(|id| property_names.get(*id).map(|name| self.alloc_string(name)))
             .collect();
 
-        let handle = ObjectHandle(u32::try_from(self.objects.len()).unwrap_or(u32::MAX));
-        self.objects.push(HeapValue::PropertyIterator {
+        let h = self.heap.alloc(HeapValue::PropertyIterator {
             key_handles,
             next_index: 0,
         });
-        Ok(handle)
+        Ok(ObjectHandle(h.0))
     }
 
     /// Advances a property key iterator by one step.
@@ -794,13 +894,11 @@ impl ObjectHeap {
         &self,
         tracer: &mut dyn FnMut(ObjectHandle, NativePayloadId),
     ) {
-        for (index, object) in self.objects.iter().enumerate() {
-            let HeapValue::NativeObject { payload, .. } = object else {
-                continue;
-            };
-            let handle = ObjectHandle(u32::try_from(index).unwrap_or(u32::MAX));
-            tracer(handle, *payload);
-        }
+        self.heap.for_each(|index, any| {
+            if let Some(HeapValue::NativeObject { payload, .. }) = any.downcast_ref::<HeapValue>() {
+                tracer(ObjectHandle(index), *payload);
+            }
+        });
     }
 
     /// Reads a value from an upvalue cell.
@@ -1240,14 +1338,14 @@ impl ObjectHeap {
     }
 
     fn object(&self, handle: ObjectHandle) -> Result<&HeapValue, ObjectError> {
-        self.objects
-            .get(usize::try_from(handle.0).unwrap_or(usize::MAX))
+        self.heap
+            .get::<HeapValue>(GcHandle(handle.0))
             .ok_or(ObjectError::InvalidHandle)
     }
 
     fn object_mut(&mut self, handle: ObjectHandle) -> Result<&mut HeapValue, ObjectError> {
-        self.objects
-            .get_mut(usize::try_from(handle.0).unwrap_or(usize::MAX))
+        self.heap
+            .get_mut::<HeapValue>(GcHandle(handle.0))
             .ok_or(ObjectError::InvalidHandle)
     }
 
@@ -1255,6 +1353,26 @@ impl ObjectHeap {
         let shape_id = ObjectShapeId(self.next_shape_id);
         self.next_shape_id = self.next_shape_id.saturating_add(1);
         shape_id
+    }
+
+    /// Triggers garbage collection with the given root handles.
+    ///
+    /// All objects transitively reachable from `roots` survive; unreachable
+    /// objects are freed and their handles become invalid.
+    pub fn collect_garbage(&mut self, roots: &[ObjectHandle]) {
+        let gc_roots: Vec<GcHandle> = roots.iter().map(|h| GcHandle(h.0)).collect();
+        self.heap.collect(&gc_roots);
+    }
+
+    /// Triggers GC if memory pressure warrants it.
+    pub fn maybe_collect_garbage(&mut self, roots: &[ObjectHandle]) {
+        let gc_roots: Vec<GcHandle> = roots.iter().map(|h| GcHandle(h.0)).collect();
+        self.heap.maybe_collect(&gc_roots);
+    }
+
+    /// Returns the number of live objects.
+    pub fn live_count(&self) -> usize {
+        self.heap.live_count()
     }
 
     fn get_own_property(

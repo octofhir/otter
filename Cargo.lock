@@ -2235,6 +2235,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-gc"
+version = "0.1.0"
+
+[[package]]
 name = "otter-jit"
 version = "0.1.0"
 dependencies = [
@@ -2410,6 +2414,7 @@ dependencies = [
 name = "otter-vm"
 version = "0.1.0"
 dependencies = [
+ "otter-gc",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",

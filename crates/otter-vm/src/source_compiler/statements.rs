@@ -52,7 +52,6 @@ impl<'a> FunctionCompiler<'a> {
         });
 
         // Phase 2: emit case bodies with fall-through.
-        let mut terminated = false;
         for (i, case) in switch.cases.iter().enumerate() {
             let body_start = self.instructions.len();
             case_body_starts.push(body_start);
@@ -60,12 +59,12 @@ impl<'a> FunctionCompiler<'a> {
             if case.test.is_some() {
                 self.patch_jump(case_jumps[i], body_start)?;
             }
-            terminated = false;
+            let mut body_terminated = false;
             for stmt in &case.consequent {
-                if terminated {
+                if body_terminated {
                     break;
                 }
-                terminated = self.compile_statement(stmt, module)?;
+                body_terminated = self.compile_statement(stmt, module)?;
             }
         }
 
@@ -83,7 +82,10 @@ impl<'a> FunctionCompiler<'a> {
             self.patch_jump(jump, end)?;
         }
 
-        Ok(terminated)
+        // A switch statement never terminates the enclosing block:
+        // - `break` exits the switch and continues after it
+        // - Even if all cases return/throw, the "no match + no default" path is reachable
+        Ok(false)
     }
 
     pub(super) fn compile_for_statement(

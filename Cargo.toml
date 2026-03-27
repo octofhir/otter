@@ -1,6 +1,7 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
+    "crates/otter-gc",
     "crates/otter-vm",
     "crates/otter-vm-bytecode",
     "crates/otter-vm-core",

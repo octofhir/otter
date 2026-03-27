@@ -1354,4 +1354,310 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    // ---- switch statement ----
+
+    #[test]
+    fn switch_basic_case_match() {
+        let result = execute_test262_basic(
+            concat!(
+                "var x = 2;\n",
+                "var r = 0;\n",
+                "switch (x) {\n",
+                "  case 1: r = 10; break;\n",
+                "  case 2: r = 20; break;\n",
+                "  case 3: r = 30; break;\n",
+                "}\n",
+                "assert.sameValue(r, 20, 'switch should match case 2');\n",
+            ),
+            "switch-basic.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn switch_fall_through() {
+        let result = execute_test262_basic(
+            concat!(
+                "var x = 1;\n",
+                "var r = 0;\n",
+                "switch (x) {\n",
+                "  case 1: r = r + 1;\n",
+                "  case 2: r = r + 2;\n",
+                "  case 3: r = r + 4; break;\n",
+                "}\n",
+                "assert.sameValue(r, 7, 'switch should fall through cases 1, 2, 3');\n",
+            ),
+            "switch-fallthrough.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn switch_default_only() {
+        let result = execute_test262_basic(
+            concat!(
+                "var r = 0;\n",
+                "switch (99) {\n",
+                "  default: r = 42;\n",
+                "}\n",
+                "assert.sameValue(r, 42, 'switch default case should execute');\n",
+            ),
+            "switch-default-only.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn switch_default_with_cases() {
+        let result = execute_test262_basic(
+            concat!(
+                "var r = 0;\n",
+                "switch (99) {\n",
+                "  case 1: r = 10; break;\n",
+                "  default: r = 50; break;\n",
+                "  case 2: r = 20; break;\n",
+                "}\n",
+                "assert.sameValue(r, 50, 'switch should fall to default when no case matches');\n",
+            ),
+            "switch-default-with-cases.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn switch_no_match_no_default() {
+        let result = execute_test262_basic(
+            concat!(
+                "var r = 5;\n",
+                "switch (99) {\n",
+                "  case 1: r = 10; break;\n",
+                "  case 2: r = 20; break;\n",
+                "}\n",
+                "assert.sameValue(r, 5, 'switch with no match and no default should be a noop');\n",
+            ),
+            "switch-no-match.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn switch_string_discriminant() {
+        let result = execute_test262_basic(
+            concat!(
+                "var r = 0;\n",
+                "switch ('b') {\n",
+                "  case 'a': r = 1; break;\n",
+                "  case 'b': r = 2; break;\n",
+                "  case 'c': r = 3; break;\n",
+                "}\n",
+                "assert.sameValue(r, 2, 'switch on string discriminant');\n",
+            ),
+            "switch-string.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    // ---- for..in ----
+
+    #[test]
+    fn for_in_body_executes() {
+        // Check: does the for-in body execute and does count increment work?
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { x: 1 };\n",
+                "var ran = false;\n",
+                "for (var k in obj) { ran = true; }\n",
+                "if (ran !== true) throw new Test262Error('for-in body did not execute');\n",
+            ),
+            "for-in-body.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn for_in_assign_inside_loop() {
+        // Debug: just assign count = 1 (no addition) inside for-in
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { x: 1 };\n",
+                "var count = 0;\n",
+                "for (var k in obj) { count = 1; }\n",
+                "if (count !== 1) throw new Test262Error('count is not 1');\n",
+            ),
+            "for-in-assign.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn for_in_literal_add_inside_loop() {
+        // Debug: 0 + 1 inside for-in (no var read)
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { x: 1 };\n",
+                "var count = 0;\n",
+                "for (var k in obj) { count = 0 + 1; }\n",
+                "if (count !== 1) throw new Test262Error('literal add failed');\n",
+            ),
+            "for-in-literal-add.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    // NOTE: for-in property enumeration tests are deferred until the property
+    // iterator correctly enumerates named properties on shaped objects.
+    // The for-in compilation + basic control flow works (see for_in_body_executes,
+    // for_in_null_undefined_no_iterations, for_in_break).
+
+    #[test]
+    fn for_in_null_undefined_no_iterations() {
+        let result = execute_test262_basic(
+            concat!(
+                "var count = 0;\n",
+                "for (var k in null) { count = count + 1; }\n",
+                "for (var k in undefined) { count = count + 1; }\n",
+                "assert.sameValue(count, 0, 'for-in on null/undefined produces no iterations');\n",
+            ),
+            "for-in-null-undefined.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn for_in_break() {
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { a: 1, b: 2, c: 3 };\n",
+                "var count = 0;\n",
+                "for (var k in obj) { count = count + 1; if (count === 2) break; }\n",
+                "assert.sameValue(count, 2, 'for-in break should stop enumeration');\n",
+            ),
+            "for-in-break.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    // ---- instanceof ----
+
+    #[test]
+    fn instanceof_positive() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Foo() {}\n",
+                "var f = new Foo();\n",
+                "assert.sameValue(f instanceof Foo, true, 'instance should be instanceof Foo');\n",
+            ),
+            "instanceof-positive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn instanceof_negative() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Foo() {}\n",
+                "function Bar() {}\n",
+                "var f = new Foo();\n",
+                "assert.sameValue(f instanceof Bar, false, 'Foo instance is not instanceof Bar');\n",
+            ),
+            "instanceof-negative.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn instanceof_prototype_chain() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Animal() {}\n",
+                "function Dog() {}\n",
+                "Dog.prototype = new Animal();\n",
+                "var d = new Dog();\n",
+                "assert.sameValue(d instanceof Dog, true, 'Dog instance is instanceof Dog');\n",
+                "assert.sameValue(d instanceof Animal, true, 'Dog instance is instanceof Animal via chain');\n",
+            ),
+            "instanceof-chain.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn instanceof_primitive_returns_false() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Foo() {}\n",
+                "assert.sameValue(42 instanceof Foo, false, 'primitive is never instanceof');\n",
+            ),
+            "instanceof-primitive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    // ---- in operator ----
+
+    #[test]
+    fn in_own_property() {
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { x: 1, y: 2 };\n",
+                "assert.sameValue('x' in obj, true, 'x should be in obj');\n",
+                "assert.sameValue('y' in obj, true, 'y should be in obj');\n",
+            ),
+            "in-own.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn in_inherited_property() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Base() {}\n",
+                "Base.prototype.inherited = true;\n",
+                "var obj = new Base();\n",
+                "assert.sameValue('inherited' in obj, true, 'inherited property found via in');\n",
+            ),
+            "in-inherited.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn in_missing_property() {
+        let result = execute_test262_basic(
+            concat!(
+                "var obj = { a: 1 };\n",
+                "assert.sameValue('z' in obj, false, 'z is not in obj');\n",
+            ),
+            "in-missing.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn in_non_object_throws() {
+        let module = compile_test262_basic_script(
+            "var r = 'x' in 42;\n",
+            "in-non-object.js",
+        )
+        .expect("should compile");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let error = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect_err("in operator on non-object should throw");
+        assert!(
+            error.to_string().contains("Cannot use 'in' operator"),
+            "unexpected error: {error}"
+        );
+    }
 }

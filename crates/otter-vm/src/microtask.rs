@@ -100,9 +100,7 @@ impl MicrotaskQueue {
 
     /// Whether all queues are empty.
     pub fn is_empty(&self) -> bool {
-        self.next_tick.is_empty()
-            && self.promise_jobs.is_empty()
-            && self.microtasks.is_empty()
+        self.next_tick.is_empty() && self.promise_jobs.is_empty() && self.microtasks.is_empty()
     }
 
     /// Total number of pending jobs across all queues.

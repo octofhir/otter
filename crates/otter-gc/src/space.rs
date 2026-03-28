@@ -57,7 +57,10 @@ impl NewSpace {
     /// (caller should trigger a scavenge).
     pub fn alloc(&mut self, size: usize) -> Option<NonNull<u8>> {
         let aligned_size = align_up(size, CELL_SIZE);
-        debug_assert!(aligned_size >= HEADER_SIZE, "allocation too small for header");
+        debug_assert!(
+            aligned_size >= HEADER_SIZE,
+            "allocation too small for header"
+        );
 
         // Fast path: try the current (last) page.
         if let Some(page) = self.from_pages.last()

@@ -752,8 +752,7 @@ impl<'a> FunctionCompiler<'a> {
                 reg
             } else {
                 let reg = self.allocate_local()?;
-                self.instructions
-                    .push(Instruction::create_arguments(reg));
+                self.instructions.push(Instruction::create_arguments(reg));
                 self.arguments_local = Some(reg);
                 self.env
                     .bindings

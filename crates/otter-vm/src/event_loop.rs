@@ -13,7 +13,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::event_loop_host::{
-    CompletedEvent, EventLoopHost, TimerId, MAX_TIMER_NESTING_BEFORE_CLAMP, MIN_TIMER_INTERVAL,
+    CompletedEvent, EventLoopHost, MAX_TIMER_NESTING_BEFORE_CLAMP, MIN_TIMER_INTERVAL, TimerId,
 };
 use crate::object::ObjectHandle;
 use crate::value::RegisterValue;
@@ -577,13 +577,7 @@ mod tests {
     fn run_event_loop_exits_when_no_work() {
         let mut event_loop = TokioEventLoop::new();
 
-        let result = run_event_loop(
-            &mut event_loop,
-            || false,
-            || Ok(()),
-            |_| Ok(()),
-            || Ok(()),
-        );
+        let result = run_event_loop(&mut event_loop, || false, || Ok(()), |_| Ok(()), || Ok(()));
 
         assert!(result.is_ok());
     }

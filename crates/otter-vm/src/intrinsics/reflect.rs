@@ -6,7 +6,7 @@ use crate::builders::NamespaceBuilder;
 use crate::descriptors::{
     NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor, VmNativeCallError,
 };
-use crate::object::{ObjectHandle, PropertyValue};
+use crate::object::ObjectHandle;
 use crate::value::RegisterValue;
 
 use super::{
@@ -25,15 +25,26 @@ pub(super) struct ReflectIntrinsic;
 fn require_object(
     args: &[RegisterValue],
     index: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
     _method: &str,
 ) -> Result<ObjectHandle, VmNativeCallError> {
-    args.get(index)
+    let Some(handle) = args
+        .get(index)
         .copied()
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Thrown(RegisterValue::undefined()) // TypeError
-        })
+    else {
+        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+    };
+
+    if matches!(
+        runtime.objects().kind(handle),
+        Ok(crate::object::HeapValueKind::String)
+    ) {
+        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+    }
+
+    Ok(handle)
 }
 
 fn to_property_key(
@@ -45,7 +56,7 @@ fn to_property_key(
         .get(index)
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    runtime.property_name_from_value(value)
+    crate::abstract_ops::to_property_key(runtime, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +117,11 @@ fn reflect_namespace_bindings() -> Vec<NativeBindingDescriptor> {
         method("defineProperty", 3, reflect_define_property),
         method("deleteProperty", 2, reflect_delete_property),
         method("get", 2, reflect_get),
-        method("getOwnPropertyDescriptor", 2, reflect_get_own_property_descriptor),
+        method(
+            "getOwnPropertyDescriptor",
+            2,
+            reflect_get_own_property_descriptor,
+        ),
         method("getPrototypeOf", 1, reflect_get_prototype_of),
         method("has", 2, reflect_has),
         method("isExtensible", 1, reflect_is_extensible),
@@ -128,9 +143,7 @@ fn reflect_apply(
     let target = args
         .first()
         .copied()
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Reflect.apply requires target".into())
-        })?;
+        .ok_or_else(|| VmNativeCallError::Internal("Reflect.apply requires target".into()))?;
     let this_arg = args
         .get(1)
         .copied()
@@ -158,9 +171,9 @@ fn reflect_apply(
 fn reflect_construct(
     _this: &RegisterValue,
     args: &[RegisterValue],
-    _runtime: &mut crate::interpreter::RuntimeState,
+    runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let _target = require_object(args, 0, "Reflect.construct")?;
+    let _target = require_object(args, 0, runtime, "Reflect.construct")?;
     // Full construct requires interpreter-level call_function_construct.
     // For now, return a useful error instead of crashing.
     Err(VmNativeCallError::Internal(
@@ -176,7 +189,7 @@ fn reflect_define_property(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.defineProperty")?;
+    let target = require_object(args, 0, runtime, "Reflect.defineProperty")?;
     let property = to_property_key(args, 1, runtime)?;
     let attrs = args
         .get(2)
@@ -184,65 +197,16 @@ fn reflect_define_property(
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle);
 
-    // Extract descriptor fields from attributes object.
-    if let Some(attrs) = attrs {
-        let value_key = runtime.intern_property_name("value");
-        let value = runtime
-            .objects()
-            .get_property(attrs, value_key)
-            .ok()
-            .flatten()
-            .and_then(|l| match l.value() {
-                PropertyValue::Data { value: v, .. } => Some(v),
-                _ => None,
-            });
+    let desc = crate::abstract_ops::to_property_descriptor(attrs, runtime)?;
+    let property_names = runtime.property_names().clone();
+    let success = runtime
+        .objects_mut()
+        .define_own_property_from_descriptor_with_registry(target, property, desc, &property_names)
+        .map_err(|e| {
+            VmNativeCallError::Internal(format!("Reflect.defineProperty failed: {e:?}").into())
+        })?;
 
-        let get_key = runtime.intern_property_name("get");
-        let getter = runtime
-            .objects()
-            .get_property(attrs, get_key)
-            .ok()
-            .flatten()
-            .and_then(|l| match l.value() {
-                PropertyValue::Data { value: v, .. } => v.as_object_handle().map(ObjectHandle),
-                _ => None,
-            });
-
-        let set_key = runtime.intern_property_name("set");
-        let setter = runtime
-            .objects()
-            .get_property(attrs, set_key)
-            .ok()
-            .flatten()
-            .and_then(|l| match l.value() {
-                PropertyValue::Data { value: v, .. } => v.as_object_handle().map(ObjectHandle),
-                _ => None,
-            });
-
-        if getter.is_some() || setter.is_some() {
-            // Accessor descriptor.
-            runtime
-                .objects_mut()
-                .define_accessor(target, property, getter, setter)
-                .map_err(|e| {
-                    VmNativeCallError::Internal(
-                        format!("Reflect.defineProperty accessor failed: {e:?}").into(),
-                    )
-                })?;
-        } else if let Some(value) = value {
-            // Data descriptor.
-            runtime
-                .objects_mut()
-                .set_property(target, property, value)
-                .map_err(|e| {
-                    VmNativeCallError::Internal(
-                        format!("Reflect.defineProperty data failed: {e:?}").into(),
-                    )
-                })?;
-        }
-    }
-
-    Ok(RegisterValue::from_bool(true))
+    Ok(RegisterValue::from_bool(success))
 }
 
 // ---------------------------------------------------------------------------
@@ -253,15 +217,14 @@ fn reflect_delete_property(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.deleteProperty")?;
+    let target = require_object(args, 0, runtime, "Reflect.deleteProperty")?;
     let property = to_property_key(args, 1, runtime)?;
+    let property_names = runtime.property_names().clone();
     let deleted = runtime
         .objects_mut()
-        .delete_property(target, property)
+        .delete_property_with_registry(target, property, &property_names)
         .map_err(|e| {
-            VmNativeCallError::Internal(
-                format!("Reflect.deleteProperty failed: {e:?}").into(),
-            )
+            VmNativeCallError::Internal(format!("Reflect.deleteProperty failed: {e:?}").into())
         })?;
     Ok(RegisterValue::from_bool(deleted))
 }
@@ -274,15 +237,12 @@ fn reflect_get(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.get")?;
+    let target = require_object(args, 0, runtime, "Reflect.get")?;
     let property = to_property_key(args, 1, runtime)?;
     let receiver = args
         .get(2)
         .copied()
-        .unwrap_or_else(|| RegisterValue::from_object_handle(target.0))
-        .as_object_handle()
-        .map(ObjectHandle)
-        .unwrap_or(target);
+        .unwrap_or_else(|| RegisterValue::from_object_handle(target.0));
     runtime.ordinary_get(target, property, receiver)
 }
 
@@ -294,75 +254,21 @@ fn reflect_get_own_property_descriptor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.getOwnPropertyDescriptor")?;
+    let target = require_object(args, 0, runtime, "Reflect.getOwnPropertyDescriptor")?;
     let property = to_property_key(args, 1, runtime)?;
 
-    // Check own property only (don't walk prototype chain).
-    let has_own = runtime.objects().has_own_property(target, property).map_err(|e| {
-        VmNativeCallError::Internal(format!("Reflect.getOwnPropertyDescriptor failed: {e:?}").into())
-    })?;
-
-    if !has_own {
-        return Ok(RegisterValue::undefined());
-    }
-
-    // Get the property value (own only — use get_property which walks prototype, but we
-    // already confirmed it's own).
-    let lookup = runtime
-        .objects()
-        .get_property(target, property)
+    let Some(descriptor) = runtime
+        .own_property_descriptor(target, property)
         .map_err(|e| {
-            VmNativeCallError::Internal(format!("descriptor lookup failed: {e:?}").into())
-        })?;
-
-    let Some(lookup) = lookup else {
+            VmNativeCallError::Internal(
+                format!("Reflect.getOwnPropertyDescriptor failed: {e:?}").into(),
+            )
+        })?
+    else {
         return Ok(RegisterValue::undefined());
     };
 
-    // Build descriptor object.
-    let desc = runtime.alloc_object_with_prototype(
-        Some(runtime.intrinsics().object_prototype()),
-    );
-
-    match lookup.value() {
-        PropertyValue::Data { value, .. } => {
-            let value_key = runtime.intern_property_name("value");
-            runtime.objects_mut().set_property(desc, value_key, value).ok();
-
-            let writable_key = runtime.intern_property_name("writable");
-            runtime
-                .objects_mut()
-                .set_property(desc, writable_key, RegisterValue::from_bool(true))
-                .ok();
-        }
-        PropertyValue::Accessor { getter, setter, .. } => {
-            let get_key = runtime.intern_property_name("get");
-            let get_val = getter
-                .map(|h| RegisterValue::from_object_handle(h.0))
-                .unwrap_or_else(RegisterValue::undefined);
-            runtime.objects_mut().set_property(desc, get_key, get_val).ok();
-
-            let set_key = runtime.intern_property_name("set");
-            let set_val = setter
-                .map(|h| RegisterValue::from_object_handle(h.0))
-                .unwrap_or_else(RegisterValue::undefined);
-            runtime.objects_mut().set_property(desc, set_key, set_val).ok();
-        }
-    }
-
-    let enumerable_key = runtime.intern_property_name("enumerable");
-    runtime
-        .objects_mut()
-        .set_property(desc, enumerable_key, RegisterValue::from_bool(true))
-        .ok();
-
-    let configurable_key = runtime.intern_property_name("configurable");
-    runtime
-        .objects_mut()
-        .set_property(desc, configurable_key, RegisterValue::from_bool(true))
-        .ok();
-
-    Ok(RegisterValue::from_object_handle(desc.0))
+    crate::abstract_ops::from_property_descriptor(descriptor, runtime)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,15 +279,10 @@ fn reflect_get_prototype_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.getPrototypeOf")?;
-    let proto = runtime
-        .objects()
-        .get_prototype(target)
-        .map_err(|e| {
-            VmNativeCallError::Internal(
-                format!("Reflect.getPrototypeOf failed: {e:?}").into(),
-            )
-        })?;
+    let target = require_object(args, 0, runtime, "Reflect.getPrototypeOf")?;
+    let proto = runtime.objects().get_prototype(target).map_err(|e| {
+        VmNativeCallError::Internal(format!("Reflect.getPrototypeOf failed: {e:?}").into())
+    })?;
     Ok(proto
         .map(|h| RegisterValue::from_object_handle(h.0))
         .unwrap_or_else(RegisterValue::null))
@@ -395,16 +296,11 @@ fn reflect_has(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.has")?;
+    let target = require_object(args, 0, runtime, "Reflect.has")?;
     let property = to_property_key(args, 1, runtime)?;
-    // get_property walks prototype chain — if it finds anything, the property exists.
     let found = runtime
-        .objects()
-        .get_property(target, property)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Reflect.has failed: {e:?}").into())
-        })?
-        .is_some();
+        .has_property(target, property)
+        .map_err(|e| VmNativeCallError::Internal(format!("Reflect.has failed: {e:?}").into()))?;
     Ok(RegisterValue::from_bool(found))
 }
 
@@ -414,11 +310,13 @@ fn reflect_has(
 fn reflect_is_extensible(
     _this: &RegisterValue,
     args: &[RegisterValue],
-    _runtime: &mut crate::interpreter::RuntimeState,
+    runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let _target = require_object(args, 0, "Reflect.isExtensible")?;
-    // All ordinary objects in the new VM are currently extensible.
-    Ok(RegisterValue::from_bool(true))
+    let target = require_object(args, 0, runtime, "Reflect.isExtensible")?;
+    let extensible = runtime.objects().is_extensible(target).map_err(|e| {
+        VmNativeCallError::Internal(format!("Reflect.isExtensible failed: {e:?}").into())
+    })?;
+    Ok(RegisterValue::from_bool(extensible))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,13 +327,10 @@ fn reflect_own_keys(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.ownKeys")?;
-    let keys = runtime
-        .objects()
-        .own_keys(target)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Reflect.ownKeys failed: {e:?}").into())
-        })?;
+    let target = require_object(args, 0, runtime, "Reflect.ownKeys")?;
+    let keys = runtime.own_property_keys(target).map_err(|e| {
+        VmNativeCallError::Internal(format!("Reflect.ownKeys failed: {e:?}").into())
+    })?;
 
     // Collect key names first to avoid borrow conflict.
     let key_names: Vec<String> = keys
@@ -467,11 +362,16 @@ fn reflect_own_keys(
 fn reflect_prevent_extensions(
     _this: &RegisterValue,
     args: &[RegisterValue],
-    _runtime: &mut crate::interpreter::RuntimeState,
+    runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let _target = require_object(args, 0, "Reflect.preventExtensions")?;
-    // Stub: always returns true. Full implementation needs extensibility flag.
-    Ok(RegisterValue::from_bool(true))
+    let target = require_object(args, 0, runtime, "Reflect.preventExtensions")?;
+    let success = runtime
+        .objects_mut()
+        .prevent_extensions(target)
+        .map_err(|e| {
+            VmNativeCallError::Internal(format!("Reflect.preventExtensions failed: {e:?}").into())
+        })?;
+    Ok(RegisterValue::from_bool(success))
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +382,7 @@ fn reflect_set(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.set")?;
+    let target = require_object(args, 0, runtime, "Reflect.set")?;
     let property = to_property_key(args, 1, runtime)?;
     let value = args
         .get(2)
@@ -491,12 +391,9 @@ fn reflect_set(
     let receiver = args
         .get(3)
         .copied()
-        .unwrap_or_else(|| RegisterValue::from_object_handle(target.0))
-        .as_object_handle()
-        .map(ObjectHandle)
-        .unwrap_or(target);
-    runtime.ordinary_set(target, property, receiver, value)?;
-    Ok(RegisterValue::from_bool(true))
+        .unwrap_or_else(|| RegisterValue::from_object_handle(target.0));
+    let success = runtime.ordinary_set(target, property, receiver, value)?;
+    Ok(RegisterValue::from_bool(success))
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +404,7 @@ fn reflect_set_prototype_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, "Reflect.setPrototypeOf")?;
+    let target = require_object(args, 0, runtime, "Reflect.setPrototypeOf")?;
     let proto_arg = args
         .get(1)
         .copied()
@@ -530,9 +427,7 @@ fn reflect_set_prototype_of(
         .objects_mut()
         .set_prototype(target, proto)
         .map_err(|e| {
-            VmNativeCallError::Internal(
-                format!("Reflect.setPrototypeOf failed: {e:?}").into(),
-            )
-        })?;
-    Ok(RegisterValue::from_bool(true))
+            VmNativeCallError::Internal(format!("Reflect.setPrototypeOf failed: {e:?}").into())
+        })
+        .map(RegisterValue::from_bool)
 }

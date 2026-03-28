@@ -15,11 +15,11 @@
 
 use std::collections::VecDeque;
 
+use crate::align_up;
 use crate::header::{GcHeader, MarkColor};
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE};
 use crate::space::OldSpace;
 use crate::trace::TraceTable;
-use crate::align_up;
 
 /// State of an in-progress or completed mark phase.
 pub struct MarkingState {
@@ -232,7 +232,13 @@ pub unsafe fn sweep_old_space(old_space: &mut OldSpace) -> SweepResult {
                 if let Some(start) = dead_start.take() {
                     let dead_size = offset - start;
                     unsafe {
-                        install_free_block(base, start, dead_size, &mut last_free_offset, header_mut);
+                        install_free_block(
+                            base,
+                            start,
+                            dead_size,
+                            &mut last_free_offset,
+                            header_mut,
+                        );
                     }
                     result.dead_count += 1; // Approximate: one free block per gap
                     result.freed_bytes += dead_size;
@@ -485,7 +491,8 @@ mod tests {
         // The page should have a free list entry where obj2 was.
         let page = &old_space.pages()[0];
         assert_ne!(
-            page.header().free_list_head, 0,
+            page.header().free_list_head,
+            0,
             "free_list_head should be non-zero after sweeping a dead object"
         );
     }

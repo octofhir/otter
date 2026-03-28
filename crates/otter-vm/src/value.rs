@@ -121,6 +121,12 @@ impl RegisterValue {
         Self(TAG_NULL)
     }
 
+    /// Encodes an internal array hole marker.
+    #[must_use]
+    pub const fn hole() -> Self {
+        Self(TAG_HOLE)
+    }
+
     /// Encodes a VM-local object handle.
     #[must_use]
     pub const fn from_object_handle(handle: u32) -> Self {
@@ -161,6 +167,12 @@ impl RegisterValue {
         } else {
             None
         }
+    }
+
+    /// Returns whether the value is the internal hole marker.
+    #[must_use]
+    pub const fn is_hole(self) -> bool {
+        self.0 == TAG_HOLE
     }
 
     /// Decodes the value as a number.

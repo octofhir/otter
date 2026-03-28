@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use otter_vm::Interpreter;
 use otter_vm::interpreter::{ExecutionResult, RuntimeState};
 use otter_vm::module::Module;
-use otter_vm::Interpreter;
 
 use crate::builder::RuntimeBuilder;
 
@@ -250,33 +250,38 @@ mod tests {
 
     struct CaptureForTest(Arc<CaptureConsoleBackend>);
     impl otter_vm::console::ConsoleBackend for CaptureForTest {
-        fn log(&self, msg: &str) { self.0.log(msg); }
-        fn warn(&self, msg: &str) { self.0.warn(msg); }
-        fn error(&self, msg: &str) { self.0.error(msg); }
+        fn log(&self, msg: &str) {
+            self.0.log(msg);
+        }
+        fn warn(&self, msg: &str) {
+            self.0.warn(msg);
+        }
+        fn error(&self, msg: &str) {
+            self.0.error(msg);
+        }
     }
 
     #[test]
     fn run_simple_arithmetic() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script("console.log(1 + 2)", "test.js").expect("should run");
+        rt.run_script("console.log(1 + 2)", "test.js")
+            .expect("should run");
         assert_eq!(capture.text(), "3");
     }
 
     #[test]
     fn run_console_log() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script("console.log(42)", "test.js").expect("should run");
+        rt.run_script("console.log(42)", "test.js")
+            .expect("should run");
         assert_eq!(capture.text(), "42");
     }
 
     #[test]
     fn run_console_multiple_args() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script(
-            "console.log('hello', true, 3.14)",
-            "test.js",
-        )
-        .expect("should run");
+        rt.run_script("console.log('hello', true, 3.14)", "test.js")
+            .expect("should run");
         assert_eq!(capture.text(), "hello true 3.14");
     }
 
@@ -373,8 +378,11 @@ mod tests {
     #[test]
     fn function_prototype_bind_exists() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script("console.log(typeof Function.prototype.call.bind)", "test.js")
-            .expect("should run");
+        rt.run_script(
+            "console.log(typeof Function.prototype.call.bind)",
+            "test.js",
+        )
+        .expect("should run");
         assert_eq!(capture.text(), "function");
     }
 
@@ -393,11 +401,8 @@ mod tests {
     fn bound_function_invocation() {
         let (mut rt, capture) = rt_with_capture();
         // First test: direct join works.
-        rt.run_script(
-            "var arr = [1,2,3]; console.log(arr.join('-'))",
-            "test.js",
-        )
-        .expect("direct join should work");
+        rt.run_script("var arr = [1,2,3]; console.log(arr.join('-'))", "test.js")
+            .expect("direct join should work");
         assert_eq!(capture.text(), "1-2-3");
     }
 
@@ -425,7 +430,8 @@ mod tests {
 
     #[test]
     fn full_verify_property_test() {
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
         let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
         let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
         let prop_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
@@ -439,18 +445,22 @@ mod tests {
         {
             let mut rt = OtterRuntime::builder().build();
             let code = format!("{sta}\n{assert_js}");
-            rt.run_script(&code, "test.js").expect("sta+assert should load");
+            rt.run_script(&code, "test.js")
+                .expect("sta+assert should load");
         }
         // Step 3: sta + assert + propertyHelper
         {
             let mut rt = OtterRuntime::builder().build();
             let code = format!("{sta}\n{assert_js}\n{prop_helper}");
-            rt.run_script(&code, "test.js").expect("sta+assert+propHelper should load");
+            rt.run_script(&code, "test.js")
+                .expect("sta+assert+propHelper should load");
         }
         // Step 3.5: sta + assert + propertyHelper + minimal call
         {
             let mut rt = OtterRuntime::builder().build();
-            let code = format!("{sta}\n{assert_js}\n{prop_helper}\nvar d = Object.getOwnPropertyDescriptor(Math, 'abs'); console.log(typeof d);");
+            let code = format!(
+                "{sta}\n{assert_js}\n{prop_helper}\nvar d = Object.getOwnPropertyDescriptor(Math, 'abs'); console.log(typeof d);"
+            );
             match rt.run_script(&code, "test.js") {
                 Ok(_) => {}
                 Err(e) => panic!("step 3.5 (GOPD after harness): {e}"),
@@ -493,13 +503,16 @@ mod tests {
     #[test]
     fn minimal_verify_property() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script(r#"
+        rt.run_script(
+            r#"
             var desc = Object.getOwnPropertyDescriptor(Math, "abs");
             console.log(typeof desc);
             console.log(desc.writable);
             console.log(desc.enumerable);
             console.log(desc.configurable);
-        "#, "test.js")
+        "#,
+            "test.js",
+        )
         .expect("minimal verifyProperty");
         assert_eq!(capture.text(), "object\ntrue\nfalse\ntrue");
     }
@@ -507,11 +520,14 @@ mod tests {
     #[test]
     fn for_in_on_descriptor() {
         let (mut rt, capture) = rt_with_capture();
-        rt.run_script(r#"
+        rt.run_script(
+            r#"
             var desc = { value: 1, writable: true, enumerable: false, configurable: true };
             var names = Object.getOwnPropertyNames(desc);
             console.log(names.join(","));
-        "#, "test.js")
+        "#,
+            "test.js",
+        )
         .expect("for-in on descriptor");
         assert_eq!(capture.text(), "value,writable,enumerable,configurable");
     }

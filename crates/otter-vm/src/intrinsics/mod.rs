@@ -18,10 +18,13 @@ mod reflect;
 mod string_class;
 pub(crate) mod timer_globals;
 
+pub(crate) use boolean_class::box_boolean_object;
+pub(crate) use number_class::box_number_object;
+
 use crate::host::NativeFunctionRegistry;
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap};
-use crate::value::RegisterValue;
 use crate::property::PropertyNameRegistry;
+use crate::value::RegisterValue;
 use install::{IntrinsicInstallContext, IntrinsicInstaller};
 
 /// Stable well-known symbol identifiers owned by the intrinsic registry.
@@ -331,8 +334,7 @@ impl VmIntrinsics {
             for binding in crate::console::console_bindings() {
                 let function_desc = binding.function().clone();
                 let host_fn = cx.native_functions.register(function_desc.clone());
-                let handle =
-                    cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
+                let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
                 let prop = cx.property_names.intern(function_desc.js_name());
                 cx.heap.set_property(
                     console_obj,
@@ -376,11 +378,8 @@ impl VmIntrinsics {
                 RegisterValue::from_number(f64::INFINITY),
             )?;
             let undef_prop = cx.property_names.intern("undefined");
-            cx.heap.set_property(
-                self.global_object,
-                undef_prop,
-                RegisterValue::undefined(),
-            )?;
+            cx.heap
+                .set_property(self.global_object, undef_prop, RegisterValue::undefined())?;
         }
 
         // Install global functions (§19.2): isNaN, isFinite, parseFloat, parseInt.
@@ -388,7 +387,10 @@ impl VmIntrinsics {
             let host_fn = cx.native_functions.register(binding);
             let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
             let prop = cx.property_names.intern(
-                cx.native_functions.get(host_fn).expect("just registered").js_name(),
+                cx.native_functions
+                    .get(host_fn)
+                    .expect("just registered")
+                    .js_name(),
             );
             cx.heap.set_property(
                 self.global_object,
@@ -562,8 +564,12 @@ impl VmIntrinsics {
             self.promise_constructor,
             self.promise_prototype,
         ]);
-        if let Some(h) = self.math_namespace { roots.push(h); }
-        if let Some(h) = self.reflect_namespace { roots.push(h); }
+        if let Some(h) = self.math_namespace {
+            roots.push(h);
+        }
+        if let Some(h) = self.reflect_namespace {
+            roots.push(h);
+        }
         roots.extend_from_slice(&self.namespace_roots);
         roots
     }
@@ -680,7 +686,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 119);
+        assert_eq!(native_functions.len(), 127);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))
@@ -705,7 +711,11 @@ mod tests {
             .expect("global Math lookup should succeed")
             .expect("Math namespace should be installed");
         let math_namespace = math_namespace.value();
-        let PropertyValue::Data { value: math_namespace, .. } = math_namespace else {
+        let PropertyValue::Data {
+            value: math_namespace,
+            ..
+        } = math_namespace
+        else {
             panic!("expected Math to be a data property");
         };
         let math_namespace = math_namespace
@@ -745,7 +755,11 @@ mod tests {
             .expect("global Object lookup should succeed")
             .expect("Object constructor should be installed");
         let object_constructor = object_constructor.value();
-        let PropertyValue::Data { value: object_constructor, .. } = object_constructor else {
+        let PropertyValue::Data {
+            value: object_constructor,
+            ..
+        } = object_constructor
+        else {
             panic!("expected Object to be a data property");
         };
         let object_constructor = object_constructor
@@ -764,7 +778,10 @@ mod tests {
             .expect("Object.prototype lookup should succeed")
             .expect("Object.prototype should be installed");
         let prototype = prototype.value();
-        let PropertyValue::Data { value: prototype, .. } = prototype else {
+        let PropertyValue::Data {
+            value: prototype, ..
+        } = prototype
+        else {
             panic!("expected Object.prototype to be a data property");
         };
         let prototype = prototype
@@ -779,7 +796,11 @@ mod tests {
             .expect("global Function lookup should succeed")
             .expect("Function constructor should be installed");
         let function_constructor = function_constructor.value();
-        let PropertyValue::Data { value: function_constructor, .. } = function_constructor else {
+        let PropertyValue::Data {
+            value: function_constructor,
+            ..
+        } = function_constructor
+        else {
             panic!("expected Function to be a data property");
         };
         let function_constructor = function_constructor
@@ -797,7 +818,11 @@ mod tests {
             .expect("Function.prototype lookup should succeed")
             .expect("Function.prototype should be installed");
         let function_prototype = function_prototype.value();
-        let PropertyValue::Data { value: function_prototype, .. } = function_prototype else {
+        let PropertyValue::Data {
+            value: function_prototype,
+            ..
+        } = function_prototype
+        else {
             panic!("expected Function.prototype to be a data property");
         };
         let function_prototype = function_prototype
@@ -812,7 +837,11 @@ mod tests {
             .expect("global Array lookup should succeed")
             .expect("Array constructor should be installed");
         let array_constructor = array_constructor.value();
-        let PropertyValue::Data { value: array_constructor, .. } = array_constructor else {
+        let PropertyValue::Data {
+            value: array_constructor,
+            ..
+        } = array_constructor
+        else {
             panic!("expected Array to be a data property");
         };
         let array_constructor = array_constructor
@@ -826,7 +855,11 @@ mod tests {
             .expect("Array.prototype lookup should succeed")
             .expect("Array.prototype should be installed");
         let array_prototype = array_prototype.value();
-        let PropertyValue::Data { value: array_prototype, .. } = array_prototype else {
+        let PropertyValue::Data {
+            value: array_prototype,
+            ..
+        } = array_prototype
+        else {
             panic!("expected Array.prototype to be a data property");
         };
         let array_prototype = array_prototype
@@ -856,7 +889,11 @@ mod tests {
             .expect("global String lookup should succeed")
             .expect("String constructor should be installed");
         let string_constructor = string_constructor.value();
-        let PropertyValue::Data { value: string_constructor, .. } = string_constructor else {
+        let PropertyValue::Data {
+            value: string_constructor,
+            ..
+        } = string_constructor
+        else {
             panic!("expected String to be a data property");
         };
         let string_constructor = string_constructor
@@ -870,7 +907,11 @@ mod tests {
             .expect("String.prototype lookup should succeed")
             .expect("String.prototype should be installed");
         let string_prototype = string_prototype.value();
-        let PropertyValue::Data { value: string_prototype, .. } = string_prototype else {
+        let PropertyValue::Data {
+            value: string_prototype,
+            ..
+        } = string_prototype
+        else {
             panic!("expected String.prototype to be a data property");
         };
         let string_prototype = string_prototype
@@ -892,7 +933,11 @@ mod tests {
             .expect("global Number lookup should succeed")
             .expect("Number constructor should be installed");
         let number_constructor = number_constructor.value();
-        let PropertyValue::Data { value: number_constructor, .. } = number_constructor else {
+        let PropertyValue::Data {
+            value: number_constructor,
+            ..
+        } = number_constructor
+        else {
             panic!("expected Number to be a data property");
         };
         let number_constructor = number_constructor
@@ -907,7 +952,11 @@ mod tests {
             .expect("global Boolean lookup should succeed")
             .expect("Boolean constructor should be installed");
         let boolean_constructor = boolean_constructor.value();
-        let PropertyValue::Data { value: boolean_constructor, .. } = boolean_constructor else {
+        let PropertyValue::Data {
+            value: boolean_constructor,
+            ..
+        } = boolean_constructor
+        else {
             panic!("expected Boolean to be a data property");
         };
         let boolean_constructor = boolean_constructor
@@ -922,7 +971,11 @@ mod tests {
             .expect("global Reflect lookup should succeed")
             .expect("Reflect namespace should be installed");
         let reflect_namespace = reflect_namespace.value();
-        let PropertyValue::Data { value: reflect_namespace, .. } = reflect_namespace else {
+        let PropertyValue::Data {
+            value: reflect_namespace,
+            ..
+        } = reflect_namespace
+        else {
             panic!("expected Reflect to be a data property");
         };
         let reflect_namespace = reflect_namespace

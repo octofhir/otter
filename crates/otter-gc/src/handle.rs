@@ -76,7 +76,10 @@ impl HandleStack {
     /// Returns all entries as root slots for the GC marker.
     /// Each entry is a pointer-to-pointer that the scavenger/compactor can update.
     pub fn root_slots(&mut self) -> Vec<*mut *const GcHeader> {
-        self.entries.iter_mut().map(|slot| slot as *mut *const GcHeader).collect()
+        self.entries
+            .iter_mut()
+            .map(|slot| slot as *mut *const GcHeader)
+            .collect()
     }
 
     /// Returns all entries as immutable root pointers for the marker.
@@ -192,9 +195,7 @@ impl GlobalHandleTable {
     pub fn root_slots(&mut self) -> Vec<*mut *const GcHeader> {
         self.entries
             .iter_mut()
-            .filter_map(|slot| {
-                slot.as_mut().map(|ptr| ptr as *mut *const GcHeader)
-            })
+            .filter_map(|slot| slot.as_mut().map(|ptr| ptr as *mut *const GcHeader))
             .collect()
     }
 

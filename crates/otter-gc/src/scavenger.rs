@@ -28,11 +28,11 @@
 //! [`PROMOTE_AFTER_SURVIVALS`] scavenge cycles. Tracked via a per-page
 //! survival counter (all objects on a page share the same age).
 
+use crate::align_up;
 use crate::header::{GcHeader, MarkColor};
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE};
 use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
-use crate::align_up;
 
 // Promotion policy: objects that survived one scavenge (marked Gray) get
 // promoted on the next scavenge. This matches V8's single-survival heuristic.
@@ -257,12 +257,9 @@ unsafe fn cheney_scan_to_space(
             // Phase 1: Collect all child pointer slots from this object.
             child_slots.clear();
             unsafe {
-                trace_table.trace_object(
-                    header_ptr as *const GcHeader,
-                    &mut |slot| {
-                        child_slots.push(slot);
-                    },
-                );
+                trace_table.trace_object(header_ptr as *const GcHeader, &mut |slot| {
+                    child_slots.push(slot);
+                });
             }
 
             // Phase 2: Evacuate each child (may mutate new_space/old_space).
@@ -338,9 +335,8 @@ mod tests {
         let root_slot: *mut *const GcHeader = &mut root;
 
         // Scavenge.
-        let result = unsafe {
-            scavenge(&mut new_space, &mut old_space, &trace_table, &[root_slot])
-        };
+        let result =
+            unsafe { scavenge(&mut new_space, &mut old_space, &trace_table, &[root_slot]) };
 
         assert_eq!(result.copied_count, 1);
         assert_eq!(result.promoted_count, 0);
@@ -416,14 +412,8 @@ mod tests {
         // Root only the node — the leaf should be kept alive transitively.
         let mut root: *const GcHeader = node_ptr.as_ptr() as *const GcHeader;
 
-        let result = unsafe {
-            scavenge(
-                &mut new_space,
-                &mut old_space,
-                &trace_table,
-                &[&mut root],
-            )
-        };
+        let result =
+            unsafe { scavenge(&mut new_space, &mut old_space, &trace_table, &[&mut root]) };
 
         // Both objects copied.
         assert_eq!(result.copied_count, 2);
@@ -461,14 +451,8 @@ mod tests {
         // Root only the first leaf — the second is garbage.
         let mut root: *const GcHeader = alive_ptr.as_ptr() as *const GcHeader;
 
-        let result = unsafe {
-            scavenge(
-                &mut new_space,
-                &mut old_space,
-                &trace_table,
-                &[&mut root],
-            )
-        };
+        let result =
+            unsafe { scavenge(&mut new_space, &mut old_space, &trace_table, &[&mut root]) };
 
         assert_eq!(result.copied_count, 1); // Only the alive leaf
     }
@@ -490,14 +474,7 @@ mod tests {
         let mut root: *const GcHeader = ptr.as_ptr() as *const GcHeader;
 
         // First scavenge: object survives to to-space, marked as "survived".
-        let r1 = unsafe {
-            scavenge(
-                &mut new_space,
-                &mut old_space,
-                &trace_table,
-                &[&mut root],
-            )
-        };
+        let r1 = unsafe { scavenge(&mut new_space, &mut old_space, &trace_table, &[&mut root]) };
         assert_eq!(r1.copied_count, 1);
         assert_eq!(r1.promoted_count, 0);
 
@@ -507,14 +484,7 @@ mod tests {
         assert!(header.is_marked()); // Survived marker
 
         // Second scavenge: object should be promoted to old space.
-        let r2 = unsafe {
-            scavenge(
-                &mut new_space,
-                &mut old_space,
-                &trace_table,
-                &[&mut root],
-            )
-        };
+        let r2 = unsafe { scavenge(&mut new_space, &mut old_space, &trace_table, &[&mut root]) };
         assert_eq!(r2.promoted_count, 1);
         assert_eq!(r2.copied_count, 0);
 

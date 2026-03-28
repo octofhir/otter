@@ -404,11 +404,15 @@ mod tests {
         let h1 = ObjectHandle(10);
         let h2 = ObjectHandle(20);
         p.then(Some(h1), None, dummy_capability());
-        p.then(Some(h2), None, PromiseCapability {
-            promise: ObjectHandle(200),
-            resolve: ObjectHandle(201),
-            reject: ObjectHandle(202),
-        });
+        p.then(
+            Some(h2),
+            None,
+            PromiseCapability {
+                promise: ObjectHandle(200),
+                resolve: ObjectHandle(201),
+                reject: ObjectHandle(202),
+            },
+        );
 
         assert_eq!(p.fulfill_reactions.len(), 2);
 
@@ -427,7 +431,11 @@ mod tests {
     fn traceable_reports_handles() {
         let mut p = JsPromise::new();
         p.resolve_function = Some(ObjectHandle(5));
-        p.then(Some(ObjectHandle(10)), Some(ObjectHandle(11)), dummy_capability());
+        p.then(
+            Some(ObjectHandle(10)),
+            Some(ObjectHandle(11)),
+            dummy_capability(),
+        );
 
         let mut handles = Vec::new();
         p.trace_handles(&mut |h| handles.push(h.0));

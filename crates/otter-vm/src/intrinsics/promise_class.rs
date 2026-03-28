@@ -155,8 +155,14 @@ fn promise_then(
         .map(ObjectHandle)
         .ok_or_else(|| VmNativeCallError::Internal("then called on non-object".into()))?;
 
-    let on_fulfill = args.first().copied().and_then(|v| v.as_object_handle().map(ObjectHandle));
-    let on_reject = args.get(1).copied().and_then(|v| v.as_object_handle().map(ObjectHandle));
+    let on_fulfill = args
+        .first()
+        .copied()
+        .and_then(|v| v.as_object_handle().map(ObjectHandle));
+    let on_reject = args
+        .get(1)
+        .copied()
+        .and_then(|v| v.as_object_handle().map(ObjectHandle));
 
     // Create a new promise for the chain.
     let result_promise = runtime.objects_mut().alloc_promise();
@@ -193,11 +199,7 @@ fn promise_catch(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let reject_handler = args.first().copied().unwrap_or(RegisterValue::undefined());
-    promise_then(
-        this,
-        &[RegisterValue::undefined(), reject_handler],
-        runtime,
-    )
+    promise_then(this, &[RegisterValue::undefined(), reject_handler], runtime)
 }
 
 /// `Promise.prototype.finally(onFinally)` — ES2024 §27.2.5.3

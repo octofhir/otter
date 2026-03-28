@@ -207,7 +207,7 @@ fn boolean_data(
     Ok(Some(value))
 }
 
-pub(super) fn box_boolean_object(
+pub(crate) fn box_boolean_object(
     primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {

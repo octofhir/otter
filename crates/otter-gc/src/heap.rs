@@ -6,6 +6,7 @@
 
 use std::ptr::NonNull;
 
+use crate::align_up;
 use crate::barrier::WriteBarrier;
 use crate::handle::{GlobalHandle, GlobalHandleTable, HandleScopeLevel, HandleStack, LocalHandle};
 use crate::header::{GcHeader, HEADER_SIZE};
@@ -14,7 +15,6 @@ use crate::page::CELL_SIZE;
 use crate::scavenger::{ScavengeResult, scavenge};
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::trace::TraceTable;
-use crate::align_up;
 
 /// Configuration for the GC heap.
 #[derive(Debug, Clone)]
@@ -94,11 +94,7 @@ impl GcHeap {
     // -----------------------------------------------------------------------
 
     /// Registers a trace function for the given type tag.
-    pub fn register_trace_fn(
-        &mut self,
-        type_tag: u8,
-        trace_fn: crate::trace::TraceFn,
-    ) {
+    pub fn register_trace_fn(&mut self, type_tag: u8, trace_fn: crate::trace::TraceFn) {
         self.trace_table.register(type_tag, trace_fn);
     }
 
@@ -248,12 +244,11 @@ impl GcHeap {
         self.marking.begin();
 
         // Roots: handle stack + global handles.
-        let root_ptrs: Vec<*const GcHeader> = self.handle_stack
-            .root_pointers()
-            .to_vec();
+        let root_ptrs: Vec<*const GcHeader> = self.handle_stack.root_pointers().to_vec();
         unsafe { self.marking.mark_root_objects(&root_ptrs) };
 
-        let global_ptrs: Vec<*const GcHeader> = self.global_handles
+        let global_ptrs: Vec<*const GcHeader> = self
+            .global_handles
             .root_slots()
             .iter()
             .map(|slot| unsafe { **slot })
@@ -303,11 +298,21 @@ impl GcHeap {
     // Accessors
     // -----------------------------------------------------------------------
 
-    pub fn stats(&self) -> &GcStats { &self.stats }
-    pub fn new_space(&self) -> &NewSpace { &self.new_space }
-    pub fn old_space(&self) -> &OldSpace { &self.old_space }
-    pub fn large_space(&self) -> &LargeObjectSpace { &self.large_space }
-    pub fn trace_table(&self) -> &TraceTable { &self.trace_table }
+    pub fn stats(&self) -> &GcStats {
+        &self.stats
+    }
+    pub fn new_space(&self) -> &NewSpace {
+        &self.new_space
+    }
+    pub fn old_space(&self) -> &OldSpace {
+        &self.old_space
+    }
+    pub fn large_space(&self) -> &LargeObjectSpace {
+        &self.large_space
+    }
+    pub fn trace_table(&self) -> &TraceTable {
+        &self.trace_table
+    }
 
     fn update_stats(&mut self) {
         self.stats.young_gen_bytes = self.new_space.allocated_bytes();
@@ -399,7 +404,9 @@ mod tests {
 
         assert!(result.copied_count >= 1); // At least the rooted object
         // The handle should still be valid (updated by scavenger).
-        let new_ptr = heap.deref_local(handle).expect("handle should be valid after scavenge");
+        let new_ptr = heap
+            .deref_local(handle)
+            .expect("handle should be valid after scavenge");
         let new_leaf = unsafe { &*(new_ptr as *const Leaf) };
         assert_eq!(new_leaf.value, 999);
     }

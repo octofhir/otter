@@ -83,12 +83,7 @@ pub(super) fn install_object_plan(
                 let host_function = cx.native_functions.register(function.clone());
                 let handle = cx.alloc_intrinsic_host_function(host_function, function_prototype)?;
                 // ES2024 §10.2.8 SetFunctionLength + §10.2.9 SetFunctionName
-                install_function_length_name(
-                    handle,
-                    function.length(),
-                    function.js_name(),
-                    cx,
-                )?;
+                install_function_length_name(handle, function.length(), function.js_name(), cx)?;
                 let property = cx.property_names.intern(function.js_name());
                 // ES2024 §18: built-in methods are {W:true, E:false, C:true}.
                 cx.heap.define_own_property(
@@ -311,7 +306,11 @@ mod tests {
             .get_property(intrinsics.global_object(), tools)
             .expect("global lookup should succeed")
             .expect("namespace should be installed");
-        let PropertyValue::Data { value: global_value, .. } = global_lookup.value() else {
+        let PropertyValue::Data {
+            value: global_value,
+            ..
+        } = global_lookup.value()
+        else {
             panic!("namespace should install as a data property");
         };
         assert_eq!(global_value, RegisterValue::from_object_handle(namespace.0));

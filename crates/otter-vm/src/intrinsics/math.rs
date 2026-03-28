@@ -28,10 +28,7 @@ fn coerce_err(e: InterpreterError) -> VmNativeCallError {
 }
 
 /// ES spec 7.1.4 ToNumber — shorthand for native Math functions.
-fn to_number(
-    arg: RegisterValue,
-    runtime: &mut RuntimeState,
-) -> Result<f64, VmNativeCallError> {
+fn to_number(arg: RegisterValue, runtime: &mut RuntimeState) -> Result<f64, VmNativeCallError> {
     runtime.js_to_number(arg).map_err(coerce_err)
 }
 
@@ -41,7 +38,10 @@ fn arg_to_number(
     index: usize,
     runtime: &mut RuntimeState,
 ) -> Result<f64, VmNativeCallError> {
-    let value = args.get(index).copied().unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .get(index)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     to_number(value, runtime)
 }
 
@@ -52,7 +52,11 @@ fn arg_to_int32(
     runtime: &mut RuntimeState,
 ) -> Result<i32, VmNativeCallError> {
     runtime
-        .js_to_int32(args.get(index).copied().unwrap_or_else(RegisterValue::undefined))
+        .js_to_int32(
+            args.get(index)
+                .copied()
+                .unwrap_or_else(RegisterValue::undefined),
+        )
         .map_err(coerce_err)
 }
 
@@ -63,7 +67,11 @@ fn arg_to_uint32(
     runtime: &mut RuntimeState,
 ) -> Result<u32, VmNativeCallError> {
     runtime
-        .js_to_uint32(args.get(index).copied().unwrap_or_else(RegisterValue::undefined))
+        .js_to_uint32(
+            args.get(index)
+                .copied()
+                .unwrap_or_else(RegisterValue::undefined),
+        )
         .map_err(coerce_err)
 }
 
@@ -630,11 +638,7 @@ fn js_pow(base: f64, exponent: f64) -> f64 {
     }
     // §21.3.2.26 step 4: If base is +∞:
     if base == f64::INFINITY {
-        return if exponent > 0.0 {
-            f64::INFINITY
-        } else {
-            0.0
-        };
+        return if exponent > 0.0 { f64::INFINITY } else { 0.0 };
     }
     // §21.3.2.26 step 5: If base is -∞:
     if base == f64::NEG_INFINITY {
@@ -649,11 +653,7 @@ fn js_pow(base: f64, exponent: f64) -> f64 {
     }
     // §21.3.2.26 step 6: If base is +0:
     if base == 0.0 && base.is_sign_positive() {
-        return if exponent > 0.0 {
-            0.0
-        } else {
-            f64::INFINITY
-        };
+        return if exponent > 0.0 { 0.0 } else { f64::INFINITY };
     }
     // §21.3.2.26 step 7: If base is -0:
     if base == 0.0 && base.is_sign_negative() {
@@ -930,9 +930,7 @@ fn f64_to_f16_round(value: f64) -> f64 {
         let truncated = (f64_mantissa >> shift) as u16;
         let remainder = f64_mantissa & ((1u64 << shift) - 1);
         let halfway = 1u64 << (shift - 1);
-        let rounded = if remainder > halfway
-            || (remainder == halfway && (truncated & 1) != 0)
-        {
+        let rounded = if remainder > halfway || (remainder == halfway && (truncated & 1) != 0) {
             truncated + 1
         } else {
             truncated
@@ -963,9 +961,7 @@ fn f64_to_f16_round(value: f64) -> f64 {
         let truncated = (full_mantissa >> subnormal_shift) as u16;
         let remainder = full_mantissa & ((1u64 << subnormal_shift) - 1);
         let halfway = 1u64 << (subnormal_shift - 1);
-        let rounded = if remainder > halfway
-            || (remainder == halfway && (truncated & 1) != 0)
-        {
+        let rounded = if remainder > halfway || (remainder == halfway && (truncated & 1) != 0) {
             truncated + 1
         } else {
             truncated
@@ -1026,14 +1022,13 @@ mod tests {
     use crate::value::RegisterValue;
 
     /// Helper: call a Math native function with f64 args.
-    fn call_math_fn(
-        func: crate::descriptors::VmNativeFunction,
-        float_args: &[f64],
-    ) -> f64 {
+    fn call_math_fn(func: crate::descriptors::VmNativeFunction, float_args: &[f64]) -> f64 {
         let mut runtime = RuntimeState::new();
         let this = RegisterValue::undefined();
-        let args: Vec<RegisterValue> =
-            float_args.iter().map(|&v| RegisterValue::from_number(v)).collect();
+        let args: Vec<RegisterValue> = float_args
+            .iter()
+            .map(|&v| RegisterValue::from_number(v))
+            .collect();
         let result = func(&this, &args, &mut runtime).expect("math fn should succeed");
         result.as_number().expect("result should be a number")
     }
@@ -1127,10 +1122,7 @@ mod tests {
         assert_eq!(call_math_fn(math_abs, &[-5.0]), 5.0);
         assert_eq!(call_math_fn(math_abs, &[5.0]), 5.0);
         assert_eq!(call_math_fn(math_abs, &[0.0]), 0.0);
-        assert_eq!(
-            call_math_fn(math_abs, &[f64::NEG_INFINITY]),
-            f64::INFINITY
-        );
+        assert_eq!(call_math_fn(math_abs, &[f64::NEG_INFINITY]), f64::INFINITY);
     }
 
     // -----------------------------------------------------------------------
@@ -1310,10 +1302,7 @@ mod tests {
 
     #[test]
     fn math_pow_infinity_base() {
-        assert_eq!(
-            call_math_fn(math_pow, &[f64::INFINITY, 2.0]),
-            f64::INFINITY
-        );
+        assert_eq!(call_math_fn(math_pow, &[f64::INFINITY, 2.0]), f64::INFINITY);
         assert_eq!(call_math_fn(math_pow, &[f64::INFINITY, -2.0]), 0.0);
         assert_eq!(
             call_math_fn(math_pow, &[f64::NEG_INFINITY, 3.0]),
@@ -1335,19 +1324,13 @@ mod tests {
         let r = call_math_fn(math_pow, &[-0.0, 3.0]);
         assert!(r == 0.0 && r.is_sign_negative());
         assert_eq!(call_math_fn(math_pow, &[-0.0, 2.0]), 0.0);
-        assert_eq!(
-            call_math_fn(math_pow, &[-0.0, -3.0]),
-            f64::NEG_INFINITY
-        );
+        assert_eq!(call_math_fn(math_pow, &[-0.0, -3.0]), f64::NEG_INFINITY);
         assert_eq!(call_math_fn(math_pow, &[-0.0, -2.0]), f64::INFINITY);
     }
 
     #[test]
     fn math_pow_infinity_exponent() {
-        assert_eq!(
-            call_math_fn(math_pow, &[2.0, f64::INFINITY]),
-            f64::INFINITY
-        );
+        assert_eq!(call_math_fn(math_pow, &[2.0, f64::INFINITY]), f64::INFINITY);
         assert!(call_math_fn(math_pow, &[1.0, f64::INFINITY]).is_nan());
         assert_eq!(call_math_fn(math_pow, &[0.5, f64::INFINITY]), 0.0);
         assert_eq!(call_math_fn(math_pow, &[2.0, f64::NEG_INFINITY]), 0.0);
@@ -1385,10 +1368,7 @@ mod tests {
         assert_eq!(call_math_fn(math_imul, &[2.0, 3.0]), 6.0);
         assert_eq!(call_math_fn(math_imul, &[-1.0, 8.0]), -8.0);
         // Overflow wraps
-        assert_eq!(
-            call_math_fn(math_imul, &[4_294_967_295.0, 5.0]),
-            -5.0
-        );
+        assert_eq!(call_math_fn(math_imul, &[4_294_967_295.0, 5.0]), -5.0);
     }
 
     // -----------------------------------------------------------------------
@@ -1524,10 +1504,7 @@ mod tests {
         assert_eq!(call_math_fn(math_f16round, &[1.0]), 1.0);
         assert_eq!(call_math_fn(math_f16round, &[1.5]), 1.5);
         assert!(call_math_fn(math_f16round, &[f64::NAN]).is_nan());
-        assert_eq!(
-            call_math_fn(math_f16round, &[f64::INFINITY]),
-            f64::INFINITY
-        );
+        assert_eq!(call_math_fn(math_f16round, &[f64::INFINITY]), f64::INFINITY);
         assert_eq!(
             call_math_fn(math_f16round, &[f64::NEG_INFINITY]),
             f64::NEG_INFINITY
@@ -1537,14 +1514,8 @@ mod tests {
     #[test]
     fn math_f16round_precision_loss() {
         // f16 max ≈ 65504, values beyond overflow to infinity
-        assert_eq!(
-            call_math_fn(math_f16round, &[65504.0]),
-            65504.0
-        );
-        assert_eq!(
-            call_math_fn(math_f16round, &[65520.0]),
-            f64::INFINITY
-        );
+        assert_eq!(call_math_fn(math_f16round, &[65504.0]), 65504.0);
+        assert_eq!(call_math_fn(math_f16round, &[65520.0]), f64::INFINITY);
 
         // f16 precision: smallest subnormal ≈ 2^-24 ≈ 5.96e-8
         let tiny = call_math_fn(math_f16round, &[1e-9]);
@@ -1574,7 +1545,11 @@ mod tests {
         // 36 methods (37 in ES2024 minus the memory getter/setter we removed,
         // but we have f16round which is the 37th).
         let bindings = math_method_bindings();
-        assert_eq!(bindings.len(), 36, "ES2024 Math should have 36 function properties");
+        assert_eq!(
+            bindings.len(),
+            36,
+            "ES2024 Math should have 36 function properties"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1588,11 +1563,10 @@ mod tests {
         let math_ns = intrinsics.math_namespace().expect("Math namespace");
 
         let expected_methods = [
-            "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "atan2",
-            "cbrt", "ceil", "clz32", "cos", "cosh", "exp", "expm1", "floor",
-            "fround", "hypot", "imul", "log", "log1p", "log10", "log2",
-            "max", "min", "pow", "random", "round", "sign", "sin", "sinh",
-            "sqrt", "tan", "tanh", "trunc", "f16round",
+            "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "atan2", "cbrt", "ceil",
+            "clz32", "cos", "cosh", "exp", "expm1", "floor", "fround", "hypot", "imul", "log",
+            "log1p", "log10", "log2", "max", "min", "pow", "random", "round", "sign", "sin",
+            "sinh", "sqrt", "tan", "tanh", "trunc", "f16round",
         ];
 
         for name in &expected_methods {

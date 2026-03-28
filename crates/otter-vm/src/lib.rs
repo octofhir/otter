@@ -9,10 +9,10 @@
 
 /// Shared execution ABI.
 pub mod abi;
+/// ECMAScript abstract operations shared across interpreter and intrinsics.
+pub mod abstract_ops;
 /// Suspended async function context for await support.
 pub mod async_context;
-/// Console API with pluggable backend.
-pub mod console;
 /// Engine/runtime integration boundary.
 pub mod bridge;
 /// Builder-side adapters for descriptor-driven bootstrap.
@@ -23,6 +23,8 @@ pub mod bytecode;
 pub mod call;
 /// Closure creation metadata and upvalue identifiers.
 pub mod closure;
+/// Console API with pluggable backend.
+pub mod console;
 /// Deoptimization metadata and handoff types.
 pub mod deopt;
 /// Descriptor layer shared by proc-macros and future builders.

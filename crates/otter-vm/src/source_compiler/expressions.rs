@@ -1170,6 +1170,7 @@ impl<'a> FunctionCompiler<'a> {
         self.instructions.push(Instruction::new_array(destination));
 
         for (index, element) in array.elements.iter().enumerate() {
+            let is_elision = matches!(element, oxc_ast::ast::ArrayExpressionElement::Elision(_));
             let value = match element {
                 oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
                     return Err(SourceLoweringError::Unsupported(
@@ -1186,6 +1187,14 @@ impl<'a> FunctionCompiler<'a> {
                 index_value.register,
                 value.register,
             ));
+            if is_elision {
+                let property = self.intern_property_name(&index.to_string())?;
+                self.instructions.push(Instruction::delete_property(
+                    value.register,
+                    destination,
+                    property,
+                ));
+            }
             self.release(index_value);
             self.release(value);
         }

@@ -505,6 +505,7 @@ impl<'a> TinyScriptLowerer<'a> {
 #[cfg(test)]
 mod tests {
     use crate::Interpreter;
+    use crate::interpreter::InterpreterError;
     use crate::source::{compile_script, compile_test262_basic_script, lower_script};
     use crate::value::RegisterValue;
 
@@ -524,6 +525,23 @@ mod tests {
             )
             .expect("test262 basic script executes")
             .return_value()
+    }
+
+    fn execute_test262_basic_error(source: &str, source_url: &str) -> InterpreterError {
+        let module = compile_test262_basic_script(source, source_url)
+            .expect("test262 basic script compiles");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect_err("test262 basic script should throw")
     }
 
     #[test]
@@ -777,9 +795,18 @@ mod tests {
                 "var proto = { value: 7 };\n",
                 "var child = Object.create(proto);\n",
                 "assert.sameValue(Reflect.get(child, \"value\"), 7, \"Reflect.get walks prototypes\");\n",
+                "var accessor = {};\n",
+                "Reflect.defineProperty(accessor, \"flag\", { get: Boolean.prototype.valueOf });\n",
+                "assert.sameValue(Reflect.get(accessor, \"flag\", true), true, \"Reflect.get preserves primitive boolean receiver\");\n",
+                "assert.sameValue(Reflect.get(accessor, \"flag\", false), false, \"Reflect.get preserves false boolean receiver\");\n",
+                "var setter = {};\n",
+                "Reflect.defineProperty(setter, \"flag\", { set: Boolean.prototype.valueOf });\n",
+                "assert.sameValue(Reflect.set(setter, \"flag\", 1, true), true, \"Reflect.set preserves primitive boolean receiver for setter\");\n",
+                "assert.sameValue(Reflect.set(child, \"value\", 9, true), false, \"Reflect.set fails for primitive receiver on inherited data property\");\n",
                 "assert.sameValue(Reflect.set(child, \"value\", 9), true, \"Reflect.set reports success\");\n",
                 "assert.sameValue(child.value, 9, \"Reflect.set writes onto receiver\");\n",
                 "assert.sameValue(proto.value, 7, \"Reflect.set keeps prototype slot intact\");\n",
+                "assert.sameValue(Reflect.set({}, \"fresh\", 1, true), false, \"Reflect.set cannot create property on primitive receiver\");\n",
             ),
             "native-test262-array-reflect.js",
         )
@@ -797,6 +824,503 @@ mod tests {
             )
             .expect("array/reflect script should execute");
         assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_property_introspection_semantics() {
+        let result = execute_test262_basic(
+            concat!(
+                "var proto = { inherited: 1 };\n",
+                "var object = Object.create(proto);\n",
+                "object.own = 2;\n",
+                "var array = [10];\n",
+                "assert.sameValue(Reflect.has(object, 'own'), true, 'Reflect.has sees own property');\n",
+                "assert.sameValue(Reflect.has(object, 'inherited'), true, 'Reflect.has walks prototype chain');\n",
+                "assert.sameValue(Reflect.has(array, '0'), true, 'Reflect.has sees array index');\n",
+                "assert.sameValue(Reflect.has(array, 'length'), true, 'Reflect.has sees array length');\n",
+                "assert.sameValue('length' in array, true, 'in operator sees array length');\n",
+                "assert.sameValue(Object.hasOwn(object, 'own'), true, 'Object.hasOwn sees own property');\n",
+                "assert.sameValue(Object.hasOwn(object, 'inherited'), false, 'Object.hasOwn ignores inherited property');\n",
+                "assert.sameValue(Object.hasOwn('otter', 'length'), true, 'Object.hasOwn coerces string receiver');\n",
+                "assert.sameValue(Object.prototype.hasOwnProperty.call('otter', 'length'), true, 'hasOwnProperty coerces string receiver');\n",
+                "assert.sameValue(Object.prototype.propertyIsEnumerable.call('otter', 'length'), false, 'string length is non-enumerable');\n",
+                "try {\n",
+                "  Reflect.has('otter', 'length');\n",
+                "  throw new Test262Error('Reflect.has should reject primitive string targets');\n",
+                "} catch (error) {}\n",
+            ),
+            "native-test262-property-introspection.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_string_exotic_object_introspection() {
+        let result = execute_test262_basic(
+            concat!(
+                "var keys = Object.keys('otter');\n",
+                "assert.sameValue(keys.length, 5, 'Object.keys string length');\n",
+                "assert.sameValue(keys[0], '0', 'Object.keys string index 0');\n",
+                "assert.sameValue(keys[4], '4', 'Object.keys string index 4');\n",
+                "var values = Object.values('otter');\n",
+                "assert.sameValue(values.length, 5, 'Object.values string length');\n",
+                "assert.sameValue(values[0], 'o', 'Object.values string value 0');\n",
+                "assert.sameValue(values[4], 'r', 'Object.values string value 4');\n",
+                "var entries = Object.entries('otter');\n",
+                "assert.sameValue(entries.length, 5, 'Object.entries string length');\n",
+                "assert.sameValue(entries[0][0], '0', 'Object.entries key 0');\n",
+                "assert.sameValue(entries[0][1], 'o', 'Object.entries value 0');\n",
+                "assert.sameValue(entries[4][0], '4', 'Object.entries key 4');\n",
+                "assert.sameValue(entries[4][1], 'r', 'Object.entries value 4');\n",
+                "var names = Object.getOwnPropertyNames('otter');\n",
+                "assert.sameValue(names.length, 6, 'Object.getOwnPropertyNames string length');\n",
+                "assert.sameValue(names[0], '0', 'Object.getOwnPropertyNames key 0');\n",
+                "assert.sameValue(names[4], '4', 'Object.getOwnPropertyNames key 4');\n",
+                "assert.sameValue(names[5], 'length', 'Object.getOwnPropertyNames length key');\n",
+                "var indexDesc = Object.getOwnPropertyDescriptor('otter', '0');\n",
+                "assert.sameValue(indexDesc.value, 'o', 'string index descriptor value');\n",
+                "assert.sameValue(indexDesc.writable, false, 'string index descriptor writable');\n",
+                "assert.sameValue(indexDesc.enumerable, true, 'string index descriptor enumerable');\n",
+                "assert.sameValue(indexDesc.configurable, false, 'string index descriptor configurable');\n",
+                "var lengthDesc = Object.getOwnPropertyDescriptor('otter', 'length');\n",
+                "assert.sameValue(lengthDesc.value, 5, 'string length descriptor value');\n",
+                "assert.sameValue(lengthDesc.enumerable, false, 'string length descriptor enumerable');\n",
+                "var descriptors = Object.getOwnPropertyDescriptors('otter');\n",
+                "assert.sameValue(descriptors['0'].value, 'o', 'string descriptors index value');\n",
+                "assert.sameValue(descriptors.length.value, 5, 'string descriptors length value');\n",
+                "assert.sameValue(Object.hasOwn('otter', '0'), true, 'Object.hasOwn sees string index');\n",
+                "assert.sameValue(Object.prototype.propertyIsEnumerable.call('otter', '0'), true, 'string index is enumerable');\n",
+            ),
+            "native-test262-string-exotic-introspection.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_computed_property_key_coercion() {
+        let result = execute_test262_basic(
+            concat!(
+                "var stringValue = 'otter';\n",
+                "var zero = '0';\n",
+                "var lengthKey = 'length';\n",
+                "assert.sameValue(stringValue[zero], 'o', 'computed string index via string key');\n",
+                "assert.sameValue(stringValue[lengthKey], 5, 'computed string length via string key');\n",
+                "assert.sameValue(stringValue['9'], undefined, 'missing computed string index');\n",
+                "var object = {};\n",
+                "var objectKey = '0';\n",
+                "object[objectKey] = 7;\n",
+                "assert.sameValue(object[0], 7, 'computed object numeric key stored as property');\n",
+                "var array = [1, 2];\n",
+                "var indexKey = '1';\n",
+                "array[indexKey] = 9;\n",
+                "assert.sameValue(array[1], 9, 'computed array string index updates element');\n",
+                "var appendKey = '2';\n",
+                "array[appendKey] = 11;\n",
+                "assert.sameValue(array[2], 11, 'computed array string index appends element');\n",
+                "var deleteTarget = { keep: 1, drop: 2 };\n",
+                "var deleteKey = 'drop';\n",
+                "assert.sameValue(delete deleteTarget[deleteKey], true, 'delete computed returns true');\n",
+                "assert.sameValue('drop' in deleteTarget, false, 'delete computed removes ordinary property');\n",
+            ),
+            "native-test262-computed-property-key-coercion.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_number_and_boolean_member_access() {
+        let result = execute_test262_basic(
+            concat!(
+                "var numberValue = 7;\n",
+                "var booleanValue = true;\n",
+                "assert.sameValue(numberValue.valueOf(), 7, 'number primitive method call');\n",
+                "assert.sameValue(booleanValue.valueOf(), true, 'boolean primitive method call');\n",
+                "assert.sameValue(numberValue['valueOf'](), 7, 'computed number primitive method call');\n",
+                "assert.sameValue(booleanValue['valueOf'](), true, 'computed boolean primitive method call');\n",
+                "assert.sameValue(numberValue.constructor, Number, 'number primitive prototype property');\n",
+                "assert.sameValue(booleanValue.constructor, Boolean, 'boolean primitive prototype property');\n",
+                "numberValue.extra = 1;\n",
+                "booleanValue.extra = 1;\n",
+                "assert.sameValue(numberValue.extra, undefined, 'number primitive write does not persist');\n",
+                "assert.sameValue(booleanValue.extra, undefined, 'boolean primitive write does not persist');\n",
+                "assert.sameValue(delete numberValue.missing, true, 'delete on number primitive succeeds');\n",
+                "assert.sameValue(delete booleanValue.missing, true, 'delete on boolean primitive succeeds');\n",
+            ),
+            "native-test262-primitive-member-access.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_rejects_nullish_member_access() {
+        let cases = [
+            ("var x = null.foo;\n", "null-static-get.js"),
+            ("var x = undefined.foo;\n", "undefined-static-get.js"),
+            ("var x = null['foo'];\n", "null-computed-get.js"),
+            ("var x = undefined['foo'];\n", "undefined-computed-get.js"),
+            ("null.foo = 1;\n", "null-static-set.js"),
+            ("undefined['foo'] = 1;\n", "undefined-computed-set.js"),
+            ("delete null.foo;\n", "null-static-delete.js"),
+            ("delete undefined['foo'];\n", "undefined-computed-delete.js"),
+            ("null.valueOf();\n", "null-static-call.js"),
+            ("undefined['valueOf']();\n", "undefined-computed-call.js"),
+        ];
+
+        for (source, source_url) in cases {
+            let error = execute_test262_basic_error(source, source_url);
+            assert!(
+                matches!(error, InterpreterError::TypeError(_)),
+                "expected TypeError for {source_url}, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains("null or undefined"),
+                "unexpected error for {source_url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_test262_basic_script_coerces_property_keys_via_to_property_key() {
+        let result = execute_test262_basic(
+            concat!(
+                "var object = {};\n",
+                "assert.sameValue(Reflect.defineProperty(object, 1, { value: 7 }), true, 'Reflect.defineProperty numeric key');\n",
+                "assert.sameValue(object['1'], 7, 'numeric key stored as string');\n",
+                "assert.sameValue(Object.defineProperty(object, new String('boxed'), { value: 9 }).boxed, 9, 'boxed string key');\n",
+                "assert.sameValue(object.hasOwnProperty(new Number(1)), true, 'boxed number key');\n",
+                "assert.sameValue(object.propertyIsEnumerable(new String('boxed')), false, 'boxed string enumerable default');\n",
+            ),
+            "native-test262-to-property-key.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_preserves_descriptor_flags() {
+        let result = execute_test262_basic(
+            concat!(
+                "var object = {};\n",
+                "assert.sameValue(Reflect.defineProperty(object, 'hidden', { value: 7, writable: false, enumerable: false, configurable: false }), true, 'Reflect.defineProperty succeeds');\n",
+                "var reflectDesc = Reflect.getOwnPropertyDescriptor(object, 'hidden');\n",
+                "assert.sameValue(reflectDesc.value, 7, 'reflect desc value');\n",
+                "assert.sameValue(reflectDesc.writable, false, 'reflect desc writable');\n",
+                "assert.sameValue(reflectDesc.enumerable, false, 'reflect desc enumerable');\n",
+                "assert.sameValue(reflectDesc.configurable, false, 'reflect desc configurable');\n",
+                "var objectDesc = Object.getOwnPropertyDescriptor(object, 'hidden');\n",
+                "assert.sameValue(objectDesc.value, 7, 'object desc value');\n",
+                "assert.sameValue(objectDesc.writable, false, 'object desc writable');\n",
+                "assert.sameValue(objectDesc.enumerable, false, 'object desc enumerable');\n",
+                "assert.sameValue(objectDesc.configurable, false, 'object desc configurable');\n",
+                "var partial = {};\n",
+                "Object.defineProperty(partial, 'visible', { value: 1, writable: true, enumerable: true, configurable: true });\n",
+                "Object.defineProperty(partial, 'visible', { value: 2 });\n",
+                "var partialDesc = Object.getOwnPropertyDescriptor(partial, 'visible');\n",
+                "assert.sameValue(partialDesc.value, 2, 'partial desc updates value');\n",
+                "assert.sameValue(partialDesc.writable, true, 'partial desc preserves writable');\n",
+                "assert.sameValue(partialDesc.enumerable, true, 'partial desc preserves enumerable');\n",
+                "assert.sameValue(partialDesc.configurable, true, 'partial desc preserves configurable');\n",
+                "var fixed = {};\n",
+                "Object.defineProperty(fixed, 'locked', { value: 1, writable: false, enumerable: false, configurable: false });\n",
+                "assert.sameValue(Reflect.defineProperty(fixed, 'locked', { value: 1 }), true, 'same value redefine succeeds');\n",
+                "assert.sameValue(Reflect.defineProperty(fixed, 'locked', { value: 2 }), false, 'changing frozen value fails');\n",
+                "assert.sameValue(Reflect.defineProperty(fixed, 'locked', { writable: true }), false, 'making frozen value writable fails');\n",
+                "assert.sameValue(Reflect.defineProperty(fixed, 'locked', { enumerable: true }), false, 'changing enumerable fails');\n",
+                "try {\n",
+                "  Object.defineProperty(fixed, 'locked', { value: 2 });\n",
+                "  throw new Test262Error('Object.defineProperty should throw on invalid redefine');\n",
+                "} catch (error) {}\n",
+            ),
+            "native-test262-descriptor-flags.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_define_properties() {
+        let result = execute_test262_basic(
+            concat!(
+                "var target = {};\n",
+                "var source = {};\n",
+                "Object.defineProperty(source, 'hidden', { value: { value: 99 }, enumerable: false });\n",
+                "Object.defineProperty(source, 'visible', { value: { value: 7, writable: false, enumerable: true, configurable: false }, enumerable: true });\n",
+                "Object.defineProperties(target, source);\n",
+                "assert.sameValue(target.visible, 7, 'defineProperties installs data descriptor entry');\n",
+                "var desc = Object.getOwnPropertyDescriptor(target, 'visible');\n",
+                "assert.sameValue(desc.writable, false, 'defineProperties preserves writable');\n",
+                "assert.sameValue(desc.enumerable, true, 'defineProperties preserves enumerable');\n",
+                "assert.sameValue(desc.configurable, false, 'defineProperties preserves configurable');\n",
+                "assert.sameValue(target.hasOwnProperty('hidden'), false, 'non-enumerable descriptor source key skipped');\n",
+                "try {\n",
+                "  Object.defineProperty({}, 'broken', undefined);\n",
+                "  throw new Test262Error('defineProperty should reject non-object descriptor');\n",
+                "} catch (error) {}\n",
+                "try {\n",
+                "  Object.defineProperties({}, { broken: 1 });\n",
+                "  throw new Test262Error('defineProperties should reject non-object descriptor entry');\n",
+                "} catch (error) {}\n",
+            ),
+            "native-test262-object-define-properties.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_get_own_property_descriptors() {
+        let result = execute_test262_basic(
+            concat!(
+                "var object = { visible: 1 };\n",
+                "Object.defineProperty(object, 'hidden', { value: 2, writable: false, enumerable: false, configurable: false });\n",
+                "var descriptors = Object.getOwnPropertyDescriptors(object);\n",
+                "assert.sameValue(descriptors.visible.value, 1, 'visible descriptor value');\n",
+                "assert.sameValue(descriptors.visible.writable, true, 'visible descriptor writable');\n",
+                "assert.sameValue(descriptors.visible.enumerable, true, 'visible descriptor enumerable');\n",
+                "assert.sameValue(descriptors.hidden.value, 2, 'hidden descriptor value');\n",
+                "assert.sameValue(descriptors.hidden.writable, false, 'hidden descriptor writable');\n",
+                "assert.sameValue(descriptors.hidden.enumerable, false, 'hidden descriptor enumerable');\n",
+                "assert.sameValue(descriptors.hidden.configurable, false, 'hidden descriptor configurable');\n",
+                "var arrayDescriptors = Object.getOwnPropertyDescriptors([7]);\n",
+                "assert.sameValue(arrayDescriptors['0'].value, 7, 'array index descriptor value');\n",
+                "assert.sameValue(arrayDescriptors['0'].enumerable, true, 'array index descriptor enumerable');\n",
+                "assert.sameValue(arrayDescriptors.length.value, 1, 'array length descriptor value');\n",
+                "assert.sameValue(arrayDescriptors.length.enumerable, false, 'array length descriptor enumerable');\n",
+                "assert.sameValue(arrayDescriptors.hasOwnProperty('0'), true, 'result carries numeric key');\n",
+                "assert.sameValue(arrayDescriptors.hasOwnProperty('length'), true, 'result carries length key');\n",
+            ),
+            "native-test262-object-get-own-property-descriptors.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_extensibility_controls() {
+        let result = execute_test262_basic(
+            concat!(
+                "var object = {};\n",
+                "assert.sameValue(Object.isExtensible(object), true, 'Object.isExtensible true');\n",
+                "assert.sameValue(Reflect.isExtensible(object), true, 'Reflect.isExtensible true');\n",
+                "assert.sameValue(Object.preventExtensions(object), object, 'Object.preventExtensions returns target');\n",
+                "assert.sameValue(Reflect.preventExtensions(object), true, 'Reflect.preventExtensions returns true');\n",
+                "assert.sameValue(Object.isExtensible(object), false, 'Object.isExtensible false');\n",
+                "assert.sameValue(Reflect.isExtensible(object), false, 'Reflect.isExtensible false');\n",
+                "assert.sameValue(Reflect.setPrototypeOf(object, null), false, 'Reflect.setPrototypeOf fails on non-extensible target');\n",
+                "try {\n",
+                "  Object.setPrototypeOf(object, null);\n",
+                "  throw new Test262Error('Object.setPrototypeOf should throw on non-extensible target');\n",
+                "} catch (error) {}\n",
+            ),
+            "native-test262-extensibility-controls.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_integrity_predicates() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(Object.isFrozen(undefined), true, 'undefined is frozen');\n",
+                "assert.sameValue(Object.isSealed(undefined), true, 'undefined is sealed');\n",
+                "var object = { value: 1 };\n",
+                "assert.sameValue(Object.isFrozen(object), false, 'plain object is not frozen');\n",
+                "assert.sameValue(Object.isSealed(object), false, 'plain object is not sealed');\n",
+                "Object.seal(object);\n",
+                "assert.sameValue(Object.isSealed(object), true, 'sealed object is sealed');\n",
+                "assert.sameValue(Object.isFrozen(object), false, 'sealed object is not frozen');\n",
+                "Object.freeze(object);\n",
+                "assert.sameValue(Object.isFrozen(object), true, 'frozen object is frozen');\n",
+                "assert.sameValue(Object.isSealed(object), true, 'frozen object is sealed');\n",
+            ),
+            "native-test262-integrity-predicates.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_array_own_key_enumeration() {
+        let result = execute_test262_basic(
+            concat!(
+                "var array = [10, 20];\n",
+                "var ownKeys = Reflect.ownKeys(array);\n",
+                "assert.sameValue(ownKeys.length, 3, 'Reflect.ownKeys length');\n",
+                "assert.sameValue(ownKeys[0], '0', 'index 0 first');\n",
+                "assert.sameValue(ownKeys[1], '1', 'index 1 second');\n",
+                "assert.sameValue(ownKeys[2], 'length', 'length last');\n",
+                "var keys = Object.keys(array);\n",
+                "assert.sameValue(keys.length, 2, 'Object.keys length');\n",
+                "assert.sameValue(keys[0], '0', 'Object.keys index 0');\n",
+                "assert.sameValue(keys[1], '1', 'Object.keys index 1');\n",
+                "var names = Object.getOwnPropertyNames(array);\n",
+                "assert.sameValue(names.length, 3, 'Object.getOwnPropertyNames length');\n",
+                "assert.sameValue(names[0], '0', 'Object.getOwnPropertyNames index 0');\n",
+                "assert.sameValue(names[1], '1', 'Object.getOwnPropertyNames index 1');\n",
+                "assert.sameValue(names[2], 'length', 'Object.getOwnPropertyNames length key');\n",
+                "var elementDesc = Reflect.getOwnPropertyDescriptor(array, '0');\n",
+                "assert.sameValue(elementDesc.value, 10, 'element descriptor value');\n",
+                "assert.sameValue(elementDesc.writable, true, 'element descriptor writable');\n",
+                "assert.sameValue(elementDesc.enumerable, true, 'element descriptor enumerable');\n",
+                "assert.sameValue(elementDesc.configurable, true, 'element descriptor configurable');\n",
+                "var lengthDesc = Object.getOwnPropertyDescriptor(array, 'length');\n",
+                "assert.sameValue(lengthDesc.value, 2, 'length descriptor value');\n",
+                "assert.sameValue(lengthDesc.writable, true, 'length descriptor writable');\n",
+                "assert.sameValue(lengthDesc.enumerable, false, 'length descriptor enumerable');\n",
+                "assert.sameValue(lengthDesc.configurable, false, 'length descriptor configurable');\n",
+            ),
+            "native-test262-array-own-key-enumeration.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_array_integrity_predicates() {
+        let result = execute_test262_basic(
+            concat!(
+                "var sealed = [1, 2];\n",
+                "assert.sameValue(Object.isSealed(sealed), false, 'plain array is not sealed');\n",
+                "assert.sameValue(Object.isFrozen(sealed), false, 'plain array is not frozen');\n",
+                "Object.seal(sealed);\n",
+                "assert.sameValue(Object.isSealed(sealed), true, 'sealed array is sealed');\n",
+                "assert.sameValue(Object.isFrozen(sealed), false, 'sealed array is not frozen');\n",
+                "var sealedIndex = Reflect.getOwnPropertyDescriptor(sealed, '0');\n",
+                "assert.sameValue(sealedIndex.writable, true, 'sealed index remains writable');\n",
+                "assert.sameValue(sealedIndex.configurable, false, 'sealed index is not configurable');\n",
+                "var frozen = [3, 4];\n",
+                "Object.freeze(frozen);\n",
+                "assert.sameValue(Object.isSealed(frozen), true, 'frozen array is sealed');\n",
+                "assert.sameValue(Object.isFrozen(frozen), true, 'frozen array is frozen');\n",
+                "var frozenIndex = Reflect.getOwnPropertyDescriptor(frozen, '0');\n",
+                "assert.sameValue(frozenIndex.writable, false, 'frozen index is not writable');\n",
+                "assert.sameValue(frozenIndex.configurable, false, 'frozen index is not configurable');\n",
+                "var frozenLength = Object.getOwnPropertyDescriptor(frozen, 'length');\n",
+                "assert.sameValue(frozenLength.writable, false, 'frozen length is not writable');\n",
+                "assert.sameValue(frozenLength.configurable, false, 'frozen length is not configurable');\n",
+                "frozen[0] = 99;\n",
+                "assert.sameValue(frozen[0], 3, 'frozen array does not overwrite existing element');\n",
+                "frozen[2] = 5;\n",
+                "assert.sameValue(frozen.length, 2, 'frozen array does not grow');\n",
+                "assert.sameValue(frozen[2], undefined, 'frozen array does not create new element');\n",
+            ),
+            "native-test262-array-integrity-predicates.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_array_define_property_semantics() {
+        let result = execute_test262_basic(
+            concat!(
+                "var array = [1, 2, 3];\n",
+                "assert.sameValue(Object.defineProperty(array, '0', { value: 9 }), array, 'Object.defineProperty returns array');\n",
+                "assert.sameValue(array[0], 9, 'existing dense index updates value');\n",
+                "Object.defineProperty(array, 'length', { value: 1 });\n",
+                "assert.sameValue(array.length, 1, 'array length shrinks');\n",
+                "assert.sameValue(array[1], undefined, 'shrunk elements disappear');\n",
+                "var lengthDesc = Object.getOwnPropertyDescriptor(array, 'length');\n",
+                "assert.sameValue(lengthDesc.value, 1, 'length descriptor tracks shrink');\n",
+                "assert.sameValue(lengthDesc.writable, true, 'length stays writable');\n",
+                "Object.defineProperty(array, 'length', { writable: false });\n",
+                "assert.sameValue(Object.getOwnPropertyDescriptor(array, 'length').writable, false, 'length can be locked');\n",
+                "assert.sameValue(Reflect.defineProperty(array, '1', { value: 7, writable: true, enumerable: true, configurable: true }), false, 'locked length prevents append');\n",
+                "assert.sameValue(array.length, 1, 'failed append preserves length');\n",
+                "var grow = [4];\n",
+                "assert.sameValue(Reflect.defineProperty(grow, '1', { value: 8, writable: true, enumerable: true, configurable: true }), true, 'explicit dense index descriptor appends');\n",
+                "assert.sameValue(grow.length, 2, 'explicit dense append updates length');\n",
+                "assert.sameValue(grow[1], 8, 'explicit dense append stores value');\n",
+                "var sealed = [5, 6];\n",
+                "Object.seal(sealed);\n",
+                "assert.sameValue(Reflect.defineProperty(sealed, 'length', { value: 1 }), false, 'sealed array cannot shrink length');\n",
+                "var frozen = [7];\n",
+                "Object.freeze(frozen);\n",
+                "assert.sameValue(Reflect.defineProperty(frozen, '0', { value: 11 }), false, 'frozen array index redefine fails');\n",
+                "assert.sameValue(Reflect.defineProperty(frozen, 'length', { value: 0 }), false, 'frozen array length redefine fails');\n",
+            ),
+            "native-test262-array-define-property-semantics.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_sparse_array_hole_semantics() {
+        let result = execute_test262_basic(
+            concat!(
+                "var sparse = [1,,3];\n",
+                "assert.sameValue(sparse.length, 3, 'sparse length');\n",
+                "assert.sameValue(sparse[1], undefined, 'hole reads as undefined');\n",
+                "assert.sameValue(Reflect.has(sparse, '1'), false, 'hole is not an own property');\n",
+                "var keys = Object.keys(sparse);\n",
+                "assert.sameValue(keys.length, 2, 'Object.keys skips holes');\n",
+                "assert.sameValue(keys[0], '0', 'Object.keys keeps first present index');\n",
+                "assert.sameValue(keys[1], '2', 'Object.keys keeps later present index');\n",
+                "var ownKeys = Reflect.ownKeys(sparse);\n",
+                "assert.sameValue(ownKeys.length, 3, 'Reflect.ownKeys skips holes but keeps length');\n",
+                "assert.sameValue(ownKeys[0], '0', 'Reflect.ownKeys first index');\n",
+                "assert.sameValue(ownKeys[1], '2', 'Reflect.ownKeys second present index');\n",
+                "assert.sameValue(ownKeys[2], 'length', 'Reflect.ownKeys length last');\n",
+                "assert.sameValue(Object.getOwnPropertyDescriptor(sparse, '1'), undefined, 'hole has no own descriptor');\n",
+                "assert.sameValue(sparse.join(), '1,,3', 'join preserves holes as empty fields');\n",
+                "assert.sameValue(sparse.indexOf(undefined), -1, 'indexOf skips holes');\n",
+                "var iterated = [];\n",
+                "for (var value of sparse) {\n",
+                "  iterated.push(value);\n",
+                "}\n",
+                "assert.sameValue(iterated.length, 3, 'for-of walks full array length');\n",
+                "assert.sameValue(iterated[0], 1, 'for-of yields first element');\n",
+                "assert.sameValue(iterated[1], undefined, 'for-of yields undefined for hole');\n",
+                "assert.sameValue(iterated[2], 3, 'for-of yields later element');\n",
+                "assert.sameValue(delete sparse[0], true, 'delete array index succeeds');\n",
+                "assert.sameValue(Reflect.has(sparse, '0'), false, 'deleted index becomes hole');\n",
+                "assert.sameValue(sparse.length, 3, 'delete preserves array length');\n",
+                "assert.sameValue(Reflect.deleteProperty(sparse, 'length'), false, 'length is not configurable');\n",
+                "var empty = new Array(3);\n",
+                "assert.sameValue(empty.length, 3, 'Array(length) creates sparse array of that length');\n",
+                "assert.sameValue(Object.keys(empty).length, 0, 'Array(length) does not materialize elements');\n",
+                "assert.sameValue(empty.join(), ',,', 'Array(length) join reflects holes');\n",
+                "try {\n",
+                "  new Array(3.5);\n",
+                "  throw new Test262Error('Array constructor should reject fractional length');\n",
+                "} catch (error) {}\n",
+            ),
+            "native-test262-sparse-array-hole-semantics.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_array_named_properties() {
+        let result = execute_test262_basic(
+            concat!(
+                "var array = [1, 2];\n",
+                "array.extra = 99;\n",
+                "array['note'] = 7;\n",
+                "assert.sameValue(array.extra, 99, 'dot assignment stores named property');\n",
+                "assert.sameValue(array.note, 7, 'computed assignment stores named property');\n",
+                "assert.sameValue(array.length, 2, 'named properties do not change length');\n",
+                "Object.defineProperty(array, 'hidden', {\n",
+                "  value: 123,\n",
+                "  writable: true,\n",
+                "  enumerable: false,\n",
+                "  configurable: true\n",
+                "});\n",
+                "assert.sameValue(array.hidden, 123, 'array named data property works');\n",
+                "var keys = Object.keys(array);\n",
+                "assert.sameValue(keys.length, 4, 'Object.keys includes indices plus enumerable named props');\n",
+                "assert.sameValue(keys[0], '0', 'Object.keys keeps first index');\n",
+                "assert.sameValue(keys[1], '1', 'Object.keys keeps second index');\n",
+                "assert.sameValue(keys[2], 'extra', 'Object.keys includes first named property in insertion order');\n",
+                "assert.sameValue(keys[3], 'note', 'Object.keys includes second named property in insertion order');\n",
+                "var ownKeys = Reflect.ownKeys(array);\n",
+                "assert.sameValue(ownKeys.length, 6, 'Reflect.ownKeys includes length and non-enumerable named props');\n",
+                "assert.sameValue(ownKeys[0], '0', 'Reflect.ownKeys first index');\n",
+                "assert.sameValue(ownKeys[1], '1', 'Reflect.ownKeys second index');\n",
+                "assert.sameValue(ownKeys[2], 'length', 'Reflect.ownKeys keeps length before named props');\n",
+                "assert.sameValue(ownKeys[3], 'extra', 'Reflect.ownKeys keeps first named prop order');\n",
+                "assert.sameValue(ownKeys[4], 'note', 'Reflect.ownKeys keeps second named prop order');\n",
+                "assert.sameValue(ownKeys[5], 'hidden', 'Reflect.ownKeys includes non-enumerable named props');\n",
+                "assert.sameValue(Object.getOwnPropertyDescriptor(array, 'hidden').enumerable, false, 'descriptor round-trips named data property');\n",
+                "assert.sameValue(delete array.extra, true, 'delete removes named array property');\n",
+                "assert.sameValue(array.extra, undefined, 'deleted named array property is gone');\n",
+            ),
+            "native-test262-array-named-properties.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
     }
 
     #[test]
@@ -917,6 +1441,22 @@ mod tests {
                 "assert.sameValue((new Boolean(new Object())).toString(), \"true\", \"(new Boolean(new Object())).toString()\");\n",
             ),
             "native-test262-boolean-prototype-tostring.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_is() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(Object.is(NaN, NaN), true, 'NaN same-value');\n",
+                "var negZero = 0 / -1;\n",
+                "assert.sameValue(Object.is(0, negZero), false, '+0 vs -0');\n",
+                "assert.sameValue(Object.is(negZero, negZero), true, '-0 vs -0');\n",
+                "assert.sameValue(Object.is(1, 1), true, 'equal numbers');\n",
+                "assert.sameValue(Object.is({}, {}), false, 'distinct objects');\n",
+            ),
+            "native-test262-object-is.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
     }
@@ -1638,11 +2178,8 @@ mod tests {
 
     #[test]
     fn in_non_object_throws() {
-        let module = compile_test262_basic_script(
-            "var r = 'x' in 42;\n",
-            "in-non-object.js",
-        )
-        .expect("should compile");
+        let module = compile_test262_basic_script("var r = 'x' in 42;\n", "in-non-object.js")
+            .expect("should compile");
 
         let mut runtime = crate::interpreter::RuntimeState::new();
         let global = runtime.intrinsics().global_object();
@@ -1655,6 +2192,28 @@ mod tests {
                 &mut runtime,
             )
             .expect_err("in operator on non-object should throw");
+        assert!(
+            error.to_string().contains("Cannot use 'in' operator"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn in_string_primitive_throws() {
+        let module = compile_test262_basic_script("var r = 'length' in 'otter';\n", "in-string.js")
+            .expect("should compile");
+
+        let mut runtime = crate::interpreter::RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let error = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect_err("in operator on primitive string should throw");
         assert!(
             error.to_string().contains("Cannot use 'in' operator"),
             "unexpected error: {error}"

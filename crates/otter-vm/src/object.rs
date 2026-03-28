@@ -99,6 +99,8 @@ pub enum ObjectError {
     InvalidKind,
     /// The heap value exists, but the requested slot index is out of bounds.
     InvalidIndex,
+    /// The requested array length is not a valid ECMAScript array length.
+    InvalidArrayLength,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -279,6 +281,13 @@ impl PropertyAttributes {
         Self(0)
     }
 
+    /// Array `length` property (§10.4.2.4 ArraySetLength).
+    /// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: false }
+    #[must_use]
+    pub const fn array_length() -> Self {
+        Self(ATTR_WRITABLE)
+    }
+
     /// Frozen data property (§20.1.2.6 Object.freeze).
     /// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
     #[must_use]
@@ -377,10 +386,7 @@ impl PropertyValue {
 
     /// Creates an accessor property with default builtin accessor attributes.
     #[must_use]
-    pub const fn accessor(
-        getter: Option<ObjectHandle>,
-        setter: Option<ObjectHandle>,
-    ) -> Self {
+    pub const fn accessor(getter: Option<ObjectHandle>, setter: Option<ObjectHandle>) -> Self {
         Self::Accessor {
             getter,
             setter,
@@ -393,6 +399,101 @@ impl PropertyValue {
     pub const fn attributes(&self) -> PropertyAttributes {
         match self {
             Self::Data { attributes, .. } | Self::Accessor { attributes, .. } => *attributes,
+        }
+    }
+}
+
+/// ES2024 §6.2.6 Property Descriptor record with field presence preserved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PropertyDescriptorKind {
+    Generic,
+    Data {
+        value: Option<RegisterValue>,
+        writable: Option<bool>,
+    },
+    Accessor {
+        getter: Option<Option<ObjectHandle>>,
+        setter: Option<Option<ObjectHandle>>,
+    },
+}
+
+/// Partial property descriptor used by `[[DefineOwnProperty]]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropertyDescriptor {
+    kind: PropertyDescriptorKind,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+impl PropertyDescriptor {
+    #[must_use]
+    pub const fn generic(enumerable: Option<bool>, configurable: Option<bool>) -> Self {
+        Self {
+            kind: PropertyDescriptorKind::Generic,
+            enumerable,
+            configurable,
+        }
+    }
+
+    #[must_use]
+    pub const fn data(
+        value: Option<RegisterValue>,
+        writable: Option<bool>,
+        enumerable: Option<bool>,
+        configurable: Option<bool>,
+    ) -> Self {
+        Self {
+            kind: PropertyDescriptorKind::Data { value, writable },
+            enumerable,
+            configurable,
+        }
+    }
+
+    #[must_use]
+    pub const fn accessor(
+        getter: Option<Option<ObjectHandle>>,
+        setter: Option<Option<ObjectHandle>>,
+        enumerable: Option<bool>,
+        configurable: Option<bool>,
+    ) -> Self {
+        Self {
+            kind: PropertyDescriptorKind::Accessor { getter, setter },
+            enumerable,
+            configurable,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> PropertyDescriptorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn enumerable(self) -> Option<bool> {
+        self.enumerable
+    }
+
+    #[must_use]
+    pub const fn configurable(self) -> Option<bool> {
+        self.configurable
+    }
+
+    #[must_use]
+    pub const fn from_property_value(value: PropertyValue) -> Self {
+        let attributes = value.attributes();
+        match value {
+            PropertyValue::Data { value, .. } => Self::data(
+                Some(value),
+                Some(attributes.writable()),
+                Some(attributes.enumerable()),
+                Some(attributes.configurable()),
+            ),
+            PropertyValue::Accessor { getter, setter, .. } => Self::accessor(
+                Some(getter),
+                Some(setter),
+                Some(attributes.enumerable()),
+                Some(attributes.configurable()),
+            ),
         }
     }
 }
@@ -417,7 +518,13 @@ enum HeapValue {
     Array {
         prototype: Option<ObjectHandle>,
         extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
         elements: Vec<RegisterValue>,
+        elements_writable: bool,
+        elements_configurable: bool,
+        length_writable: bool,
     },
     String {
         prototype: Option<ObjectHandle>,
@@ -499,9 +606,15 @@ fn trace_property_value(pv: &PropertyValue, visitor: &mut dyn FnMut(GcHandle)) {
 impl Traceable for HeapValue {
     fn trace_handles(&self, visitor: &mut dyn FnMut(GcHandle)) {
         match self {
-            HeapValue::Object { prototype, values, .. }
-            | HeapValue::NativeObject { prototype, values, .. }
-            | HeapValue::HostFunction { prototype, values, .. } => {
+            HeapValue::Object {
+                prototype, values, ..
+            }
+            | HeapValue::NativeObject {
+                prototype, values, ..
+            }
+            | HeapValue::HostFunction {
+                prototype, values, ..
+            } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
                 }
@@ -509,7 +622,12 @@ impl Traceable for HeapValue {
                     trace_property_value(v, visitor);
                 }
             }
-            HeapValue::Closure { prototype, values, upvalues, .. } => {
+            HeapValue::Closure {
+                prototype,
+                values,
+                upvalues,
+                ..
+            } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
                 }
@@ -520,9 +638,17 @@ impl Traceable for HeapValue {
                     trace_handle(*uv, visitor);
                 }
             }
-            HeapValue::Array { prototype, elements, .. } => {
+            HeapValue::Array {
+                prototype,
+                values,
+                elements,
+                ..
+            } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
+                }
+                for value in values {
+                    trace_property_value(value, visitor);
                 }
                 for elem in elements {
                     trace_register_value(*elem, visitor);
@@ -637,10 +763,17 @@ impl ObjectHeap {
 
     /// Allocates an empty dense array.
     pub fn alloc_array(&mut self) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::Array {
             prototype: None,
             extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
             elements: Vec::new(),
+            elements_writable: true,
+            elements_configurable: true,
+            length_writable: true,
         });
         ObjectHandle(h.0)
     }
@@ -712,7 +845,10 @@ impl ObjectHeap {
     }
 
     /// Reads a mutable reference to a JsPromise.
-    pub fn get_promise_mut(&mut self, handle: ObjectHandle) -> Option<&mut crate::promise::JsPromise> {
+    pub fn get_promise_mut(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Option<&mut crate::promise::JsPromise> {
         match self.object_mut(handle).ok()? {
             HeapValue::Promise { promise } => Some(promise),
             _ => None,
@@ -764,6 +900,14 @@ impl ObjectHeap {
         handle: ObjectHandle,
         prototype: Option<ObjectHandle>,
     ) -> Result<bool, ObjectError> {
+        let current = self.get_prototype(handle)?;
+        if current == prototype {
+            return Ok(true);
+        }
+        if !self.is_extensible(handle)? {
+            return Ok(false);
+        }
+
         // Cycle detection: walk from new_prototype upward and check if we
         // encounter `handle`.  This matches V8's OrdinarySetPrototypeOf and
         // the mature VM's implementation.
@@ -843,23 +987,21 @@ impl ObjectHeap {
 
     /// Compares two register values with the current strict-equality semantics.
     pub fn strict_eq(&self, lhs: RegisterValue, rhs: RegisterValue) -> Result<bool, ObjectError> {
-        if lhs == rhs {
-            return Ok(true);
-        }
+        crate::abstract_ops::is_strictly_equal(self, lhs, rhs)
+    }
 
-        let Some(lhs_handle) = lhs.as_object_handle().map(ObjectHandle) else {
-            return Ok(false);
-        };
-        let Some(rhs_handle) = rhs.as_object_handle().map(ObjectHandle) else {
-            return Ok(false);
-        };
+    /// ES2024 §7.2.9 SameValue(x, y).
+    pub fn same_value(&self, lhs: RegisterValue, rhs: RegisterValue) -> Result<bool, ObjectError> {
+        crate::abstract_ops::same_value(self, lhs, rhs)
+    }
 
-        match (self.object(lhs_handle)?, self.object(rhs_handle)?) {
-            (HeapValue::String { value: lhs, .. }, HeapValue::String { value: rhs, .. }) => {
-                Ok(lhs == rhs)
-            }
-            _ => Ok(false),
-        }
+    /// ES2024 §7.2.10 SameValueZero(x, y).
+    pub fn same_value_zero(
+        &self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<bool, ObjectError> {
+        crate::abstract_ops::same_value_zero(self, lhs, rhs)
     }
 
     /// Loads an indexed element from an array or string.
@@ -869,7 +1011,15 @@ impl ObjectHeap {
         index: usize,
     ) -> Result<Option<RegisterValue>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::Array { elements, .. } => Ok(elements.get(index).copied()),
+            HeapValue::Array { elements, .. } => {
+                let Some(value) = elements.get(index).copied() else {
+                    return Ok(None);
+                };
+                if value.is_hole() {
+                    return Ok(None);
+                }
+                Ok(Some(value))
+            }
             HeapValue::String { value, .. } => {
                 let character = value
                     .chars()
@@ -904,9 +1054,21 @@ impl ObjectHeap {
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
-            HeapValue::Array { elements, .. } => {
+            HeapValue::Array {
+                extensible,
+                elements,
+                elements_writable,
+                length_writable,
+                ..
+            } => {
+                if !*elements_writable {
+                    return Ok(());
+                }
                 if index >= elements.len() {
-                    elements.resize(index.saturating_add(1), RegisterValue::undefined());
+                    if !*extensible || !*length_writable {
+                        return Ok(());
+                    }
+                    elements.resize(index.saturating_add(1), RegisterValue::hole());
                 }
                 elements[index] = value;
                 Ok(())
@@ -932,9 +1094,51 @@ impl ObjectHeap {
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
-            HeapValue::Array { elements, .. } => {
+            HeapValue::Array {
+                extensible,
+                elements,
+                elements_writable,
+                length_writable,
+                ..
+            } => {
+                if !*extensible || !*elements_writable || !*length_writable {
+                    return Ok(());
+                }
                 elements.push(value);
                 Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Resizes an array length while preserving sparse holes.
+    pub fn set_array_length(
+        &mut self,
+        handle: ObjectHandle,
+        length: usize,
+    ) -> Result<bool, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Array {
+                extensible,
+                elements,
+                elements_configurable,
+                length_writable,
+                ..
+            } => {
+                if length < elements.len() {
+                    if !*elements_configurable {
+                        return Ok(false);
+                    }
+                    elements.truncate(length);
+                    return Ok(true);
+                }
+                if length > elements.len() {
+                    if !*extensible || !*length_writable {
+                        return Ok(false);
+                    }
+                    elements.resize(length, RegisterValue::hole());
+                }
+                Ok(true)
             }
             _ => Err(ObjectError::InvalidKind),
         }
@@ -994,12 +1198,19 @@ impl ObjectHeap {
         }
 
         let step = match kind {
-            IteratorKind::Array | IteratorKind::String => {
-                match self.get_index(iterable, next_index)? {
-                    Some(value) => IteratorStep::yield_value(value),
-                    None => IteratorStep::done(),
+            IteratorKind::Array => match self.array_length(iterable)? {
+                Some(length) if next_index < length => {
+                    match self.get_index(iterable, next_index)? {
+                        Some(value) => IteratorStep::yield_value(value),
+                        None => IteratorStep::yield_value(RegisterValue::undefined()),
+                    }
                 }
-            }
+                _ => IteratorStep::done(),
+            },
+            IteratorKind::String => match self.get_index(iterable, next_index)? {
+                Some(value) => IteratorStep::yield_value(value),
+                None => IteratorStep::done(),
+            },
         };
 
         match self.object_mut(handle)? {
@@ -1066,10 +1277,9 @@ impl ObjectHeap {
                 | HeapValue::HostFunction {
                     keys, prototype, ..
                 } => (keys.clone(), *prototype),
-                HeapValue::Array { prototype, .. } => {
-                    // for..in on arrays is unusual; skip indexed elements for now.
-                    (Vec::new(), *prototype)
-                }
+                HeapValue::Array {
+                    keys, prototype, ..
+                } => (keys.clone(), *prototype),
                 _ => (Vec::new(), None),
             };
             for key in obj_keys {
@@ -1310,10 +1520,20 @@ impl ObjectHeap {
         handle: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyLookup>, ObjectError> {
+        self.get_property_with_registry(handle, property, &PropertyNameRegistry::default())
+    }
+
+    /// Returns a named property lookup using the caller's property-name registry.
+    pub fn get_property_with_registry(
+        &self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<Option<PropertyLookup>, ObjectError> {
         let mut current = Some(handle);
         let mut depth = 0;
         while let Some(owner) = current {
-            if let Some((value, cache)) = self.get_own_property(owner, property)? {
+            if let Some((value, cache)) = self.get_own_property(owner, property, property_names)? {
                 let cache = (owner == handle).then_some(cache);
                 return Ok(Some(PropertyLookup::new(owner, value, cache)));
             }
@@ -1421,103 +1641,42 @@ impl ObjectHeap {
         property: PropertyNameId,
         value: RegisterValue,
     ) -> Result<PropertyInlineCache, ObjectError> {
-        if let Some(slot_index) = match self.object(handle)? {
-            HeapValue::Object { keys, .. } => property_slot(keys, property),
-            HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
-            HeapValue::Closure { keys, .. } => property_slot(keys, property),
-            HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
-            HeapValue::Array { .. }
-            | HeapValue::String { .. }
-            | HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => {
-                return Err(ObjectError::InvalidKind);
+        match self.object(handle)? {
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. } => {
+                self.set_named_property_storage(handle, property, value)
             }
-        } {
-            let object = self.object_mut(handle)?;
-            let (shape_id, values) = match object {
-                HeapValue::Object {
-                    shape_id, values, ..
-                }
-                | HeapValue::NativeObject {
-                    shape_id, values, ..
-                }
-                | HeapValue::Closure {
-                    shape_id, values, ..
-                }
-                | HeapValue::HostFunction {
-                    shape_id, values, ..
-                } => (shape_id, values),
-                _ => return Err(ObjectError::InvalidKind),
-            };
-            // ES2024 §10.1.9 OrdinarySet step 3: reject if non-writable data property.
-            let slot = &mut values[usize::from(slot_index)];
-            match slot {
-                PropertyValue::Data { attributes, .. } if !attributes.writable() => {
-                    // Non-writable — silently fail (strict mode TypeError handled by caller).
-                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
-                }
-                PropertyValue::Data { value: v, .. } => {
-                    *v = value;
-                }
-                PropertyValue::Accessor { .. } => {
-                    // Accessor — caller handles setter invocation; we don't overwrite here.
-                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
-                }
-            }
-            return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+            _ => Err(ObjectError::InvalidKind),
         }
+    }
 
-        // ES2024 §10.1.9 OrdinarySet step 3.d: reject if not extensible.
-        if !self.is_extensible(handle)? {
-            // Non-extensible object — cannot add new properties.
-            let shape_id = match self.object(handle)? {
-                HeapValue::Object { shape_id, .. }
-                | HeapValue::NativeObject { shape_id, .. }
-                | HeapValue::Closure { shape_id, .. }
-                | HeapValue::HostFunction { shape_id, .. } => *shape_id,
-                _ => return Err(ObjectError::InvalidKind),
-            };
-            return Ok(PropertyInlineCache::new(shape_id, 0));
+    /// Writes a property using the caller's property registry.
+    pub fn set_property_with_registry(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        value: RegisterValue,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<PropertyInlineCache, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Array { .. } => {
+                let Some(property_name) = property_names.get(property) else {
+                    return Err(ObjectError::InvalidKind);
+                };
+                if property_name == "length" {
+                    self.set_array_length_from_value(handle, value)?;
+                    return Ok(PropertyInlineCache::new(ObjectShapeId(0), 0));
+                }
+                if let Some(index) = canonical_array_index(property_name) {
+                    self.set_index(handle, index, value)?;
+                    return Ok(PropertyInlineCache::new(ObjectShapeId(0), 0));
+                }
+                self.set_array_named_property_storage(handle, property, value)
+            }
+            _ => self.set_property(handle, property, value),
         }
-
-        let shape_id = self.allocate_shape();
-        let object = self.object_mut(handle)?;
-        let (object_shape_id, keys, values) = match object {
-            HeapValue::Object {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::NativeObject {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::Closure {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::HostFunction {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            } => (object_shape_id, keys, values),
-            _ => return Err(ObjectError::InvalidKind),
-        };
-        keys.push(property);
-        values.push(PropertyValue::data(value));
-        *object_shape_id = shape_id;
-        let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
-        Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
     }
 
     /// Deletes an own named property from one ordinary object-like heap value.
@@ -1526,74 +1685,76 @@ impl ObjectHeap {
         handle: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<bool, ObjectError> {
-        let slot_index = match self.object(handle)? {
-            HeapValue::Object { keys, .. } => property_slot(keys, property),
-            HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
-            HeapValue::Closure { keys, .. } => property_slot(keys, property),
-            HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
-            HeapValue::Array { .. }
-            | HeapValue::String { .. }
-            | HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
-            | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
-        };
+        match self.object(handle)? {
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. } => self.delete_ordinary_property(handle, property),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
 
-        let Some(slot_index) = slot_index.map(usize::from) else {
-            // Property not found — deletion is vacuously true (ES2024 §10.1.10 step 2).
+    /// Deletes an own property using the caller's property registry.
+    pub fn delete_property_with_registry(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. } => self.delete_ordinary_property(handle, property),
+            HeapValue::Array { .. } => self.delete_array_property(handle, property, property_names),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    fn delete_ordinary_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<bool, ObjectError> {
+        self.delete_named_property_storage(handle, property, false)
+    }
+
+    fn delete_array_property(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<bool, ObjectError> {
+        let Some(property_name) = property_names.get(property) else {
             return Ok(true);
         };
-
-        // ES2024 §10.1.10 OrdinaryDelete step 3: reject if non-configurable.
-        {
-            let values = match self.object(handle)? {
-                HeapValue::Object { values, .. }
-                | HeapValue::NativeObject { values, .. }
-                | HeapValue::Closure { values, .. }
-                | HeapValue::HostFunction { values, .. } => values,
-                _ => return Err(ObjectError::InvalidKind),
+        if property_name == "length" {
+            return Ok(false);
+        }
+        if let Some(index) = canonical_array_index(property_name) {
+            return match self.object_mut(handle)? {
+                HeapValue::Array {
+                    elements,
+                    elements_configurable,
+                    ..
+                } => {
+                    let Some(value) = elements.get_mut(index) else {
+                        return Ok(true);
+                    };
+                    if value.is_hole() {
+                        return Ok(true);
+                    }
+                    if !*elements_configurable {
+                        return Ok(false);
+                    }
+                    *value = RegisterValue::hole();
+                    Ok(true)
+                }
+                _ => Err(ObjectError::InvalidKind),
             };
-            if !values[slot_index].attributes().configurable() {
-                return Ok(false);
-            }
         }
 
-        let shape_id = self.allocate_shape();
-        let object = self.object_mut(handle)?;
-        let (object_shape_id, keys, values) = match object {
-            HeapValue::Object {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::NativeObject {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::Closure {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::HostFunction {
-                shape_id: object_shape_id,
-                keys,
-                values,
-                ..
-            } => (object_shape_id, keys, values),
-            _ => return Err(ObjectError::InvalidKind),
-        };
-
-        keys.remove(slot_index);
-        values.remove(slot_index);
-        *object_shape_id = shape_id;
-        Ok(true)
+        self.delete_named_property_storage(handle, property, true)
     }
 
     /// ES2024 §10.1.6 `[[DefineOwnProperty]]` — defines or replaces a property
@@ -1604,90 +1765,224 @@ impl ObjectHeap {
         property: PropertyNameId,
         desc: PropertyValue,
     ) -> Result<bool, ObjectError> {
-        // Check if property already exists.
-        let existing_slot = match self.object(handle)? {
-            HeapValue::Object { keys, .. }
-            | HeapValue::NativeObject { keys, .. }
-            | HeapValue::Closure { keys, .. }
-            | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
-            _ => None,
+        self.define_own_property_from_descriptor(
+            handle,
+            property,
+            PropertyDescriptor::from_property_value(desc),
+        )
+    }
+
+    /// ES2024 §10.1.6 `[[DefineOwnProperty]]` using a partial property descriptor.
+    pub fn define_own_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. } => {
+                self.define_ordinary_own_property_from_descriptor(handle, property, desc)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// ES2024 §10.1.6 `[[DefineOwnProperty]]` using the caller's property registry.
+    pub fn define_own_property_from_descriptor_with_registry(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { .. }
+            | HeapValue::NativeObject { .. }
+            | HeapValue::Closure { .. }
+            | HeapValue::HostFunction { .. } => {
+                self.define_ordinary_own_property_from_descriptor(handle, property, desc)
+            }
+            HeapValue::Array { .. } => self.define_array_own_property_from_descriptor(
+                handle,
+                property,
+                desc,
+                property_names,
+            ),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    fn define_ordinary_own_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, ObjectError> {
+        self.define_named_property_storage(handle, property, desc, false)
+    }
+
+    fn define_array_own_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<bool, ObjectError> {
+        let Some(property_name) = property_names.get(property) else {
+            return Ok(false);
         };
 
-        if let Some(slot_index) = existing_slot {
-            // §10.1.6.1 ValidateAndApplyPropertyDescriptor step 3-7:
-            // If existing is non-configurable, only value changes (if writable) are allowed.
-            let slot = usize::from(slot_index);
-            let existing_attrs = {
-                let values = match self.object(handle)? {
-                    HeapValue::Object { values, .. }
-                    | HeapValue::NativeObject { values, .. }
-                    | HeapValue::Closure { values, .. }
-                    | HeapValue::HostFunction { values, .. } => values,
-                    _ => return Err(ObjectError::InvalidKind),
-                };
-                values[slot].attributes()
-            };
-
-            if !existing_attrs.configurable() {
-                // Non-configurable — very limited changes allowed.
-                if desc.attributes().configurable() {
-                    return Ok(false); // Can't make configurable again
-                }
-                if desc.attributes().enumerable() != existing_attrs.enumerable() {
-                    return Ok(false); // Can't change enumerability
-                }
-            }
-
-            // Apply the new descriptor.
-            let values = match self.object_mut(handle)? {
-                HeapValue::Object { values, .. }
-                | HeapValue::NativeObject { values, .. }
-                | HeapValue::Closure { values, .. }
-                | HeapValue::HostFunction { values, .. } => values,
-                _ => return Err(ObjectError::InvalidKind),
-            };
-            values[slot] = desc;
-            return Ok(true);
+        if property_name == "length" {
+            return self.define_array_length_property_from_descriptor(handle, desc);
         }
 
-        // Property does not exist — create it (check extensibility).
-        if !self.is_extensible(handle)? {
+        if let Some(index) = canonical_array_index(property_name) {
+            return self.define_array_index_property_from_descriptor(handle, index, desc);
+        }
+
+        self.define_array_named_property_from_descriptor(handle, property, desc)
+    }
+
+    fn define_array_length_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, ObjectError> {
+        if matches!(desc.kind(), PropertyDescriptorKind::Accessor { .. }) {
             return Ok(false);
         }
 
-        let shape_id = self.allocate_shape();
-        let object = self.object_mut(handle)?;
-        let (object_shape_id, keys, values) = match object {
-            HeapValue::Object {
-                shape_id: s,
-                keys,
-                values,
+        let (current_length, current_writable) = match self.object(handle)? {
+            HeapValue::Array {
+                elements,
+                length_writable,
                 ..
-            }
-            | HeapValue::NativeObject {
-                shape_id: s,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::Closure {
-                shape_id: s,
-                keys,
-                values,
-                ..
-            }
-            | HeapValue::HostFunction {
-                shape_id: s,
-                keys,
-                values,
-                ..
-            } => (s, keys, values),
+            } => (elements.len(), *length_writable),
             _ => return Err(ObjectError::InvalidKind),
         };
-        keys.push(property);
-        values.push(desc);
-        *object_shape_id = shape_id;
+
+        let current = PropertyValue::data_with_attrs(
+            RegisterValue::from_i32(i32::try_from(current_length).unwrap_or(i32::MAX)),
+            PropertyAttributes::from_flags(current_writable, false, false),
+        );
+        let Some(next) = self.apply_property_descriptor(current, desc)? else {
+            return Ok(false);
+        };
+
+        let PropertyValue::Data { value, attributes } = next else {
+            return Ok(false);
+        };
+        if attributes.enumerable() || attributes.configurable() {
+            return Ok(false);
+        }
+
+        let Some(next_length) = array_length_from_value(value) else {
+            return Ok(false);
+        };
+
+        if !self.set_array_length(handle, next_length)? {
+            return Ok(false);
+        }
+
+        let HeapValue::Array {
+            length_writable, ..
+        } = self.object_mut(handle)?
+        else {
+            return Err(ObjectError::InvalidKind);
+        };
+        *length_writable = attributes.writable();
         Ok(true)
+    }
+
+    fn define_array_index_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, ObjectError> {
+        if matches!(desc.kind(), PropertyDescriptorKind::Accessor { .. }) {
+            return Ok(false);
+        }
+
+        let existing = match self.object(handle)? {
+            HeapValue::Array {
+                elements,
+                elements_writable,
+                elements_configurable,
+                ..
+            } => elements
+                .get(index)
+                .copied()
+                .filter(|value| !value.is_hole())
+                .map(|value| {
+                    PropertyValue::data_with_attrs(
+                        value,
+                        PropertyAttributes::from_flags(
+                            *elements_writable,
+                            true,
+                            *elements_configurable,
+                        ),
+                    )
+                }),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        let next = if let Some(existing) = existing {
+            let Some(next) = self.apply_property_descriptor(existing, desc)? else {
+                return Ok(false);
+            };
+            next
+        } else {
+            if !self.is_extensible(handle)? {
+                return Ok(false);
+            }
+            self.new_property_from_descriptor(desc)
+        };
+
+        let PropertyValue::Data { value, attributes } = next else {
+            return Ok(false);
+        };
+
+        let array = self.object_mut(handle)?;
+        let HeapValue::Array {
+            extensible,
+            elements,
+            elements_writable,
+            elements_configurable,
+            length_writable,
+            ..
+        } = array
+        else {
+            return Err(ObjectError::InvalidKind);
+        };
+
+        if !attributes.enumerable()
+            || attributes.writable() != *elements_writable
+            || attributes.configurable() != *elements_configurable
+        {
+            return Ok(false);
+        }
+
+        if index >= elements.len() {
+            if !*extensible || !*length_writable {
+                return Ok(false);
+            }
+            elements.resize(index.saturating_add(1), RegisterValue::hole());
+        }
+        elements[index] = value;
+        Ok(true)
+    }
+
+    fn define_array_named_property_from_descriptor(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, ObjectError> {
+        self.define_named_property_storage(handle, property, desc, true)
     }
 
     /// Writes a shaped property value when the shape and slot still match.
@@ -1834,9 +2129,61 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
-            HeapValue::Array { .. } => Ok(Vec::new()), // TODO: numeric index keys
+            HeapValue::Array { keys, .. } => Ok(keys.clone()),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Returns all own property keys, interning array index keys into the shared registry.
+    pub fn own_keys_with_registry(
+        &self,
+        handle: ObjectHandle,
+        property_names: &mut PropertyNameRegistry,
+    ) -> Result<Vec<PropertyNameId>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
+            HeapValue::Array { elements, keys, .. } => {
+                let mut result =
+                    Vec::with_capacity(elements.len().saturating_add(keys.len()).saturating_add(1));
+                for (index, value) in elements.iter().enumerate() {
+                    if value.is_hole() {
+                        continue;
+                    }
+                    let name = index.to_string();
+                    result.push(property_names.intern(&name));
+                }
+                result.push(property_names.intern("length"));
+                result.extend(keys.iter().copied());
+                Ok(result)
+            }
+            HeapValue::String { value, .. } => {
+                let length = value.chars().count();
+                let mut keys = Vec::with_capacity(length.saturating_add(1));
+                for index in 0..length {
+                    let name = index.to_string();
+                    keys.push(property_names.intern(&name));
+                }
+                keys.push(property_names.intern("length"));
+                Ok(keys)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Returns an own property descriptor without walking the prototype chain.
+    pub fn own_property_descriptor(
+        &self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        property_names: &PropertyNameRegistry,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        if let Some((value, _cache)) = self.get_own_property(handle, property, property_names)? {
+            return Ok(Some(value));
+        }
+        Ok(None)
     }
 
     /// Checks if an object-like heap value has an own property with the given name.
@@ -1849,7 +2196,8 @@ impl ObjectHeap {
             HeapValue::Object { keys, .. }
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
-            | HeapValue::HostFunction { keys, .. } => Ok(property_slot(keys, property).is_some()),
+            | HeapValue::HostFunction { keys, .. }
+            | HeapValue::Array { keys, .. } => Ok(property_slot(keys, property).is_some()),
             _ => Ok(false),
         }
     }
@@ -1931,6 +2279,29 @@ impl ObjectHeap {
     /// ES2024 §20.1.2.6 `Object.freeze(O)` — sets configurable+writable to false on all own properties.
     pub fn freeze(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
         self.prevent_extensions(handle)?;
+        if let HeapValue::Array {
+            elements_writable,
+            elements_configurable,
+            length_writable,
+            values,
+            ..
+        } = self.object_mut(handle)?
+        {
+            *elements_writable = false;
+            *elements_configurable = false;
+            *length_writable = false;
+            for value in values {
+                match value {
+                    PropertyValue::Data { attributes, .. } => {
+                        *attributes = attributes.with_writable_false().with_configurable_false();
+                    }
+                    PropertyValue::Accessor { attributes, .. } => {
+                        *attributes = attributes.with_configurable_false();
+                    }
+                }
+            }
+            return Ok(());
+        }
         let keys = self.own_keys(handle)?;
         for key in keys {
             self.freeze_property(handle, key)?;
@@ -1941,11 +2312,96 @@ impl ObjectHeap {
     /// ES2024 §20.1.2.19 `Object.seal(O)` — sets configurable to false on all own properties.
     pub fn seal(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
         self.prevent_extensions(handle)?;
+        if let HeapValue::Array {
+            elements_configurable,
+            values,
+            ..
+        } = self.object_mut(handle)?
+        {
+            *elements_configurable = false;
+            for value in values {
+                match value {
+                    PropertyValue::Data { attributes, .. }
+                    | PropertyValue::Accessor { attributes, .. } => {
+                        *attributes = attributes.with_configurable_false();
+                    }
+                }
+            }
+            return Ok(());
+        }
         let keys = self.own_keys(handle)?;
         for key in keys {
             self.seal_property(handle, key)?;
         }
         Ok(())
+    }
+
+    /// ES2024 integrity-level check used by `Object.isSealed`.
+    pub fn is_sealed(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        if self.is_extensible(handle)? {
+            return Ok(false);
+        }
+
+        let values = match self.object(handle)? {
+            HeapValue::Object { values, .. }
+            | HeapValue::NativeObject { values, .. }
+            | HeapValue::Closure { values, .. }
+            | HeapValue::HostFunction { values, .. } => values,
+            HeapValue::Array {
+                elements_configurable,
+                values,
+                ..
+            } => {
+                return Ok(!elements_configurable
+                    && values
+                        .iter()
+                        .all(|value| !value.attributes().configurable()));
+            }
+            _ => return Ok(true),
+        };
+
+        Ok(values
+            .iter()
+            .all(|value| !value.attributes().configurable()))
+    }
+
+    /// ES2024 integrity-level check used by `Object.isFrozen`.
+    pub fn is_frozen(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        if self.is_extensible(handle)? {
+            return Ok(false);
+        }
+
+        let values = match self.object(handle)? {
+            HeapValue::Object { values, .. }
+            | HeapValue::NativeObject { values, .. }
+            | HeapValue::Closure { values, .. }
+            | HeapValue::HostFunction { values, .. } => values,
+            HeapValue::Array {
+                elements_writable,
+                elements_configurable,
+                length_writable,
+                values,
+                ..
+            } => {
+                return Ok(!elements_configurable
+                    && !elements_writable
+                    && !length_writable
+                    && values.iter().all(|value| match value {
+                        PropertyValue::Data { attributes, .. } => {
+                            !attributes.configurable() && !attributes.writable()
+                        }
+                        PropertyValue::Accessor { attributes, .. } => !attributes.configurable(),
+                    }));
+            }
+            _ => return Ok(true),
+        };
+
+        Ok(values.iter().all(|value| match value {
+            PropertyValue::Data { attributes, .. } => {
+                !attributes.configurable() && !attributes.writable()
+            }
+            PropertyValue::Accessor { attributes, .. } => !attributes.configurable(),
+        }))
     }
 
     /// Sets configurable=false and writable=false on a single property.
@@ -1998,6 +2454,524 @@ impl ObjectHeap {
         Ok(())
     }
 
+    fn new_property_from_descriptor(&self, desc: PropertyDescriptor) -> PropertyValue {
+        match desc.kind() {
+            PropertyDescriptorKind::Accessor { getter, setter } => PropertyValue::Accessor {
+                getter: getter.unwrap_or(None),
+                setter: setter.unwrap_or(None),
+                attributes: PropertyAttributes::from_flags(
+                    false,
+                    desc.enumerable().unwrap_or(false),
+                    desc.configurable().unwrap_or(false),
+                ),
+            },
+            PropertyDescriptorKind::Generic => PropertyValue::Data {
+                value: RegisterValue::undefined(),
+                attributes: PropertyAttributes::from_flags(
+                    false,
+                    desc.enumerable().unwrap_or(false),
+                    desc.configurable().unwrap_or(false),
+                ),
+            },
+            PropertyDescriptorKind::Data { value, writable } => PropertyValue::Data {
+                value: value.unwrap_or_else(RegisterValue::undefined),
+                attributes: PropertyAttributes::from_flags(
+                    writable.unwrap_or(false),
+                    desc.enumerable().unwrap_or(false),
+                    desc.configurable().unwrap_or(false),
+                ),
+            },
+        }
+    }
+
+    fn apply_property_descriptor(
+        &self,
+        current: PropertyValue,
+        desc: PropertyDescriptor,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        match current {
+            PropertyValue::Data {
+                value: current_value,
+                attributes,
+            } => self.apply_data_property_descriptor(current_value, attributes, desc),
+            PropertyValue::Accessor {
+                getter: current_getter,
+                setter: current_setter,
+                attributes,
+            } => self.apply_accessor_property_descriptor(
+                current_getter,
+                current_setter,
+                attributes,
+                desc,
+            ),
+        }
+    }
+
+    fn apply_data_property_descriptor(
+        &self,
+        current_value: RegisterValue,
+        current_attributes: PropertyAttributes,
+        desc: PropertyDescriptor,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        if !current_attributes.configurable() {
+            if desc.configurable() == Some(true) {
+                return Ok(None);
+            }
+            if let Some(enumerable) = desc.enumerable()
+                && enumerable != current_attributes.enumerable()
+            {
+                return Ok(None);
+            }
+        }
+
+        match desc.kind() {
+            PropertyDescriptorKind::Accessor { getter, setter } => {
+                if !current_attributes.configurable() {
+                    return Ok(None);
+                }
+                Ok(Some(PropertyValue::Accessor {
+                    getter: getter.unwrap_or(None),
+                    setter: setter.unwrap_or(None),
+                    attributes: PropertyAttributes::from_flags(
+                        false,
+                        desc.enumerable().unwrap_or(current_attributes.enumerable()),
+                        desc.configurable()
+                            .unwrap_or(current_attributes.configurable()),
+                    ),
+                }))
+            }
+            PropertyDescriptorKind::Generic
+            | PropertyDescriptorKind::Data {
+                value: _,
+                writable: _,
+            } => {
+                let (next_value, next_writable) = match desc.kind() {
+                    PropertyDescriptorKind::Generic => {
+                        (current_value, current_attributes.writable())
+                    }
+                    PropertyDescriptorKind::Data { value, writable } => (
+                        value.unwrap_or(current_value),
+                        writable.unwrap_or(current_attributes.writable()),
+                    ),
+                    PropertyDescriptorKind::Accessor { .. } => unreachable!(),
+                };
+
+                if !current_attributes.configurable()
+                    && !current_attributes.writable()
+                    && let PropertyDescriptorKind::Data { value, writable } = desc.kind()
+                {
+                    if writable == Some(true) {
+                        return Ok(None);
+                    }
+                    if let Some(value) = value
+                        && !self.same_value(value, current_value)?
+                    {
+                        return Ok(None);
+                    }
+                }
+
+                Ok(Some(PropertyValue::Data {
+                    value: next_value,
+                    attributes: PropertyAttributes::from_flags(
+                        next_writable,
+                        desc.enumerable().unwrap_or(current_attributes.enumerable()),
+                        desc.configurable()
+                            .unwrap_or(current_attributes.configurable()),
+                    ),
+                }))
+            }
+        }
+    }
+
+    fn apply_accessor_property_descriptor(
+        &self,
+        current_getter: Option<ObjectHandle>,
+        current_setter: Option<ObjectHandle>,
+        current_attributes: PropertyAttributes,
+        desc: PropertyDescriptor,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        if !current_attributes.configurable() {
+            if desc.configurable() == Some(true) {
+                return Ok(None);
+            }
+            if let Some(enumerable) = desc.enumerable()
+                && enumerable != current_attributes.enumerable()
+            {
+                return Ok(None);
+            }
+        }
+
+        match desc.kind() {
+            PropertyDescriptorKind::Data { value, writable } => {
+                if !current_attributes.configurable() {
+                    return Ok(None);
+                }
+                Ok(Some(PropertyValue::Data {
+                    value: value.unwrap_or_else(RegisterValue::undefined),
+                    attributes: PropertyAttributes::from_flags(
+                        writable.unwrap_or(false),
+                        desc.enumerable().unwrap_or(current_attributes.enumerable()),
+                        desc.configurable()
+                            .unwrap_or(current_attributes.configurable()),
+                    ),
+                }))
+            }
+            PropertyDescriptorKind::Generic => Ok(Some(PropertyValue::Accessor {
+                getter: current_getter,
+                setter: current_setter,
+                attributes: PropertyAttributes::from_flags(
+                    false,
+                    desc.enumerable().unwrap_or(current_attributes.enumerable()),
+                    desc.configurable()
+                        .unwrap_or(current_attributes.configurable()),
+                ),
+            })),
+            PropertyDescriptorKind::Accessor { getter, setter } => {
+                if !current_attributes.configurable() {
+                    if let Some(getter) = getter
+                        && getter != current_getter
+                    {
+                        return Ok(None);
+                    }
+                    if let Some(setter) = setter
+                        && setter != current_setter
+                    {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(PropertyValue::Accessor {
+                    getter: getter.unwrap_or(current_getter),
+                    setter: setter.unwrap_or(current_setter),
+                    attributes: PropertyAttributes::from_flags(
+                        false,
+                        desc.enumerable().unwrap_or(current_attributes.enumerable()),
+                        desc.configurable()
+                            .unwrap_or(current_attributes.configurable()),
+                    ),
+                }))
+            }
+        }
+    }
+
+    fn set_named_property_storage(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        value: RegisterValue,
+    ) -> Result<PropertyInlineCache, ObjectError> {
+        if let Some(slot_index) = match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. }
+            | HeapValue::Array { keys, .. } => property_slot(keys, property),
+            HeapValue::String { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::Promise { .. } => {
+                return Err(ObjectError::InvalidKind);
+            }
+        } {
+            let object = self.object_mut(handle)?;
+            let (shape_id, values) = match object {
+                HeapValue::Object {
+                    shape_id, values, ..
+                }
+                | HeapValue::NativeObject {
+                    shape_id, values, ..
+                }
+                | HeapValue::Closure {
+                    shape_id, values, ..
+                }
+                | HeapValue::HostFunction {
+                    shape_id, values, ..
+                }
+                | HeapValue::Array {
+                    shape_id, values, ..
+                } => (shape_id, values),
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            let slot = &mut values[usize::from(slot_index)];
+            match slot {
+                PropertyValue::Data { attributes, .. } if !attributes.writable() => {
+                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+                }
+                PropertyValue::Data { value: v, .. } => {
+                    *v = value;
+                }
+                PropertyValue::Accessor { .. } => {
+                    return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+                }
+            }
+            return Ok(PropertyInlineCache::new(*shape_id, slot_index));
+        }
+
+        if !self.is_extensible(handle)? {
+            let shape_id = match self.object(handle)? {
+                HeapValue::Object { shape_id, .. }
+                | HeapValue::NativeObject { shape_id, .. }
+                | HeapValue::Closure { shape_id, .. }
+                | HeapValue::HostFunction { shape_id, .. }
+                | HeapValue::Array { shape_id, .. } => *shape_id,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            return Ok(PropertyInlineCache::new(shape_id, 0));
+        }
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Array {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } => (object_shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        keys.push(property);
+        values.push(PropertyValue::data(value));
+        *object_shape_id = shape_id;
+        let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
+    }
+
+    fn set_array_named_property_storage(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        value: RegisterValue,
+    ) -> Result<PropertyInlineCache, ObjectError> {
+        self.set_named_property_storage(handle, property, value)
+    }
+
+    fn define_named_property_storage(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        desc: PropertyDescriptor,
+        include_array: bool,
+    ) -> Result<bool, ObjectError> {
+        let existing_slot = match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
+            _ => None,
+        };
+
+        if let Some(slot_index) = existing_slot {
+            let slot = usize::from(slot_index);
+            let existing = {
+                let values = match self.object(handle)? {
+                    HeapValue::Object { values, .. }
+                    | HeapValue::NativeObject { values, .. }
+                    | HeapValue::Closure { values, .. }
+                    | HeapValue::HostFunction { values, .. } => values,
+                    HeapValue::Array { values, .. } if include_array => values,
+                    _ => return Err(ObjectError::InvalidKind),
+                };
+                values[slot]
+            };
+
+            let Some(next_value) = self.apply_property_descriptor(existing, desc)? else {
+                return Ok(false);
+            };
+
+            let values = match self.object_mut(handle)? {
+                HeapValue::Object { values, .. }
+                | HeapValue::NativeObject { values, .. }
+                | HeapValue::Closure { values, .. }
+                | HeapValue::HostFunction { values, .. } => values,
+                HeapValue::Array { values, .. } if include_array => values,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            values[slot] = next_value;
+            return Ok(true);
+        }
+
+        if !self.is_extensible(handle)? {
+            return Ok(false);
+        }
+
+        let next_value = self.new_property_from_descriptor(desc);
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            } => (s, keys, values),
+            HeapValue::Array {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            } if include_array => (s, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        keys.push(property);
+        values.push(next_value);
+        *object_shape_id = shape_id;
+        Ok(true)
+    }
+
+    fn delete_named_property_storage(
+        &mut self,
+        handle: ObjectHandle,
+        property: PropertyNameId,
+        include_array: bool,
+    ) -> Result<bool, ObjectError> {
+        let slot_index = match self.object(handle)? {
+            HeapValue::Object { keys, .. }
+            | HeapValue::NativeObject { keys, .. }
+            | HeapValue::Closure { keys, .. }
+            | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
+            HeapValue::String { .. }
+            | HeapValue::UpvalueCell { .. }
+            | HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. }
+            | HeapValue::PropertyIterator { .. }
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
+            _ => None,
+        };
+
+        let Some(slot_index) = slot_index.map(usize::from) else {
+            return Ok(true);
+        };
+
+        {
+            let values = match self.object(handle)? {
+                HeapValue::Object { values, .. }
+                | HeapValue::NativeObject { values, .. }
+                | HeapValue::Closure { values, .. }
+                | HeapValue::HostFunction { values, .. } => values,
+                HeapValue::Array { values, .. } if include_array => values,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            if !values[slot_index].attributes().configurable() {
+                return Ok(false);
+            }
+        }
+
+        let shape_id = self.allocate_shape();
+        let object = self.object_mut(handle)?;
+        let (object_shape_id, keys, values) = match object {
+            HeapValue::Object {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::NativeObject {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::Closure {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } => (object_shape_id, keys, values),
+            HeapValue::Array {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            } if include_array => (object_shape_id, keys, values),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        keys.remove(slot_index);
+        values.remove(slot_index);
+        *object_shape_id = shape_id;
+        Ok(true)
+    }
+
+    fn set_array_length_from_value(
+        &mut self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        let (current_length, length_writable) = match self.object(handle)? {
+            HeapValue::Array {
+                elements,
+                length_writable,
+                ..
+            } => (elements.len(), *length_writable),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let Some(next_length) = array_length_from_value(value) else {
+            return Err(ObjectError::InvalidArrayLength);
+        };
+
+        if next_length == current_length || !length_writable {
+            return Ok(());
+        }
+
+        self.set_array_length(handle, next_length)?;
+        Ok(())
+    }
+
     fn allocate_shape(&mut self) -> ObjectShapeId {
         let shape_id = ObjectShapeId(self.next_shape_id);
         self.next_shape_id = self.next_shape_id.saturating_add(1);
@@ -2028,6 +3002,7 @@ impl ObjectHeap {
         &self,
         handle: ObjectHandle,
         property: PropertyNameId,
+        property_names: &PropertyNameRegistry,
     ) -> Result<Option<(PropertyValue, PropertyInlineCache)>, ObjectError> {
         let object = self.object(handle)?;
         let (shape_id, keys, values) = match object {
@@ -2055,7 +3030,77 @@ impl ObjectHeap {
                 values,
                 ..
             } => (shape_id, keys, values),
-            HeapValue::Array { .. } | HeapValue::String { .. } => {
+            HeapValue::Array {
+                shape_id,
+                keys,
+                values,
+                elements,
+                elements_writable,
+                elements_configurable,
+                length_writable,
+                ..
+            } => {
+                let Some(property_name) = property_names.get(property) else {
+                    return Ok(None);
+                };
+                if property_name == "length" {
+                    return Ok(Some((
+                        PropertyValue::data_with_attrs(
+                            RegisterValue::from_i32(
+                                i32::try_from(elements.len()).unwrap_or(i32::MAX),
+                            ),
+                            PropertyAttributes::from_flags(*length_writable, false, false),
+                        ),
+                        PropertyInlineCache::new(ObjectShapeId(0), 0),
+                    )));
+                }
+
+                if let Some(index) = canonical_array_index(property_name) {
+                    let Some(value) = elements.get(index).copied() else {
+                        return Ok(None);
+                    };
+                    if value.is_hole() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((
+                        PropertyValue::data_with_attrs(
+                            value,
+                            PropertyAttributes::from_flags(
+                                *elements_writable,
+                                true,
+                                *elements_configurable,
+                            ),
+                        ),
+                        PropertyInlineCache::new(ObjectShapeId(0), 0),
+                    )));
+                }
+
+                if let Some(slot_index) = property_slot(keys, property) {
+                    let slot_index = usize::from(slot_index);
+                    if let Some(value) = values.get(slot_index).copied() {
+                        return Ok(Some((
+                            value,
+                            PropertyInlineCache::new(*shape_id, slot_index as u16),
+                        )));
+                    }
+                }
+                return Ok(None);
+            }
+            HeapValue::String { value, .. } => {
+                let Some(property_name) = property_names.get(property) else {
+                    return Ok(None);
+                };
+                if property_name == "length" {
+                    return Ok(Some((
+                        PropertyValue::data_with_attrs(
+                            RegisterValue::from_i32(
+                                i32::try_from(value.chars().count()).unwrap_or(i32::MAX),
+                            ),
+                            PropertyAttributes::from_flags(false, false, false),
+                        ),
+                        PropertyInlineCache::new(ObjectShapeId(0), 0),
+                    )));
+                }
                 return Ok(None);
             }
             HeapValue::UpvalueCell { .. }
@@ -2100,18 +3145,44 @@ fn property_slot(keys: &[PropertyNameId], property: PropertyNameId) -> Option<u1
         .and_then(|index| u16::try_from(index).ok())
 }
 
+fn canonical_array_index(property_name: &str) -> Option<usize> {
+    let index = property_name.parse::<u32>().ok()?;
+    if index == u32::MAX || index.to_string() != property_name {
+        return None;
+    }
+    Some(index as usize)
+}
+
+fn array_length_from_value(value: RegisterValue) -> Option<usize> {
+    if let Some(length) = value.as_i32()
+        && length >= 0
+    {
+        return Some(length as usize);
+    }
+
+    let length = value.as_number()?;
+    if !length.is_finite() || length < 0.0 || length.fract() != 0.0 {
+        return None;
+    }
+    if length > (u32::MAX - 1) as f64 || length > usize::MAX as f64 {
+        return None;
+    }
+    Some(length as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::host::HostFunctionId;
     use crate::module::FunctionIndex;
-    use crate::property::PropertyNameId;
+    use crate::property::{PropertyNameId, PropertyNameRegistry};
     use crate::value::RegisterValue;
 
     use super::ClosureFlags;
     use crate::payload::NativePayloadId;
 
     use super::{
-        HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyInlineCache, PropertyValue,
+        HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyDescriptor,
+        PropertyInlineCache, PropertyValue,
     };
 
     #[test]
@@ -2213,6 +3284,71 @@ mod tests {
         assert_eq!(
             heap.set_property(array, PropertyNameId(0), RegisterValue::from_i32(1)),
             Err(ObjectError::InvalidKind)
+        );
+    }
+
+    #[test]
+    fn object_heap_supports_array_define_own_property_semantics() {
+        let mut heap = ObjectHeap::new();
+        let mut property_names = PropertyNameRegistry::new();
+        let array = heap.alloc_array();
+        let index_zero = property_names.intern("0");
+        let index_one = property_names.intern("1");
+        let length = property_names.intern("length");
+
+        assert_eq!(
+            heap.define_own_property_from_descriptor_with_registry(
+                array,
+                index_zero,
+                PropertyDescriptor::data(
+                    Some(RegisterValue::from_i32(1)),
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                ),
+                &property_names,
+            ),
+            Ok(true)
+        );
+        assert_eq!(heap.array_length(array), Ok(Some(1)));
+        assert_eq!(
+            heap.get_index(array, 0),
+            Ok(Some(RegisterValue::from_i32(1)))
+        );
+
+        assert_eq!(
+            heap.define_own_property_from_descriptor_with_registry(
+                array,
+                length,
+                PropertyDescriptor::data(Some(RegisterValue::from_i32(0)), None, None, None),
+                &property_names,
+            ),
+            Ok(true)
+        );
+        assert_eq!(heap.array_length(array), Ok(Some(0)));
+
+        assert_eq!(
+            heap.define_own_property_from_descriptor_with_registry(
+                array,
+                length,
+                PropertyDescriptor::data(None, Some(false), None, None),
+                &property_names,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            heap.define_own_property_from_descriptor_with_registry(
+                array,
+                index_one,
+                PropertyDescriptor::data(
+                    Some(RegisterValue::from_i32(2)),
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                ),
+                &property_names,
+            ),
+            Ok(false)
         );
     }
 

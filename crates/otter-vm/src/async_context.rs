@@ -130,7 +130,10 @@ impl SuspendedFrameSet {
 
     /// Number of currently suspended frames.
     pub fn count(&self) -> usize {
-        self.frames.iter().filter(|f| !f.registers.is_empty()).count()
+        self.frames
+            .iter()
+            .filter(|f| !f.registers.is_empty())
+            .count()
     }
 
     /// Whether there are any suspended frames.

@@ -53,8 +53,12 @@ impl<T: Traceable> TypeErasedObject for T {
     fn trace_handles(&self, visitor: &mut dyn FnMut(Handle)) {
         Traceable::trace_handles(self, visitor);
     }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Safe, typed GC heap built on top of the page-based `GcHeap`.
@@ -290,7 +294,10 @@ mod tests {
     fn collect_follows_references() {
         let mut heap = TypedHeap::new();
         let leaf = heap.alloc(Leaf(10));
-        let node = heap.alloc(Node { value: 1, child: Some(leaf) });
+        let node = heap.alloc(Node {
+            value: 1,
+            child: Some(leaf),
+        });
         let _orphan = heap.alloc(Leaf(99));
 
         heap.collect(&[node]);
@@ -338,9 +345,18 @@ mod tests {
 
         // Build a chain: root → n1 → n2 → n3 → leaf
         let leaf = heap.alloc(Leaf(42));
-        let n3 = heap.alloc(Node { value: 3, child: Some(leaf) });
-        let n2 = heap.alloc(Node { value: 2, child: Some(n3) });
-        let n1 = heap.alloc(Node { value: 1, child: Some(n2) });
+        let n3 = heap.alloc(Node {
+            value: 3,
+            child: Some(leaf),
+        });
+        let n2 = heap.alloc(Node {
+            value: 2,
+            child: Some(n3),
+        });
+        let n1 = heap.alloc(Node {
+            value: 1,
+            child: Some(n2),
+        });
 
         // Also some garbage.
         let _g1 = heap.alloc(Leaf(0));

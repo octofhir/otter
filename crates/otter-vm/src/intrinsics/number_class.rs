@@ -191,7 +191,7 @@ fn initialize_number_constructor(
         ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0), // 2^53 - 1
         ("MAX_VALUE", f64::MAX),
         ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0), // -(2^53 - 1)
-        ("MIN_VALUE", f64::MIN_POSITIVE), // smallest positive subnormal ≈ 5e-324
+        ("MIN_VALUE", f64::MIN_POSITIVE),               // smallest positive subnormal ≈ 5e-324
         ("NaN", f64::NAN),
         ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
         ("POSITIVE_INFINITY", f64::INFINITY),
@@ -225,11 +225,8 @@ fn initialize_number_constructor(
         let host_fn = cx.native_functions.register(descriptor);
         let handle = cx.alloc_intrinsic_host_function(host_fn, intrinsics.function_prototype())?;
         let prop = cx.property_names.intern(name);
-        cx.heap.set_property(
-            ctor,
-            prop,
-            RegisterValue::from_object_handle(handle.0),
-        )?;
+        cx.heap
+            .set_property(ctor, prop, RegisterValue::from_object_handle(handle.0))?;
     }
 
     Ok(())
@@ -245,7 +242,10 @@ fn number_is_finite(
     args: &[RegisterValue],
     _runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     // If Type(number) is not Number, return false.
     let Some(n) = arg.as_number() else {
         return Ok(RegisterValue::from_bool(false));
@@ -259,13 +259,14 @@ fn number_is_integer(
     args: &[RegisterValue],
     _runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let Some(n) = arg.as_number() else {
         return Ok(RegisterValue::from_bool(false));
     };
-    Ok(RegisterValue::from_bool(
-        n.is_finite() && n.trunc() == n,
-    ))
+    Ok(RegisterValue::from_bool(n.is_finite() && n.trunc() == n))
 }
 
 /// §21.1.2.4 Number.isNaN(number)
@@ -274,7 +275,10 @@ fn number_is_nan(
     args: &[RegisterValue],
     _runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let Some(n) = arg.as_number() else {
         return Ok(RegisterValue::from_bool(false));
     };
@@ -287,14 +291,15 @@ fn number_is_safe_integer(
     args: &[RegisterValue],
     _runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let Some(n) = arg.as_number() else {
         return Ok(RegisterValue::from_bool(false));
     };
     Ok(RegisterValue::from_bool(
-        n.is_finite()
-            && n.trunc() == n
-            && n.abs() <= 9_007_199_254_740_991.0,
+        n.is_finite() && n.trunc() == n && n.abs() <= 9_007_199_254_740_991.0,
     ))
 }
 
@@ -304,7 +309,10 @@ fn number_parse_float(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let s = runtime.js_to_string_infallible(arg);
     let trimmed = s.trim_start();
     if trimmed.is_empty() {
@@ -321,9 +329,15 @@ fn number_parse_int(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let s = runtime.js_to_string_infallible(arg);
-    let radix_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let radix_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let radix = if radix_arg == RegisterValue::undefined() {
         0 // auto-detect
@@ -354,7 +368,10 @@ fn global_is_nan(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let n = runtime
         .js_to_number(arg)
         .map_err(|e| VmNativeCallError::Internal(format!("isNaN: {e}").into()))?;
@@ -367,7 +384,10 @@ fn global_is_finite(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let n = runtime
         .js_to_number(arg)
         .map_err(|e| VmNativeCallError::Internal(format!("isFinite: {e}").into()))?;
@@ -445,7 +465,12 @@ fn parse_int_impl(input: &str, radix: i32) -> f64 {
 
     let radix = if radix == 0 {
         // Auto-detect: 0x → 16, else 10
-        if chars.clone().take(2).collect::<String>().to_ascii_lowercase() == "0x" {
+        if chars
+            .clone()
+            .take(2)
+            .collect::<String>()
+            .eq_ignore_ascii_case("0x")
+        {
             chars.next(); // skip '0'
             chars.next(); // skip 'x'
             16
@@ -524,7 +549,7 @@ fn number_data(
     Ok(Some(value))
 }
 
-pub(super) fn box_number_object(
+pub(crate) fn box_number_object(
     primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {

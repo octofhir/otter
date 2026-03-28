@@ -115,11 +115,21 @@ impl PageFlags {
     /// Page contains at least one pinned object (cannot be evacuated).
     pub const HAS_PINNED: Self = Self(1 << 3);
 
-    pub const fn empty() -> Self { Self(0) }
-    pub const fn bits(self) -> u64 { self.0 }
-    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
-    pub fn insert(&mut self, other: Self) { self.0 |= other.0; }
-    pub fn remove(&mut self, other: Self) { self.0 &= !other.0; }
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,8 +442,8 @@ fn alloc_aligned_page() -> Result<NonNull<u8>, PageAllocError> {
     // This maps to posix_memalign on Unix (which uses mmap internally
     // for large alignments) and _aligned_malloc on Windows.
     // Simpler, portable, and the allocator handles alignment correctly.
-    let layout = std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
-        .map_err(|_| PageAllocError)?;
+    let layout =
+        std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).map_err(|_| PageAllocError)?;
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     NonNull::new(ptr).ok_or(PageAllocError)
 }
@@ -451,7 +461,10 @@ fn dealloc_aligned_page(base: NonNull<u8>) {
 // Static assertions
 // ---------------------------------------------------------------------------
 
-const _: () = assert!(PAGE_SIZE.is_power_of_two(), "PAGE_SIZE must be power of two");
+const _: () = assert!(
+    PAGE_SIZE.is_power_of_two(),
+    "PAGE_SIZE must be power of two"
+);
 const _: () = assert!(
     PAGE_HEADER_SIZE < PAGE_SIZE,
     "header must leave room for payload"
@@ -461,10 +474,7 @@ const _: () = assert!(
     PAGE_HEADER_SIZE % OBJECT_ALIGNMENT == 0,
     "header must be object-aligned"
 );
-const _: () = assert!(
-    PAGE_PAYLOAD_SIZE > 0,
-    "payload area must be non-empty"
-);
+const _: () = assert!(PAGE_PAYLOAD_SIZE > 0, "payload area must be non-empty");
 
 #[cfg(test)]
 mod tests {

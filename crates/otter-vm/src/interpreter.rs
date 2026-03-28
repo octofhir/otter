@@ -13,11 +13,11 @@ use crate::feedback::{FeedbackKind, FeedbackSlotId};
 use crate::float::FloatId;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::host::{HostFunctionId, NativeFunctionRegistry};
-use crate::intrinsics::VmIntrinsics;
+use crate::intrinsics::{VmIntrinsics, box_boolean_object, box_number_object};
 use crate::module::{Function, FunctionIndex, Module};
 use crate::object::{
     ClosureFlags as ObjectClosureFlags, HeapValueKind, ObjectError, ObjectHandle, ObjectHeap,
-    PropertyAttributes, PropertyInlineCache, PropertyValue,
+    PropertyAttributes, PropertyInlineCache, PropertyLookup, PropertyValue,
 };
 use crate::payload::{NativePayloadError, NativePayloadRegistry, VmTrace, VmValueTracer};
 use crate::property::{PropertyNameId, PropertyNameRegistry};
@@ -136,6 +136,7 @@ impl From<ObjectError> for InterpreterError {
             ObjectError::InvalidHandle => Self::InvalidObjectHandle,
             ObjectError::InvalidIndex => Self::InvalidHeapSlot,
             ObjectError::InvalidKind => Self::InvalidHeapValueKind,
+            ObjectError::InvalidArrayLength => Self::NativeCall("invalid array length".into()),
         }
     }
 }
@@ -482,6 +483,100 @@ impl RuntimeState {
         self.property_names.intern(name)
     }
 
+    /// Returns own property keys using the runtime-wide property-name registry.
+    pub fn own_property_keys(
+        &mut self,
+        object: ObjectHandle,
+    ) -> Result<Vec<PropertyNameId>, ObjectError> {
+        self.objects
+            .own_keys_with_registry(object, &mut self.property_names)
+    }
+
+    /// Returns an own property descriptor without prototype traversal.
+    pub fn own_property_descriptor(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        if let Some(descriptor) = self.string_exotic_own_property(object, property)? {
+            return Ok(Some(descriptor));
+        }
+        self.objects
+            .own_property_descriptor(object, property, &self.property_names)
+    }
+
+    /// Returns a named property lookup using the runtime-wide property registry.
+    pub fn property_lookup(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<Option<PropertyLookup>, ObjectError> {
+        if let Some(descriptor) = self.string_exotic_own_property(object, property)? {
+            return Ok(Some(PropertyLookup::new(object, descriptor, None)));
+        }
+        self.objects
+            .get_property_with_registry(object, property, &self.property_names)
+    }
+
+    /// Returns whether a named property exists on an object or its prototype chain.
+    pub fn has_property(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<bool, ObjectError> {
+        Ok(self.property_lookup(object, property)?.is_some())
+    }
+
+    /// Writes a named property using the runtime-wide property-name registry.
+    pub fn set_named_property(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+        value: RegisterValue,
+    ) -> Result<PropertyInlineCache, InterpreterError> {
+        match self
+            .objects
+            .set_property_with_registry(object, property, value, &self.property_names)
+        {
+            Ok(cache) => Ok(cache),
+            Err(ObjectError::InvalidArrayLength) => Err(self.invalid_array_length_error()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn string_exotic_own_property(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<Option<PropertyValue>, ObjectError> {
+        let Some(string) = self.objects.string_value(object)? else {
+            return Ok(None);
+        };
+        let Some(property_name) = self.property_names.get(property) else {
+            return Ok(None);
+        };
+
+        if property_name == "length" {
+            return Ok(Some(PropertyValue::data_with_attrs(
+                RegisterValue::from_i32(i32::try_from(string.chars().count()).unwrap_or(i32::MAX)),
+                PropertyAttributes::from_flags(false, false, false),
+            )));
+        }
+
+        let Some(index) = canonical_string_exotic_index(property_name) else {
+            return Ok(None);
+        };
+        let Some(character) = string.chars().nth(index) else {
+            return Ok(None);
+        };
+
+        let character = self.alloc_string(character.to_string());
+        Ok(Some(PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(character.0),
+            PropertyAttributes::from_flags(false, true, false),
+        )))
+    }
+
     /// Returns the runtime-wide native host-function registry.
     #[must_use]
     pub fn native_functions(&self) -> &NativeFunctionRegistry {
@@ -654,9 +749,9 @@ impl RuntimeState {
         &mut self,
         handle: ObjectHandle,
     ) -> Result<Vec<RegisterValue>, VmNativeCallError> {
-        self.objects.array_elements(handle).map_err(|e| {
-            VmNativeCallError::Internal(format!("array_to_args failed: {e:?}").into())
-        })
+        self.objects
+            .array_elements(handle)
+            .map_err(|e| VmNativeCallError::Internal(format!("array_to_args failed: {e:?}").into()))
     }
 
     /// Allocates one string object with the runtime default prototype.
@@ -758,11 +853,9 @@ impl RuntimeState {
             Ok(HeapValueKind::HostFunction) => {
                 // Host functions are constructors only if registered with Constructor slot kind.
                 if let Ok(Some(host_fn_id)) = self.objects.host_function(handle) {
-                    self.native_functions
-                        .get(host_fn_id)
-                        .is_some_and(|desc| {
-                            desc.slot_kind() == crate::descriptors::NativeSlotKind::Constructor
-                        })
+                    self.native_functions.get(host_fn_id).is_some_and(|desc| {
+                        desc.slot_kind() == crate::descriptors::NativeSlotKind::Constructor
+                    })
                 } else {
                     false
                 }
@@ -852,20 +945,7 @@ impl RuntimeState {
         &mut self,
         value: RegisterValue,
     ) -> Result<PropertyNameId, VmNativeCallError> {
-        let handle = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-            VmNativeCallError::Internal("property key must be a string object".into())
-        })?;
-        let key = self
-            .objects
-            .string_value(handle)
-            .map_err(|error| {
-                VmNativeCallError::Internal(format!("property key lookup failed: {error:?}").into())
-            })?
-            .ok_or_else(|| {
-                VmNativeCallError::Internal("property key must be a string object".into())
-            })?
-            .to_owned();
-        Ok(self.intern_property_name(&key))
+        crate::abstract_ops::to_property_key(self, value)
     }
 
     /// Executes ordinary named-property `[[Get]]` with an explicit receiver.
@@ -873,21 +953,16 @@ impl RuntimeState {
         &mut self,
         target: ObjectHandle,
         property: PropertyNameId,
-        receiver: ObjectHandle,
+        receiver: RegisterValue,
     ) -> Result<RegisterValue, VmNativeCallError> {
-        match self
-            .objects
-            .get_property(target, property)
-            .map_err(|error| {
-                VmNativeCallError::Internal(format!("ordinary get failed: {error:?}").into())
-            })? {
+        match self.property_lookup(target, property).map_err(|error| {
+            VmNativeCallError::Internal(format!("ordinary get failed: {error:?}").into())
+        })? {
             Some(lookup) => match lookup.value() {
                 PropertyValue::Data { value, .. } => Ok(value),
-                PropertyValue::Accessor { getter, .. } => self.call_host_function(
-                    getter,
-                    RegisterValue::from_object_handle(receiver.0),
-                    &[],
-                ),
+                PropertyValue::Accessor { getter, .. } => {
+                    self.call_host_function(getter, receiver, &[])
+                }
             },
             None => Ok(RegisterValue::undefined()),
         }
@@ -898,70 +973,84 @@ impl RuntimeState {
         &mut self,
         target: ObjectHandle,
         property: PropertyNameId,
-        receiver: ObjectHandle,
+        receiver: RegisterValue,
         value: RegisterValue,
-    ) -> Result<(), VmNativeCallError> {
-        match self
-            .objects
-            .get_property(target, property)
-            .map_err(|error| {
-                VmNativeCallError::Internal(format!("ordinary set failed: {error:?}").into())
-            })? {
+    ) -> Result<bool, VmNativeCallError> {
+        match self.property_lookup(target, property).map_err(|error| {
+            VmNativeCallError::Internal(format!("ordinary set failed: {error:?}").into())
+        })? {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data { .. } if lookup.owner() == receiver => {
-                    let cache = lookup.cache().ok_or_else(|| {
-                        VmNativeCallError::Internal(
-                            "receiver own-property lookup must carry cache metadata".into(),
-                        )
-                    })?;
-                    let updated = self
-                        .objects
-                        .set_cached(receiver, property, value, cache)
-                        .map_err(|error| {
+                PropertyValue::Data { .. } => {
+                    let Some(receiver_handle) =
+                        self.non_string_object_handle(receiver).map_err(|error| {
                             VmNativeCallError::Internal(
-                                format!("ordinary set receiver update failed: {error:?}").into(),
+                                format!("ordinary set receiver check failed: {error:?}").into(),
+                            )
+                        })?
+                    else {
+                        return Ok(false);
+                    };
+
+                    if lookup.owner() == receiver_handle {
+                        let cache = lookup.cache().ok_or_else(|| {
+                            VmNativeCallError::Internal(
+                                "receiver own-property lookup must carry cache metadata".into(),
                             )
                         })?;
-                    if !updated {
-                        self.objects
-                            .set_property(receiver, property, value)
+                        let updated = self
+                            .objects
+                            .set_cached(receiver_handle, property, value, cache)
                             .map_err(|error| {
                                 VmNativeCallError::Internal(
-                                    format!("ordinary set receiver fallback failed: {error:?}")
+                                    format!("ordinary set receiver update failed: {error:?}")
                                         .into(),
                                 )
                             })?;
+                        if !updated {
+                            self.objects
+                                .set_property(receiver_handle, property, value)
+                                .map_err(|error| {
+                                    VmNativeCallError::Internal(
+                                        format!("ordinary set receiver fallback failed: {error:?}")
+                                            .into(),
+                                    )
+                                })?;
+                        }
+                        return Ok(true);
                     }
-                    Ok(())
-                }
-                PropertyValue::Data { .. } => {
+
                     self.objects
-                        .set_property(receiver, property, value)
+                        .set_property(receiver_handle, property, value)
                         .map_err(|error| {
                             VmNativeCallError::Internal(
                                 format!("ordinary set receiver define failed: {error:?}").into(),
                             )
                         })?;
-                    Ok(())
+                    Ok(true)
                 }
                 PropertyValue::Accessor { setter, .. } => {
-                    let _ = self.call_host_function(
-                        setter,
-                        RegisterValue::from_object_handle(receiver.0),
-                        &[value],
-                    )?;
-                    Ok(())
+                    let _ = self.call_host_function(setter, receiver, &[value])?;
+                    Ok(setter.is_some())
                 }
             },
             None => {
+                let Some(receiver_handle) =
+                    self.non_string_object_handle(receiver).map_err(|error| {
+                        VmNativeCallError::Internal(
+                            format!("ordinary set receiver create check failed: {error:?}").into(),
+                        )
+                    })?
+                else {
+                    return Ok(false);
+                };
                 self.objects
-                    .set_property(receiver, property, value)
+                    .set_property(receiver_handle, property, value)
                     .map_err(|error| {
                         VmNativeCallError::Internal(
                             format!("ordinary set receiver create failed: {error:?}").into(),
                         )
                     })?;
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -978,13 +1067,9 @@ impl RuntimeState {
 
         // ES2024 §10.4.1.1 [[Call]] — resolve bound function chain.
         if let Ok(HeapValueKind::BoundFunction) = self.objects.kind(callable) {
-            let (target, bound_this, bound_args) = self
-                .objects
-                .bound_function_parts(callable)
-                .map_err(|e| {
-                    VmNativeCallError::Internal(
-                        format!("bound function resolution: {e:?}").into(),
-                    )
+            let (target, bound_this, bound_args) =
+                self.objects.bound_function_parts(callable).map_err(|e| {
+                    VmNativeCallError::Internal(format!("bound function resolution: {e:?}").into())
                 })?;
             // Prepend bound_args to arguments.
             let mut full_args = bound_args;
@@ -1023,8 +1108,24 @@ impl RuntimeState {
         target: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<bool, InterpreterError> {
-        let _deleted = self.objects.delete_property(target, property)?;
-        Ok(true)
+        self.objects
+            .delete_property_with_registry(target, property, &self.property_names)
+            .map_err(Into::into)
+    }
+
+    fn invalid_array_length_error(&mut self) -> InterpreterError {
+        let prototype = self.intrinsics().range_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let message = self.alloc_string("Invalid array length");
+        let message_prop = self.intern_property_name("message");
+        self.objects
+            .set_property(
+                handle,
+                message_prop,
+                RegisterValue::from_object_handle(message.0),
+            )
+            .ok();
+        InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(handle.0))
     }
 
     fn own_data_property(
@@ -1045,7 +1146,7 @@ impl RuntimeState {
         Ok(Some(value))
     }
 
-    fn boxed_primitive_value(
+    pub(crate) fn boxed_primitive_value(
         &mut self,
         handle: ObjectHandle,
     ) -> Result<Option<RegisterValue>, InterpreterError> {
@@ -1098,6 +1199,83 @@ impl RuntimeState {
         Ok(false)
     }
 
+    fn non_string_object_handle(
+        &self,
+        value: RegisterValue,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(None);
+        };
+        if matches!(self.objects.kind(handle)?, HeapValueKind::String) {
+            return Ok(None);
+        }
+        Ok(Some(handle))
+    }
+
+    fn computed_property_name(
+        &mut self,
+        key: RegisterValue,
+    ) -> Result<PropertyNameId, InterpreterError> {
+        self.property_name_from_value(key)
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(_) => {
+                    InterpreterError::TypeError("property key coercion threw".into())
+                }
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })
+    }
+
+    fn property_base_object_handle(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        if value == RegisterValue::undefined() || value == RegisterValue::null() {
+            return Err(InterpreterError::TypeError(
+                "Cannot read properties of null or undefined".into(),
+            ));
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            return Ok(handle);
+        }
+        if let Some(boolean) = value.as_bool() {
+            let object =
+                box_boolean_object(RegisterValue::from_bool(boolean), self).map_err(|error| {
+                    match error {
+                        VmNativeCallError::Thrown(_) => {
+                            InterpreterError::TypeError("boolean boxing threw".into())
+                        }
+                        VmNativeCallError::Internal(message) => {
+                            InterpreterError::NativeCall(message)
+                        }
+                    }
+                })?;
+            return Ok(ObjectHandle(
+                object
+                    .as_object_handle()
+                    .expect("boxed boolean should return object handle"),
+            ));
+        }
+        if let Some(number) = value.as_number() {
+            let object =
+                box_number_object(RegisterValue::from_number(number), self).map_err(|error| {
+                    match error {
+                        VmNativeCallError::Thrown(_) => {
+                            InterpreterError::TypeError("number boxing threw".into())
+                        }
+                        VmNativeCallError::Internal(message) => {
+                            InterpreterError::NativeCall(message)
+                        }
+                    }
+                })?;
+            return Ok(ObjectHandle(
+                object
+                    .as_object_handle()
+                    .expect("boxed number should return object handle"),
+            ));
+        }
+        Err(InterpreterError::InvalidObjectValue)
+    }
+
     fn coerce_loose_equality_primitive(
         &mut self,
         value: RegisterValue,
@@ -1113,7 +1291,10 @@ impl RuntimeState {
         Ok(value)
     }
 
-    fn js_to_string(&mut self, value: RegisterValue) -> Result<Box<str>, InterpreterError> {
+    pub(crate) fn js_to_string(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<Box<str>, InterpreterError> {
         if value == RegisterValue::undefined() {
             return Ok("undefined".into());
         }
@@ -1265,7 +1446,7 @@ impl RuntimeState {
     /// ES spec 7.1.2 ToBoolean — runtime-aware truthiness check.
     /// Unlike `RegisterValue::is_truthy()`, this correctly handles heap strings
     /// (empty string "" is falsy).
-    fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
+    pub(crate) fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         // Fast path: non-object values use the NaN-box check.
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(value.is_truthy());
@@ -1329,14 +1510,15 @@ impl RuntimeState {
         key: RegisterValue,
         object: RegisterValue,
     ) -> Result<bool, InterpreterError> {
-        let Some(obj_handle) = object.as_object_handle().map(ObjectHandle) else {
+        let Some(obj_handle) = self.non_string_object_handle(object)? else {
             return Err(InterpreterError::TypeError(
                 "Cannot use 'in' operator to search for property in non-object".into(),
             ));
         };
         let key_str = self.js_to_string(key)?;
         let property = self.intern_property_name(&key_str);
-        Ok(self.objects.get_property(obj_handle, property)?.is_some())
+        self.has_property(obj_handle, property)
+            .map_err(InterpreterError::from)
     }
 
     /// Allocate an error object with the correct prototype chain.
@@ -1598,9 +1780,7 @@ impl Interpreter {
                 }
             }
             HeapValueKind::Closure => {
-                let callee_index = runtime
-                    .objects
-                    .closure_callee(callable)?;
+                let callee_index = runtime.objects.closure_callee(callable)?;
                 let callee_function = module
                     .function(callee_index)
                     .ok_or(InterpreterError::InvalidCallTarget)?;
@@ -1969,27 +2149,33 @@ impl Interpreter {
 
                 // §10.4.4.6 step 7: Install `length` as own data property {W:true, E:false, C:true}.
                 let length_key = runtime.intern_property_name("length");
-                runtime.objects_mut().define_own_property(
-                    args_obj,
-                    length_key,
-                    PropertyValue::data_with_attrs(
-                        RegisterValue::from_i32(i32::from(actual_argc)),
-                        PropertyAttributes::builtin_method(),
-                    ),
-                ).ok();
+                runtime
+                    .objects_mut()
+                    .define_own_property(
+                        args_obj,
+                        length_key,
+                        PropertyValue::data_with_attrs(
+                            RegisterValue::from_i32(i32::from(actual_argc)),
+                            PropertyAttributes::builtin_method(),
+                        ),
+                    )
+                    .ok();
 
                 // §10.4.4.7 step 13: Install `callee` (sloppy mode only).
                 // For now, install if closure is available.
                 if let Some(closure) = activation.closure_handle() {
                     let callee_key = runtime.intern_property_name("callee");
-                    runtime.objects_mut().define_own_property(
-                        args_obj,
-                        callee_key,
-                        PropertyValue::data_with_attrs(
-                            RegisterValue::from_object_handle(closure.0),
-                            PropertyAttributes::builtin_method(),
-                        ),
-                    ).ok();
+                    runtime
+                        .objects_mut()
+                        .define_own_property(
+                            args_obj,
+                            callee_key,
+                            PropertyValue::data_with_attrs(
+                                RegisterValue::from_object_handle(closure.0),
+                                PropertyAttributes::builtin_method(),
+                            ),
+                        )
+                        .ok();
                 }
 
                 activation.write_bytecode_register(
@@ -2299,7 +2485,8 @@ impl Interpreter {
             Opcode::GetProperty => {
                 let pc = activation.pc();
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
-                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = runtime.property_base_object_handle(base)?;
                 let property_name = runtime
                     .property_names()
                     .get(property)
@@ -2314,20 +2501,35 @@ impl Interpreter {
                     return Ok(StepOutcome::Continue);
                 }
 
-                let value = if let Some(cache) = frame_runtime.property_cache(function, pc) {
-                    match runtime.objects.get_cached(handle, property, cache)? {
-                        Some(PropertyValue::Data { value, .. }) => value,
-                        Some(PropertyValue::Accessor { getter, .. }) => {
-                            Self::invoke_accessor_getter(runtime, handle, getter)?
+                let supports_inline_property_cache = !matches!(
+                    runtime.objects.kind(handle)?,
+                    HeapValueKind::Array | HeapValueKind::String
+                );
+                let value = if supports_inline_property_cache {
+                    if let Some(cache) = frame_runtime.property_cache(function, pc) {
+                        match runtime.objects.get_cached(handle, property, cache)? {
+                            Some(PropertyValue::Data { value, .. }) => value,
+                            Some(PropertyValue::Accessor { getter, .. }) => {
+                                Self::invoke_accessor_getter(runtime, handle, getter)?
+                            }
+                            None => Self::generic_get_property(
+                                function,
+                                runtime,
+                                frame_runtime,
+                                pc,
+                                handle,
+                                property,
+                            )?,
                         }
-                        None => Self::generic_get_property(
+                    } else {
+                        Self::generic_get_property(
                             function,
                             runtime,
                             frame_runtime,
                             pc,
                             handle,
                             property,
-                        )?,
+                        )?
                     }
                 } else {
                     Self::generic_get_property(
@@ -2347,19 +2549,36 @@ impl Interpreter {
             Opcode::SetProperty => {
                 let pc = activation.pc();
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
-                let handle = Self::read_object_handle(activation, function, instruction.a())?;
+                let base = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(base)?;
                 let value = activation.read_bytecode_register(function, instruction.b())?;
 
-                let handled = if let Some(cache) = frame_runtime.property_cache(function, pc) {
-                    match runtime.objects.get_cached(handle, property, cache)? {
-                        Some(PropertyValue::Data { .. }) => {
-                            runtime.objects.set_cached(handle, property, value, cache)?
+                let supports_inline_property_cache = !matches!(
+                    runtime.objects.kind(handle)?,
+                    HeapValueKind::Array | HeapValueKind::String
+                );
+                let handled = if supports_inline_property_cache {
+                    if let Some(cache) = frame_runtime.property_cache(function, pc) {
+                        match runtime.objects.get_cached(handle, property, cache)? {
+                            Some(PropertyValue::Data { .. }) => {
+                                runtime.objects.set_cached(handle, property, value, cache)?
+                            }
+                            Some(PropertyValue::Accessor { setter, .. }) => {
+                                Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                                true
+                            }
+                            None => Self::generic_set_property(
+                                function,
+                                runtime,
+                                frame_runtime,
+                                pc,
+                                handle,
+                                property,
+                                value,
+                            )?,
                         }
-                        Some(PropertyValue::Accessor { setter, .. }) => {
-                            Self::invoke_accessor_setter(runtime, handle, setter, value)?;
-                            true
-                        }
-                        None => Self::generic_set_property(
+                    } else {
+                        Self::generic_set_property(
                             function,
                             runtime,
                             frame_runtime,
@@ -2367,7 +2586,7 @@ impl Interpreter {
                             handle,
                             property,
                             value,
-                        )?,
+                        )?
                     }
                 } else {
                     Self::generic_set_property(
@@ -2382,8 +2601,10 @@ impl Interpreter {
                 };
 
                 if !handled {
-                    let cache = runtime.objects.set_property(handle, property, value)?;
-                    frame_runtime.update_property_cache(function, pc, cache);
+                    let cache = runtime.set_named_property(handle, property, value)?;
+                    if supports_inline_property_cache {
+                        frame_runtime.update_property_cache(function, pc, cache);
+                    }
                 }
 
                 activation.advance();
@@ -2391,7 +2612,8 @@ impl Interpreter {
             }
             Opcode::DeleteProperty => {
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
-                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = runtime.property_base_object_handle(base)?;
                 let deleted = runtime.delete_named_property(handle, property)?;
                 activation.write_bytecode_register(
                     function,
@@ -2402,10 +2624,10 @@ impl Interpreter {
                 Ok(StepOutcome::Continue)
             }
             Opcode::DeleteComputed => {
-                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = runtime.property_base_object_handle(base)?;
                 let key_value = activation.read_bytecode_register(function, instruction.c())?;
-                let key_str = runtime.js_to_string_infallible(key_value);
-                let property = runtime.intern_property_name(&key_str);
+                let property = runtime.computed_property_name(key_value)?;
                 let deleted = runtime.delete_named_property(handle, property)?;
                 activation.write_bytecode_register(
                     function,
@@ -2416,21 +2638,58 @@ impl Interpreter {
                 Ok(StepOutcome::Continue)
             }
             Opcode::GetIndex => {
-                let handle = Self::read_object_handle(activation, function, instruction.b())?;
-                let index = Self::read_index(activation, function, instruction.c())?;
-                let value = runtime
-                    .objects
-                    .get_index(handle, index)?
-                    .unwrap_or_else(RegisterValue::undefined);
+                let pc = activation.pc();
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = runtime.property_base_object_handle(base)?;
+                let key = activation.read_bytecode_register(function, instruction.c())?;
+                let property = runtime.computed_property_name(key)?;
+                let value = Self::generic_get_property(
+                    function,
+                    runtime,
+                    frame_runtime,
+                    pc,
+                    handle,
+                    property,
+                )?;
                 activation.write_bytecode_register(function, instruction.a(), value)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::SetIndex => {
-                let handle = Self::read_object_handle(activation, function, instruction.a())?;
-                let index = Self::read_index(activation, function, instruction.b())?;
+                let pc = activation.pc();
+                let base = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(base)?;
+                let key = activation.read_bytecode_register(function, instruction.b())?;
                 let value = activation.read_bytecode_register(function, instruction.c())?;
-                runtime.objects.set_index(handle, index, value)?;
+                let property = runtime.computed_property_name(key)?;
+
+                match runtime.objects.kind(handle)? {
+                    HeapValueKind::Array => {
+                        let property_name = runtime.property_names().get(property).unwrap_or("");
+                        if let Some(index) = canonical_string_exotic_index(property_name) {
+                            runtime.objects.set_index(handle, index, value)?;
+                        } else {
+                            runtime.set_named_property(handle, property, value)?;
+                        }
+                    }
+                    HeapValueKind::String => {}
+                    _ => {
+                        let handled = Self::generic_set_property(
+                            function,
+                            runtime,
+                            frame_runtime,
+                            pc,
+                            handle,
+                            property,
+                            value,
+                        )?;
+
+                        if !handled {
+                            let cache = runtime.set_named_property(handle, property, value)?;
+                            frame_runtime.update_property_cache(function, pc, cache);
+                        }
+                    }
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -2626,7 +2885,8 @@ impl Interpreter {
                         instruction.c(),
                         call.argument_count(),
                     )?;
-                    match Self::invoke_host_function_handle(runtime, callee, receiver, &arguments)? {
+                    match Self::invoke_host_function_handle(runtime, callee, receiver, &arguments)?
+                    {
                         Completion::Return(value) => {
                             activation.write_bytecode_register(function, instruction.a(), value)?;
                             activation.advance();
@@ -2765,7 +3025,8 @@ impl Interpreter {
                             crate::promise::PromiseState::Fulfilled(result) => {
                                 // Already fulfilled — write result, continue.
                                 let result = *result;
-                                let abs = activation.resolve_bytecode_register(function, dst_reg)?;
+                                let abs =
+                                    activation.resolve_bytecode_register(function, dst_reg)?;
                                 activation.set_register(abs, result)?;
                                 activation.advance();
                                 return Ok(StepOutcome::Continue);
@@ -2778,7 +3039,8 @@ impl Interpreter {
                             }
                             crate::promise::PromiseState::Pending => {
                                 // Pending — suspend.
-                                let abs = activation.resolve_bytecode_register(function, dst_reg)?;
+                                let abs =
+                                    activation.resolve_bytecode_register(function, dst_reg)?;
                                 activation.advance();
                                 return Ok(StepOutcome::Suspend {
                                     awaited_promise: handle,
@@ -2870,7 +3132,7 @@ impl Interpreter {
         handle: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<RegisterValue, InterpreterError> {
-        match runtime.objects.get_property(handle, property)? {
+        match runtime.property_lookup(handle, property)? {
             Some(lookup) => {
                 if let Some(cache) = lookup.cache() {
                     frame_runtime.update_property_cache(function, pc, cache);
@@ -2895,7 +3157,24 @@ impl Interpreter {
         property: PropertyNameId,
         value: RegisterValue,
     ) -> Result<bool, InterpreterError> {
-        match runtime.objects.get_property(handle, property)? {
+        match runtime.objects.kind(handle)? {
+            HeapValueKind::String => return Ok(false),
+            HeapValueKind::Array => {
+                return match runtime.property_lookup(handle, property)? {
+                    Some(lookup) => match lookup.value() {
+                        PropertyValue::Accessor { setter, .. } => {
+                            Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                            Ok(true)
+                        }
+                        PropertyValue::Data { .. } => Ok(false),
+                    },
+                    None => Ok(false),
+                };
+            }
+            _ => {}
+        }
+
+        match runtime.property_lookup(handle, property)? {
             Some(lookup) => {
                 if let Some(cache) = lookup.cache() {
                     frame_runtime.update_property_cache(function, pc, cache);
@@ -2916,16 +3195,6 @@ impl Interpreter {
             }
             None => Ok(false),
         }
-    }
-
-    fn read_index(
-        activation: &Activation,
-        function: &Function,
-        register: RegisterIndex,
-    ) -> Result<usize, InterpreterError> {
-        let value = activation.read_bytecode_register(function, register)?;
-        let index = value.as_i32().ok_or(ValueError::ExpectedI32)?;
-        usize::try_from(index).map_err(|_| InterpreterError::InvalidValue(ValueError::ExpectedI32))
     }
 
     fn resolve_upvalue_cell(
@@ -3220,9 +3489,8 @@ impl Interpreter {
     ) -> Result<Completion, InterpreterError> {
         // ES2024 §10.4.1.1 [[Call]] — resolve bound function chain.
         if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callable) {
-            let (target, bound_this, bound_args) = runtime
-                .objects
-                .bound_function_parts(callable)?;
+            let (target, bound_this, bound_args) =
+                runtime.objects.bound_function_parts(callable)?;
             let mut full_args = bound_args;
             full_args.extend_from_slice(arguments);
             return Self::invoke_host_function_handle(runtime, target, bound_this, &full_args);
@@ -3335,6 +3603,55 @@ impl Interpreter {
             Completion::Throw(value) => Completion::Throw(value),
         }
     }
+}
+
+/// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
+/// ES spec 7.1.6 ToInt32(argument).
+pub(crate) fn f64_to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    // Step 3-5: modulo 2^32, then adjust to signed range.
+    let i = (n.trunc() % 4_294_967_296.0) as i64;
+    let i = if i < 0 { i + 4_294_967_296 } else { i };
+    if i >= 2_147_483_648 {
+        (i - 4_294_967_296) as i32
+    } else {
+        i as i32
+    }
+}
+
+/// ES spec 7.1.7 ToUint32(argument).
+pub(crate) fn f64_to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let i = (n.trunc() % 4_294_967_296.0) as i64;
+    if i < 0 {
+        (i + 4_294_967_296) as u32
+    } else {
+        i as u32
+    }
+}
+
+fn parse_string_to_number(s: &str) -> f64 {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    match trimmed {
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => trimmed.parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+fn canonical_string_exotic_index(property_name: &str) -> Option<usize> {
+    let index = property_name.parse::<u32>().ok()?;
+    if index == u32::MAX || index.to_string() != property_name {
+        return None;
+    }
+    Some(index as usize)
 }
 
 #[cfg(test)]
@@ -3836,7 +4153,7 @@ mod tests {
             Some("entry"),
             layout,
             Bytecode::from(vec![
-                Instruction::load_i32(BytecodeRegister::new(0), 1),
+                Instruction::load_undefined(BytecodeRegister::new(0)),
                 Instruction::get_property(
                     BytecodeRegister::new(1),
                     BytecodeRegister::new(0),
@@ -3865,7 +4182,7 @@ mod tests {
 
         let result = Interpreter::new().execute(&module);
 
-        assert_eq!(result, Err(InterpreterError::InvalidObjectValue));
+        assert!(matches!(result, Err(InterpreterError::TypeError(_))));
     }
 
     #[test]
@@ -5078,46 +5395,5 @@ mod tests {
             result.map(ExecutionResult::return_value),
             Ok(RegisterValue::from_i32(43))
         );
-    }
-}
-
-/// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
-/// ES spec 7.1.6 ToInt32(argument).
-pub(crate) fn f64_to_int32(n: f64) -> i32 {
-    if n.is_nan() || n.is_infinite() || n == 0.0 {
-        return 0;
-    }
-    // Step 3-5: modulo 2^32, then adjust to signed range.
-    let i = (n.trunc() % 4_294_967_296.0) as i64;
-    let i = if i < 0 { i + 4_294_967_296 } else { i };
-    if i >= 2_147_483_648 {
-        (i - 4_294_967_296) as i32
-    } else {
-        i as i32
-    }
-}
-
-/// ES spec 7.1.7 ToUint32(argument).
-pub(crate) fn f64_to_uint32(n: f64) -> u32 {
-    if n.is_nan() || n.is_infinite() || n == 0.0 {
-        return 0;
-    }
-    let i = (n.trunc() % 4_294_967_296.0) as i64;
-    if i < 0 {
-        (i + 4_294_967_296) as u32
-    } else {
-        i as u32
-    }
-}
-
-fn parse_string_to_number(s: &str) -> f64 {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return 0.0;
-    }
-    match trimmed {
-        "Infinity" | "+Infinity" => f64::INFINITY,
-        "-Infinity" => f64::NEG_INFINITY,
-        _ => trimmed.parse::<f64>().unwrap_or(f64::NAN),
     }
 }

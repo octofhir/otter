@@ -44,7 +44,9 @@ impl From<ObjectError> for NativePayloadError {
     fn from(value: ObjectError) -> Self {
         match value {
             ObjectError::InvalidHandle => Self::InvalidObjectHandle,
-            ObjectError::InvalidKind | ObjectError::InvalidIndex => Self::MissingPayload,
+            ObjectError::InvalidKind
+            | ObjectError::InvalidIndex
+            | ObjectError::InvalidArrayLength => Self::MissingPayload,
         }
     }
 }

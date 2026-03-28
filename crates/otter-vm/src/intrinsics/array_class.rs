@@ -98,25 +98,36 @@ fn array_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let array = runtime.alloc_array();
 
-    if let [length] = args
-        && let Some(length) = length.as_i32()
-        && length >= 0
-    {
-        if length > 0 {
+    if let [length] = args {
+        if let Some(length) = length.as_i32() {
+            if length < 0 {
+                return Err(invalid_array_length_error(runtime));
+            }
             runtime
                 .objects_mut()
-                .set_index(
-                    array,
-                    usize::try_from(length - 1).unwrap_or(usize::MAX),
-                    RegisterValue::undefined(),
-                )
+                .set_array_length(array, usize::try_from(length).unwrap_or(usize::MAX))
                 .map_err(|error| {
                     VmNativeCallError::Internal(
                         format!("Array constructor length setup failed: {error:?}").into(),
                     )
                 })?;
+            return Ok(RegisterValue::from_object_handle(array.0));
         }
-        return Ok(RegisterValue::from_object_handle(array.0));
+
+        if let Some(length) = length.as_number() {
+            if !is_valid_array_length(length) {
+                return Err(invalid_array_length_error(runtime));
+            }
+            runtime
+                .objects_mut()
+                .set_array_length(array, length as usize)
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("Array constructor length setup failed: {error:?}").into(),
+                    )
+                })?;
+            return Ok(RegisterValue::from_object_handle(array.0));
+        }
     }
 
     for (index, value) in args.iter().copied().enumerate() {
@@ -199,9 +210,10 @@ fn array_join(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.join requires array receiver".into())
     })?;
-    let elements = runtime.objects().array_elements(receiver).map_err(|e| {
-        VmNativeCallError::Internal(format!("Array.prototype.join: {e:?}").into())
-    })?;
+    let elements = runtime
+        .objects()
+        .array_elements(receiver)
+        .map_err(|e| VmNativeCallError::Internal(format!("Array.prototype.join: {e:?}").into()))?;
 
     let separator = if let Some(sep_arg) = args.first().copied() {
         if sep_arg == RegisterValue::undefined() {
@@ -216,7 +228,7 @@ fn array_join(
     let parts: Vec<String> = elements
         .iter()
         .map(|v| {
-            if *v == RegisterValue::undefined() || *v == RegisterValue::null() {
+            if v.is_hole() || *v == RegisterValue::undefined() || *v == RegisterValue::null() {
                 String::new()
             } else {
                 runtime.js_to_string_infallible(*v).to_string()
@@ -242,7 +254,10 @@ fn array_index_of(
         VmNativeCallError::Internal(format!("Array.prototype.indexOf: {e:?}").into())
     })?;
 
-    let search = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let search = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let from = args
         .get(1)
         .copied()
@@ -255,6 +270,9 @@ fn array_index_of(
     };
 
     for (i, elem) in elements.iter().enumerate().skip(start) {
+        if elem.is_hole() {
+            continue;
+        }
         if *elem == search {
             return Ok(RegisterValue::from_i32(i as i32));
         }
@@ -271,21 +289,44 @@ fn array_concat(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.concat requires array receiver".into())
     })?;
-    let base_elems = runtime.objects().array_elements(receiver).unwrap_or_default();
+    let base_elems = runtime
+        .objects()
+        .array_elements(receiver)
+        .unwrap_or_default();
     let result = runtime.alloc_array();
-    for elem in &base_elems {
-        runtime.objects_mut().push_element(result, *elem).ok();
+    runtime
+        .objects_mut()
+        .set_array_length(result, base_elems.len())
+        .ok();
+    for (index, elem) in base_elems.iter().enumerate() {
+        if elem.is_hole() {
+            continue;
+        }
+        runtime.objects_mut().set_index(result, index, *elem).ok();
     }
+    let mut next_index = base_elems.len();
     for arg in args {
-        if let Some(handle) = arg.as_object_handle().map(ObjectHandle) {
-            if let Ok(elems) = runtime.objects().array_elements(handle) {
-                for elem in &elems {
-                    runtime.objects_mut().push_element(result, *elem).ok();
+        if let Some(handle) = arg.as_object_handle().map(ObjectHandle)
+            && let Ok(elems) = runtime.objects().array_elements(handle)
+        {
+            runtime
+                .objects_mut()
+                .set_array_length(result, next_index.saturating_add(elems.len()))
+                .ok();
+            for (offset, elem) in elems.iter().enumerate() {
+                if elem.is_hole() {
+                    continue;
                 }
-                continue;
+                runtime
+                    .objects_mut()
+                    .set_index(result, next_index.saturating_add(offset), *elem)
+                    .ok();
             }
+            next_index = next_index.saturating_add(elems.len());
+            continue;
         }
         runtime.objects_mut().push_element(result, *arg).ok();
+        next_index = next_index.saturating_add(1);
     }
     Ok(RegisterValue::from_object_handle(result.0))
 }
@@ -299,7 +340,10 @@ fn array_slice(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.slice requires array receiver".into())
     })?;
-    let elements = runtime.objects().array_elements(receiver).unwrap_or_default();
+    let elements = runtime
+        .objects()
+        .array_elements(receiver)
+        .unwrap_or_default();
     let len = elements.len() as i32;
 
     let raw_start = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
@@ -326,8 +370,33 @@ fn array_slice(
     };
 
     let result = runtime.alloc_array();
-    for elem in elements.iter().skip(start).take(end.saturating_sub(start)) {
-        runtime.objects_mut().push_element(result, *elem).ok();
+    let count = end.saturating_sub(start);
+    runtime.objects_mut().set_array_length(result, count).ok();
+    for (offset, elem) in elements.iter().skip(start).take(count).enumerate() {
+        if elem.is_hole() {
+            continue;
+        }
+        runtime.objects_mut().set_index(result, offset, *elem).ok();
     }
     Ok(RegisterValue::from_object_handle(result.0))
+}
+
+fn invalid_array_length_error(runtime: &mut crate::interpreter::RuntimeState) -> VmNativeCallError {
+    let prototype = runtime.intrinsics().range_error_prototype;
+    let handle = runtime.alloc_object_with_prototype(Some(prototype));
+    let message = runtime.alloc_string("Invalid array length");
+    let message_prop = runtime.intern_property_name("message");
+    runtime
+        .objects_mut()
+        .set_property(
+            handle,
+            message_prop,
+            RegisterValue::from_object_handle(message.0),
+        )
+        .ok();
+    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+}
+
+fn is_valid_array_length(length: f64) -> bool {
+    length.is_finite() && length >= 0.0 && length.fract() == 0.0 && length <= (u32::MAX - 1) as f64
 }

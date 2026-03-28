@@ -117,8 +117,7 @@ fn test262_done(
                 && *arg != RegisterValue::null()
                 && arg.as_bool() != Some(false)
             {
-                inner.done_result =
-                    Some(Err(format_register_value(*arg, runtime)));
+                inner.done_result = Some(Err(format_register_value(*arg, runtime)));
                 return;
             }
         }
@@ -415,9 +414,7 @@ fn main() {
         let pb = ProgressBar::new(test_count as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}",
-                )
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
                 .unwrap()
                 .progress_chars("#>-"),
         );

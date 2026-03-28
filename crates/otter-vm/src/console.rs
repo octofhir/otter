@@ -107,7 +107,10 @@ impl CaptureConsoleBackend {
     }
 
     pub fn lines(&self) -> Vec<CapturedLine> {
-        self.output.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn text(&self) -> String {
@@ -119,7 +122,10 @@ impl CaptureConsoleBackend {
     }
 
     pub fn clear(&self) {
-        self.output.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -372,14 +378,32 @@ mod tests {
     #[test]
     fn format_primitives() {
         let runtime = RuntimeState::new();
-        assert_eq!(format_value(RegisterValue::undefined(), &runtime), "undefined");
+        assert_eq!(
+            format_value(RegisterValue::undefined(), &runtime),
+            "undefined"
+        );
         assert_eq!(format_value(RegisterValue::null(), &runtime), "null");
-        assert_eq!(format_value(RegisterValue::from_bool(true), &runtime), "true");
-        assert_eq!(format_value(RegisterValue::from_bool(false), &runtime), "false");
+        assert_eq!(
+            format_value(RegisterValue::from_bool(true), &runtime),
+            "true"
+        );
+        assert_eq!(
+            format_value(RegisterValue::from_bool(false), &runtime),
+            "false"
+        );
         assert_eq!(format_value(RegisterValue::from_i32(42), &runtime), "42");
-        assert_eq!(format_value(RegisterValue::from_number(3.14), &runtime), "3.14");
-        assert_eq!(format_value(RegisterValue::from_number(f64::NAN), &runtime), "NaN");
-        assert_eq!(format_value(RegisterValue::from_number(f64::INFINITY), &runtime), "Infinity");
+        assert_eq!(
+            format_value(RegisterValue::from_number(1.25), &runtime),
+            "1.25"
+        );
+        assert_eq!(
+            format_value(RegisterValue::from_number(f64::NAN), &runtime),
+            "NaN"
+        );
+        assert_eq!(
+            format_value(RegisterValue::from_number(f64::INFINITY), &runtime),
+            "Infinity"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
-use crate::object::{HeapValueKind, ObjectHandle, PropertyAttributes, PropertyValue};
+use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
@@ -92,7 +92,19 @@ fn object_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
-            NativeFunctionDescriptor::method("getOwnPropertyDescriptor", 2, object_get_own_property_descriptor),
+            NativeFunctionDescriptor::method(
+                "getOwnPropertyDescriptor",
+                2,
+                object_get_own_property_descriptor,
+            ),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method(
+                "getOwnPropertyDescriptors",
+                1,
+                object_get_own_property_descriptors,
+            ),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
@@ -100,7 +112,23 @@ fn object_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
-            NativeFunctionDescriptor::method("getOwnPropertyNames", 1, object_get_own_property_names),
+            NativeFunctionDescriptor::method("defineProperties", 2, object_define_properties),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("is", 2, object_is),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("hasOwn", 2, object_has_own),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method(
+                "getOwnPropertyNames",
+                1,
+                object_get_own_property_names,
+            ),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
@@ -120,7 +148,23 @@ fn object_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("isFrozen", 1, object_is_frozen),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("preventExtensions", 1, object_prevent_extensions),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("seal", 1, object_seal),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("isSealed", 1, object_is_sealed),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("isExtensible", 1, object_is_extensible),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
@@ -140,7 +184,11 @@ fn object_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("propertyIsEnumerable", 1, object_property_is_enumerable),
+            NativeFunctionDescriptor::method(
+                "propertyIsEnumerable",
+                1,
+                object_property_is_enumerable,
+            ),
         ))
 }
 
@@ -252,6 +300,38 @@ fn object_create(
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
+fn to_object_for_introspection(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    if value == RegisterValue::undefined() || value == RegisterValue::null() {
+        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+    }
+
+    if let Some(boolean) = value.as_bool() {
+        let object = box_boolean_object(RegisterValue::from_bool(boolean), runtime)?;
+        return Ok(ObjectHandle(
+            object
+                .as_object_handle()
+                .expect("boxed boolean should return an object"),
+        ));
+    }
+
+    if let Some(number) = value.as_number() {
+        let object = box_number_object(RegisterValue::from_number(number), runtime)?;
+        return Ok(ObjectHandle(
+            object
+                .as_object_handle()
+                .expect("boxed number should return an object"),
+        ));
+    }
+
+    value
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Thrown(RegisterValue::undefined()))
+}
+
 fn object_to_string_tag(
     value: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
@@ -309,84 +389,71 @@ fn object_get_own_property_descriptor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args
-        .first()
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
+    let key = args
+        .get(1)
         .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal(
-                "Object.getOwnPropertyDescriptor requires an object".into(),
-            )
-        })?;
-    let key = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+        .unwrap_or_else(RegisterValue::undefined);
     let property = runtime.property_name_from_value(key)?;
 
-    if !runtime.objects().has_own_property(target, property).map_err(|e| {
-        VmNativeCallError::Internal(format!("getOwnPropertyDescriptor: {e:?}").into())
-    })? {
-        return Ok(RegisterValue::undefined());
-    }
-
-    let lookup = runtime.objects().get_property(target, property).map_err(|e| {
-        VmNativeCallError::Internal(format!("getOwnPropertyDescriptor lookup: {e:?}").into())
-    })?;
-
-    let Some(lookup) = lookup else {
+    let Some(descriptor) = runtime
+        .own_property_descriptor(target, property)
+        .map_err(|e| {
+            VmNativeCallError::Internal(format!("getOwnPropertyDescriptor: {e:?}").into())
+        })?
+    else {
         return Ok(RegisterValue::undefined());
     };
 
-    // ES2024 §6.2.6.4 FromPropertyDescriptor — build descriptor object.
-    from_property_descriptor(lookup.value(), runtime)
+    crate::abstract_ops::from_property_descriptor(descriptor, runtime)
 }
 
-/// ES2024 §6.2.6.4 FromPropertyDescriptor(Desc)
-fn from_property_descriptor(
-    pv: PropertyValue,
+// ---------------------------------------------------------------------------
+// ES2024 §20.1.2.9  Object.getOwnPropertyDescriptors(O)
+// ---------------------------------------------------------------------------
+fn object_get_own_property_descriptors(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let desc = runtime.alloc_object_with_prototype(Some(runtime.intrinsics().object_prototype()));
-    let attrs = pv.attributes();
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    match pv {
-        PropertyValue::Data { value, .. } => {
-            let value_key = runtime.intern_property_name("value");
-            runtime.objects_mut().set_property(desc, value_key, value).ok();
+    let keys = runtime.own_property_keys(target).map_err(|e| {
+        VmNativeCallError::Internal(format!("Object.getOwnPropertyDescriptors: {e:?}").into())
+    })?;
+    let result = runtime.alloc_object();
 
-            let writable_key = runtime.intern_property_name("writable");
-            runtime
-                .objects_mut()
-                .set_property(desc, writable_key, RegisterValue::from_bool(attrs.writable()))
-                .ok();
-        }
-        PropertyValue::Accessor { getter, setter, .. } => {
-            let get_key = runtime.intern_property_name("get");
-            let get_val = getter
-                .map(|h| RegisterValue::from_object_handle(h.0))
-                .unwrap_or_else(RegisterValue::undefined);
-            runtime.objects_mut().set_property(desc, get_key, get_val).ok();
-
-            let set_key = runtime.intern_property_name("set");
-            let set_val = setter
-                .map(|h| RegisterValue::from_object_handle(h.0))
-                .unwrap_or_else(RegisterValue::undefined);
-            runtime.objects_mut().set_property(desc, set_key, set_val).ok();
-        }
+    for key in keys {
+        let Some(descriptor) = runtime.own_property_descriptor(target, key).map_err(|e| {
+            VmNativeCallError::Internal(
+                format!("Object.getOwnPropertyDescriptors descriptor: {e:?}").into(),
+            )
+        })?
+        else {
+            continue;
+        };
+        let descriptor_object = crate::abstract_ops::from_property_descriptor(descriptor, runtime)?;
+        runtime
+            .objects_mut()
+            .set_property(result, key, descriptor_object)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("Object.getOwnPropertyDescriptors result store: {e:?}").into(),
+                )
+            })?;
     }
 
-    let enumerable_key = runtime.intern_property_name("enumerable");
-    runtime
-        .objects_mut()
-        .set_property(desc, enumerable_key, RegisterValue::from_bool(attrs.enumerable()))
-        .ok();
-
-    let configurable_key = runtime.intern_property_name("configurable");
-    runtime
-        .objects_mut()
-        .set_property(desc, configurable_key, RegisterValue::from_bool(attrs.configurable()))
-        .ok();
-
-    Ok(RegisterValue::from_object_handle(desc.0))
+    Ok(RegisterValue::from_object_handle(result.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +472,10 @@ fn object_define_property(
         .ok_or_else(|| {
             VmNativeCallError::Internal("Object.defineProperty requires an object".into())
         })?;
-    let key = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let key = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let property = runtime.property_name_from_value(key)?;
     let desc_obj = args
         .get(2)
@@ -413,99 +483,105 @@ fn object_define_property(
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle);
 
-    let desc = to_property_descriptor(desc_obj, runtime)?;
-    runtime.objects_mut().define_own_property(target, property, desc).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.defineProperty: {e:?}").into())
-    })?;
+    let desc = crate::abstract_ops::to_property_descriptor(desc_obj, runtime)?;
+    let property_names = runtime.property_names().clone();
+    let success = runtime
+        .objects_mut()
+        .define_own_property_from_descriptor_with_registry(target, property, desc, &property_names)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.defineProperty: {e:?}").into()))?;
+
+    if !success {
+        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+    }
 
     Ok(RegisterValue::from_object_handle(target.0))
 }
 
-/// ES2024 §6.2.6.5 ToPropertyDescriptor(Obj)
-fn to_property_descriptor(
-    desc_obj: Option<ObjectHandle>,
+// ES2024 §20.1.2.3  Object.defineProperties(O, Properties)
+// ---------------------------------------------------------------------------
+fn object_define_properties(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
-) -> Result<PropertyValue, VmNativeCallError> {
-    let Some(obj) = desc_obj else {
-        return Ok(PropertyValue::data(RegisterValue::undefined()));
-    };
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = args
+        .first()
+        .copied()
+        .and_then(RegisterValue::as_object_handle)
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("Object.defineProperties requires an object".into())
+        })?;
+    let properties_obj = args
+        .get(1)
+        .copied()
+        .and_then(RegisterValue::as_object_handle)
+        .map(ObjectHandle);
 
-    // Check for accessor descriptor (get/set present).
-    let get_key = runtime.intern_property_name("get");
-    let getter = runtime
-        .objects()
-        .get_property(obj, get_key)
-        .ok()
-        .flatten()
-        .and_then(|l| match l.value() {
-            PropertyValue::Data { value, .. } if value != RegisterValue::undefined() => {
-                value.as_object_handle().map(ObjectHandle)
-            }
-            _ => None,
-        });
-
-    let set_key = runtime.intern_property_name("set");
-    let setter = runtime
-        .objects()
-        .get_property(obj, set_key)
-        .ok()
-        .flatten()
-        .and_then(|l| match l.value() {
-            PropertyValue::Data { value, .. } if value != RegisterValue::undefined() => {
-                value.as_object_handle().map(ObjectHandle)
-            }
-            _ => None,
-        });
-
-    let enumerable = read_bool_attr(obj, "enumerable", true, runtime);
-    let configurable = read_bool_attr(obj, "configurable", true, runtime);
-
-    if getter.is_some() || setter.is_some() {
-        return Ok(PropertyValue::Accessor {
-            getter,
-            setter,
-            attributes: PropertyAttributes::from_flags(false, enumerable, configurable),
-        });
+    let descriptors = crate::abstract_ops::collect_define_properties(properties_obj, runtime)?;
+    let property_names = runtime.property_names().clone();
+    for (property, descriptor) in descriptors {
+        let success = runtime
+            .objects_mut()
+            .define_own_property_from_descriptor_with_registry(
+                target,
+                property,
+                descriptor,
+                &property_names,
+            )
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.defineProperties: {e:?}").into())
+            })?;
+        if !success {
+            return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+        }
     }
 
-    // Data descriptor.
-    let value_key = runtime.intern_property_name("value");
-    let value = runtime
-        .objects()
-        .get_property(obj, value_key)
-        .ok()
-        .flatten()
-        .map(|l| match l.value() {
-            PropertyValue::Data { value, .. } => value,
-            _ => RegisterValue::undefined(),
-        })
-        .unwrap_or_else(RegisterValue::undefined);
-
-    let writable = read_bool_attr(obj, "writable", true, runtime);
-
-    Ok(PropertyValue::Data {
-        value,
-        attributes: PropertyAttributes::from_flags(writable, enumerable, configurable),
-    })
+    Ok(RegisterValue::from_object_handle(target.0))
 }
 
-fn read_bool_attr(
-    obj: ObjectHandle,
-    name: &str,
-    default: bool,
+/// ES2024 §20.1.2.14 Object.is(value1, value2)
+fn object_is(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
-) -> bool {
-    let key = runtime.intern_property_name(name);
-    runtime
+) -> Result<RegisterValue, VmNativeCallError> {
+    let lhs = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let rhs = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let same = runtime
         .objects()
-        .get_property(obj, key)
-        .ok()
-        .flatten()
-        .map(|l| match l.value() {
-            PropertyValue::Data { value, .. } => value.is_truthy(),
-            _ => default,
-        })
-        .unwrap_or(default)
+        .same_value(lhs, rhs)
+        .map_err(|error| VmNativeCallError::Internal(format!("Object.is: {error:?}").into()))?;
+    Ok(RegisterValue::from_bool(same))
+}
+
+fn object_has_own(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
+    let property = runtime.property_name_from_value(
+        args.get(1)
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+    )?;
+    let has = runtime
+        .own_property_descriptor(target, property)
+        .map_err(|error| VmNativeCallError::Internal(format!("Object.hasOwn: {error:?}").into()))?
+        .is_some();
+    Ok(RegisterValue::from_bool(has))
 }
 
 // ---------------------------------------------------------------------------
@@ -516,27 +592,35 @@ fn object_keys(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args
-        .first()
-        .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Internal("Object.keys requires an object".into()))?;
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    let keys = runtime.objects().own_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.keys: {e:?}").into())
-    })?;
+    let keys = runtime
+        .own_property_keys(target)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.keys: {e:?}").into()))?;
 
-    // Filter by enumerable.
     let array = runtime.alloc_array();
     for key_id in &keys {
-        // Check if property is enumerable.
-        if let Ok(Some(lookup)) = runtime.objects().get_property(target, *key_id) {
-            if !lookup.value().attributes().enumerable() {
-                continue;
-            }
+        let Some(descriptor) = runtime
+            .own_property_descriptor(target, *key_id)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.keys descriptor: {e:?}").into())
+            })?
+        else {
+            continue;
+        };
+        if !descriptor.attributes().enumerable() {
+            continue;
         }
-        let name = runtime.property_names().get(*key_id).unwrap_or("").to_string();
+        let name = runtime
+            .property_names()
+            .get(*key_id)
+            .unwrap_or("")
+            .to_string();
         let str_handle = runtime.alloc_string(name);
         runtime
             .objects_mut()
@@ -555,29 +639,35 @@ fn object_values(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args
-        .first()
-        .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Internal("Object.values requires an object".into()))?;
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    let keys = runtime.objects().own_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.values: {e:?}").into())
-    })?;
+    let keys = runtime
+        .own_property_keys(target)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.values: {e:?}").into()))?;
 
     let array = runtime.alloc_array();
     for key_id in &keys {
-        if let Ok(Some(lookup)) = runtime.objects().get_property(target, *key_id) {
-            if !lookup.value().attributes().enumerable() {
-                continue;
-            }
-            let value = match lookup.value() {
-                PropertyValue::Data { value, .. } => value,
-                _ => RegisterValue::undefined(),
-            };
-            runtime.objects_mut().push_element(array, value).ok();
+        let Some(descriptor) = runtime
+            .own_property_descriptor(target, *key_id)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.values descriptor: {e:?}").into())
+            })?
+        else {
+            continue;
+        };
+        if !descriptor.attributes().enumerable() {
+            continue;
         }
+        let value = match descriptor {
+            PropertyValue::Data { value, .. } => value,
+            PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+        };
+        runtime.objects_mut().push_element(array, value).ok();
     }
 
     Ok(RegisterValue::from_object_handle(array.0))
@@ -591,40 +681,50 @@ fn object_entries(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args
-        .first()
-        .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Internal("Object.entries requires an object".into()))?;
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    let keys = runtime.objects().own_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.entries: {e:?}").into())
-    })?;
+    let keys = runtime
+        .own_property_keys(target)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.entries: {e:?}").into()))?;
 
     let result = runtime.alloc_array();
     for key_id in &keys {
-        if let Ok(Some(lookup)) = runtime.objects().get_property(target, *key_id) {
-            if !lookup.value().attributes().enumerable() {
-                continue;
-            }
-            let value = match lookup.value() {
-                PropertyValue::Data { value, .. } => value,
-                _ => RegisterValue::undefined(),
-            };
-            let name = runtime.property_names().get(*key_id).unwrap_or("").to_string();
-            let key_str = runtime.alloc_string(name);
-            let pair = runtime.alloc_array();
-            runtime
-                .objects_mut()
-                .push_element(pair, RegisterValue::from_object_handle(key_str.0))
-                .ok();
-            runtime.objects_mut().push_element(pair, value).ok();
-            runtime
-                .objects_mut()
-                .push_element(result, RegisterValue::from_object_handle(pair.0))
-                .ok();
+        let Some(descriptor) = runtime
+            .own_property_descriptor(target, *key_id)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.entries descriptor: {e:?}").into())
+            })?
+        else {
+            continue;
+        };
+        if !descriptor.attributes().enumerable() {
+            continue;
         }
+        let value = match descriptor {
+            PropertyValue::Data { value, .. } => value,
+            PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+        };
+        let name = runtime
+            .property_names()
+            .get(*key_id)
+            .unwrap_or("")
+            .to_string();
+        let key_str = runtime.alloc_string(name);
+        let pair = runtime.alloc_array();
+        runtime
+            .objects_mut()
+            .push_element(pair, RegisterValue::from_object_handle(key_str.0))
+            .ok();
+        runtime.objects_mut().push_element(pair, value).ok();
+        runtime
+            .objects_mut()
+            .push_element(result, RegisterValue::from_object_handle(pair.0))
+            .ok();
     }
 
     Ok(RegisterValue::from_object_handle(result.0))
@@ -638,14 +738,18 @@ fn object_freeze(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     // Non-object arguments are returned as-is per spec.
     let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
         return Ok(target);
     };
-    runtime.objects_mut().freeze(handle).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.freeze: {e:?}").into())
-    })?;
+    runtime
+        .objects_mut()
+        .freeze(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.freeze: {e:?}").into()))?;
     Ok(target)
 }
 
@@ -657,14 +761,108 @@ fn object_seal(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
         return Ok(target);
     };
-    runtime.objects_mut().seal(handle).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.seal: {e:?}").into())
-    })?;
+    runtime
+        .objects_mut()
+        .seal(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.seal: {e:?}").into()))?;
     Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 §20.1.2.17 Object.preventExtensions(O)
+// ---------------------------------------------------------------------------
+fn object_prevent_extensions(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+        return Ok(target);
+    };
+    runtime
+        .objects_mut()
+        .prevent_extensions(handle)
+        .map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.preventExtensions: {e:?}").into())
+        })?;
+    Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 §20.1.2.15 Object.isExtensible(O)
+// ---------------------------------------------------------------------------
+fn object_is_extensible(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+    let extensible = runtime
+        .objects()
+        .is_extensible(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.isExtensible: {e:?}").into()))?;
+    Ok(RegisterValue::from_bool(extensible))
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 §20.1.2.x Object.isFrozen(O)
+// ---------------------------------------------------------------------------
+fn object_is_frozen(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+        return Ok(RegisterValue::from_bool(true));
+    };
+    let frozen = runtime
+        .objects()
+        .is_frozen(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.isFrozen: {e:?}").into()))?;
+    Ok(RegisterValue::from_bool(frozen))
+}
+
+// ---------------------------------------------------------------------------
+// ES2024 §20.1.2.x Object.isSealed(O)
+// ---------------------------------------------------------------------------
+fn object_is_sealed(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+        return Ok(RegisterValue::from_bool(true));
+    };
+    let sealed = runtime
+        .objects()
+        .is_sealed(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.isSealed: {e:?}").into()))?;
+    Ok(RegisterValue::from_bool(sealed))
 }
 
 // ---------------------------------------------------------------------------
@@ -683,9 +881,10 @@ fn object_get_prototype_of(
         .ok_or_else(|| {
             VmNativeCallError::Internal("Object.getPrototypeOf requires an object".into())
         })?;
-    let proto = runtime.objects().get_prototype(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.getPrototypeOf: {e:?}").into())
-    })?;
+    let proto = runtime
+        .objects()
+        .get_prototype(target)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.getPrototypeOf: {e:?}").into()))?;
     Ok(proto
         .map(|h| RegisterValue::from_object_handle(h.0))
         .unwrap_or_else(RegisterValue::null))
@@ -707,7 +906,10 @@ fn object_set_prototype_of(
         .ok_or_else(|| {
             VmNativeCallError::Internal("Object.setPrototypeOf requires an object".into())
         })?;
-    let proto_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let proto_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let proto = if proto_arg == RegisterValue::null() {
         None
     } else {
@@ -722,9 +924,12 @@ fn object_set_prototype_of(
                 })?,
         )
     };
-    runtime.objects_mut().set_prototype(target, proto).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.setPrototypeOf: {e:?}").into())
-    })?;
+    runtime
+        .objects_mut()
+        .set_prototype(target, proto)
+        .map_err(|e| VmNativeCallError::Internal(format!("Object.setPrototypeOf: {e:?}").into()))?
+        .then_some(())
+        .ok_or_else(|| VmNativeCallError::Thrown(RegisterValue::undefined()))?;
     Ok(RegisterValue::from_object_handle(target.0))
 }
 
@@ -747,18 +952,21 @@ fn object_assign(
         let Some(source) = source_arg.as_object_handle().map(ObjectHandle) else {
             continue; // null/undefined sources are skipped
         };
-        let keys = runtime.objects().own_keys(source).unwrap_or_default();
+        let keys = runtime.own_property_keys(source).unwrap_or_default();
         for key_id in keys {
-            if let Ok(Some(lookup)) = runtime.objects().get_property(source, key_id) {
-                if !lookup.value().attributes().enumerable() {
-                    continue;
-                }
-                let value = match lookup.value() {
-                    PropertyValue::Data { value, .. } => value,
-                    _ => continue,
-                };
-                runtime.objects_mut().set_property(target, key_id, value).ok();
+            let Ok(Some(descriptor)) = runtime.own_property_descriptor(source, key_id) else {
+                continue;
+            };
+            if !descriptor.attributes().enumerable() {
+                continue;
             }
+            let PropertyValue::Data { value, .. } = descriptor else {
+                continue;
+            };
+            runtime
+                .objects_mut()
+                .set_property(target, key_id, value)
+                .ok();
         }
     }
 
@@ -773,16 +981,14 @@ fn object_get_own_property_names(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = args
-        .first()
-        .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Object.getOwnPropertyNames requires an object".into())
-        })?;
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    let keys = runtime.objects().own_keys(target).map_err(|e| {
+    let keys = runtime.own_property_keys(target).map_err(|e| {
         VmNativeCallError::Internal(format!("Object.getOwnPropertyNames: {e:?}").into())
     })?;
 
@@ -812,28 +1018,21 @@ fn object_property_is_enumerable(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("propertyIsEnumerable requires object receiver".into())
-        })?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let target = to_object_for_introspection(*this, runtime)?;
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let property = runtime.property_name_from_value(key)?;
 
-    let has_own = runtime.objects().has_own_property(target, property).unwrap_or(false);
-    if !has_own {
-        return Ok(RegisterValue::from_bool(false));
-    }
-
-    // Check enumerable attribute on own property.
-    if let Ok(Some(lookup)) = runtime.objects().get_property(target, property) {
-        if lookup.owner() == target {
-            return Ok(RegisterValue::from_bool(lookup.value().attributes().enumerable()));
-        }
-    }
-
-    Ok(RegisterValue::from_bool(false))
+    let has_own = runtime
+        .own_property_descriptor(target, property)
+        .map_err(|e| VmNativeCallError::Internal(format!("propertyIsEnumerable: {e:?}").into()))?;
+    Ok(RegisterValue::from_bool(
+        has_own
+            .map(|descriptor| descriptor.attributes().enumerable())
+            .unwrap_or(false),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -844,17 +1043,16 @@ fn object_has_own_property(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("hasOwnProperty requires an object receiver".into())
-        })?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let target = to_object_for_introspection(*this, runtime)?;
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let property = runtime.property_name_from_value(key)?;
-    let has = runtime.objects().has_own_property(target, property).map_err(|e| {
-        VmNativeCallError::Internal(format!("hasOwnProperty: {e:?}").into())
-    })?;
+    let has = runtime
+        .own_property_descriptor(target, property)
+        .map_err(|e| VmNativeCallError::Internal(format!("hasOwnProperty: {e:?}").into()))?
+        .is_some();
     Ok(RegisterValue::from_bool(has))
 }
 

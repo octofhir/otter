@@ -1,5 +1,7 @@
 //! Minimal object heap and inline-cache support for the new VM.
 
+use std::collections::BTreeMap;
+
 use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
 
 use crate::host::HostFunctionId;
@@ -153,6 +155,36 @@ impl IteratorStep {
     #[must_use]
     pub const fn value(self) -> RegisterValue {
         self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IteratorCursor {
+    iterable: ObjectHandle,
+    next_index: usize,
+    closed: bool,
+    is_array: bool,
+}
+
+impl IteratorCursor {
+    #[must_use]
+    pub const fn iterable(self) -> ObjectHandle {
+        self.iterable
+    }
+
+    #[must_use]
+    pub const fn next_index(self) -> usize {
+        self.next_index
+    }
+
+    #[must_use]
+    pub const fn closed(self) -> bool {
+        self.closed
+    }
+
+    #[must_use]
+    pub const fn is_array(self) -> bool {
+        self.is_array
     }
 }
 
@@ -522,6 +554,7 @@ enum HeapValue {
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
         elements: Vec<RegisterValue>,
+        indexed_properties: BTreeMap<usize, PropertyValue>,
         elements_writable: bool,
         elements_configurable: bool,
         length_writable: bool,
@@ -642,12 +675,16 @@ impl Traceable for HeapValue {
                 prototype,
                 values,
                 elements,
+                indexed_properties,
                 ..
             } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
                 }
                 for value in values {
+                    trace_property_value(value, visitor);
+                }
+                for value in indexed_properties.values() {
                     trace_property_value(value, visitor);
                 }
                 for elem in elements {
@@ -771,6 +808,7 @@ impl ObjectHeap {
             keys: Vec::new(),
             values: Vec::new(),
             elements: Vec::new(),
+            indexed_properties: BTreeMap::new(),
             elements_writable: true,
             elements_configurable: true,
             length_writable: true,
@@ -1011,7 +1049,17 @@ impl ObjectHeap {
         index: usize,
     ) -> Result<Option<RegisterValue>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::Array { elements, .. } => {
+            HeapValue::Array {
+                elements,
+                indexed_properties,
+                ..
+            } => {
+                if let Some(property) = indexed_properties.get(&index) {
+                    return Ok(match property {
+                        PropertyValue::Data { value, .. } => Some(*value),
+                        PropertyValue::Accessor { .. } => None,
+                    });
+                }
                 let Some(value) = elements.get(index).copied() else {
                     return Ok(None);
                 };
@@ -1057,18 +1105,37 @@ impl ObjectHeap {
             HeapValue::Array {
                 extensible,
                 elements,
+                indexed_properties,
                 elements_writable,
                 length_writable,
                 ..
             } => {
-                if !*elements_writable {
-                    return Ok(());
-                }
                 if index >= elements.len() {
                     if !*extensible || !*length_writable {
                         return Ok(());
                     }
                     elements.resize(index.saturating_add(1), RegisterValue::hole());
+                }
+
+                if let Some(property) = indexed_properties.get_mut(&index) {
+                    match property {
+                        PropertyValue::Data {
+                            value: slot,
+                            attributes,
+                        } => {
+                            if !attributes.writable() {
+                                return Ok(());
+                            }
+                            *slot = value;
+                            elements[index] = value;
+                            return Ok(());
+                        }
+                        PropertyValue::Accessor { .. } => return Ok(()),
+                    }
+                }
+
+                if !*elements_writable {
+                    return Ok(());
                 }
                 elements[index] = value;
                 Ok(())
@@ -1121,6 +1188,7 @@ impl ObjectHeap {
             HeapValue::Array {
                 extensible,
                 elements,
+                indexed_properties,
                 elements_configurable,
                 length_writable,
                 ..
@@ -1129,7 +1197,23 @@ impl ObjectHeap {
                     if !*elements_configurable {
                         return Ok(false);
                     }
+
+                    let first_non_configurable =
+                        indexed_properties
+                            .range(length..)
+                            .rev()
+                            .find_map(|(&index, property)| {
+                                (!property.attributes().configurable()).then_some(index)
+                            });
+
+                    if let Some(index) = first_non_configurable {
+                        elements.truncate(index.saturating_add(1));
+                        indexed_properties.retain(|&key, _| key <= index);
+                        return Ok(false);
+                    }
+
                     elements.truncate(length);
+                    indexed_properties.retain(|&key, _| key < length);
                     return Ok(true);
                 }
                 if length > elements.len() {
@@ -1230,6 +1314,55 @@ impl ObjectHeap {
         }
 
         Ok(step)
+    }
+
+    pub fn iterator_cursor(&self, handle: ObjectHandle) -> Result<IteratorCursor, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayIterator {
+                iterable,
+                next_index,
+                closed,
+            } => Ok(IteratorCursor {
+                iterable: *iterable,
+                next_index: *next_index,
+                closed: *closed,
+                is_array: true,
+            }),
+            HeapValue::StringIterator {
+                iterable,
+                next_index,
+                closed,
+            } => Ok(IteratorCursor {
+                iterable: *iterable,
+                next_index: *next_index,
+                closed: *closed,
+                is_array: false,
+            }),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    pub fn advance_iterator_cursor(
+        &mut self,
+        handle: ObjectHandle,
+        done: bool,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::ArrayIterator {
+                next_index, closed, ..
+            }
+            | HeapValue::StringIterator {
+                next_index, closed, ..
+            } => {
+                if done {
+                    *closed = true;
+                } else {
+                    *next_index = next_index.saturating_add(1);
+                }
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
     }
 
     /// Closes an internal iterator.
@@ -1735,9 +1868,20 @@ impl ObjectHeap {
             return match self.object_mut(handle)? {
                 HeapValue::Array {
                     elements,
+                    indexed_properties,
                     elements_configurable,
                     ..
                 } => {
+                    if let Some(property) = indexed_properties.get(&index) {
+                        if !property.attributes().configurable() {
+                            return Ok(false);
+                        }
+                        indexed_properties.remove(&index);
+                        if let Some(value) = elements.get_mut(index) {
+                            *value = RegisterValue::hole();
+                        }
+                        return Ok(true);
+                    }
                     let Some(value) = elements.get_mut(index) else {
                         return Ok(true);
                     };
@@ -1903,30 +2047,29 @@ impl ObjectHeap {
         index: usize,
         desc: PropertyDescriptor,
     ) -> Result<bool, ObjectError> {
-        if matches!(desc.kind(), PropertyDescriptorKind::Accessor { .. }) {
-            return Ok(false);
-        }
-
         let existing = match self.object(handle)? {
             HeapValue::Array {
                 elements,
+                indexed_properties,
                 elements_writable,
                 elements_configurable,
                 ..
-            } => elements
-                .get(index)
-                .copied()
-                .filter(|value| !value.is_hole())
-                .map(|value| {
-                    PropertyValue::data_with_attrs(
-                        value,
-                        PropertyAttributes::from_flags(
-                            *elements_writable,
-                            true,
-                            *elements_configurable,
-                        ),
-                    )
-                }),
+            } => indexed_properties.get(&index).copied().or_else(|| {
+                elements
+                    .get(index)
+                    .copied()
+                    .filter(|value| !value.is_hole())
+                    .map(|value| {
+                        PropertyValue::data_with_attrs(
+                            value,
+                            PropertyAttributes::from_flags(
+                                *elements_writable,
+                                true,
+                                *elements_configurable,
+                            ),
+                        )
+                    })
+            }),
             _ => return Err(ObjectError::InvalidKind),
         };
 
@@ -1942,14 +2085,11 @@ impl ObjectHeap {
             self.new_property_from_descriptor(desc)
         };
 
-        let PropertyValue::Data { value, attributes } = next else {
-            return Ok(false);
-        };
-
         let array = self.object_mut(handle)?;
         let HeapValue::Array {
             extensible,
             elements,
+            indexed_properties,
             elements_writable,
             elements_configurable,
             length_writable,
@@ -1959,21 +2099,51 @@ impl ObjectHeap {
             return Err(ObjectError::InvalidKind);
         };
 
-        if !attributes.enumerable()
-            || attributes.writable() != *elements_writable
-            || attributes.configurable() != *elements_configurable
-        {
-            return Ok(false);
-        }
+        match next {
+            PropertyValue::Data { value, attributes } => {
+                if index >= elements.len() {
+                    if !*extensible || !*length_writable {
+                        return Ok(false);
+                    }
+                    elements.resize(index.saturating_add(1), RegisterValue::hole());
+                }
+                elements[index] = value;
 
-        if index >= elements.len() {
-            if !*extensible || !*length_writable {
-                return Ok(false);
+                let default =
+                    array_index_default_attributes(*elements_writable, *elements_configurable);
+                if attributes == default {
+                    indexed_properties.remove(&index);
+                } else {
+                    indexed_properties
+                        .insert(index, PropertyValue::data_with_attrs(value, attributes));
+                }
+                Ok(true)
             }
-            elements.resize(index.saturating_add(1), RegisterValue::hole());
+            PropertyValue::Accessor {
+                getter,
+                setter,
+                attributes,
+            } => {
+                if index >= elements.len() {
+                    if !*extensible || !*length_writable {
+                        return Ok(false);
+                    }
+                    elements.resize(index.saturating_add(1), RegisterValue::hole());
+                } else {
+                    elements[index] = RegisterValue::hole();
+                }
+                indexed_properties.insert(
+                    index,
+                    PropertyValue::Accessor {
+                        getter,
+                        setter,
+                        attributes,
+                    },
+                );
+                let _ = (elements_writable, elements_configurable);
+                Ok(true)
+            }
         }
-        elements[index] = value;
-        Ok(true)
     }
 
     fn define_array_named_property_from_descriptor(
@@ -2145,15 +2315,31 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
-            HeapValue::Array { elements, keys, .. } => {
+            HeapValue::Array {
+                elements,
+                indexed_properties,
+                keys,
+                ..
+            } => {
                 let mut result =
                     Vec::with_capacity(elements.len().saturating_add(keys.len()).saturating_add(1));
                 for (index, value) in elements.iter().enumerate() {
+                    if indexed_properties.contains_key(&index) {
+                        let name = index.to_string();
+                        result.push(property_names.intern(&name));
+                        continue;
+                    }
                     if value.is_hole() {
                         continue;
                     }
                     let name = index.to_string();
                     result.push(property_names.intern(&name));
+                }
+                for &index in indexed_properties.keys() {
+                    if index >= elements.len() {
+                        let name = index.to_string();
+                        result.push(property_names.intern(&name));
+                    }
                 }
                 result.push(property_names.intern("length"));
                 result.extend(keys.iter().copied());
@@ -2284,6 +2470,7 @@ impl ObjectHeap {
             elements_configurable,
             length_writable,
             values,
+            indexed_properties,
             ..
         } = self.object_mut(handle)?
         {
@@ -2291,6 +2478,16 @@ impl ObjectHeap {
             *elements_configurable = false;
             *length_writable = false;
             for value in values {
+                match value {
+                    PropertyValue::Data { attributes, .. } => {
+                        *attributes = attributes.with_writable_false().with_configurable_false();
+                    }
+                    PropertyValue::Accessor { attributes, .. } => {
+                        *attributes = attributes.with_configurable_false();
+                    }
+                }
+            }
+            for value in indexed_properties.values_mut() {
                 match value {
                     PropertyValue::Data { attributes, .. } => {
                         *attributes = attributes.with_writable_false().with_configurable_false();
@@ -2315,11 +2512,20 @@ impl ObjectHeap {
         if let HeapValue::Array {
             elements_configurable,
             values,
+            indexed_properties,
             ..
         } = self.object_mut(handle)?
         {
             *elements_configurable = false;
             for value in values {
+                match value {
+                    PropertyValue::Data { attributes, .. }
+                    | PropertyValue::Accessor { attributes, .. } => {
+                        *attributes = attributes.with_configurable_false();
+                    }
+                }
+            }
+            for value in indexed_properties.values_mut() {
                 match value {
                     PropertyValue::Data { attributes, .. }
                     | PropertyValue::Accessor { attributes, .. } => {
@@ -2350,11 +2556,15 @@ impl ObjectHeap {
             HeapValue::Array {
                 elements_configurable,
                 values,
+                indexed_properties,
                 ..
             } => {
                 return Ok(!elements_configurable
                     && values
                         .iter()
+                        .all(|value| !value.attributes().configurable())
+                    && indexed_properties
+                        .values()
                         .all(|value| !value.attributes().configurable()));
             }
             _ => return Ok(true),
@@ -2381,12 +2591,19 @@ impl ObjectHeap {
                 elements_configurable,
                 length_writable,
                 values,
+                indexed_properties,
                 ..
             } => {
                 return Ok(!elements_configurable
                     && !elements_writable
                     && !length_writable
                     && values.iter().all(|value| match value {
+                        PropertyValue::Data { attributes, .. } => {
+                            !attributes.configurable() && !attributes.writable()
+                        }
+                        PropertyValue::Accessor { attributes, .. } => !attributes.configurable(),
+                    })
+                    && indexed_properties.values().all(|value| match value {
                         PropertyValue::Data { attributes, .. } => {
                             !attributes.configurable() && !attributes.writable()
                         }
@@ -3035,6 +3252,7 @@ impl ObjectHeap {
                 keys,
                 values,
                 elements,
+                indexed_properties,
                 elements_writable,
                 elements_configurable,
                 length_writable,
@@ -3056,6 +3274,9 @@ impl ObjectHeap {
                 }
 
                 if let Some(index) = canonical_array_index(property_name) {
+                    if let Some(value) = indexed_properties.get(&index).copied() {
+                        return Ok(Some((value, PropertyInlineCache::new(ObjectShapeId(0), 0))));
+                    }
                     let Some(value) = elements.get(index).copied() else {
                         return Ok(None);
                     };
@@ -3151,6 +3372,13 @@ fn canonical_array_index(property_name: &str) -> Option<usize> {
         return None;
     }
     Some(index as usize)
+}
+
+fn array_index_default_attributes(
+    elements_writable: bool,
+    elements_configurable: bool,
+) -> PropertyAttributes {
+    PropertyAttributes::from_flags(elements_writable, true, elements_configurable)
 }
 
 fn array_length_from_value(value: RegisterValue) -> Option<usize> {

@@ -163,10 +163,13 @@ fn initialize_string_prototype(
     cx.heap
         .set_prototype(primitive, Some(intrinsics.string_prototype()))?;
     let backing = cx.property_names.intern(STRING_DATA_SLOT);
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         intrinsics.string_prototype(),
         backing,
-        RegisterValue::from_object_handle(primitive.0),
+        crate::object::PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(primitive.0),
+            crate::object::PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
     Ok(())
 }
@@ -179,10 +182,13 @@ fn set_string_data(
     let backing = runtime.intern_property_name(STRING_DATA_SLOT);
     runtime
         .objects_mut()
-        .set_property(
+        .define_own_property(
             receiver,
             backing,
-            RegisterValue::from_object_handle(primitive.0),
+            crate::object::PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(primitive.0),
+                crate::object::PropertyAttributes::from_flags(true, false, true),
+            ),
         )
         .map_err(|error| {
             VmNativeCallError::Internal(

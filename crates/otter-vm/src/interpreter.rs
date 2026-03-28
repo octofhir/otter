@@ -399,6 +399,7 @@ pub struct RuntimeState {
     microtasks: crate::microtask::MicrotaskQueue,
     timers: crate::event_loop::TimerRegistry,
     console_backend: Box<dyn crate::console::ConsoleBackend>,
+    current_module: Option<Module>,
 }
 
 impl RuntimeState {
@@ -428,6 +429,7 @@ impl RuntimeState {
             microtasks: crate::microtask::MicrotaskQueue::new(),
             timers: crate::event_loop::TimerRegistry::new(),
             console_backend: Box::new(crate::console::StdioConsoleBackend),
+            current_module: None,
         }
     }
 
@@ -488,8 +490,32 @@ impl RuntimeState {
         &mut self,
         object: ObjectHandle,
     ) -> Result<Vec<PropertyNameId>, ObjectError> {
-        self.objects
-            .own_keys_with_registry(object, &mut self.property_names)
+        let mut keys = self
+            .objects
+            .own_keys_with_registry(object, &mut self.property_names)?;
+        keys.retain(|key| !self.is_hidden_internal_property(*key));
+
+        let Some(string_handle) = self.string_exotic_value_handle(object)? else {
+            return Ok(keys);
+        };
+        if string_handle == object {
+            return Ok(keys);
+        }
+
+        let Some(string) = self.objects.string_value(string_handle)? else {
+            return Ok(keys);
+        };
+        let length = string.chars().count();
+        let mut result = Vec::with_capacity(length.saturating_add(1).saturating_add(keys.len()));
+        for index in 0..length {
+            result.push(self.property_names.intern(&index.to_string()));
+        }
+        result.push(self.property_names.intern("length"));
+        result.extend(
+            keys.into_iter()
+                .filter(|key| !self.is_string_exotic_public_key(*key, length)),
+        );
+        Ok(result)
     }
 
     /// Returns an own property descriptor without prototype traversal.
@@ -498,11 +524,52 @@ impl RuntimeState {
         object: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyValue>, ObjectError> {
+        if self.is_hidden_internal_property(property) {
+            return Ok(None);
+        }
         if let Some(descriptor) = self.string_exotic_own_property(object, property)? {
             return Ok(Some(descriptor));
         }
         self.objects
             .own_property_descriptor(object, property, &self.property_names)
+    }
+
+    /// Returns enumerable own property keys in spec-visible enumeration order.
+    pub fn enumerable_own_property_keys(
+        &mut self,
+        object: ObjectHandle,
+    ) -> Result<Vec<PropertyNameId>, VmNativeCallError> {
+        let keys = self.own_property_keys(object).map_err(|error| {
+            VmNativeCallError::Internal(format!("enumerable own keys failed: {error:?}").into())
+        })?;
+        let mut enumerable = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(descriptor) = self.own_property_descriptor(object, key).map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("enumerable own descriptor failed: {error:?}").into(),
+                )
+            })?
+            else {
+                continue;
+            };
+            if descriptor.attributes().enumerable() {
+                enumerable.push(key);
+            }
+        }
+        Ok(enumerable)
+    }
+
+    /// Returns one own property value using the object itself as `receiver`.
+    pub fn own_property_value(
+        &mut self,
+        object: ObjectHandle,
+        property: PropertyNameId,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        self.ordinary_get(
+            object,
+            property,
+            RegisterValue::from_object_handle(object.0),
+        )
     }
 
     /// Returns a named property lookup using the runtime-wide property registry.
@@ -511,6 +578,9 @@ impl RuntimeState {
         object: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyLookup>, ObjectError> {
+        if self.is_hidden_internal_property(property) {
+            return Ok(None);
+        }
         if let Some(descriptor) = self.string_exotic_own_property(object, property)? {
             return Ok(Some(PropertyLookup::new(object, descriptor, None)));
         }
@@ -544,12 +614,131 @@ impl RuntimeState {
         }
     }
 
+    pub fn get_array_index_value(
+        &mut self,
+        object: ObjectHandle,
+        index: usize,
+    ) -> Result<Option<RegisterValue>, VmNativeCallError> {
+        let property = self.intern_property_name(&index.to_string());
+        match self.property_lookup(object, property).map_err(|error| {
+            VmNativeCallError::Internal(format!("array index lookup failed: {error:?}").into())
+        })? {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Data { value, .. } => Ok(Some(value)),
+                PropertyValue::Accessor { getter, .. } => self
+                    .call_callable_for_accessor(
+                        getter,
+                        RegisterValue::from_object_handle(object.0),
+                        &[],
+                    )
+                    .map(Some)
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    }),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn iterator_next(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<crate::object::IteratorStep, InterpreterError> {
+        let cursor = self.objects.iterator_cursor(handle)?;
+        if cursor.closed() {
+            return Ok(crate::object::IteratorStep::done());
+        }
+
+        let step = if cursor.is_array() {
+            match self.objects.array_length(cursor.iterable())? {
+                Some(length) if cursor.next_index() < length => {
+                    let value =
+                        match self.get_array_index_value(cursor.iterable(), cursor.next_index()) {
+                            Ok(value) => value,
+                            Err(VmNativeCallError::Thrown(value)) => {
+                                return Err(InterpreterError::UncaughtThrow(value));
+                            }
+                            Err(VmNativeCallError::Internal(message)) => {
+                                return Err(InterpreterError::NativeCall(message));
+                            }
+                        };
+                    match value {
+                        Some(value) => crate::object::IteratorStep::yield_value(value),
+                        None => {
+                            crate::object::IteratorStep::yield_value(RegisterValue::undefined())
+                        }
+                    }
+                }
+                _ => crate::object::IteratorStep::done(),
+            }
+        } else {
+            match self
+                .objects
+                .get_index(cursor.iterable(), cursor.next_index())?
+            {
+                Some(value) => crate::object::IteratorStep::yield_value(value),
+                None => crate::object::IteratorStep::done(),
+            }
+        };
+
+        self.objects
+            .advance_iterator_cursor(handle, step.is_done())?;
+        Ok(step)
+    }
+
+    fn enter_module(&mut self, module: &Module) -> Option<Module> {
+        let previous = self.current_module.clone();
+        self.current_module = Some(module.clone());
+        previous
+    }
+
+    fn restore_module(&mut self, previous: Option<Module>) {
+        self.current_module = previous;
+    }
+
+    fn call_callable_for_accessor(
+        &mut self,
+        callable: Option<ObjectHandle>,
+        receiver: RegisterValue,
+        arguments: &[RegisterValue],
+    ) -> Result<RegisterValue, InterpreterError> {
+        let Some(callable) = callable else {
+            return Ok(RegisterValue::undefined());
+        };
+
+        if let Ok(HeapValueKind::BoundFunction) = self.objects.kind(callable) {
+            let (target, bound_this, bound_args) = self.objects.bound_function_parts(callable)?;
+            let mut full_args = bound_args;
+            full_args.extend_from_slice(arguments);
+            return self.call_callable_for_accessor(Some(target), bound_this, &full_args);
+        }
+
+        let Some(module) = self.current_module.clone() else {
+            return self
+                .call_host_function(Some(callable), receiver, arguments)
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                });
+        };
+
+        Interpreter::call_function(self, &module, callable, receiver, arguments)
+    }
+
     fn string_exotic_own_property(
         &mut self,
         object: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyValue>, ObjectError> {
-        let Some(string) = self.objects.string_value(object)? else {
+        let Some(string_handle) = self.string_exotic_value_handle(object)? else {
+            return Ok(None);
+        };
+        let Some(string) = self.objects.string_value(string_handle)? else {
             return Ok(None);
         };
         let Some(property_name) = self.property_names.get(property) else {
@@ -575,6 +764,50 @@ impl RuntimeState {
             RegisterValue::from_object_handle(character.0),
             PropertyAttributes::from_flags(false, true, false),
         )))
+    }
+
+    fn string_exotic_value_handle(
+        &mut self,
+        object: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        if self.objects.string_value(object)?.is_some() {
+            return Ok(Some(object));
+        }
+
+        let backing = self.intern_property_name(STRING_DATA_SLOT);
+        let Some(lookup) = self.objects.get_property(object, backing)? else {
+            return Ok(None);
+        };
+        if lookup.owner() != object {
+            return Ok(None);
+        }
+        let PropertyValue::Data { value, .. } = lookup.value() else {
+            return Ok(None);
+        };
+        let Some(inner) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(None);
+        };
+        if self.objects.string_value(inner)?.is_some() {
+            return Ok(Some(inner));
+        }
+        Ok(None)
+    }
+
+    fn is_hidden_internal_property(&self, property: PropertyNameId) -> bool {
+        matches!(
+            self.property_names.get(property),
+            Some(STRING_DATA_SLOT | NUMBER_DATA_SLOT | BOOLEAN_DATA_SLOT)
+        )
+    }
+
+    fn is_string_exotic_public_key(&self, property: PropertyNameId, length: usize) -> bool {
+        let Some(name) = self.property_names.get(property) else {
+            return false;
+        };
+        if name == "length" {
+            return true;
+        }
+        canonical_string_exotic_index(name).is_some_and(|index| index < length)
     }
 
     /// Returns the runtime-wide native host-function registry.
@@ -752,6 +985,33 @@ impl RuntimeState {
         self.objects
             .array_elements(handle)
             .map_err(|e| VmNativeCallError::Internal(format!("array_to_args failed: {e:?}").into()))
+    }
+
+    pub fn list_from_array_like(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<RegisterValue>, VmNativeCallError> {
+        let length_key = self.intern_property_name("length");
+        let receiver = RegisterValue::from_object_handle(handle.0);
+        let length_value = self.ordinary_get(handle, length_key, receiver)?;
+        let length = usize::try_from(self.js_to_uint32(length_value).map_err(
+            |error| match error {
+                InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                InterpreterError::NativeCall(message) | InterpreterError::TypeError(message) => {
+                    VmNativeCallError::Internal(message)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            },
+        )?)
+        .unwrap_or(usize::MAX);
+
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            let property = self.intern_property_name(&index.to_string());
+            let value = self.ordinary_get(handle, property, receiver)?;
+            values.push(value);
+        }
+        Ok(values)
     }
 
     /// Allocates one string object with the runtime default prototype.
@@ -960,9 +1220,16 @@ impl RuntimeState {
         })? {
             Some(lookup) => match lookup.value() {
                 PropertyValue::Data { value, .. } => Ok(value),
-                PropertyValue::Accessor { getter, .. } => {
-                    self.call_host_function(getter, receiver, &[])
-                }
+                PropertyValue::Accessor { getter, .. } => self
+                    .call_callable_for_accessor(getter, receiver, &[])
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    }),
             },
             None => Ok(RegisterValue::undefined()),
         }
@@ -980,7 +1247,7 @@ impl RuntimeState {
             VmNativeCallError::Internal(format!("ordinary set failed: {error:?}").into())
         })? {
             Some(lookup) => match lookup.value() {
-                PropertyValue::Data { .. } => {
+                PropertyValue::Data { attributes, .. } => {
                     let Some(receiver_handle) =
                         self.non_string_object_handle(receiver).map_err(|error| {
                             VmNativeCallError::Internal(
@@ -991,45 +1258,54 @@ impl RuntimeState {
                         return Ok(false);
                     };
 
+                    if !attributes.writable() {
+                        return Ok(false);
+                    }
+
                     if lookup.owner() == receiver_handle {
-                        let cache = lookup.cache().ok_or_else(|| {
-                            VmNativeCallError::Internal(
-                                "receiver own-property lookup must carry cache metadata".into(),
-                            )
-                        })?;
-                        let updated = self
-                            .objects
-                            .set_cached(receiver_handle, property, value, cache)
-                            .map_err(|error| {
-                                VmNativeCallError::Internal(
-                                    format!("ordinary set receiver update failed: {error:?}")
-                                        .into(),
-                                )
-                            })?;
-                        if !updated {
-                            self.objects
-                                .set_property(receiver_handle, property, value)
+                        if let Some(cache) = lookup.cache() {
+                            let updated = self
+                                .objects
+                                .set_cached(receiver_handle, property, value, cache)
                                 .map_err(|error| {
                                     VmNativeCallError::Internal(
-                                        format!("ordinary set receiver fallback failed: {error:?}")
+                                        format!("ordinary set receiver update failed: {error:?}")
                                             .into(),
                                     )
                                 })?;
+                            if !updated {
+                                self.objects
+                                    .set_property(receiver_handle, property, value)
+                                    .map_err(|error| {
+                                        VmNativeCallError::Internal(
+                                            format!(
+                                                "ordinary set receiver fallback failed: {error:?}"
+                                            )
+                                            .into(),
+                                        )
+                                    })?;
+                            }
+                            return Ok(true);
                         }
-                        return Ok(true);
+
+                        return self.ordinary_set_on_receiver(receiver_handle, property, value);
                     }
 
-                    self.objects
-                        .set_property(receiver_handle, property, value)
-                        .map_err(|error| {
-                            VmNativeCallError::Internal(
-                                format!("ordinary set receiver define failed: {error:?}").into(),
-                            )
-                        })?;
-                    Ok(true)
+                    self.ordinary_set_on_receiver(receiver_handle, property, value)
                 }
                 PropertyValue::Accessor { setter, .. } => {
-                    let _ = self.call_host_function(setter, receiver, &[value])?;
+                    let _ = self
+                        .call_callable_for_accessor(setter, receiver, &[value])
+                        .map_err(|error| match error {
+                            InterpreterError::UncaughtThrow(value) => {
+                                VmNativeCallError::Thrown(value)
+                            }
+                            InterpreterError::NativeCall(message)
+                            | InterpreterError::TypeError(message) => {
+                                VmNativeCallError::Internal(message)
+                            }
+                            other => VmNativeCallError::Internal(format!("{other}").into()),
+                        })?;
                     Ok(setter.is_some())
                 }
             },
@@ -1043,15 +1319,105 @@ impl RuntimeState {
                 else {
                     return Ok(false);
                 };
-                self.objects
-                    .set_property(receiver_handle, property, value)
+                self.ordinary_set_on_receiver(receiver_handle, property, value)
+            }
+        }
+    }
+
+    fn ordinary_set_on_receiver(
+        &mut self,
+        receiver_handle: ObjectHandle,
+        property: PropertyNameId,
+        value: RegisterValue,
+    ) -> Result<bool, VmNativeCallError> {
+        match self
+            .own_property_descriptor(receiver_handle, property)
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("ordinary set receiver own-descriptor failed: {error:?}").into(),
+                )
+            })? {
+            Some(PropertyValue::Data { attributes, .. }) => {
+                if !attributes.writable() {
+                    return Ok(false);
+                }
+                self.set_named_property(receiver_handle, property, value)
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    })?;
+                self.receiver_data_property_matches(receiver_handle, property, value)
+            }
+            Some(PropertyValue::Accessor { setter, .. }) => {
+                let _ = self
+                    .call_callable_for_accessor(
+                        setter,
+                        RegisterValue::from_object_handle(receiver_handle.0),
+                        &[value],
+                    )
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    })?;
+                Ok(setter.is_some())
+            }
+            None => {
+                if !self
+                    .objects
+                    .is_extensible(receiver_handle)
                     .map_err(|error| {
                         VmNativeCallError::Internal(
-                            format!("ordinary set receiver create failed: {error:?}").into(),
+                            format!("ordinary set receiver extensible check failed: {error:?}")
+                                .into(),
                         )
+                    })?
+                {
+                    return Ok(false);
+                }
+                self.set_named_property(receiver_handle, property, value)
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
                     })?;
-                Ok(true)
+                self.receiver_data_property_matches(receiver_handle, property, value)
             }
+        }
+    }
+
+    fn receiver_data_property_matches(
+        &mut self,
+        receiver_handle: ObjectHandle,
+        property: PropertyNameId,
+        expected: RegisterValue,
+    ) -> Result<bool, VmNativeCallError> {
+        let descriptor = self
+            .own_property_descriptor(receiver_handle, property)
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("ordinary set receiver verification failed: {error:?}").into(),
+                )
+            })?;
+        match descriptor {
+            Some(PropertyValue::Data { value, .. }) => {
+                self.objects.same_value(value, expected).map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("ordinary set receiver SameValue failed: {error:?}").into(),
+                    )
+                })
+            }
+            _ => Ok(false),
         }
     }
 
@@ -1100,6 +1466,148 @@ impl RuntimeState {
             Ok(value) => Ok(value),
             Err(VmNativeCallError::Thrown(value)) => Err(VmNativeCallError::Thrown(value)),
             Err(VmNativeCallError::Internal(message)) => Err(VmNativeCallError::Internal(message)),
+        }
+    }
+
+    pub fn call_callable(
+        &mut self,
+        callable: ObjectHandle,
+        receiver: RegisterValue,
+        arguments: &[RegisterValue],
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        self.call_callable_for_accessor(Some(callable), receiver, arguments)
+            .map_err(|error| match error {
+                InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                InterpreterError::NativeCall(message) | InterpreterError::TypeError(message) => {
+                    VmNativeCallError::Internal(message)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            })
+    }
+
+    pub fn construct_callable(
+        &mut self,
+        target: ObjectHandle,
+        arguments: &[RegisterValue],
+        new_target: ObjectHandle,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let kind = self.objects.kind(target).map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("construct target kind lookup failed: {error:?}").into(),
+            )
+        })?;
+        let completion = match kind {
+            HeapValueKind::HostFunction => {
+                let host_function = self
+                    .objects
+                    .host_function(target)
+                    .map_err(|error| {
+                        VmNativeCallError::Internal(
+                            format!("construct host function lookup failed: {error:?}").into(),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        VmNativeCallError::Internal(
+                            "construct target host function is missing".into(),
+                        )
+                    })?;
+                if !Interpreter::is_host_function_constructible(self, host_function)
+                    .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
+                {
+                    return Err(VmNativeCallError::Internal(
+                        "construct target is not constructible".into(),
+                    ));
+                }
+                let default_receiver = RegisterValue::from_object_handle(
+                    Interpreter::allocate_construct_receiver(self, new_target)
+                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
+                        .0,
+                );
+                let completion = Interpreter::invoke_registered_host_function(
+                    self,
+                    host_function,
+                    default_receiver,
+                    arguments,
+                )
+                .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?;
+                Interpreter::apply_construct_return_override(completion, default_receiver)
+            }
+            HeapValueKind::Closure => {
+                let Some(module) = self.current_module.clone() else {
+                    return Err(VmNativeCallError::Internal(
+                        "closure construction requires active module context".into(),
+                    ));
+                };
+                let callee_index = self.objects.closure_callee(target).map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("construct closure callee lookup failed: {error:?}").into(),
+                    )
+                })?;
+                let callee_function = module.function(callee_index).ok_or_else(|| {
+                    VmNativeCallError::Internal("construct closure callee is missing".into())
+                })?;
+                let register_count = callee_function.frame_layout().register_count();
+                let default_receiver = RegisterValue::from_object_handle(
+                    Interpreter::allocate_construct_receiver(self, new_target)
+                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
+                        .0,
+                );
+                let mut activation = Activation::with_context(
+                    callee_index,
+                    register_count,
+                    FrameMetadata::new(
+                        arguments.len() as RegisterIndex,
+                        FrameFlags::new(true, true, false),
+                    ),
+                    Some(target),
+                );
+
+                if callee_function.frame_layout().receiver_slot().is_some() {
+                    activation
+                        .set_receiver(callee_function, default_receiver)
+                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?;
+                }
+
+                let param_count = callee_function.frame_layout().parameter_count();
+                for (index, &argument) in arguments.iter().take(param_count as usize).enumerate() {
+                    let register = callee_function
+                        .frame_layout()
+                        .resolve_user_visible(index as u16)
+                        .ok_or_else(|| {
+                            VmNativeCallError::Internal(
+                                "construct argument register resolution failed".into(),
+                            )
+                        })?;
+                    activation
+                        .set_register(register, argument)
+                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?;
+                }
+                if arguments.len() > param_count as usize {
+                    activation.overflow_args = arguments[param_count as usize..].to_vec();
+                }
+
+                let completion = Interpreter::new()
+                    .run_completion_with_runtime(&module, &mut activation, self)
+                    .map_err(|error| match error {
+                        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::NativeCall(message)
+                        | InterpreterError::TypeError(message) => {
+                            VmNativeCallError::Internal(message)
+                        }
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    })?;
+                Interpreter::apply_construct_return_override(completion, default_receiver)
+            }
+            _ => {
+                return Err(VmNativeCallError::Internal(
+                    "construct target is not callable".into(),
+                ));
+            }
+        };
+
+        match completion {
+            Completion::Return(value) => Ok(value),
+            Completion::Throw(value) => Err(VmNativeCallError::Thrown(value)),
         }
     }
 
@@ -1535,6 +2043,20 @@ impl RuntimeState {
         Ok(handle)
     }
 
+    /// Allocate a TypeError object with the correct prototype chain.
+    pub fn alloc_type_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
+        let prototype = self.intrinsics.type_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let msg_handle = self.objects.alloc_string(message);
+        let msg_prop = self.intern_property_name("message");
+        self.objects.set_property(
+            handle,
+            msg_prop,
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
+        Ok(handle)
+    }
+
     /// Checks whether a value is a string type (heap string or string wrapper).
     fn value_is_string(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
@@ -1946,21 +2468,33 @@ impl Interpreter {
         activation: &mut Activation,
         runtime: &mut RuntimeState,
     ) -> Result<Completion, InterpreterError> {
+        let previous_module = runtime.enter_module(module);
         let function = module
             .function(activation.function_index())
             .expect("activation function index must be valid");
         let mut frame_runtime = FrameRuntimeState::new(function);
 
         loop {
-            match self.step(function, module, activation, runtime, &mut frame_runtime)? {
+            let outcome = match self.step(function, module, activation, runtime, &mut frame_runtime)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    runtime.restore_module(previous_module);
+                    return Err(error);
+                }
+            };
+
+            match outcome {
                 StepOutcome::Continue => {}
                 StepOutcome::Return(return_value) => {
+                    runtime.restore_module(previous_module);
                     return Ok(Completion::Return(return_value));
                 }
                 StepOutcome::Throw(value) => {
                     if self.transfer_exception(function, activation, value) {
                         continue;
                     }
+                    runtime.restore_module(previous_module);
                     return Ok(Completion::Throw(value));
                 }
                 StepOutcome::Suspend { .. } => {
@@ -1968,6 +2502,7 @@ impl Interpreter {
                     // For now, async functions are not fully wired — treat as
                     // returning undefined (the result_promise will be settled
                     // when the event loop integrates suspend/resume).
+                    runtime.restore_module(previous_module);
                     return Ok(Completion::Return(RegisterValue::undefined()));
                 }
             }
@@ -2665,10 +3200,17 @@ impl Interpreter {
 
                 match runtime.objects.kind(handle)? {
                     HeapValueKind::Array => {
-                        let property_name = runtime.property_names().get(property).unwrap_or("");
-                        if let Some(index) = canonical_string_exotic_index(property_name) {
-                            runtime.objects.set_index(handle, index, value)?;
-                        } else {
+                        let handled = Self::generic_set_property(
+                            function,
+                            runtime,
+                            frame_runtime,
+                            pc,
+                            handle,
+                            property,
+                            value,
+                        )?;
+
+                        if !handled {
                             runtime.set_named_property(handle, property, value)?;
                         }
                     }
@@ -2706,7 +3248,7 @@ impl Interpreter {
             }
             Opcode::IteratorNext => {
                 let iterator = Self::read_object_handle(activation, function, instruction.c())?;
-                let step = runtime.objects.iterator_next(iterator)?;
+                let step = runtime.iterator_next(iterator)?;
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -3445,19 +3987,11 @@ impl Interpreter {
         receiver_handle: ObjectHandle,
         getter: Option<ObjectHandle>,
     ) -> Result<RegisterValue, InterpreterError> {
-        let Some(getter) = getter else {
-            return Ok(RegisterValue::undefined());
-        };
-
-        match Self::invoke_host_function_handle(
-            runtime,
+        runtime.call_callable_for_accessor(
             getter,
             RegisterValue::from_object_handle(receiver_handle.0),
             &[],
-        )? {
-            Completion::Return(value) => Ok(value),
-            Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
-        }
+        )
     }
 
     fn invoke_accessor_setter(
@@ -3466,19 +4000,12 @@ impl Interpreter {
         setter: Option<ObjectHandle>,
         value: RegisterValue,
     ) -> Result<(), InterpreterError> {
-        let Some(setter) = setter else {
-            return Ok(());
-        };
-
-        match Self::invoke_host_function_handle(
-            runtime,
+        let _ = runtime.call_callable_for_accessor(
             setter,
             RegisterValue::from_object_handle(receiver_handle.0),
             &[value],
-        )? {
-            Completion::Return(_) => Ok(()),
-            Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
-        }
+        )?;
+        Ok(())
     }
 
     fn invoke_host_function_handle(

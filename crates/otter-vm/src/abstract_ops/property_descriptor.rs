@@ -1,8 +1,20 @@
 use crate::descriptors::VmNativeCallError;
 use crate::interpreter::RuntimeState;
-use crate::object::{ObjectHandle, PropertyDescriptor, PropertyValue};
+use crate::object::{HeapValueKind, ObjectHandle, PropertyDescriptor, PropertyValue};
 use crate::property::PropertyNameId;
 use crate::value::RegisterValue;
+
+fn type_error(
+    runtime: &mut RuntimeState,
+    message: &str,
+) -> Result<VmNativeCallError, VmNativeCallError> {
+    let error = runtime.alloc_type_error(message).map_err(|error| {
+        VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+    })?;
+    Ok(VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error.0),
+    ))
+}
 
 /// ES2024 §6.2.6.4 FromPropertyDescriptor(Desc)
 pub(crate) fn from_property_descriptor(
@@ -64,8 +76,17 @@ pub(crate) fn to_property_descriptor(
     runtime: &mut RuntimeState,
 ) -> Result<PropertyDescriptor, VmNativeCallError> {
     let Some(obj) = desc_obj else {
-        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+        return Err(type_error(
+            runtime,
+            "property descriptor must be an object",
+        )?);
     };
+    if matches!(runtime.objects().kind(obj), Ok(HeapValueKind::String)) {
+        return Err(type_error(
+            runtime,
+            "property descriptor must be an object",
+        )?);
+    }
 
     let value = get_descriptor_data_field(runtime, obj, "value")?;
     let writable = get_descriptor_bool_field(runtime, obj, "writable", false)?;
@@ -79,9 +100,10 @@ pub(crate) fn to_property_descriptor(
     let is_data_descriptor = value.is_some() || has_own_descriptor_field(runtime, obj, "writable")?;
 
     if is_accessor_descriptor && is_data_descriptor {
-        return Err(VmNativeCallError::Internal(
-            "ToPropertyDescriptor cannot mix accessor and data fields".into(),
-        ));
+        return Err(type_error(
+            runtime,
+            "property descriptor cannot mix accessor and data fields",
+        )?);
     }
 
     if is_accessor_descriptor {
@@ -109,43 +131,20 @@ pub(crate) fn to_property_descriptor(
 }
 
 pub(crate) fn collect_define_properties(
-    properties_obj: Option<ObjectHandle>,
+    properties: ObjectHandle,
     runtime: &mut RuntimeState,
 ) -> Result<Vec<(PropertyNameId, PropertyDescriptor)>, VmNativeCallError> {
-    let Some(properties) = properties_obj else {
-        return Err(VmNativeCallError::Internal(
-            "Object.defineProperties requires an object descriptor map".into(),
-        ));
-    };
-
-    let keys = runtime.own_property_keys(properties).map_err(|error| {
-        VmNativeCallError::Internal(
-            format!("defineProperties key collection failed: {error:?}").into(),
-        )
-    })?;
+    let keys = runtime
+        .enumerable_own_property_keys(properties)
+        .map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("defineProperties key collection failed: {error}").into(),
+            )
+        })?;
 
     let mut descriptors = Vec::new();
     for key in keys {
-        let Some(property_desc) =
-            runtime
-                .own_property_descriptor(properties, key)
-                .map_err(|error| {
-                    VmNativeCallError::Internal(
-                        format!("defineProperties key descriptor failed: {error:?}").into(),
-                    )
-                })?
-        else {
-            continue;
-        };
-        if !property_desc.attributes().enumerable() {
-            continue;
-        }
-
-        let descriptor_value = runtime.ordinary_get(
-            properties,
-            key,
-            RegisterValue::from_object_handle(properties.0),
-        )?;
+        let descriptor_value = runtime.own_property_value(properties, key)?;
         let descriptor_object = descriptor_value.as_object_handle().map(ObjectHandle);
         let descriptor = to_property_descriptor(descriptor_object, runtime)?;
         descriptors.push((key, descriptor));
@@ -239,15 +238,19 @@ fn get_descriptor_callable_field(
     }
 
     let handle = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal(
-            format!("descriptor field '{name}' must be callable or undefined").into(),
+        type_error(
+            runtime,
+            &format!("descriptor field '{name}' must be callable or undefined"),
         )
+        .unwrap_or_else(|error| error)
     })?;
 
     if !runtime.objects().is_callable(handle) {
-        return Err(VmNativeCallError::Internal(
-            format!("descriptor field '{name}' must be callable or undefined").into(),
-        ));
+        return Err(type_error(
+            runtime,
+            &format!("descriptor field '{name}' must be callable or undefined"),
+        )
+        .unwrap_or_else(|error| error));
     }
 
     Ok((present, Some(handle)))

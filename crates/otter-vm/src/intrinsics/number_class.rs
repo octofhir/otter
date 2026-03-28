@@ -156,10 +156,13 @@ fn initialize_number_prototype(
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
     let backing = cx.property_names.intern(NUMBER_DATA_SLOT);
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         intrinsics.number_prototype(),
         backing,
-        RegisterValue::from_i32(0),
+        crate::object::PropertyValue::data_with_attrs(
+            RegisterValue::from_i32(0),
+            crate::object::PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
     Ok(())
 }
@@ -518,7 +521,14 @@ fn set_number_data(
     let backing = runtime.intern_property_name(NUMBER_DATA_SLOT);
     runtime
         .objects_mut()
-        .set_property(receiver, backing, primitive)
+        .define_own_property(
+            receiver,
+            backing,
+            crate::object::PropertyValue::data_with_attrs(
+                primitive,
+                crate::object::PropertyAttributes::from_flags(true, false, true),
+            ),
+        )
         .map_err(|error| {
             VmNativeCallError::Internal(
                 format!("Number constructor backing store failed: {error:?}").into(),

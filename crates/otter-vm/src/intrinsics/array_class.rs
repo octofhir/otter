@@ -210,10 +210,7 @@ fn array_join(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.join requires array receiver".into())
     })?;
-    let elements = runtime
-        .objects()
-        .array_elements(receiver)
-        .map_err(|e| VmNativeCallError::Internal(format!("Array.prototype.join: {e:?}").into()))?;
+    let length = array_length(receiver, runtime, "Array.prototype.join")?;
 
     let separator = if let Some(sep_arg) = args.first().copied() {
         if sep_arg == RegisterValue::undefined() {
@@ -225,16 +222,20 @@ fn array_join(
         ",".to_string()
     };
 
-    let parts: Vec<String> = elements
-        .iter()
-        .map(|v| {
-            if v.is_hole() || *v == RegisterValue::undefined() || *v == RegisterValue::null() {
+    let mut parts = Vec::with_capacity(length);
+    for index in 0..length {
+        let value = array_index_value(receiver, index, runtime, "Array.prototype.join")?;
+        let part = match value {
+            None => String::new(),
+            Some(value)
+                if value == RegisterValue::undefined() || value == RegisterValue::null() =>
+            {
                 String::new()
-            } else {
-                runtime.js_to_string_infallible(*v).to_string()
             }
-        })
-        .collect();
+            Some(value) => runtime.js_to_string_infallible(value).to_string(),
+        };
+        parts.push(part);
+    }
 
     let result = parts.join(&separator);
     let handle = runtime.alloc_string(result);
@@ -250,9 +251,7 @@ fn array_index_of(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.indexOf requires array receiver".into())
     })?;
-    let elements = runtime.objects().array_elements(receiver).map_err(|e| {
-        VmNativeCallError::Internal(format!("Array.prototype.indexOf: {e:?}").into())
-    })?;
+    let length = array_length(receiver, runtime, "Array.prototype.indexOf")?;
 
     let search = args
         .first()
@@ -264,17 +263,18 @@ fn array_index_of(
         .and_then(RegisterValue::as_i32)
         .unwrap_or(0);
     let start = if from < 0 {
-        (elements.len() as i32 + from).max(0) as usize
+        (length as i32 + from).max(0) as usize
     } else {
         from as usize
     };
 
-    for (i, elem) in elements.iter().enumerate().skip(start) {
-        if elem.is_hole() {
+    for index in start..length {
+        let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.indexOf")?
+        else {
             continue;
-        }
-        if *elem == search {
-            return Ok(RegisterValue::from_i32(i as i32));
+        };
+        if elem == search {
+            return Ok(RegisterValue::from_i32(index as i32));
         }
     }
     Ok(RegisterValue::from_i32(-1))
@@ -289,40 +289,38 @@ fn array_concat(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.concat requires array receiver".into())
     })?;
-    let base_elems = runtime
-        .objects()
-        .array_elements(receiver)
-        .unwrap_or_default();
+    let base_len = array_length(receiver, runtime, "Array.prototype.concat")?;
     let result = runtime.alloc_array();
     runtime
         .objects_mut()
-        .set_array_length(result, base_elems.len())
+        .set_array_length(result, base_len)
         .ok();
-    for (index, elem) in base_elems.iter().enumerate() {
-        if elem.is_hole() {
-            continue;
+    for index in 0..base_len {
+        if let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.concat")? {
+            runtime.objects_mut().set_index(result, index, elem).ok();
         }
-        runtime.objects_mut().set_index(result, index, *elem).ok();
     }
-    let mut next_index = base_elems.len();
+    let mut next_index = base_len;
     for arg in args {
         if let Some(handle) = arg.as_object_handle().map(ObjectHandle)
-            && let Ok(elems) = runtime.objects().array_elements(handle)
+            && matches!(runtime.objects().kind(handle), Ok(HeapValueKind::Array))
         {
+            let arg_len = array_length(handle, runtime, "Array.prototype.concat")?;
             runtime
                 .objects_mut()
-                .set_array_length(result, next_index.saturating_add(elems.len()))
+                .set_array_length(result, next_index.saturating_add(arg_len))
                 .ok();
-            for (offset, elem) in elems.iter().enumerate() {
-                if elem.is_hole() {
-                    continue;
+            for offset in 0..arg_len {
+                if let Some(elem) =
+                    array_index_value(handle, offset, runtime, "Array.prototype.concat")?
+                {
+                    runtime
+                        .objects_mut()
+                        .set_index(result, next_index.saturating_add(offset), elem)
+                        .ok();
                 }
-                runtime
-                    .objects_mut()
-                    .set_index(result, next_index.saturating_add(offset), *elem)
-                    .ok();
             }
-            next_index = next_index.saturating_add(elems.len());
+            next_index = next_index.saturating_add(arg_len);
             continue;
         }
         runtime.objects_mut().push_element(result, *arg).ok();
@@ -340,11 +338,7 @@ fn array_slice(
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array.prototype.slice requires array receiver".into())
     })?;
-    let elements = runtime
-        .objects()
-        .array_elements(receiver)
-        .unwrap_or_default();
-    let len = elements.len() as i32;
+    let len = array_length(receiver, runtime, "Array.prototype.slice")? as i32;
 
     let raw_start = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
     let start = if raw_start < 0 {
@@ -372,13 +366,33 @@ fn array_slice(
     let result = runtime.alloc_array();
     let count = end.saturating_sub(start);
     runtime.objects_mut().set_array_length(result, count).ok();
-    for (offset, elem) in elements.iter().skip(start).take(count).enumerate() {
-        if elem.is_hole() {
-            continue;
+    for (offset, index) in (start..end).enumerate() {
+        if let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.slice")? {
+            runtime.objects_mut().set_index(result, offset, elem).ok();
         }
-        runtime.objects_mut().set_index(result, offset, *elem).ok();
     }
     Ok(RegisterValue::from_object_handle(result.0))
+}
+
+fn array_length(
+    receiver: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+    op: &str,
+) -> Result<usize, VmNativeCallError> {
+    runtime
+        .objects()
+        .array_length(receiver)
+        .map_err(|error| VmNativeCallError::Internal(format!("{op}: {error:?}").into()))?
+        .ok_or_else(|| VmNativeCallError::Internal(format!("{op} requires array receiver").into()))
+}
+
+fn array_index_value(
+    receiver: ObjectHandle,
+    index: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+    _op: &str,
+) -> Result<Option<RegisterValue>, VmNativeCallError> {
+    runtime.get_array_index_value(receiver, index)
 }
 
 fn invalid_array_length_error(runtime: &mut crate::interpreter::RuntimeState) -> VmNativeCallError {

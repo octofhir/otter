@@ -59,6 +59,18 @@ fn to_property_key(
     crate::abstract_ops::to_property_key(runtime, value)
 }
 
+fn type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<VmNativeCallError, VmNativeCallError> {
+    let error = runtime.alloc_type_error(message).map_err(|error| {
+        VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+    })?;
+    Ok(VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error.0),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Installer
 // ---------------------------------------------------------------------------
@@ -149,20 +161,30 @@ fn reflect_apply(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
 
-    // Extract arguments from argumentsList (arg 2).
-    let call_args = if let Some(args_list) = args.get(2).copied()
-        && let Some(handle) = args_list.as_object_handle().map(ObjectHandle)
-    {
-        runtime.array_to_args(handle)?
-    } else {
-        Vec::new()
-    };
-
-    // Call via host function bridge (works for host functions; closures need interpreter).
     let target_handle = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Reflect.apply target must be callable".into())
+        type_error(runtime, "Reflect.apply target must be callable").unwrap_or_else(|error| error)
     })?;
-    runtime.call_host_function(Some(target_handle), this_arg, &call_args)
+    if !runtime.objects().is_callable(target_handle) {
+        return Err(type_error(
+            runtime,
+            "Reflect.apply target must be callable",
+        )?);
+    }
+
+    let args_list = args
+        .get(2)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let args_handle = args_list
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            type_error(runtime, "Reflect.apply argumentsList must be an object")
+                .unwrap_or_else(|error| error)
+        })?;
+    let call_args = runtime.list_from_array_like(args_handle)?;
+
+    runtime.call_callable(target_handle, this_arg, &call_args)
 }
 
 // ---------------------------------------------------------------------------
@@ -173,12 +195,50 @@ fn reflect_construct(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let _target = require_object(args, 0, runtime, "Reflect.construct")?;
-    // Full construct requires interpreter-level call_function_construct.
-    // For now, return a useful error instead of crashing.
-    Err(VmNativeCallError::Internal(
-        "Reflect.construct not yet fully implemented (requires interpreter call bridge)".into(),
-    ))
+    let target = args
+        .first()
+        .copied()
+        .ok_or_else(|| VmNativeCallError::Internal("Reflect.construct requires target".into()))?;
+    let target_handle = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(runtime, "Reflect.construct target must be a constructor")
+            .unwrap_or_else(|error| error)
+    })?;
+    if !runtime.is_constructible(target_handle) {
+        return Err(type_error(
+            runtime,
+            "Reflect.construct target must be a constructor",
+        )?);
+    }
+
+    let arguments_list = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let arguments_handle = arguments_list
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            type_error(runtime, "Reflect.construct argumentsList must be an object")
+                .unwrap_or_else(|error| error)
+        })?;
+    let call_args = runtime.list_from_array_like(arguments_handle)?;
+
+    let new_target = args.get(2).copied().unwrap_or(target);
+    let new_target_handle = new_target
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            type_error(runtime, "Reflect.construct newTarget must be a constructor")
+                .unwrap_or_else(|error| error)
+        })?;
+    if !runtime.is_constructible(new_target_handle) {
+        return Err(type_error(
+            runtime,
+            "Reflect.construct newTarget must be a constructor",
+        )?);
+    }
+
+    runtime.construct_callable(target_handle, &call_args, new_target_handle)
 }
 
 // ---------------------------------------------------------------------------

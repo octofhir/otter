@@ -4,7 +4,7 @@ use core::fmt;
 
 use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
-use crate::closure::{ClosureTable, ClosureTemplate, UpvalueId};
+use crate::closure::{CaptureDescriptor, ClosureTable, ClosureTemplate, UpvalueId};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
 use crate::float::FloatTable;
 use crate::frame::{FrameFlags, FrameLayout};
@@ -479,7 +479,10 @@ fn closure_case() -> SmokeCase {
                 FloatTable::default(),
                 ClosureTable::new(vec![
                     None,
-                    Some(ClosureTemplate::new(FunctionIndex(1), 1)),
+                    Some(ClosureTemplate::new(
+                        FunctionIndex(1),
+                        [CaptureDescriptor::Register(BytecodeRegister::new(0))],
+                    )),
                     None,
                     None,
                     None,

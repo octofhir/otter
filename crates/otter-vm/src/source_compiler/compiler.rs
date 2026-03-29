@@ -1,5 +1,6 @@
 use super::ast::{
-    ParamInfo, collect_function_declarations, collect_var_names, extract_function_params,
+    ParamInfo, collect_binding_identifier_names, collect_function_declarations, collect_var_names,
+    expected_function_length, extract_function_params, identifier_name_for_parameter_pattern,
     is_test262_failure_throw,
 };
 use super::module_compiler::{FunctionIdentity, ModuleCompiler};
@@ -42,24 +43,59 @@ impl<'a> FunctionCompiler<'a> {
             loop_stack: Vec::new(),
             pending_loop_label: None,
             arguments_local: None,
+            rest_local: None,
+            parameter_binding_registers: Vec::new(),
+            parameter_tdz_active: false,
             _marker: std::marker::PhantomData,
         }
     }
 
+    fn declare_parameter_pattern_bindings(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+    ) -> Result<(), SourceLoweringError> {
+        let mut names = Vec::new();
+        collect_binding_identifier_names(pattern, &mut names);
+        for name in names {
+            let register = self.allocate_local()?;
+            self.env.bindings.insert(name, Binding::Register(register));
+            self.parameter_binding_registers.push(register);
+        }
+        Ok(())
+    }
+
     pub(super) fn declare_parameters(
         &mut self,
-        params: &[&str],
+        params: &[ParamInfo<'_>],
     ) -> Result<(), SourceLoweringError> {
-        for name in params {
+        for param in params {
+            if param.is_rest {
+                let register = self.allocate_local()?;
+                if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                    self.env
+                        .bindings
+                        .insert(name.to_string(), Binding::Register(register));
+                    self.parameter_binding_registers.push(register);
+                } else {
+                    self.declare_parameter_pattern_bindings(param.pattern)?;
+                }
+                self.rest_local = Some(register);
+                continue;
+            }
             let register = BytecodeRegister::new(self.parameter_count);
             self.parameter_count = self
                 .parameter_count
                 .checked_add(1)
                 .ok_or(SourceLoweringError::TooManyLocals)?;
             self.next_local = self.parameter_count;
-            self.env
-                .bindings
-                .insert((*name).to_string(), Binding::Register(register));
+            if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                self.env
+                    .bindings
+                    .insert(name.to_string(), Binding::Register(register));
+                self.parameter_binding_registers.push(register);
+            } else {
+                self.declare_parameter_pattern_bindings(param.pattern)?;
+            }
         }
         Ok(())
     }
@@ -74,41 +110,110 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    /// Emits default-parameter initialization for parameters that have defaults.
-    pub(super) fn compile_default_params(
+    /// Emits default-parameter and destructuring initialization left-to-right.
+    pub(super) fn compile_parameter_initialization(
         &mut self,
         params: &[ParamInfo<'_>],
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
+        let mut incoming_param_registers = Vec::new();
+        let mut parameter_index: RegisterIndex = 0;
         for param in params {
-            let Some(default_expr) = param.default else {
+            if param.is_rest {
                 continue;
-            };
-            // Resolve the binding for this param (it was declared via declare_parameters).
-            let register = match self.resolve_binding(param.name)? {
-                Binding::Register(r) => r,
-                _ => continue,
-            };
-            // if (param === undefined) param = default;
-            let param_val = ValueLocation::local(register);
-            let undef = self.load_undefined()?;
-            let cmp = ValueLocation::temp(self.alloc_temp());
-            self.instructions.push(Instruction::eq(
-                cmp.register,
-                param_val.register,
-                undef.register,
-            ));
-            self.release(undef);
-            let jump_skip = self.emit_conditional_placeholder(Opcode::JumpIfFalse, cmp.register);
-            self.release(cmp);
-            let default_val = self.compile_expression(default_expr, module)?;
-            if default_val.register != register {
-                self.instructions
-                    .push(Instruction::move_(register, default_val.register));
-                self.release(default_val);
             }
-            self.patch_jump(jump_skip, self.instructions.len())?;
+            let incoming = self.allocate_local()?;
+            self.instructions.push(Instruction::move_(
+                incoming,
+                BytecodeRegister::new(parameter_index),
+            ));
+            incoming_param_registers.push(incoming);
+            parameter_index = parameter_index
+                .checked_add(1)
+                .ok_or(SourceLoweringError::TooManyLocals)?;
         }
+        self.parameter_tdz_active = true;
+        for &register in &self.parameter_binding_registers {
+            self.instructions.push(Instruction::load_hole(register));
+        }
+
+        let mut incoming_index = 0usize;
+        let mut target_param_index: RegisterIndex = 0;
+        for param in params {
+            if param.is_rest {
+                let register = self.rest_local.ok_or_else(|| {
+                    SourceLoweringError::Unsupported(
+                        "rest parameter local was not allocated".to_string(),
+                    )
+                })?;
+                self.instructions
+                    .push(Instruction::create_rest_parameters(register));
+                if !matches!(param.pattern, BindingPattern::BindingIdentifier(_)) {
+                    self.compile_binding_pattern_target(
+                        param.pattern,
+                        ValueLocation::local(register),
+                        false,
+                        module,
+                    )?;
+                }
+                continue;
+            }
+            let incoming = *incoming_param_registers
+                .get(incoming_index)
+                .ok_or_else(|| {
+                    SourceLoweringError::Unsupported("missing incoming parameter".to_string())
+                })?;
+            incoming_index += 1;
+
+            let register = BytecodeRegister::new(target_param_index);
+            target_param_index = target_param_index
+                .checked_add(1)
+                .ok_or(SourceLoweringError::TooManyLocals)?;
+
+            let source = ValueLocation::local(incoming);
+            if let Some(default_expr) = param.default {
+                let undef = self.load_undefined()?;
+                let cmp = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::eq(
+                    cmp.register,
+                    source.register,
+                    undef.register,
+                ));
+                self.release(undef);
+                let use_actual_jump =
+                    self.emit_conditional_placeholder(Opcode::JumpIfFalse, cmp.register);
+                self.release(cmp);
+
+                let default_val = self.compile_expression_with_inferred_name(
+                    default_expr,
+                    identifier_name_for_parameter_pattern(param.pattern),
+                    module,
+                )?;
+                if default_val.register != register {
+                    self.instructions
+                        .push(Instruction::move_(register, default_val.register));
+                    self.release(default_val);
+                }
+                let done_jump = self.emit_jump_placeholder();
+                self.patch_jump(use_actual_jump, self.instructions.len())?;
+                self.instructions
+                    .push(Instruction::move_(register, source.register));
+                self.patch_jump(done_jump, self.instructions.len())?;
+            } else {
+                self.instructions
+                    .push(Instruction::move_(register, source.register));
+            }
+
+            if !matches!(param.pattern, BindingPattern::BindingIdentifier(_)) {
+                self.compile_binding_pattern_target(
+                    param.pattern,
+                    ValueLocation::local(register),
+                    false,
+                    module,
+                )?;
+            }
+        }
+        self.parameter_tdz_active = false;
         Ok(())
     }
 
@@ -151,6 +256,7 @@ impl<'a> FunctionCompiler<'a> {
                 FunctionIdentity {
                     debug_name: Some(name.name.to_string()),
                     self_binding_name: Some(name.name.to_string()),
+                    length: expected_function_length(&params),
                 },
                 function
                     .body
@@ -189,6 +295,7 @@ impl<'a> FunctionCompiler<'a> {
     pub(super) fn finish(
         self,
         _function_index: FunctionIndex,
+        length: u16,
         name: Option<&str>,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let frame_layout = FrameLayout::new(
@@ -214,8 +321,9 @@ impl<'a> FunctionCompiler<'a> {
         );
 
         Ok(CompiledFunction {
-            function: VmFunction::new(
+            function: VmFunction::new_with_length(
                 name,
+                length,
                 frame_layout,
                 Bytecode::from(self.instructions),
                 tables,
@@ -404,7 +512,11 @@ impl<'a> FunctionCompiler<'a> {
                     let register =
                         self.declare_variable_binding(identifier.name.as_str(), is_var)?;
                     if let Some(init) = &declarator.init {
-                        let value = self.compile_expression(init, module)?;
+                        let value = self.compile_expression_with_inferred_name(
+                            init,
+                            Some(identifier.name.as_str()),
+                            module,
+                        )?;
                         self.assign_binding(identifier.name.as_str(), register, value)?;
                     }
                 }
@@ -528,6 +640,11 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(register))
     }
 
+    pub(super) fn emit_assert_not_hole(&mut self, register: BytecodeRegister) {
+        self.instructions
+            .push(Instruction::assert_not_hole(register));
+    }
+
     pub(super) fn load_null(&mut self) -> Result<ValueLocation, SourceLoweringError> {
         let register = self.alloc_temp();
         self.instructions.push(Instruction::load_null(register));
@@ -575,41 +692,15 @@ impl<'a> FunctionCompiler<'a> {
             explicit_captures.to_vec()
         };
 
-        let capture_count = RegisterIndex::try_from(captures.len())
-            .map_err(|_| SourceLoweringError::TooManyLocals)?;
-        let capture_start = if capture_count == 0 {
-            BytecodeRegister::new(self.next_local + self.next_temp)
-        } else {
-            self.reserve_temp_window(capture_count)?
-        };
-
-        for (offset, capture) in captures.iter().enumerate() {
-            let register = BytecodeRegister::new(capture_start.index() + offset as u16);
-            match capture {
-                CaptureSource::Register(source) => {
-                    if *source != register {
-                        self.instructions
-                            .push(Instruction::move_(register, *source));
-                    }
-                }
-                CaptureSource::Upvalue(upvalue) => {
-                    self.instructions
-                        .push(Instruction::get_upvalue(register, *upvalue));
-                }
-            }
-        }
-
         let pc = self.instructions.len();
-        self.instructions
-            .push(Instruction::new_closure(destination, capture_start));
+        self.instructions.push(Instruction::new_closure(
+            destination,
+            BytecodeRegister::new(0),
+        ));
         self.record_closure_template(
             pc,
-            ClosureTemplate::with_flags(callee, capture_count, closure_flags),
+            ClosureTemplate::with_flags(callee, captures, closure_flags),
         );
-
-        if capture_count != 0 {
-            self.release_temp_window(capture_count);
-        }
 
         Ok(())
     }
@@ -831,6 +922,19 @@ impl<'a> FunctionCompiler<'a> {
         self.instructions
             .push(Instruction::move_(register, value.register));
         ValueLocation::temp(register)
+    }
+
+    pub(super) fn stabilize_binding_value(
+        &mut self,
+        value: ValueLocation,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let register = self.allocate_local()?;
+        if value.register != register {
+            self.instructions
+                .push(Instruction::move_(register, value.register));
+        }
+        self.release(value);
+        Ok(ValueLocation::local(register))
     }
 
     pub(super) fn emit_iterator_closes_for_active_loops(&mut self) {

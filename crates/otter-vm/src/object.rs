@@ -306,6 +306,13 @@ impl PropertyAttributes {
         Self(ATTR_WRITABLE | ATTR_CONFIGURABLE)
     }
 
+    /// Constructor function `.prototype` property (§10.2.6 MakeConstructor step 6).
+    /// { [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: false }
+    #[must_use]
+    pub const fn function_prototype() -> Self {
+        Self(ATTR_WRITABLE)
+    }
+
     /// Non-writable, non-enumerable, non-configurable (§21.3.1 Math value properties).
     /// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
     #[must_use]
@@ -583,6 +590,11 @@ enum HeapValue {
     },
     /// ES2024 §10.4.1 Bound Function Exotic Objects.
     BoundFunction {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
         target: ObjectHandle,
         bound_this: RegisterValue,
         bound_args: Vec<RegisterValue>,
@@ -697,10 +709,19 @@ impl Traceable for HeapValue {
                 }
             }
             HeapValue::BoundFunction {
+                prototype,
+                values,
                 target,
                 bound_this,
                 bound_args,
+                ..
             } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for value in values {
+                    trace_property_value(value, visitor);
+                }
                 trace_handle(*target, visitor);
                 trace_register_value(*bound_this, visitor);
                 for arg in bound_args {
@@ -919,12 +940,12 @@ impl ObjectHeap {
             | HeapValue::Array { prototype, .. }
             | HeapValue::String { prototype, .. }
             | HeapValue::Closure { prototype, .. }
-            | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
+            | HeapValue::HostFunction { prototype, .. }
+            | HeapValue::BoundFunction { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -983,6 +1004,9 @@ impl ObjectHeap {
             }
             | HeapValue::HostFunction {
                 prototype: slot, ..
+            }
+            | HeapValue::BoundFunction {
+                prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
@@ -991,7 +1015,6 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }
@@ -1006,11 +1029,11 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
@@ -1632,6 +1655,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::BoundFunction {
+                shape_id,
+                keys,
+                values,
+                ..
             } => (shape_id, keys, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -1749,6 +1778,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::BoundFunction {
+                shape_id,
+                keys,
+                values,
+                ..
             } => (shape_id, keys, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -1778,7 +1813,8 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::HostFunction { .. } => {
+            | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. } => {
                 self.set_named_property_storage(handle, property, value)
             }
             _ => Err(ObjectError::InvalidKind),
@@ -1822,7 +1858,8 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::HostFunction { .. } => self.delete_ordinary_property(handle, property),
+            | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. } => self.delete_ordinary_property(handle, property),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -1838,7 +1875,8 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::HostFunction { .. } => self.delete_ordinary_property(handle, property),
+            | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. } => self.delete_ordinary_property(handle, property),
             HeapValue::Array { .. } => self.delete_array_property(handle, property, property_names),
             _ => Err(ObjectError::InvalidKind),
         }
@@ -1927,7 +1965,8 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::HostFunction { .. } => {
+            | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
             _ => Err(ObjectError::InvalidKind),
@@ -1946,7 +1985,8 @@ impl ObjectHeap {
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
-            | HeapValue::HostFunction { .. } => {
+            | HeapValue::HostFunction { .. }
+            | HeapValue::BoundFunction { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
             HeapValue::Array { .. } => self.define_array_own_property_from_descriptor(
@@ -2212,13 +2252,13 @@ impl ObjectHeap {
             HeapValue::NativeObject { keys, .. } => property_slot(keys, property),
             HeapValue::Closure { keys, .. } => property_slot(keys, property),
             HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
@@ -2233,6 +2273,9 @@ impl ObjectHeap {
                     shape_id, values, ..
                 }
                 | HeapValue::HostFunction {
+                    shape_id, values, ..
+                }
+                | HeapValue::BoundFunction {
                     shape_id, values, ..
                 } => (shape_id, values),
                 _ => return Err(ObjectError::InvalidKind),
@@ -2263,6 +2306,12 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::BoundFunction {
                 shape_id: object_shape_id,
                 keys,
                 values,
@@ -2298,7 +2347,8 @@ impl ObjectHeap {
             HeapValue::Object { keys, .. }
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
-            | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
+            | HeapValue::HostFunction { keys, .. }
+            | HeapValue::BoundFunction { keys, .. } => Ok(keys.clone()),
             HeapValue::Array { keys, .. } => Ok(keys.clone()),
             _ => Ok(Vec::new()),
         }
@@ -2314,7 +2364,8 @@ impl ObjectHeap {
             HeapValue::Object { keys, .. }
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
-            | HeapValue::HostFunction { keys, .. } => Ok(keys.clone()),
+            | HeapValue::HostFunction { keys, .. }
+            | HeapValue::BoundFunction { keys, .. } => Ok(keys.clone()),
             HeapValue::Array {
                 elements,
                 indexed_properties,
@@ -2383,6 +2434,7 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
+            | HeapValue::BoundFunction { keys, .. }
             | HeapValue::Array { keys, .. } => Ok(property_slot(keys, property).is_some()),
             _ => Ok(false),
         }
@@ -2394,13 +2446,20 @@ impl ObjectHeap {
         target: ObjectHandle,
         bound_this: RegisterValue,
         bound_args: Vec<RegisterValue>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
+        let prototype = self.get_prototype(target)?;
+        let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::BoundFunction {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
             target,
             bound_this,
             bound_args,
         });
-        ObjectHandle(h.0)
+        Ok(ObjectHandle(h.0))
     }
 
     /// Returns the (target, bound_this, bound_args) for a bound function.
@@ -2413,6 +2472,7 @@ impl ObjectHeap {
                 target,
                 bound_this,
                 bound_args,
+                ..
             } => Ok((*target, *bound_this, bound_args.clone())),
             _ => Err(ObjectError::InvalidKind),
         }
@@ -2441,7 +2501,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { extensible, .. }
             | HeapValue::Array { extensible, .. }
             | HeapValue::Closure { extensible, .. }
-            | HeapValue::HostFunction { extensible, .. } => Ok(*extensible),
+            | HeapValue::HostFunction { extensible, .. }
+            | HeapValue::BoundFunction { extensible, .. } => Ok(*extensible),
             // Strings, iterators, promises, upvalue cells are not extensible objects.
             _ => Ok(false),
         }
@@ -2454,7 +2515,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { extensible, .. }
             | HeapValue::Array { extensible, .. }
             | HeapValue::Closure { extensible, .. }
-            | HeapValue::HostFunction { extensible, .. } => {
+            | HeapValue::HostFunction { extensible, .. }
+            | HeapValue::BoundFunction { extensible, .. } => {
                 *extensible = false;
                 Ok(true)
             }
@@ -2552,7 +2614,8 @@ impl ObjectHeap {
             HeapValue::Object { values, .. }
             | HeapValue::NativeObject { values, .. }
             | HeapValue::Closure { values, .. }
-            | HeapValue::HostFunction { values, .. } => values,
+            | HeapValue::HostFunction { values, .. }
+            | HeapValue::BoundFunction { values, .. } => values,
             HeapValue::Array {
                 elements_configurable,
                 values,
@@ -2585,7 +2648,8 @@ impl ObjectHeap {
             HeapValue::Object { values, .. }
             | HeapValue::NativeObject { values, .. }
             | HeapValue::Closure { values, .. }
-            | HeapValue::HostFunction { values, .. } => values,
+            | HeapValue::HostFunction { values, .. }
+            | HeapValue::BoundFunction { values, .. } => values,
             HeapValue::Array {
                 elements_writable,
                 elements_configurable,
@@ -2631,7 +2695,8 @@ impl ObjectHeap {
             HeapValue::Object { keys, values, .. }
             | HeapValue::NativeObject { keys, values, .. }
             | HeapValue::Closure { keys, values, .. }
-            | HeapValue::HostFunction { keys, values, .. } => (keys, values),
+            | HeapValue::HostFunction { keys, values, .. }
+            | HeapValue::BoundFunction { keys, values, .. } => (keys, values),
             _ => return Ok(()),
         };
         if let Some(slot) = property_slot(keys, property).map(usize::from) {
@@ -2657,7 +2722,8 @@ impl ObjectHeap {
             HeapValue::Object { keys, values, .. }
             | HeapValue::NativeObject { keys, values, .. }
             | HeapValue::Closure { keys, values, .. }
-            | HeapValue::HostFunction { keys, values, .. } => (keys, values),
+            | HeapValue::HostFunction { keys, values, .. }
+            | HeapValue::BoundFunction { keys, values, .. } => (keys, values),
             _ => return Ok(()),
         };
         if let Some(slot) = property_slot(keys, property).map(usize::from) {
@@ -2881,13 +2947,13 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
+            | HeapValue::BoundFunction { keys, .. }
             | HeapValue::Array { keys, .. } => property_slot(keys, property),
             HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
@@ -2904,6 +2970,9 @@ impl ObjectHeap {
                     shape_id, values, ..
                 }
                 | HeapValue::HostFunction {
+                    shape_id, values, ..
+                }
+                | HeapValue::BoundFunction {
                     shape_id, values, ..
                 }
                 | HeapValue::Array {
@@ -2932,6 +3001,7 @@ impl ObjectHeap {
                 | HeapValue::NativeObject { shape_id, .. }
                 | HeapValue::Closure { shape_id, .. }
                 | HeapValue::HostFunction { shape_id, .. }
+                | HeapValue::BoundFunction { shape_id, .. }
                 | HeapValue::Array { shape_id, .. } => *shape_id,
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -2960,6 +3030,12 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::BoundFunction {
                 shape_id: object_shape_id,
                 keys,
                 values,
@@ -3001,6 +3077,7 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
             _ => None,
         };
@@ -3012,7 +3089,8 @@ impl ObjectHeap {
                     HeapValue::Object { values, .. }
                     | HeapValue::NativeObject { values, .. }
                     | HeapValue::Closure { values, .. }
-                    | HeapValue::HostFunction { values, .. } => values,
+                    | HeapValue::HostFunction { values, .. }
+                    | HeapValue::BoundFunction { values, .. } => values,
                     HeapValue::Array { values, .. } if include_array => values,
                     _ => return Err(ObjectError::InvalidKind),
                 };
@@ -3027,7 +3105,8 @@ impl ObjectHeap {
                 HeapValue::Object { values, .. }
                 | HeapValue::NativeObject { values, .. }
                 | HeapValue::Closure { values, .. }
-                | HeapValue::HostFunction { values, .. } => values,
+                | HeapValue::HostFunction { values, .. }
+                | HeapValue::BoundFunction { values, .. } => values,
                 HeapValue::Array { values, .. } if include_array => values,
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -3067,6 +3146,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::BoundFunction {
+                shape_id: s,
+                keys,
+                values,
+                ..
             } => (s, keys, values),
             HeapValue::Array {
                 shape_id: s,
@@ -3092,14 +3177,14 @@ impl ObjectHeap {
             HeapValue::Object { keys, .. }
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
-            | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
+            | HeapValue::HostFunction { keys, .. }
+            | HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
             HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
             HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
             _ => None,
         };
@@ -3113,7 +3198,8 @@ impl ObjectHeap {
                 HeapValue::Object { values, .. }
                 | HeapValue::NativeObject { values, .. }
                 | HeapValue::Closure { values, .. }
-                | HeapValue::HostFunction { values, .. } => values,
+                | HeapValue::HostFunction { values, .. }
+                | HeapValue::BoundFunction { values, .. } => values,
                 HeapValue::Array { values, .. } if include_array => values,
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -3144,6 +3230,12 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::HostFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::BoundFunction {
                 shape_id: object_shape_id,
                 keys,
                 values,
@@ -3246,6 +3338,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::BoundFunction {
+                shape_id,
+                keys,
+                values,
+                ..
             } => (shape_id, keys, values),
             HeapValue::Array {
                 shape_id,
@@ -3328,7 +3426,6 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
         };
         let Some(slot_index) = property_slot(keys, property) else {
@@ -3349,12 +3446,12 @@ impl ObjectHeap {
             | HeapValue::Array { prototype, .. }
             | HeapValue::String { prototype, .. }
             | HeapValue::Closure { prototype, .. }
-            | HeapValue::HostFunction { prototype, .. } => Ok(*prototype),
+            | HeapValue::HostFunction { prototype, .. }
+            | HeapValue::BoundFunction { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
     }

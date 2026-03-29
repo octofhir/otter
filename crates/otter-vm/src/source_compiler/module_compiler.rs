@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct FunctionIdentity {
     pub(super) debug_name: Option<String>,
     pub(super) self_binding_name: Option<String>,
+    pub(super) length: u16,
 }
 
 pub(super) struct ModuleCompiler<'a> {
@@ -33,6 +34,7 @@ impl<'a> ModuleCompiler<'a> {
             FunctionIdentity {
                 debug_name: Some(self.source_url.to_string()),
                 self_binding_name: None,
+                length: 0,
             },
             &program.body,
             &[],
@@ -78,12 +80,11 @@ impl<'a> ModuleCompiler<'a> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
-        let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
-        compiler.declare_parameters(&param_names)?;
+        compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {
             compiler.declare_this_binding()?;
         }
-        compiler.compile_default_params(params, self)?;
+        compiler.compile_parameter_initialization(params, self)?;
         if kind == FunctionKind::Script {
             compiler.declare_intrinsic_globals()?;
         }
@@ -100,7 +101,11 @@ impl<'a> ModuleCompiler<'a> {
             compiler.emit_implicit_return()?;
         }
 
-        compiler.finish(function_index, identity.debug_name.as_deref())
+        compiler.finish(
+            function_index,
+            identity.length,
+            identity.debug_name.as_deref(),
+        )
     }
 
     pub(super) fn compile_function_from_expression(
@@ -115,17 +120,20 @@ impl<'a> ModuleCompiler<'a> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
 
-        let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
-        compiler.declare_parameters(&param_names)?;
+        compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {
             compiler.declare_this_binding()?;
         }
-        compiler.compile_default_params(params, self)?;
+        compiler.compile_parameter_initialization(params, self)?;
         let value = compiler.compile_expression(expression, self)?;
         compiler.instructions.push(Instruction::ret(value.register));
         compiler.release(value);
 
-        compiler.finish(function_index, identity.debug_name.as_deref())
+        compiler.finish(
+            function_index,
+            identity.length,
+            identity.debug_name.as_deref(),
+        )
     }
 
     pub(super) fn set_function(&mut self, index: FunctionIndex, function: VmFunction) {

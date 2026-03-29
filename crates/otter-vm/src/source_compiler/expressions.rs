@@ -1,5 +1,5 @@
 use super::ast::{
-    extract_function_params, extract_function_params_from_formal,
+    expected_function_length, extract_function_params, extract_function_params_from_formal,
     is_test262_assert_same_value_call, non_computed_property_key_name,
 };
 use super::module_compiler::{FunctionIdentity, ModuleCompiler};
@@ -7,6 +7,23 @@ use super::shared::{Binding, FunctionCompiler, FunctionKind, ValueLocation};
 use super::*;
 
 impl<'a> FunctionCompiler<'a> {
+    pub(super) fn compile_expression_with_inferred_name(
+        &mut self,
+        expression: &Expression<'_>,
+        inferred_name: Option<&str>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        match expression {
+            Expression::FunctionExpression(function) => {
+                self.compile_function_expression(function, inferred_name, module)
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.compile_arrow_function_expression(arrow, inferred_name, module)
+            }
+            _ => self.compile_expression(expression, module),
+        }
+    }
+
     pub(super) fn compile_expression(
         &mut self,
         expression: &Expression<'_>,
@@ -39,7 +56,7 @@ impl<'a> FunctionCompiler<'a> {
                 self.compile_new_expression(new_expression, module)
             }
             Expression::FunctionExpression(function) => {
-                self.compile_function_expression(function, module)
+                self.compile_function_expression(function, None, module)
             }
             Expression::ObjectExpression(object) => self.compile_object_expression(object, module),
             Expression::StaticMemberExpression(member) => {
@@ -52,7 +69,7 @@ impl<'a> FunctionCompiler<'a> {
                 self.compile_conditional_expression(conditional, module)
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                self.compile_arrow_function_expression(arrow, module)
+                self.compile_arrow_function_expression(arrow, None, module)
             }
             Expression::TemplateLiteral(template) => {
                 self.compile_template_literal(template, module)
@@ -106,7 +123,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(register))
     }
 
-    fn compile_string_literal(
+    pub(super) fn compile_string_literal(
         &mut self,
         value: &str,
     ) -> Result<ValueLocation, SourceLoweringError> {
@@ -142,7 +159,12 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         match self.resolve_binding(name) {
-            Ok(Binding::Register(register)) => Ok(ValueLocation::local(register)),
+            Ok(Binding::Register(register)) => {
+                if self.parameter_tdz_active {
+                    self.emit_assert_not_hole(register);
+                }
+                Ok(ValueLocation::local(register))
+            }
             Ok(Binding::Function {
                 closure_register, ..
             }) => Ok(ValueLocation::local(closure_register)),
@@ -161,174 +183,6 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(ValueLocation::temp(register))
             }
             Err(e) => Err(e),
-        }
-    }
-
-    fn compile_assignment_expression(
-        &mut self,
-        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
-        module: &mut ModuleCompiler<'a>,
-    ) -> Result<ValueLocation, SourceLoweringError> {
-        match assignment.operator {
-            AssignmentOperator::Assign => match &assignment.left {
-                AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                    let value = self.compile_expression(&assignment.right, module)?;
-                    self.assign_to_name(identifier.name.as_str(), value)
-                }
-                AssignmentTarget::ComputedMemberExpression(member) => {
-                    let object = self.compile_expression(&member.object, module)?;
-                    let value = self.compile_expression(&assignment.right, module)?;
-                    self.store_computed_member(object, module, member, value)?;
-                    Ok(value)
-                }
-                AssignmentTarget::StaticMemberExpression(member) => {
-                    let object = self.compile_expression(&member.object, module)?;
-                    let value = self.compile_expression(&assignment.right, module)?;
-                    let property = self.intern_property_name(member.property.name.as_str())?;
-                    self.instructions.push(Instruction::set_property(
-                        object.register,
-                        value.register,
-                        property,
-                    ));
-                    self.release(object);
-                    Ok(value)
-                }
-                _ => Err(SourceLoweringError::Unsupported(
-                    "unsupported assignment target".to_string(),
-                )),
-            },
-            AssignmentOperator::Addition
-            | AssignmentOperator::Subtraction
-            | AssignmentOperator::Multiplication
-            | AssignmentOperator::Division
-            | AssignmentOperator::Remainder
-            | AssignmentOperator::BitwiseAnd
-            | AssignmentOperator::BitwiseOR
-            | AssignmentOperator::BitwiseXOR
-            | AssignmentOperator::ShiftLeft
-            | AssignmentOperator::ShiftRight
-            | AssignmentOperator::ShiftRightZeroFill => {
-                self.compile_compound_assignment(assignment, module)
-            }
-            _ => Err(SourceLoweringError::Unsupported(format!(
-                "assignment operator {:?}",
-                assignment.operator
-            ))),
-        }
-    }
-
-    fn emit_compound_op(
-        &mut self,
-        op: AssignmentOperator,
-        dst: BytecodeRegister,
-        lhs: BytecodeRegister,
-        rhs: BytecodeRegister,
-    ) {
-        let instr = match op {
-            AssignmentOperator::Addition => Instruction::add(dst, lhs, rhs),
-            AssignmentOperator::Subtraction => Instruction::sub(dst, lhs, rhs),
-            AssignmentOperator::Multiplication => Instruction::mul(dst, lhs, rhs),
-            AssignmentOperator::Division => Instruction::div(dst, lhs, rhs),
-            AssignmentOperator::Remainder => Instruction::mod_(dst, lhs, rhs),
-            AssignmentOperator::BitwiseAnd => Instruction::bit_and(dst, lhs, rhs),
-            AssignmentOperator::BitwiseOR => Instruction::bit_or(dst, lhs, rhs),
-            AssignmentOperator::BitwiseXOR => Instruction::bit_xor(dst, lhs, rhs),
-            AssignmentOperator::ShiftLeft => Instruction::shl(dst, lhs, rhs),
-            AssignmentOperator::ShiftRight => Instruction::shr(dst, lhs, rhs),
-            AssignmentOperator::ShiftRightZeroFill => Instruction::ushr(dst, lhs, rhs),
-            _ => unreachable!(),
-        };
-        self.instructions.push(instr);
-    }
-
-    fn compile_compound_assignment(
-        &mut self,
-        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
-        module: &mut ModuleCompiler<'a>,
-    ) -> Result<ValueLocation, SourceLoweringError> {
-        match &assignment.left {
-            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                let current = self.compile_identifier(identifier.name.as_str())?;
-                let current = self.materialize_value(current);
-                let rhs = self.compile_expression(&assignment.right, module)?;
-                let result = if current.is_temp {
-                    current
-                } else if rhs.is_temp {
-                    rhs
-                } else {
-                    ValueLocation::temp(self.alloc_temp())
-                };
-                self.emit_compound_op(
-                    assignment.operator,
-                    result.register,
-                    current.register,
-                    rhs.register,
-                );
-                if result.register != current.register {
-                    self.release(current);
-                }
-                if result.register != rhs.register {
-                    self.release(rhs);
-                }
-                self.assign_to_name(identifier.name.as_str(), result)
-            }
-            AssignmentTarget::StaticMemberExpression(member) => {
-                let object = self.compile_expression(&member.object, module)?;
-                let object = self.materialize_value(object);
-                let property = self.intern_property_name(member.property.name.as_str())?;
-                let current = ValueLocation::temp(self.alloc_temp());
-                self.instructions.push(Instruction::get_property(
-                    current.register,
-                    object.register,
-                    property,
-                ));
-                let rhs = self.compile_expression(&assignment.right, module)?;
-                self.emit_compound_op(
-                    assignment.operator,
-                    current.register,
-                    current.register,
-                    rhs.register,
-                );
-                self.release(rhs);
-                self.instructions.push(Instruction::set_property(
-                    object.register,
-                    current.register,
-                    property,
-                ));
-                self.release(object);
-                Ok(current)
-            }
-            AssignmentTarget::ComputedMemberExpression(member) => {
-                let object = self.compile_expression(&member.object, module)?;
-                let object = self.materialize_value(object);
-                let index = self.compile_expression(&member.expression, module)?;
-                let index = self.materialize_value(index);
-                let current = ValueLocation::temp(self.alloc_temp());
-                self.instructions.push(Instruction::get_index(
-                    current.register,
-                    object.register,
-                    index.register,
-                ));
-                let rhs = self.compile_expression(&assignment.right, module)?;
-                self.emit_compound_op(
-                    assignment.operator,
-                    current.register,
-                    current.register,
-                    rhs.register,
-                );
-                self.release(rhs);
-                self.instructions.push(Instruction::set_index(
-                    object.register,
-                    index.register,
-                    current.register,
-                ));
-                self.release(index);
-                self.release(object);
-                Ok(current)
-            }
-            _ => Err(SourceLoweringError::Unsupported(
-                "compound assignment target".to_string(),
-            )),
         }
     }
 
@@ -1090,21 +944,26 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_function_expression(
         &mut self,
         function: &Function<'_>,
+        inferred_name: Option<&str>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let fn_name = function.id.as_ref().map(|id| id.name.to_string());
+        let public_name = fn_name
+            .clone()
+            .or_else(|| inferred_name.map(ToOwned::to_owned));
 
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
         let compiled = module.compile_function_from_statements(
             reserved,
             FunctionIdentity {
-                debug_name: fn_name.clone().or_else(|| {
+                debug_name: public_name.clone().or_else(|| {
                     self.function_name
                         .as_ref()
                         .map(|name| format!("{name}::<anonymous>"))
                 }),
                 self_binding_name: fn_name,
+                length: expected_function_length(&params),
             },
             function
                 .body
@@ -1136,26 +995,115 @@ impl<'a> FunctionCompiler<'a> {
 
         for property in &object.properties {
             let ObjectPropertyKind::ObjectProperty(property) = property else {
-                return Err(SourceLoweringError::Unsupported(
-                    "object spread properties".to_string(),
+                let ObjectPropertyKind::SpreadProperty(spread) = property else {
+                    unreachable!("object literal property kind should be exhaustively handled");
+                };
+                let source = self.compile_expression(&spread.argument, module)?;
+                self.instructions.push(Instruction::copy_data_properties(
+                    destination,
+                    source.register,
                 ));
+                self.release(source);
+                continue;
             };
-            if property.kind != PropertyKind::Init {
+            if property.kind != PropertyKind::Init
+                && !matches!(property.kind, PropertyKind::Get | PropertyKind::Set)
+            {
                 return Err(SourceLoweringError::Unsupported(
                     "object getters/setters/methods".to_string(),
                 ));
             }
-            let name = non_computed_property_key_name(&property.key).ok_or_else(|| {
-                SourceLoweringError::Unsupported("computed object property names".to_string())
-            })?;
-            let property_id = self.intern_property_name(&name)?;
-            let value = self.compile_expression(&property.value, module)?;
-            self.instructions.push(Instruction::set_property(
-                destination,
-                value.register,
-                property_id,
-            ));
-            self.release(value);
+            if matches!(property.kind, PropertyKind::Get | PropertyKind::Set) {
+                let inferred_name = if property.computed {
+                    None
+                } else {
+                    let name = non_computed_property_key_name(&property.key).ok_or_else(|| {
+                        SourceLoweringError::Unsupported("object accessor property key".to_string())
+                    })?;
+                    Some(match property.kind {
+                        PropertyKind::Get => format!("get {name}"),
+                        PropertyKind::Set => format!("set {name}"),
+                        _ => unreachable!(),
+                    })
+                };
+                let accessor = self.compile_expression_with_inferred_name(
+                    &property.value,
+                    inferred_name.as_deref(),
+                    module,
+                )?;
+                if property.computed {
+                    let key = self.compile_expression(property.key.to_expression(), module)?;
+                    match property.kind {
+                        PropertyKind::Get => {
+                            self.instructions.push(Instruction::define_computed_getter(
+                                destination,
+                                key.register,
+                                accessor.register,
+                            ))
+                        }
+                        PropertyKind::Set => {
+                            self.instructions.push(Instruction::define_computed_setter(
+                                destination,
+                                key.register,
+                                accessor.register,
+                            ))
+                        }
+                        _ => unreachable!(),
+                    }
+                    self.release(key);
+                } else {
+                    let name = non_computed_property_key_name(&property.key).ok_or_else(|| {
+                        SourceLoweringError::Unsupported("object accessor property key".to_string())
+                    })?;
+                    let property_id = self.intern_property_name(&name)?;
+                    match property.kind {
+                        PropertyKind::Get => {
+                            self.instructions.push(Instruction::define_named_getter(
+                                destination,
+                                accessor.register,
+                                property_id,
+                            ))
+                        }
+                        PropertyKind::Set => {
+                            self.instructions.push(Instruction::define_named_setter(
+                                destination,
+                                accessor.register,
+                                property_id,
+                            ))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                self.release(accessor);
+                continue;
+            }
+            if property.computed {
+                let key = self.compile_expression(property.key.to_expression(), module)?;
+                let value = self.compile_expression(&property.value, module)?;
+                self.instructions.push(Instruction::set_index(
+                    destination,
+                    key.register,
+                    value.register,
+                ));
+                self.release(key);
+                self.release(value);
+            } else {
+                let name = non_computed_property_key_name(&property.key).ok_or_else(|| {
+                    SourceLoweringError::Unsupported("object property key".to_string())
+                })?;
+                let property_id = self.intern_property_name(&name)?;
+                let value = self.compile_expression_with_inferred_name(
+                    &property.value,
+                    Some(&name),
+                    module,
+                )?;
+                self.instructions.push(Instruction::set_property(
+                    destination,
+                    value.register,
+                    property_id,
+                ));
+                self.release(value);
+            }
         }
 
         Ok(ValueLocation::temp(destination))
@@ -1263,36 +1211,6 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
-    pub(super) fn store_computed_member(
-        &mut self,
-        object: ValueLocation,
-        module: &mut ModuleCompiler<'a>,
-        member: &ComputedMemberExpression<'_>,
-        value: ValueLocation,
-    ) -> Result<(), SourceLoweringError> {
-        match &member.expression {
-            Expression::StringLiteral(literal) => {
-                let property = self.intern_property_name(literal.value.as_str())?;
-                self.instructions.push(Instruction::set_property(
-                    object.register,
-                    value.register,
-                    property,
-                ));
-            }
-            _ => {
-                let index = self.compile_expression(&member.expression, module)?;
-                self.instructions.push(Instruction::set_index(
-                    object.register,
-                    index.register,
-                    value.register,
-                ));
-                self.release(index);
-            }
-        }
-        self.release(object);
-        Ok(())
-    }
-
     fn compile_delete_expression(
         &mut self,
         argument: &Expression<'_>,
@@ -1366,8 +1284,10 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_arrow_function_expression(
         &mut self,
         arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
+        inferred_name: Option<&str>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        let public_name = inferred_name.map(ToOwned::to_owned);
         let reserved = module.reserve_function();
         let params = extract_function_params_from_formal(&arrow.params)?;
 
@@ -1384,11 +1304,13 @@ impl<'a> FunctionCompiler<'a> {
             module.compile_function_from_expression(
                 reserved,
                 FunctionIdentity {
-                    debug_name: self
-                        .function_name
-                        .as_ref()
-                        .map(|name| format!("{name}::<arrow>")),
+                    debug_name: public_name.clone().or_else(|| {
+                        self.function_name
+                            .as_ref()
+                            .map(|name| format!("{name}::<arrow>"))
+                    }),
                     self_binding_name: None,
+                    length: expected_function_length(&params),
                 },
                 expression,
                 &params,
@@ -1399,11 +1321,13 @@ impl<'a> FunctionCompiler<'a> {
             module.compile_function_from_statements(
                 reserved,
                 FunctionIdentity {
-                    debug_name: self
-                        .function_name
-                        .as_ref()
-                        .map(|name| format!("{name}::<arrow>")),
+                    debug_name: public_name.clone().or_else(|| {
+                        self.function_name
+                            .as_ref()
+                            .map(|name| format!("{name}::<arrow>"))
+                    }),
                     self_binding_name: None,
+                    length: expected_function_length(&params),
                 },
                 &arrow.body.statements,
                 &params,

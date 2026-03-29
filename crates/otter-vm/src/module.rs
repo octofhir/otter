@@ -131,6 +131,7 @@ impl Default for FunctionTables {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     name: Option<Box<str>>,
+    length: u16,
     frame_layout: FrameLayout,
     bytecode: Bytecode,
     property_names: PropertyNameTable,
@@ -153,8 +154,27 @@ impl Function {
         bytecode: Bytecode,
         tables: FunctionTables,
     ) -> Self {
+        Self::new_with_length(
+            name,
+            u16::from(frame_layout.parameter_count()),
+            frame_layout,
+            bytecode,
+            tables,
+        )
+    }
+
+    /// Creates an executable function with explicit `.length`.
+    #[must_use]
+    pub fn new_with_length(
+        name: Option<impl Into<Box<str>>>,
+        length: u16,
+        frame_layout: FrameLayout,
+        bytecode: Bytecode,
+        tables: FunctionTables,
+    ) -> Self {
         Self {
             name: name.map(Into::into),
+            length,
             frame_layout,
             bytecode,
             property_names: tables.side_tables.property_names,
@@ -183,6 +203,12 @@ impl Function {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Returns the JS-visible function `.length`.
+    #[must_use]
+    pub const fn length(&self) -> u16 {
+        self.length
     }
 
     /// Returns the frame layout.

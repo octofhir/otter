@@ -3,7 +3,7 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
-use crate::object::{HeapValueKind, ObjectHandle};
+use crate::object::{HeapValueKind, ObjectHandle, PropertyAttributes, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
@@ -14,6 +14,103 @@ use super::{
 pub(super) static FUNCTION_INTRINSIC: FunctionIntrinsic = FunctionIntrinsic;
 
 pub(super) struct FunctionIntrinsic;
+
+fn type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<VmNativeCallError, VmNativeCallError> {
+    let error = runtime.alloc_type_error(message).map_err(|error| {
+        VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+    })?;
+    Ok(VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error.0),
+    ))
+}
+
+fn require_callable(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let handle = value
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| type_error(runtime, message).unwrap_or_else(|error| error))?;
+    if !runtime.objects().is_callable(handle) {
+        return Err(type_error(runtime, message)?);
+    }
+    Ok(handle)
+}
+
+fn list_from_apply_argument(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<Vec<RegisterValue>, VmNativeCallError> {
+    if value == RegisterValue::undefined() || value == RegisterValue::null() {
+        return Ok(Vec::new());
+    }
+
+    let handle = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(
+            runtime,
+            "Function.prototype.apply requires an object or null/undefined argArray",
+        )
+        .unwrap_or_else(|error| error)
+    })?;
+    if matches!(runtime.objects().kind(handle), Ok(HeapValueKind::String)) {
+        return Err(type_error(
+            runtime,
+            "Function.prototype.apply requires an object or null/undefined argArray",
+        )?);
+    }
+
+    runtime.list_from_array_like(handle)
+}
+
+fn target_function_length(
+    target: ObjectHandle,
+    bound_arg_count: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<i32, VmNativeCallError> {
+    let length = runtime.intern_property_name("length");
+    let target_value = match runtime
+        .own_property_descriptor(target, length)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("bound length lookup: {error:?}").into())
+        })? {
+        Some(_) => {
+            runtime.ordinary_get(target, length, RegisterValue::from_object_handle(target.0))?
+        }
+        None => RegisterValue::undefined(),
+    };
+    let target_length = if let Some(value) = target_value.as_i32() {
+        usize::try_from(value).unwrap_or(0)
+    } else if let Some(value) = target_value.as_number() {
+        if value.is_finite() && value >= 0.0 {
+            value as usize
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    Ok(i32::try_from(target_length.saturating_sub(bound_arg_count)).unwrap_or(i32::MAX))
+}
+
+fn target_function_name(
+    target: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<String, VmNativeCallError> {
+    let name = runtime.intern_property_name("name");
+    let target_name = runtime
+        .ordinary_get(target, name, RegisterValue::from_object_handle(target.0))?
+        .as_object_handle()
+        .map(ObjectHandle)
+        .and_then(|handle| runtime.objects().string_value(handle).ok().flatten())
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    Ok(format!("bound {target_name}"))
+}
 
 impl IntrinsicInstaller for FunctionIntrinsic {
     fn init(
@@ -107,12 +204,7 @@ fn function_is_callable(
         .copied()
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
-        .map(|handle| {
-            matches!(
-                runtime.objects().kind(handle),
-                Ok(HeapValueKind::HostFunction | HeapValueKind::Closure)
-            )
-        })
+        .map(|handle| runtime.objects().is_callable(handle))
         .unwrap_or(false);
     Ok(RegisterValue::from_bool(is_callable))
 }
@@ -122,31 +214,18 @@ fn function_call(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let callable = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Function.prototype.call requires callable receiver".into())
-    })?;
+    let callable = require_callable(
+        *this,
+        runtime,
+        "Function.prototype.call requires callable receiver",
+    )?;
     let receiver = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let forwarded = if args.len() > 1 { &args[1..] } else { &[] };
 
-    let Some(host_function) = runtime.objects().host_function(callable).map_err(|error| {
-        VmNativeCallError::Internal(format!("Function.prototype.call failed: {error:?}").into())
-    })?
-    else {
-        return Err(VmNativeCallError::Internal(
-            "Function.prototype.call only supports host functions in otter-vm bootstrap".into(),
-        ));
-    };
-
-    let descriptor = runtime
-        .native_functions()
-        .get(host_function)
-        .cloned()
-        .ok_or_else(|| VmNativeCallError::Internal("host function descriptor is missing".into()))?;
-
-    (descriptor.callback())(&receiver, forwarded, runtime)
+    runtime.call_callable(callable, receiver, forwarded)
 }
 
 /// ES2024 §20.2.3.1 Function.prototype.apply(thisArg, argArray)
@@ -155,49 +234,85 @@ fn function_apply(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let callable = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Function.prototype.apply requires callable receiver".into())
-    })?;
+    let callable = require_callable(
+        *this,
+        runtime,
+        "Function.prototype.apply requires callable receiver",
+    )?;
     let receiver = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
 
-    // Extract args from argArray (second argument).
-    let call_args = if let Some(arg_array) = args.get(1).copied()
-        && let Some(handle) = arg_array.as_object_handle().map(ObjectHandle)
-    {
-        runtime.array_to_args(handle)?
-    } else {
-        Vec::new()
-    };
+    let call_args = list_from_apply_argument(
+        args.get(1)
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
 
-    runtime.call_host_function(Some(callable), receiver, &call_args)
+    runtime.call_callable(callable, receiver, &call_args)
 }
 
 /// ES2024 §20.2.3.2 Function.prototype.bind(thisArg, ...args)
 ///
 /// Creates a bound function that wraps the original with a fixed `this` and
-/// optional prepended arguments. The bound function is a new host function
-/// object that delegates to the original on invocation.
+/// optional prepended arguments.
 fn function_bind(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Function.prototype.bind requires callable receiver".into())
-    })?;
+    let target = require_callable(
+        *this,
+        runtime,
+        "Function.prototype.bind requires callable receiver",
+    )?;
     let bound_this = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let bound_args: Vec<RegisterValue> = args.get(1..).unwrap_or(&[]).to_vec();
+    let bound_length = target_function_length(target, bound_args.len(), runtime)?;
+    let bound_name = target_function_name(target, runtime)?;
 
     // ES2024 §10.4.1.3 BoundFunctionCreate — create a proper bound function exotic object.
     let bound = runtime
         .objects_mut()
-        .alloc_bound_function(target, bound_this, bound_args);
+        .alloc_bound_function(target, bound_this, bound_args)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("bound function alloc: {error:?}").into())
+        })?;
+
+    let length_prop = runtime.intern_property_name("length");
+    runtime
+        .objects_mut()
+        .define_own_property(
+            bound,
+            length_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_i32(bound_length),
+                PropertyAttributes::function_length(),
+            ),
+        )
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("bound function length install: {error:?}").into())
+        })?;
+    let name_prop = runtime.intern_property_name("name");
+    let name_handle = runtime.alloc_string(bound_name);
+    runtime
+        .objects_mut()
+        .define_own_property(
+            bound,
+            name_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(name_handle.0),
+                PropertyAttributes::function_length(),
+            ),
+        )
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("bound function name install: {error:?}").into())
+        })?;
 
     Ok(RegisterValue::from_object_handle(bound.0))
 }
@@ -207,13 +322,16 @@ fn function_to_string(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Function.prototype.toString requires callable receiver".into())
-    })?;
+    let receiver = require_callable(
+        *this,
+        runtime,
+        "Function.prototype.toString requires callable receiver",
+    )?;
 
     let text = match runtime.objects().kind(receiver) {
         Ok(HeapValueKind::HostFunction) => "function () { [native code] }",
         Ok(HeapValueKind::Closure) => "function () { [bytecode] }",
+        Ok(HeapValueKind::BoundFunction) => "function () { [native code] }",
         Ok(_) => {
             return Err(VmNativeCallError::Internal(
                 "Function.prototype.toString requires callable receiver".into(),

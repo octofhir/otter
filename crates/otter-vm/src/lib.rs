@@ -63,6 +63,8 @@ pub mod payload;
 pub mod promise;
 /// Property side tables for named access.
 pub mod property;
+/// Shared CopyDataProperties helpers for object spread/rest semantics.
+mod property_copy;
 /// Small smoke harness for iterative validation.
 pub mod smoke;
 /// Tiny JS source lowering for the first new-VM migration slice.

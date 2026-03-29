@@ -698,15 +698,380 @@ mod tests {
                 "if (object[\"flag\"] !== true) {\n",
                 "    throw new Test262Error(\"#2\");\n",
                 "}\n",
+                "function outerCaptureWrite() {\n",
+                "    var value = 1;\n",
+                "    function inc() {\n",
+                "        value = value + 1;\n",
+                "        return value;\n",
+                "    }\n",
+                "    assert.sameValue(inc(), 2, 'inner closure updates captured binding');\n",
+                "    return value;\n",
+                "}\n",
+                "assert.sameValue(outerCaptureWrite(), 2, 'outer frame observes closure writes to captured binding after call returns');\n",
+                "function outerAccessorWrite() {\n",
+                "    var value = 1;\n",
+                "    var obj = {};\n",
+                "    Object.defineProperty(obj, 'mutate', {\n",
+                "        get: function() {\n",
+                "            value = 4;\n",
+                "            return 0;\n",
+                "        },\n",
+                "        enumerable: true,\n",
+                "        configurable: true\n",
+                "    });\n",
+                "    obj.mutate;\n",
+                "    return value;\n",
+                "}\n",
+                "assert.sameValue(outerAccessorWrite(), 4, 'outer frame observes closure writes through accessor call');\n",
+                "function sum(a, b) {\n",
+                "    return this.base + a + b;\n",
+                "}\n",
+                "var inferred = function(a) { return a; };\n",
+                "assert.sameValue(inferred.name, 'inferred', 'anonymous function expression infers name from variable binding');\n",
+                "assert.sameValue(inferred.length, 1, 'anonymous function expression preserves formal parameter count');\n",
+                "var inferredArrow = (left, right) => left + right;\n",
+                "assert.sameValue(inferredArrow.name, 'inferredArrow', 'anonymous arrow infers name from variable binding');\n",
+                "assert.sameValue(inferredArrow.length, 2, 'anonymous arrow preserves formal parameter count');\n",
+                "var assigned;\n",
+                "assigned = function() { return 1; };\n",
+                "assert.sameValue(assigned.name, 'assigned', 'anonymous function expression infers name from identifier assignment');\n",
+                "var objectWithFns = {\n",
+                "    methodish: function() { return 1; },\n",
+                "    arrowish: (value) => value,\n",
+                "    explicit: function ExplicitInner() { return 1; }\n",
+                "};\n",
+                "assert.sameValue(objectWithFns.methodish.name, 'methodish', 'anonymous object property function infers property name');\n",
+                "assert.sameValue(objectWithFns.arrowish.name, 'arrowish', 'anonymous object property arrow infers property name');\n",
+                "assert.sameValue(objectWithFns.explicit.name, 'ExplicitInner', 'explicit function expression name wins over inferred property name');\n",
+                "assert.sameValue(sum.length, 2, 'ordinary function length matches formal parameter count');\n",
+                "assert.sameValue(sum.name, 'sum', 'ordinary function name installs from source name');\n",
+                "var sumNames = Object.getOwnPropertyNames(sum);\n",
+                "assert.sameValue(sumNames[0], 'length', 'ordinary function names expose length first');\n",
+                "assert.sameValue(sumNames[1], 'name', 'ordinary function names expose name second');\n",
+                "assert.sameValue(sumNames[2], 'prototype', 'constructable function names expose prototype after length/name');\n",
+                "var sumLengthDesc = Object.getOwnPropertyDescriptor(sum, 'length');\n",
+                "assert.sameValue(sumLengthDesc.writable, false, 'ordinary function length is non-writable');\n",
+                "assert.sameValue(sumLengthDesc.enumerable, false, 'ordinary function length is non-enumerable');\n",
+                "assert.sameValue(sumLengthDesc.configurable, true, 'ordinary function length is configurable');\n",
+                "assert.sameValue(sum.call({ base: 4 }, 5, 6), 15, 'Function.prototype.call invokes ordinary function');\n",
+                "var applyArgs = { length: 2 };\n",
+                "Object.defineProperty(applyArgs, '0', { get: function() { return 7; }, enumerable: true, configurable: true });\n",
+                "Object.defineProperty(applyArgs, '1', { get: function() { return 8; }, enumerable: true, configurable: true });\n",
+                "assert.sameValue(sum.apply({ base: 1 }, applyArgs), 16, 'Function.prototype.apply uses list-from-array-like over closures');\n",
+                "var bound = sum.bind({ base: 10 }, 2);\n",
+                "assert.sameValue(bound(3), 15, 'Function.prototype.bind prepends bound args for closures');\n",
+                "function PointCtor(x, y) { this.x = x; this.y = y; }\n",
+                "var pointCtorProtoDesc = Object.getOwnPropertyDescriptor(PointCtor, 'prototype');\n",
+                "assert.sameValue(pointCtorProtoDesc.writable, true, 'compiled constructor prototype is writable');\n",
+                "assert.sameValue(pointCtorProtoDesc.enumerable, false, 'compiled constructor prototype is non-enumerable');\n",
+                "assert.sameValue(pointCtorProtoDesc.configurable, false, 'compiled constructor prototype is non-configurable');\n",
+                "var BoundPointCtor = PointCtor.bind({ ignored: true }, 2);\n",
+                "var pointFromBound = new BoundPointCtor(5);\n",
+                "assert.sameValue(pointFromBound.x, 2, 'bound constructors prepend bound arguments');\n",
+                "assert.sameValue(pointFromBound.y, 5, 'bound constructors forward runtime arguments');\n",
+                "assert.sameValue(Object.getPrototypeOf(pointFromBound), PointCtor.prototype, 'new bound constructor normalizes newTarget to target');\n",
+                "function ProtoSwapCtor(value) { this.value = value; }\n",
+                "var replacementProto = { swapped: true };\n",
+                "ProtoSwapCtor.prototype = replacementProto;\n",
+                "var swappedInstance = new ProtoSwapCtor(9);\n",
+                "assert.sameValue(Object.getPrototypeOf(swappedInstance), replacementProto, 'compiled constructor uses reassigned prototype');\n",
+                "assert.sameValue(swappedInstance.value, 9, 'compiled constructor still runs body after prototype reassignment');\n",
+                "var boundAbs = Math.abs.bind(null);\n",
+                "assert.sameValue(boundAbs.length, 1, 'bound function length defaults from target');\n",
+                "assert.sameValue(boundAbs.name, 'bound abs', 'bound function name prefixes target name');\n",
+                "var applyAbs = Reflect.apply.bind(null, Math.abs, null);\n",
+                "assert.sameValue(applyAbs.length, 1, 'bound function length subtracts bound arguments');\n",
+                "var bindMetaLengthCalls = 0;\n",
+                "var bindMetaNameCalls = 0;\n",
+                "function BindMeta(a, b, c, d) {}\n",
+                "Object.defineProperty(BindMeta, 'length', { get: function() { bindMetaLengthCalls = bindMetaLengthCalls + 1; return 4; }, configurable: true });\n",
+                "Object.defineProperty(BindMeta, 'name', { get: function() { bindMetaNameCalls = bindMetaNameCalls + 1; return 'Meta'; }, configurable: true });\n",
+                "var boundMeta = BindMeta.bind(null, 1, 2);\n",
+                "assert.sameValue(boundMeta.length, 2, 'bound function length uses [[Get]] on target length');\n",
+                "assert.sameValue(boundMeta.name, 'bound Meta', 'bound function name uses [[Get]] on target name');\n",
+                "assert.sameValue(bindMetaLengthCalls, 1, 'bind reads target length getter once');\n",
+                "assert.sameValue(bindMetaNameCalls, 1, 'bind reads target name getter once');\n",
+                "Object.defineProperty(BindMeta, 'name', { get: function() { throw 5; }, configurable: true });\n",
+                "try {\n",
+                "    BindMeta.bind(null);\n",
+                "    throw new Test262Error('#5');\n",
+                "} catch (error) {\n",
+                "    assert.sameValue(error, 5, 'bind propagates target name getter throw');\n",
+                "}\n",
+                "var boundAbsNames = Object.getOwnPropertyNames(boundAbs);\n",
+                "assert.sameValue(boundAbsNames[0], 'length', 'bound function names expose length first');\n",
+                "assert.sameValue(boundAbsNames[1], 'name', 'bound function names expose name second');\n",
+                "var boundLengthDesc = Object.getOwnPropertyDescriptor(boundAbs, 'length');\n",
+                "assert.sameValue(boundLengthDesc.writable, false, 'bound length is non-writable');\n",
+                "assert.sameValue(boundLengthDesc.enumerable, false, 'bound length is non-enumerable');\n",
+                "assert.sameValue(boundLengthDesc.configurable, true, 'bound length is configurable');\n",
+                "boundAbs.extra = 9;\n",
+                "assert.sameValue(boundAbs.extra, 9, 'bound function stores ordinary own properties');\n",
+                "Object.defineProperty(boundAbs, 'hidden', { value: 3, enumerable: false, configurable: true, writable: true });\n",
+                "assert.sameValue(boundAbs.hidden, 3, 'bound function defineProperty stores ordinary descriptors');\n",
+                "assert.sameValue(Object.keys(boundAbs).length, 1, 'bound function Object.keys sees enumerable custom props only');\n",
+                "assert.sameValue(Object.keys(boundAbs)[0], 'extra', 'bound function Object.keys includes enumerable custom prop');\n",
+                "assert.sameValue(delete boundAbs.extra, true, 'bound function delete removes configurable custom props');\n",
+                "assert.sameValue(boundAbs.extra, undefined, 'bound function delete clears custom prop');\n",
+                "Object.preventExtensions(boundAbs);\n",
+                "assert.sameValue(Object.isExtensible(boundAbs), false, 'bound function preventExtensions works');\n",
+                "assert.sameValue(Reflect.set(boundAbs, 'late', 1), false, 'bound function rejects new props when non-extensible');\n",
+                "Object.freeze(boundAbs);\n",
+                "assert.sameValue(Object.isFrozen(boundAbs), true, 'bound function freeze works');\n",
+                "assert.sameValue(Function.isCallable(sum), true, 'Function.isCallable sees closures');\n",
+                "assert.sameValue(Function.isCallable(bound), true, 'Function.isCallable sees bound functions');\n",
+                "assert.sameValue(Function.isCallable({}), false, 'Function.isCallable rejects plain objects');\n",
+                "assert.sameValue(sum.toString(), 'function () { [bytecode] }', 'Function.prototype.toString formats closures');\n",
+                "assert.sameValue(bound.toString(), 'function () { [native code] }', 'Function.prototype.toString formats bound functions');\n",
+                "try {\n",
+                "    Function.prototype.call.call({}, null);\n",
+                "    throw new Test262Error('#3');\n",
+                "} catch (error) {\n",
+                "    assert.sameValue(error.name, 'TypeError', 'Function.prototype.call rejects non-callable receiver');\n",
+                "}\n",
+                "try {\n",
+                "    Function.prototype.apply.call(sum, null, 'otter');\n",
+                "    throw new Test262Error('#4');\n",
+                "} catch (error) {\n",
+                "    assert.sameValue(error.name, 'TypeError', 'Function.prototype.apply rejects primitive string argArray');\n",
+                "}\n",
             ),
             "native-test262-closures-objects.js",
         )
         .expect("closure/object script should compile");
 
-        let result = Interpreter::new()
+        Interpreter::new()
             .execute(&module)
             .expect("closure/object script should execute");
-        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_default_initializer_name_inference() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var [arrayDefault = function() { return 1; }] = [];\n",
+                "assert.sameValue(arrayDefault.name, 'arrayDefault', 'array destructuring default infers binding name');\n",
+                "var { objectDefault = function() { return 1; } } = {};\n",
+                "assert.sameValue(objectDefault.name, 'objectDefault', 'object destructuring default infers binding name');\n",
+                "var { source: aliasDefault = function() { return 1; } } = {};\n",
+                "assert.sameValue(aliasDefault.name, 'aliasDefault', 'aliased object destructuring default infers local binding name');\n",
+                "function readDefaultParamValues(numberParam = 1, fnParam = function() { return 2; }, arrowParam = () => 3) {\n",
+                "    assert.sameValue(readDefaultParamValues.length, 0, 'function length stops at first default parameter');\n",
+                "    assert.sameValue(numberParam, 1, 'default parameter uses initializer when argument is missing');\n",
+                "    assert.sameValue(fnParam.name, 'fnParam', 'default parameter function infers parameter name');\n",
+                "    assert.sameValue(fnParam(), 2, 'default parameter function remains callable');\n",
+                "    assert.sameValue(arrowParam.name, 'arrowParam', 'default parameter arrow infers parameter name');\n",
+                "    assert.sameValue(arrowParam(), 3, 'default parameter arrow remains callable');\n",
+                "}\n",
+                "function oneBeforeDefault(a, b = 1, c) { return a + b + c; }\n",
+                "assert.sameValue(oneBeforeDefault.length, 1, 'function length counts parameters before first default');\n",
+                "readDefaultParamValues();\n",
+                "readDefaultParamValues(4, function override() { return 5; }, () => 6);\n",
+                "var defaultArrowLength = (a, b = 1, c) => a + b + c;\n",
+                "assert.sameValue(defaultArrowLength.length, 1, 'arrow length counts parameters before first default');\n",
+            ),
+            "native-test262-default-initializer-names.js",
+        )
+        .expect("default initializer name script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("default initializer name script should execute");
+    }
+
+    #[test]
+    fn compile_test262_basic_script_enforces_parameter_default_tdz_semantics() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function earlierUsesEarlier(a = 1, b = a) { return b; }\n",
+                "assert.sameValue(earlierUsesEarlier(), 1, 'later default can read earlier initialized parameter');\n",
+                "function selfRef(a = a) { return a; }\n",
+                "try {\n",
+                "  selfRef();\n",
+                "  throw new Test262Error('self-referential parameter default should throw ReferenceError');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'ReferenceError', 'self-referential parameter default throws ReferenceError');\n",
+                "}\n",
+                "function earlierUsesLater(a = b, b = 1) { return a + b; }\n",
+                "try {\n",
+                "  earlierUsesLater();\n",
+                "  throw new Test262Error('earlier default reading later parameter should throw ReferenceError');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'ReferenceError', 'later parameter is TDZ during earlier default');\n",
+                "}\n",
+                "function destructuringUsesLater({ x = y } = {}, y = 2) { return x + y; }\n",
+                "try {\n",
+                "  destructuringUsesLater();\n",
+                "  throw new Test262Error('destructuring default reading later parameter should throw ReferenceError');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'ReferenceError', 'later parameter stays TDZ inside earlier destructuring default');\n",
+                "}\n",
+                "function invokedClosureBeforeInit(a = function() { return b; }(), b = 4) { return a; }\n",
+                "try {\n",
+                "  invokedClosureBeforeInit();\n",
+                "  throw new Test262Error('closure invoked during default before later initialization should throw ReferenceError');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'ReferenceError', 'captured later parameter remains TDZ until initialized');\n",
+                "}\n",
+                "function closureAfterInit(a = function() { return b; }, b = 3) { return a(); }\n",
+                "assert.sameValue(closureAfterInit(), 3, 'closure created during earlier default observes later parameter initialization');\n",
+            ),
+            "native-test262-parameter-default-tdz.js",
+        )
+        .expect("parameter default TDZ script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("parameter default TDZ script should execute");
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_destructuring_parameters() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function readPoint({ x, y }) {\n",
+                "    return x + y;\n",
+                "}\n",
+                "assert.sameValue(readPoint.length, 1, 'object destructuring parameter counts as one formal parameter');\n",
+                "assert.sameValue(readPoint({ x: 2, y: 5 }), 7, 'object destructuring parameter binds properties');\n",
+                "var readPair = ([left, right]) => left + right;\n",
+                "assert.sameValue(readPair.length, 1, 'array destructuring parameter counts as one formal parameter');\n",
+                "assert.sameValue(readPair([3, 4]), 7, 'array destructuring parameter binds indices');\n",
+                "function readDefaults({ fn = function() { return 5; }, arrow = () => 6 } = {}) {\n",
+                "    assert.sameValue(fn.name, 'fn', 'nested destructuring default function infers binding name');\n",
+                "    assert.sameValue(fn(), 5, 'nested destructuring default function remains callable');\n",
+                "    assert.sameValue(arrow.name, 'arrow', 'nested destructuring default arrow infers binding name');\n",
+                "    assert.sameValue(arrow(), 6, 'nested destructuring default arrow remains callable');\n",
+                "}\n",
+                "assert.sameValue(readDefaults.length, 0, 'destructuring parameter with top-level default shortens function length');\n",
+                "readDefaults();\n",
+                "function sumDefaultPair([left, right] = [7, 8]) { return left + right; }\n",
+                "assert.sameValue(sumDefaultPair.length, 0, 'array destructuring parameter default shortens function length');\n",
+                "assert.sameValue(sumDefaultPair(), 15, 'array destructuring parameter uses top-level default');\n",
+                "function collectTail([head, ...tail]) {\n",
+                "    assert.sameValue(collectTail.length, 1, 'array rest parameter still counts as one formal parameter');\n",
+                "    assert.sameValue(head, 1, 'array rest parameter keeps head binding');\n",
+                "    assert.sameValue(tail.length, 2, 'array rest parameter collects remaining elements');\n",
+                "    assert.sameValue(tail[0], 2, 'array rest parameter keeps first remaining element');\n",
+                "    assert.sameValue(tail[1], 3, 'array rest parameter keeps second remaining element');\n",
+                "    return tail.join(',');\n",
+                "}\n",
+                "assert.sameValue(collectTail([1, 2, 3]), '2,3', 'array rest parameter materializes tail array');\n",
+                "function nestedArrayRest([first, ...[second, third = function() { return 4; }]]) {\n",
+                "    assert.sameValue(third.name, 'third', 'array rest nested default infers local binding name');\n",
+                "    return first + second + third();\n",
+                "}\n",
+                "assert.sameValue(nestedArrayRest([1, 2]), 7, 'array rest parameter supports nested destructuring and defaults');\n",
+                "var dynamicKey = 'value';\n",
+                "var { [dynamicKey]: computedValue } = { value: 12 };\n",
+                "assert.sameValue(computedValue, 12, 'computed object destructuring key reads dynamic property');\n",
+                "var missingKey = 'missing';\n",
+                "var { [missingKey]: computedDefault = function() { return 13; } } = {};\n",
+                "assert.sameValue(computedDefault.name, 'computedDefault', 'computed object destructuring default infers local binding name');\n",
+                "assert.sameValue(computedDefault(), 13, 'computed object destructuring default remains callable');\n",
+            ),
+            "native-test262-destructuring-parameters.js",
+        )
+        .expect("destructuring parameter script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("destructuring parameter script should execute");
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_rest_destructuring() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var source = { keep: 2, drop: 1, extra: 3 };\n",
+                "var { drop, ...rest } = source;\n",
+                "assert.sameValue(drop, 1, 'object rest keeps extracted binding');\n",
+                "assert.sameValue(rest.drop, undefined, 'object rest excludes extracted key');\n",
+                "assert.sameValue(rest.keep, 2, 'object rest copies first remaining own key');\n",
+                "assert.sameValue(rest.extra, 3, 'object rest copies later remaining own key');\n",
+                "assert.sameValue(Object.keys(rest).length, 2, 'object rest copies only remaining enumerable own keys');\n",
+                "var proto = { inherited: 4 };\n",
+                "var derived = Object.create(proto);\n",
+                "derived.own = 5;\n",
+                "var { ...ownOnly } = derived;\n",
+                "assert.sameValue(ownOnly.own, 5, 'object rest copies own enumerable properties');\n",
+                "assert.sameValue(ownOnly.inherited, undefined, 'object rest skips inherited enumerable properties');\n",
+                "function readObjectRest({ head, ...tail }) {\n",
+                "    assert.sameValue(head, 7, 'object rest parameter keeps extracted binding');\n",
+                "    assert.sameValue(tail.left, 8, 'object rest parameter copies remaining own key');\n",
+                "    assert.sameValue(tail.head, undefined, 'object rest parameter excludes extracted key');\n",
+                "    return tail.right;\n",
+                "}\n",
+                "assert.sameValue(readObjectRest({ head: 7, left: 8, right: 9 }), 9, 'object rest parameter remains callable');\n",
+                "var { 0: firstChar, ...stringRest } = 'ot';\n",
+                "assert.sameValue(firstChar, 'o', 'object rest boxes primitive string source for extracted binding');\n",
+                "assert.sameValue(stringRest[0], undefined, 'object rest excludes extracted string index');\n",
+                "assert.sameValue(stringRest[1], 't', 'object rest keeps remaining boxed string index');\n",
+                "var { head: renamed, ...tailObject } = { head: 1, tail: function() { return 11; } };\n",
+                "assert.sameValue(renamed, 1, 'object rest nested pattern keeps aliased binding');\n",
+                "assert.sameValue(tailObject.tail.name, 'tail', 'object rest preserves callable own properties');\n",
+                "assert.sameValue(tailObject.tail(), 11, 'object rest copied function property remains callable');\n",
+                "var computedKey = 'drop';\n",
+                "var { [computedKey]: computedDrop, ...computedRest } = { drop: 5, keep: 6 };\n",
+                "assert.sameValue(computedDrop, 5, 'object rest with computed key keeps extracted binding');\n",
+                "assert.sameValue(computedRest.drop, undefined, 'object rest excludes computed extracted key');\n",
+                "assert.sameValue(computedRest.keep, 6, 'object rest preserves non-excluded own key after computed extraction');\n",
+            ),
+            "native-test262-object-rest-destructuring.js",
+        )
+        .expect("object rest destructuring script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("object rest destructuring script should execute");
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_rest_parameters() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function collect(...rest) {\n",
+                "    assert.sameValue(collect.length, 0, 'rest-only function length is zero');\n",
+                "    assert.sameValue(rest.length, 3, 'rest-only parameter captures all arguments');\n",
+                "    assert.sameValue(rest[0], 1, 'rest-only parameter keeps first extra argument');\n",
+                "    assert.sameValue(rest[2], 3, 'rest-only parameter keeps last extra argument');\n",
+                "    return rest.join(',');\n",
+                "}\n",
+                "assert.sameValue(collect(1, 2, 3), '1,2,3', 'rest-only parameter materializes a real array');\n",
+                "function headAndTail(head, ...tail) {\n",
+                "    assert.sameValue(headAndTail.length, 1, 'rest parameter does not contribute to function length');\n",
+                "    return head + ':' + tail.join(',');\n",
+                "}\n",
+                "assert.sameValue(headAndTail(1, 2, 3), '1:2,3', 'rest parameter captures overflow arguments only');\n",
+                "assert.sameValue(headAndTail(1), '1:', 'rest parameter becomes an empty array when no overflow args exist');\n",
+                "var arrowRest = (prefix, ...tail) => prefix + ':' + tail.length;\n",
+                "assert.sameValue(arrowRest.length, 1, 'arrow rest parameter does not contribute to length');\n",
+                "assert.sameValue(arrowRest('x', 1, 2), 'x:2', 'arrow rest parameter captures overflow arguments');\n",
+                "function destructureRest(...[first, second = function() { return 7; }]) {\n",
+                "    assert.sameValue(second.name, 'second', 'rest destructuring default infers local binding name');\n",
+                "    return first + second();\n",
+                "}\n",
+                "assert.sameValue(destructureRest(5), 12, 'destructuring can bind against the generated rest array');\n",
+                "var [lead, ...tail] = [1, 2, 3];\n",
+                "assert.sameValue(lead, 1, 'array destructuring rest keeps leading binding');\n",
+                "assert.sameValue(tail.length, 2, 'array destructuring rest collects remaining elements');\n",
+                "assert.sameValue(tail[0], 2, 'array destructuring rest keeps first remaining element');\n",
+                "assert.sameValue(tail[1], 3, 'array destructuring rest keeps second remaining element');\n",
+                "var [single, ...emptyTail] = [9];\n",
+                "assert.sameValue(emptyTail.length, 0, 'array destructuring rest becomes empty array when there is no tail');\n",
+                "var [outer, ...[inner, inferred = function() { return 8; }]] = [1, 2];\n",
+                "assert.sameValue(outer, 1, 'array destructuring nested rest keeps head binding');\n",
+                "assert.sameValue(inner, 2, 'array destructuring nested rest keeps first tail element');\n",
+                "assert.sameValue(inferred.name, 'inferred', 'array destructuring nested rest default infers binding name');\n",
+                "assert.sameValue(inferred(), 8, 'array destructuring nested rest default remains callable');\n",
+            ),
+            "native-test262-rest-parameters.js",
+        )
+        .expect("rest parameter script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("rest parameter script should execute");
     }
 
     #[test]
@@ -745,9 +1110,29 @@ mod tests {
                 "}\n",
                 "var box = new Box(7);\n",
                 "var override = new Override();\n",
+                "var arrow = () => 1;\n",
+                "var boundArrow = arrow.bind(null);\n",
                 "assert.sameValue(box.value, 7, \"primitive return falls back to receiver\");\n",
                 "assert.sameValue(override.value, 9, \"object return overrides receiver\");\n",
                 "assert.sameValue(box.constructor, Box, \"closure prototype constructor link\");\n",
+                "try {\n",
+                "  new arrow();\n",
+                "  throw new Test262Error('new arrow should reject non-constructible closure');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'new arrow throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  new boundArrow();\n",
+                "  throw new Test262Error('new boundArrow should reject non-constructible bound closure');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'new boundArrow throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  new (Math.abs)(1);\n",
+                "  throw new Test262Error('new Math.abs should reject non-constructible host function');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'new Math.abs throws TypeError');\n",
+                "}\n",
             ),
             "native-test262-new-constructors.js",
         )
@@ -819,12 +1204,37 @@ mod tests {
                 "var pointFromArrayLike = Reflect.construct(Point, constructArgs);\n",
                 "assert.sameValue(pointFromArrayLike.x, 6, 'Reflect.construct reads array-like argument 0');\n",
                 "assert.sameValue(pointFromArrayLike.y, 7, 'Reflect.construct uses [[Get]] on argumentsList');\n",
+                "var BoundPoint = Point.bind({ ignored: true }, 11);\n",
+                "var pointFromBoundTarget = Reflect.construct(BoundPoint, [12]);\n",
+                "assert.sameValue(pointFromBoundTarget.x, 11, 'Reflect.construct prepends bound constructor args');\n",
+                "assert.sameValue(pointFromBoundTarget.y, 12, 'Reflect.construct forwards runtime args through bound constructor');\n",
+                "assert.sameValue(Object.getPrototypeOf(pointFromBoundTarget), Point.prototype, 'Reflect.construct normalizes bound newTarget to target');\n",
                 "function NewTarget() {}\n",
                 "var customProto = { kind: 'custom' };\n",
                 "NewTarget.prototype = customProto;\n",
                 "var viaNewTarget = Reflect.construct(Point, [8, 9], NewTarget);\n",
                 "assert.sameValue(Object.getPrototypeOf(viaNewTarget), customProto, 'Reflect.construct uses newTarget prototype');\n",
                 "assert.sameValue(viaNewTarget.x, 8, 'Reflect.construct still runs target body with newTarget');\n",
+                "var viaBoundNewTarget = Reflect.construct(BoundPoint, [13], NewTarget);\n",
+                "assert.sameValue(Object.getPrototypeOf(viaBoundNewTarget), customProto, 'Reflect.construct preserves explicit newTarget through bound constructor');\n",
+                "assert.sameValue(viaBoundNewTarget.x, 11, 'Reflect.construct keeps bound args with explicit newTarget');\n",
+                "assert.sameValue(viaBoundNewTarget.y, 13, 'Reflect.construct forwards args with explicit newTarget through bound constructor');\n",
+                "var BoundNewTarget = Point.bind(null, 21);\n",
+                "var boundProtoGetterCalls = 0;\n",
+                "Object.defineProperty(BoundNewTarget, 'prototype', { get: function() { boundProtoGetterCalls = boundProtoGetterCalls + 1; return customProto; }, configurable: true });\n",
+                "var viaBoundPrototypeGetter = Reflect.construct(Point, [22], BoundNewTarget);\n",
+                "assert.sameValue(Object.getPrototypeOf(viaBoundPrototypeGetter), customProto, 'Reflect.construct uses [[Get]] for explicit newTarget prototype');\n",
+                "assert.sameValue(boundProtoGetterCalls, 1, 'Reflect.construct invokes explicit newTarget prototype getter');\n",
+                "Object.defineProperty(BoundNewTarget, 'prototype', { get: function() { return 1; }, configurable: true });\n",
+                "var viaNonObjectPrototype = Reflect.construct(Point, [23], BoundNewTarget);\n",
+                "assert.sameValue(Object.getPrototypeOf(viaNonObjectPrototype), Object.prototype, 'Reflect.construct falls back when explicit newTarget prototype getter returns non-object');\n",
+                "Object.defineProperty(BoundNewTarget, 'prototype', { get: function() { throw 5; }, configurable: true });\n",
+                "try {\n",
+                "  Reflect.construct(Point, [24], BoundNewTarget);\n",
+                "  throw new Test262Error('Reflect.construct should propagate explicit newTarget prototype getter throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error, 5, 'Reflect.construct propagates explicit newTarget prototype getter throw');\n",
+                "}\n",
                 "function HostTarget() {}\n",
                 "HostTarget.prototype = { host: true };\n",
                 "var stringViaNewTarget = Reflect.construct(String, ['ot'], HostTarget);\n",
@@ -842,6 +1252,12 @@ mod tests {
                 "  throw new Test262Error('Reflect.construct should reject undefined argumentsList');\n",
                 "} catch (error) {\n",
                 "  assert.sameValue(error.name, 'TypeError', 'Reflect.construct undefined argumentsList throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.construct(Point, 'ot');\n",
+                "  throw new Test262Error('Reflect.construct should reject primitive string argumentsList');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.construct primitive string argumentsList throws TypeError');\n",
                 "}\n",
                 "try {\n",
                 "  Reflect.construct(Point, [], {});\n",
@@ -866,6 +1282,12 @@ mod tests {
                 "  throw new Test262Error('Reflect.apply should reject undefined argumentsList');\n",
                 "} catch (error) {\n",
                 "  assert.sameValue(error.name, 'TypeError', 'Reflect.apply undefined argumentsList throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.apply(add, null, 'ot');\n",
+                "  throw new Test262Error('Reflect.apply should reject primitive string argumentsList');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.apply primitive string argumentsList throws TypeError');\n",
                 "}\n",
                 "var accessor = {};\n",
                 "Reflect.defineProperty(accessor, \"flag\", { get: Boolean.prototype.valueOf });\n",
@@ -920,7 +1342,7 @@ mod tests {
         let mut runtime = crate::interpreter::RuntimeState::new();
         let global = runtime.intrinsics().global_object();
         let registers = [RegisterValue::from_object_handle(global.0)];
-        let result = Interpreter::new()
+        Interpreter::new()
             .execute_with_runtime(
                 &module,
                 crate::module::FunctionIndex(0),
@@ -928,7 +1350,6 @@ mod tests {
                 &mut runtime,
             )
             .expect("array/reflect script should execute");
-        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
     }
 
     #[test]
@@ -955,6 +1376,196 @@ mod tests {
                 "} catch (error) {}\n",
             ),
             "native-test262-property-introspection.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_reflect_object_target_validation() {
+        let result = execute_test262_basic(
+            concat!(
+                "try {\n",
+                "  Reflect.get(1, 'x');\n",
+                "  throw new Test262Error('Reflect.get should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.get primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.get('otter', 'length');\n",
+                "  throw new Test262Error('Reflect.get should reject primitive string targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.get primitive string target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.set(1, 'x', 1);\n",
+                "  throw new Test262Error('Reflect.set should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.set primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.defineProperty(1, 'x', { value: 1 });\n",
+                "  throw new Test262Error('Reflect.defineProperty should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.defineProperty primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.deleteProperty(1, 'x');\n",
+                "  throw new Test262Error('Reflect.deleteProperty should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.deleteProperty primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.getOwnPropertyDescriptor(1, 'x');\n",
+                "  throw new Test262Error('Reflect.getOwnPropertyDescriptor should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.getOwnPropertyDescriptor primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.getPrototypeOf(1);\n",
+                "  throw new Test262Error('Reflect.getPrototypeOf should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.getPrototypeOf primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.has(1, 'x');\n",
+                "  throw new Test262Error('Reflect.has should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.has primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.isExtensible(1);\n",
+                "  throw new Test262Error('Reflect.isExtensible should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.isExtensible primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.ownKeys('otter');\n",
+                "  throw new Test262Error('Reflect.ownKeys should reject primitive string targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.ownKeys primitive string target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.preventExtensions(1);\n",
+                "  throw new Test262Error('Reflect.preventExtensions should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.preventExtensions primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.setPrototypeOf(1, null);\n",
+                "  throw new Test262Error('Reflect.setPrototypeOf should reject primitive targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.setPrototypeOf primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.setPrototypeOf({}, 1);\n",
+                "  throw new Test262Error('Reflect.setPrototypeOf should reject primitive proto');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.setPrototypeOf primitive proto throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Reflect.setPrototypeOf({}, 'otter');\n",
+                "  throw new Test262Error('Reflect.setPrototypeOf should reject primitive string proto');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Reflect.setPrototypeOf primitive string proto throws TypeError');\n",
+                "}\n",
+            ),
+            "native-test262-reflect-target-validation.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_introspection_nullish_type_errors() {
+        let result = execute_test262_basic(
+            concat!(
+                "try {\n",
+                "  Object.hasOwn(null, 'x');\n",
+                "  throw new Test262Error('Object.hasOwn should reject null target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.hasOwn null target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.keys(null);\n",
+                "  throw new Test262Error('Object.keys should reject null target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.keys null target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.values(undefined);\n",
+                "  throw new Test262Error('Object.values should reject undefined target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.values undefined target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.entries(null);\n",
+                "  throw new Test262Error('Object.entries should reject null target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.entries null target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.getOwnPropertyDescriptor(undefined, 'x');\n",
+                "  throw new Test262Error('Object.getOwnPropertyDescriptor should reject undefined target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.getOwnPropertyDescriptor undefined target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.getOwnPropertyDescriptors(null);\n",
+                "  throw new Test262Error('Object.getOwnPropertyDescriptors should reject null target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.getOwnPropertyDescriptors null target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.getOwnPropertyNames(undefined);\n",
+                "  throw new Test262Error('Object.getOwnPropertyNames should reject undefined target');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.getOwnPropertyNames undefined target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.prototype.hasOwnProperty.call(null, 'x');\n",
+                "  throw new Test262Error('hasOwnProperty should reject null receiver');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'hasOwnProperty null receiver throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.prototype.propertyIsEnumerable.call(undefined, 'x');\n",
+                "  throw new Test262Error('propertyIsEnumerable should reject undefined receiver');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'propertyIsEnumerable undefined receiver throws TypeError');\n",
+                "}\n",
+                "assert.sameValue(Object.prototype.toString.call(undefined), '[object Undefined]', 'Object.prototype.toString preserves undefined tag');\n",
+                "assert.sameValue(Object.prototype.toString.call(null), '[object Null]', 'Object.prototype.toString preserves null tag');\n",
+            ),
+            "native-test262-object-introspection-nullish-errors.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_prototype_to_string_tags() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(Object.prototype.toString.call({}), '[object Object]', 'plain object default tag');\n",
+                "assert.sameValue(Object.prototype.toString.call([]), '[object Array]', 'array builtin tag');\n",
+                "assert.sameValue(Object.prototype.toString.call(function() {}), '[object Function]', 'function builtin tag');\n",
+                "assert.sameValue(Object.prototype.toString.call('otter'), '[object String]', 'primitive string builtin tag');\n",
+                "assert.sameValue(Object.prototype.toString.call(1), '[object Number]', 'primitive number builtin tag');\n",
+                "assert.sameValue(Object.prototype.toString.call(true), '[object Boolean]', 'primitive boolean builtin tag');\n",
+                "assert.sameValue(Object.prototype.toString.call(Math), '[object Math]', 'Math uses @@toStringTag');\n",
+                "var tagged = { '@@toStringTag': 'OtterThing' };\n",
+                "assert.sameValue(Object.prototype.toString.call(tagged), '[object OtterThing]', 'own @@toStringTag overrides builtin tag');\n",
+                "var taggedProto = { '@@toStringTag': 'ProtoTag' };\n",
+                "var inheritedTagged = Object.create(taggedProto);\n",
+                "assert.sameValue(Object.prototype.toString.call(inheritedTagged), '[object ProtoTag]', 'inherited @@toStringTag is observed');\n",
+                "var nonStringTag = { '@@toStringTag': 1 };\n",
+                "assert.sameValue(Object.prototype.toString.call(nonStringTag), '[object Object]', 'non-string @@toStringTag falls back to builtin tag');\n",
+                "Boolean.prototype['@@toStringTag'] = 'Flag';\n",
+                "assert.sameValue(Object.prototype.toString.call(true), '[object Flag]', 'primitive boolean receiver observes inherited @@toStringTag via boxing');\n",
+                "delete Boolean.prototype['@@toStringTag'];\n",
+                "String.prototype['@@toStringTag'] = 'Text';\n",
+                "assert.sameValue(Object.prototype.toString.call('otter'), '[object Text]', 'primitive string receiver observes inherited @@toStringTag via boxing');\n",
+                "delete String.prototype['@@toStringTag'];\n",
+            ),
+            "native-test262-object-prototype-to-string-tags.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
     }
@@ -1314,6 +1925,12 @@ mod tests {
                 "} catch (error) {\n",
                 "  assert.sameValue(error.name, 'TypeError', 'Object.defineProperty primitive target throws TypeError');\n",
                 "}\n",
+                "try {\n",
+                "  Object.defineProperty('otter', 'x', { value: 1 });\n",
+                "  throw new Test262Error('Object.defineProperty should reject primitive string targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.defineProperty primitive string target throws TypeError');\n",
+                "}\n",
                 "var blocked = {};\n",
                 "Object.preventExtensions(blocked);\n",
                 "try {\n",
@@ -1390,6 +2007,12 @@ mod tests {
                 "  throw new Test262Error('defineProperties should reject primitive targets');\n",
                 "} catch (error) {\n",
                 "  assert.sameValue(error.name, 'TypeError', 'defineProperties primitive target throws TypeError');\n",
+                "}\n",
+                "try {\n",
+                "  Object.defineProperties('otter', { late: { value: 1 } });\n",
+                "  throw new Test262Error('defineProperties should reject primitive string targets');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'defineProperties primitive string target throws TypeError');\n",
                 "}\n",
             ),
             "native-test262-object-define-properties.js",
@@ -1478,10 +2101,20 @@ mod tests {
                 "assert.sameValue(Object.isExtensible(object), false, 'Object.isExtensible false');\n",
                 "assert.sameValue(Reflect.isExtensible(object), false, 'Reflect.isExtensible false');\n",
                 "assert.sameValue(Reflect.setPrototypeOf(object, null), false, 'Reflect.setPrototypeOf fails on non-extensible target');\n",
+                "assert.sameValue(Object.preventExtensions('otter'), 'otter', 'Object.preventExtensions returns primitive string unchanged');\n",
+                "assert.sameValue(Object.seal('otter'), 'otter', 'Object.seal returns primitive string unchanged');\n",
+                "assert.sameValue(Object.freeze('otter'), 'otter', 'Object.freeze returns primitive string unchanged');\n",
+                "assert.sameValue(Object.isExtensible('otter'), false, 'Object.isExtensible treats primitive string as non-object');\n",
                 "try {\n",
                 "  Object.setPrototypeOf(object, null);\n",
                 "  throw new Test262Error('Object.setPrototypeOf should throw on non-extensible target');\n",
                 "} catch (error) {}\n",
+                "try {\n",
+                "  Object.setPrototypeOf({}, 'otter');\n",
+                "  throw new Test262Error('Object.setPrototypeOf should reject primitive string proto');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'Object.setPrototypeOf primitive string proto throws TypeError');\n",
+                "}\n",
             ),
             "native-test262-extensibility-controls.js",
         );
@@ -1494,6 +2127,8 @@ mod tests {
             concat!(
                 "assert.sameValue(Object.isFrozen(undefined), true, 'undefined is frozen');\n",
                 "assert.sameValue(Object.isSealed(undefined), true, 'undefined is sealed');\n",
+                "assert.sameValue(Object.isFrozen('otter'), true, 'primitive string is frozen');\n",
+                "assert.sameValue(Object.isSealed('otter'), true, 'primitive string is sealed');\n",
                 "var object = { value: 1 };\n",
                 "assert.sameValue(Object.isFrozen(object), false, 'plain object is not frozen');\n",
                 "assert.sameValue(Object.isSealed(object), false, 'plain object is not sealed');\n",
@@ -2269,6 +2904,128 @@ mod tests {
         assert_eq!(result.return_value(), RegisterValue::from_i32(0));
     }
 
+    #[test]
+    fn compile_test262_basic_script_supports_object_literal_computed_property_names() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var key = 'dynamic';\n",
+                "var calls = 0;\n",
+                "var obj = {\n",
+                "    [key]: 7,\n",
+                "    [1 + 1]: 'two',\n",
+                "    ['pre' + 'fix']: true,\n",
+                "    [(() => { calls = calls + 1; return 'side'; })()]: 9\n",
+                "};\n",
+                "assert.sameValue(obj.dynamic, 7, 'computed string key defines property');\n",
+                "assert.sameValue(obj['2'], 'two', 'computed numeric key is coerced through ToPropertyKey');\n",
+                "assert.sameValue(obj.prefix, true, 'computed concatenated string key defines property');\n",
+                "assert.sameValue(obj.side, 9, 'computed key expression result defines property');\n",
+                "assert.sameValue(calls, 1, 'computed key expression evaluates exactly once');\n",
+                "var overwrite = { fixed: 1, ['fixed']: 3 };\n",
+                "assert.sameValue(overwrite.fixed, 3, 'computed key can overwrite earlier static property');\n",
+            ),
+            "native-test262-object-literal-computed-keys.js",
+        )
+        .expect("computed object property script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("computed object property script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_literal_accessors() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var storage = 1;\n",
+                "var obj = {\n",
+                "    get value() { return storage + this.offset; },\n",
+                "    set value(v) { storage = v - this.offset; }\n",
+                "};\n",
+                "obj.offset = 4;\n",
+                "assert.sameValue(obj.value, 5, 'object literal getter reads through accessor semantics');\n",
+                "obj.value = 11;\n",
+                "assert.sameValue(storage, 7, 'object literal setter receives assigned value and receiver');\n",
+                "var desc = Object.getOwnPropertyDescriptor(obj, 'value');\n",
+                "assert.sameValue(typeof desc.get, 'function', 'object literal getter installs accessor getter');\n",
+                "assert.sameValue(typeof desc.set, 'function', 'object literal setter installs accessor setter');\n",
+                "assert.sameValue(desc.enumerable, true, 'object literal accessors are enumerable');\n",
+                "assert.sameValue(desc.configurable, true, 'object literal accessors are configurable');\n",
+                "assert.sameValue(desc.get.name, 'get value', 'object literal getter gets prefixed function name');\n",
+                "assert.sameValue(desc.set.name, 'set value', 'object literal setter gets prefixed function name');\n",
+                "var replaced = { value: 1, get value() { return 3; } };\n",
+                "assert.sameValue(replaced.value, 3, 'object literal getter can replace earlier data property');\n",
+                "var dynamicKey = 'computed';\n",
+                "var computedStorage = 0;\n",
+                "var computed = {\n",
+                "    get [dynamicKey]() { return computedStorage + 1; },\n",
+                "    set [dynamicKey](v) { computedStorage = v; },\n",
+                "    method(value) { return value + this.extra; }\n",
+                "};\n",
+                "computed.extra = 2;\n",
+                "assert.sameValue(computed.computed, 1, 'computed object literal getter defines accessor');\n",
+                "computed.computed = 5;\n",
+                "assert.sameValue(computedStorage, 5, 'computed object literal setter defines accessor');\n",
+                "assert.sameValue(computed.method(3), 5, 'object literal method shorthand remains callable with receiver');\n",
+                "assert.sameValue(computed.method.name, 'method', 'object literal method shorthand infers function name');\n",
+            ),
+            "native-test262-object-literal-accessors.js",
+        )
+        .expect("object literal accessor script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("object literal accessor script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_test262_basic_script_supports_object_literal_spread_properties() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var getterCalls = 0;\n",
+                "var setterCalls = 0;\n",
+                "var source = {\n",
+                "    get value() { getterCalls = getterCalls + 1; return 7; },\n",
+                "    fixed: 9\n",
+                "};\n",
+                "var obj = { prefix: 1, ...source, suffix: 3 };\n",
+                "assert.sameValue(obj.prefix, 1, 'spread preserves earlier properties');\n",
+                "assert.sameValue(obj.value, 7, 'spread copies enumerable getter-backed source values');\n",
+                "assert.sameValue(obj.fixed, 9, 'spread copies enumerable own data properties');\n",
+                "assert.sameValue(obj.suffix, 3, 'spread preserves later properties');\n",
+                "assert.sameValue(getterCalls, 1, 'spread evaluates getter exactly once');\n",
+                "var overwrite = { a: 1, ...{ a: 4 }, a2: 5 };\n",
+                "assert.sameValue(overwrite.a, 4, 'later spread overwrites earlier data property');\n",
+                "assert.sameValue(overwrite.a2, 5, 'later static property still defines normally');\n",
+                "var ignored = { before: 1, ...undefined, ...null, after: 2 };\n",
+                "assert.sameValue(ignored.before, 1, 'undefined spread is ignored');\n",
+                "assert.sameValue(ignored.after, 2, 'null spread is ignored');\n",
+                "var replaced = {\n",
+                "    set value(v) { setterCalls = setterCalls + 1; },\n",
+                "    ...{ value: 11 }\n",
+                "};\n",
+                "assert.sameValue(setterCalls, 0, 'spread defines data property instead of invoking target setter');\n",
+                "assert.sameValue(replaced.value, 11, 'spread replaces earlier accessor with data property');\n",
+                "var desc = Object.getOwnPropertyDescriptor(replaced, 'value');\n",
+                "assert.sameValue(desc.enumerable, true, 'spread defines enumerable data property');\n",
+                "assert.sameValue(desc.writable, true, 'spread defines writable data property');\n",
+                "assert.sameValue(desc.configurable, true, 'spread defines configurable data property');\n",
+                "var stringSpread = { ...'ot' };\n",
+                "assert.sameValue(stringSpread[0], 'o', 'spread boxes string source index 0');\n",
+                "assert.sameValue(stringSpread[1], 't', 'spread boxes string source index 1');\n",
+            ),
+            "native-test262-object-literal-spread.js",
+        )
+        .expect("object literal spread script should compile");
+
+        let result = Interpreter::new()
+            .execute(&module)
+            .expect("object literal spread script should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
     // --- TASK-BASE-0007: for-of with let/const ---
 
     #[test]
@@ -2610,6 +3367,80 @@ mod tests {
         assert_eq!(result, RegisterValue::from_i32(0));
     }
 
+    #[test]
+    fn instanceof_bound_function_uses_target_prototype() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Foo() {}\n",
+                "var BoundFoo = Foo.bind(null);\n",
+                "var BoundBoundFoo = BoundFoo.bind(null);\n",
+                "var f = new Foo();\n",
+                "assert.sameValue(f instanceof BoundFoo, true, 'bound instanceof unwraps target');\n",
+                "assert.sameValue(f instanceof BoundBoundFoo, true, 'nested bound instanceof unwraps recursively');\n",
+            ),
+            "instanceof-bound.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn instanceof_rejects_non_callable_rhs() {
+        let result = execute_test262_basic(
+            concat!(
+                "function Foo() {}\n",
+                "var f = new Foo();\n",
+                "try {\n",
+                "  f instanceof {};\n",
+                "  throw new Test262Error('plain object rhs should throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'non-callable rhs throws TypeError');\n",
+                "}\n",
+            ),
+            "instanceof-non-callable-rhs.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn instanceof_uses_get_for_prototype() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "var proto = { marker: true };\n",
+                "var obj = Object.create(proto);\n",
+                "var arrow = () => 1;\n",
+                "var ownGetterCalls = 0;\n",
+                "Object.defineProperty(arrow, 'prototype', { get: function() { ownGetterCalls = ownGetterCalls + 1; return proto; }, configurable: true });\n",
+                "assert.sameValue(obj instanceof arrow, true, 'instanceof uses own accessor prototype');\n",
+                "assert.sameValue(ownGetterCalls, 1, 'instanceof invokes own prototype getter exactly once');\n",
+                "var inheritedGetterCalls = 0;\n",
+                "Object.defineProperty(Function.prototype, 'prototype', { get: function() { inheritedGetterCalls = inheritedGetterCalls + 1; return proto; }, configurable: true });\n",
+                "assert.sameValue(obj instanceof Math.abs, true, 'instanceof uses inherited prototype getter');\n",
+                "assert.sameValue(inheritedGetterCalls, 1, 'instanceof invokes inherited prototype getter');\n",
+                "delete Function.prototype.prototype;\n",
+                "Object.defineProperty(arrow, 'prototype', { get: function() { return 1; }, configurable: true });\n",
+                "try {\n",
+                "  obj instanceof arrow;\n",
+                "  throw new Test262Error('non-object prototype should throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'instanceof rejects non-object prototype after getter');\n",
+                "}\n",
+                "Object.defineProperty(arrow, 'prototype', { get: function() { throw 5; }, configurable: true });\n",
+                "try {\n",
+                "  obj instanceof arrow;\n",
+                "  throw new Test262Error('prototype getter throw should propagate');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error, 5, 'instanceof propagates prototype getter throw');\n",
+                "}\n",
+            ),
+            "instanceof-get-prototype.js",
+        )
+        .expect("instanceof get-prototype script should compile");
+
+        Interpreter::new()
+            .execute(&module)
+            .expect("instanceof get-prototype script should execute");
+    }
+
     // ---- in operator ----
 
     #[test]
@@ -2635,6 +3466,22 @@ mod tests {
                 "assert.sameValue('inherited' in obj, true, 'inherited property found via in');\n",
             ),
             "in-inherited.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn in_non_object_rhs_throws_type_error() {
+        let result = execute_test262_basic(
+            concat!(
+                "try {\n",
+                "  'x' in 1;\n",
+                "  throw new Test262Error('in should reject non-object rhs');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'in operator throws TypeError for non-object rhs');\n",
+                "}\n",
+            ),
+            "in-non-object.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
     }
@@ -2668,7 +3515,7 @@ mod tests {
             )
             .expect_err("in operator on non-object should throw");
         assert!(
-            error.to_string().contains("Cannot use 'in' operator"),
+            matches!(error, InterpreterError::UncaughtThrow(_)),
             "unexpected error: {error}"
         );
     }
@@ -2690,7 +3537,7 @@ mod tests {
             )
             .expect_err("in operator on primitive string should throw");
         assert!(
-            error.to_string().contains("Cannot use 'in' operator"),
+            matches!(error, InterpreterError::UncaughtThrow(_)),
             "unexpected error: {error}"
         );
     }

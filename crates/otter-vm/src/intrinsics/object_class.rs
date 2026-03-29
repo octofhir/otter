@@ -251,7 +251,34 @@ fn object_to_string(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let tag = object_to_string_tag(*this, runtime)?;
+    let tag = if *this == RegisterValue::undefined() || *this == RegisterValue::null() {
+        object_to_string_tag(*this, runtime)?.to_string()
+    } else {
+        let object = to_object_for_prototype_method(
+            *this,
+            runtime,
+            "Object.prototype.toString requires an object-coercible receiver",
+        )?;
+        let builtin_tag =
+            object_to_string_tag(RegisterValue::from_object_handle(object.0), runtime)?;
+        let to_string_tag = runtime.intern_property_name("@@toStringTag");
+        let tag_value = runtime.ordinary_get(
+            object,
+            to_string_tag,
+            RegisterValue::from_object_handle(object.0),
+        )?;
+        match tag_value.as_object_handle().map(ObjectHandle) {
+            Some(handle) => match runtime.objects().string_value(handle).map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("Object.prototype.toString tag lookup failed: {error:?}").into(),
+                )
+            })? {
+                Some(tag) => tag.to_string(),
+                None => builtin_tag.to_string(),
+            },
+            None => builtin_tag.to_string(),
+        }
+    };
     let string = runtime.alloc_string(format!("[object {tag}]"));
     Ok(RegisterValue::from_object_handle(string.0))
 }
@@ -358,7 +385,10 @@ fn to_object_for_introspection(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<ObjectHandle, VmNativeCallError> {
     if value == RegisterValue::undefined() || value == RegisterValue::null() {
-        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+        return Err(throw_type_error(
+            runtime,
+            "Object operation requires an object-coercible value",
+        )?);
     }
 
     if let Some(boolean) = value.as_bool() {
@@ -379,10 +409,24 @@ fn to_object_for_introspection(
         ));
     }
 
-    value
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Thrown(RegisterValue::undefined()))
+    value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        throw_type_error(
+            runtime,
+            "Object operation requires an object-coercible value",
+        )
+        .unwrap_or_else(|error| error)
+    })
+}
+
+fn non_string_object_target(
+    value: RegisterValue,
+    runtime: &crate::interpreter::RuntimeState,
+) -> Option<ObjectHandle> {
+    let handle = value.as_object_handle().map(ObjectHandle)?;
+    if matches!(runtime.objects().kind(handle), Ok(HeapValueKind::String)) {
+        return None;
+    }
+    Some(handle)
 }
 
 fn with_vm_context(error: VmNativeCallError, context: &str) -> VmNativeCallError {
@@ -498,9 +542,7 @@ fn prototype_argument(
         return Ok(None);
     }
 
-    value
-        .as_object_handle()
-        .map(ObjectHandle)
+    non_string_object_target(value, runtime)
         .map(Some)
         .ok_or_else(|| {
             throw_type_error(
@@ -646,8 +688,7 @@ fn object_define_property(
     let target = args
         .first()
         .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
+        .and_then(|value| non_string_object_target(value, runtime))
         .ok_or_else(|| {
             throw_type_error(runtime, "Object.defineProperty requires an object")
                 .unwrap_or_else(|error| error)
@@ -690,8 +731,7 @@ fn object_define_properties(
     let target = args
         .first()
         .copied()
-        .and_then(RegisterValue::as_object_handle)
-        .map(ObjectHandle)
+        .and_then(|value| non_string_object_target(value, runtime))
         .ok_or_else(|| {
             throw_type_error(runtime, "Object.defineProperties requires an object")
                 .unwrap_or_else(|error| error)
@@ -899,7 +939,7 @@ fn object_freeze(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     // Non-object arguments are returned as-is per spec.
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(target);
     };
     runtime
@@ -921,7 +961,7 @@ fn object_seal(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(target);
     };
     runtime
@@ -943,7 +983,7 @@ fn object_prevent_extensions(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(target);
     };
     runtime
@@ -967,7 +1007,7 @@ fn object_is_extensible(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(RegisterValue::from_bool(false));
     };
     let extensible = runtime
@@ -989,7 +1029,7 @@ fn object_is_frozen(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(RegisterValue::from_bool(true));
     };
     let frozen = runtime
@@ -1011,7 +1051,7 @@ fn object_is_sealed(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let Some(handle) = target.as_object_handle().map(ObjectHandle) else {
+    let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(RegisterValue::from_bool(true));
     };
     let sealed = runtime

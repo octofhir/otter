@@ -2,8 +2,62 @@ use super::*;
 
 /// Represents a single function parameter, possibly with a default value.
 pub(super) struct ParamInfo<'a> {
-    pub(super) name: &'a str,
+    pub(super) pattern: &'a BindingPattern<'a>,
     pub(super) default: Option<&'a Expression<'a>>,
+    pub(super) is_rest: bool,
+}
+
+pub(super) fn expected_function_length(params: &[ParamInfo<'_>]) -> u16 {
+    u16::try_from(
+        params
+            .iter()
+            .take_while(|param| !param.is_rest && param.default.is_none())
+            .count(),
+    )
+    .unwrap_or(u16::MAX)
+}
+
+pub(super) fn identifier_name_for_parameter_pattern<'a>(
+    pattern: &'a BindingPattern<'a>,
+) -> Option<&'a str> {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str()),
+        BindingPattern::ObjectPattern(_)
+        | BindingPattern::ArrayPattern(_)
+        | BindingPattern::AssignmentPattern(_) => None,
+    }
+}
+
+pub(super) fn collect_binding_identifier_names(
+    pattern: &BindingPattern<'_>,
+    names: &mut Vec<String>,
+) {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => {
+            names.push(identifier.name.to_string());
+        }
+        BindingPattern::AssignmentPattern(assignment) => {
+            collect_binding_identifier_names(&assignment.left, names);
+        }
+        BindingPattern::ObjectPattern(object_pattern) => {
+            for property in &object_pattern.properties {
+                collect_binding_identifier_names(&property.value, names);
+            }
+            if let Some(rest) = &object_pattern.rest {
+                collect_binding_identifier_names(&rest.argument, names);
+            }
+        }
+        BindingPattern::ArrayPattern(array_pattern) => {
+            for element in &array_pattern.elements {
+                if let Some(element) = element {
+                    collect_binding_identifier_names(element, names);
+                }
+            }
+            if let Some(rest) = &array_pattern.rest {
+                collect_binding_identifier_names(&rest.argument, names);
+            }
+        }
+    }
 }
 
 pub(super) fn collect_var_names(statements: &[AstStatement<'_>]) -> Vec<String> {
@@ -192,37 +246,33 @@ pub(super) fn extract_function_params_from_formal<'a>(
     let mut result = Vec::new();
     for param in &params.items {
         match &param.pattern {
-            BindingPattern::BindingIdentifier(identifier) => {
+            BindingPattern::BindingIdentifier(_) => {
                 result.push(ParamInfo {
-                    name: identifier.name.as_str(),
-                    default: None,
+                    pattern: &param.pattern,
+                    default: param.initializer.as_deref(),
+                    is_rest: false,
                 });
             }
-            BindingPattern::AssignmentPattern(assignment) => {
-                let name = match &assignment.left {
-                    BindingPattern::BindingIdentifier(identifier) => identifier.name.as_str(),
-                    _ => {
-                        return Err(SourceLoweringError::Unsupported(
-                            "destructuring default parameters".to_string(),
-                        ));
-                    }
-                };
+            BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {
                 result.push(ParamInfo {
-                    name,
-                    default: Some(&assignment.right),
+                    pattern: &param.pattern,
+                    default: param.initializer.as_deref(),
+                    is_rest: false,
                 });
             }
-            _ => {
+            BindingPattern::AssignmentPattern(_) => {
                 return Err(SourceLoweringError::Unsupported(
-                    "non-identifier parameters".to_string(),
+                    "assignment pattern parameters".to_string(),
                 ));
             }
         }
     }
-    if params.rest.is_some() {
-        return Err(SourceLoweringError::Unsupported(
-            "rest parameters".to_string(),
-        ));
+    if let Some(rest) = &params.rest {
+        result.push(ParamInfo {
+            pattern: &rest.rest.argument,
+            default: None,
+            is_rest: true,
+        });
     }
     Ok(result)
 }
@@ -240,6 +290,35 @@ pub(super) fn non_computed_property_key_name(key: &PropertyKey<'_>) -> Option<St
         }),
         PropertyKey::NullLiteral(_) => Some("null".to_string()),
         _ => None,
+    }
+}
+
+pub(super) fn inferred_name_for_binding_pattern<'a>(
+    pattern: &'a BindingPattern<'a>,
+) -> Option<&'a str> {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str()),
+        BindingPattern::AssignmentPattern(assignment) => {
+            inferred_name_for_binding_pattern(&assignment.left)
+        }
+        BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => None,
+    }
+}
+
+pub(super) fn inferred_name_for_assignment_target<'a>(
+    target: &'a AssignmentTarget<'a>,
+) -> Option<&'a str> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(identifier) => Some(identifier.name.as_str()),
+        AssignmentTarget::ArrayAssignmentTarget(_)
+        | AssignmentTarget::ObjectAssignmentTarget(_)
+        | AssignmentTarget::ComputedMemberExpression(_)
+        | AssignmentTarget::StaticMemberExpression(_)
+        | AssignmentTarget::PrivateFieldExpression(_)
+        | AssignmentTarget::TSAsExpression(_)
+        | AssignmentTarget::TSSatisfiesExpression(_)
+        | AssignmentTarget::TSNonNullExpression(_)
+        | AssignmentTarget::TSTypeAssertion(_) => None,
     }
 }
 

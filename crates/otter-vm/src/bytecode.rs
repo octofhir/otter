@@ -180,6 +180,26 @@ pub enum Opcode {
     /// ES2024 §10.4.4 CreateArguments — create arguments exotic object from
     /// the current activation's actual arguments (formal params + overflow).
     CreateArguments = 0x46,
+    /// ES2024 rest parameter binding — create an Array from overflow arguments.
+    CreateRestParameters = 0x47,
+    /// Collect enumerable own property keys into a dense Array of strings.
+    CreateEnumerableOwnKeys = 0x48,
+    /// Load the internal hole sentinel.
+    LoadHole = 0x49,
+    /// Throw ReferenceError if the source register contains the hole sentinel.
+    AssertNotHole = 0x4A,
+    /// Define a named getter accessor on an object literal.
+    DefineNamedGetter = 0x4B,
+    /// Define a named setter accessor on an object literal.
+    DefineNamedSetter = 0x4C,
+    /// Define a computed getter accessor on an object literal.
+    DefineComputedGetter = 0x4D,
+    /// Define a computed setter accessor on an object literal.
+    DefineComputedSetter = 0x4E,
+    /// Copy enumerable own properties from source to target using data-property defines.
+    CopyDataProperties = 0x4F,
+    /// Copy enumerable own properties from source to target excluding listed keys.
+    CopyDataPropertiesExcept = 0x50,
 }
 
 impl Opcode {
@@ -248,6 +268,16 @@ impl Opcode {
             0x44 => Some(Self::Await),
             0x45 => Some(Self::DeleteComputed),
             0x46 => Some(Self::CreateArguments),
+            0x47 => Some(Self::CreateRestParameters),
+            0x48 => Some(Self::CreateEnumerableOwnKeys),
+            0x49 => Some(Self::LoadHole),
+            0x4A => Some(Self::AssertNotHole),
+            0x4B => Some(Self::DefineNamedGetter),
+            0x4C => Some(Self::DefineNamedSetter),
+            0x4D => Some(Self::DefineComputedGetter),
+            0x4E => Some(Self::DefineComputedSetter),
+            0x4F => Some(Self::CopyDataProperties),
+            0x50 => Some(Self::CopyDataPropertiesExcept),
             _ => None,
         }
     }
@@ -626,6 +656,126 @@ impl Instruction {
             dst,
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
+        )
+    }
+
+    /// Rest parameter materialization — `dst = [...overflowArgs]`.
+    #[must_use]
+    pub const fn create_rest_parameters(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CreateRestParameters,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Enumerable-own-keys materialization — `dst = EnumerableOwnKeys(src)`.
+    #[must_use]
+    pub const fn create_enumerable_own_keys(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CreateEnumerableOwnKeys,
+            dst,
+            src,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes an internal hole load.
+    #[must_use]
+    pub const fn load_hole(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadHole,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a hole assertion for TDZ-like binding checks.
+    #[must_use]
+    pub const fn assert_not_hole(src: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::AssertNotHole,
+            src,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Defines a named getter accessor on an object.
+    #[must_use]
+    pub const fn define_named_getter(
+        object: BytecodeRegister,
+        getter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineNamedGetter,
+            object,
+            getter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Defines a named setter accessor on an object.
+    #[must_use]
+    pub const fn define_named_setter(
+        object: BytecodeRegister,
+        setter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineNamedSetter,
+            object,
+            setter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Defines a computed getter accessor on an object.
+    #[must_use]
+    pub const fn define_computed_getter(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        getter: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineComputedGetter, object, key, getter)
+    }
+
+    /// Defines a computed setter accessor on an object.
+    #[must_use]
+    pub const fn define_computed_setter(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        setter: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineComputedSetter, object, key, setter)
+    }
+
+    /// Copies enumerable own properties from source to target using `[[DefineOwnProperty]]`.
+    #[must_use]
+    pub const fn copy_data_properties(target: BytecodeRegister, source: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CopyDataProperties,
+            target,
+            source,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Copies enumerable own properties from source to target excluding keys from an array-like.
+    #[must_use]
+    pub const fn copy_data_properties_except(
+        target: BytecodeRegister,
+        source: BytecodeRegister,
+        excluded_keys: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::CopyDataPropertiesExcept,
+            target,
+            source,
+            excluded_keys,
         )
     }
 
@@ -1073,6 +1223,33 @@ mod tests {
         );
         let get_upvalue = Instruction::get_upvalue(BytecodeRegister::new(7), UpvalueId(8));
         let set_upvalue = Instruction::set_upvalue(BytecodeRegister::new(9), UpvalueId(10));
+        let define_getter = Instruction::define_named_getter(
+            BytecodeRegister::new(10),
+            BytecodeRegister::new(11),
+            PropertyNameId(12),
+        );
+        let define_setter = Instruction::define_named_setter(
+            BytecodeRegister::new(13),
+            BytecodeRegister::new(14),
+            PropertyNameId(15),
+        );
+        let define_computed_getter = Instruction::define_computed_getter(
+            BytecodeRegister::new(16),
+            BytecodeRegister::new(17),
+            BytecodeRegister::new(18),
+        );
+        let define_computed_setter = Instruction::define_computed_setter(
+            BytecodeRegister::new(19),
+            BytecodeRegister::new(20),
+            BytecodeRegister::new(21),
+        );
+        let copy_data_properties =
+            Instruction::copy_data_properties(BytecodeRegister::new(22), BytecodeRegister::new(23));
+        let copy_data_properties_except = Instruction::copy_data_properties_except(
+            BytecodeRegister::new(24),
+            BytecodeRegister::new(25),
+            BytecodeRegister::new(26),
+        );
         let call_closure = Instruction::call_closure(
             BytecodeRegister::new(11),
             BytecodeRegister::new(12),
@@ -1111,6 +1288,45 @@ mod tests {
         assert_eq!(set_upvalue.opcode(), Opcode::SetUpvalue);
         assert_eq!(set_upvalue.a(), 9);
         assert_eq!(set_upvalue.b(), 10);
+
+        assert_eq!(define_getter.opcode(), Opcode::DefineNamedGetter);
+        assert_eq!(define_getter.a(), 10);
+        assert_eq!(define_getter.b(), 11);
+        assert_eq!(define_getter.c(), 12);
+
+        assert_eq!(define_setter.opcode(), Opcode::DefineNamedSetter);
+        assert_eq!(define_setter.a(), 13);
+        assert_eq!(define_setter.b(), 14);
+        assert_eq!(define_setter.c(), 15);
+
+        assert_eq!(
+            define_computed_getter.opcode(),
+            Opcode::DefineComputedGetter
+        );
+        assert_eq!(define_computed_getter.a(), 16);
+        assert_eq!(define_computed_getter.b(), 17);
+        assert_eq!(define_computed_getter.c(), 18);
+
+        assert_eq!(
+            define_computed_setter.opcode(),
+            Opcode::DefineComputedSetter
+        );
+        assert_eq!(define_computed_setter.a(), 19);
+        assert_eq!(define_computed_setter.b(), 20);
+        assert_eq!(define_computed_setter.c(), 21);
+
+        assert_eq!(copy_data_properties.opcode(), Opcode::CopyDataProperties);
+        assert_eq!(copy_data_properties.a(), 22);
+        assert_eq!(copy_data_properties.b(), 23);
+        assert_eq!(copy_data_properties.c(), 0);
+
+        assert_eq!(
+            copy_data_properties_except.opcode(),
+            Opcode::CopyDataPropertiesExcept
+        );
+        assert_eq!(copy_data_properties_except.a(), 24);
+        assert_eq!(copy_data_properties_except.b(), 25);
+        assert_eq!(copy_data_properties_except.c(), 26);
 
         assert_eq!(call_closure.opcode(), Opcode::CallClosure);
         assert_eq!(call_closure.a(), 11);

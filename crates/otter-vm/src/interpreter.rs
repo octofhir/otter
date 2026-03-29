@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
-use crate::closure::{ClosureTemplate, UpvalueId};
+use crate::closure::{CaptureDescriptor, ClosureTemplate, UpvalueId};
 use crate::descriptors::{NativeSlotKind, VmNativeCallError};
 use crate::feedback::{FeedbackKind, FeedbackSlotId};
 use crate::float::FloatId;
@@ -170,6 +170,8 @@ pub struct Activation {
     pending_exception: Option<RegisterValue>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
+    open_upvalues: Box<[Option<ObjectHandle>]>,
+    written_registers: Vec<RegisterIndex>,
     /// ES2024 §10.4.4 — Overflow arguments beyond formal parameter count.
     /// Stored separately from the register file to avoid polluting the frame layout.
     /// Used by `CreateArguments` to populate the arguments exotic object.
@@ -209,6 +211,8 @@ impl Activation {
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
                 .into_boxed_slice(),
+            open_upvalues: vec![None; usize::from(register_count)].into_boxed_slice(),
+            written_registers: Vec::new(),
             overflow_args: Vec::new(),
         }
     }
@@ -311,10 +315,87 @@ impl Activation {
         match self.registers.get_mut(usize::from(index)) {
             Some(slot) => {
                 *slot = value;
+                self.written_registers.push(index);
                 Ok(())
             }
             None => Err(InterpreterError::RegisterOutOfBounds),
         }
+    }
+
+    fn begin_step(&mut self) {
+        self.written_registers.clear();
+    }
+
+    fn sync_written_open_upvalues(
+        &mut self,
+        runtime: &mut RuntimeState,
+    ) -> Result<(), InterpreterError> {
+        let written_registers = std::mem::take(&mut self.written_registers);
+        for index in written_registers {
+            let Some(upvalue) = self
+                .open_upvalues
+                .get(usize::from(index))
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let value = self.register(index)?;
+            runtime.objects.set_upvalue(upvalue, value)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_open_upvalues_from_cells(
+        &mut self,
+        runtime: &RuntimeState,
+    ) -> Result<(), InterpreterError> {
+        for (index, maybe_upvalue) in self.open_upvalues.iter().enumerate() {
+            let Some(upvalue) = maybe_upvalue else {
+                continue;
+            };
+            let value = runtime.objects.get_upvalue(*upvalue)?;
+            let slot = self
+                .registers
+                .get_mut(index)
+                .ok_or(InterpreterError::RegisterOutOfBounds)?;
+            *slot = value;
+        }
+        Ok(())
+    }
+
+    fn ensure_open_upvalue(
+        &mut self,
+        index: RegisterIndex,
+        runtime: &mut RuntimeState,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        if let Some(existing) = self
+            .open_upvalues
+            .get(usize::from(index))
+            .copied()
+            .flatten()
+        {
+            return Ok(existing);
+        }
+
+        let value = self.register(index)?;
+        let upvalue = runtime.objects.alloc_upvalue(value);
+        let slot = self
+            .open_upvalues
+            .get_mut(usize::from(index))
+            .ok_or(InterpreterError::RegisterOutOfBounds)?;
+        *slot = Some(upvalue);
+        Ok(upvalue)
+    }
+
+    fn capture_bytecode_register_upvalue(
+        &mut self,
+        function: &Function,
+        runtime: &mut RuntimeState,
+        register: BytecodeRegister,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let absolute = self.resolve_bytecode_register(function, register.index())?;
+        self.ensure_open_upvalue(absolute, runtime)
     }
 
     fn instruction(&self, function: &Function) -> Option<Instruction> {
@@ -1078,6 +1159,42 @@ impl RuntimeState {
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
+        let closure_length = self
+            .current_module
+            .as_ref()
+            .and_then(|module| module.function(callee))
+            .map(|function| function.length())
+            .unwrap_or(0);
+        let closure_name = self
+            .current_module
+            .as_ref()
+            .and_then(|module| module.function(callee))
+            .and_then(|function| function.name())
+            .unwrap_or("")
+            .to_string();
+        let length_property = self.intern_property_name("length");
+        self.objects
+            .define_own_property(
+                handle,
+                length_property,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_i32(i32::from(closure_length)),
+                    PropertyAttributes::function_length(),
+                ),
+            )
+            .expect("closure length should install");
+        let name_property = self.intern_property_name("name");
+        let name_handle = self.alloc_string(closure_name);
+        self.objects
+            .define_own_property(
+                handle,
+                name_property,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_object_handle(name_handle.0),
+                    PropertyAttributes::function_length(),
+                ),
+            )
+            .expect("closure name should install");
         // Only constructable closures get a .prototype property (§10.2.6).
         if flags.is_constructable() {
             let prototype_property = self.intern_property_name("prototype");
@@ -1089,7 +1206,7 @@ impl RuntimeState {
                     prototype_property,
                     PropertyValue::data_with_attrs(
                         RegisterValue::from_object_handle(instance_prototype.0),
-                        PropertyAttributes::frozen(),
+                        PropertyAttributes::function_prototype(),
                     ),
                 )
                 .expect("closure prototype object should install");
@@ -1124,6 +1241,10 @@ impl RuntimeState {
                 .objects
                 .closure_flags(handle)
                 .is_ok_and(|f| f.is_constructable()),
+            Ok(HeapValueKind::BoundFunction) => self
+                .objects
+                .bound_function_parts(handle)
+                .is_ok_and(|(target, _, _)| self.is_constructible(target)),
             _ => false,
         }
     }
@@ -1491,12 +1612,52 @@ impl RuntimeState {
         arguments: &[RegisterValue],
         new_target: ObjectHandle,
     ) -> Result<RegisterValue, VmNativeCallError> {
+        if !self.is_constructible(target) {
+            let error = self
+                .alloc_type_error("construct target is not constructible")
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("construct TypeError allocation failed: {error}").into(),
+                    )
+                })?;
+            return Err(VmNativeCallError::Thrown(
+                RegisterValue::from_object_handle(error.0),
+            ));
+        }
+        if !self.is_constructible(new_target) {
+            let error = self
+                .alloc_type_error("construct newTarget is not constructible")
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("construct TypeError allocation failed: {error}").into(),
+                    )
+                })?;
+            return Err(VmNativeCallError::Thrown(
+                RegisterValue::from_object_handle(error.0),
+            ));
+        }
         let kind = self.objects.kind(target).map_err(|error| {
             VmNativeCallError::Internal(
                 format!("construct target kind lookup failed: {error:?}").into(),
             )
         })?;
         let completion = match kind {
+            HeapValueKind::BoundFunction => {
+                let (bound_target, _, bound_args) =
+                    self.objects.bound_function_parts(target).map_err(|error| {
+                        VmNativeCallError::Internal(
+                            format!("construct bound function lookup failed: {error:?}").into(),
+                        )
+                    })?;
+                let mut full_args = bound_args;
+                full_args.extend_from_slice(arguments);
+                let forwarded_new_target = if new_target == target {
+                    bound_target
+                } else {
+                    new_target
+                };
+                return self.construct_callable(bound_target, &full_args, forwarded_new_target);
+            }
             HeapValueKind::HostFunction => {
                 let host_function = self
                     .objects
@@ -1511,13 +1672,6 @@ impl RuntimeState {
                             "construct target host function is missing".into(),
                         )
                     })?;
-                if !Interpreter::is_host_function_constructible(self, host_function)
-                    .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
-                {
-                    return Err(VmNativeCallError::Internal(
-                        "construct target is not constructible".into(),
-                    ));
-                }
                 let default_receiver = RegisterValue::from_object_handle(
                     Interpreter::allocate_construct_receiver(self, new_target)
                         .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
@@ -1733,7 +1887,7 @@ impl RuntimeState {
             })
     }
 
-    fn property_base_object_handle(
+    pub(crate) fn property_base_object_handle(
         &mut self,
         value: RegisterValue,
     ) -> Result<ObjectHandle, InterpreterError> {
@@ -1983,14 +2137,30 @@ impl RuntimeState {
                 "Right-hand side of instanceof is not an object".into(),
             ));
         };
+        if !self.objects.is_callable(ctor_handle) {
+            return Err(InterpreterError::TypeError(
+                "Right-hand side of instanceof is not callable".into(),
+            ));
+        }
+        let mut effective_ctor = ctor_handle;
+        while matches!(
+            self.objects.kind(effective_ctor),
+            Ok(HeapValueKind::BoundFunction)
+        ) {
+            let (target, _, _) = self.objects.bound_function_parts(effective_ctor)?;
+            effective_ctor = target;
+        }
         let proto_prop = self.intern_property_name("prototype");
-        let proto_value = match self.objects.get_property(ctor_handle, proto_prop)? {
-            Some(lookup) => match lookup.value() {
-                PropertyValue::Data { value: v, .. } => v,
-                PropertyValue::Accessor { .. } => RegisterValue::undefined(),
-            },
-            None => RegisterValue::undefined(),
-        };
+        let proto_value = self
+            .ordinary_get(
+                effective_ctor,
+                proto_prop,
+                RegisterValue::from_object_handle(effective_ctor.0),
+            )
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?;
         let Some(proto_handle) = proto_value.as_object_handle().map(ObjectHandle) else {
             return Err(InterpreterError::TypeError(
                 "Function has non-object prototype in instanceof check".into(),
@@ -2426,6 +2596,7 @@ impl Interpreter {
         let mut frame_runtime = FrameRuntimeState::new(function);
 
         loop {
+            activation.begin_step();
             match self.step(
                 function,
                 module,
@@ -2433,7 +2604,10 @@ impl Interpreter {
                 &mut runtime,
                 &mut frame_runtime,
             )? {
-                StepOutcome::Continue => {}
+                StepOutcome::Continue => {
+                    activation.sync_written_open_upvalues(&mut runtime)?;
+                    activation.refresh_open_upvalues_from_cells(&runtime)?;
+                }
                 StepOutcome::Return(_) => {
                     return Ok(frame_runtime.property_feedback);
                 }
@@ -2475,6 +2649,7 @@ impl Interpreter {
         let mut frame_runtime = FrameRuntimeState::new(function);
 
         loop {
+            activation.begin_step();
             let outcome = match self.step(function, module, activation, runtime, &mut frame_runtime)
             {
                 Ok(outcome) => outcome,
@@ -2485,7 +2660,10 @@ impl Interpreter {
             };
 
             match outcome {
-                StepOutcome::Continue => {}
+                StepOutcome::Continue => {
+                    activation.sync_written_open_upvalues(runtime)?;
+                    activation.refresh_open_upvalues_from_cells(runtime)?;
+                }
                 StepOutcome::Return(return_value) => {
                     runtime.restore_module(previous_module);
                     return Ok(Completion::Return(return_value));
@@ -2627,13 +2805,17 @@ impl Interpreter {
             }
             Opcode::NewClosure => {
                 let template = Self::resolve_closure_template(function, activation.pc())?;
-                let capture_start = instruction.b();
                 let mut upvalues = Vec::with_capacity(usize::from(template.capture_count()));
 
-                for offset in 0..template.capture_count() {
-                    let value = activation
-                        .read_bytecode_register(function, capture_start.saturating_add(offset))?;
-                    upvalues.push(runtime.objects.alloc_upvalue(value));
+                for capture in template.captures() {
+                    let upvalue = match capture {
+                        CaptureDescriptor::Register(register) => activation
+                            .capture_bytecode_register_upvalue(function, runtime, *register)?,
+                        CaptureDescriptor::Upvalue(upvalue) => {
+                            Self::resolve_upvalue_cell(activation, runtime, *upvalue)?
+                        }
+                    };
+                    upvalues.push(upvalue);
                 }
 
                 let handle = runtime.alloc_closure(template.callee(), upvalues, template.flags());
@@ -2720,6 +2902,154 @@ impl Interpreter {
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
+            }
+            Opcode::CreateRestParameters => {
+                let rest_array = runtime.alloc_array_with_elements(&activation.overflow_args);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(rest_array.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::CreateEnumerableOwnKeys => {
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = runtime.property_base_object_handle(base)?;
+                let keys =
+                    runtime
+                        .enumerable_own_property_keys(handle)
+                        .map_err(|error| match error {
+                            VmNativeCallError::Thrown(_) => {
+                                InterpreterError::TypeError("enumerable own keys threw".into())
+                            }
+                            VmNativeCallError::Internal(message) => {
+                                InterpreterError::NativeCall(message)
+                            }
+                        })?;
+                let key_names = keys
+                    .into_iter()
+                    .filter_map(|key| runtime.property_names().get(key))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let key_values = key_names
+                    .into_iter()
+                    .map(|name| RegisterValue::from_object_handle(runtime.alloc_string(name).0))
+                    .collect::<Vec<_>>();
+                let keys_array = runtime.alloc_array_with_elements(&key_values);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(keys_array.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::LoadHole => {
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::hole(),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::AssertNotHole => {
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                if value.is_hole() {
+                    let error =
+                        runtime.alloc_reference_error("Cannot access uninitialized binding")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::DefineNamedGetter
+            | Opcode::DefineNamedSetter
+            | Opcode::DefineComputedGetter
+            | Opcode::DefineComputedSetter => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(object)?;
+                let (property, accessor_register) = match instruction.opcode() {
+                    Opcode::DefineNamedGetter | Opcode::DefineNamedSetter => (
+                        Self::resolve_property_name(function, runtime, instruction.c())?,
+                        instruction.b(),
+                    ),
+                    Opcode::DefineComputedGetter | Opcode::DefineComputedSetter => {
+                        let key = activation.read_bytecode_register(function, instruction.b())?;
+                        (runtime.computed_property_name(key)?, instruction.c())
+                    }
+                    _ => unreachable!(),
+                };
+                let accessor = activation
+                    .read_bytecode_register(function, accessor_register)?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let desc = match instruction.opcode() {
+                    Opcode::DefineNamedGetter => crate::object::PropertyDescriptor::accessor(
+                        Some(Some(accessor)),
+                        None,
+                        Some(true),
+                        Some(true),
+                    ),
+                    Opcode::DefineNamedSetter => crate::object::PropertyDescriptor::accessor(
+                        None,
+                        Some(Some(accessor)),
+                        Some(true),
+                        Some(true),
+                    ),
+                    Opcode::DefineComputedGetter => crate::object::PropertyDescriptor::accessor(
+                        Some(Some(accessor)),
+                        None,
+                        Some(true),
+                        Some(true),
+                    ),
+                    Opcode::DefineComputedSetter => crate::object::PropertyDescriptor::accessor(
+                        None,
+                        Some(Some(accessor)),
+                        Some(true),
+                        Some(true),
+                    ),
+                    _ => unreachable!(),
+                };
+                let defined = runtime
+                    .objects
+                    .define_own_property_from_descriptor(handle, property, desc)?;
+                if !defined {
+                    return Err(InterpreterError::TypeError(
+                        "object literal accessor define failed".into(),
+                    ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::CopyDataProperties | Opcode::CopyDataPropertiesExcept => {
+                let target = activation.read_bytecode_register(function, instruction.a())?;
+                let target_handle = runtime.property_base_object_handle(target)?;
+                let source = activation.read_bytecode_register(function, instruction.b())?;
+                let excluded_keys = if instruction.opcode() == Opcode::CopyDataPropertiesExcept {
+                    Some(activation.read_bytecode_register(function, instruction.c())?)
+                } else {
+                    None
+                };
+                match crate::property_copy::copy_data_properties(
+                    runtime,
+                    target_handle,
+                    source,
+                    excluded_keys,
+                ) {
+                    Ok(()) => {
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Err(VmNativeCallError::Thrown(value)) => Ok(StepOutcome::Throw(value)),
+                    Err(VmNativeCallError::Internal(message)) => {
+                        Err(InterpreterError::NativeCall(message))
+                    }
+                }
             }
             Opcode::LoadUndefined => {
                 activation.write_bytecode_register(
@@ -3237,7 +3567,16 @@ impl Interpreter {
             }
             Opcode::GetIterator => {
                 let handle = Self::read_object_handle(activation, function, instruction.b())?;
-                let iterator = runtime.objects.alloc_iterator(handle)?;
+                let iterator = match runtime.objects.alloc_iterator(handle) {
+                    Ok(iterator) => iterator,
+                    Err(ObjectError::InvalidKind) => {
+                        let error = runtime.alloc_type_error("Value is not iterable")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -3350,7 +3689,16 @@ impl Interpreter {
             Opcode::InstanceOf => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let result = runtime.js_instance_of(lhs, rhs)?;
+                let result = match runtime.js_instance_of(lhs, rhs) {
+                    Ok(result) => result,
+                    Err(InterpreterError::TypeError(message)) => {
+                        let error = runtime.alloc_type_error(&message)?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -3363,7 +3711,16 @@ impl Interpreter {
             Opcode::HasProperty => {
                 let key = activation.read_bytecode_register(function, instruction.b())?;
                 let object = activation.read_bytecode_register(function, instruction.c())?;
-                let result = runtime.js_has_property(key, object)?;
+                let result = match runtime.js_has_property(key, object) {
+                    Ok(result) => result,
+                    Err(InterpreterError::TypeError(message)) => {
+                        let error = runtime.alloc_type_error(&message)?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -3376,6 +3733,13 @@ impl Interpreter {
                 let upvalue =
                     Self::resolve_upvalue_cell(activation, runtime, UpvalueId(instruction.b()))?;
                 let value = runtime.objects.get_upvalue(upvalue)?;
+                if value.is_hole() {
+                    let error =
+                        runtime.alloc_reference_error("Cannot access uninitialized binding")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
                 activation.write_bytecode_register(function, instruction.a(), value)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -3413,6 +3777,29 @@ impl Interpreter {
                     .ok_or(InterpreterError::InvalidObjectValue)?;
 
                 // ES2024 §10.4.1.1 [[Call]] — resolve bound function before dispatch.
+                let arguments = Self::read_call_arguments(
+                    caller_function,
+                    activation,
+                    instruction.c(),
+                    call.argument_count(),
+                )?;
+                if call.flags().is_construct() {
+                    match runtime.construct_callable(callee, &arguments, callee) {
+                        Ok(value) => {
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
+                            activation.write_bytecode_register(function, instruction.a(), value)?;
+                            activation.advance();
+                            return Ok(StepOutcome::Continue);
+                        }
+                        Err(VmNativeCallError::Thrown(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(VmNativeCallError::Internal(message)) => {
+                            return Err(InterpreterError::NativeCall(message));
+                        }
+                    }
+                }
+
                 if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callee) {
                     let receiver = Self::resolve_call_receiver(
                         caller_function,
@@ -3421,20 +3808,17 @@ impl Interpreter {
                         call.receiver(),
                         None,
                     )?;
-                    let arguments = Self::read_call_arguments(
-                        caller_function,
-                        activation,
-                        instruction.c(),
-                        call.argument_count(),
-                    )?;
-                    match Self::invoke_host_function_handle(runtime, callee, receiver, &arguments)?
-                    {
-                        Completion::Return(value) => {
+                    match runtime.call_callable_for_accessor(Some(callee), receiver, &arguments) {
+                        Ok(value) => {
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
                             activation.write_bytecode_register(function, instruction.a(), value)?;
                             activation.advance();
                             return Ok(StepOutcome::Continue);
                         }
-                        Completion::Throw(value) => return Ok(StepOutcome::Throw(value)),
+                        Err(InterpreterError::UncaughtThrow(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
 
@@ -3456,49 +3840,21 @@ impl Interpreter {
                         Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
                     }
                 } else {
-                    let (mut callee_activation, construct_receiver) = if call.flags().is_construct()
-                    {
-                        let (activation, receiver) = Self::prepare_construct_closure_call(
-                            module,
-                            activation,
-                            runtime,
-                            instruction.b(),
-                            instruction.c(),
-                            call,
-                        )?;
-                        (activation, Some(receiver))
-                    } else {
-                        (
-                            Self::prepare_closure_call(
-                                module,
-                                activation,
-                                runtime,
-                                instruction.b(),
-                                instruction.c(),
-                                call,
-                            )?,
-                            None,
-                        )
-                    };
+                    let mut callee_activation = Self::prepare_closure_call(
+                        module,
+                        activation,
+                        runtime,
+                        instruction.b(),
+                        instruction.c(),
+                        call,
+                    )?;
                     match self.run_completion_with_runtime(
                         module,
                         &mut callee_activation,
                         runtime,
                     )? {
                         Completion::Return(value) => {
-                            let value = if let Some(default_receiver) = construct_receiver {
-                                match Self::apply_construct_return_override(
-                                    Completion::Return(value),
-                                    default_receiver,
-                                ) {
-                                    Completion::Return(value) => value,
-                                    Completion::Throw(_) => {
-                                        unreachable!("return override cannot throw")
-                                    }
-                                }
-                            } else {
-                                value
-                            };
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
                             activation.write_bytecode_register(function, instruction.a(), value)?;
                             activation.advance();
                             Ok(StepOutcome::Continue)
@@ -3854,56 +4210,6 @@ impl Interpreter {
         Ok(activation)
     }
 
-    fn prepare_construct_closure_call(
-        module: &Module,
-        caller_activation: &Activation,
-        runtime: &mut RuntimeState,
-        callee_register: RegisterIndex,
-        arg_start: RegisterIndex,
-        call: ClosureCall,
-    ) -> Result<(Activation, RegisterValue), InterpreterError> {
-        let caller_function = module
-            .function(caller_activation.function_index())
-            .expect("activation function index must be valid");
-        let closure = caller_activation
-            .read_bytecode_register(caller_function, callee_register)?
-            .as_object_handle()
-            .map(ObjectHandle)
-            .ok_or(InterpreterError::InvalidObjectValue)?;
-        let callee_index = runtime.objects.closure_callee(closure)?;
-        let callee = module
-            .function(callee_index)
-            .ok_or(InterpreterError::InvalidCallTarget)?;
-        let default_receiver = Self::allocate_construct_receiver(runtime, closure)?;
-        let default_receiver_value = RegisterValue::from_object_handle(default_receiver.0);
-        let mut activation = Activation::with_context(
-            callee_index,
-            callee.frame_layout().register_count(),
-            FrameMetadata::new(call.argument_count(), call.flags()),
-            Some(closure),
-        );
-        let parameter_range = callee.frame_layout().parameter_range();
-        let copy_count = call.argument_count().min(parameter_range.len());
-
-        for offset in 0..copy_count {
-            let value = caller_activation
-                .read_bytecode_register(caller_function, arg_start.saturating_add(offset))?;
-            activation.set_register(parameter_range.start().saturating_add(offset), value)?;
-        }
-
-        Self::initialize_receiver(
-            caller_function,
-            caller_activation,
-            callee,
-            &mut activation,
-            call.flags(),
-            call.receiver(),
-            Some(default_receiver_value),
-        )?;
-
-        Ok((activation, default_receiver_value))
-    }
-
     fn invoke_host_function(
         callable: ObjectHandle,
         caller_function: &Function,
@@ -4085,25 +4391,19 @@ impl Interpreter {
     ) -> Result<ObjectHandle, InterpreterError> {
         let prototype_property = runtime.intern_property_name("prototype");
         let default_prototype = runtime.intrinsics().object_prototype();
-        let prototype = match runtime
-            .objects()
-            .get_property(constructor, prototype_property)?
-        {
-            Some(lookup) => match lookup.value() {
-                PropertyValue::Data { value, .. } => value
-                    .as_object_handle()
-                    .map(ObjectHandle)
-                    .unwrap_or(default_prototype),
-                PropertyValue::Accessor { getter, .. } => {
-                    let value = Self::invoke_accessor_getter(runtime, constructor, getter)?;
-                    value
-                        .as_object_handle()
-                        .map(ObjectHandle)
-                        .unwrap_or(default_prototype)
-                }
-            },
-            None => default_prototype,
-        };
+        let prototype = runtime
+            .ordinary_get(
+                constructor,
+                prototype_property,
+                RegisterValue::from_object_handle(constructor.0),
+            )
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?
+            .as_object_handle()
+            .map(ObjectHandle)
+            .unwrap_or(default_prototype);
         Ok(runtime.alloc_object_with_prototype(Some(prototype)))
     }
 
@@ -4185,7 +4485,7 @@ fn canonical_string_exotic_index(property_name: &str) -> Option<usize> {
 mod tests {
     use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
     use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
-    use crate::closure::{ClosureTable, ClosureTemplate, UpvalueId};
+    use crate::closure::{CaptureDescriptor, ClosureTable, ClosureTemplate, UpvalueId};
     use crate::deopt::DeoptTable;
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::exception::ExceptionTable;
@@ -5608,7 +5908,7 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_rejects_construct_on_non_constructible_host_function() {
+    fn interpreter_throws_type_error_on_non_constructible_host_function() {
         let layout = FrameLayout::new(0, 0, 0, 2).expect("frame layout should be valid");
         let entry = Function::new(
             Some("entry"),
@@ -5659,7 +5959,7 @@ mod tests {
             .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
             .expect_err("constructing a plain host method should fail");
 
-        assert_eq!(error, InterpreterError::InvalidCallTarget);
+        assert!(matches!(error, InterpreterError::UncaughtThrow(_)));
     }
 
     #[test]
@@ -5740,7 +6040,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::new(vec![
                         None,
-                        Some(ClosureTemplate::new(FunctionIndex(1), 0)),
+                        Some(ClosureTemplate::new(FunctionIndex(1), [])),
                         None,
                         None,
                     ]),
@@ -5867,7 +6167,10 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::new(vec![
                         None,
-                        Some(ClosureTemplate::new(FunctionIndex(1), 1)),
+                        Some(ClosureTemplate::new(
+                            FunctionIndex(1),
+                            [CaptureDescriptor::Register(BytecodeRegister::new(0))],
+                        )),
                         None,
                         None,
                         None,

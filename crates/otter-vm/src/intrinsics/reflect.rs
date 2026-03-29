@@ -22,26 +22,44 @@ pub(super) struct ReflectIntrinsic;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn require_object(
+fn require_target_object(
     args: &[RegisterValue],
     index: usize,
     runtime: &mut crate::interpreter::RuntimeState,
-    _method: &str,
+    message: &str,
 ) -> Result<ObjectHandle, VmNativeCallError> {
-    let Some(handle) = args
+    let handle = args
         .get(index)
         .copied()
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
-    else {
-        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
-    };
+        .ok_or_else(|| type_error(runtime, message).unwrap_or_else(|error| error))?;
 
     if matches!(
         runtime.objects().kind(handle),
         Ok(crate::object::HeapValueKind::String)
     ) {
-        return Err(VmNativeCallError::Thrown(RegisterValue::undefined()));
+        return Err(type_error(runtime, message)?);
+    }
+
+    Ok(handle)
+}
+
+fn require_non_string_object(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let handle = value
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| type_error(runtime, message).unwrap_or_else(|error| error))?;
+
+    if matches!(
+        runtime.objects().kind(handle),
+        Ok(crate::object::HeapValueKind::String)
+    ) {
+        return Err(type_error(runtime, message)?);
     }
 
     Ok(handle)
@@ -175,13 +193,11 @@ fn reflect_apply(
         .get(2)
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let args_handle = args_list
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(runtime, "Reflect.apply argumentsList must be an object")
-                .unwrap_or_else(|error| error)
-        })?;
+    let args_handle = require_non_string_object(
+        args_list,
+        runtime,
+        "Reflect.apply argumentsList must be an object",
+    )?;
     let call_args = runtime.list_from_array_like(args_handle)?;
 
     runtime.call_callable(target_handle, this_arg, &call_args)
@@ -214,13 +230,11 @@ fn reflect_construct(
         .get(1)
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let arguments_handle = arguments_list
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(runtime, "Reflect.construct argumentsList must be an object")
-                .unwrap_or_else(|error| error)
-        })?;
+    let arguments_handle = require_non_string_object(
+        arguments_list,
+        runtime,
+        "Reflect.construct argumentsList must be an object",
+    )?;
     let call_args = runtime.list_from_array_like(arguments_handle)?;
 
     let new_target = args.get(2).copied().unwrap_or(target);
@@ -249,7 +263,12 @@ fn reflect_define_property(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.defineProperty")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.defineProperty target must be an object",
+    )?;
     let property = to_property_key(args, 1, runtime)?;
     let attrs = args
         .get(2)
@@ -277,7 +296,12 @@ fn reflect_delete_property(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.deleteProperty")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.deleteProperty target must be an object",
+    )?;
     let property = to_property_key(args, 1, runtime)?;
     let property_names = runtime.property_names().clone();
     let deleted = runtime
@@ -297,7 +321,7 @@ fn reflect_get(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.get")?;
+    let target = require_target_object(args, 0, runtime, "Reflect.get target must be an object")?;
     let property = to_property_key(args, 1, runtime)?;
     let receiver = args
         .get(2)
@@ -314,7 +338,12 @@ fn reflect_get_own_property_descriptor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.getOwnPropertyDescriptor")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.getOwnPropertyDescriptor target must be an object",
+    )?;
     let property = to_property_key(args, 1, runtime)?;
 
     let Some(descriptor) = runtime
@@ -339,7 +368,12 @@ fn reflect_get_prototype_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.getPrototypeOf")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.getPrototypeOf target must be an object",
+    )?;
     let proto = runtime.objects().get_prototype(target).map_err(|e| {
         VmNativeCallError::Internal(format!("Reflect.getPrototypeOf failed: {e:?}").into())
     })?;
@@ -356,7 +390,7 @@ fn reflect_has(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.has")?;
+    let target = require_target_object(args, 0, runtime, "Reflect.has target must be an object")?;
     let property = to_property_key(args, 1, runtime)?;
     let found = runtime
         .has_property(target, property)
@@ -372,7 +406,12 @@ fn reflect_is_extensible(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.isExtensible")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.isExtensible target must be an object",
+    )?;
     let extensible = runtime.objects().is_extensible(target).map_err(|e| {
         VmNativeCallError::Internal(format!("Reflect.isExtensible failed: {e:?}").into())
     })?;
@@ -387,7 +426,8 @@ fn reflect_own_keys(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.ownKeys")?;
+    let target =
+        require_target_object(args, 0, runtime, "Reflect.ownKeys target must be an object")?;
     let keys = runtime.own_property_keys(target).map_err(|e| {
         VmNativeCallError::Internal(format!("Reflect.ownKeys failed: {e:?}").into())
     })?;
@@ -424,7 +464,12 @@ fn reflect_prevent_extensions(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.preventExtensions")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.preventExtensions target must be an object",
+    )?;
     let success = runtime
         .objects_mut()
         .prevent_extensions(target)
@@ -442,7 +487,7 @@ fn reflect_set(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.set")?;
+    let target = require_target_object(args, 0, runtime, "Reflect.set target must be an object")?;
     let property = to_property_key(args, 1, runtime)?;
     let value = args
         .get(2)
@@ -464,7 +509,12 @@ fn reflect_set_prototype_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let target = require_object(args, 0, runtime, "Reflect.setPrototypeOf")?;
+    let target = require_target_object(
+        args,
+        0,
+        runtime,
+        "Reflect.setPrototypeOf target must be an object",
+    )?;
     let proto_arg = args
         .get(1)
         .copied()
@@ -472,16 +522,11 @@ fn reflect_set_prototype_of(
     let proto = if proto_arg == RegisterValue::null() {
         None
     } else {
-        Some(
-            proto_arg
-                .as_object_handle()
-                .map(ObjectHandle)
-                .ok_or_else(|| {
-                    VmNativeCallError::Internal(
-                        "Reflect.setPrototypeOf proto must be object or null".into(),
-                    )
-                })?,
-        )
+        Some(require_non_string_object(
+            proto_arg,
+            runtime,
+            "Reflect.setPrototypeOf proto must be an object or null",
+        )?)
     };
     runtime
         .objects_mut()

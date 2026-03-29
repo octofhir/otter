@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use oxc_ast::ast::{
-    Argument, AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern,
-    ComputedMemberExpression, Expression, ForStatementLeft, Function, LogicalOperator,
-    ObjectPropertyKind, Program as AstProgram, PropertyKey, PropertyKind, SimpleAssignmentTarget,
-    Statement as AstStatement, StaticMemberExpression, UnaryOperator, UpdateOperator,
-    VariableDeclarationKind,
+    Argument, AssignmentOperator, AssignmentTarget, AssignmentTargetMaybeDefault,
+    AssignmentTargetProperty, BinaryOperator, BindingPattern, ComputedMemberExpression, Expression,
+    ForStatementLeft, Function, LogicalOperator, ObjectPropertyKind, Program as AstProgram,
+    PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement as AstStatement,
+    StaticMemberExpression, UnaryOperator, UpdateOperator, VariableDeclarationKind,
 };
 
 use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset, Opcode};
@@ -24,6 +24,7 @@ use crate::source::{LoweringMode, SourceLoweringError};
 use crate::source_map::SourceMap;
 use crate::string::{StringId, StringTable};
 
+mod assignment;
 mod ast;
 mod compiler;
 mod destructuring;

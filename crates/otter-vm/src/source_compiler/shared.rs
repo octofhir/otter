@@ -1,4 +1,5 @@
 use super::*;
+use crate::closure::CaptureDescriptor;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Binding {
@@ -19,11 +20,7 @@ impl Binding {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum CaptureSource {
-    Register(BytecodeRegister),
-    Upvalue(UpvalueId),
-}
+pub(super) type CaptureSource = CaptureDescriptor;
 
 #[derive(Debug, Clone)]
 pub(super) struct CompileEnv {
@@ -123,5 +120,11 @@ pub(super) struct FunctionCompiler<'a> {
     /// ES2024 §10.4.4: Lazily allocated local for `arguments` object.
     /// `None` if `arguments` hasn't been referenced in this function body.
     pub(super) arguments_local: Option<crate::bytecode::BytecodeRegister>,
+    /// Local backing slot for a rest parameter array, when present.
+    pub(super) rest_local: Option<crate::bytecode::BytecodeRegister>,
+    /// Parameter or destructuring-binding locals that participate in parameter TDZ.
+    pub(super) parameter_binding_registers: Vec<crate::bytecode::BytecodeRegister>,
+    /// While true, reads of register-backed bindings must reject the internal hole sentinel.
+    pub(super) parameter_tdz_active: bool,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

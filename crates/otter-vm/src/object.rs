@@ -201,6 +201,7 @@ const FLAG_ARROW: u8 = 0x01;
 const FLAG_METHOD: u8 = 0x02;
 const FLAG_GENERATOR: u8 = 0x04;
 const FLAG_ASYNC: u8 = 0x08;
+const FLAG_CLASS_CONSTRUCTOR: u8 = 0x10;
 
 impl ClosureFlags {
     /// Regular function declaration/expression — has `[[Construct]]`.
@@ -233,10 +234,16 @@ impl ClosureFlags {
         Self(FLAG_ASYNC)
     }
 
+    /// Class constructor (§15.7) — constructable, but plain calls throw.
+    #[must_use]
+    pub const fn class_constructor() -> Self {
+        Self(FLAG_CLASS_CONSTRUCTOR)
+    }
+
     /// ES2024 §7.2.4 IsConstructor — true only for regular function declarations/expressions.
     #[must_use]
     pub const fn is_constructable(self) -> bool {
-        self.0 == 0
+        self.0 == 0 || self.0 == FLAG_CLASS_CONSTRUCTOR
     }
 
     #[must_use]
@@ -257,6 +264,11 @@ impl ClosureFlags {
     #[must_use]
     pub const fn is_async(self) -> bool {
         self.0 & FLAG_ASYNC != 0
+    }
+
+    #[must_use]
+    pub const fn is_class_constructor(self) -> bool {
+        self.0 & FLAG_CLASS_CONSTRUCTOR != 0
     }
 }
 
@@ -967,7 +979,8 @@ impl ObjectHeap {
         if current == prototype {
             return Ok(true);
         }
-        if !self.is_extensible(handle)? {
+        let is_string_value = matches!(self.object(handle)?, HeapValue::String { .. });
+        if !is_string_value && !self.is_extensible(handle)? {
             return Ok(false);
         }
 

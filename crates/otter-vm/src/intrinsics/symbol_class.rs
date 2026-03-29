@@ -33,7 +33,7 @@ impl IntrinsicInstaller for SymbolIntrinsic {
     ) -> Result<(), IntrinsicsError> {
         let constructor_id = cx
             .native_functions
-            .register(NativeFunctionDescriptor::method(
+            .register(NativeFunctionDescriptor::constructor(
                 "Symbol",
                 0,
                 symbol_function,
@@ -228,6 +228,9 @@ fn symbol_function(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    if runtime.is_current_native_construct_call() {
+        return Err(type_error(runtime, "Symbol is not a constructor")?);
+    }
     let description = args
         .first()
         .copied()

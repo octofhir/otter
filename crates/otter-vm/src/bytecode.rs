@@ -200,6 +200,14 @@ pub enum Opcode {
     CopyDataProperties = 0x4F,
     /// Copy enumerable own properties from source to target excluding listed keys.
     CopyDataPropertiesExcept = 0x50,
+    /// Invoke `super(...)` inside a derived constructor with an explicit argument window.
+    CallSuper = 0x51,
+    /// Invoke the default derived constructor forwarding all original arguments.
+    CallSuperForward = 0x52,
+    /// ToNumber conversion.
+    ToNumber = 0x5D,
+    /// ToString conversion.
+    ToString = 0x5E,
 }
 
 impl Opcode {
@@ -278,6 +286,10 @@ impl Opcode {
             0x4E => Some(Self::DefineComputedSetter),
             0x4F => Some(Self::CopyDataProperties),
             0x50 => Some(Self::CopyDataPropertiesExcept),
+            0x51 => Some(Self::CallSuper),
+            0x52 => Some(Self::CallSuperForward),
+            0x5D => Some(Self::ToNumber),
+            0x5E => Some(Self::ToString),
             _ => None,
         }
     }
@@ -462,6 +474,18 @@ impl Instruction {
     #[must_use]
     pub const fn not(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Not, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes a ToNumber conversion.
+    #[must_use]
+    pub const fn to_number(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::ToNumber, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes a ToString conversion.
+    #[must_use]
+    pub const fn to_string(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::ToString, dst, src, BytecodeRegister::new(0))
     }
 
     /// Encodes an addition.
@@ -776,6 +800,27 @@ impl Instruction {
             target,
             source,
             excluded_keys,
+        )
+    }
+
+    /// Calls `super(...)` with an explicit contiguous argument window.
+    #[must_use]
+    pub const fn call_super(
+        dst: BytecodeRegister,
+        args_base: BytecodeRegister,
+        argc: RegisterIndex,
+    ) -> Self {
+        Self::encode_abc(Opcode::CallSuper, dst, args_base, BytecodeRegister::new(argc))
+    }
+
+    /// Calls the default derived constructor forwarding the original arguments.
+    #[must_use]
+    pub const fn call_super_forward(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CallSuperForward,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
         )
     }
 

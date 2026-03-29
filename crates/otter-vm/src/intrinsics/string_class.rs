@@ -19,6 +19,18 @@ const STRING_VALUE_OF_ERROR: &str = "String.prototype.valueOf requires a string 
 
 pub(super) struct StringIntrinsic;
 
+fn type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<VmNativeCallError, VmNativeCallError> {
+    let error = runtime.alloc_type_error(message).map_err(|error| {
+        VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+    })?;
+    Ok(VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error.0),
+    ))
+}
+
 impl IntrinsicInstaller for StringIntrinsic {
     fn init(
         &self,
@@ -78,6 +90,10 @@ fn string_class_descriptor() -> JsClassDescriptor {
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("valueOf", 0, string_value_of),
         ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("concat", 1, string_concat),
+        ))
 }
 
 fn string_constructor(
@@ -118,6 +134,25 @@ fn string_value_of(
     Err(VmNativeCallError::Internal(STRING_VALUE_OF_ERROR.into()))
 }
 
+fn string_concat(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let mut text = runtime
+        .js_to_string(*this)
+        .map_err(|error| map_interpreter_error(error, runtime))?
+        .into_string();
+    for arg in args {
+        let next = runtime
+            .js_to_string(*arg)
+            .map_err(|error| map_interpreter_error(error, runtime))?;
+        text.push_str(&next);
+    }
+    let result = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
 fn coerce_to_string(
     value: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
@@ -153,16 +188,33 @@ fn coerce_to_string(
         {
             return Ok(string.to_string().into_boxed_str());
         }
-        if let Some(primitive) = runtime.boxed_primitive_value(handle).map_err(|error| {
-            VmNativeCallError::Internal(format!("boxed primitive lookup failed: {error}").into())
-        })? && primitive.is_symbol()
-        {
-            return Ok(symbol_descriptive_string(primitive, runtime).into_boxed_str());
-        }
-        return Ok("[object Object]".into());
+        return runtime.js_to_string(value).map_err(|error| match error {
+            crate::interpreter::InterpreterError::UncaughtThrow(value) => {
+                VmNativeCallError::Thrown(value)
+            }
+            crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
+                Ok(error) => error,
+                Err(error) => error,
+            },
+            other => VmNativeCallError::Internal(format!("{other}").into()),
+        });
     }
 
     Ok(String::new().into_boxed_str())
+}
+
+fn map_interpreter_error(
+    error: crate::interpreter::InterpreterError,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> VmNativeCallError {
+    match error {
+        crate::interpreter::InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+        crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
+            Ok(error) => error,
+            Err(error) => error,
+        },
+        other => VmNativeCallError::Internal(format!("{other}").into()),
+    }
 }
 
 fn initialize_string_prototype(

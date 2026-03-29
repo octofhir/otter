@@ -18,6 +18,18 @@ const NUMBER_VALUE_OF_ERROR: &str = "Number.prototype.valueOf requires a number 
 
 pub(super) struct NumberIntrinsic;
 
+fn type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> Result<VmNativeCallError, VmNativeCallError> {
+    let error = runtime.alloc_type_error(message).map_err(|error| {
+        VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+    })?;
+    Ok(VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error.0),
+    ))
+}
+
 impl IntrinsicInstaller for NumberIntrinsic {
     fn init(
         &self,
@@ -89,7 +101,7 @@ fn number_constructor(
                 .copied()
                 .unwrap_or_else(RegisterValue::undefined),
             runtime,
-        )
+        )?
     };
 
     if this.as_object_handle().is_some() {
@@ -119,36 +131,20 @@ fn number_value_of(
 fn coerce_to_number(
     value: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
-    if value == RegisterValue::undefined() {
-        return RegisterValue::from_number(f64::NAN);
-    }
-    if value == RegisterValue::null() {
-        return RegisterValue::from_i32(0);
-    }
-    if let Some(number) = value.as_number() {
-        return RegisterValue::from_number(number);
-    }
-    if let Some(boolean) = value.as_bool() {
-        return RegisterValue::from_i32(if boolean { 1 } else { 0 });
-    }
-    if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
-        if let Some(string) = runtime.objects().string_value(handle).ok().flatten() {
-            let trimmed = string.trim();
-            if trimmed.is_empty() {
-                return RegisterValue::from_i32(0);
+) -> Result<RegisterValue, VmNativeCallError> {
+    runtime
+        .js_to_number(value)
+        .map(RegisterValue::from_number)
+        .map_err(|error| match error {
+            crate::interpreter::InterpreterError::UncaughtThrow(value) => {
+                VmNativeCallError::Thrown(value)
             }
-            if let Ok(parsed) = trimmed.parse::<f64>() {
-                return RegisterValue::from_number(parsed);
-            }
-            return RegisterValue::from_number(f64::NAN);
-        }
-        if let Ok(Some(value)) = number_data(handle, runtime) {
-            return value;
-        }
-    }
-
-    RegisterValue::from_number(f64::NAN)
+            crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
+                Ok(error) => error,
+                Err(error) => error,
+            },
+            other => VmNativeCallError::Internal(format!("{other}").into()),
+        })
 }
 
 fn initialize_number_prototype(

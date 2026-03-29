@@ -1,4 +1,4 @@
-use super::ast::ParamInfo;
+use super::ast::{ParamInfo, has_use_strict_directive};
 use super::shared::{CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind};
 use super::*;
 
@@ -40,6 +40,7 @@ impl<'a> ModuleCompiler<'a> {
             &[],
             FunctionKind::Script,
             None,
+            has_use_strict_directive(program.directives.as_slice()),
         )?;
         self.functions[entry.0 as usize] = Some(compiled.function);
 
@@ -76,9 +77,35 @@ impl<'a> ModuleCompiler<'a> {
         params: &[ParamInfo<'_>],
         kind: FunctionKind,
         parent_env: Option<CompileEnv>,
+        inherited_strict: bool,
+    ) -> Result<CompiledFunction, SourceLoweringError> {
+        self.compile_function_from_statements_with_options(
+            function_index,
+            identity,
+            statements,
+            params,
+            kind,
+            parent_env,
+            inherited_strict,
+            false,
+        )
+    }
+
+    pub(super) fn compile_function_from_statements_with_options(
+        &mut self,
+        function_index: FunctionIndex,
+        identity: FunctionIdentity,
+        statements: &[AstStatement<'_>],
+        params: &[ParamInfo<'_>],
+        kind: FunctionKind,
+        parent_env: Option<CompileEnv>,
+        inherited_strict: bool,
+        is_derived_constructor: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
+        compiler.strict_mode = inherited_strict;
+        compiler.is_derived_constructor = is_derived_constructor;
 
         compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {
@@ -117,9 +144,11 @@ impl<'a> ModuleCompiler<'a> {
         params: &[ParamInfo<'_>],
         kind: FunctionKind,
         parent_env: Option<CompileEnv>,
+        inherited_strict: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
             FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
+        compiler.strict_mode = inherited_strict;
 
         compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {

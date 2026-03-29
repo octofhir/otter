@@ -32,8 +32,14 @@ impl<'a> IntrinsicInstallContext<'a> {
         value: RegisterValue,
     ) -> Result<(), IntrinsicsError> {
         let property = self.property_names.intern(js_name);
-        self.heap
-            .set_property(intrinsics.global_object(), property, value)?;
+        self.heap.define_own_property(
+            intrinsics.global_object(),
+            property,
+            PropertyValue::data_with_attrs(
+                value,
+                PropertyAttributes::from_flags(true, false, true),
+            ),
+        )?;
         Ok(())
     }
 

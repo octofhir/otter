@@ -4,18 +4,22 @@ use crate::closure::CaptureDescriptor;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Binding {
     Register(BytecodeRegister),
+    ThisRegister(BytecodeRegister),
     Function { closure_register: BytecodeRegister },
     Upvalue(UpvalueId),
+    ThisUpvalue(UpvalueId),
 }
 
 impl Binding {
     pub(super) fn capture_source(self) -> CaptureSource {
         match self {
             Self::Register(register) => CaptureSource::Register(register),
+            Self::ThisRegister(register) => CaptureSource::Register(register),
             Self::Function {
                 closure_register, ..
             } => CaptureSource::Register(closure_register),
             Self::Upvalue(upvalue) => CaptureSource::Upvalue(upvalue),
+            Self::ThisUpvalue(upvalue) => CaptureSource::Upvalue(upvalue),
         }
     }
 }
@@ -94,6 +98,8 @@ pub(super) struct LoopScope {
 
 pub(super) struct FunctionCompiler<'a> {
     pub(super) mode: LoweringMode,
+    pub(super) strict_mode: bool,
+    pub(super) is_derived_constructor: bool,
     pub(super) function_name: Option<String>,
     pub(super) kind: FunctionKind,
     pub(super) parent_env: Option<CompileEnv>,

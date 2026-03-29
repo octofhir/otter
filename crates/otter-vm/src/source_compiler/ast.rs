@@ -1,4 +1,5 @@
 use super::*;
+use oxc_ast::ast::Directive;
 
 /// Represents a single function parameter, possibly with a default value.
 pub(super) struct ParamInfo<'a> {
@@ -15,6 +16,10 @@ pub(super) fn expected_function_length(params: &[ParamInfo<'_>]) -> u16 {
             .count(),
     )
     .unwrap_or(u16::MAX)
+}
+
+pub(super) fn has_use_strict_directive(directives: &[Directive<'_>]) -> bool {
+    directives.iter().any(|directive| directive.directive == "use strict")
 }
 
 pub(super) fn identifier_name_for_parameter_pattern<'a>(

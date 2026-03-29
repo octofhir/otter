@@ -132,6 +132,8 @@ impl Default for FunctionTables {
 pub struct Function {
     name: Option<Box<str>>,
     length: u16,
+    strict: bool,
+    derived_constructor: bool,
     frame_layout: FrameLayout,
     bytecode: Bytecode,
     property_names: PropertyNameTable,
@@ -175,6 +177,8 @@ impl Function {
         Self {
             name: name.map(Into::into),
             length,
+            strict: false,
+            derived_constructor: false,
             frame_layout,
             bytecode,
             property_names: tables.side_tables.property_names,
@@ -209,6 +213,32 @@ impl Function {
     #[must_use]
     pub const fn length(&self) -> u16 {
         self.length
+    }
+
+    /// Returns whether this function executes in strict mode.
+    #[must_use]
+    pub const fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Marks this function as strict or non-strict.
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
+    /// Marks this function as a derived class constructor.
+    #[must_use]
+    pub fn with_derived_constructor(mut self, derived_constructor: bool) -> Self {
+        self.derived_constructor = derived_constructor;
+        self
+    }
+
+    /// Returns whether this function is a derived class constructor.
+    #[must_use]
+    pub const fn is_derived_constructor(&self) -> bool {
+        self.derived_constructor
     }
 
     /// Returns the frame layout.

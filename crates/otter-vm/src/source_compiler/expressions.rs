@@ -165,6 +165,10 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(ValueLocation::local(register))
             }
+            Ok(Binding::ThisRegister(register)) => {
+                self.emit_assert_not_hole(register);
+                Ok(ValueLocation::local(register))
+            }
             Ok(Binding::Function {
                 closure_register, ..
             }) => Ok(ValueLocation::local(closure_register)),
@@ -172,6 +176,13 @@ impl<'a> FunctionCompiler<'a> {
                 let register = self.alloc_temp();
                 self.instructions
                     .push(Instruction::get_upvalue(register, upvalue));
+                Ok(ValueLocation::temp(register))
+            }
+            Ok(Binding::ThisUpvalue(upvalue)) => {
+                let register = self.alloc_temp();
+                self.instructions
+                    .push(Instruction::get_upvalue(register, upvalue));
+                self.emit_assert_not_hole(register);
                 Ok(ValueLocation::temp(register))
             }
             Err(SourceLoweringError::UnknownBinding(_)) => {
@@ -475,7 +486,20 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(result)
             }
-            UnaryOperator::UnaryPlus => self.compile_expression(&unary.argument, module),
+            UnaryOperator::UnaryPlus => {
+                let argument = self.compile_expression(&unary.argument, module)?;
+                let result = if argument.is_temp {
+                    argument
+                } else {
+                    ValueLocation::temp(self.alloc_temp())
+                };
+                self.instructions
+                    .push(Instruction::to_number(result.register, argument.register));
+                if result.register != argument.register {
+                    self.release(argument);
+                }
+                Ok(result)
+            }
             UnaryOperator::Typeof => {
                 let value = self.compile_expression(&unary.argument, module)?;
                 let result = if value.is_temp {
@@ -566,6 +590,9 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ValueLocation, SourceLoweringError> {
         if self.mode == LoweringMode::Test262Basic && is_test262_assert_same_value_call(call) {
             return self.compile_test262_assert_same_value(call, module);
+        }
+        if matches!(&call.callee, Expression::Super(_)) {
+            return self.compile_super_call_expression(call, module);
         }
 
         let (callee, receiver) = self.compile_call_target(&call.callee, module)?;
@@ -659,6 +686,79 @@ impl<'a> FunctionCompiler<'a> {
         {
             self.release(receiver);
         }
+        Ok(result)
+    }
+
+    fn compile_super_call_expression(
+        &mut self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        if !self.is_derived_constructor {
+            return Err(SourceLoweringError::Unsupported(
+                "super() is only supported inside derived class constructors".to_string(),
+            ));
+        }
+
+        for argument in &call.arguments {
+            if matches!(argument, Argument::SpreadElement(_)) {
+                return Err(SourceLoweringError::Unsupported(
+                    "super(...spread) is not implemented yet on the new VM path".to_string(),
+                ));
+            }
+        }
+
+        let argument_count = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let mut argument_values = Vec::with_capacity(usize::from(argument_count));
+        for argument in &call.arguments {
+            let value = self.compile_expression(
+                argument.as_expression().ok_or_else(|| {
+                    SourceLoweringError::Unsupported("unsupported super() argument".to_string())
+                })?,
+                module,
+            )?;
+            argument_values.push(value);
+        }
+
+        let arg_start = if argument_count == 0 {
+            BytecodeRegister::new(self.next_local + self.next_temp)
+        } else {
+            self.reserve_temp_window(argument_count)?
+        };
+        for (offset, value) in argument_values.into_iter().enumerate() {
+            let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
+            if value.register != destination {
+                self.instructions
+                    .push(Instruction::move_(destination, value.register));
+                self.release(value);
+            }
+        }
+
+        let mut result = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::call_super(
+            result.register,
+            arg_start,
+            argument_count,
+        ));
+        if let Some(Binding::ThisRegister(this_register)) = self.env.bindings.get("this").copied()
+            && this_register != result.register
+        {
+            self.instructions
+                .push(Instruction::move_(this_register, result.register));
+        }
+
+        if argument_count != 0 {
+            let stable_register =
+                BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
+            if result.register != stable_register {
+                self.instructions
+                    .push(Instruction::move_(stable_register, result.register));
+                result = ValueLocation::temp(stable_register);
+            }
+            self.release_temp_window(argument_count.saturating_sub(1));
+        }
+
         Ok(result)
     }
 
@@ -1024,6 +1124,14 @@ impl<'a> FunctionCompiler<'a> {
             &params,
             FunctionKind::Ordinary,
             Some(self.env.clone()),
+            self.strict_mode
+                || super::ast::has_use_strict_directive(
+                    function
+                        .body
+                        .as_ref()
+                        .map(|body| body.directives.as_slice())
+                        .unwrap_or(&[]),
+                ),
         )?;
         module.set_function(reserved, compiled.function);
 
@@ -1369,6 +1477,7 @@ impl<'a> FunctionCompiler<'a> {
                 &params,
                 FunctionKind::Arrow,
                 Some(self.env.clone()),
+                self.strict_mode,
             )?
         } else {
             module.compile_function_from_statements(
@@ -1386,6 +1495,8 @@ impl<'a> FunctionCompiler<'a> {
                 &params,
                 FunctionKind::Arrow,
                 Some(self.env.clone()),
+                self.strict_mode
+                    || super::ast::has_use_strict_directive(arrow.body.directives.as_slice()),
             )?
         };
         module.set_function(reserved, compiled.function);
@@ -1469,6 +1580,10 @@ impl<'a> FunctionCompiler<'a> {
 
         for (i, expression) in template.expressions.iter().enumerate() {
             let expr_val = self.compile_expression(expression, module)?;
+            let expr_string = ValueLocation::temp(self.alloc_temp());
+            self.instructions
+                .push(Instruction::to_string(expr_string.register, expr_val.register));
+            self.release(expr_val);
             let dst = if result.is_temp {
                 result
             } else {
@@ -1477,12 +1592,12 @@ impl<'a> FunctionCompiler<'a> {
             self.instructions.push(Instruction::add(
                 dst.register,
                 result.register,
-                expr_val.register,
+                expr_string.register,
             ));
             if dst.register != result.register {
                 self.release(result);
             }
-            self.release(expr_val);
+            self.release(expr_string);
             result = dst;
 
             // Append the next quasi (string part after the expression).

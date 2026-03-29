@@ -7,6 +7,7 @@
 
 mod array_class;
 mod boolean_class;
+mod date_class;
 mod error_class;
 mod function_class;
 mod install;
@@ -14,7 +15,9 @@ mod math;
 mod number_class;
 mod object_class;
 mod promise_class;
+mod proxy_class;
 mod reflect;
+mod species_support;
 mod string_class;
 mod symbol_class;
 pub(crate) mod timer_globals;
@@ -194,6 +197,7 @@ pub struct VmIntrinsics {
     symbol_constructor: ObjectHandle,
     number_constructor: ObjectHandle,
     boolean_constructor: ObjectHandle,
+    date_constructor: ObjectHandle,
     object_constructor: ObjectHandle,
     function_constructor: ObjectHandle,
     array_constructor: ObjectHandle,
@@ -202,6 +206,8 @@ pub struct VmIntrinsics {
     symbol_prototype: ObjectHandle,
     number_prototype: ObjectHandle,
     boolean_prototype: ObjectHandle,
+    date_prototype: ObjectHandle,
+    proxy_constructor: ObjectHandle,
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 15],
@@ -231,6 +237,7 @@ impl VmIntrinsics {
         let symbol_constructor = heap.alloc_object();
         let number_constructor = heap.alloc_object();
         let boolean_constructor = heap.alloc_object();
+        let date_constructor = heap.alloc_object();
         let object_constructor = heap.alloc_object();
         let function_constructor = heap.alloc_object();
         let array_constructor = heap.alloc_object();
@@ -239,6 +246,8 @@ impl VmIntrinsics {
         let symbol_prototype = heap.alloc_object();
         let number_prototype = heap.alloc_object();
         let boolean_prototype = heap.alloc_object();
+        let date_prototype = heap.alloc_object();
+        let proxy_constructor = heap.alloc_object();
         let error_prototype = heap.alloc_object();
         let error_constructor = heap.alloc_object();
         let type_error_prototype = heap.alloc_object();
@@ -262,6 +271,7 @@ impl VmIntrinsics {
             symbol_constructor,
             number_constructor,
             boolean_constructor,
+            date_constructor,
             object_constructor,
             function_constructor,
             array_constructor,
@@ -270,6 +280,8 @@ impl VmIntrinsics {
             symbol_prototype,
             number_prototype,
             boolean_prototype,
+            date_prototype,
+            proxy_constructor,
             namespace_roots: Vec::new(),
             reflect_namespace: None,
             well_known_symbols: [
@@ -316,6 +328,7 @@ impl VmIntrinsics {
         heap.set_prototype(self.symbol_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.number_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.boolean_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.date_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.object_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.function_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_constructor, Some(self.function_prototype))?;
@@ -324,6 +337,8 @@ impl VmIntrinsics {
         heap.set_prototype(self.symbol_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.number_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.boolean_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.date_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.proxy_constructor, Some(self.function_prototype))?;
         // Error hierarchy: Error.prototype → Object.prototype,
         // NativeError.prototype → Error.prototype
         heap.set_prototype(self.error_prototype, Some(self.object_prototype))?;
@@ -505,6 +520,12 @@ impl VmIntrinsics {
         self.boolean_constructor
     }
 
+    /// Returns `%Date%`.
+    #[must_use]
+    pub const fn date_constructor(&self) -> ObjectHandle {
+        self.date_constructor
+    }
+
     /// Returns `%Object%`.
     #[must_use]
     pub const fn object_constructor(&self) -> ObjectHandle {
@@ -551,6 +572,18 @@ impl VmIntrinsics {
     #[must_use]
     pub const fn boolean_prototype(&self) -> ObjectHandle {
         self.boolean_prototype
+    }
+
+    /// Returns `%Date.prototype%`.
+    #[must_use]
+    pub const fn date_prototype(&self) -> ObjectHandle {
+        self.date_prototype
+    }
+
+    /// Returns `%Proxy%`.
+    #[must_use]
+    pub const fn proxy_constructor(&self) -> ObjectHandle {
+        self.proxy_constructor
     }
 
     /// Returns `%Promise%`.
@@ -608,7 +641,7 @@ impl VmIntrinsics {
 
     /// Collects all ObjectHandle roots owned by intrinsics for GC.
     pub fn gc_root_handles(&self) -> Vec<ObjectHandle> {
-        let mut roots = Vec::with_capacity(20 + self.namespace_roots.len());
+        let mut roots = Vec::with_capacity(24 + self.namespace_roots.len());
         roots.extend_from_slice(&[
             self.global_object,
             self.object_prototype,
@@ -617,6 +650,7 @@ impl VmIntrinsics {
             self.symbol_constructor,
             self.number_constructor,
             self.boolean_constructor,
+            self.date_constructor,
             self.object_constructor,
             self.function_constructor,
             self.array_constructor,
@@ -625,6 +659,8 @@ impl VmIntrinsics {
             self.symbol_prototype,
             self.number_prototype,
             self.boolean_prototype,
+            self.date_prototype,
+            self.proxy_constructor,
             self.error_prototype,
             self.error_constructor,
             self.type_error_prototype,
@@ -658,6 +694,7 @@ impl VmIntrinsics {
             self.symbol_constructor,
             self.number_constructor,
             self.boolean_constructor,
+            self.date_constructor,
             self.object_constructor,
             self.function_constructor,
             self.array_constructor,
@@ -666,6 +703,8 @@ impl VmIntrinsics {
             self.symbol_prototype,
             self.number_prototype,
             self.boolean_prototype,
+            self.date_prototype,
+            self.proxy_constructor,
         ] {
             tracer(IntrinsicRoot::Object(handle));
         }
@@ -680,17 +719,20 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 11] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 14] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
+        &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
         &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
         &number_class::NUMBER_INTRINSIC as &dyn IntrinsicInstaller,
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
         &promise_class::PROMISE_INTRINSIC as &dyn IntrinsicInstaller,
+        &proxy_class::PROXY_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
     ]
@@ -755,6 +797,10 @@ mod tests {
             Ok(HeapValueKind::HostFunction)
         );
         assert_eq!(
+            heap.kind(intrinsics.date_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
             heap.kind(intrinsics.object_constructor()),
             Ok(HeapValueKind::HostFunction)
         );
@@ -766,9 +812,13 @@ mod tests {
             heap.kind(intrinsics.array_constructor()),
             Ok(HeapValueKind::HostFunction)
         );
+        assert_eq!(
+            heap.kind(intrinsics.proxy_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 132);
+        assert_eq!(native_functions.len(), 139);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

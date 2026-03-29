@@ -19,6 +19,8 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Self {
         Self {
             mode,
+            strict_mode: false,
+            is_derived_constructor: false,
             function_name,
             kind,
             parent_env,
@@ -100,13 +102,20 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    /// Allocates a local for `this` and emits LoadThis, binding it as "this".
+    /// Allocates the lexical `this` binding slot used by nested arrow functions.
+    ///
+    /// Derived constructors start with an uninitialized `this` binding that is
+    /// only initialized after `super()` completes.
     pub(super) fn declare_this_binding(&mut self) -> Result<(), SourceLoweringError> {
         let register = self.allocate_local()?;
-        self.instructions.push(Instruction::load_this(register));
+        if self.is_derived_constructor {
+            self.instructions.push(Instruction::load_hole(register));
+        } else {
+            self.instructions.push(Instruction::load_this(register));
+        }
         self.env
             .bindings
-            .insert("this".to_string(), Binding::Register(register));
+            .insert("this".to_string(), Binding::ThisRegister(register));
         Ok(())
     }
 
@@ -294,6 +303,14 @@ impl<'a> FunctionCompiler<'a> {
                 &extract_function_params(function)?,
                 FunctionKind::Ordinary,
                 Some(self.env.clone()),
+                self.strict_mode
+                    || super::ast::has_use_strict_directive(
+                        function
+                            .body
+                            .as_ref()
+                            .map(|body| body.directives.as_slice())
+                            .unwrap_or(&[]),
+                    ),
             )?;
             module.set_function(pending.reserved, compiled.function);
             self.hoisted_functions.push(PendingFunction {
@@ -353,7 +370,9 @@ impl<'a> FunctionCompiler<'a> {
                 frame_layout,
                 Bytecode::from(self.instructions),
                 tables,
-            ),
+            )
+            .with_strict(self.strict_mode)
+            .with_derived_constructor(self.is_derived_constructor),
             captures: self.captures,
         })
     }
@@ -382,6 +401,10 @@ impl<'a> FunctionCompiler<'a> {
             AstStatement::EmptyStatement(_) => Ok(false),
             AstStatement::BlockStatement(block) => self.compile_statements(&block.body, module),
             AstStatement::FunctionDeclaration(_) => Ok(false),
+            AstStatement::ClassDeclaration(class) => {
+                self.compile_class_declaration(class, module)?;
+                Ok(false)
+            }
             AstStatement::VariableDeclaration(declaration) => {
                 self.compile_variable_declaration(declaration, module)?;
                 Ok(false)
@@ -586,6 +609,308 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    fn compile_class_declaration(
+        &mut self,
+        class: &Class<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        let name = class.id.as_ref().ok_or_else(|| {
+            SourceLoweringError::Unsupported("class declarations without identifiers".to_string())
+        })?;
+        let binding = self.declare_variable_binding(name.name.as_str(), false)?;
+
+        let mut constructor = None;
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method)
+                    if matches!(method.kind, MethodDefinitionKind::Constructor) =>
+                {
+                    if constructor.is_some() {
+                        return Err(SourceLoweringError::Unsupported(
+                            "duplicate class constructors".to_string(),
+                        ));
+                    }
+                    if method.r#static {
+                        return Err(SourceLoweringError::Unsupported(
+                            "static class constructors".to_string(),
+                        ));
+                    }
+                    constructor = Some(&method.value);
+                }
+                ClassElement::MethodDefinition(_) => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "class methods are not implemented yet on the new VM path".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "class elements beyond constructors are not implemented yet".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let super_class = if let Some(super_class) = class.super_class.as_ref() {
+            if matches!(super_class, Expression::NullLiteral(_)) {
+                return Err(SourceLoweringError::Unsupported(
+                    "class extends null is not implemented yet on the new VM path".to_string(),
+                ));
+            }
+            let super_value = self.compile_expression(super_class, module)?;
+            Some(self.stabilize_binding_value(super_value)?)
+        } else {
+            None
+        };
+
+        let constructor_value = if let Some(constructor) = constructor {
+            self.compile_class_constructor(
+                name.name.as_str(),
+                constructor,
+                super_class.is_some(),
+                module,
+            )?
+        } else if super_class.is_some() {
+            self.compile_default_derived_class_constructor(name.name.as_str(), module)?
+        } else {
+            self.compile_default_base_class_constructor(name.name.as_str(), module)?
+        };
+        let constructor_value = if constructor_value.is_temp {
+            self.stabilize_binding_value(constructor_value)?
+        } else {
+            constructor_value
+        };
+
+        if let Some(super_class) = super_class {
+            self.emit_object_method_call(
+                "setPrototypeOf",
+                constructor_value,
+                &[super_class],
+                module,
+            )?;
+        }
+
+        let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
+        let prototype_parent = if let Some(super_class) = super_class {
+            self.emit_named_property_load(super_class, "prototype")?
+        } else {
+            let object_ctor = self.compile_identifier("Object")?;
+            let object_ctor = if object_ctor.is_temp {
+                self.stabilize_binding_value(object_ctor)?
+            } else {
+                object_ctor
+            };
+            self.emit_named_property_load(object_ctor, "prototype")?
+        };
+        self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
+        self.emit_make_class_prototype_non_writable(constructor_value, module)?;
+
+        if constructor_value.register != binding {
+            self.instructions
+                .push(Instruction::move_(binding, constructor_value.register));
+        }
+
+        Ok(())
+    }
+
+    fn compile_class_constructor(
+        &mut self,
+        class_name: &str,
+        constructor: &Function<'_>,
+        derived: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let reserved = module.reserve_function();
+        let params = extract_function_params(constructor)?;
+        let compiled = module.compile_function_from_statements_with_options(
+            reserved,
+            FunctionIdentity {
+                debug_name: Some(class_name.to_string()),
+                self_binding_name: Some(class_name.to_string()),
+                length: expected_function_length(&params),
+            },
+            constructor
+                .body
+                .as_ref()
+                .map(|body| body.statements.as_slice())
+                .ok_or_else(|| {
+                    SourceLoweringError::Unsupported(
+                        "class constructors without bodies".to_string(),
+                    )
+                })?,
+            &params,
+            FunctionKind::Ordinary,
+            Some(self.env.clone()),
+            true,
+            derived,
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    fn compile_default_base_class_constructor(
+        &mut self,
+        class_name: &str,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let reserved = module.reserve_function();
+        let compiled = module.compile_function_from_statements(
+            reserved,
+            FunctionIdentity {
+                debug_name: Some(class_name.to_string()),
+                self_binding_name: Some(class_name.to_string()),
+                length: 0,
+            },
+            &[],
+            &[],
+            FunctionKind::Ordinary,
+            Some(self.env.clone()),
+            true,
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    fn compile_default_derived_class_constructor(
+        &mut self,
+        class_name: &str,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let reserved = module.reserve_function();
+        let mut compiler = FunctionCompiler::new(
+            self.mode,
+            Some(class_name.to_string()),
+            FunctionKind::Ordinary,
+            Some(self.env.clone()),
+        );
+        compiler.strict_mode = true;
+        compiler.is_derived_constructor = true;
+        compiler.declare_parameters(&[])?;
+        compiler.declare_this_binding()?;
+        compiler.reserve_arguments_binding_slot()?;
+        compiler.compile_parameter_initialization(&[], module)?;
+        let closure_register = compiler.declare_function_binding(class_name)?;
+        compiler
+            .instructions
+            .push(Instruction::load_current_closure(closure_register));
+        let forwarded = ValueLocation::temp(compiler.alloc_temp());
+        compiler
+            .instructions
+            .push(Instruction::call_super_forward(forwarded.register));
+        if let Some(Binding::ThisRegister(this_register)) = compiler.env.bindings.get("this").copied()
+            && this_register != forwarded.register
+        {
+            compiler
+                .instructions
+                .push(Instruction::move_(this_register, forwarded.register));
+        }
+        compiler.release(forwarded);
+        compiler.emit_implicit_return()?;
+        let compiled = compiler.finish(reserved, 0, Some(class_name))?;
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    fn emit_named_property_load(
+        &mut self,
+        base: ValueLocation,
+        name: &str,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let property = self.intern_property_name(name)?;
+        let result = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::get_property(
+            result.register,
+            base.register,
+            property,
+        ));
+        Ok(result)
+    }
+
+    fn emit_make_class_prototype_non_writable(
+        &mut self,
+        constructor: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        let descriptor = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_object(descriptor.register));
+        let writable = self.compile_bool(false)?;
+        let writable_key = self.intern_property_name("writable")?;
+        self.instructions.push(Instruction::set_property(
+            descriptor.register,
+            writable.register,
+            writable_key,
+        ));
+        self.release(writable);
+
+        let prototype_key = self.compile_string_literal("prototype")?;
+        self.emit_object_method_call(
+            "defineProperty",
+            constructor,
+            &[prototype_key, descriptor],
+            module,
+        )?;
+        Ok(())
+    }
+
+    fn emit_object_method_call(
+        &mut self,
+        method_name: &str,
+        receiver: ValueLocation,
+        args: &[ValueLocation],
+        _module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        let object = self.compile_identifier("Object")?;
+        let object = if object.is_temp {
+            self.stabilize_binding_value(object)?
+        } else {
+            object
+        };
+        let callee = self.emit_named_property_load(object, method_name)?;
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
+
+        let argument_count =
+            RegisterIndex::try_from(args.len() + 1).map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let arg_start = self.reserve_temp_window(argument_count)?;
+        let values: Vec<ValueLocation> = std::iter::once(receiver).chain(args.iter().copied()).collect();
+        for (offset, value) in values.into_iter().enumerate() {
+            let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
+            if value.register != destination {
+                self.instructions
+                    .push(Instruction::move_(destination, value.register));
+                self.release(value);
+            }
+        }
+
+        let result = self.alloc_temp();
+        let pc = self.instructions.len();
+        self.instructions
+            .push(Instruction::call_closure(result, callee.register, arg_start));
+        self.record_call_site(
+            pc,
+            CallSite::Closure(ClosureCall::new_with_receiver(
+                argument_count,
+                FrameFlags::new(false, true, false),
+                object.register,
+            )),
+        );
+        self.release(ValueLocation::temp(result));
+        self.release_temp_window(argument_count);
+        Ok(())
+    }
+
     pub(super) fn compile_expression_statement(
         &mut self,
         expression: &Expression<'_>,
@@ -719,6 +1044,20 @@ impl<'a> FunctionCompiler<'a> {
         )
     }
 
+    pub(super) fn emit_new_closure_class_constructor(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::class_constructor(),
+        )
+    }
+
     fn emit_new_closure_with_flags(
         &mut self,
         destination: BytecodeRegister,
@@ -774,6 +1113,19 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::set_upvalue(value.register, upvalue));
                 Ok(value)
             }
+            Binding::ThisRegister(register) => {
+                if register != value.register {
+                    self.instructions
+                        .push(Instruction::move_(register, value.register));
+                    self.release(value);
+                }
+                Ok(ValueLocation::local(register))
+            }
+            Binding::ThisUpvalue(upvalue) => {
+                self.instructions
+                    .push(Instruction::set_upvalue(value.register, upvalue));
+                Ok(value)
+            }
         }
     }
 
@@ -814,7 +1166,9 @@ impl<'a> FunctionCompiler<'a> {
                         Err(SourceLoweringError::DuplicateBinding(name.to_string()))
                     }
                 }
-                Binding::Upvalue(_) => Err(SourceLoweringError::DuplicateBinding(name.to_string())),
+                Binding::ThisRegister(_) | Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
+                    Err(SourceLoweringError::DuplicateBinding(name.to_string()))
+                }
             };
         }
 
@@ -832,10 +1186,11 @@ impl<'a> FunctionCompiler<'a> {
         let closure_register = if let Some(existing) = self.env.bindings.get(name).copied() {
             match existing {
                 Binding::Register(register) => register,
+                Binding::ThisRegister(register) => register,
                 Binding::Function {
                     closure_register, ..
                 } => closure_register,
-                Binding::Upvalue(_) => {
+                Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
                     return Err(SourceLoweringError::Unsupported(format!(
                         "function declaration {name} conflicts with an upvalue binding"
                     )));
@@ -908,10 +1263,12 @@ impl<'a> FunctionCompiler<'a> {
                 self.capture_ids.insert(name.to_string(), upvalue);
                 upvalue
             };
-            self.env
-                .bindings
-                .insert(name.to_string(), Binding::Upvalue(upvalue));
-            return Ok(Binding::Upvalue(upvalue));
+            let captured = match binding {
+                Binding::ThisRegister(_) | Binding::ThisUpvalue(_) => Binding::ThisUpvalue(upvalue),
+                _ => Binding::Upvalue(upvalue),
+            };
+            self.env.bindings.insert(name.to_string(), captured);
+            return Ok(captured);
         }
 
         // ES2024 §10.4.4: `arguments` is implicitly available in non-arrow functions.

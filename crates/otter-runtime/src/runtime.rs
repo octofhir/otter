@@ -674,6 +674,248 @@ mod tests {
     }
 
     #[test]
+    fn run_script_handles_symbol_wrapper_redefined_nullish_to_primitive_with_assert_throws() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let body = concat!(
+            "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: null });\n",
+            "assert.sameValue(Object(Symbol()) == 'Symbol()', false, 'hint: default');\n",
+            "assert.throws(TypeError, () => { +Object(Symbol()); }, 'hint: number');\n",
+            "assert.sameValue(`${Object(Symbol())}`, 'Symbol()', 'hint: string');\n",
+            "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+            "assert(Object(Symbol.iterator) == Symbol.iterator, 'hint: default');\n",
+            "assert.throws(TypeError, () => { Object(Symbol()) <= ''; }, 'hint: number');\n",
+            "assert.sameValue({ 'Symbol()': 1 }[Object(Symbol())], 1, 'hint: string');\n",
+        );
+
+        let mut rt = OtterRuntime::builder().build();
+        let code = format!("{sta}\n{assert_js}\n{body}");
+        rt.run_script(&code, "symbol-wrapper-redefined-nullish.js")
+            .expect("runtime should satisfy the exact test262 symbol wrapper nullish @@toPrimitive shape");
+    }
+
+    #[test]
+    fn run_script_reports_zero_failures_for_symbol_wrapper_redefined_nullish_probe() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var failures = 0;\n",
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: null });\n",
+                "if (Object(Symbol()) == 'Symbol()') failures |= 1;\n",
+                "try { +Object(Symbol()); failures |= 2; } catch (thrown) {\n",
+                "  if (typeof thrown !== 'object' || thrown === null) failures |= 4;\n",
+                "  else if (thrown.constructor !== TypeError) failures |= 8;\n",
+                "}\n",
+                "if (`${Object(Symbol())}` !== 'Symbol()') failures |= 16;\n",
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "if (!(Object(Symbol.iterator) == Symbol.iterator)) failures |= 32;\n",
+                "try { Object(Symbol()) <= ''; failures |= 64; } catch (thrown) {\n",
+                "  if (typeof thrown !== 'object' || thrown === null) failures |= 128;\n",
+                "  else if (thrown.constructor !== TypeError) failures |= 256;\n",
+                "}\n",
+                "if ({ 'Symbol()': 1 }[Object(Symbol())] !== 1) failures |= 512;\n",
+                "console.log(failures);\n",
+            ),
+            "symbol-wrapper-redefined-nullish-probe.js",
+        )
+        .expect("runtime probe should execute");
+        assert_eq!(capture.text(), "0");
+    }
+
+    #[test]
+    fn run_script_handles_date_constructor_after_symbol_wrapper_ordinary_to_primitive() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "if (!delete Symbol.prototype[Symbol.toPrimitive]) throw new Error('delete failed');\n",
+                "let valueOfFunction = null;\n",
+                "Object.defineProperty(Symbol.prototype, 'valueOf', {\n",
+                "  get: () => valueOfFunction,\n",
+                "});\n",
+                "let toStringFunction = () => 'foo';\n",
+                "Object.defineProperty(Symbol.prototype, 'toString', {\n",
+                "  get: () => toStringFunction,\n",
+                "});\n",
+                "console.log(String(new Date(Object(Symbol())).getTime()));\n",
+            ),
+            "symbol-wrapper-date-probe.js",
+        )
+        .expect("Date constructor probe should execute");
+        assert_eq!(capture.text(), "NaN");
+    }
+
+    #[test]
+    fn run_script_exposes_string_prototype_concat_on_string_literals() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "console.log(typeof ''.concat);\n",
+                "console.log(''.concat('a'));\n",
+            ),
+            "string-concat-smoke.js",
+        )
+        .expect("String.prototype.concat should work on string literals");
+        assert_eq!(capture.text(), "function\na");
+    }
+
+    #[test]
+    fn run_script_exposes_string_concat_surface_on_string_literals() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "console.log(typeof String.prototype.concat);\n",
+                "console.log(typeof ''.concat);\n",
+                "console.log(Object.getPrototypeOf('') === String.prototype);\n",
+            ),
+            "string-concat-surface.js",
+        )
+        .expect("String concat surface lookup should execute");
+        assert_eq!(capture.text(), "function\nundefined\ntrue");
+    }
+
+    #[test]
+    fn run_script_exposes_string_concat_on_string_variables() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var text = '';\n",
+                "console.log(typeof text.concat);\n",
+                "console.log(text.concat('a'));\n",
+            ),
+            "string-concat-variable-smoke.js",
+        )
+        .expect("String.prototype.concat should work on string variables");
+        assert_eq!(capture.text(), "function\na");
+    }
+
+    #[test]
+    fn runtime_state_finds_concat_on_allocated_string_values() {
+        let (mut rt, _capture) = rt_with_capture();
+        let property = rt.state_mut().intern_property_name("concat");
+        let string = rt.state_mut().alloc_string("");
+        let prototype = rt
+            .state()
+            .objects()
+            .get_prototype(string)
+            .expect("string prototype lookup should succeed")
+            .expect("allocated strings should have a prototype");
+        assert_eq!(prototype, rt.state().intrinsics().string_prototype());
+        let prototype_lookup = rt
+            .state_mut()
+            .property_lookup(prototype, property)
+            .expect("prototype property lookup should succeed")
+            .expect("concat should exist directly on String.prototype");
+        match prototype_lookup.value() {
+            otter_vm::object::PropertyValue::Data { value, .. } => {
+                assert!(value.as_object_handle().is_some());
+            }
+            other => panic!("expected data property for String.prototype.concat, got {other:?}"),
+        }
+        let lookup = rt
+            .state_mut()
+            .property_lookup(string, property)
+            .expect("string property lookup should succeed")
+            .expect("concat should exist on string prototype");
+        match lookup.value() {
+            otter_vm::object::PropertyValue::Data { value, .. } => {
+                let handle = value
+                    .as_object_handle()
+                    .map(otter_vm::object::ObjectHandle)
+                    .expect("concat should resolve to a callable object");
+                let kind = rt
+                    .state()
+                    .objects()
+                    .kind(handle)
+                    .expect("callable kind lookup should succeed");
+                assert_eq!(kind, otter_vm::object::HeapValueKind::HostFunction);
+            }
+            other => panic!("expected data property for concat lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_script_reports_progress_through_removed_symbol_wrapper_ordinary_to_primitive() {
+        let (mut rt, capture) = rt_with_capture();
+        let result = rt.run_script(
+            concat!(
+                "function ProbeError() {}\n",
+                "if (!delete Symbol.prototype[Symbol.toPrimitive]) throw new Error('delete failed');\n",
+                "console.log('d');\n",
+                "let valueOfGets = 0;\n",
+                "let valueOfCalls = 0;\n",
+                "let valueOfFunction = () => { ++valueOfCalls; return 123; };\n",
+                "Object.defineProperty(Symbol.prototype, 'valueOf', { get: () => { ++valueOfGets; return valueOfFunction; } });\n",
+                "console.log('v');\n",
+                "if (!(Object(Symbol()) == 123)) throw new Error('stage1-a');\n",
+                "console.log('1a');\n",
+                "if (Object(Symbol()) - 0 !== 123) throw new Error('stage1-b');\n",
+                "console.log('1b');\n",
+                "if (''.concat(Object(Symbol())) !== 'Symbol()') throw new Error('stage1-c');\n",
+                "console.log('1');\n",
+                "let toStringGets = 0;\n",
+                "let toStringCalls = 0;\n",
+                "let toStringFunction = () => { ++toStringCalls; return 'foo'; };\n",
+                "Object.defineProperty(Symbol.prototype, 'toString', { get: () => { ++toStringGets; return toStringFunction; } });\n",
+                "if ('' + Object(Symbol()) !== '123') throw new Error('stage2-a');\n",
+                "if (Object(Symbol()) * 1 !== 123) throw new Error('stage2-b');\n",
+                "if ({ '123': 1, 'Symbol()': 2, 'foo': 3 }[Object(Symbol())] !== 3) throw new Error('stage2-c');\n",
+                "console.log('2');\n",
+                "valueOfFunction = null;\n",
+                "if (String(new Date(Object(Symbol())).getTime()) !== 'NaN') throw new Error('stage3-a');\n",
+                "if (String(+Object(Symbol())) !== 'NaN') throw new Error('stage3-b');\n",
+                "if (`${Object(Symbol())}` !== 'foo') throw new Error('stage3-c');\n",
+                "console.log('3');\n",
+                "toStringFunction = function() { throw new ProbeError(); };\n",
+                "try { Object(Symbol()) != 123; throw new Error('stage4-a'); } catch (error) { if (error.constructor !== ProbeError) throw error; }\n",
+                "console.log('4a');\n",
+                "try { Object(Symbol()) / 0; throw new Error('stage4-b'); } catch (error) { if (error.constructor !== ProbeError) throw error; }\n",
+                "console.log('4b');\n",
+                "try { ''.concat(Object(Symbol())); throw new Error('stage4-c'); } catch (error) { if (error.constructor !== ProbeError) throw error; }\n",
+                "console.log('4');\n",
+                "toStringFunction = undefined;\n",
+                "try { 1 + Object(Symbol()); throw new Error('stage5-a'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
+                "console.log('5a');\n",
+                "try { Number(Object(Symbol())); throw new Error('stage5-b'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
+                "console.log('5b');\n",
+                "try { String(Object(Symbol())); throw new Error('stage5-c'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
+                "console.log('5');\n",
+            ),
+            "symbol-wrapper-removed-ordinary-progress.js",
+        );
+        assert!(result.is_ok(), "result = {result:?}, progress = {}", capture.text());
+    }
+
+    #[test]
+    fn run_script_reports_strict_symbol_primitive_assignment_errors() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "\"use strict\";\n",
+                "var sym = Symbol('66');\n",
+                "try {\n",
+                "  sym.toString = 0;\n",
+                "  console.log('no-throw-1');\n",
+                "} catch (error) {\n",
+                "  console.log(error.name);\n",
+                "  console.log(error.constructor === TypeError);\n",
+                "}\n",
+                "try {\n",
+                "  sym.valueOf = 0;\n",
+                "  console.log('no-throw-2');\n",
+                "} catch (error) {\n",
+                "  console.log(error.name);\n",
+                "  console.log(error.constructor === TypeError);\n",
+                "}\n",
+            ),
+            "strict-symbol-primitive-assignment-diagnostics.js",
+        )
+        .expect("strict symbol assignment diagnostics should execute");
+        assert_eq!(capture.text(), "TypeError\ntrue\nTypeError\ntrue");
+    }
+
+    #[test]
     fn run_script_handles_property_helper_on_math_after_separate_include() {
         let base =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");

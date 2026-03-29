@@ -3839,14 +3839,16 @@ mod tests {
     fn symbol_wrapper_redefined_nullish_to_primitive_uses_ordinary_paths() {
         let result = execute_test262_basic(
             concat!(
+                "var failures = 0;\n",
                 "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: null });\n",
-                "assert.sameValue(Object(Symbol()) == 'Symbol()', false);\n",
-                "try { +Object(Symbol()); throw new Test262Error('expected TypeError for unary plus'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
-                "assert.sameValue(`${Object(Symbol())}`, 'Symbol()');\n",
+                "if (Object(Symbol()) == 'Symbol()') failures |= 1;\n",
+                "try { +Object(Symbol()); failures |= 2; } catch (error) { if (error.name !== 'TypeError') failures |= 4; }\n",
+                "if (`${Object(Symbol())}` !== 'Symbol()') failures |= 8;\n",
                 "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
-                "assert.sameValue(Object(Symbol.iterator) == Symbol.iterator, true);\n",
-                "try { Object(Symbol()) <= ''; throw new Test262Error('expected TypeError for relational compare'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
-                "assert.sameValue({ 'Symbol()': 1 }[Object(Symbol())], 1);\n",
+                "if (!(Object(Symbol.iterator) == Symbol.iterator)) failures |= 16;\n",
+                "try { Object(Symbol()) <= ''; failures |= 32; } catch (error) { if (error.name !== 'TypeError') failures |= 64; }\n",
+                "if ({ 'Symbol()': 1 }[Object(Symbol())] !== 1) failures |= 128;\n",
+                "failures;\n",
             ),
             "symbol-wrapper-redefined-nullish-ordinary-to-primitive.js",
         );
@@ -3854,7 +3856,33 @@ mod tests {
     }
 
     #[test]
-    fn reflect_construct_reports_symbol_builtins_as_non_constructors() {
+    fn exact_test262_symbol_wrapper_redefined_nullish_to_primitive_passes_locally() {
+        let result = execute_test262_basic(
+            concat!(
+                "var failures = 0;\n",
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: null });\n",
+                "if (Object(Symbol()) == 'Symbol()') failures |= 1;\n",
+                "try { +Object(Symbol()); failures |= 2; } catch (thrown) {\n",
+                "  if (typeof thrown !== 'object' || thrown === null) failures |= 4;\n",
+                "  else if (thrown.constructor !== TypeError) failures |= 8;\n",
+                "}\n",
+                "if (`${Object(Symbol())}` !== 'Symbol()') failures |= 16;\n",
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "if (!(Object(Symbol.iterator) == Symbol.iterator)) failures |= 32;\n",
+                "try { Object(Symbol()) <= ''; failures |= 64; } catch (thrown) {\n",
+                "  if (typeof thrown !== 'object' || thrown === null) failures |= 128;\n",
+                "  else if (thrown.constructor !== TypeError) failures |= 256;\n",
+                "}\n",
+                "if ({ 'Symbol()': 1 }[Object(Symbol())] !== 1) failures |= 512;\n",
+                "failures;\n",
+            ),
+            "symbol-wrapper-redefined-nullish-exact.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn reflect_construct_reports_symbol_constructor_shape() {
         let result = execute_test262_basic(
             concat!(
                 "function isConstructor(f) {\n",
@@ -3865,7 +3893,7 @@ mod tests {
                 "  }\n",
                 "  return true;\n",
                 "}\n",
-                "if (isConstructor(Symbol)) throw new Test262Error('Symbol should not be constructible');\n",
+                "if (!isConstructor(Symbol)) throw new Test262Error('Symbol should be constructible');\n",
                 "if (isConstructor(Symbol.for)) throw new Test262Error('Symbol.for should not be constructible');\n",
                 "if (isConstructor(Symbol.keyFor)) throw new Test262Error('Symbol.keyFor should not be constructible');\n",
             ),
@@ -4043,6 +4071,152 @@ mod tests {
                 "assert.sameValue(Object.prototype.hasOwnProperty.call(Math, 'E'), true, 'Math.E remains present after delete attempt');\n",
             ),
             "math-e-property-operations.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn strict_symbol_primitive_property_assignment_throws_type_error() {
+        let result = execute_test262_basic(
+            concat!(
+                "\"use strict\";\n",
+                "var sym = Symbol('66');\n",
+                "try {\n",
+                "  sym.toString = 0;\n",
+                "  throw new Test262Error('sym.toString assignment should throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'strict symbol toString assignment throws');\n",
+                "}\n",
+                "try {\n",
+                "  sym.valueOf = 0;\n",
+                "  throw new Test262Error('sym.valueOf assignment should throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'strict symbol valueOf assignment throws');\n",
+                "}\n",
+            ),
+            "symbol-primitive-strict-property-assignment.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn compile_script_marks_use_strict_entry_function_as_strict() {
+        let module =
+            compile_script("\"use strict\";\nvar x = 1;\n", "strict-flag-entry.js")
+                .expect("strict script should compile");
+        assert!(module.entry_function().is_strict());
+    }
+
+    #[test]
+    fn default_derived_constructor_forwards_arguments_to_super() {
+        let result = execute_test262_basic(
+            concat!(
+                "class Base {\n",
+                "  constructor(x, y) {\n",
+                "    this.x = x;\n",
+                "    this.y = y;\n",
+                "  }\n",
+                "}\n",
+                "class Derived extends Base {}\n",
+                "var value = new Derived(1, 2);\n",
+                "assert.sameValue(value.x, 1, 'default derived constructor forwards first arg');\n",
+                "assert.sameValue(value.y, 2, 'default derived constructor forwards second arg');\n",
+                "assert.sameValue(Object.getPrototypeOf(value), Derived.prototype, 'default derived constructor uses Derived.prototype');\n",
+            ),
+            "default-derived-constructor-forwarding.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn derived_constructor_this_before_super_throws_reference_error() {
+        let result = execute_test262_basic(
+            concat!(
+                "class Base {}\n",
+                "class Derived extends Base {\n",
+                "  constructor() {\n",
+                "    try {\n",
+                "      this;\n",
+                "      throw new Test262Error('this before super should throw');\n",
+                "    } catch (error) {\n",
+                "      assert.sameValue(error.name, 'ReferenceError', 'this before super throws ReferenceError');\n",
+                "    }\n",
+                "    super();\n",
+                "  }\n",
+                "}\n",
+                "new Derived();\n",
+            ),
+            "derived-constructor-this-before-super.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn derived_constructor_arrow_created_before_super_observes_initialized_this_after_super() {
+        let result = execute_test262_basic(
+            concat!(
+                "class Base {\n",
+                "  constructor(value) {\n",
+                "    this.value = value;\n",
+                "  }\n",
+                "}\n",
+                "class Derived extends Base {\n",
+                "  constructor(value) {\n",
+                "    var read = () => this.value;\n",
+                "    super(value);\n",
+                "    assert.sameValue(read(), value, 'lexical this binding updates after super');\n",
+                "  }\n",
+                "}\n",
+                "new Derived(7);\n",
+            ),
+            "derived-constructor-arrow-lexical-this.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn derived_constructor_return_object_overrides_initialized_this() {
+        let result = execute_test262_basic(
+            concat!(
+                "class Base {\n",
+                "  constructor() {\n",
+                "    this.prop = 1;\n",
+                "  }\n",
+                "}\n",
+                "class Derived extends Base {\n",
+                "  constructor() {\n",
+                "    super();\n",
+                "    return { override: true };\n",
+                "  }\n",
+                "}\n",
+                "var value = new Derived();\n",
+                "assert.sameValue(value.override, true, 'returned object replaces initialized this');\n",
+                "assert.sameValue(typeof value.prop, 'undefined', 'base initialized object is discarded');\n",
+                "assert.sameValue(value instanceof Derived, false, 'returned object is not a Derived instance');\n",
+            ),
+            "derived-constructor-return-object-override.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn derived_constructor_returning_primitive_throws_type_error() {
+        let result = execute_test262_basic(
+            concat!(
+                "class Base {}\n",
+                "class Derived extends Base {\n",
+                "  constructor() {\n",
+                "    return 42;\n",
+                "  }\n",
+                "}\n",
+                "try {\n",
+                "  new Derived();\n",
+                "  throw new Test262Error('derived constructor primitive return should throw');\n",
+                "} catch (error) {\n",
+                "  assert.sameValue(error.name, 'TypeError', 'derived constructor primitive return throws TypeError');\n",
+                "}\n",
+            ),
+            "derived-constructor-return-primitive.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
     }

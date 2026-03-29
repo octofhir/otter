@@ -30,7 +30,6 @@ use crate::value::{RegisterValue, ValueError};
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
 const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
-const SYMBOL_DATA_SLOT: &str = "__otter_symbol_data__";
 
 /// Errors produced by the new interpreter.
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +170,7 @@ pub struct Activation {
     function_index: FunctionIndex,
     metadata: FrameMetadata,
     closure_handle: Option<ObjectHandle>,
+    construct_new_target: Option<ObjectHandle>,
     pending_exception: Option<RegisterValue>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
@@ -211,6 +211,7 @@ impl Activation {
             function_index,
             metadata,
             closure_handle,
+            construct_new_target: None,
             pending_exception: None,
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
@@ -237,6 +238,15 @@ impl Activation {
     #[must_use]
     pub const fn closure_handle(&self) -> Option<ObjectHandle> {
         self.closure_handle
+    }
+
+    #[must_use]
+    pub const fn construct_new_target(&self) -> Option<ObjectHandle> {
+        self.construct_new_target
+    }
+
+    pub fn set_construct_new_target(&mut self, new_target: Option<ObjectHandle>) {
+        self.construct_new_target = new_target;
     }
 
     /// Returns the pending exception value, if one exists.
@@ -491,6 +501,7 @@ pub struct RuntimeState {
     timers: crate::event_loop::TimerRegistry,
     console_backend: Box<dyn crate::console::ConsoleBackend>,
     current_module: Option<Module>,
+    native_call_construct_stack: Vec<bool>,
     next_symbol_id: u32,
     symbol_descriptions: BTreeMap<u32, Option<Box<str>>>,
     global_symbol_registry: BTreeMap<Box<str>, u32>,
@@ -529,6 +540,7 @@ impl RuntimeState {
             timers: crate::event_loop::TimerRegistry::new(),
             console_backend: Box::new(crate::console::StdioConsoleBackend),
             current_module: None,
+            native_call_construct_stack: Vec::new(),
             next_symbol_id: WellKnownSymbol::Unscopables.stable_id() + 1,
             symbol_descriptions,
             global_symbol_registry: BTreeMap::new(),
@@ -567,6 +579,16 @@ impl RuntimeState {
     /// Returns the mutable runtime-wide property-name registry.
     pub fn property_names_mut(&mut self) -> &mut PropertyNameRegistry {
         &mut self.property_names
+    }
+
+    /// Returns `true` when the active native callback was entered via
+    /// [[Construct]].
+    #[must_use]
+    pub fn is_current_native_construct_call(&self) -> bool {
+        self.native_call_construct_stack
+            .last()
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Creates a property key iterator (for..in) from an object and its prototype chain.
@@ -1209,30 +1231,6 @@ impl RuntimeState {
     }
 
     fn coerce_symbol_string(&mut self, value: RegisterValue) -> Result<Box<str>, InterpreterError> {
-        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
-            let to_string = self.intern_property_name("toString");
-            let to_string_value = self
-                .ordinary_get(handle, to_string, value)
-                .map_err(|error| match error {
-                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
-                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
-                })?;
-            if let Some(callable) = to_string_value.as_object_handle().map(ObjectHandle)
-                && self.objects.is_callable(callable)
-            {
-                let result =
-                    self.call_callable(callable, value, &[])
-                        .map_err(|error| match error {
-                            VmNativeCallError::Thrown(value) => {
-                                InterpreterError::UncaughtThrow(value)
-                            }
-                            VmNativeCallError::Internal(message) => {
-                                InterpreterError::NativeCall(message)
-                            }
-                        })?;
-                return self.js_to_string(result);
-            }
-        }
         self.js_to_string(value)
     }
 
@@ -1817,6 +1815,7 @@ impl RuntimeState {
                     host_function,
                     default_receiver,
                     arguments,
+                    true,
                 )
                 .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?;
                 Interpreter::apply_construct_return_override(completion, default_receiver)
@@ -1836,11 +1835,18 @@ impl RuntimeState {
                     VmNativeCallError::Internal("construct closure callee is missing".into())
                 })?;
                 let register_count = callee_function.frame_layout().register_count();
-                let default_receiver = RegisterValue::from_object_handle(
-                    Interpreter::allocate_construct_receiver(self, new_target)
-                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
-                        .0,
-                );
+                let is_derived_constructor = callee_function.is_derived_constructor();
+                let default_receiver = if is_derived_constructor {
+                    RegisterValue::undefined()
+                } else {
+                    RegisterValue::from_object_handle(
+                        Interpreter::allocate_construct_receiver(self, new_target)
+                            .map_err(|error| {
+                                VmNativeCallError::Internal(format!("{error}").into())
+                            })?
+                            .0,
+                    )
+                };
                 let mut activation = Activation::with_context(
                     callee_index,
                     register_count,
@@ -1850,6 +1856,7 @@ impl RuntimeState {
                     ),
                     Some(target),
                 );
+                activation.set_construct_new_target(Some(new_target));
 
                 if callee_function.frame_layout().receiver_slot().is_some() {
                     activation
@@ -1885,7 +1892,53 @@ impl RuntimeState {
                         }
                         other => VmNativeCallError::Internal(format!("{other}").into()),
                     })?;
-                Interpreter::apply_construct_return_override(completion, default_receiver)
+                if is_derived_constructor {
+                    match completion {
+                        Completion::Return(value) if value.as_object_handle().is_some() => {
+                            Completion::Return(value)
+                        }
+                        Completion::Return(value) if value != RegisterValue::undefined() => {
+                            let error = self
+                                .alloc_type_error(
+                                    "Derived constructors may only return object or undefined values",
+                                )
+                                .map_err(|error| {
+                                    VmNativeCallError::Internal(format!("{error}").into())
+                                })?;
+                            Completion::Throw(RegisterValue::from_object_handle(error.0))
+                        }
+                        Completion::Return(_) => {
+                            let this_value = if callee_function.frame_layout().receiver_slot().is_some()
+                            {
+                                activation.receiver(callee_function).map_err(|error| {
+                                    VmNativeCallError::Internal(format!("{error}").into())
+                                })?
+                            } else {
+                                RegisterValue::undefined()
+                            };
+                            if this_value.as_object_handle().is_some() {
+                                Completion::Return(this_value)
+                            } else {
+                                let error = self
+                                    .alloc_reference_error(
+                                        "Must call super constructor in derived class before returning from derived constructor",
+                                    )
+                                    .map_err(|error| {
+                                        VmNativeCallError::Internal(
+                                            format!(
+                                                "construct ReferenceError allocation failed: {error}"
+                                            )
+                                            .into(),
+                                        )
+                                    })?;
+                                Completion::Throw(RegisterValue::from_object_handle(error.0))
+                            }
+                        }
+                        Completion::Throw(value) => Completion::Throw(value),
+                    }
+                } else {
+                    Interpreter::apply_construct_return_override(completion, default_receiver)
+                }
             }
             _ => {
                 return Err(VmNativeCallError::Internal(
@@ -1941,29 +1994,6 @@ impl RuntimeState {
             return Ok(None);
         };
         Ok(Some(value))
-    }
-
-    pub(crate) fn boxed_primitive_value(
-        &mut self,
-        handle: ObjectHandle,
-    ) -> Result<Option<RegisterValue>, InterpreterError> {
-        if let Some(value) = self.own_data_property(handle, STRING_DATA_SLOT)?
-            && value.as_object_handle().is_some()
-        {
-            return Ok(Some(value));
-        }
-        if let Some(value) = self.own_data_property(handle, NUMBER_DATA_SLOT)? {
-            return Ok(Some(value));
-        }
-        if let Some(value) = self.own_data_property(handle, BOOLEAN_DATA_SLOT)? {
-            return Ok(Some(value));
-        }
-        if let Some(value) = self.own_data_property(handle, SYMBOL_DATA_SLOT)?
-            && value.is_symbol()
-        {
-            return Ok(Some(value));
-        }
-        Ok(None)
     }
 
     fn string_wrapper_data(
@@ -2089,6 +2119,40 @@ impl RuntimeState {
             ));
         }
         Err(InterpreterError::InvalidObjectValue)
+    }
+
+    pub(crate) fn property_set_target_handle(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        if value == RegisterValue::undefined() || value == RegisterValue::null() {
+            return Err(InterpreterError::TypeError(
+                "Cannot set properties of null or undefined".into(),
+            ));
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            return Ok(handle);
+        }
+        if value.as_bool().is_some() {
+            return Ok(self.intrinsics.boolean_prototype());
+        }
+        if value.as_number().is_some() {
+            return Ok(self.intrinsics.number_prototype());
+        }
+        if value.is_symbol() {
+            return Ok(self.intrinsics.symbol_prototype());
+        }
+        Err(InterpreterError::InvalidObjectValue)
+    }
+
+    fn is_primitive_property_base(&self, value: RegisterValue) -> Result<bool, ObjectError> {
+        if value.as_bool().is_some() || value.as_number().is_some() || value.is_symbol() {
+            return Ok(true);
+        }
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+        Ok(matches!(self.objects.kind(handle)?, HeapValueKind::String))
     }
 
     fn ordinary_to_primitive(
@@ -2243,11 +2307,6 @@ impl RuntimeState {
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             if let Some(string) = self.objects.string_value(handle)? {
                 return Ok(string.to_string().into_boxed_str());
-            }
-            if let Some(primitive) = self.boxed_primitive_value(handle)?
-                && primitive.is_symbol()
-            {
-                return Ok(crate::intrinsics::symbol_descriptive_string(primitive, self).into());
             }
             let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::String)?;
             if primitive != value {
@@ -2713,6 +2772,15 @@ impl Interpreter {
                 }
             }
             HeapValueKind::Closure => {
+                if runtime
+                    .objects
+                    .closure_flags(callable)
+                    .is_ok_and(|flags| flags.is_class_constructor())
+                {
+                    return Err(InterpreterError::TypeError(
+                        "Class constructor cannot be invoked without 'new'".into(),
+                    ));
+                }
                 let module = runtime.objects.closure_module(callable)?;
                 let callee_index = runtime.objects.closure_callee(callable)?;
                 let callee_function = module
@@ -2895,6 +2963,11 @@ impl Interpreter {
             let outcome = match self.step(function, module, activation, runtime, &mut frame_runtime)
             {
                 Ok(outcome) => outcome,
+                Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
+                Err(InterpreterError::TypeError(message)) => {
+                    let error = runtime.alloc_type_error(&message)?;
+                    StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
+                }
                 Err(error) => {
                     runtime.restore_module(previous_module);
                     return Err(error);
@@ -3333,6 +3406,17 @@ impl Interpreter {
             }
             Opcode::LoadThis => {
                 let receiver = activation.receiver(function)?;
+                if function.is_derived_constructor()
+                    && activation.metadata().flags().is_construct()
+                    && receiver == RegisterValue::undefined()
+                {
+                    let error = runtime.alloc_reference_error(
+                        "Must call super constructor in derived class before accessing 'this'",
+                    )?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
                 activation.write_bytecode_register(function, instruction.a(), receiver)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -3351,6 +3435,29 @@ impl Interpreter {
                     function,
                     instruction.a(),
                     RegisterValue::from_bool(!truthy),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::ToNumber => {
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let number = runtime.js_to_number(value)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(number),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            Opcode::ToString => {
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let text = runtime.js_to_string(value)?;
+                let string = runtime.alloc_string(text);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(string.0),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -3660,8 +3767,22 @@ impl Interpreter {
                 let pc = activation.pc();
                 let property = Self::resolve_property_name(function, runtime, instruction.c())?;
                 let base = activation.read_bytecode_register(function, instruction.a())?;
-                let handle = runtime.property_base_object_handle(base)?;
+                let handle = runtime.property_set_target_handle(base)?;
                 let value = activation.read_bytecode_register(function, instruction.b())?;
+                let primitive_base = runtime.is_primitive_property_base(base)?;
+
+                if primitive_base {
+                    let handled = Self::primitive_set_property(runtime, handle, base, property, value)?;
+                    if !handled && function.is_strict() {
+                        let error = runtime
+                            .alloc_type_error("Cannot assign to property of primitive value")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
 
                 let supports_inline_property_cache = !matches!(
                     runtime.objects.kind(handle)?,
@@ -3772,10 +3893,25 @@ impl Interpreter {
             Opcode::SetIndex => {
                 let pc = activation.pc();
                 let base = activation.read_bytecode_register(function, instruction.a())?;
-                let handle = runtime.property_base_object_handle(base)?;
                 let key = activation.read_bytecode_register(function, instruction.b())?;
                 let value = activation.read_bytecode_register(function, instruction.c())?;
                 let property = runtime.computed_property_name(key)?;
+                let handle = runtime.property_set_target_handle(base)?;
+                let primitive_base = runtime.is_primitive_property_base(base)?;
+
+                if primitive_base {
+                    let handled =
+                        Self::primitive_set_property(runtime, handle, base, property, value)?;
+                    if !handled && function.is_strict() {
+                        let error = runtime
+                            .alloc_type_error("Cannot assign to property of primitive value")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
 
                 match runtime.objects.kind(handle)? {
                     HeapValueKind::Array => {
@@ -4013,11 +4149,14 @@ impl Interpreter {
                 let caller_function = module
                     .function(activation.function_index())
                     .expect("activation function index must be valid");
-                let callee = activation
-                    .read_bytecode_register(caller_function, instruction.b())?
-                    .as_object_handle()
-                    .map(ObjectHandle)
-                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let callee_value =
+                    activation.read_bytecode_register(caller_function, instruction.b())?;
+                let Some(callee) = callee_value.as_object_handle().map(ObjectHandle) else {
+                    let error = runtime.alloc_type_error("Value is not callable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
 
                 // ES2024 §10.4.1.1 [[Call]] — resolve bound function before dispatch.
                 let arguments = Self::read_call_arguments(
@@ -4027,6 +4166,12 @@ impl Interpreter {
                     call.argument_count(),
                 )?;
                 if call.flags().is_construct() {
+                    if !runtime.is_constructible(callee) {
+                        let error = runtime.alloc_type_error("Value is not a constructor")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                            error.0,
+                        )));
+                    }
                     match runtime.construct_callable(callee, &arguments, callee) {
                         Ok(value) => {
                             activation.refresh_open_upvalues_from_cells(runtime)?;
@@ -4041,6 +4186,26 @@ impl Interpreter {
                             return Err(InterpreterError::NativeCall(message));
                         }
                     }
+                }
+
+                if !runtime.objects.is_callable(callee) {
+                    let error = runtime.alloc_type_error("Value is not callable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+
+                if matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
+                    && runtime
+                        .objects
+                        .closure_flags(callee)
+                        .is_ok_and(|flags| flags.is_class_constructor())
+                {
+                    let error = runtime
+                        .alloc_type_error("Class constructor cannot be invoked without 'new'")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
                 }
 
                 if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callee) {
@@ -4103,6 +4268,99 @@ impl Interpreter {
                             Ok(StepOutcome::Continue)
                         }
                         Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
+                    }
+                }
+            }
+            Opcode::CallSuper => {
+                if !function.is_derived_constructor() || !activation.metadata().flags().is_construct()
+                {
+                    let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                    let error = runtime.alloc_type_error("Super constructor is not available")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
+                let new_target = activation.construct_new_target().unwrap_or(closure);
+                let argc = instruction.c();
+                let mut arguments = Vec::with_capacity(usize::from(argc));
+                for offset in 0..argc {
+                    let value = activation.read_bytecode_register(
+                        function,
+                        instruction.b().saturating_add(offset),
+                    )?;
+                    arguments.push(value);
+                }
+
+                match runtime.construct_callable(super_ctor, &arguments, new_target) {
+                    Ok(this_value) => {
+                        if function.frame_layout().receiver_slot().is_some() {
+                            activation.set_receiver(function, this_value)?;
+                        }
+                        activation.write_bytecode_register(function, instruction.a(), this_value)?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Err(VmNativeCallError::Thrown(value)) => Ok(StepOutcome::Throw(value)),
+                    Err(VmNativeCallError::Internal(message)) => {
+                        Err(InterpreterError::NativeCall(message))
+                    }
+                }
+            }
+            Opcode::CallSuperForward => {
+                if !function.is_derived_constructor() || !activation.metadata().flags().is_construct()
+                {
+                    let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                    let error = runtime.alloc_type_error("Super constructor is not available")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
+                let new_target = activation.construct_new_target().unwrap_or(closure);
+                let param_count = function.frame_layout().parameter_count();
+                let actual_argc = activation.metadata().argument_count();
+                let mut arguments = Vec::with_capacity(usize::from(actual_argc));
+                for offset in 0..actual_argc {
+                    let value = if offset < param_count {
+                        activation.read_bytecode_register(function, offset)?
+                    } else {
+                        *activation
+                            .overflow_args
+                            .get(usize::from(offset - param_count))
+                            .ok_or(InterpreterError::RegisterOutOfBounds)?
+                    };
+                    arguments.push(value);
+                }
+
+                match runtime.construct_callable(super_ctor, &arguments, new_target) {
+                    Ok(this_value) => {
+                        if function.frame_layout().receiver_slot().is_some() {
+                            activation.set_receiver(function, this_value)?;
+                        }
+                        activation.write_bytecode_register(function, instruction.a(), this_value)?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Err(VmNativeCallError::Thrown(value)) => Ok(StepOutcome::Throw(value)),
+                    Err(VmNativeCallError::Internal(message)) => {
+                        Err(InterpreterError::NativeCall(message))
                     }
                 }
             }
@@ -4324,10 +4582,15 @@ impl Interpreter {
                 }
                 match lookup.value() {
                     PropertyValue::Data { .. } if lookup.owner() == handle => {
-                        let cache = lookup
-                            .cache()
-                            .expect("own-property lookup should yield a receiver cache");
-                        Ok(runtime.objects.set_cached(handle, property, value, cache)?)
+                        if let Some(cache) = lookup.cache() {
+                            let updated = runtime.objects.set_cached(handle, property, value, cache)?;
+                            if updated {
+                                return Ok(true);
+                            }
+                        }
+                        let cache = runtime.objects.set_property(handle, property, value)?;
+                        frame_runtime.update_property_cache(function, pc, cache);
+                        Ok(true)
                     }
                     PropertyValue::Data { .. } => Ok(false),
                     PropertyValue::Accessor { setter, .. } => {
@@ -4336,6 +4599,25 @@ impl Interpreter {
                     }
                 }
             }
+            None => Ok(false),
+        }
+    }
+
+    fn primitive_set_property(
+        runtime: &mut RuntimeState,
+        target: ObjectHandle,
+        receiver: RegisterValue,
+        property: PropertyNameId,
+        value: RegisterValue,
+    ) -> Result<bool, InterpreterError> {
+        match runtime.property_lookup(target, property)? {
+            Some(lookup) => match lookup.value() {
+                PropertyValue::Accessor { setter, .. } => {
+                    let _ = runtime.call_callable_for_accessor(setter, receiver, &[value])?;
+                    Ok(true)
+                }
+                PropertyValue::Data { .. } => Ok(false),
+            },
             None => Ok(false),
         }
     }
@@ -4488,8 +4770,13 @@ impl Interpreter {
             arg_start,
             call.argument_count(),
         )?;
-        let completion =
-            Self::invoke_registered_host_function(runtime, host_function, receiver, &arguments)?;
+        let completion = Self::invoke_registered_host_function(
+            runtime,
+            host_function,
+            receiver,
+            &arguments,
+            call.flags().is_construct(),
+        )?;
         if let Some(default_receiver) = construct_receiver {
             Ok(Self::apply_construct_return_override(
                 completion,
@@ -4553,7 +4840,7 @@ impl Interpreter {
             .objects
             .host_function(callable)?
             .ok_or(InterpreterError::InvalidCallTarget)?;
-        Self::invoke_registered_host_function(runtime, host_function, receiver, arguments)
+        Self::invoke_registered_host_function(runtime, host_function, receiver, arguments, false)
     }
 
     fn invoke_registered_host_function(
@@ -4561,6 +4848,7 @@ impl Interpreter {
         host_function: HostFunctionId,
         receiver: RegisterValue,
         arguments: &[RegisterValue],
+        is_construct: bool,
     ) -> Result<Completion, InterpreterError> {
         let descriptor = runtime
             .native_functions()
@@ -4568,11 +4856,14 @@ impl Interpreter {
             .cloned()
             .ok_or(InterpreterError::InvalidCallTarget)?;
 
-        match (descriptor.callback())(&receiver, arguments, runtime) {
+        runtime.native_call_construct_stack.push(is_construct);
+        let completion = match (descriptor.callback())(&receiver, arguments, runtime) {
             Ok(value) => Ok(Completion::Return(value)),
             Err(VmNativeCallError::Thrown(value)) => Ok(Completion::Throw(value)),
             Err(VmNativeCallError::Internal(message)) => Err(InterpreterError::NativeCall(message)),
-        }
+        };
+        runtime.native_call_construct_stack.pop();
+        completion
     }
 
     fn initialize_receiver(

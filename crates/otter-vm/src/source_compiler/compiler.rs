@@ -110,6 +110,19 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    /// Reserves a stable local slot for the implicit `arguments` binding.
+    ///
+    /// The actual arguments object remains lazily materialized on first access,
+    /// but the slot itself must exist before any temp registers are allocated.
+    pub(super) fn reserve_arguments_binding_slot(&mut self) -> Result<(), SourceLoweringError> {
+        if self.kind == FunctionKind::Arrow || self.arguments_local.is_some() {
+            return Ok(());
+        }
+        let register = self.allocate_local()?;
+        self.arguments_local = Some(register);
+        Ok(())
+    }
+
     /// Emits default-parameter and destructuring initialization left-to-right.
     pub(super) fn compile_parameter_initialization(
         &mut self,
@@ -235,7 +248,8 @@ impl<'a> FunctionCompiler<'a> {
 
         let mut reserved = Vec::new();
         collect_function_declarations(statements, &mut reserved);
-        for function in reserved {
+        let mut pending_functions = Vec::with_capacity(reserved.len());
+        for function in &reserved {
             let name = function.id.as_ref().ok_or_else(|| {
                 SourceLoweringError::Unsupported(
                     "function declarations without identifiers".to_string(),
@@ -244,19 +258,29 @@ impl<'a> FunctionCompiler<'a> {
 
             let reserved_index = module.reserve_function();
             let closure_register = self.declare_function_binding(name.name.as_str())?;
-            let pending = PendingFunction {
-                reserved: reserved_index,
-                closure_register,
-                captures: Vec::new(),
-            };
+            pending_functions.push((
+                *function,
+                PendingFunction {
+                    reserved: reserved_index,
+                    closure_register,
+                    captures: Vec::new(),
+                },
+            ));
+        }
 
-            let params = extract_function_params(function)?;
+        for (function, pending) in pending_functions {
+            let name = function.id.as_ref().ok_or_else(|| {
+                SourceLoweringError::Unsupported(
+                    "function declarations without identifiers".to_string(),
+                )
+            })?;
+
             let compiled = module.compile_function_from_statements(
-                reserved_index,
+                pending.reserved,
                 FunctionIdentity {
                     debug_name: Some(name.name.to_string()),
                     self_binding_name: Some(name.name.to_string()),
-                    length: expected_function_length(&params),
+                    length: expected_function_length(&extract_function_params(function)?),
                 },
                 function
                     .body
@@ -267,14 +291,15 @@ impl<'a> FunctionCompiler<'a> {
                             "function declarations without bodies".to_string(),
                         )
                     })?,
-                &params,
+                &extract_function_params(function)?,
                 FunctionKind::Ordinary,
                 Some(self.env.clone()),
             )?;
-            module.set_function(reserved_index, compiled.function);
+            module.set_function(pending.reserved, compiled.function);
             self.hoisted_functions.push(PendingFunction {
                 captures: compiled.captures,
-                ..pending
+                reserved: pending.reserved,
+                closure_register: pending.closure_register,
             });
         }
 
@@ -288,6 +313,7 @@ impl<'a> FunctionCompiler<'a> {
                 pending.reserved,
                 &pending.captures,
             )?;
+            self.mirror_script_binding_to_global_by_register(pending.closure_register)?;
         }
         Ok(())
     }
@@ -518,6 +544,20 @@ impl<'a> FunctionCompiler<'a> {
                             module,
                         )?;
                         self.assign_binding(identifier.name.as_str(), register, value)?;
+                        if is_var {
+                            self.mirror_script_binding_to_global(
+                                identifier.name.as_str(),
+                                register,
+                            )?;
+                        }
+                    } else if is_var && self.kind == FunctionKind::Script {
+                        let undefined = self.load_undefined()?;
+                        if undefined.register != register {
+                            self.instructions
+                                .push(Instruction::move_(register, undefined.register));
+                        }
+                        self.release(undefined);
+                        self.mirror_script_binding_to_global(identifier.name.as_str(), register)?;
                     }
                 }
                 BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {
@@ -811,6 +851,44 @@ impl<'a> FunctionCompiler<'a> {
         Ok(closure_register)
     }
 
+    pub(super) fn mirror_script_binding_to_global(
+        &mut self,
+        name: &str,
+        register: BytecodeRegister,
+    ) -> Result<(), SourceLoweringError> {
+        if self.kind != FunctionKind::Script {
+            return Ok(());
+        }
+        let property = self.intern_property_name(name)?;
+        self.instructions
+            .push(Instruction::set_global(register, property));
+        Ok(())
+    }
+
+    pub(super) fn mirror_script_binding_to_global_by_register(
+        &mut self,
+        register: BytecodeRegister,
+    ) -> Result<(), SourceLoweringError> {
+        if self.kind != FunctionKind::Script {
+            return Ok(());
+        }
+        let Some(name) = self
+            .env
+            .bindings
+            .iter()
+            .find(|(_, binding)| matches!(
+                binding,
+                Binding::Function { closure_register } if *closure_register == register
+            ))
+            .map(|(name, _)| name.clone()) else {
+            return Ok(());
+        };
+        let property = self.intern_property_name(&name)?;
+        self.instructions
+            .push(Instruction::set_global(register, property));
+        Ok(())
+    }
+
     pub(super) fn resolve_binding(&mut self, name: &str) -> Result<Binding, SourceLoweringError> {
         if let Some(binding) = self.env.bindings.get(name).copied() {
             return Ok(binding);
@@ -843,13 +921,16 @@ impl<'a> FunctionCompiler<'a> {
                 reg
             } else {
                 let reg = self.allocate_local()?;
-                self.instructions.push(Instruction::create_arguments(reg));
                 self.arguments_local = Some(reg);
-                self.env
-                    .bindings
-                    .insert("arguments".to_string(), Binding::Register(reg));
                 reg
             };
+            if !self.env.bindings.contains_key("arguments") {
+                self.instructions
+                    .push(Instruction::create_arguments(register));
+                self.env
+                    .bindings
+                    .insert("arguments".to_string(), Binding::Register(register));
+            }
             return Ok(Binding::Register(register));
         }
 

@@ -13,11 +13,6 @@ doctest = false
 
 [[bin]]
 name = "test262"
-path = "src/bin/test262_new.rs"
-test = false
-
-[[bin]]
-name = "test262-legacy"
 path = "src/main.rs"
 test = false
 

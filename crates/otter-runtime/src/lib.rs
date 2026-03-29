@@ -45,7 +45,7 @@ pub use runtime::{OtterRuntime, RunError};
 // depend on otter-vm directly.
 pub use otter_vm::console;
 pub use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError, VmNativeFunction};
-pub use otter_vm::interpreter::{ExecutionResult, RuntimeState};
+pub use otter_vm::interpreter::{ExecutionResult, InterpreterError, RuntimeState};
 pub use otter_vm::object::ObjectHandle;
 pub use otter_vm::source;
 pub use otter_vm::value::RegisterValue;

@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+const INTERNAL_SYMBOL_PREFIX: &str = "\u{0}otter:sym:";
+
 /// Stable property-name identifier inside a function side table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PropertyNameId(pub u16);
@@ -50,10 +52,28 @@ impl PropertyNameRegistry {
         id
     }
 
+    /// Interns one symbol-keyed property into the runtime-wide registry.
+    pub fn intern_symbol(&mut self, symbol_id: u32) -> PropertyNameId {
+        self.intern(&format!("{INTERNAL_SYMBOL_PREFIX}{symbol_id}"))
+    }
+
     /// Resolves a runtime-wide property id back to its name.
     #[must_use]
     pub fn get(&self, id: PropertyNameId) -> Option<&str> {
         self.names.get(usize::from(id.0)).map(Box::as_ref)
+    }
+
+    /// Returns `true` when the property id refers to an internal symbol key.
+    #[must_use]
+    pub fn is_symbol(&self, id: PropertyNameId) -> bool {
+        self.symbol_id(id).is_some()
+    }
+
+    /// Resolves one internal symbol key back to its stable symbol id.
+    #[must_use]
+    pub fn symbol_id(&self, id: PropertyNameId) -> Option<u32> {
+        let name = self.get(id)?;
+        name.strip_prefix(INTERNAL_SYMBOL_PREFIX)?.parse().ok()
     }
 }
 

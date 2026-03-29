@@ -16,10 +16,12 @@ mod object_class;
 mod promise_class;
 mod reflect;
 mod string_class;
+mod symbol_class;
 pub(crate) mod timer_globals;
 
 pub(crate) use boolean_class::box_boolean_object;
 pub(crate) use number_class::box_number_object;
+pub(crate) use symbol_class::{box_symbol_object, symbol_descriptive_string};
 
 use crate::host::NativeFunctionRegistry;
 use crate::object::{ObjectError, ObjectHandle, ObjectHeap};
@@ -34,17 +36,39 @@ pub enum WellKnownSymbol {
     AsyncIterator,
     ToStringTag,
     Species,
+    Dispose,
+    AsyncDispose,
+    HasInstance,
+    IsConcatSpreadable,
+    Match,
+    MatchAll,
+    Replace,
+    Search,
+    Split,
+    ToPrimitive,
+    Unscopables,
 }
 
 impl WellKnownSymbol {
     /// Returns the stable numeric identifier of the symbol.
     #[must_use]
-    pub const fn stable_id(self) -> u64 {
+    pub const fn stable_id(self) -> u32 {
         match self {
             Self::Iterator => 1,
             Self::AsyncIterator => 2,
             Self::ToStringTag => 3,
             Self::Species => 4,
+            Self::Dispose => 5,
+            Self::AsyncDispose => 6,
+            Self::HasInstance => 7,
+            Self::IsConcatSpreadable => 8,
+            Self::Match => 9,
+            Self::MatchAll => 10,
+            Self::Replace => 11,
+            Self::Search => 12,
+            Self::Split => 13,
+            Self::ToPrimitive => 14,
+            Self::Unscopables => 15,
         }
     }
 
@@ -56,6 +80,17 @@ impl WellKnownSymbol {
             Self::AsyncIterator => "Symbol.asyncIterator",
             Self::ToStringTag => "Symbol.toStringTag",
             Self::Species => "Symbol.species",
+            Self::Dispose => "Symbol.dispose",
+            Self::AsyncDispose => "Symbol.asyncDispose",
+            Self::HasInstance => "Symbol.hasInstance",
+            Self::IsConcatSpreadable => "Symbol.isConcatSpreadable",
+            Self::Match => "Symbol.match",
+            Self::MatchAll => "Symbol.matchAll",
+            Self::Replace => "Symbol.replace",
+            Self::Search => "Symbol.search",
+            Self::Split => "Symbol.split",
+            Self::ToPrimitive => "Symbol.toPrimitive",
+            Self::Unscopables => "Symbol.unscopables",
         }
     }
 }
@@ -156,6 +191,7 @@ pub struct VmIntrinsics {
     object_prototype: ObjectHandle,
     function_prototype: ObjectHandle,
     string_constructor: ObjectHandle,
+    symbol_constructor: ObjectHandle,
     number_constructor: ObjectHandle,
     boolean_constructor: ObjectHandle,
     object_constructor: ObjectHandle,
@@ -163,11 +199,12 @@ pub struct VmIntrinsics {
     array_constructor: ObjectHandle,
     array_prototype: ObjectHandle,
     string_prototype: ObjectHandle,
+    symbol_prototype: ObjectHandle,
     number_prototype: ObjectHandle,
     boolean_prototype: ObjectHandle,
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
-    well_known_symbols: [WellKnownSymbol; 4],
+    well_known_symbols: [WellKnownSymbol; 15],
     // Error hierarchy
     pub(crate) error_prototype: ObjectHandle,
     pub(crate) error_constructor: ObjectHandle,
@@ -191,6 +228,7 @@ impl VmIntrinsics {
         let object_prototype = heap.alloc_object();
         let function_prototype = heap.alloc_object();
         let string_constructor = heap.alloc_object();
+        let symbol_constructor = heap.alloc_object();
         let number_constructor = heap.alloc_object();
         let boolean_constructor = heap.alloc_object();
         let object_constructor = heap.alloc_object();
@@ -198,6 +236,7 @@ impl VmIntrinsics {
         let array_constructor = heap.alloc_object();
         let array_prototype = heap.alloc_object();
         let string_prototype = heap.alloc_object();
+        let symbol_prototype = heap.alloc_object();
         let number_prototype = heap.alloc_object();
         let boolean_prototype = heap.alloc_object();
         let error_prototype = heap.alloc_object();
@@ -220,6 +259,7 @@ impl VmIntrinsics {
             object_prototype,
             function_prototype,
             string_constructor,
+            symbol_constructor,
             number_constructor,
             boolean_constructor,
             object_constructor,
@@ -227,6 +267,7 @@ impl VmIntrinsics {
             array_constructor,
             array_prototype,
             string_prototype,
+            symbol_prototype,
             number_prototype,
             boolean_prototype,
             namespace_roots: Vec::new(),
@@ -236,6 +277,17 @@ impl VmIntrinsics {
                 WellKnownSymbol::AsyncIterator,
                 WellKnownSymbol::ToStringTag,
                 WellKnownSymbol::Species,
+                WellKnownSymbol::Dispose,
+                WellKnownSymbol::AsyncDispose,
+                WellKnownSymbol::HasInstance,
+                WellKnownSymbol::IsConcatSpreadable,
+                WellKnownSymbol::Match,
+                WellKnownSymbol::MatchAll,
+                WellKnownSymbol::Replace,
+                WellKnownSymbol::Search,
+                WellKnownSymbol::Split,
+                WellKnownSymbol::ToPrimitive,
+                WellKnownSymbol::Unscopables,
             ],
             error_prototype,
             error_constructor,
@@ -261,6 +313,7 @@ impl VmIntrinsics {
         heap.set_prototype(self.object_prototype, None)?;
         heap.set_prototype(self.function_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.string_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.symbol_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.number_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.boolean_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.object_constructor, Some(self.function_prototype))?;
@@ -268,6 +321,7 @@ impl VmIntrinsics {
         heap.set_prototype(self.array_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.string_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.symbol_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.number_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.boolean_prototype, Some(self.object_prototype))?;
         // Error hierarchy: Error.prototype → Object.prototype,
@@ -433,6 +487,12 @@ impl VmIntrinsics {
         self.string_constructor
     }
 
+    /// Returns `%Symbol%`.
+    #[must_use]
+    pub const fn symbol_constructor(&self) -> ObjectHandle {
+        self.symbol_constructor
+    }
+
     /// Returns `%Number%`.
     #[must_use]
     pub const fn number_constructor(&self) -> ObjectHandle {
@@ -473,6 +533,12 @@ impl VmIntrinsics {
     #[must_use]
     pub const fn string_prototype(&self) -> ObjectHandle {
         self.string_prototype
+    }
+
+    /// Returns `%Symbol.prototype%`.
+    #[must_use]
+    pub const fn symbol_prototype(&self) -> ObjectHandle {
+        self.symbol_prototype
     }
 
     /// Returns `%Number.prototype%`.
@@ -534,6 +600,12 @@ impl VmIntrinsics {
         &self.well_known_symbols
     }
 
+    /// Returns the immediate register value for a stable well-known symbol.
+    #[must_use]
+    pub const fn well_known_symbol_value(&self, symbol: WellKnownSymbol) -> RegisterValue {
+        RegisterValue::from_symbol_id(symbol.stable_id())
+    }
+
     /// Collects all ObjectHandle roots owned by intrinsics for GC.
     pub fn gc_root_handles(&self) -> Vec<ObjectHandle> {
         let mut roots = Vec::with_capacity(20 + self.namespace_roots.len());
@@ -542,6 +614,7 @@ impl VmIntrinsics {
             self.object_prototype,
             self.function_prototype,
             self.string_constructor,
+            self.symbol_constructor,
             self.number_constructor,
             self.boolean_constructor,
             self.object_constructor,
@@ -549,6 +622,7 @@ impl VmIntrinsics {
             self.array_constructor,
             self.array_prototype,
             self.string_prototype,
+            self.symbol_prototype,
             self.number_prototype,
             self.boolean_prototype,
             self.error_prototype,
@@ -581,6 +655,7 @@ impl VmIntrinsics {
             self.object_prototype,
             self.function_prototype,
             self.string_constructor,
+            self.symbol_constructor,
             self.number_constructor,
             self.boolean_constructor,
             self.object_constructor,
@@ -588,6 +663,7 @@ impl VmIntrinsics {
             self.array_constructor,
             self.array_prototype,
             self.string_prototype,
+            self.symbol_prototype,
             self.number_prototype,
             self.boolean_prototype,
         ] {
@@ -604,7 +680,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 10] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 11] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
@@ -615,13 +691,14 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 10] {
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
         &promise_class::PROMISE_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
+    use super::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics};
     use crate::host::NativeFunctionRegistry;
     use crate::object::{HeapValueKind, PropertyValue};
     use crate::property::PropertyNameRegistry;
@@ -655,6 +732,7 @@ mod tests {
             intrinsics.function_prototype(),
             intrinsics.array_prototype(),
             intrinsics.string_prototype(),
+            intrinsics.symbol_prototype(),
             intrinsics.number_prototype(),
             intrinsics.boolean_prototype(),
         ] {
@@ -662,6 +740,10 @@ mod tests {
         }
         assert_eq!(
             heap.kind(intrinsics.string_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
+            heap.kind(intrinsics.symbol_constructor()),
             Ok(HeapValueKind::HostFunction)
         );
         assert_eq!(
@@ -686,7 +768,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 127);
+        assert_eq!(native_functions.len(), 132);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))
@@ -702,6 +784,10 @@ mod tests {
         );
         assert_eq!(
             heap.get_prototype(intrinsics.string_constructor()),
+            Ok(Some(intrinsics.function_prototype()))
+        );
+        assert_eq!(
+            heap.get_prototype(intrinsics.symbol_constructor()),
             Ok(Some(intrinsics.function_prototype()))
         );
 
@@ -927,6 +1013,84 @@ mod tests {
             .expect("String.prototype.valueOf should be installed");
         assert_eq!(string_value_of.owner(), intrinsics.string_prototype());
 
+        let symbol_property = property_names.intern("Symbol");
+        let symbol_constructor = heap
+            .get_property(intrinsics.global_object(), symbol_property)
+            .expect("global Symbol lookup should succeed")
+            .expect("Symbol constructor should be installed");
+        let symbol_constructor = symbol_constructor.value();
+        let PropertyValue::Data {
+            value: symbol_constructor,
+            ..
+        } = symbol_constructor
+        else {
+            panic!("expected Symbol to be a data property");
+        };
+        let symbol_constructor = symbol_constructor
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Symbol should be an object");
+        assert_eq!(symbol_constructor, intrinsics.symbol_constructor());
+
+        let symbol_prototype = heap
+            .get_property(symbol_constructor, prototype_property)
+            .expect("Symbol.prototype lookup should succeed")
+            .expect("Symbol.prototype should be installed");
+        let symbol_prototype = symbol_prototype.value();
+        let PropertyValue::Data {
+            value: symbol_prototype,
+            ..
+        } = symbol_prototype
+        else {
+            panic!("expected Symbol.prototype to be a data property");
+        };
+        let symbol_prototype = symbol_prototype
+            .as_object_handle()
+            .map(crate::object::ObjectHandle)
+            .expect("Symbol.prototype should be an object");
+        assert_eq!(symbol_prototype, intrinsics.symbol_prototype());
+
+        for &symbol in intrinsics.well_known_symbols() {
+            let property_name = symbol
+                .description()
+                .strip_prefix("Symbol.")
+                .expect("well-known symbol descriptions use Symbol.<name>");
+            let property = property_names.intern(property_name);
+            let installed = heap
+                .get_property(symbol_constructor, property)
+                .unwrap_or_else(|_| panic!("{} lookup should succeed", symbol.description()))
+                .unwrap_or_else(|| panic!("{} should be installed", symbol.description()));
+            let installed = installed.value();
+            let PropertyValue::Data {
+                value: installed,
+                attributes,
+            } = installed
+            else {
+                panic!("expected {} to be a data property", symbol.description());
+            };
+            assert_eq!(
+                installed.as_symbol_id(),
+                Some(symbol.stable_id()),
+                "{} should expose the stable symbol value",
+                symbol.description()
+            );
+            assert!(
+                !attributes.writable(),
+                "{} should be non-writable",
+                symbol.description()
+            );
+            assert!(
+                !attributes.enumerable(),
+                "{} should be non-enumerable",
+                symbol.description()
+            );
+            assert!(
+                !attributes.configurable(),
+                "{} should be non-configurable",
+                symbol.description()
+            );
+        }
+
         let number_property = property_names.intern("Number");
         let number_constructor = heap
             .get_property(intrinsics.global_object(), number_property)
@@ -997,9 +1161,8 @@ mod tests {
 
         assert!(seen.contains(&IntrinsicRoot::Object(intrinsics.global_object())));
         assert!(seen.contains(&IntrinsicRoot::Object(namespace)));
-        assert!(seen.contains(&IntrinsicRoot::Symbol(WellKnownSymbol::Iterator)));
-        assert!(seen.contains(&IntrinsicRoot::Symbol(WellKnownSymbol::AsyncIterator)));
-        assert!(seen.contains(&IntrinsicRoot::Symbol(WellKnownSymbol::ToStringTag)));
-        assert!(seen.contains(&IntrinsicRoot::Symbol(WellKnownSymbol::Species)));
+        for &symbol in intrinsics.well_known_symbols() {
+            assert!(seen.contains(&IntrinsicRoot::Symbol(symbol)));
+        }
     }
 }

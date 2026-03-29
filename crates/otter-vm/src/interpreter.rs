@@ -2,6 +2,7 @@
 
 use core::any::Any;
 use core::fmt;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,7 +14,9 @@ use crate::feedback::{FeedbackKind, FeedbackSlotId};
 use crate::float::FloatId;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::host::{HostFunctionId, NativeFunctionRegistry};
-use crate::intrinsics::{VmIntrinsics, box_boolean_object, box_number_object};
+use crate::intrinsics::{
+    VmIntrinsics, WellKnownSymbol, box_boolean_object, box_number_object, box_symbol_object,
+};
 use crate::module::{Function, FunctionIndex, Module};
 use crate::object::{
     ClosureFlags as ObjectClosureFlags, HeapValueKind, ObjectError, ObjectHandle, ObjectHeap,
@@ -27,6 +30,7 @@ use crate::value::{RegisterValue, ValueError};
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
 const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
+const SYMBOL_DATA_SLOT: &str = "__otter_symbol_data__";
 
 /// Errors produced by the new interpreter.
 #[derive(Debug, Clone, PartialEq)]
@@ -470,6 +474,12 @@ enum Completion {
     Throw(RegisterValue),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToPrimitiveHint {
+    String,
+    Number,
+}
+
 /// Shared execution runtime for one interpreter/JIT run.
 pub struct RuntimeState {
     intrinsics: VmIntrinsics,
@@ -481,6 +491,10 @@ pub struct RuntimeState {
     timers: crate::event_loop::TimerRegistry,
     console_backend: Box<dyn crate::console::ConsoleBackend>,
     current_module: Option<Module>,
+    next_symbol_id: u32,
+    symbol_descriptions: BTreeMap<u32, Option<Box<str>>>,
+    global_symbol_registry: BTreeMap<Box<str>, u32>,
+    global_symbol_registry_reverse: BTreeMap<u32, Box<str>>,
 }
 
 impl RuntimeState {
@@ -500,6 +514,10 @@ impl RuntimeState {
         intrinsics
             .install_on_global(&mut objects, &mut property_names, &mut native_functions)
             .expect("intrinsic global install should bootstrap cleanly");
+        let mut symbol_descriptions = BTreeMap::new();
+        for &symbol in intrinsics.well_known_symbols() {
+            symbol_descriptions.insert(symbol.stable_id(), Some(symbol.description().into()));
+        }
 
         Self {
             intrinsics,
@@ -511,6 +529,10 @@ impl RuntimeState {
             timers: crate::event_loop::TimerRegistry::new(),
             console_backend: Box::new(crate::console::StdioConsoleBackend),
             current_module: None,
+            next_symbol_id: WellKnownSymbol::Unscopables.stable_id() + 1,
+            symbol_descriptions,
+            global_symbol_registry: BTreeMap::new(),
+            global_symbol_registry_reverse: BTreeMap::new(),
         }
     }
 
@@ -564,6 +586,11 @@ impl RuntimeState {
     /// Interns one property name into the runtime-wide registry.
     pub fn intern_property_name(&mut self, name: &str) -> PropertyNameId {
         self.property_names.intern(name)
+    }
+
+    /// Interns one symbol-keyed property into the runtime-wide registry.
+    pub fn intern_symbol_property_name(&mut self, symbol_id: u32) -> PropertyNameId {
+        self.property_names.intern_symbol(symbol_id)
     }
 
     /// Returns own property keys using the runtime-wide property-name registry.
@@ -625,6 +652,9 @@ impl RuntimeState {
         })?;
         let mut enumerable = Vec::with_capacity(keys.len());
         for key in keys {
+            if self.property_names.is_symbol(key) {
+                continue;
+            }
             let Some(descriptor) = self.own_property_descriptor(object, key).map_err(|error| {
                 VmNativeCallError::Internal(
                     format!("enumerable own descriptor failed: {error:?}").into(),
@@ -1105,6 +1135,107 @@ impl RuntimeState {
         handle
     }
 
+    /// Allocates one fresh symbol primitive with a VM-wide stable identifier.
+    pub fn alloc_symbol(&mut self) -> RegisterValue {
+        self.alloc_symbol_with_description(None)
+    }
+
+    /// Allocates one fresh symbol primitive and records its optional description.
+    pub fn alloc_symbol_with_description(
+        &mut self,
+        description: Option<Box<str>>,
+    ) -> RegisterValue {
+        let symbol_id = self.next_symbol_id;
+        self.next_symbol_id = self
+            .next_symbol_id
+            .checked_add(1)
+            .expect("symbol identifier space exhausted");
+        self.symbol_descriptions.insert(symbol_id, description);
+        RegisterValue::from_symbol_id(symbol_id)
+    }
+
+    /// Returns the recorded description for a symbol value, if any.
+    #[must_use]
+    pub fn symbol_description(&self, value: RegisterValue) -> Option<&str> {
+        let symbol_id = value.as_symbol_id()?;
+        self.symbol_descriptions
+            .get(&symbol_id)
+            .and_then(|description| description.as_deref())
+    }
+
+    /// Interns a global-registry symbol key and returns the canonical symbol value.
+    pub fn intern_global_symbol(&mut self, key: Box<str>) -> RegisterValue {
+        if let Some(&symbol_id) = self.global_symbol_registry.get(key.as_ref()) {
+            return RegisterValue::from_symbol_id(symbol_id);
+        }
+
+        let symbol = self.alloc_symbol_with_description(Some(key.clone()));
+        let symbol_id = symbol
+            .as_symbol_id()
+            .expect("allocated symbol should expose a symbol id");
+        self.global_symbol_registry.insert(key.clone(), symbol_id);
+        self.global_symbol_registry_reverse.insert(symbol_id, key);
+        symbol
+    }
+
+    /// Returns the registry key for a symbol value, if it was created via `Symbol.for`.
+    #[must_use]
+    pub fn symbol_registry_key(&self, value: RegisterValue) -> Option<&str> {
+        let symbol_id = value.as_symbol_id()?;
+        self.global_symbol_registry_reverse
+            .get(&symbol_id)
+            .map(Box::as_ref)
+    }
+
+    /// Allocates a new symbol from a JS-visible description value.
+    pub fn create_symbol_from_value(
+        &mut self,
+        description: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if description == RegisterValue::undefined() {
+            return Ok(self.alloc_symbol_with_description(None));
+        }
+        let description = self.coerce_symbol_string(description)?;
+        Ok(self.alloc_symbol_with_description(Some(description)))
+    }
+
+    /// Resolves `Symbol.for(key)` using the runtime-wide global symbol registry.
+    pub fn symbol_for_value(
+        &mut self,
+        key: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let key = self.coerce_symbol_string(key)?;
+        Ok(self.intern_global_symbol(key))
+    }
+
+    fn coerce_symbol_string(&mut self, value: RegisterValue) -> Result<Box<str>, InterpreterError> {
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            let to_string = self.intern_property_name("toString");
+            let to_string_value = self
+                .ordinary_get(handle, to_string, value)
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                })?;
+            if let Some(callable) = to_string_value.as_object_handle().map(ObjectHandle)
+                && self.objects.is_callable(callable)
+            {
+                let result =
+                    self.call_callable(callable, value, &[])
+                        .map_err(|error| match error {
+                            VmNativeCallError::Thrown(value) => {
+                                InterpreterError::UncaughtThrow(value)
+                            }
+                            VmNativeCallError::Internal(message) => {
+                                InterpreterError::NativeCall(message)
+                            }
+                        })?;
+                return self.js_to_string(result);
+            }
+        }
+        self.js_to_string(value)
+    }
+
     /// Allocates one host-callable function with the runtime default prototype.
     pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
         let prototype = self.intrinsics.function_prototype();
@@ -1155,7 +1286,11 @@ impl RuntimeState {
         flags: ObjectClosureFlags,
     ) -> ObjectHandle {
         let prototype = self.intrinsics.function_prototype();
-        let handle = self.objects.alloc_closure(callee, upvalues, flags);
+        let module = self
+            .current_module
+            .clone()
+            .expect("closure allocation requires active module context");
+        let handle = self.objects.alloc_closure(module, callee, upvalues, flags);
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
@@ -1687,11 +1822,11 @@ impl RuntimeState {
                 Interpreter::apply_construct_return_override(completion, default_receiver)
             }
             HeapValueKind::Closure => {
-                let Some(module) = self.current_module.clone() else {
-                    return Err(VmNativeCallError::Internal(
-                        "closure construction requires active module context".into(),
-                    ));
-                };
+                let module = self.objects.closure_module(target).map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("construct closure module lookup failed: {error:?}").into(),
+                    )
+                })?;
                 let callee_index = self.objects.closure_callee(target).map_err(|error| {
                     VmNativeCallError::Internal(
                         format!("construct closure callee lookup failed: {error:?}").into(),
@@ -1823,6 +1958,11 @@ impl RuntimeState {
         if let Some(value) = self.own_data_property(handle, BOOLEAN_DATA_SLOT)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.own_data_property(handle, SYMBOL_DATA_SLOT)?
+            && value.is_symbol()
+        {
+            return Ok(Some(value));
+        }
         Ok(None)
     }
 
@@ -1935,22 +2075,133 @@ impl RuntimeState {
                     .expect("boxed number should return object handle"),
             ));
         }
+        if value.is_symbol() {
+            let object = box_symbol_object(value, self).map_err(|error| match error {
+                VmNativeCallError::Thrown(_) => {
+                    InterpreterError::TypeError("symbol boxing threw".into())
+                }
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?;
+            return Ok(ObjectHandle(
+                object
+                    .as_object_handle()
+                    .expect("boxed symbol should return object handle"),
+            ));
+        }
         Err(InterpreterError::InvalidObjectValue)
+    }
+
+    fn ordinary_to_primitive(
+        &mut self,
+        value: RegisterValue,
+        hint: ToPrimitiveHint,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(value);
+        };
+
+        let method_names = match hint {
+            ToPrimitiveHint::String => ["toString", "valueOf"],
+            ToPrimitiveHint::Number => ["valueOf", "toString"],
+        };
+
+        for method_name in method_names {
+            let property = self.intern_property_name(method_name);
+            let method = self
+                .ordinary_get(handle, property, value)
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                })?;
+            let Some(callable) = method.as_object_handle().map(ObjectHandle) else {
+                continue;
+            };
+            if !self.objects.is_callable(callable) {
+                continue;
+            }
+
+            let result = self
+                .call_callable(callable, value, &[])
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                })?;
+            if self.non_string_object_handle(result)?.is_none() {
+                return Ok(result);
+            }
+        }
+
+        Err(InterpreterError::TypeError(
+            "Cannot convert object to primitive value".into(),
+        ))
+    }
+
+    pub(crate) fn js_to_primitive_with_hint(
+        &mut self,
+        value: RegisterValue,
+        hint: ToPrimitiveHint,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(value);
+        };
+
+        if self.objects.string_value(handle)?.is_some() {
+            return Ok(value);
+        }
+
+        let to_primitive = self.intern_symbol_property_name(WellKnownSymbol::ToPrimitive.stable_id());
+        let exotic = self
+            .ordinary_get(handle, to_primitive, value)
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?;
+
+        if exotic != RegisterValue::undefined() && exotic != RegisterValue::null() {
+            let Some(callable) = exotic.as_object_handle().map(ObjectHandle) else {
+                return Err(InterpreterError::TypeError(
+                    "@@toPrimitive is not callable".into(),
+                ));
+            };
+            if !self.objects.is_callable(callable) {
+                return Err(InterpreterError::TypeError(
+                    "@@toPrimitive is not callable".into(),
+                ));
+            }
+
+            let hint_value = match hint {
+                ToPrimitiveHint::String => self.alloc_string("string"),
+                ToPrimitiveHint::Number => self.alloc_string("number"),
+            };
+            let result = self
+                .call_callable(
+                    callable,
+                    value,
+                    &[RegisterValue::from_object_handle(hint_value.0)],
+                )
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                })?;
+            if self.non_string_object_handle(result)?.is_some() {
+                return Err(InterpreterError::TypeError(
+                    "@@toPrimitive must return a primitive value".into(),
+                ));
+            }
+            return Ok(result);
+        }
+
+        self.ordinary_to_primitive(value, hint)
     }
 
     fn coerce_loose_equality_primitive(
         &mut self,
         value: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+        let Some(_handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(value);
         };
-
-        if let Some(primitive) = self.boxed_primitive_value(handle)? {
-            return Ok(primitive);
-        }
-
-        Ok(value)
+        self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)
     }
 
     pub(crate) fn js_to_string(
@@ -1965,6 +2216,11 @@ impl RuntimeState {
         }
         if let Some(boolean) = value.as_bool() {
             return Ok(if boolean { "true" } else { "false" }.into());
+        }
+        if value.is_symbol() {
+            return Err(InterpreterError::TypeError(
+                "Cannot convert a Symbol value to a string".into(),
+            ));
         }
         if let Some(number) = value.as_number() {
             let text = if number.is_nan() {
@@ -1988,10 +2244,14 @@ impl RuntimeState {
             if let Some(string) = self.objects.string_value(handle)? {
                 return Ok(string.to_string().into_boxed_str());
             }
-            if let Some(primitive) = self.string_wrapper_data(handle)?
-                && let Some(string) = self.objects.string_value(primitive)?
+            if let Some(primitive) = self.boxed_primitive_value(handle)?
+                && primitive.is_symbol()
             {
-                return Ok(string.to_string().into_boxed_str());
+                return Ok(crate::intrinsics::symbol_descriptive_string(primitive, self).into());
+            }
+            let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::String)?;
+            if primitive != value {
+                return self.js_to_string(primitive);
             }
             return Ok("[object Object]".into());
         }
@@ -2015,6 +2275,11 @@ impl RuntimeState {
         if let Some(boolean) = value.as_bool() {
             return Ok(if boolean { 1.0 } else { 0.0 });
         }
+        if value.is_symbol() {
+            return Err(InterpreterError::TypeError(
+                "Cannot convert a Symbol value to a number".into(),
+            ));
+        }
         if let Some(number) = value.as_number() {
             return Ok(number);
         }
@@ -2022,10 +2287,8 @@ impl RuntimeState {
             if let Some(string) = self.objects.string_value(handle)? {
                 return Ok(parse_string_to_number(string));
             }
-            // ToPrimitive(value, number) for objects — try valueOf slot, then
-            // boxed primitive unwrap. Full spec valueOf/toString dispatch is
-            // not yet available, but this handles wrapper objects (Number, Boolean, String).
-            if let Some(primitive) = self.boxed_primitive_value(handle)? {
+            let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)?;
+            if primitive != value {
                 return self.js_to_number(primitive);
             }
             return Ok(f64::NAN);
@@ -2051,19 +2314,7 @@ impl RuntimeState {
         &mut self,
         value: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
-            return Ok(value);
-        };
-        // String heap values are already primitive-ish — extract the string.
-        if let Some(_string) = self.objects.string_value(handle)? {
-            return Ok(value);
-        }
-        // Boxed primitive wrappers (Number, Boolean, String constructors).
-        if let Some(primitive) = self.boxed_primitive_value(handle)? {
-            return Ok(primitive);
-        }
-        // Default for plain objects: NaN.
-        Ok(RegisterValue::from_number(f64::NAN))
+        self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)
     }
 
     /// ES spec 7.2.13 Abstract Relational Comparison.
@@ -2248,22 +2499,10 @@ impl RuntimeState {
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        let lhs_is_string = lhs
-            .as_object_handle()
-            .map(ObjectHandle)
-            .map(|handle| {
-                matches!(self.objects.kind(handle), Ok(HeapValueKind::String))
-                    || matches!(self.string_wrapper_data(handle), Ok(Some(_)))
-            })
-            .unwrap_or(false);
-        let rhs_is_string = rhs
-            .as_object_handle()
-            .map(ObjectHandle)
-            .map(|handle| {
-                matches!(self.objects.kind(handle), Ok(HeapValueKind::String))
-                    || matches!(self.string_wrapper_data(handle), Ok(Some(_)))
-            })
-            .unwrap_or(false);
+        let lhs = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
+        let rhs = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
+        let lhs_is_string = self.value_is_string(lhs)?;
+        let rhs_is_string = self.value_is_string(rhs)?;
 
         if lhs_is_string || rhs_is_string {
             let mut text = self.js_to_string(lhs)?.into_string();
@@ -2286,6 +2525,8 @@ impl RuntimeState {
             "object"
         } else if value.as_bool().is_some() {
             "boolean"
+        } else if value.is_symbol() {
+            "symbol"
         } else if value.as_number().is_some() {
             "number"
         } else if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
@@ -2458,7 +2699,7 @@ impl Interpreter {
     /// native host functions and compiled closures.
     pub fn call_function(
         runtime: &mut RuntimeState,
-        module: &Module,
+        _module: &Module,
         callable: ObjectHandle,
         this_value: RegisterValue,
         arguments: &[RegisterValue],
@@ -2472,6 +2713,7 @@ impl Interpreter {
                 }
             }
             HeapValueKind::Closure => {
+                let module = runtime.objects.closure_module(callable)?;
                 let callee_index = runtime.objects.closure_callee(callable)?;
                 let callee_function = module
                     .function(callee_index)
@@ -2509,7 +2751,7 @@ impl Interpreter {
                     FrameMetadata::new(arguments.len() as RegisterIndex, FrameFlags::default());
 
                 let interpreter = Interpreter::new();
-                let result = interpreter.run_with_runtime(module, &mut activation, runtime)?;
+                let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
                 Ok(result.return_value())
             }
             _ => Err(InterpreterError::TypeError(
@@ -3375,7 +3617,7 @@ impl Interpreter {
                         match runtime.objects.get_cached(handle, property, cache)? {
                             Some(PropertyValue::Data { value, .. }) => value,
                             Some(PropertyValue::Accessor { getter, .. }) => {
-                                Self::invoke_accessor_getter(runtime, handle, getter)?
+                                runtime.call_callable_for_accessor(getter, base, &[])?
                             }
                             None => Self::generic_get_property(
                                 function,
@@ -3383,6 +3625,7 @@ impl Interpreter {
                                 frame_runtime,
                                 pc,
                                 handle,
+                                base,
                                 property,
                             )?,
                         }
@@ -3393,6 +3636,7 @@ impl Interpreter {
                             frame_runtime,
                             pc,
                             handle,
+                            base,
                             property,
                         )?
                     }
@@ -3403,6 +3647,7 @@ impl Interpreter {
                         frame_runtime,
                         pc,
                         handle,
+                        base,
                         property,
                     )?
                 };
@@ -3429,7 +3674,7 @@ impl Interpreter {
                                 runtime.objects.set_cached(handle, property, value, cache)?
                             }
                             Some(PropertyValue::Accessor { setter, .. }) => {
-                                Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                                let _ = runtime.call_callable_for_accessor(setter, base, &[value])?;
                                 true
                             }
                             None => Self::generic_set_property(
@@ -3438,6 +3683,7 @@ impl Interpreter {
                                 frame_runtime,
                                 pc,
                                 handle,
+                                base,
                                 property,
                                 value,
                             )?,
@@ -3449,6 +3695,7 @@ impl Interpreter {
                             frame_runtime,
                             pc,
                             handle,
+                            base,
                             property,
                             value,
                         )?
@@ -3460,6 +3707,7 @@ impl Interpreter {
                         frame_runtime,
                         pc,
                         handle,
+                        base,
                         property,
                         value,
                     )?
@@ -3514,6 +3762,7 @@ impl Interpreter {
                     frame_runtime,
                     pc,
                     handle,
+                    base,
                     property,
                 )?;
                 activation.write_bytecode_register(function, instruction.a(), value)?;
@@ -3536,6 +3785,7 @@ impl Interpreter {
                             frame_runtime,
                             pc,
                             handle,
+                            base,
                             property,
                             value,
                         )?;
@@ -3552,6 +3802,7 @@ impl Interpreter {
                             frame_runtime,
                             pc,
                             handle,
+                            base,
                             property,
                             value,
                         )?;
@@ -3607,11 +3858,7 @@ impl Interpreter {
             // global object (receiver r0).  Throws if not found.
             Opcode::GetGlobal => {
                 let property = Self::resolve_property_name(function, runtime, instruction.b())?;
-                let global = activation.receiver(function)?;
-                let global_handle = global
-                    .as_object_handle()
-                    .map(ObjectHandle)
-                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let global_handle = runtime.intrinsics().global_object();
                 let value = runtime.objects.get_property(global_handle, property)?;
                 match value {
                     Some(lookup) => {
@@ -3637,11 +3884,7 @@ impl Interpreter {
             Opcode::SetGlobal => {
                 let property = Self::resolve_property_name(function, runtime, instruction.b())?;
                 let value = activation.read_bytecode_register(function, instruction.a())?;
-                let global = activation.receiver(function)?;
-                let global_handle = global
-                    .as_object_handle()
-                    .map(ObjectHandle)
-                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let global_handle = runtime.intrinsics().global_object();
                 runtime
                     .objects
                     .set_property(global_handle, property, value)?;
@@ -3840,7 +4083,7 @@ impl Interpreter {
                         Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
                     }
                 } else {
-                    let mut callee_activation = Self::prepare_closure_call(
+                    let (callee_module, mut callee_activation) = Self::prepare_closure_call(
                         module,
                         activation,
                         runtime,
@@ -3849,7 +4092,7 @@ impl Interpreter {
                         call,
                     )?;
                     match self.run_completion_with_runtime(
-                        module,
+                        &callee_module,
                         &mut callee_activation,
                         runtime,
                     )? {
@@ -4028,6 +4271,7 @@ impl Interpreter {
         frame_runtime: &mut FrameRuntimeState,
         pc: ProgramCounter,
         handle: ObjectHandle,
+        receiver: RegisterValue,
         property: PropertyNameId,
     ) -> Result<RegisterValue, InterpreterError> {
         match runtime.property_lookup(handle, property)? {
@@ -4038,7 +4282,7 @@ impl Interpreter {
                 match lookup.value() {
                     PropertyValue::Data { value, .. } => Ok(value),
                     PropertyValue::Accessor { getter, .. } => {
-                        Self::invoke_accessor_getter(runtime, handle, getter)
+                        runtime.call_callable_for_accessor(getter, receiver, &[])
                     }
                 }
             }
@@ -4052,6 +4296,7 @@ impl Interpreter {
         frame_runtime: &mut FrameRuntimeState,
         pc: ProgramCounter,
         handle: ObjectHandle,
+        receiver: RegisterValue,
         property: PropertyNameId,
         value: RegisterValue,
     ) -> Result<bool, InterpreterError> {
@@ -4061,7 +4306,7 @@ impl Interpreter {
                 return match runtime.property_lookup(handle, property)? {
                     Some(lookup) => match lookup.value() {
                         PropertyValue::Accessor { setter, .. } => {
-                            Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                            let _ = runtime.call_callable_for_accessor(setter, receiver, &[value])?;
                             Ok(true)
                         }
                         PropertyValue::Data { .. } => Ok(false),
@@ -4086,7 +4331,7 @@ impl Interpreter {
                     }
                     PropertyValue::Data { .. } => Ok(false),
                     PropertyValue::Accessor { setter, .. } => {
-                        Self::invoke_accessor_setter(runtime, handle, setter, value)?;
+                        let _ = runtime.call_callable_for_accessor(setter, receiver, &[value])?;
                         Ok(true)
                     }
                 }
@@ -4148,16 +4393,16 @@ impl Interpreter {
     }
 
     fn prepare_closure_call(
-        module: &Module,
+        caller_module: &Module,
         caller_activation: &Activation,
         runtime: &RuntimeState,
         callee_register: RegisterIndex,
         arg_start: RegisterIndex,
         call: ClosureCall,
-    ) -> Result<Activation, InterpreterError> {
+    ) -> Result<(Module, Activation), InterpreterError> {
         let closure = caller_activation
             .read_bytecode_register(
-                module
+                caller_module
                     .function(caller_activation.function_index())
                     .expect("activation function index must be valid"),
                 callee_register,
@@ -4165,6 +4410,7 @@ impl Interpreter {
             .as_object_handle()
             .map(ObjectHandle)
             .ok_or(InterpreterError::InvalidObjectValue)?;
+        let module = runtime.objects.closure_module(closure)?;
         let callee_index = runtime.objects.closure_callee(closure)?;
         let callee = module
             .function(callee_index)
@@ -4175,7 +4421,7 @@ impl Interpreter {
             FrameMetadata::new(call.argument_count(), call.flags()),
             Some(closure),
         );
-        let caller_function = module
+        let caller_function = caller_module
             .function(caller_activation.function_index())
             .expect("activation function index must be valid");
         let parameter_range = callee.frame_layout().parameter_range();
@@ -4207,7 +4453,7 @@ impl Interpreter {
             None,
         )?;
 
-        Ok(activation)
+        Ok((module, activation))
     }
 
     fn invoke_host_function(
@@ -4286,32 +4532,6 @@ impl Interpreter {
             None if flags.has_receiver() => Ok(RegisterValue::undefined()),
             None => Ok(RegisterValue::undefined()),
         }
-    }
-
-    fn invoke_accessor_getter(
-        runtime: &mut RuntimeState,
-        receiver_handle: ObjectHandle,
-        getter: Option<ObjectHandle>,
-    ) -> Result<RegisterValue, InterpreterError> {
-        runtime.call_callable_for_accessor(
-            getter,
-            RegisterValue::from_object_handle(receiver_handle.0),
-            &[],
-        )
-    }
-
-    fn invoke_accessor_setter(
-        runtime: &mut RuntimeState,
-        receiver_handle: ObjectHandle,
-        setter: Option<ObjectHandle>,
-        value: RegisterValue,
-    ) -> Result<(), InterpreterError> {
-        let _ = runtime.call_callable_for_accessor(
-            setter,
-            RegisterValue::from_object_handle(receiver_handle.0),
-            &[value],
-        )?;
-        Ok(())
     }
 
     fn invoke_host_function_handle(
@@ -4492,6 +4712,7 @@ mod tests {
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
     use crate::float::FloatTable;
     use crate::frame::{FrameFlags, FrameLayout};
+    use crate::intrinsics::WellKnownSymbol;
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};
     use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
     use crate::payload::{VmTrace, VmValueTracer};
@@ -4588,6 +4809,14 @@ mod tests {
         _runtime: &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError> {
         Ok(RegisterValue::undefined())
+    }
+
+    fn host_echo_receiver(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        _runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        Ok(*this)
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -6084,6 +6313,67 @@ mod tests {
             value.as_object_handle().is_some(),
             "expected object receiver"
         );
+    }
+
+    #[test]
+    fn interpreter_host_method_calls_preserve_symbol_primitive_receiver() {
+        let layout = FrameLayout::new(0, 0, 0, 3).expect("frame layout should be valid");
+        let entry = Function::new(
+            Some("entry"),
+            layout,
+            Bytecode::from(vec![
+                Instruction::call_closure(
+                    BytecodeRegister::new(2),
+                    BytecodeRegister::new(0),
+                    BytecodeRegister::new(2),
+                ),
+                Instruction::ret(BytecodeRegister::new(2)),
+            ]),
+            FunctionTables::new(
+                FunctionSideTables::new(
+                    PropertyNameTable::default(),
+                    StringTable::default(),
+                    FloatTable::default(),
+                    ClosureTable::default(),
+                    CallTable::new(vec![
+                        Some(CallSite::Closure(ClosureCall::new_with_receiver(
+                            0,
+                            FrameFlags::new(false, true, false),
+                            BytecodeRegister::new(1),
+                        ))),
+                        None,
+                    ]),
+                ),
+                FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+                    FeedbackSlotId(0),
+                    FeedbackKind::Call,
+                )]),
+                DeoptTable::default(),
+                ExceptionTable::default(),
+                SourceMap::default(),
+            ),
+        );
+        let module = Module::new(Some("symbol-host-this"), vec![entry], FunctionIndex(0))
+            .expect("module should be valid");
+        let mut runtime = RuntimeState::new();
+        let method = runtime.register_native_function(NativeFunctionDescriptor::method(
+            "echoReceiver",
+            0,
+            host_echo_receiver,
+        ));
+        let method = runtime.alloc_host_function(method);
+        let receiver = runtime.intrinsics().well_known_symbol_value(WellKnownSymbol::ToPrimitive);
+        let registers = [
+            RegisterValue::from_object_handle(method.0),
+            receiver,
+            RegisterValue::undefined(),
+        ];
+
+        let result = Interpreter::new()
+            .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+            .expect("host symbol receiver call should execute");
+
+        assert_eq!(result.return_value(), receiver);
     }
 
     #[test]

@@ -505,15 +505,70 @@ impl<'a> TinyScriptLowerer<'a> {
 #[cfg(test)]
 mod tests {
     use crate::Interpreter;
+    use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::interpreter::InterpreterError;
     use crate::source::{compile_script, compile_test262_basic_script, lower_script};
     use crate::value::RegisterValue;
+
+    fn install_test262_global(runtime: &mut crate::interpreter::RuntimeState) {
+        fn create_realm(
+            _this: &RegisterValue,
+            _args: &[RegisterValue],
+            runtime: &mut crate::interpreter::RuntimeState,
+        ) -> Result<RegisterValue, VmNativeCallError> {
+            let realm = runtime.alloc_object();
+            let global = runtime.intrinsics().global_object();
+            let global_property = runtime.intern_property_name("global");
+            runtime
+                .objects_mut()
+                .set_property(
+                    realm,
+                    global_property,
+                    RegisterValue::from_object_handle(global.0),
+                )
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("test262 $262.createRealm global install failed: {error:?}").into(),
+                    )
+                })?;
+            Ok(RegisterValue::from_object_handle(realm.0))
+        }
+
+        let create_realm = runtime.register_native_function(NativeFunctionDescriptor::method(
+            "createRealm",
+            0,
+            create_realm,
+        ));
+        let create_realm = runtime.alloc_host_function(create_realm);
+        let test262 = runtime.alloc_object();
+        let global = runtime.intrinsics().global_object();
+        let global_property = runtime.intern_property_name("global");
+        runtime
+            .objects_mut()
+            .set_property(
+                test262,
+                global_property,
+                RegisterValue::from_object_handle(global.0),
+            )
+            .expect("test262 $262.global should install");
+        let create_realm_property = runtime.intern_property_name("createRealm");
+        runtime
+            .objects_mut()
+            .set_property(
+                test262,
+                create_realm_property,
+                RegisterValue::from_object_handle(create_realm.0),
+            )
+            .expect("test262 $262.createRealm should install");
+        runtime.install_global_value("$262", RegisterValue::from_object_handle(test262.0));
+    }
 
     fn execute_test262_basic(source: &str, source_url: &str) -> RegisterValue {
         let module = compile_test262_basic_script(source, source_url)
             .expect("test262 basic script compiles");
 
         let mut runtime = crate::interpreter::RuntimeState::new();
+        install_test262_global(&mut runtime);
         let global = runtime.intrinsics().global_object();
         let registers = [RegisterValue::from_object_handle(global.0)];
         Interpreter::new()
@@ -532,6 +587,7 @@ mod tests {
             .expect("test262 basic script compiles");
 
         let mut runtime = crate::interpreter::RuntimeState::new();
+        install_test262_global(&mut runtime);
         let global = runtime.intrinsics().global_object();
         let registers = [RegisterValue::from_object_handle(global.0)];
         Interpreter::new()
@@ -3540,5 +3596,1073 @@ mod tests {
             matches!(error, InterpreterError::UncaughtThrow(_)),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn symbol_dispose_descriptor_round_trips() {
+        let result = execute_test262_basic(
+            concat!(
+                "var desc = Object.getOwnPropertyDescriptor(Symbol, 'dispose');\n",
+                "assert.sameValue(typeof desc.value, 'symbol', 'descriptor stores symbol primitive');\n",
+                "assert.sameValue(desc.value, Symbol.dispose, 'descriptor value matches Symbol.dispose');\n",
+                "assert.sameValue(desc.writable, false, 'descriptor keeps writable false');\n",
+                "assert.sameValue(desc.enumerable, false, 'descriptor keeps enumerable false');\n",
+                "assert.sameValue(desc.configurable, false, 'descriptor keeps configurable false');\n",
+            ),
+            "symbol-dispose-descriptor.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_dispose_is_shared_across_test262_realms() {
+        let result = execute_test262_basic(
+            concat!(
+                "var realm = $262.createRealm();\n",
+                "if (realm === undefined) throw 1;\n",
+                "assert.sameValue(realm.global.Symbol.dispose, Symbol.dispose, 'well-known symbol is shared across realms');\n",
+            ),
+            "symbol-dispose-cross-realm.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_for_reuses_global_registry_entries() {
+        let result = execute_test262_basic(
+            concat!(
+                "var canonical = Symbol.for('otter');\n",
+                "if (typeof canonical !== 'symbol') throw new Test262Error('Symbol.for should create a symbol');\n",
+                "if (canonical !== Symbol.for('otter')) throw new Test262Error('Symbol.for should reuse registry entries');\n",
+                "if (canonical === Symbol('otter')) throw new Test262Error('Symbol() should not reuse registry entries');\n",
+            ),
+            "symbol-for-registry.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_key_for_returns_registry_key() {
+        let result = execute_test262_basic(
+            concat!(
+                "var canonical = Symbol.for('otter');\n",
+                "if (Symbol.keyFor(canonical) !== 'otter') throw new Test262Error('Symbol.keyFor should return the registry key');\n",
+                "if (Symbol.keyFor(Symbol('otter')) !== undefined) throw new Test262Error('Symbol.keyFor should ignore unregistered symbols');\n",
+            ),
+            "symbol-key-for.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_description_reflects_runtime_metadata() {
+        let result = execute_test262_basic(
+            concat!(
+                "if (Symbol('otter').description !== 'otter') throw new Test262Error('Symbol(description) should record description');\n",
+                "if (Symbol().description !== undefined) throw new Test262Error('Symbol() should have undefined description');\n",
+                "if (Symbol.for('registry').description !== 'registry') throw new Test262Error('Symbol.for should record registry description');\n",
+            ),
+            "symbol-description.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_for_throws_js_exceptions_from_string_coercion() {
+        let result = execute_test262_basic(
+            concat!(
+                "var sentinel = { boom: true };\n",
+                "var subject = { toString: function() { throw sentinel; } };\n",
+                "try {\n",
+                "  Symbol.for(subject);\n",
+                "  throw new Test262Error('Symbol.for should propagate thrown toString errors');\n",
+                "} catch (error) {\n",
+                "  if (error !== sentinel) throw error;\n",
+                "}\n",
+                "try {\n",
+                "  Symbol.for(Symbol('otter'));\n",
+                "  throw new Test262Error('Symbol.for should reject symbol keys');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+            ),
+            "symbol-for-errors.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_prototype_installs_symbol_keyed_intrinsics() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(typeof Symbol.prototype[Symbol.toPrimitive], 'function');\n",
+                "assert.sameValue(Symbol.prototype[Symbol.toPrimitive].length, 1);\n",
+                "assert.sameValue(Symbol.prototype[Symbol.toPrimitive].name, '[Symbol.toPrimitive]');\n",
+                "assert.sameValue(Symbol.prototype[Symbol.toStringTag], 'Symbol');\n",
+            ),
+            "symbol-prototype-symbol-keyed-intrinsics.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_wrapper_boxing_and_to_string_work() {
+        let result = execute_test262_basic(
+            concat!(
+                "var sym = Symbol('otter');\n",
+                "assert.sameValue(Object(sym).valueOf(), sym);\n",
+                "assert.sameValue(Object.getPrototypeOf(sym), Symbol.prototype);\n",
+                "assert.sameValue(sym.toString(), 'Symbol(otter)');\n",
+                "assert.sameValue(Object(sym).toString(), 'Symbol(otter)');\n",
+                "assert.sameValue(String(sym), 'Symbol(otter)');\n",
+            ),
+            "symbol-wrapper-boxing-and-to-string.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_description_getter_accepts_primitives_and_wrappers() {
+        let result = execute_test262_basic(
+            concat!(
+                "var getter = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get;\n",
+                "var sym = Symbol('wrapped');\n",
+                "assert.sameValue(getter.call(sym), 'wrapped');\n",
+                "assert.sameValue(getter.call(Object(sym)), 'wrapped');\n",
+                "assert.sameValue(getter.call(Symbol()), undefined);\n",
+            ),
+            "symbol-description-getter.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_description_getter_rejects_non_symbol_receivers() {
+        let result = execute_test262_basic(
+            concat!(
+                "var getter = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get;\n",
+                "try {\n",
+                "  getter.call(123);\n",
+                "  throw new Test262Error('getter.call(123) should throw');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+                "try {\n",
+                "  getter.call({});\n",
+                "  throw new Test262Error('getter.call({}) should throw');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+            ),
+            "symbol-description-getter-rejects-non-symbol.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_to_primitive_method_accepts_symbol_primitive_receiver() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(Symbol.toPrimitive[Symbol.toPrimitive](), Symbol.toPrimitive);\n",
+            ),
+            "symbol-to-primitive-primitive-receiver.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_wrapper_property_key_uses_ordinary_to_primitive_when_symbol_to_primitive_is_undefined() {
+        let result = execute_test262_basic(
+            concat!(
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "assert.sameValue({ 'Symbol()': 1 }[Object(Symbol())], 1);\n",
+            ),
+            "symbol-wrapper-property-key-ordinary-to-primitive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_define_property_overwrites_symbol_to_primitive_value() {
+        let result = execute_test262_basic(
+            concat!(
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "var desc = Object.getOwnPropertyDescriptor(Symbol.prototype, Symbol.toPrimitive);\n",
+                "assert.sameValue(desc.value, undefined);\n",
+                "assert.sameValue(desc.writable, false);\n",
+                "assert.sameValue(desc.enumerable, false);\n",
+                "assert.sameValue(desc.configurable, true);\n",
+            ),
+            "symbol-define-property-overwrites-to-primitive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_primitive_member_lookup_finds_symbol_to_primitive_method() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(typeof Symbol.toPrimitive[Symbol.toPrimitive], 'function');\n",
+            ),
+            "symbol-primitive-member-lookup.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_wrapper_observes_redefined_symbol_to_primitive() {
+        let result = execute_test262_basic(
+            concat!(
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "assert.sameValue(Object(Symbol())[Symbol.toPrimitive], undefined);\n",
+                "assert.sameValue(Object(Symbol()).toString(), 'Symbol()');\n",
+            ),
+            "symbol-wrapper-observes-redefined-to-primitive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_wrapper_property_key_matches_object_has_own() {
+        let result = execute_test262_basic(
+            concat!(
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "var obj = { 'Symbol()': 1 };\n",
+                "assert.sameValue(Object.hasOwn(obj, Object(Symbol())), true);\n",
+            ),
+            "symbol-wrapper-property-key-has-own.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_wrapper_redefined_nullish_to_primitive_uses_ordinary_paths() {
+        let result = execute_test262_basic(
+            concat!(
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: null });\n",
+                "assert.sameValue(Object(Symbol()) == 'Symbol()', false);\n",
+                "try { +Object(Symbol()); throw new Test262Error('expected TypeError for unary plus'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
+                "assert.sameValue(`${Object(Symbol())}`, 'Symbol()');\n",
+                "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
+                "assert.sameValue(Object(Symbol.iterator) == Symbol.iterator, true);\n",
+                "try { Object(Symbol()) <= ''; throw new Test262Error('expected TypeError for relational compare'); } catch (error) { if (error.name !== 'TypeError') throw error; }\n",
+                "assert.sameValue({ 'Symbol()': 1 }[Object(Symbol())], 1);\n",
+            ),
+            "symbol-wrapper-redefined-nullish-ordinary-to-primitive.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn reflect_construct_reports_symbol_builtins_as_non_constructors() {
+        let result = execute_test262_basic(
+            concat!(
+                "function isConstructor(f) {\n",
+                "  try {\n",
+                "    Reflect.construct(function(){}, [], f);\n",
+                "  } catch (error) {\n",
+                "    return false;\n",
+                "  }\n",
+                "  return true;\n",
+                "}\n",
+                "if (isConstructor(Symbol)) throw new Test262Error('Symbol should not be constructible');\n",
+                "if (isConstructor(Symbol.for)) throw new Test262Error('Symbol.for should not be constructible');\n",
+                "if (isConstructor(Symbol.keyFor)) throw new Test262Error('Symbol.keyFor should not be constructible');\n",
+            ),
+            "symbol-is-constructor.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn symbol_non_constructor_checks_work_inside_assert_throws_callbacks() {
+        let result = execute_test262_basic(
+            concat!(
+                "var sawTypeError = false;\n",
+                "try {\n",
+                "  (() => { new Symbol.for(); })();\n",
+                "} catch (error) {\n",
+                "  sawTypeError = error.name === 'TypeError';\n",
+                "}\n",
+                "if (!sawTypeError) throw new Test262Error('arrow callback should preserve TypeError from new Symbol.for');\n",
+                "sawTypeError = false;\n",
+                "try {\n",
+                "  (() => { new Symbol.keyFor(Symbol()); })();\n",
+                "} catch (error) {\n",
+                "  sawTypeError = error.name === 'TypeError';\n",
+                "}\n",
+                "if (!sawTypeError) throw new Test262Error('arrow callback should preserve TypeError from new Symbol.keyFor');\n",
+            ),
+            "symbol-not-constructible-callbacks.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn test262_assert_throws_handles_symbol_non_constructors() {
+        let result = execute_test262_basic(
+            concat!(
+                "function assert(mustBeTrue, message) {\n",
+                "  if (mustBeTrue === true) return;\n",
+                "  throw new Test262Error(message);\n",
+                "}\n",
+                "assert.throws = function(expectedErrorConstructor, func, message) {\n",
+                "  var expectedName, actualName;\n",
+                "  if (typeof func !== 'function') throw new Test262Error('bad func');\n",
+                "  if (message === undefined) message = '';\n",
+                "  else message += ' ';\n",
+                "  try {\n",
+                "    func();\n",
+                "  } catch (thrown) {\n",
+                "    if (typeof thrown !== 'object' || thrown === null) {\n",
+                "      throw new Test262Error(message + 'Thrown value was not an object!');\n",
+                "    } else if (thrown.constructor !== expectedErrorConstructor) {\n",
+                "      expectedName = expectedErrorConstructor.name;\n",
+                "      actualName = thrown.constructor.name;\n",
+                "      if (expectedName === actualName) {\n",
+                "        throw new Test262Error(message + 'Expected a ' + expectedName + ' but got a different error constructor with the same name');\n",
+                "      }\n",
+                "      throw new Test262Error(message + 'Expected a ' + expectedName + ' but got a ' + actualName);\n",
+                "    }\n",
+                "    return;\n",
+                "  }\n",
+                "  throw new Test262Error(message + 'Expected a ' + expectedErrorConstructor.name + ' to be thrown but no exception was thrown at all');\n",
+                "};\n",
+                "assert.throws(TypeError, () => {\n",
+                "  new Symbol.for();\n",
+                "});\n",
+                "assert.throws(TypeError, () => {\n",
+                "  new Symbol.keyFor(Symbol());\n",
+                "});\n",
+            ),
+            "symbol-test262-assert-throws.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn exact_test262_symbol_not_a_constructor_shapes_pass_locally() {
+        let result = execute_test262_basic(
+            concat!(
+                "function assert(mustBeTrue, message) {\n",
+                "  if (mustBeTrue === true) return;\n",
+                "  throw new Test262Error(message);\n",
+                "}\n",
+                "assert.sameValue = function(actual, expected, message) {\n",
+                "  if (actual === expected) return;\n",
+                "  throw new Test262Error(message);\n",
+                "};\n",
+                "assert.throws = function(expectedErrorConstructor, func, message) {\n",
+                "  if (typeof func !== 'function') throw new Test262Error('bad func');\n",
+                "  try {\n",
+                "    func();\n",
+                "  } catch (thrown) {\n",
+                "    if (typeof thrown !== 'object' || thrown === null) throw new Test262Error('not object');\n",
+                "    if (thrown.constructor !== expectedErrorConstructor) throw new Test262Error(message);\n",
+                "    return;\n",
+                "  }\n",
+                "  throw new Test262Error('missing throw');\n",
+                "};\n",
+                "function isConstructor(f) {\n",
+                "  if (typeof f !== 'function') throw new Test262Error('non-function');\n",
+                "  try {\n",
+                "    Reflect.construct(function(){}, [], f);\n",
+                "  } catch (e) {\n",
+                "    return false;\n",
+                "  }\n",
+                "  return true;\n",
+                "}\n",
+                "assert.sameValue(isConstructor(Symbol.for), false, 'isConstructor(Symbol.for) must return false');\n",
+                "assert.throws(TypeError, () => {\n",
+                "  new Symbol.for();\n",
+                "}, 'new Symbol.for');\n",
+                "assert.sameValue(isConstructor(Symbol.keyFor), false, 'isConstructor(Symbol.keyFor) must return false');\n",
+                "assert.throws(TypeError, () => {\n",
+                "  new Symbol.keyFor(Symbol());\n",
+                "}, 'new Symbol.keyFor');\n",
+            ),
+            "symbol-not-a-constructor-exact.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn non_constructible_symbol_builtins_throw_type_error() {
+        let result = execute_test262_basic(
+            concat!(
+                "try {\n",
+                "  new Symbol();\n",
+                "  throw new Test262Error('new Symbol should reject non-constructible host function');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+                "try {\n",
+                "  new Symbol.for();\n",
+                "  throw new Test262Error('new Symbol.for should reject non-constructible host function');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+                "try {\n",
+                "  new Symbol.keyFor(Symbol());\n",
+                "  throw new Test262Error('new Symbol.keyFor should reject non-constructible host function');\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+            ),
+            "symbol-not-constructible.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_bound_primordials_work_for_math_constants() {
+        let result = execute_test262_basic(
+            concat!(
+                "var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);\n",
+                "var propertyIsEnumerable = Function.prototype.call.bind(Object.prototype.propertyIsEnumerable);\n",
+                "var join = Function.prototype.call.bind(Array.prototype.join);\n",
+                "var desc = Object.getOwnPropertyDescriptor(Math, 'E');\n",
+                "assert.sameValue(hasOwn(Math, 'E'), true, 'bound hasOwnProperty sees Math.E');\n",
+                "assert.sameValue(propertyIsEnumerable(Math, 'E'), false, 'bound propertyIsEnumerable sees Math.E as non-enumerable');\n",
+                "assert.sameValue(hasOwn(desc, 'writable'), true, 'bound hasOwnProperty sees descriptor fields');\n",
+                "assert.sameValue(join(['a', 'b'], ':'), 'a:b', 'bound array join forwards receiver and args');\n",
+            ),
+            "property-helper-bound-primordials.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn math_e_property_operations_match_property_helper_expectations() {
+        let result = execute_test262_basic(
+            concat!(
+                "var before = Math.E;\n",
+                "Math.E = 1;\n",
+                "assert.sameValue(Math.E, before, 'writing non-writable Math.E is ignored in non-strict code');\n",
+                "assert.sameValue(delete Math.E, false, 'deleting non-configurable Math.E returns false');\n",
+                "assert.sameValue(Object.prototype.hasOwnProperty.call(Math, 'E'), true, 'Math.E remains present after delete attempt');\n",
+            ),
+            "math-e-property-operations.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_verify_property_accepts_math_e() {
+        let source = format!(
+            "{}\n{}\nverifyProperty(Math, 'E', {{ writable: false, enumerable: false, configurable: false }});\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+        );
+        let result = execute_test262_basic(&source, "property-helper-math-e.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_is_enumerable_accepts_math_e() {
+        let source = format!(
+            "{}\n{}\nassert.sameValue(isEnumerable(Math, 'E'), false);\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+        );
+        let result = execute_test262_basic(&source, "property-helper-is-enumerable-math-e.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_is_writable_accepts_math_e() {
+        let source = format!(
+            "{}\n{}\nassert.sameValue(isWritable(Math, 'E'), false);\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+        );
+        let result = execute_test262_basic(&source, "property-helper-is-writable-math-e.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_is_configurable_accepts_math_e() {
+        let source = format!(
+            "{}\n{}\nassert.sameValue(isConfigurable(Math, 'E'), false);\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+        );
+        let result = execute_test262_basic(&source, "property-helper-is-configurable-math-e.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn test262_assert_function_and_not_same_value_work() {
+        let source = format!(
+            "{}\nassert(true, 'assert callable succeeds');\nassert.notSameValue({{}}, null, 'notSameValue succeeds');\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+        );
+        let result = execute_test262_basic(&source, "test262-assert-basic.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn simplified_verify_property_body_accepts_math_e() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  var names = __getOwnPropertyNames(desc);\n",
+            "  var failures = [];\n",
+            "  for (var i = 0; i < names.length; i++) {\n",
+            "    assert(names[i] === 'value' || names[i] === 'writable' || names[i] === 'enumerable' || names[i] === 'configurable' || names[i] === 'get' || names[i] === 'set', 'Invalid descriptor field: ' + names[i]);\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'enumerable') && desc.enumerable !== undefined) {\n",
+            "    if (desc.enumerable !== originalDesc.enumerable || desc.enumerable !== isEnumerable(obj, name)) {\n",
+            "      __push(failures, 'enumerable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'writable') && desc.writable !== undefined) {\n",
+            "    if (desc.writable !== originalDesc.writable || desc.writable !== isWritable(obj, name)) {\n",
+            "      __push(failures, 'writable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'configurable') && desc.configurable !== undefined) {\n",
+            "    if (desc.configurable !== originalDesc.configurable || desc.configurable !== isConfigurable(obj, name)) {\n",
+            "      __push(failures, 'configurable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (failures.length) {\n",
+            "    assert(false, __join(failures, '; '));\n",
+            "  }\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "simplified-verify-property-body.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn combined_verify_property_without_value_or_restore_accepts_math_e() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  if (desc === undefined) {\n",
+            "    assert.sameValue(originalDesc, undefined, \"obj['\" + nameStr + \"'] descriptor should be undefined\");\n",
+            "    return true;\n",
+            "  }\n",
+            "  assert(__hasOwnProperty(obj, name), 'obj should have an own property ' + nameStr);\n",
+            "  assert.notSameValue(desc, null, 'The desc argument should be an object or undefined, null');\n",
+            "  assert.sameValue(typeof desc, 'object', 'The desc argument should be an object or undefined, ' + String(desc));\n",
+            "  var names = __getOwnPropertyNames(desc);\n",
+            "  for (var i = 0; i < names.length; i++) {\n",
+            "    assert(names[i] === 'value' || names[i] === 'writable' || names[i] === 'enumerable' || names[i] === 'configurable' || names[i] === 'get' || names[i] === 'set', 'Invalid descriptor field: ' + names[i]);\n",
+            "  }\n",
+            "  var failures = [];\n",
+            "  if (__hasOwnProperty(desc, 'enumerable') && desc.enumerable !== undefined) {\n",
+            "    if (desc.enumerable !== originalDesc.enumerable || desc.enumerable !== isEnumerable(obj, name)) {\n",
+            "      __push(failures, 'enumerable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'writable') && desc.writable !== undefined) {\n",
+            "    if (desc.writable !== originalDesc.writable || desc.writable !== isWritable(obj, name)) {\n",
+            "      __push(failures, 'writable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'configurable') && desc.configurable !== undefined) {\n",
+            "    if (desc.configurable !== originalDesc.configurable || desc.configurable !== isConfigurable(obj, name)) {\n",
+            "      __push(failures, 'configurable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (failures.length) {\n",
+            "    assert(false, __join(failures, '; '));\n",
+            "  }\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "combined-verify-property-no-value-restore.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn combined_verify_property_with_value_branch_accepts_math_e() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  if (desc === undefined) {\n",
+            "    assert.sameValue(originalDesc, undefined, \"obj['\" + nameStr + \"'] descriptor should be undefined\");\n",
+            "    return true;\n",
+            "  }\n",
+            "  assert(__hasOwnProperty(obj, name), 'obj should have an own property ' + nameStr);\n",
+            "  assert.notSameValue(desc, null, 'The desc argument should be an object or undefined, null');\n",
+            "  assert.sameValue(typeof desc, 'object', 'The desc argument should be an object or undefined, ' + String(desc));\n",
+            "  var names = __getOwnPropertyNames(desc);\n",
+            "  for (var i = 0; i < names.length; i++) {\n",
+            "    assert(names[i] === 'value' || names[i] === 'writable' || names[i] === 'enumerable' || names[i] === 'configurable' || names[i] === 'get' || names[i] === 'set', 'Invalid descriptor field: ' + names[i]);\n",
+            "  }\n",
+            "  var failures = [];\n",
+            "  if (__hasOwnProperty(desc, 'value')) {\n",
+            "    if (!isSameValue(desc.value, originalDesc.value)) {\n",
+            "      __push(failures, \"obj['\" + nameStr + \"'] descriptor value should be \" + desc.value);\n",
+            "    }\n",
+            "    if (!isSameValue(desc.value, obj[name])) {\n",
+            "      __push(failures, \"obj['\" + nameStr + \"'] value should be \" + desc.value);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'enumerable') && desc.enumerable !== undefined) {\n",
+            "    if (desc.enumerable !== originalDesc.enumerable || desc.enumerable !== isEnumerable(obj, name)) {\n",
+            "      __push(failures, 'enumerable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'writable') && desc.writable !== undefined) {\n",
+            "    if (desc.writable !== originalDesc.writable || desc.writable !== isWritable(obj, name)) {\n",
+            "      __push(failures, 'writable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'configurable') && desc.configurable !== undefined) {\n",
+            "    if (desc.configurable !== originalDesc.configurable || desc.configurable !== isConfigurable(obj, name)) {\n",
+            "      __push(failures, 'configurable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (failures.length) {\n",
+            "    assert(false, __join(failures, '; '));\n",
+            "  }\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "combined-verify-property-with-value.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn combined_verify_property_with_restore_branch_accepts_math_e() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc, options) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  if (desc === undefined) {\n",
+            "    assert.sameValue(originalDesc, undefined, \"obj['\" + nameStr + \"'] descriptor should be undefined\");\n",
+            "    return true;\n",
+            "  }\n",
+            "  assert(__hasOwnProperty(obj, name), 'obj should have an own property ' + nameStr);\n",
+            "  assert.notSameValue(desc, null, 'The desc argument should be an object or undefined, null');\n",
+            "  assert.sameValue(typeof desc, 'object', 'The desc argument should be an object or undefined, ' + String(desc));\n",
+            "  var names = __getOwnPropertyNames(desc);\n",
+            "  for (var i = 0; i < names.length; i++) {\n",
+            "    assert(names[i] === 'value' || names[i] === 'writable' || names[i] === 'enumerable' || names[i] === 'configurable' || names[i] === 'get' || names[i] === 'set', 'Invalid descriptor field: ' + names[i]);\n",
+            "  }\n",
+            "  var failures = [];\n",
+            "  if (__hasOwnProperty(desc, 'value')) {\n",
+            "    if (!isSameValue(desc.value, originalDesc.value)) {\n",
+            "      __push(failures, \"obj['\" + nameStr + \"'] descriptor value should be \" + desc.value);\n",
+            "    }\n",
+            "    if (!isSameValue(desc.value, obj[name])) {\n",
+            "      __push(failures, \"obj['\" + nameStr + \"'] value should be \" + desc.value);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'enumerable') && desc.enumerable !== undefined) {\n",
+            "    if (desc.enumerable !== originalDesc.enumerable || desc.enumerable !== isEnumerable(obj, name)) {\n",
+            "      __push(failures, 'enumerable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'writable') && desc.writable !== undefined) {\n",
+            "    if (desc.writable !== originalDesc.writable || desc.writable !== isWritable(obj, name)) {\n",
+            "      __push(failures, 'writable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (__hasOwnProperty(desc, 'configurable') && desc.configurable !== undefined) {\n",
+            "    if (desc.configurable !== originalDesc.configurable || desc.configurable !== isConfigurable(obj, name)) {\n",
+            "      __push(failures, 'configurable mismatch ' + nameStr);\n",
+            "    }\n",
+            "  }\n",
+            "  if (failures.length) {\n",
+            "    assert(false, __join(failures, '; '));\n",
+            "  }\n",
+            "  if (options && options.restore) {\n",
+            "    __defineProperty(obj, name, originalDesc);\n",
+            "  }\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "combined-verify-property-with-restore.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_accepts_math_e() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  if (desc === undefined) {\n",
+            "    assert.sameValue(originalDesc, undefined, \"obj['\" + nameStr + \"'] descriptor should be undefined\");\n",
+            "    return true;\n",
+            "  }\n",
+            "  assert(__hasOwnProperty(obj, name), 'obj should have an own property ' + nameStr);\n",
+            "  assert.notSameValue(desc, null, 'The desc argument should be an object or undefined, null');\n",
+            "  assert.sameValue(typeof desc, 'object', 'The desc argument should be an object or undefined, ' + String(desc));\n",
+            "  return true;\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn string_callable_coerces_plain_objects() {
+        let result = execute_test262_basic(
+            concat!(
+                "assert.sameValue(String({}), '[object Object]', 'String(object) uses object coercion');\n",
+                "assert.sameValue(String({ value: 1 }), '[object Object]', 'String(object literal with fields) still coerces');\n",
+            ),
+            "string-callable-object-coercion.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_stage_fetches_descriptor_and_name() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  var nameStr = String(name);\n",
+            "  assert.sameValue(originalDesc.writable, false, nameStr + ' descriptor fetched');\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix-stage-fetch.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_stage_validates_own_property_and_desc_object() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  var nameStr = String(name);\n",
+            "  assert(__hasOwnProperty(obj, name), 'obj should have an own property ' + nameStr);\n",
+            "  assert.notSameValue(desc, null, 'The desc argument should be an object or undefined, null');\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix-stage-asserts.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_stage_validates_desc_type_message() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(desc) {\n",
+            "  assert.sameValue(typeof desc, 'object', 'The desc argument should be an object or undefined, ' + String(desc));\n",
+            "}\n",
+            "probe({ writable: false, enumerable: false, configurable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix-stage-type.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_stage_arguments_length_guard_works() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            "function probe(obj, name, desc) {\n",
+            "  assert(arguments.length > 2, 'verifyProperty should receive at least 3 arguments: obj, name, and descriptor');\n",
+            "}\n",
+            "probe(Math, 'E', { writable: false });\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix-arguments-guard.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn verify_property_prefix_stage_descriptor_alias_call_works() {
+        let source = [
+            include_str!("../../../tests/test262/harness/assert.js"),
+            "\n",
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+            "\n",
+            "function probe(obj, name) {\n",
+            "  var originalDesc = __getOwnPropertyDescriptor(obj, name);\n",
+            "  assert.sameValue(originalDesc.writable, false, 'descriptor alias call returns writable false');\n",
+            "}\n",
+            "probe(Math, 'E');\n",
+        ]
+        .concat();
+        let result = execute_test262_basic(&source, "verify-property-prefix-descriptor-alias.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_length_direct_relational_comparison_works() {
+        let result = execute_test262_basic(
+            concat!(
+                "function probe() {\n",
+                "  assert.sameValue(arguments.length > 2, true, 'direct relational compare on arguments.length');\n",
+                "}\n",
+                "probe(1, 2, 3);\n",
+            ),
+            "arguments-length-direct-gt.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_length_local_relational_comparison_works() {
+        let result = execute_test262_basic(
+            concat!(
+                "function probe() {\n",
+                "  var len = arguments.length;\n",
+                "  assert.sameValue(len > 2, true, 'local relational compare on arguments.length');\n",
+                "}\n",
+                "probe(1, 2, 3);\n",
+            ),
+            "arguments-length-local-gt.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_object_works_with_formal_parameters() {
+        let result = execute_test262_basic(
+            concat!(
+                "function probe(obj, name, desc) {\n",
+                "  assert.sameValue(arguments.length, 3, 'arguments length survives formal parameters');\n",
+                "  assert.sameValue(arguments.length > 2, true, 'arguments length compares with formal parameters');\n",
+                "}\n",
+                "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+            ),
+            "arguments-with-formals.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_length_guard_works_without_assert_harness_magic() {
+        let result = execute_test262_basic(
+            concat!(
+                "function expectTrue(value) {\n",
+                "  if (value !== true) {\n",
+                "    throw new Test262Error('expected true');\n",
+                "  }\n",
+                "}\n",
+                "function probe(obj, name, desc) {\n",
+                "  expectTrue(arguments.length > 2);\n",
+                "}\n",
+                "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+            ),
+            "arguments-length-guard-no-assert-magic.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_length_guard_works_inline_without_outer_function_call() {
+        let result = execute_test262_basic(
+            concat!(
+                "function probe(obj, name, desc) {\n",
+                "  if (!(arguments.length > 2)) {\n",
+                "    throw new Test262Error('expected true');\n",
+                "  }\n",
+                "}\n",
+                "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+            ),
+            "arguments-length-guard-inline.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn inner_function_can_call_outer_function_declaration() {
+        let result = execute_test262_basic(
+            concat!(
+                "function helper() {\n",
+                "  return true;\n",
+                "}\n",
+                "function probe() {\n",
+                "  if (helper() !== true) {\n",
+                "    throw new Test262Error('helper call failed');\n",
+                "  }\n",
+                "}\n",
+                "probe();\n",
+            ),
+            "inner-calls-outer-helper.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn inner_function_can_call_outer_function_declaration_with_argument() {
+        let result = execute_test262_basic(
+            concat!(
+                "function helper(value) {\n",
+                "  if (value !== true) {\n",
+                "    throw new Test262Error('helper argument failed');\n",
+                "  }\n",
+                "}\n",
+                "function probe() {\n",
+                "  helper(true);\n",
+                "}\n",
+                "probe();\n",
+            ),
+            "inner-calls-outer-helper-with-arg.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn inner_function_can_call_outer_function_with_relational_argument() {
+        let result = execute_test262_basic(
+            concat!(
+                "function helper(value) {\n",
+                "  if (value !== true) {\n",
+                "    throw new Test262Error('relational helper argument failed');\n",
+                "  }\n",
+                "}\n",
+                "function probe() {\n",
+                "  helper(1 < 2);\n",
+                "}\n",
+                "probe();\n",
+            ),
+            "inner-calls-outer-helper-with-relational-arg.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn inner_function_can_call_outer_function_with_arguments_length_argument() {
+        let result = execute_test262_basic(
+            concat!(
+                "function helper(value) {\n",
+                "  if (value !== 3) {\n",
+                "    throw new Test262Error('arguments length helper argument failed');\n",
+                "  }\n",
+                "}\n",
+                "function probe(obj, name, desc) {\n",
+                "  helper(arguments.length);\n",
+                "}\n",
+                "probe(Math, 'E', { writable: false, enumerable: false, configurable: false });\n",
+            ),
+            "inner-calls-outer-helper-with-arguments-length.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn arguments_object_reports_runtime_argument_count() {
+        let result = execute_test262_basic(
+            concat!(
+                "function readCount() {\n",
+                "  assert.sameValue(arguments.length, 3, 'arguments length tracks actual args');\n",
+                "}\n",
+                "readCount(1, 2, 3);\n",
+            ),
+            "arguments-length.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn nested_function_declarations_are_hoisted_inside_functions() {
+        let result = execute_test262_basic(
+            concat!(
+                "function outer() {\n",
+                "  assert.sameValue(inner(), 1, 'nested function declaration is hoisted');\n",
+                "  function inner() { return 1; }\n",
+                "}\n",
+                "outer();\n",
+            ),
+            "nested-function-hoist.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_primitives_support_descriptor_name_listing_and_failure_arrays() {
+        let result = execute_test262_basic(
+            concat!(
+                "var desc = Object.getOwnPropertyDescriptor(Math, 'E');\n",
+                "var names = Object.getOwnPropertyNames(desc);\n",
+                "assert.sameValue(names.length >= 3, true, 'descriptor names materialize into an array');\n",
+                "var push = Function.prototype.call.bind(Array.prototype.push);\n",
+                "var failures = [];\n",
+                "assert.sameValue(push(failures, 'x'), 1, 'bound push appends first failure');\n",
+                "assert.sameValue(push(failures, 'y'), 2, 'bound push appends second failure');\n",
+                "assert.sameValue(failures.length, 2, 'failure array tracks appended entries');\n",
+            ),
+            "property-helper-primitives.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn property_helper_has_own_property_distinguishes_missing_value_field() {
+        let source = format!(
+            "{}\n{}\nvar desc = {{ writable: false, enumerable: false, configurable: false }};\nassert.sameValue(__hasOwnProperty(desc, 'value'), false);\nassert.sameValue(__hasOwnProperty(desc, 'writable'), true);\n",
+            include_str!("../../../tests/test262/harness/assert.js"),
+            include_str!("../../../tests/test262/harness/propertyHelper.js"),
+        );
+        let result =
+            execute_test262_basic(&source, "property-helper-has-own-property-missing-value.js");
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn logical_and_short_circuits_undefined_options_receiver() {
+        let result = execute_test262_basic(
+            concat!(
+                "function probe(options) {\n",
+                "  if (options && options.restore) {\n",
+                "    throw new Test262Error('options short-circuit failed');\n",
+                "  }\n",
+                "}\n",
+                "probe();\n",
+            ),
+            "logical-and-short-circuit-options.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
     }
 }

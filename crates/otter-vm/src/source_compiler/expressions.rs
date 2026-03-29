@@ -569,16 +569,24 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         let (callee, receiver) = self.compile_call_target(&call.callee, module)?;
+        // Spill older temporaries before newer ones. `allocate_local()` grows the
+        // local prefix from the bottom, so stabilizing a newer temp first can
+        // overlap and clobber an older live temp register.
+        let receiver = match receiver {
+            Some(receiver) if receiver.is_temp => Some(self.stabilize_binding_value(receiver)?),
+            other => other,
+        };
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
 
         let argument_count = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::TooManyLocals)?;
-        let arg_start = if argument_count == 0 {
-            BytecodeRegister::new(self.next_local + self.next_temp)
-        } else {
-            self.reserve_temp_window(argument_count)?
-        };
+        let mut argument_values = Vec::with_capacity(usize::from(argument_count));
 
-        for (offset, argument) in call.arguments.iter().enumerate() {
+        for argument in &call.arguments {
             let value = match argument {
                 Argument::SpreadElement(_) => {
                     return Err(SourceLoweringError::Unsupported(
@@ -592,6 +600,16 @@ impl<'a> FunctionCompiler<'a> {
                     module,
                 )?,
             };
+            argument_values.push(value);
+        }
+
+        let arg_start = if argument_count == 0 {
+            BytecodeRegister::new(self.next_local + self.next_temp)
+        } else {
+            self.reserve_temp_window(argument_count)?
+        };
+
+        for (offset, value) in argument_values.into_iter().enumerate() {
             let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
             if value.register != destination {
                 self.instructions
@@ -600,7 +618,7 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        let result = if receiver.is_some_and(|receiver| receiver.is_temp) {
+        let mut result = if receiver.is_some_and(|receiver| receiver.is_temp) {
             receiver.expect("receiver must exist when reusing receiver temp")
         } else if callee.is_temp {
             callee
@@ -624,7 +642,14 @@ impl<'a> FunctionCompiler<'a> {
         self.record_call_site(pc, call_site);
 
         if argument_count != 0 {
-            self.release_temp_window(argument_count);
+            let stable_register =
+                BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
+            if result.register != stable_register {
+                self.instructions
+                    .push(Instruction::move_(stable_register, result.register));
+                result = ValueLocation::temp(stable_register);
+            }
+            self.release_temp_window(argument_count.saturating_sub(1));
         }
         if callee.register != result.register {
             self.release(callee);
@@ -643,16 +668,22 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let (callee, cleanup) = self.compile_construct_target(&new_expression.callee, module)?;
+        // Same spill ordering rule as ordinary calls: stabilize older temps first.
+        let cleanup = match cleanup {
+            Some(value) if value.is_temp => Some(self.stabilize_binding_value(value)?),
+            other => other,
+        };
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
         let arguments = &new_expression.arguments;
         let argument_count = RegisterIndex::try_from(arguments.len())
             .map_err(|_| SourceLoweringError::TooManyLocals)?;
-        let arg_start = if argument_count == 0 {
-            BytecodeRegister::new(self.next_local + self.next_temp)
-        } else {
-            self.reserve_temp_window(argument_count)?
-        };
+        let mut argument_values = Vec::with_capacity(usize::from(argument_count));
 
-        for (offset, argument) in arguments.iter().enumerate() {
+        for argument in arguments {
             let value = match argument {
                 Argument::SpreadElement(_) => {
                     return Err(SourceLoweringError::Unsupported(
@@ -666,6 +697,16 @@ impl<'a> FunctionCompiler<'a> {
                     module,
                 )?,
             };
+            argument_values.push(value);
+        }
+
+        let arg_start = if argument_count == 0 {
+            BytecodeRegister::new(self.next_local + self.next_temp)
+        } else {
+            self.reserve_temp_window(argument_count)?
+        };
+
+        for (offset, value) in argument_values.into_iter().enumerate() {
             let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
             if value.register != destination {
                 self.instructions
@@ -746,7 +787,10 @@ impl<'a> FunctionCompiler<'a> {
                 Ok((ValueLocation::temp(callee_register), Some(receiver)))
             }
             Expression::ComputedMemberExpression(member) => {
-                let receiver = self.compile_expression(&member.object, module)?;
+                let mut receiver = self.compile_expression(&member.object, module)?;
+                if receiver.is_temp {
+                    receiver = self.stabilize_binding_value(receiver)?;
+                }
                 let callee_register = self.alloc_temp();
 
                 match &member.expression {
@@ -796,7 +840,10 @@ impl<'a> FunctionCompiler<'a> {
                 Ok((ValueLocation::temp(callee_register), Some(object)))
             }
             Expression::ComputedMemberExpression(member) => {
-                let object = self.compile_expression(&member.object, module)?;
+                let mut object = self.compile_expression(&member.object, module)?;
+                if object.is_temp {
+                    object = self.stabilize_binding_value(object)?;
+                }
                 let callee_register = self.alloc_temp();
 
                 match &member.expression {
@@ -1178,7 +1225,10 @@ impl<'a> FunctionCompiler<'a> {
         member: &ComputedMemberExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let object = self.compile_expression(&member.object, module)?;
+        let mut object = self.compile_expression(&member.object, module)?;
+        if object.is_temp {
+            object = self.stabilize_binding_value(object)?;
+        }
         let result = if object.is_temp {
             object
         } else {
@@ -1257,7 +1307,10 @@ impl<'a> FunctionCompiler<'a> {
                 }
 
                 // General case: dynamic key — emit DeleteComputed.
-                let object = self.compile_expression(&member.object, module)?;
+                let mut object = self.compile_expression(&member.object, module)?;
+                if object.is_temp {
+                    object = self.stabilize_binding_value(object)?;
+                }
                 let key = self.compile_expression(&member.expression, module)?;
                 let result = if object.is_temp {
                     object

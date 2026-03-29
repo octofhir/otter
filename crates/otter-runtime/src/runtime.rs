@@ -479,6 +479,267 @@ mod tests {
     }
 
     #[test]
+    fn run_script_handles_direct_symbol_for_non_constructor_checks() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            concat!(
+                "try {\n",
+                "  new Symbol.for();\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+            ),
+            "symbol-for-direct.js",
+        )
+        .expect("direct new Symbol.for should throw TypeError under run_script");
+    }
+
+    #[test]
+    fn run_script_handles_direct_symbol_key_for_non_constructor_checks() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            concat!(
+                "try {\n",
+                "  new Symbol.keyFor(Symbol());\n",
+                "} catch (error) {\n",
+                "  if (error.name !== 'TypeError') throw error;\n",
+                "}\n",
+            ),
+            "symbol-key-for-direct.js",
+        )
+        .expect("direct new Symbol.keyFor should throw TypeError under run_script");
+    }
+
+    #[test]
+    fn run_script_handles_assert_throws_for_symbol_non_constructors() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let body = concat!(
+            "assert.throws(TypeError, () => {\n",
+            "  new Symbol.for();\n",
+            "});\n",
+            "assert.throws(TypeError, () => {\n",
+            "  new Symbol.keyFor(Symbol());\n",
+            "});\n",
+        );
+
+        let mut rt = OtterRuntime::builder().build();
+        let code = format!("{sta}\n{assert_js}\n{body}");
+        rt.run_script(&code, "symbol-assert-throws.js")
+            .expect("assert.throws should handle Symbol non-constructors");
+    }
+
+    #[test]
+    fn run_script_handles_minimal_is_constructor_shape() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            concat!(
+                "function isConstructor(f) {\n",
+                "  try {\n",
+                "    Reflect.construct(function(){}, [], f);\n",
+                "  } catch (error) {\n",
+                "    return false;\n",
+                "  }\n",
+                "  return true;\n",
+                "}\n",
+                "if (isConstructor(Symbol.for) !== false) throw new Error('Symbol.for should not be constructible');\n",
+                "if (isConstructor(Symbol.keyFor) !== false) throw new Error('Symbol.keyFor should not be constructible');\n",
+            ),
+            "symbol-minimal-is-constructor.js",
+        )
+        .expect("minimal isConstructor shape should pass");
+    }
+
+    #[test]
+    fn run_script_exposes_test262_helpers_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let is_constructor = std::fs::read_to_string(base.join("isConstructor.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&is_constructor, "isConstructor.js")
+            .expect("isConstructor.js should load");
+        rt.run_script(
+            concat!(
+                "if (typeof assert !== 'function') throw new Error('assert should survive');\n",
+                "if (typeof isConstructor !== 'function') throw new Error('isConstructor should survive');\n",
+            ),
+            "helpers-visible.js",
+        )
+        .expect("test262 helpers should be visible in later scripts");
+    }
+
+    #[test]
+    fn run_script_persists_top_level_function_declarations_across_scripts() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script("function persist() { return 7; }", "persist-a.js")
+            .expect("function declaration should load");
+        rt.run_script(
+            "if (persist() !== 7) throw new Error('persist should survive across scripts');",
+            "persist-b.js",
+        )
+        .expect("top-level function declaration should be callable in later scripts");
+    }
+
+    #[test]
+    fn run_script_handles_is_constructor_after_separate_test262_includes() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let is_constructor = std::fs::read_to_string(base.join("isConstructor.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&is_constructor, "isConstructor.js")
+            .expect("isConstructor.js should load");
+        rt.run_script(
+            "assert.sameValue(isConstructor(Symbol.for), false, 'Symbol.for is not constructible');",
+            "is-constructor-check.js",
+        )
+        .expect("isConstructor(Symbol.for) should work after separate includes");
+    }
+
+    #[test]
+    fn run_script_evaluates_is_constructor_after_separate_include_without_assert() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let is_constructor = std::fs::read_to_string(base.join("isConstructor.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&is_constructor, "isConstructor.js")
+            .expect("isConstructor.js should load");
+        rt.run_script(
+            concat!(
+                "var result = isConstructor(Symbol.for);\n",
+                "if (result !== false) throw new Error('expected false');\n",
+            ),
+            "is-constructor-raw-check.js",
+        )
+        .expect("isConstructor(Symbol.for) should evaluate to false after separate include");
+    }
+
+    #[test]
+    fn run_script_handles_assert_same_value_after_separate_include() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(
+            "assert.sameValue(1, 1, 'assert.sameValue should survive across scripts');",
+            "assert-same-value.js",
+        )
+        .expect("assert.sameValue should work after separate include");
+    }
+
+    #[test]
+    fn run_script_handles_symbol_for_length_descriptor_after_separate_include() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(
+            concat!(
+                "var desc = Object.getOwnPropertyDescriptor(Symbol.for, 'length');\n",
+                "if (typeof desc !== 'object') throw new Error('desc should be object');\n",
+                "if (desc.value !== 1) throw new Error('length should be 1');\n",
+                "if (desc.writable !== false) throw new Error('length writable should be false');\n",
+                "if (desc.enumerable !== false) throw new Error('length enumerable should be false');\n",
+                "if (desc.configurable !== true) throw new Error('length configurable should be true');\n",
+            ),
+            "symbol-for-length-desc.js",
+        )
+        .expect("direct Symbol.for length descriptor lookup should work");
+    }
+
+    #[test]
+    fn run_script_handles_property_helper_on_math_after_separate_include() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "verifyProperty(Math, 'abs', { writable: true, enumerable: false, configurable: true });",
+            "verify-math-abs.js",
+        )
+        .expect("propertyHelper should work on Math.abs after separate include");
+    }
+
+    #[test]
+    fn run_script_handles_property_helper_on_symbol_for_after_separate_include() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "verifyProperty(Symbol.for, 'length', { value: 1, writable: false, enumerable: false, configurable: true });",
+            "verify-symbol-for-length.js",
+        )
+        .expect("propertyHelper should work on Symbol.for after separate include");
+    }
+
+    #[test]
+    fn run_script_handles_split_cross_script_calls_in_sequence() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let is_constructor = std::fs::read_to_string(base.join("isConstructor.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&is_constructor, "isConstructor.js")
+            .expect("isConstructor.js should load");
+        rt.run_script(
+            concat!(
+                "var result = isConstructor(Symbol.for);\n",
+                "assert.sameValue(result, false, 'split cross-script calls should work');\n",
+            ),
+            "split-cross-script-calls.js",
+        )
+        .expect("split cross-script calls should work");
+    }
+
+    #[test]
     fn arguments_object_basic() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
@@ -554,5 +815,226 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("propertyHelper preamble failed: {e}"),
         }
+    }
+
+    #[test]
+    fn property_helper_bound_globals_survive_separate_script_loads() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            concat!(
+                "console.log(typeof __getOwnPropertyNames);\n",
+                "console.log(typeof __join);\n",
+                "console.log(typeof __push);\n",
+                "console.log(typeof __hasOwnProperty);\n",
+                "console.log(typeof __propertyIsEnumerable);\n",
+            ),
+            "property-helper-types.js",
+        )
+        .expect("propertyHelper globals should survive separate script loads");
+        assert_eq!(capture.text(), "function\nfunction\nfunction\nfunction\nfunction");
+    }
+
+    #[test]
+    fn property_helper_bound_has_own_property_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "console.log(__hasOwnProperty({ a: 1 }, 'a'));",
+            "property-helper-has-own.js",
+        )
+        .expect("__hasOwnProperty should work across scripts");
+        assert_eq!(capture.text(), "true");
+    }
+
+    #[test]
+    fn property_helper_bound_push_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            concat!(
+                "var failures = [];\n",
+                "console.log(__push(failures, 'x'));\n",
+                "console.log(failures.length);\n",
+            ),
+            "property-helper-push.js",
+        )
+        .expect("__push should work across scripts");
+        assert_eq!(capture.text(), "1\n1");
+    }
+
+    #[test]
+    fn property_helper_get_own_property_names_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "console.log(__getOwnPropertyNames({ a: 1, b: 2 }).join(','));",
+            "property-helper-own-property-names.js",
+        )
+        .expect("__getOwnPropertyNames should work across scripts");
+        assert_eq!(capture.text(), "a,b");
+    }
+
+    #[test]
+    fn property_helper_is_enumerable_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "assert.sameValue(isEnumerable(Math, 'abs'), false);",
+            "property-helper-is-enumerable.js",
+        )
+        .expect("isEnumerable should work across scripts");
+    }
+
+    #[test]
+    fn property_helper_is_writable_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "assert.sameValue(isWritable(Math, 'abs'), true);",
+            "property-helper-is-writable.js",
+        )
+        .expect("isWritable should work across scripts");
+    }
+
+    #[test]
+    fn property_helper_is_configurable_works_across_scripts() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/test262/harness");
+        let sta = std::fs::read_to_string(base.join("sta.js")).unwrap();
+        let assert_js = std::fs::read_to_string(base.join("assert.js")).unwrap();
+        let property_helper = std::fs::read_to_string(base.join("propertyHelper.js")).unwrap();
+
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(&sta, "sta.js").expect("sta.js should load");
+        rt.run_script(&assert_js, "assert.js")
+            .expect("assert.js should load");
+        rt.run_script(&property_helper, "propertyHelper.js")
+            .expect("propertyHelper.js should load");
+        rt.run_script(
+            "assert.sameValue(isConfigurable(Math, 'abs'), true);",
+            "property-helper-is-configurable.js",
+        )
+        .expect("isConfigurable should work across scripts");
+    }
+
+    #[test]
+    fn cross_script_functions_receive_three_arguments() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            concat!(
+                "function probe(a, b, c) {\n",
+                "  if (a !== 1) throw new Error('a');\n",
+                "  if (b !== 2) throw new Error('b');\n",
+                "  if (typeof c !== 'object') throw new Error('c:' + typeof c);\n",
+                "}\n",
+            ),
+            "cross-script-probe-setup.js",
+        )
+        .expect("probe should load");
+        rt.run_script(
+            "probe(1, 2, { ok: true });",
+            "cross-script-probe-call.js",
+        )
+        .expect("cross-script function should receive three arguments");
+    }
+
+    #[test]
+    fn cross_script_functions_preserve_arguments_length() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            concat!(
+                "function probe() {\n",
+                "  if (arguments.length !== 3) throw new Error('argc:' + arguments.length);\n",
+                "}\n",
+            ),
+            "cross-script-arguments-setup.js",
+        )
+        .expect("probe should load");
+        rt.run_script(
+            "probe(1, 2, 3);",
+            "cross-script-arguments-call.js",
+        )
+        .expect("cross-script function should preserve arguments.length");
+    }
+
+    #[test]
+    fn nested_cross_script_function_calls_work_across_multiple_prior_scripts() {
+        let mut rt = OtterRuntime::builder().build();
+        rt.run_script(
+            "function helper(value) { if (value !== 7) throw new Error('helper'); }",
+            "nested-cross-script-helper.js",
+        )
+        .expect("helper should load");
+        rt.run_script(
+            "function probe() { helper(7); }",
+            "nested-cross-script-probe.js",
+        )
+        .expect("probe should load");
+        rt.run_script(
+            "probe();",
+            "nested-cross-script-call.js",
+        )
+        .expect("nested cross-script function calls should work");
     }
 }

@@ -84,6 +84,7 @@ impl<'a> ModuleCompiler<'a> {
         if kind != FunctionKind::Arrow {
             compiler.declare_this_binding()?;
         }
+        compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(params, self)?;
         if kind == FunctionKind::Script {
             compiler.declare_intrinsic_globals()?;
@@ -124,6 +125,7 @@ impl<'a> ModuleCompiler<'a> {
         if kind != FunctionKind::Arrow {
             compiler.declare_this_binding()?;
         }
+        compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(params, self)?;
         let value = compiler.compile_expression(expression, self)?;
         compiler.instructions.push(Instruction::ret(value.register));

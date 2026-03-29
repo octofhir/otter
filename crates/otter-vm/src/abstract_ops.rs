@@ -75,7 +75,19 @@ pub fn to_property_key(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<PropertyNameId, VmNativeCallError> {
-    let key = to_property_key_string(runtime, value)?;
+    let primitive = runtime
+        .js_to_primitive_with_hint(value, crate::interpreter::ToPrimitiveHint::String)
+        .map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("ToPropertyKey primitive coercion failed: {error}").into(),
+            )
+        })?;
+
+    if let Some(symbol_id) = primitive.as_symbol_id() {
+        return Ok(runtime.intern_symbol_property_name(symbol_id));
+    }
+
+    let key = to_property_key_string(runtime, primitive)?;
     Ok(runtime.intern_property_name(&key))
 }
 
@@ -83,16 +95,6 @@ fn to_property_key_string(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<Box<str>, VmNativeCallError> {
-    if let Some(handle) = value.as_object_handle().map(ObjectHandle)
-        && let Some(primitive) = runtime.boxed_primitive_value(handle).map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("ToPropertyKey boxed primitive lookup failed: {error}").into(),
-            )
-        })?
-    {
-        return to_property_key_string(runtime, primitive);
-    }
-
     runtime.js_to_string(value).map_err(|error| {
         VmNativeCallError::Internal(format!("ToPropertyKey string coercion failed: {error}").into())
     })

@@ -209,7 +209,7 @@ fn install_class_members(
 ///
 /// Installs `.length` and `.name` as non-writable, non-enumerable, configurable
 /// data properties on a host function object.
-fn install_function_length_name(
+pub(super) fn install_function_length_name(
     handle: ObjectHandle,
     length: u16,
     name: &str,

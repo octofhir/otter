@@ -35,7 +35,9 @@ const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
 const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004;
 const TAG_NAN: u64 = 0x7FFA_0000_0000_0000;
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
+const TAG_SYMBOL: u64 = 0x7FF8_0002_0000_0000;
 const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const SYMBOL_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
 
 /// Shared register value cell for the new VM.
@@ -48,6 +50,7 @@ const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
 /// - booleans
 /// - canonical `NaN`
 /// - `int32`
+/// - `symbol`
 /// - plain `f64`
 ///
 /// Object values already use the object-tag namespace, but the payload is a
@@ -71,6 +74,7 @@ impl RegisterValue {
             || bits == TAG_HOLE
             || bits == TAG_NAN
             || (bits & INT32_TAG_MASK) == TAG_INT32
+            || (bits & SYMBOL_TAG_MASK) == TAG_SYMBOL
             || (bits & QUIET_NAN) != QUIET_NAN
         {
             Some(Self(bits))
@@ -107,6 +111,12 @@ impl RegisterValue {
         }
 
         Self(value.to_bits())
+    }
+
+    /// Encodes a symbol primitive by stable VM-local identifier.
+    #[must_use]
+    pub const fn from_symbol_id(symbol_id: u32) -> Self {
+        Self(TAG_SYMBOL | symbol_id as u64)
     }
 
     /// Encodes `undefined`.
@@ -167,6 +177,22 @@ impl RegisterValue {
         } else {
             None
         }
+    }
+
+    /// Decodes the value as a symbol identifier.
+    #[must_use]
+    pub const fn as_symbol_id(self) -> Option<u32> {
+        if (self.0 & SYMBOL_TAG_MASK) == TAG_SYMBOL {
+            Some((self.0 & 0xFFFF_FFFF) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether the value is a symbol primitive.
+    #[must_use]
+    pub const fn is_symbol(self) -> bool {
+        self.as_symbol_id().is_some()
     }
 
     /// Returns whether the value is the internal hole marker.
@@ -341,6 +367,9 @@ impl fmt::Debug for RegisterValue {
             TAG_TRUE => f.write_str("true"),
             TAG_FALSE => f.write_str("false"),
             TAG_HOLE => f.write_str("<hole>"),
+            _ if (self.0 & SYMBOL_TAG_MASK) == TAG_SYMBOL => {
+                write!(f, "Symbol({})", self.as_symbol_id().unwrap_or_default())
+            }
             _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_OBJECT => {
                 write!(
                     f,
@@ -361,8 +390,8 @@ impl fmt::Debug for RegisterValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        INT32_TAG_MASK, RegisterValue, TAG_FALSE, TAG_INT32, TAG_NAN, TAG_NULL, TAG_PTR_OBJECT,
-        TAG_TRUE, TAG_UNDEFINED, ValueError,
+        INT32_TAG_MASK, RegisterValue, SYMBOL_TAG_MASK, TAG_FALSE, TAG_INT32, TAG_NAN, TAG_NULL,
+        TAG_PTR_OBJECT, TAG_SYMBOL, TAG_TRUE, TAG_UNDEFINED, ValueError,
     };
 
     #[test]
@@ -404,6 +433,16 @@ mod tests {
     }
 
     #[test]
+    fn symbol_values_round_trip() {
+        let value = RegisterValue::from_symbol_id(17);
+
+        assert_eq!(value.as_symbol_id(), Some(17));
+        assert!(value.is_symbol());
+        assert_eq!(value.as_number(), None);
+        assert_eq!(value.as_object_handle(), None);
+    }
+
+    #[test]
     fn primitive_tag_bits_match_existing_nan_box_layout() {
         assert_eq!(RegisterValue::undefined().raw_bits(), TAG_UNDEFINED);
         assert_eq!(RegisterValue::null().raw_bits(), TAG_NULL);
@@ -413,6 +452,10 @@ mod tests {
         assert_eq!(
             RegisterValue::from_i32(7).raw_bits() & INT32_TAG_MASK,
             TAG_INT32
+        );
+        assert_eq!(
+            RegisterValue::from_symbol_id(7).raw_bits() & SYMBOL_TAG_MASK,
+            TAG_SYMBOL
         );
     }
 
@@ -426,6 +469,10 @@ mod tests {
 
         assert_eq!(object.raw_bits(), object_bits);
         assert_eq!(object.as_object_handle(), Some(0x1234));
+        assert_eq!(
+            RegisterValue::from_raw_bits(RegisterValue::from_symbol_id(9).raw_bits()),
+            Some(RegisterValue::from_symbol_id(9))
+        );
         assert_eq!(
             RegisterValue::from_raw_bits(TAG_TRUE),
             Some(RegisterValue::from_bool(true))

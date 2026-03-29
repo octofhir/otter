@@ -11,7 +11,9 @@ use super::{
     boolean_class::box_boolean_object,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
     number_class::box_number_object,
+    symbol_class::box_symbol_object,
     string_class::box_string_object,
+    WellKnownSymbol,
 };
 
 pub(super) static OBJECT_INTRINSIC: ObjectIntrinsic = ObjectIntrinsic;
@@ -19,6 +21,7 @@ pub(super) static OBJECT_INTRINSIC: ObjectIntrinsic = ObjectIntrinsic;
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
 const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
+const SYMBOL_DATA_SLOT: &str = "__otter_symbol_data__";
 const OBJECT_IS_PROTOTYPE_OF_ERROR: &str =
     "Object.prototype.isPrototypeOf requires an object receiver";
 
@@ -214,6 +217,10 @@ fn object_constructor(
             return box_number_object(RegisterValue::from_number(number), runtime);
         }
 
+        if value.is_symbol() {
+            return box_symbol_object(value, runtime);
+        }
+
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             return match runtime.objects().kind(handle) {
                 Ok(HeapValueKind::String) => box_string_object(handle, runtime),
@@ -261,22 +268,39 @@ fn object_to_string(
         )?;
         let builtin_tag =
             object_to_string_tag(RegisterValue::from_object_handle(object.0), runtime)?;
-        let to_string_tag = runtime.intern_property_name("@@toStringTag");
-        let tag_value = runtime.ordinary_get(
+        let to_string_tag =
+            runtime.intern_symbol_property_name(WellKnownSymbol::ToStringTag.stable_id());
+        let symbol_tag = runtime.ordinary_get(
             object,
             to_string_tag,
             RegisterValue::from_object_handle(object.0),
         )?;
-        match tag_value.as_object_handle().map(ObjectHandle) {
-            Some(handle) => match runtime.objects().string_value(handle).map_err(|error| {
+        if let Some(handle) = symbol_tag.as_object_handle().map(ObjectHandle)
+            && let Some(tag) = runtime.objects().string_value(handle).map_err(|error| {
                 VmNativeCallError::Internal(
                     format!("Object.prototype.toString tag lookup failed: {error:?}").into(),
                 )
-            })? {
-                Some(tag) => tag.to_string(),
+            })?
+        {
+            tag.to_string()
+        } else {
+            let legacy_tag = runtime.intern_property_name("@@toStringTag");
+            let tag_value = runtime.ordinary_get(
+                object,
+                legacy_tag,
+                RegisterValue::from_object_handle(object.0),
+            )?;
+            match tag_value.as_object_handle().map(ObjectHandle) {
+                Some(handle) => match runtime.objects().string_value(handle).map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("Object.prototype.toString tag lookup failed: {error:?}").into(),
+                    )
+                })? {
+                    Some(tag) => tag.to_string(),
+                    None => builtin_tag.to_string(),
+                },
                 None => builtin_tag.to_string(),
-            },
-            None => builtin_tag.to_string(),
+            }
         }
     };
     let string = runtime.alloc_string(format!("[object {tag}]"));
@@ -409,6 +433,15 @@ fn to_object_for_introspection(
         ));
     }
 
+    if value.is_symbol() {
+        let object = box_symbol_object(value, runtime)?;
+        return Ok(ObjectHandle(
+            object
+                .as_object_handle()
+                .expect("boxed symbol should return an object"),
+        ));
+    }
+
     value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         throw_type_error(
             runtime,
@@ -477,6 +510,15 @@ fn to_object_for_prototype_method(
         ));
     }
 
+    if value.is_symbol() {
+        let object = box_symbol_object(value, runtime)?;
+        return Ok(ObjectHandle(
+            object
+                .as_object_handle()
+                .expect("boxed symbol should return an object"),
+        ));
+    }
+
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
         return Err(throw_type_error(runtime, context)?);
     };
@@ -519,6 +561,10 @@ fn primitive_prototype(
 
     if value.as_number().is_some() {
         return Ok(Some(runtime.intrinsics().number_prototype()));
+    }
+
+    if value.is_symbol() {
+        return Ok(Some(runtime.intrinsics().symbol_prototype()));
     }
 
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
@@ -569,6 +615,9 @@ fn object_to_string_tag(
     if value.as_number().is_some() {
         return Ok("Number");
     }
+    if value.is_symbol() {
+        return Ok("Symbol");
+    }
 
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
         return Ok("Object");
@@ -585,6 +634,9 @@ fn object_to_string_tag(
     }
     if has_own_data_slot(handle, BOOLEAN_DATA_SLOT, runtime)? {
         return Ok("Boolean");
+    }
+    if has_own_data_slot(handle, SYMBOL_DATA_SLOT, runtime)? {
+        return Ok("Symbol");
     }
 
     match runtime.objects().kind(handle).map_err(|error| {
@@ -1214,6 +1266,7 @@ fn object_get_own_property_names(
     // All own string-keyed properties (no enumerable filter).
     let key_names: Vec<String> = keys
         .iter()
+        .filter(|key| !runtime.property_names().is_symbol(**key))
         .map(|k| runtime.property_names().get(*k).unwrap_or("").to_string())
         .collect();
 

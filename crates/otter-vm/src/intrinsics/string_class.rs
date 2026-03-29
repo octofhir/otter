@@ -9,6 +9,7 @@ use crate::value::RegisterValue;
 use super::{
     IntrinsicsError, VmIntrinsics,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+    symbol_descriptive_string,
 };
 
 pub(super) static STRING_INTRINSIC: StringIntrinsic = StringIntrinsic;
@@ -133,6 +134,9 @@ fn coerce_to_string(
     if let Some(number) = value.as_number() {
         return Ok(number_to_string(number).into_boxed_str());
     }
+    if value.is_symbol() {
+        return Ok(symbol_descriptive_string(value, runtime).into_boxed_str());
+    }
     if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
         if let Some(string) = runtime
             .objects()
@@ -148,6 +152,12 @@ fn coerce_to_string(
                 .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?
         {
             return Ok(string.to_string().into_boxed_str());
+        }
+        if let Some(primitive) = runtime.boxed_primitive_value(handle).map_err(|error| {
+            VmNativeCallError::Internal(format!("boxed primitive lookup failed: {error}").into())
+        })? && primitive.is_symbol()
+        {
+            return Ok(symbol_descriptive_string(primitive, runtime).into_boxed_str());
         }
         return Ok("[object Object]".into());
     }

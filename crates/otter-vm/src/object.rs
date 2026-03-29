@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
 
 use crate::host::HostFunctionId;
+use crate::module::Module;
 use crate::module::FunctionIndex;
 use crate::payload::NativePayloadId;
 use crate::property::{PropertyNameId, PropertyNameRegistry};
@@ -577,6 +578,7 @@ enum HeapValue {
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
+        module: Module,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
     },
@@ -855,6 +857,7 @@ impl ObjectHeap {
     /// Allocates a closure object with captured upvalue cells and function kind flags.
     pub fn alloc_closure(
         &mut self,
+        module: Module,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
         flags: ClosureFlags,
@@ -867,6 +870,7 @@ impl ObjectHeap {
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
+            module,
             callee,
             upvalues,
         });
@@ -1449,6 +1453,7 @@ impl ObjectHeap {
         // Pre-allocate string handles for all collected keys.
         let key_handles: Vec<ObjectHandle> = name_ids
             .iter()
+            .filter(|id| !property_names.is_symbol(**id))
             .filter_map(|id| property_names.get(*id).map(|name| self.alloc_string(name)))
             .collect();
 
@@ -1491,6 +1496,14 @@ impl ObjectHeap {
     pub fn closure_callee(&self, handle: ObjectHandle) -> Result<FunctionIndex, ObjectError> {
         match self.object(handle)? {
             HeapValue::Closure { callee, .. } => Ok(*callee),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the owning module stored in a closure object.
+    pub fn closure_module(&self, handle: ObjectHandle) -> Result<Module, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure { module, .. } => Ok(module.clone()),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -1795,8 +1808,19 @@ impl ObjectHeap {
         if keys.get(slot_index) == Some(&property)
             && let Some(slot) = values.get_mut(slot_index)
         {
-            *slot = PropertyValue::data(value);
-            return Ok(true);
+            match slot {
+                PropertyValue::Data {
+                    value: slot_value,
+                    attributes,
+                } => {
+                    if !attributes.writable() {
+                        return Ok(false);
+                    }
+                    *slot_value = value;
+                    return Ok(true);
+                }
+                PropertyValue::Accessor { .. } => return Ok(false),
+            }
         }
 
         Ok(false)
@@ -3506,8 +3530,8 @@ mod tests {
     use crate::payload::NativePayloadId;
 
     use super::{
-        HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyDescriptor,
-        PropertyInlineCache, PropertyValue,
+        HeapValueKind, IteratorStep, ObjectError, ObjectHeap, PropertyAttributes,
+        PropertyDescriptor, PropertyInlineCache, PropertyLookup, PropertyValue,
     };
 
     #[test]
@@ -3547,6 +3571,66 @@ mod tests {
                     cache.slot_index()
                 ))
             ))
+        );
+    }
+
+    #[test]
+    fn cached_property_store_preserves_non_writable_attributes() {
+        let mut heap = ObjectHeap::new();
+        let handle = heap.alloc_object();
+        let property = PropertyNameId(0);
+
+        assert!(
+            heap.define_own_property(
+                handle,
+                property,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_i32(7),
+                    PropertyAttributes::constant(),
+                ),
+            )
+            .expect("define should succeed")
+        );
+
+        let PropertyLookup { cache, value, .. } = heap
+            .get_property(handle, property)
+            .expect("lookup should succeed")
+            .expect("property should exist");
+        let PropertyValue::Data { attributes, .. } = value else {
+            panic!("expected data property");
+        };
+        assert!(!attributes.writable(), "fixture should be non-writable");
+
+        let cache = cache.expect("own property should expose inline cache");
+        assert!(
+            !heap
+                .set_cached(handle, property, RegisterValue::from_i32(9), cache)
+                .expect("cache store should succeed"),
+            "cached store should report failure for non-writable property"
+        );
+
+        let PropertyLookup { value, .. } = heap
+            .get_property(handle, property)
+            .expect("lookup should succeed")
+            .expect("property should still exist");
+        let PropertyValue::Data {
+            value, attributes, ..
+        } = value
+        else {
+            panic!("expected data property");
+        };
+        assert_eq!(value, RegisterValue::from_i32(7));
+        assert!(
+            !attributes.writable(),
+            "non-writable flag should be preserved"
+        );
+        assert!(
+            !attributes.enumerable(),
+            "enumerable flag should be preserved"
+        );
+        assert!(
+            !attributes.configurable(),
+            "configurable flag should be preserved"
         );
     }
 
@@ -3692,7 +3776,18 @@ mod tests {
     fn object_heap_supports_closure_and_upvalue_cells() {
         let mut heap = ObjectHeap::new();
         let upvalue = heap.alloc_upvalue(RegisterValue::from_i32(1));
-        let closure = heap.alloc_closure(FunctionIndex(7), vec![upvalue], ClosureFlags::normal());
+        let module = crate::module::Module::new(
+            Some("closure-module"),
+            vec![crate::module::Function::with_bytecode(
+                Some("entry"),
+                crate::frame::FrameLayout::default(),
+                crate::bytecode::Bytecode::default(),
+            )],
+            FunctionIndex(0),
+        )
+        .expect("test module should construct");
+        let closure =
+            heap.alloc_closure(module, FunctionIndex(7), vec![upvalue], ClosureFlags::normal());
 
         assert_eq!(heap.kind(closure), Ok(HeapValueKind::Closure));
         assert_eq!(heap.kind(upvalue), Ok(HeapValueKind::UpvalueCell));

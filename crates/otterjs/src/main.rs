@@ -417,17 +417,15 @@ impl Drop for ResolveBaseDirGuard {
     }
 }
 
-/// Run a JavaScript file
-async fn run_file(path: &PathBuf, script_args: &[String], cli: &Cli) -> Result<()> {
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", path.display()))?;
-
-    // Use absolute path as source_url so module resolution works correctly
-    // regardless of CWD changes by ResolveBaseDirGuard.
-    let abs_path = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
-    let source_url = abs_path.to_string_lossy();
-    run_code(&source, &source_url, script_args, cli, false).await
+/// Run a JavaScript file using the new VM (otter-runtime).
+async fn run_file(path: &PathBuf, _script_args: &[String], _cli: &Cli) -> Result<()> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", path.display()))?;
+    let mut rt = otter_runtime::OtterRuntime::builder().build();
+    rt.run_file(path_str)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 struct ProcessArgvOverrideGuard;

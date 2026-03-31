@@ -319,7 +319,7 @@ fn string_array_case() -> SmokeCase {
                 BytecodeRegister::new(0),
                 PropertyNameId(0),
             ),
-            Instruction::new_array(BytecodeRegister::new(2)),
+            Instruction::new_array(BytecodeRegister::new(2), 0),
             Instruction::load_i32(BytecodeRegister::new(3), 0),
             Instruction::set_index(
                 BytecodeRegister::new(2),

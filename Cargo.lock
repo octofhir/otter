@@ -2423,11 +2423,15 @@ name = "otter-vm"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "itoa",
  "otter-gc",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",
  "oxc_span",
+ "ryu",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -2539,6 +2543,7 @@ dependencies = [
  "otter-kv",
  "otter-pm",
  "otter-profiler",
+ "otter-runtime",
  "otter-sql",
  "otter-vm-core",
  "otter-vm-gc",

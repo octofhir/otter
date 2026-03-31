@@ -126,6 +126,10 @@ pub enum HeapValueKind {
     Iterator,
     /// ES2024 Promise object.
     Promise,
+    /// ES2024 Map object.
+    Map,
+    /// ES2024 Set object.
+    Set,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -633,6 +637,16 @@ enum HeapValue {
     Promise {
         promise: crate::promise::JsPromise,
     },
+    /// ES2024 §24.1 Map Objects — insertion-ordered key-value pairs with SameValueZero.
+    Map {
+        prototype: Option<ObjectHandle>,
+        entries: Vec<Option<(RegisterValue, RegisterValue)>>,
+    },
+    /// ES2024 §24.2 Set Objects — insertion-ordered unique values with SameValueZero.
+    Set {
+        prototype: Option<ObjectHandle>,
+        entries: Vec<Option<RegisterValue>>,
+    },
 }
 
 /// Visit an ObjectHandle as a GcHandle for tracing.
@@ -757,6 +771,27 @@ impl Traceable for HeapValue {
             HeapValue::Promise { promise } => {
                 promise.trace_handles(visitor);
             }
+            HeapValue::Map {
+                prototype, entries, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for entry in entries.iter().flatten() {
+                    trace_register_value(entry.0, visitor);
+                    trace_register_value(entry.1, visitor);
+                }
+            }
+            HeapValue::Set {
+                prototype, entries, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for entry in entries.iter().flatten() {
+                    trace_register_value(*entry, visitor);
+                }
+            }
         }
     }
 }
@@ -849,6 +884,208 @@ impl ObjectHeap {
             length_writable: true,
         });
         ObjectHandle(h.0)
+    }
+
+    /// Allocates an empty Map object.
+    pub fn alloc_map(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Map {
+            prototype,
+            entries: Vec::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates an empty Set object.
+    pub fn alloc_set(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Set {
+            prototype,
+            entries: Vec::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Map.prototype.get — returns the value for the key, or undefined.
+    pub fn map_get(
+        &self,
+        handle: ObjectHandle,
+        key: RegisterValue,
+    ) -> Result<RegisterValue, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => {
+                for entry in entries.iter().flatten() {
+                    if svz(&self.heap,entry.0, key) {
+                        return Ok(entry.1);
+                    }
+                }
+                Ok(RegisterValue::undefined())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Map.prototype.has — returns true if the key exists.
+    pub fn map_has(&self, handle: ObjectHandle, key: RegisterValue) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => {
+                Ok(entries.iter().flatten().any(|e| svz(&self.heap,e.0, key)))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Map.prototype.set — inserts or updates a key-value pair.
+    pub fn map_set(
+        &mut self,
+        handle: ObjectHandle,
+        key: RegisterValue,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        let normalized_key = normalize_zero(key);
+        if let Some(idx) = self.map_find_index(handle, normalized_key)? {
+            match self.object_mut(handle)? {
+                HeapValue::Map { entries, .. } => {
+                    entries[idx] = Some((normalized_key, value));
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        } else {
+            match self.object_mut(handle)? {
+                HeapValue::Map { entries, .. } => {
+                    entries.push(Some((normalized_key, value)));
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        }
+        Ok(())
+    }
+
+    /// Map.prototype.delete — removes a key and returns whether it existed.
+    pub fn map_delete(
+        &mut self,
+        handle: ObjectHandle,
+        key: RegisterValue,
+    ) -> Result<bool, ObjectError> {
+        if let Some(idx) = self.map_find_index(handle, key)? {
+            match self.object_mut(handle)? {
+                HeapValue::Map { entries, .. } => {
+                    entries[idx] = None;
+                    return Ok(true);
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Map.prototype.size — returns the number of live entries.
+    pub fn map_size(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => Ok(entries.iter().flatten().count()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Map.prototype.clear — removes all entries.
+    pub fn map_clear(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Map { entries, .. } => {
+                entries.clear();
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Collect all live Map entries as (key, value) pairs.
+    pub fn map_entries(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<(RegisterValue, RegisterValue)>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => {
+                Ok(entries.iter().filter_map(|e| *e).collect())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Set.prototype.has — returns true if the value exists.
+    pub fn set_has(&self, handle: ObjectHandle, value: RegisterValue) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => {
+                Ok(entries.iter().flatten().any(|e| svz(&self.heap,*e, value)))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Set.prototype.add — inserts a value if not present.
+    pub fn set_add(
+        &mut self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        let normalized = normalize_zero(value);
+        if self.set_find_index(handle, normalized)?.is_some() {
+            return Ok(());
+        }
+        match self.object_mut(handle)? {
+            HeapValue::Set { entries, .. } => {
+                entries.push(Some(normalized));
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Set.prototype.delete — removes a value and returns whether it existed.
+    pub fn set_delete(
+        &mut self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<bool, ObjectError> {
+        if let Some(idx) = self.set_find_index(handle, value)? {
+            match self.object_mut(handle)? {
+                HeapValue::Set { entries, .. } => {
+                    entries[idx] = None;
+                    return Ok(true);
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Set.prototype.size — returns the number of live entries.
+    pub fn set_size(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => Ok(entries.iter().flatten().count()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Set.prototype.clear — removes all entries.
+    pub fn set_clear(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Set { entries, .. } => {
+                entries.clear();
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Collect all live Set values.
+    pub fn set_values(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<RegisterValue>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => {
+                Ok(entries.iter().filter_map(|e| *e).collect())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
     }
 
     /// Allocates a string value.
@@ -945,6 +1182,8 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. } => Ok(HeapValueKind::Iterator),
             HeapValue::Promise { .. } => Ok(HeapValueKind::Promise),
+            HeapValue::Map { .. } => Ok(HeapValueKind::Map),
+            HeapValue::Set { .. } => Ok(HeapValueKind::Set),
         }
     }
 
@@ -957,7 +1196,9 @@ impl ObjectHeap {
             | HeapValue::String { prototype, .. }
             | HeapValue::Closure { prototype, .. }
             | HeapValue::HostFunction { prototype, .. }
-            | HeapValue::BoundFunction { prototype, .. } => Ok(*prototype),
+            | HeapValue::BoundFunction { prototype, .. }
+            | HeapValue::Map { prototype, .. }
+            | HeapValue::Set { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
@@ -1024,6 +1265,12 @@ impl ObjectHeap {
             }
             | HeapValue::BoundFunction {
                 prototype: slot, ..
+            }
+            | HeapValue::Map {
+                prototype: slot, ..
+            }
+            | HeapValue::Set {
+                prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
@@ -1051,7 +1298,9 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -1130,7 +1379,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1190,7 +1441,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1538,7 +1791,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Ok(None),
         }
     }
 
@@ -1556,7 +1811,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Ok(None),
         }
     }
 
@@ -1574,7 +1831,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Ok(None),
         }
     }
 
@@ -1610,7 +1869,9 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
-            | HeapValue::Promise { .. } => Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => Ok(None),
         }
     }
 
@@ -2296,7 +2557,9 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -2991,7 +3254,9 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => {
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -3089,6 +3354,7 @@ impl ObjectHeap {
         keys.push(property);
         values.push(PropertyValue::data(value));
         *object_shape_id = shape_id;
+
         let slot_index = u16::try_from(values.len().saturating_sub(1)).unwrap_or(u16::MAX);
         Ok(PropertyInlineCache::new(*object_shape_id, slot_index))
     }
@@ -3222,7 +3488,9 @@ impl ObjectHeap {
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Promise { .. }
+            | HeapValue::Map { .. }
+            | HeapValue::Set { .. } => return Err(ObjectError::InvalidKind),
             _ => None,
         };
 
@@ -3464,6 +3732,7 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
+            HeapValue::Map { .. } | HeapValue::Set { .. } => return Ok(None),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -3484,7 +3753,9 @@ impl ObjectHeap {
             | HeapValue::String { prototype, .. }
             | HeapValue::Closure { prototype, .. }
             | HeapValue::HostFunction { prototype, .. }
-            | HeapValue::BoundFunction { prototype, .. } => Ok(*prototype),
+            | HeapValue::BoundFunction { prototype, .. }
+            | HeapValue::Map { prototype, .. }
+            | HeapValue::Set { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
@@ -3907,4 +4178,76 @@ mod tests {
             Ok(IteratorStep::done())
         );
     }
+}
+
+/// SameValueZero comparison at the RegisterValue level.
+/// For string comparison, delegates to the heap; other primitives compare by bits.
+fn svz(heap: &TypedHeap, a: RegisterValue, b: RegisterValue) -> bool {
+    if let (Some(na), Some(nb)) = (a.as_number(), b.as_number()) {
+        if na.is_nan() && nb.is_nan() {
+            return true;
+        }
+        return na == nb;
+    }
+    if a == b {
+        return true;
+    }
+    // Different handles might refer to equal strings.
+    if let (Some(ah), Some(bh)) = (a.as_object_handle(), b.as_object_handle()) {
+        if let (Some(hva), Some(hvb)) = (
+            heap.get::<HeapValue>(GcHandle(ah)),
+            heap.get::<HeapValue>(GcHandle(bh)),
+        ) {
+            if let (HeapValue::String { value: sa, .. }, HeapValue::String { value: sb, .. }) = (hva, hvb) {
+                return sa == sb;
+            }
+        }
+    }
+    false
+}
+
+impl ObjectHeap {
+    /// Find the index of a matching Map entry by key using SameValueZero.
+    fn map_find_index(&self, handle: ObjectHandle, key: RegisterValue) -> Result<Option<usize>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(e) = entry {
+                        if svz(&self.heap, e.0, key) {
+                            return Ok(Some(i));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Find the index of a matching Set entry by value using SameValueZero.
+    fn set_find_index(&self, handle: ObjectHandle, value: RegisterValue) -> Result<Option<usize>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(e) = entry {
+                        if svz(&self.heap, *e, value) {
+                            return Ok(Some(i));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+}
+
+/// Normalize -0.0 to +0.0 per ES2024 §24.1.3.9 step 6.
+fn normalize_zero(v: RegisterValue) -> RegisterValue {
+    if let Some(n) = v.as_number() {
+        if n == 0.0 && n.is_sign_negative() {
+            return RegisterValue::from_number(0.0);
+        }
+    }
+    v
 }

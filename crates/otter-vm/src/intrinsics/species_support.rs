@@ -33,8 +33,6 @@ impl IntrinsicInstaller for SpeciesSupportIntrinsic {
         )?;
 
         install_stub_constructor(cx, intrinsics, "RegExp", 2)?;
-        install_stub_constructor(cx, intrinsics, "Map", 0)?;
-        install_stub_constructor(cx, intrinsics, "Set", 0)?;
         Ok(())
     }
 }

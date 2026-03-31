@@ -501,6 +501,18 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(result)
             }
             UnaryOperator::Typeof => {
+                // ES2024 §13.5.1: typeof on an unresolvable global reference
+                // must return "undefined", not throw ReferenceError.
+                if let oxc_ast::ast::Expression::Identifier(ident) = &unary.argument {
+                    if !self.env.bindings.contains_key(ident.name.as_str()) {
+                        // Global variable — use TypeOfGlobal which doesn't throw.
+                        let result = ValueLocation::temp(self.alloc_temp());
+                        let prop = self.intern_property_name(ident.name.as_str())?;
+                        self.instructions
+                            .push(Instruction::type_of_global(result.register, prop));
+                        return Ok(result);
+                    }
+                }
                 let value = self.compile_expression(&unary.argument, module)?;
                 let result = if value.is_temp {
                     value
@@ -1145,7 +1157,18 @@ impl<'a> FunctionCompiler<'a> {
         object: &oxc_ast::ast::ObjectExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let destination = self.alloc_temp();
+        // Computed property keys may contain call expressions (e.g. IIFEs)
+        // whose `stabilize_binding_value` would clobber a temp destination.
+        // Pre-allocate a local in that case so it sits below the temp region.
+        let has_computed = object.properties.iter().any(|p| {
+            matches!(p, ObjectPropertyKind::ObjectProperty(p) if p.computed)
+                || matches!(p, ObjectPropertyKind::SpreadProperty(_))
+        });
+        let (destination, is_local) = if has_computed {
+            (self.allocate_local()?, true)
+        } else {
+            (self.alloc_temp(), false)
+        };
         self.instructions.push(Instruction::new_object(destination));
 
         for property in &object.properties {
@@ -1261,7 +1284,11 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        Ok(ValueLocation::temp(destination))
+        if is_local {
+            Ok(ValueLocation::local(destination))
+        } else {
+            Ok(ValueLocation::temp(destination))
+        }
     }
 
     fn compile_array_expression(
@@ -1270,19 +1297,21 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let destination = self.alloc_temp();
-        self.instructions.push(Instruction::new_array(destination));
+        let len = u16::try_from(array.elements.len()).map_err(|_| SourceLoweringError::TooManyLocals)?;
+        self.instructions.push(Instruction::new_array(destination, len));
 
         for (index, element) in array.elements.iter().enumerate() {
-            let is_elision = matches!(element, oxc_ast::ast::ArrayExpressionElement::Elision(_));
-            let value = match element {
+            let expr = match element {
                 oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
                     return Err(SourceLoweringError::Unsupported(
                         "array spread elements".to_string(),
                     ));
                 }
-                oxc_ast::ast::ArrayExpressionElement::Elision(_) => self.load_undefined()?,
-                expr => self.compile_expression(expr.to_expression(), module)?,
+                oxc_ast::ast::ArrayExpressionElement::Elision(_) => continue,
+                expr => expr.to_expression(),
             };
+
+            let value = self.compile_expression(expr, module)?;
             let index_value = self
                 .load_i32(i32::try_from(index).map_err(|_| SourceLoweringError::TooManyLocals)?)?;
             self.instructions.push(Instruction::set_index(
@@ -1290,14 +1319,6 @@ impl<'a> FunctionCompiler<'a> {
                 index_value.register,
                 value.register,
             ));
-            if is_elision {
-                let property = self.intern_property_name(&index.to_string())?;
-                self.instructions.push(Instruction::delete_property(
-                    value.register,
-                    destination,
-                    property,
-                ));
-            }
             self.release(index_value);
             self.release(value);
         }

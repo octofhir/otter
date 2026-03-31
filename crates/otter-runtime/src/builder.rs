@@ -15,12 +15,49 @@
 //! //     .build();
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use otter_vm::console::ConsoleBackend;
+use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use otter_vm::interpreter::RuntimeState;
+use otter_vm::value::RegisterValue;
 
 use crate::runtime::OtterRuntime;
+
+/// Epoch for performance.now() — set once at process start.
+static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+fn install_performance_global(state: &mut RuntimeState) {
+    // Force epoch initialization.
+    let _ = *EPOCH;
+
+    let now_desc = NativeFunctionDescriptor::method("now", 0, performance_now);
+    let now_id = state.register_native_function(now_desc);
+    let now_fn = state.alloc_host_function(now_id);
+
+    let perf_obj = state.alloc_object();
+    let now_prop = state.intern_property_name("now");
+    state
+        .objects_mut()
+        .set_property(
+            perf_obj,
+            now_prop,
+            RegisterValue::from_object_handle(now_fn.0),
+        )
+        .ok();
+
+    state.install_global_value("performance", RegisterValue::from_object_handle(perf_obj.0));
+}
+
+fn performance_now(
+    _this: &RegisterValue,
+    _args: &[RegisterValue],
+    _runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let elapsed = EPOCH.elapsed();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    Ok(RegisterValue::from_number(ms))
+}
 
 /// Builder for constructing a configured [`OtterRuntime`].
 pub struct RuntimeBuilder {
@@ -63,6 +100,9 @@ impl RuntimeBuilder {
             state.set_console_backend(console);
         }
         // Default: StdioConsoleBackend (already set in RuntimeState::new())
+
+        // Install performance.now() on the global object.
+        install_performance_global(&mut state);
 
         OtterRuntime::from_state(state, self.timeout)
     }

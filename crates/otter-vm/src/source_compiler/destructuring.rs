@@ -96,7 +96,7 @@ impl<'a> FunctionCompiler<'a> {
 
         let excluded_array = self.allocate_local()?;
         self.instructions
-            .push(Instruction::new_array(excluded_array));
+            .push(Instruction::new_array(excluded_array, 0));
         for (index, excluded) in excluded_keys.iter().enumerate() {
             let index_value = self
                 .load_i32(i32::try_from(index).map_err(|_| SourceLoweringError::TooManyLocals)?)?;
@@ -134,7 +134,7 @@ impl<'a> FunctionCompiler<'a> {
 
         let excluded_array = self.allocate_local()?;
         self.instructions
-            .push(Instruction::new_array(excluded_array));
+            .push(Instruction::new_array(excluded_array, 0));
         for (index, excluded) in excluded_keys.iter().enumerate() {
             let index_value = self
                 .load_i32(i32::try_from(index).map_err(|_| SourceLoweringError::TooManyLocals)?)?;
@@ -248,7 +248,7 @@ impl<'a> FunctionCompiler<'a> {
 
         if let Some(rest) = &pattern.rest {
             let rest_array = self.allocate_local()?;
-            self.instructions.push(Instruction::new_array(rest_array));
+            self.instructions.push(Instruction::new_array(rest_array, 0));
             let rest_index = self.allocate_local()?;
             self.instructions.push(Instruction::load_i32(rest_index, 0));
             let one = self.allocate_local()?;
@@ -430,7 +430,7 @@ impl<'a> FunctionCompiler<'a> {
 
         if let Some(rest) = &pattern.rest {
             let rest_array = self.allocate_local()?;
-            self.instructions.push(Instruction::new_array(rest_array));
+            self.instructions.push(Instruction::new_array(rest_array, 0));
             let rest_index = self.allocate_local()?;
             self.instructions.push(Instruction::load_i32(rest_index, 0));
             let one = self.allocate_local()?;

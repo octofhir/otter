@@ -182,6 +182,10 @@ fn object_class_descriptor() -> JsClassDescriptor {
             NativeFunctionDescriptor::method("assign", 2, object_assign),
         ))
         .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("fromEntries", 1, object_from_entries),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("hasOwnProperty", 1, object_has_own_property),
         ))
@@ -192,6 +196,10 @@ fn object_class_descriptor() -> JsClassDescriptor {
                 1,
                 object_property_is_enumerable,
             ),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toLocaleString", 0, object_to_locale_string),
         ))
 }
 
@@ -651,6 +659,8 @@ fn object_to_string_tag(
         | HeapValueKind::UpvalueCell
         | HeapValueKind::Iterator
         | HeapValueKind::Promise => Ok("Object"),
+        HeapValueKind::Map => Ok("Map"),
+        HeapValueKind::Set => Ok("Set"),
     }
 }
 
@@ -1349,4 +1359,99 @@ fn has_own_data_slot(
     }
 
     Ok(matches!(lookup.value(), PropertyValue::Data { .. }))
+}
+
+/// ES2024 §20.1.2.6 Object.fromEntries(iterable)
+fn object_from_entries(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let iterable = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    let result = runtime.alloc_object();
+
+    let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle) else {
+        return Err(throw_type_error(
+            runtime,
+            "Object.fromEntries requires an iterable argument",
+        )?);
+    };
+
+    if matches!(
+        runtime.objects().kind(arr_handle),
+        Ok(HeapValueKind::Array)
+    ) {
+        let length = runtime
+            .objects()
+            .array_length(arr_handle)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or(0);
+        for index in 0..length {
+            let entry = runtime.get_array_index_value(arr_handle, index)?;
+            let Some(entry) = entry else { continue };
+            let Some(entry_handle) = entry.as_object_handle().map(ObjectHandle) else {
+                continue;
+            };
+            if !matches!(
+                runtime.objects().kind(entry_handle),
+                Ok(HeapValueKind::Array)
+            ) {
+                continue;
+            }
+            let key = runtime
+                .get_array_index_value(entry_handle, 0)?
+                .unwrap_or_else(RegisterValue::undefined);
+            let value = runtime
+                .get_array_index_value(entry_handle, 1)?
+                .unwrap_or_else(RegisterValue::undefined);
+            let property = runtime.property_name_from_value(key)?;
+            runtime
+                .objects_mut()
+                .set_property(result, property, value)
+                .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        }
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// ES2024 §20.1.3.5 Object.prototype.toLocaleString()
+fn object_to_locale_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    // Calls this.toString().
+    let handle = this
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("toLocaleString requires object receiver".into())
+        })?;
+    let to_string_prop = runtime.intern_property_name("toString");
+    let to_string = runtime
+        .ordinary_get(handle, to_string_prop, *this)
+        .map_err(|e| match e {
+            VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+            other => other,
+        })?;
+    if let Some(callable) = to_string.as_object_handle().map(ObjectHandle)
+        && runtime.objects().is_callable(callable)
+    {
+        return runtime.call_callable(callable, *this, &[]);
+    }
+    let text = runtime
+        .js_to_string(*this)
+        .map_err(|e| match e {
+            crate::interpreter::InterpreterError::UncaughtThrow(v) => {
+                VmNativeCallError::Thrown(v)
+            }
+            other => VmNativeCallError::Internal(format!("{other}").into()),
+        })?;
+    let handle = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(handle.0))
 }

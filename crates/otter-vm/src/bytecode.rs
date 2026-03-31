@@ -159,6 +159,8 @@ pub enum Opcode {
     JumpIfFalse = 0x32,
     /// Store a value to a global variable by name.
     SetGlobal = 0x33,
+    /// typeof on a global — returns "undefined" for unresolvable references.
+    TypeOfGlobal = 0x36,
     /// Create a property key iterator (for..in).
     GetPropertyIterator = 0x34,
     /// Advance a property key iterator; dst_done = bool, dst_key = string key.
@@ -269,6 +271,7 @@ impl Opcode {
             0x33 => Some(Self::SetGlobal),
             0x34 => Some(Self::GetPropertyIterator),
             0x35 => Some(Self::PropertyIteratorNext),
+            0x36 => Some(Self::TypeOfGlobal),
             0x40 => Some(Self::Return),
             0x41 => Some(Self::CallDirect),
             0x42 => Some(Self::CallClosure),
@@ -389,11 +392,11 @@ impl Instruction {
 
     /// Encodes a dense-array allocation.
     #[must_use]
-    pub const fn new_array(dst: BytecodeRegister) -> Self {
+    pub const fn new_array(dst: BytecodeRegister, len: u16) -> Self {
         Self::encode_abc(
             Opcode::NewArray,
             dst,
-            BytecodeRegister::new(0),
+            BytecodeRegister::new(len as RegisterIndex),
             BytecodeRegister::new(0),
         )
     }
@@ -468,6 +471,17 @@ impl Instruction {
     #[must_use]
     pub const fn type_of(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::TypeOf, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes `typeof` on a global variable (non-throwing for unresolvable references).
+    #[must_use]
+    pub const fn type_of_global(dst: BytecodeRegister, name: PropertyNameId) -> Self {
+        Self::encode_abc(
+            Opcode::TypeOfGlobal,
+            dst,
+            BytecodeRegister::new(name.0 as RegisterIndex),
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Encodes a boolean negation.
@@ -1181,7 +1195,7 @@ mod tests {
         let jump = Instruction::jump(JumpOffset::new(-9));
         let object = Instruction::new_object(BytecodeRegister::new(6));
         let string = Instruction::load_string(BytecodeRegister::new(7), StringId(11));
-        let array = Instruction::new_array(BytecodeRegister::new(8));
+        let array = Instruction::new_array(BytecodeRegister::new(8), 0);
         let closure = Instruction::new_closure(BytecodeRegister::new(9), BytecodeRegister::new(10));
         let call = Instruction::call_direct(BytecodeRegister::new(9), BytecodeRegister::new(10));
         let exception = Instruction::load_exception(BytecodeRegister::new(12));

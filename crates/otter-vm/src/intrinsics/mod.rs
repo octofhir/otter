@@ -11,6 +11,8 @@ mod date_class;
 mod error_class;
 mod function_class;
 mod install;
+mod json;
+mod map_set_class;
 mod math;
 mod number_class;
 mod object_class;
@@ -210,6 +212,7 @@ pub struct VmIntrinsics {
     proxy_constructor: ObjectHandle,
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
+    json_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 15],
     // Error hierarchy
     pub(crate) error_prototype: ObjectHandle,
@@ -222,6 +225,15 @@ pub struct VmIntrinsics {
     pub(crate) range_error_constructor: ObjectHandle,
     pub(crate) syntax_error_prototype: ObjectHandle,
     pub(crate) syntax_error_constructor: ObjectHandle,
+    pub(crate) uri_error_prototype: ObjectHandle,
+    pub(crate) uri_error_constructor: ObjectHandle,
+    pub(crate) eval_error_prototype: ObjectHandle,
+    pub(crate) eval_error_constructor: ObjectHandle,
+    // Map / Set
+    pub(crate) map_constructor: ObjectHandle,
+    pub(crate) map_prototype: ObjectHandle,
+    pub(crate) set_constructor: ObjectHandle,
+    pub(crate) set_prototype: ObjectHandle,
     // Promise
     pub(crate) promise_constructor: ObjectHandle,
     pub(crate) promise_prototype: ObjectHandle,
@@ -258,6 +270,14 @@ impl VmIntrinsics {
         let range_error_constructor = heap.alloc_object();
         let syntax_error_prototype = heap.alloc_object();
         let syntax_error_constructor = heap.alloc_object();
+        let uri_error_prototype = heap.alloc_object();
+        let uri_error_constructor = heap.alloc_object();
+        let eval_error_prototype = heap.alloc_object();
+        let eval_error_constructor = heap.alloc_object();
+        let map_constructor = heap.alloc_object();
+        let map_prototype = heap.alloc_object();
+        let set_constructor = heap.alloc_object();
+        let set_prototype = heap.alloc_object();
         let promise_constructor = heap.alloc_object();
         let promise_prototype = heap.alloc_object();
 
@@ -284,6 +304,7 @@ impl VmIntrinsics {
             proxy_constructor,
             namespace_roots: Vec::new(),
             reflect_namespace: None,
+            json_namespace: None,
             well_known_symbols: [
                 WellKnownSymbol::Iterator,
                 WellKnownSymbol::AsyncIterator,
@@ -311,6 +332,14 @@ impl VmIntrinsics {
             range_error_constructor,
             syntax_error_prototype,
             syntax_error_constructor,
+            uri_error_prototype,
+            uri_error_constructor,
+            eval_error_prototype,
+            eval_error_constructor,
+            map_constructor,
+            map_prototype,
+            set_constructor,
+            set_prototype,
             promise_constructor,
             promise_prototype,
         }
@@ -354,6 +383,10 @@ impl VmIntrinsics {
         heap.set_prototype(self.range_error_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.syntax_error_prototype, Some(self.error_prototype))?;
         heap.set_prototype(self.syntax_error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.uri_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.uri_error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.eval_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.eval_error_constructor, Some(self.function_prototype))?;
         // Promise: constructor → Function.prototype, prototype → Object.prototype
         heap.set_prototype(self.promise_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.promise_prototype, Some(self.object_prototype))?;
@@ -621,6 +654,22 @@ impl VmIntrinsics {
         self.reflect_namespace
     }
 
+    /// Store/retrieve a named namespace (generic for JSON and future namespaces).
+    pub(super) fn set_namespace(&mut self, name: &str, handle: ObjectHandle) {
+        match name {
+            "JSON" => self.json_namespace = Some(handle),
+            _ => {}
+        }
+        self.register_namespace_root(handle);
+    }
+
+    pub(super) fn namespace(&self, name: &str) -> Option<ObjectHandle> {
+        match name {
+            "JSON" => self.json_namespace,
+            _ => None,
+        }
+    }
+
     /// Returns the additional namespace roots.
     #[must_use]
     pub fn namespace_roots(&self) -> &[ObjectHandle] {
@@ -719,13 +768,15 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 14] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 16] {
     [
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
         &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
         &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
+        &json::JSON_INTRINSIC as &dyn IntrinsicInstaller,
+        &map_set_class::MAP_SET_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
         &number_class::NUMBER_INTRINSIC as &dyn IntrinsicInstaller,
         &object_class::OBJECT_INTRINSIC as &dyn IntrinsicInstaller,
@@ -817,8 +868,8 @@ mod tests {
             Ok(HeapValueKind::HostFunction)
         );
 
-        assert_eq!(intrinsics.namespace_roots().len(), 2);
-        assert_eq!(native_functions.len(), 139);
+        assert_eq!(intrinsics.namespace_roots().len(), 3);
+        assert_eq!(native_functions.len(), 230);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

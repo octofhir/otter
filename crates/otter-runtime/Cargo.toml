@@ -14,3 +14,7 @@ all = "deny"
 
 [dependencies]
 otter-vm = { path = "../otter-vm" }
+
+[[bin]]
+name = "otter-newvm"
+path = "src/bin/otter_newvm.rs"

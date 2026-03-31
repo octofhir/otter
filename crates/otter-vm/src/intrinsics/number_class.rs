@@ -86,6 +86,123 @@ fn number_class_descriptor() -> JsClassDescriptor {
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("valueOf", 0, number_value_of),
         ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toString", 1, number_to_string),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toLocaleString", 0, number_to_string),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toFixed", 1, number_to_fixed),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toPrecision", 1, number_to_precision),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toExponential", 1, number_to_exponential),
+        ))
+}
+
+/// ES2024 §21.1.3.3 Number.prototype.toFixed(fractionDigits)
+fn number_to_fixed(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let number = this_number_value(*this, runtime)?;
+    let digits = args
+        .first()
+        .copied()
+        .and_then(|v| v.as_i32().or_else(|| v.as_number().map(|n| n as i32)))
+        .unwrap_or(0);
+    if !(0..=100).contains(&digits) {
+        return Err(type_error(runtime, "toFixed() digits argument must be between 0 and 100")?);
+    }
+    if number.is_nan() {
+        let handle = runtime.alloc_string("NaN");
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    if number.is_infinite() {
+        let s = if number > 0.0 { "Infinity" } else { "-Infinity" };
+        let handle = runtime.alloc_string(s);
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    let text = format!("{number:.prec$}", prec = digits as usize);
+    let handle = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// ES2024 §21.1.3.5 Number.prototype.toPrecision(precision)
+fn number_to_precision(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let number = this_number_value(*this, runtime)?;
+    let precision = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    if precision == RegisterValue::undefined() {
+        let text = number_to_decimal_string(number);
+        let handle = runtime.alloc_string(text);
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    let p = precision
+        .as_i32()
+        .or_else(|| precision.as_number().map(|n| n as i32))
+        .unwrap_or(0);
+    if !(1..=100).contains(&p) {
+        return Err(type_error(runtime, "toPrecision() argument must be between 1 and 100")?);
+    }
+    if number.is_nan() || number.is_infinite() {
+        let text = number_to_decimal_string(number);
+        let handle = runtime.alloc_string(text);
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    let text = format!("{number:.prec$e}", prec = (p as usize).saturating_sub(1));
+    // Rust's exponential formatting differs from JS — convert to JS-style.
+    // For simplicity, use the precision-based formatting for reasonable ranges.
+    let text = if number.abs() < 1e-6 || number.abs() >= 1e21 {
+        text
+    } else {
+        format!("{number:.prec$}", prec = (p as usize).saturating_sub(1 + (number.abs().log10().floor().max(0.0) as usize)))
+    };
+    let handle = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// ES2024 §21.1.3.2 Number.prototype.toExponential(fractionDigits)
+fn number_to_exponential(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let number = this_number_value(*this, runtime)?;
+    if number.is_nan() || number.is_infinite() {
+        let text = number_to_decimal_string(number);
+        let handle = runtime.alloc_string(text);
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    let frac = args
+        .first()
+        .copied()
+        .and_then(|v| {
+            if v == RegisterValue::undefined() { None } else { v.as_i32() }
+        });
+    let text = match frac {
+        Some(f) => {
+            if !(0..=100).contains(&f) {
+                return Err(type_error(runtime, "toExponential() argument must be between 0 and 100")?);
+            }
+            format!("{number:.prec$e}", prec = f as usize)
+        }
+        None => format!("{number:e}"),
+    };
+    let handle = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn number_constructor(
@@ -126,6 +243,125 @@ fn number_value_of(
     }
 
     Err(VmNativeCallError::Internal(NUMBER_VALUE_OF_ERROR.into()))
+}
+
+/// ES2024 §21.1.3.6 Number.prototype.toString([radix])
+fn number_to_string(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    // 1. Let x be ? ThisNumberValue(this value).
+    let number = this_number_value(*this, runtime)?;
+
+    // 2. If radix is undefined, let radixMV be 10.
+    let radix = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let radix_mv = if radix == RegisterValue::undefined() {
+        10
+    } else {
+        // 3. Else, let radixMV be ? ToInteger(radix).
+        let r = radix
+            .as_i32()
+            .or_else(|| radix.as_number().map(|n| n as i32))
+            .unwrap_or(10);
+        // 4. If radixMV < 2 or radixMV > 36, throw a RangeError.
+        if !(2..=36).contains(&r) {
+            return Err(type_error(runtime, "toString() radix must be between 2 and 36")?);
+        }
+        r as u32
+    };
+
+    // 5. If radixMV = 10, return Number::toString(x, 10).
+    let text = if radix_mv == 10 {
+        number_to_decimal_string(number)
+    } else {
+        number_to_radix_string(number, radix_mv)
+    };
+
+    let handle = runtime.alloc_string(text);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// ES2024 §21.1.3.6 step 1 — thisNumberValue(value).
+fn this_number_value(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<f64, VmNativeCallError> {
+    if let Some(n) = value.as_number() {
+        return Ok(n);
+    }
+    if let Some(n) = value.as_i32() {
+        return Ok(n as f64);
+    }
+    if let Some(handle) = value.as_object_handle().map(ObjectHandle)
+        && let Some(prim) = number_data(handle, runtime)?
+    {
+        if let Some(n) = prim.as_number() {
+            return Ok(n);
+        }
+        if let Some(n) = prim.as_i32() {
+            return Ok(n as f64);
+        }
+    }
+    Err(VmNativeCallError::Internal(NUMBER_VALUE_OF_ERROR.into()))
+}
+
+/// Formats a number as a decimal string per ES2024 §6.1.6.1.20 Number::toString.
+fn number_to_decimal_string(number: f64) -> String {
+    if number.is_nan() {
+        "NaN".to_string()
+    } else if number == 0.0 {
+        "0".to_string()
+    } else if number.is_infinite() {
+        if number.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else if number.fract() == 0.0 && number.abs() < 1e20 {
+        format!("{number:.0}")
+    } else {
+        number.to_string()
+    }
+}
+
+/// Formats a number as a string in the given radix (2..=36).
+fn number_to_radix_string(number: f64, radix: u32) -> String {
+    if number.is_nan() {
+        return "NaN".to_string();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    if number == 0.0 {
+        return "0".to_string();
+    }
+
+    let negative = number < 0.0;
+    let mut n = number.abs() as u64;
+    if n == 0 {
+        // Sub-integer magnitude — fall back to decimal.
+        return number.to_string();
+    }
+
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[(n % radix as u64) as usize]);
+        n /= radix as u64;
+    }
+    if negative {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_else(|_| number.to_string())
 }
 
 fn coerce_to_number(

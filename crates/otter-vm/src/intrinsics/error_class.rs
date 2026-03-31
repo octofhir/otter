@@ -61,6 +61,24 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             intrinsics.function_prototype,
             cx,
         )?;
+        install_error_class(
+            "URIError",
+            intrinsics.uri_error_prototype,
+            &mut intrinsics.uri_error_constructor,
+            intrinsics.function_prototype,
+            cx,
+        )?;
+        install_error_class(
+            "EvalError",
+            intrinsics.eval_error_prototype,
+            &mut intrinsics.eval_error_constructor,
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // Install Error.prototype.toString on the base Error prototype.
+        install_error_to_string(intrinsics, cx)?;
+
         Ok(())
     }
 
@@ -75,6 +93,8 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             ("ReferenceError", intrinsics.reference_error_constructor),
             ("RangeError", intrinsics.range_error_constructor),
             ("SyntaxError", intrinsics.syntax_error_constructor),
+            ("URIError", intrinsics.uri_error_constructor),
+            ("EvalError", intrinsics.eval_error_constructor),
         ];
         for &(name, handle) in globals {
             cx.install_global_value(
@@ -135,6 +155,94 @@ fn install_error_class(
     )?;
 
     Ok(())
+}
+
+/// Install `Error.prototype.toString` as a host method.
+fn install_error_to_string(
+    intrinsics: &VmIntrinsics,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let desc = NativeFunctionDescriptor::method("toString", 0, error_to_string);
+    let host_id = cx.native_functions.register(desc);
+    let method = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+    let prop = cx.property_names.intern("toString");
+    cx.heap.set_property(
+        intrinsics.error_prototype,
+        prop,
+        RegisterValue::from_object_handle(method.0),
+    )?;
+    Ok(())
+}
+
+/// ES2024 §20.5.3.4 Error.prototype.toString()
+fn error_to_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = this
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("Error.prototype.toString requires object".into()))?;
+
+    // 1. Let name be ? Get(O, "name").
+    let name_prop = runtime.intern_property_name("name");
+    let name_val = runtime
+        .ordinary_get(handle, name_prop, *this)
+        .map_err(|e| match e {
+            VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+            other => other,
+        })?;
+    // 2. If name is undefined, set name to "Error"; else set name to ? ToString(name).
+    let name = if name_val == RegisterValue::undefined() {
+        "Error".to_string()
+    } else {
+        runtime
+            .js_to_string(name_val)
+            .map_err(|e| match e {
+                crate::interpreter::InterpreterError::UncaughtThrow(v) => {
+                    VmNativeCallError::Thrown(v)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            })?
+            .into_string()
+    };
+
+    // 3. Let msg be ? Get(O, "message").
+    let msg_prop = runtime.intern_property_name("message");
+    let msg_val = runtime
+        .ordinary_get(handle, msg_prop, *this)
+        .map_err(|e| match e {
+            VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+            other => other,
+        })?;
+    // 4. If msg is undefined, set msg to ""; else set msg to ? ToString(msg).
+    let msg = if msg_val == RegisterValue::undefined() {
+        String::new()
+    } else {
+        runtime
+            .js_to_string(msg_val)
+            .map_err(|e| match e {
+                crate::interpreter::InterpreterError::UncaughtThrow(v) => {
+                    VmNativeCallError::Thrown(v)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            })?
+            .into_string()
+    };
+
+    // 5. If name is "", return msg. 6. If msg is "", return name.
+    // 7. Return name + ": " + msg.
+    let result = if name.is_empty() {
+        msg
+    } else if msg.is_empty() {
+        name
+    } else {
+        format!("{name}: {msg}")
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Shared constructor for all Error types.

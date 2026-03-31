@@ -1807,7 +1807,12 @@ impl RuntimeState {
                     })?;
                 let default_receiver = RegisterValue::from_object_handle(
                     Interpreter::allocate_construct_receiver(self, new_target)
-                        .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?
+                        .map_err(|error| match error {
+                            InterpreterError::UncaughtThrow(value) => {
+                                VmNativeCallError::Thrown(value)
+                            }
+                            other => VmNativeCallError::Internal(format!("{other}").into()),
+                        })?
                         .0,
                 );
                 let completion = Interpreter::invoke_registered_host_function(
@@ -1817,7 +1822,10 @@ impl RuntimeState {
                     arguments,
                     true,
                 )
-                .map_err(|error| VmNativeCallError::Internal(format!("{error}").into()))?;
+                .map_err(|error| match error {
+                    InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                    other => VmNativeCallError::Internal(format!("{other}").into()),
+                })?;
                 Interpreter::apply_construct_return_override(completion, default_receiver)
             }
             HeapValueKind::Closure => {
@@ -1841,8 +1849,11 @@ impl RuntimeState {
                 } else {
                     RegisterValue::from_object_handle(
                         Interpreter::allocate_construct_receiver(self, new_target)
-                            .map_err(|error| {
-                                VmNativeCallError::Internal(format!("{error}").into())
+                            .map_err(|error| match error {
+                                InterpreterError::UncaughtThrow(value) => {
+                                    VmNativeCallError::Thrown(value)
+                                }
+                                other => VmNativeCallError::Internal(format!("{other}").into()),
                             })?
                             .0,
                     )
@@ -2432,27 +2443,75 @@ impl RuntimeState {
     }
 
     /// ES spec §7.3.21 OrdinaryHasInstance — `value instanceof constructor`.
+    /// ES2024 §7.3.22 InstanceofOperator(V, target).
     fn js_instance_of(
         &mut self,
         value: RegisterValue,
         constructor: RegisterValue,
     ) -> Result<bool, InterpreterError> {
-        // LHS must be an object.
-        let Some(obj_handle) = value.as_object_handle().map(ObjectHandle) else {
-            return Ok(false);
-        };
-        // RHS must be an object with a "prototype" property.
+        // 1. If target is not an Object, throw a TypeError.
         let Some(ctor_handle) = constructor.as_object_handle().map(ObjectHandle) else {
             return Err(InterpreterError::TypeError(
                 "Right-hand side of instanceof is not an object".into(),
             ));
         };
+
+        // 2. Let instOfHandler be ? GetMethod(target, @@hasInstance).
+        let has_instance_sym =
+            self.intern_symbol_property_name(WellKnownSymbol::HasInstance.stable_id());
+        let handler = self
+            .ordinary_get(ctor_handle, has_instance_sym, constructor)
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            })?;
+
+        // 3. If instOfHandler is not undefined, then
+        if handler != RegisterValue::undefined() && handler != RegisterValue::null() {
+            let Some(handler_handle) = handler.as_object_handle().map(ObjectHandle) else {
+                return Err(InterpreterError::TypeError(
+                    "@@hasInstance is not callable".into(),
+                ));
+            };
+            if !self.objects.is_callable(handler_handle) {
+                return Err(InterpreterError::TypeError(
+                    "@@hasInstance is not callable".into(),
+                ));
+            }
+            // a. Return ! ToBoolean(? Call(instOfHandler, target, « V »)).
+            let result = self
+                .call_callable(handler_handle, constructor, &[value])
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                    VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                })?;
+            return self.js_to_boolean(result);
+        }
+
+        // 4. If IsCallable(target) is false, throw a TypeError.
         if !self.objects.is_callable(ctor_handle) {
             return Err(InterpreterError::TypeError(
                 "Right-hand side of instanceof is not callable".into(),
             ));
         }
-        let mut effective_ctor = ctor_handle;
+
+        // 5. Return ? OrdinaryHasInstance(target, V).
+        self.ordinary_has_instance(value, ctor_handle)
+    }
+
+    /// ES2024 §7.3.21 OrdinaryHasInstance(C, O).
+    fn ordinary_has_instance(
+        &mut self,
+        value: RegisterValue,
+        constructor: ObjectHandle,
+    ) -> Result<bool, InterpreterError> {
+        // 1. If IsCallable(C) is false, return false.
+        if !self.objects.is_callable(constructor) {
+            return Ok(false);
+        }
+
+        // 2. If C has a [[BoundTargetFunction]] internal slot, unwrap.
+        let mut effective_ctor = constructor;
         while matches!(
             self.objects.kind(effective_ctor),
             Ok(HeapValueKind::BoundFunction)
@@ -2460,6 +2519,13 @@ impl RuntimeState {
             let (target, _, _) = self.objects.bound_function_parts(effective_ctor)?;
             effective_ctor = target;
         }
+
+        // 3. If Type(O) is not Object, return false.
+        let Some(obj_handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+
+        // 4. Let P be ? Get(C, "prototype").
         let proto_prop = self.intern_property_name("prototype");
         let proto_value = self
             .ordinary_get(
@@ -2468,15 +2534,18 @@ impl RuntimeState {
                 RegisterValue::from_object_handle(effective_ctor.0),
             )
             .map_err(|error| match error {
-                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
-                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
             })?;
+
+        // 5. If Type(P) is not Object, throw a TypeError.
         let Some(proto_handle) = proto_value.as_object_handle().map(ObjectHandle) else {
             return Err(InterpreterError::TypeError(
                 "Function has non-object prototype in instanceof check".into(),
             ));
         };
-        // Walk the prototype chain of value.
+
+        // 6. Repeat: walk the prototype chain of O.
         let mut current = self.objects.get_prototype(obj_handle)?;
         let mut depth = 0;
         while let Some(p) = current {
@@ -2492,7 +2561,7 @@ impl RuntimeState {
         Ok(false)
     }
 
-    /// `in` operator — check if a string property exists on an object.
+    /// ES2024 §13.10.1 The `in` Operator — `HasProperty(object, ToPropertyKey(key))`.
     fn js_has_property(
         &mut self,
         key: RegisterValue,
@@ -2503,8 +2572,7 @@ impl RuntimeState {
                 "Cannot use 'in' operator to search for property in non-object".into(),
             ));
         };
-        let key_str = self.js_to_string(key)?;
-        let property = self.intern_property_name(&key_str);
+        let property = self.computed_property_name(key)?;
         self.has_property(obj_handle, property)
             .map_err(InterpreterError::from)
     }
@@ -2598,7 +2666,9 @@ impl RuntimeState {
                 | HeapValueKind::Array
                 | HeapValueKind::UpvalueCell
                 | HeapValueKind::Iterator
-                | HeapValueKind::Promise => "object",
+                | HeapValueKind::Promise
+                | HeapValueKind::Map
+                | HeapValueKind::Set => "object",
             }
         } else {
             "undefined"
@@ -2956,6 +3026,7 @@ impl Interpreter {
         let function = module
             .function(activation.function_index())
             .expect("activation function index must be valid");
+
         let mut frame_runtime = FrameRuntimeState::new(function);
 
         loop {
@@ -3110,6 +3181,10 @@ impl Interpreter {
             }
             Opcode::NewArray => {
                 let handle = runtime.alloc_array();
+                let len = instruction.b() as usize;
+                if len > 0 {
+                    runtime.objects_mut().set_array_length(handle, len)?;
+                }
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -3953,14 +4028,55 @@ impl Interpreter {
                 Ok(StepOutcome::Continue)
             }
             Opcode::GetIterator => {
-                let handle = Self::read_object_handle(activation, function, instruction.b())?;
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = base
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::TypeError(
+                        "Value is not iterable".into(),
+                    ))?;
+
+                // Fast path: internal iterators for Array and String.
                 let iterator = match runtime.objects.alloc_iterator(handle) {
                     Ok(iterator) => iterator,
                     Err(ObjectError::InvalidKind) => {
-                        let error = runtime.alloc_type_error("Value is not iterable")?;
-                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
-                            error.0,
-                        )));
+                        // Slow path: look up Symbol.iterator method.
+                        let sym_iterator = runtime.intern_symbol_property_name(
+                            super::WellKnownSymbol::Iterator.stable_id(),
+                        );
+                        let method = runtime
+                            .ordinary_get(handle, sym_iterator, base)
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                VmNativeCallError::Internal(m) => {
+                                    InterpreterError::NativeCall(m)
+                                }
+                            })?;
+                        let callable = method
+                            .as_object_handle()
+                            .map(ObjectHandle)
+                            .filter(|h| runtime.objects.is_callable(*h))
+                            .ok_or_else(|| {
+                                InterpreterError::TypeError("Value is not iterable".into())
+                            })?;
+                        let iter_obj = runtime
+                            .call_callable(callable, base, &[])
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                VmNativeCallError::Internal(m) => {
+                                    InterpreterError::NativeCall(m)
+                                }
+                            })?;
+                        iter_obj
+                            .as_object_handle()
+                            .map(ObjectHandle)
+                            .ok_or(InterpreterError::TypeError(
+                                "Symbol.iterator must return an object".into(),
+                            ))?
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -3974,7 +4090,57 @@ impl Interpreter {
             }
             Opcode::IteratorNext => {
                 let iterator = Self::read_object_handle(activation, function, instruction.c())?;
-                let step = runtime.iterator_next(iterator)?;
+                // Fast path: internal iterators.
+                let step = match runtime.iterator_next(iterator) {
+                    Ok(step) => step,
+                    Err(InterpreterError::InvalidHeapValueKind) => {
+                        // Slow path: protocol-based iterator — call .next().
+                        let next_prop = runtime.intern_property_name("next");
+                        let iter_val = RegisterValue::from_object_handle(iterator.0);
+                        let next_fn = runtime
+                            .ordinary_get(iterator, next_prop, iter_val)
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                            })?;
+                        let callable = next_fn
+                            .as_object_handle()
+                            .map(ObjectHandle)
+                            .filter(|h| runtime.objects.is_callable(*h))
+                            .ok_or_else(|| {
+                                InterpreterError::TypeError(
+                                    "Iterator .next is not a function".into(),
+                                )
+                            })?;
+                        let result_obj = runtime
+                            .call_callable(callable, iter_val, &[])
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                            })?;
+                        let result_handle = result_obj
+                            .as_object_handle()
+                            .map(ObjectHandle)
+                            .ok_or(InterpreterError::TypeError(
+                                "Iterator .next() must return an object".into(),
+                            ))?;
+                        let done_prop = runtime.intern_property_name("done");
+                        let done_val = runtime
+                            .ordinary_get(result_handle, done_prop, result_obj)
+                            .unwrap_or_else(|_| RegisterValue::from_bool(false));
+                        let done = runtime.js_to_boolean(done_val).unwrap_or(false);
+                        if done {
+                            crate::object::IteratorStep::done()
+                        } else {
+                            let value_prop = runtime.intern_property_name("value");
+                            let value = runtime
+                                .ordinary_get(result_handle, value_prop, result_obj)
+                                .unwrap_or_else(|_| RegisterValue::undefined());
+                            crate::object::IteratorStep::yield_value(value)
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -4024,6 +4190,28 @@ impl Interpreter {
                 runtime
                     .objects
                     .set_property(global_handle, property, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // typeof on a global variable — returns "undefined" for unresolvable.
+            // ES2024 §13.5.1: typeof on an unresolvable Reference returns "undefined".
+            Opcode::TypeOfGlobal => {
+                let property = Self::resolve_property_name(function, runtime, instruction.b())?;
+                let global_handle = runtime.intrinsics().global_object();
+                let value = runtime.objects.get_property(global_handle, property)?;
+                let val = match value {
+                    Some(lookup) => match lookup.value() {
+                        PropertyValue::Data { value: v, .. } => v,
+                        PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+                    },
+                    None => RegisterValue::undefined(),
+                };
+                let type_val = runtime.js_typeof(val)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    type_val,
+                )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -4544,7 +4732,9 @@ impl Interpreter {
                     }
                 }
             }
-            None => Ok(RegisterValue::undefined()),
+            None => {
+                Ok(RegisterValue::undefined())
+            }
         }
     }
 
@@ -5528,8 +5718,7 @@ mod tests {
             .expect("module should be valid");
 
         let result = Interpreter::new().execute(&module);
-
-        assert!(matches!(result, Err(InterpreterError::TypeError(_))));
+        assert!(matches!(result, Err(InterpreterError::UncaughtThrow(_))));
     }
 
     #[test]
@@ -5542,7 +5731,7 @@ mod tests {
                 BytecodeRegister::new(0),
                 crate::property::PropertyNameId(0),
             ),
-            Instruction::new_array(BytecodeRegister::new(2)),
+            Instruction::new_array(BytecodeRegister::new(2), 0),
             Instruction::load_i32(BytecodeRegister::new(3), 0),
             Instruction::set_index(
                 BytecodeRegister::new(2),
@@ -5961,7 +6150,7 @@ mod tests {
                         None,
                         None,
                         Some(CallSite::Closure(ClosureCall::new_with_receiver(
-                            0,
+                            1,
                             FrameFlags::new(false, true, false),
                             BytecodeRegister::new(1),
                         ))),

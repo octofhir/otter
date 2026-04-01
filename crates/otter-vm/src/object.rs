@@ -130,6 +130,14 @@ pub enum HeapValueKind {
     Map,
     /// ES2024 Set object.
     Set,
+    /// ES2024 Map iterator.
+    MapIterator,
+    /// ES2024 Set iterator.
+    SetIterator,
+    /// ES2024 §24.3 WeakMap object.
+    WeakMap,
+    /// ES2024 §24.4 WeakSet object.
+    WeakSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,6 +199,37 @@ impl IteratorCursor {
     pub const fn is_array(self) -> bool {
         self.is_array
     }
+}
+
+/// ES2024 §23.1.5.1 — The kind of values an Array iterator yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayIteratorKind {
+    /// `Array.prototype.keys()` — yields indices.
+    Keys,
+    /// `Array.prototype.values()` / `Array.prototype[@@iterator]()` — yields values.
+    Values,
+    /// `Array.prototype.entries()` — yields `[index, value]` pairs.
+    Entries,
+}
+
+/// ES2024 §24.1.5.1 — The kind of values a Map iterator yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MapIteratorKind {
+    /// `Map.prototype.keys()` — yields keys.
+    Keys,
+    /// `Map.prototype.values()` — yields values.
+    Values,
+    /// `Map.prototype.entries()` / `Map.prototype[@@iterator]()` — yields `[key, value]` pairs.
+    Entries,
+}
+
+/// ES2024 §24.2.5.1 — The kind of values a Set iterator yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetIteratorKind {
+    /// `Set.prototype.values()` / `Set.prototype[@@iterator]()` / `Set.prototype.keys()`.
+    Values,
+    /// `Set.prototype.entries()` — yields `[value, value]` pairs.
+    Entries,
 }
 
 /// ES2024 §10.2 — Closure function kind flags.
@@ -620,12 +659,17 @@ enum HeapValue {
     UpvalueCell {
         value: RegisterValue,
     },
+    /// ES2024 §23.1.5.1 — Array Iterator Objects.
     ArrayIterator {
+        prototype: Option<ObjectHandle>,
         iterable: ObjectHandle,
         next_index: usize,
         closed: bool,
+        kind: ArrayIteratorKind,
     },
+    /// ES2024 §22.1.5.1 — String Iterator Objects.
     StringIterator {
+        prototype: Option<ObjectHandle>,
         iterable: ObjectHandle,
         next_index: usize,
         closed: bool,
@@ -646,6 +690,36 @@ enum HeapValue {
     Set {
         prototype: Option<ObjectHandle>,
         entries: Vec<Option<RegisterValue>>,
+    },
+    /// ES2024 §24.1.5.1 — Map Iterator Objects.
+    MapIterator {
+        prototype: Option<ObjectHandle>,
+        iterable: ObjectHandle,
+        next_index: usize,
+        closed: bool,
+        kind: MapIteratorKind,
+    },
+    /// ES2024 §24.2.5.1 — Set Iterator Objects.
+    SetIterator {
+        prototype: Option<ObjectHandle>,
+        iterable: ObjectHandle,
+        next_index: usize,
+        closed: bool,
+        kind: SetIteratorKind,
+    },
+    /// ES2024 §24.3 WeakMap Objects — weak key-value pairs by handle identity.
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap-objects>
+    WeakMap {
+        prototype: Option<ObjectHandle>,
+        /// Maps key ObjectHandle index to value. Keys must be objects.
+        entries: std::collections::HashMap<u32, RegisterValue>,
+    },
+    /// ES2024 §24.4 WeakSet Objects — weak value set by handle identity.
+    /// Spec: <https://tc39.es/ecma262/#sec-weakset-objects>
+    WeakSet {
+        prototype: Option<ObjectHandle>,
+        /// Stores ObjectHandle indices. Keys must be objects.
+        entries: std::collections::HashSet<u32>,
     },
 }
 
@@ -759,8 +833,29 @@ impl Traceable for HeapValue {
             HeapValue::UpvalueCell { value } => {
                 trace_register_value(*value, visitor);
             }
-            HeapValue::ArrayIterator { iterable, .. }
-            | HeapValue::StringIterator { iterable, .. } => {
+            HeapValue::ArrayIterator {
+                prototype,
+                iterable,
+                ..
+            }
+            | HeapValue::StringIterator {
+                prototype,
+                iterable,
+                ..
+            }
+            | HeapValue::MapIterator {
+                prototype,
+                iterable,
+                ..
+            }
+            | HeapValue::SetIterator {
+                prototype,
+                iterable,
+                ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
                 trace_handle(*iterable, visitor);
             }
             HeapValue::PropertyIterator { key_handles, .. } => {
@@ -791,6 +886,13 @@ impl Traceable for HeapValue {
                 for entry in entries.iter().flatten() {
                     trace_register_value(*entry, visitor);
                 }
+            }
+            HeapValue::WeakMap { prototype, .. } | HeapValue::WeakSet { prototype, .. } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                // Entries are intentionally NOT traced — they are weak references.
+                // Ephemeron fixpoint in collect_with_ephemerons handles value liveness.
             }
         }
     }
@@ -1088,6 +1190,134 @@ impl ObjectHeap {
         }
     }
 
+    /// Allocates a WeakMap object.
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap-constructor>
+    pub fn alloc_weakmap(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::WeakMap {
+            prototype,
+            entries: std::collections::HashMap::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a WeakSet object.
+    /// Spec: <https://tc39.es/ecma262/#sec-weakset-constructor>
+    pub fn alloc_weakset(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::WeakSet {
+            prototype,
+            entries: std::collections::HashSet::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// WeakMap.prototype.get(key)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap.prototype.get>
+    pub fn weakmap_get(
+        &self,
+        handle: ObjectHandle,
+        key: u32,
+    ) -> Result<Option<RegisterValue>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::WeakMap { entries, .. } => Ok(entries.get(&key).copied()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakMap.prototype.set(key, value)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap.prototype.set>
+    pub fn weakmap_set(
+        &mut self,
+        handle: ObjectHandle,
+        key: u32,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakMap { entries, .. } => {
+                entries.insert(key, value);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakMap.prototype.has(key)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap.prototype.has>
+    pub fn weakmap_has(&self, handle: ObjectHandle, key: u32) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::WeakMap { entries, .. } => Ok(entries.contains_key(&key)),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakMap.prototype.delete(key)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakmap.prototype.delete>
+    pub fn weakmap_delete(&mut self, handle: ObjectHandle, key: u32) -> Result<bool, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakMap { entries, .. } => Ok(entries.remove(&key).is_some()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakSet.prototype.add(value)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakset.prototype.add>
+    pub fn weakset_add(&mut self, handle: ObjectHandle, key: u32) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakSet { entries, .. } => {
+                entries.insert(key);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakSet.prototype.has(value)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakset.prototype.has>
+    pub fn weakset_has(&self, handle: ObjectHandle, key: u32) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::WeakSet { entries, .. } => Ok(entries.contains(&key)),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// WeakSet.prototype.delete(value)
+    /// Spec: <https://tc39.es/ecma262/#sec-weakset.prototype.delete>
+    pub fn weakset_delete(&mut self, handle: ObjectHandle, key: u32) -> Result<bool, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakSet { entries, .. } => Ok(entries.remove(&key)),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Removes dead entries from a WeakMap. Returns values of surviving entries for ephemeron tracing.
+    pub fn weakmap_clear_dead_and_get_live_values(
+        &mut self,
+        handle: ObjectHandle,
+        is_live: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<RegisterValue>, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakMap { entries, .. } => {
+                entries.retain(|key, _| is_live(*key));
+                Ok(entries.values().copied().collect())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Removes dead entries from a WeakSet.
+    pub fn weakset_clear_dead(
+        &mut self,
+        handle: ObjectHandle,
+        is_live: &dyn Fn(u32) -> bool,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakSet { entries, .. } => {
+                entries.retain(|key| is_live(*key));
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Allocates a string value.
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::String {
@@ -1184,6 +1414,10 @@ impl ObjectHeap {
             HeapValue::Promise { .. } => Ok(HeapValueKind::Promise),
             HeapValue::Map { .. } => Ok(HeapValueKind::Map),
             HeapValue::Set { .. } => Ok(HeapValueKind::Set),
+            HeapValue::MapIterator { .. } => Ok(HeapValueKind::MapIterator),
+            HeapValue::SetIterator { .. } => Ok(HeapValueKind::SetIterator),
+            HeapValue::WeakMap { .. } => Ok(HeapValueKind::WeakMap),
+            HeapValue::WeakSet { .. } => Ok(HeapValueKind::WeakSet),
         }
     }
 
@@ -1198,10 +1432,14 @@ impl ObjectHeap {
             | HeapValue::HostFunction { prototype, .. }
             | HeapValue::BoundFunction { prototype, .. }
             | HeapValue::Map { prototype, .. }
-            | HeapValue::Set { prototype, .. } => Ok(*prototype),
+            | HeapValue::Set { prototype, .. }
+            | HeapValue::ArrayIterator { prototype, .. }
+            | HeapValue::StringIterator { prototype, .. }
+            | HeapValue::MapIterator { prototype, .. }
+            | HeapValue::SetIterator { prototype, .. }
+            | HeapValue::WeakMap { prototype, .. }
+            | HeapValue::WeakSet { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
@@ -1271,13 +1509,29 @@ impl ObjectHeap {
             }
             | HeapValue::Set {
                 prototype: slot, ..
+            }
+            | HeapValue::ArrayIterator {
+                prototype: slot, ..
+            }
+            | HeapValue::StringIterator {
+                prototype: slot, ..
+            }
+            | HeapValue::MapIterator {
+                prototype: slot, ..
+            }
+            | HeapValue::SetIterator {
+                prototype: slot, ..
+            }
+            | HeapValue::WeakMap {
+                prototype: slot, ..
+            }
+            | HeapValue::WeakSet {
+                prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
             }
             HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }
@@ -1300,7 +1554,11 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Ok(None),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -1381,7 +1639,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1443,7 +1705,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1533,11 +1799,14 @@ impl ObjectHeap {
     pub fn alloc_iterator(&mut self, iterable: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
         let iterator = match self.object(iterable)? {
             HeapValue::Array { .. } => HeapValue::ArrayIterator {
+                prototype: None,
                 iterable,
                 next_index: 0,
                 closed: false,
+                kind: ArrayIteratorKind::Values,
             },
             HeapValue::String { .. } => HeapValue::StringIterator {
+                prototype: None,
                 iterable,
                 next_index: 0,
                 closed: false,
@@ -1549,6 +1818,67 @@ impl ObjectHeap {
         Ok(ObjectHandle(h.0))
     }
 
+    /// Allocates an Array iterator with explicit kind.
+    /// Spec: <https://tc39.es/ecma262/#sec-createarrayiterator>
+    pub fn alloc_array_iterator(
+        &mut self,
+        iterable: ObjectHandle,
+        kind: ArrayIteratorKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::ArrayIterator {
+            prototype: None,
+            iterable,
+            next_index: 0,
+            closed: false,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a String iterator.
+    /// Spec: <https://tc39.es/ecma262/#sec-createstringiterator>
+    pub fn alloc_string_iterator(&mut self, iterable: ObjectHandle) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::StringIterator {
+            prototype: None,
+            iterable,
+            next_index: 0,
+            closed: false,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates an internal Map iterator.
+    pub fn alloc_map_iterator(
+        &mut self,
+        iterable: ObjectHandle,
+        kind: MapIteratorKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::MapIterator {
+            prototype: None,
+            iterable,
+            next_index: 0,
+            closed: false,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates an internal Set iterator.
+    pub fn alloc_set_iterator(
+        &mut self,
+        iterable: ObjectHandle,
+        kind: SetIteratorKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::SetIterator {
+            prototype: None,
+            iterable,
+            next_index: 0,
+            closed: false,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
     /// Advances an internal iterator by one step.
     pub fn iterator_next(&mut self, handle: ObjectHandle) -> Result<IteratorStep, ObjectError> {
         enum IteratorKind {
@@ -1557,16 +1887,26 @@ impl ObjectHeap {
         }
 
         let (iterable, next_index, closed, kind) = match self.object(handle)? {
+            // Fast path only for values-kind array iterators.
             HeapValue::ArrayIterator {
                 iterable,
                 next_index,
                 closed,
+                kind: ArrayIteratorKind::Values,
+                ..
             } => (*iterable, *next_index, *closed, IteratorKind::Array),
             HeapValue::StringIterator {
                 iterable,
                 next_index,
                 closed,
+                ..
             } => (*iterable, *next_index, *closed, IteratorKind::String),
+            // Keys/entries array iterators and Map/Set iterators use protocol .next().
+            HeapValue::ArrayIterator { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. } => {
+                return Err(ObjectError::InvalidKind);
+            }
             _ => return Err(ObjectError::InvalidKind),
         };
 
@@ -1600,7 +1940,7 @@ impl ObjectHeap {
                 if step.is_done() {
                     *closed = true;
                 } else {
-                    *next_index = next_index.saturating_add(1);
+                    *next_index = next_index.wrapping_add(1);
                 }
             }
             _ => return Err(ObjectError::InvalidKind),
@@ -1615,6 +1955,7 @@ impl ObjectHeap {
                 iterable,
                 next_index,
                 closed,
+                ..
             } => Ok(IteratorCursor {
                 iterable: *iterable,
                 next_index: *next_index,
@@ -1625,6 +1966,7 @@ impl ObjectHeap {
                 iterable,
                 next_index,
                 closed,
+                ..
             } => Ok(IteratorCursor {
                 iterable: *iterable,
                 next_index: *next_index,
@@ -1661,10 +2003,115 @@ impl ObjectHeap {
     /// Closes an internal iterator.
     pub fn iterator_close(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
-            HeapValue::ArrayIterator { closed, .. } | HeapValue::StringIterator { closed, .. } => {
+            HeapValue::ArrayIterator { closed, .. }
+            | HeapValue::StringIterator { closed, .. }
+            | HeapValue::MapIterator { closed, .. }
+            | HeapValue::SetIterator { closed, .. } => {
                 *closed = true;
                 Ok(())
             }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the `ArrayIteratorKind` for an Array iterator.
+    /// Spec: <https://tc39.es/ecma262/#sec-%arrayiteratorprototype%.next>
+    pub fn array_iterator_kind(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ArrayIteratorKind, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayIterator { kind, .. } => Ok(*kind),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns `(iterable, next_index, closed, kind)` for a Map iterator.
+    /// Spec: <https://tc39.es/ecma262/#sec-%mapiteratorprototype%.next>
+    pub fn map_iterator_state(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(ObjectHandle, usize, bool, MapIteratorKind), ObjectError> {
+        match self.object(handle)? {
+            HeapValue::MapIterator {
+                iterable,
+                next_index,
+                closed,
+                kind,
+                ..
+            } => Ok((*iterable, *next_index, *closed, *kind)),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Advances a Map iterator's cursor to `index`.
+    pub fn set_map_iterator_index(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::MapIterator { next_index, .. } => {
+                *next_index = index;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns `(iterable, next_index, closed, kind)` for a Set iterator.
+    /// Spec: <https://tc39.es/ecma262/#sec-%setiteratorprototype%.next>
+    pub fn set_iterator_state(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(ObjectHandle, usize, bool, SetIteratorKind), ObjectError> {
+        match self.object(handle)? {
+            HeapValue::SetIterator {
+                iterable,
+                next_index,
+                closed,
+                kind,
+                ..
+            } => Ok((*iterable, *next_index, *closed, *kind)),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Advances a Set iterator's cursor to `index`.
+    pub fn set_set_iterator_index(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::SetIterator { next_index, .. } => {
+                *next_index = index;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns raw Set entries (including deleted `None` slots) for lazy iteration.
+    /// Spec: <https://tc39.es/ecma262/#sec-set-objects>
+    pub fn set_entries(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<Option<RegisterValue>>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => Ok(entries.clone()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns raw Map entries (including deleted `None` slots) for lazy iteration.
+    /// Spec: <https://tc39.es/ecma262/#sec-map-objects>
+    pub fn map_entries_raw(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<Option<(RegisterValue, RegisterValue)>>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => Ok(entries.clone()),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -1793,7 +2240,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Ok(None),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(None),
         }
     }
 
@@ -1813,7 +2264,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Ok(None),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(None),
         }
     }
 
@@ -1833,7 +2288,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Ok(None),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(None),
         }
     }
 
@@ -1871,7 +2330,11 @@ impl ObjectHeap {
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => Ok(None),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(None),
         }
     }
 
@@ -2559,7 +3022,11 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -2803,7 +3270,15 @@ impl ObjectHeap {
             | HeapValue::Closure { extensible, .. }
             | HeapValue::HostFunction { extensible, .. }
             | HeapValue::BoundFunction { extensible, .. } => Ok(*extensible),
-            // Strings, iterators, promises, upvalue cells are not extensible objects.
+            // Iterator objects are extensible (prototype must be settable during init).
+            HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            // WeakMap/WeakSet are extensible (prototype must be settable during init).
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => Ok(true),
+            // Strings, promises, upvalue cells are not extensible objects.
             _ => Ok(false),
         }
     }
@@ -3256,7 +3731,11 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => {
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -3490,7 +3969,11 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Map { .. }
-            | HeapValue::Set { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Set { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => return Err(ObjectError::InvalidKind),
             _ => None,
         };
 
@@ -3592,19 +4075,80 @@ impl ObjectHeap {
         shape_id
     }
 
-    /// Triggers garbage collection with the given root handles.
+    /// Triggers garbage collection with ephemeron support for WeakMap/WeakSet.
     ///
-    /// All objects transitively reachable from `roots` survive; unreachable
-    /// objects are freed and their handles become invalid.
+    /// Phases: mark → ephemeron fixpoint → clear dead weak entries → sweep.
+    /// Spec: <https://tc39.es/ecma262/#sec-weakref-processing-model>
     pub fn collect_garbage(&mut self, roots: &[ObjectHandle]) {
         let gc_roots: Vec<GcHandle> = roots.iter().map(|h| GcHandle(h.0)).collect();
-        self.heap.collect(&gc_roots);
+
+        // Phase 1: Mark from roots (WeakMap/WeakSet entries are NOT traced).
+        self.heap.run_mark_phase(&gc_roots);
+
+        // Phase 2: Ephemeron fixpoint — trace values of surviving weak entries.
+        let weakmap_handles: Vec<ObjectHandle> = self.find_weak_handles(HeapValueKind::WeakMap);
+        if !weakmap_handles.is_empty() {
+            loop {
+                let mut extra: Vec<GcHandle> = Vec::new();
+                for &wm in &weakmap_handles {
+                    if !self.heap.is_marked(GcHandle(wm.0)) {
+                        continue;
+                    }
+                    if let Ok(HeapValue::WeakMap { entries, .. }) = self.object(wm) {
+                        for (&key, value) in entries {
+                            if self.heap.is_marked(GcHandle(key)) {
+                                if let Some(vh) = value.as_object_handle() {
+                                    if !self.heap.is_marked(GcHandle(vh)) {
+                                        extra.push(GcHandle(vh));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if extra.is_empty() {
+                    break;
+                }
+                self.heap.run_mark_additional(&extra);
+            }
+        }
+
+        // Phase 3: Clear dead weak entries.
+        // Copy marks to break borrow — marks are small (1 byte per object).
+        let marks: Vec<bool> = self.heap.marks().to_vec();
+        let is_marked = |h: u32| marks.get(h as usize).copied().unwrap_or(false);
+        for &wm in &weakmap_handles {
+            if self.heap.is_marked(GcHandle(wm.0)) {
+                let _ = self.weakmap_clear_dead_and_get_live_values(wm, &is_marked);
+            }
+        }
+        let weakset_handles: Vec<ObjectHandle> = self.find_weak_handles(HeapValueKind::WeakSet);
+        for &ws in &weakset_handles {
+            if self.heap.is_marked(GcHandle(ws.0)) {
+                let _ = self.weakset_clear_dead(ws, &is_marked);
+            }
+        }
+
+        // Phase 4: Sweep.
+        self.heap.run_sweep_phase();
     }
 
     /// Triggers GC if memory pressure warrants it.
     pub fn maybe_collect_garbage(&mut self, roots: &[ObjectHandle]) {
         let gc_roots: Vec<GcHandle> = roots.iter().map(|h| GcHandle(h.0)).collect();
         self.heap.maybe_collect(&gc_roots);
+    }
+
+    /// Finds all handles of a given HeapValueKind (for ephemeron processing).
+    fn find_weak_handles(&self, target_kind: HeapValueKind) -> Vec<ObjectHandle> {
+        let mut handles = Vec::new();
+        self.heap.for_each(|idx, _any| {
+            let h = ObjectHandle(idx);
+            if self.kind(h) == Ok(target_kind) {
+                handles.push(h);
+            }
+        });
+        handles
     }
 
     /// Returns the number of live objects.
@@ -3728,11 +4272,17 @@ impl ObjectHeap {
                 return Ok(None);
             }
             HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
-            HeapValue::Map { .. } | HeapValue::Set { .. } => return Ok(None),
+            // Iterators have no own properties but participate in prototype chain.
+            HeapValue::ArrayIterator { .. }
+            | HeapValue::StringIterator { .. }
+            | HeapValue::MapIterator { .. }
+            | HeapValue::SetIterator { .. } => return Ok(None),
+            HeapValue::Map { .. }
+            | HeapValue::Set { .. }
+            | HeapValue::WeakMap { .. }
+            | HeapValue::WeakSet { .. } => return Ok(None),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -3755,10 +4305,14 @@ impl ObjectHeap {
             | HeapValue::HostFunction { prototype, .. }
             | HeapValue::BoundFunction { prototype, .. }
             | HeapValue::Map { prototype, .. }
-            | HeapValue::Set { prototype, .. } => Ok(*prototype),
+            | HeapValue::Set { prototype, .. }
+            | HeapValue::ArrayIterator { prototype, .. }
+            | HeapValue::StringIterator { prototype, .. }
+            | HeapValue::MapIterator { prototype, .. }
+            | HeapValue::SetIterator { prototype, .. }
+            | HeapValue::WeakMap { prototype, .. }
+            | HeapValue::WeakSet { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
-            | HeapValue::ArrayIterator { .. }
-            | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
         }

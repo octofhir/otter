@@ -50,7 +50,7 @@ impl<'a> FunctionCompiler<'a> {
                 self.compile_logical_expression(logical, module)
             }
             Expression::UnaryExpression(unary) => self.compile_unary_expression(unary, module),
-            Expression::UpdateExpression(update) => self.compile_update_expression(update),
+            Expression::UpdateExpression(update) => self.compile_update_expression(update, module),
             Expression::CallExpression(call) => self.compile_call_expression(call, module),
             Expression::NewExpression(new_expression) => {
                 self.compile_new_expression(new_expression, module)
@@ -76,6 +76,16 @@ impl<'a> FunctionCompiler<'a> {
             }
             Expression::SequenceExpression(sequence) => {
                 self.compile_sequence_expression(sequence, module)
+            }
+            // §15.7 ClassExpression
+            // Spec: <https://tc39.es/ecma262/#sec-class-definitions-runtime-semantics-evaluation>
+            Expression::ClassExpression(class) => {
+                self.compile_class_expression(class, module)
+            }
+            // §13.3.7 Optional Chaining (`?.`)
+            // Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
+            Expression::ChainExpression(chain) => {
+                self.compile_chain_expression(chain, module)
             }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
@@ -564,35 +574,151 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
+    /// §13.4 Update Expressions (`x++`, `--x`, `obj.x++`, `arr[i]--`)
+    /// Spec: <https://tc39.es/ecma262/#sec-update-expressions>
     fn compile_update_expression(
         &mut self,
         update: &oxc_ast::ast::UpdateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = &update.argument
-        else {
-            return Err(SourceLoweringError::Unsupported(
-                "non-identifier update target".to_string(),
-            ));
-        };
+        match &update.argument {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                self.compile_identifier_update(identifier.name.as_str(), update)
+            }
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                self.compile_member_update_static(member, update, module)
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                self.compile_member_update_computed(member, update, module)
+            }
+            _ => Err(SourceLoweringError::Unsupported(
+                "unsupported update target".to_string(),
+            )),
+        }
+    }
 
-        let current = self.compile_identifier(identifier.name.as_str())?;
+    fn compile_identifier_update(
+        &mut self,
+        name: &str,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let current = self.compile_identifier(name)?;
         let delta = match update.operator {
             UpdateOperator::Increment => self.load_i32(1)?,
             UpdateOperator::Decrement => self.load_i32(-1)?,
         };
-        let result = if current.is_temp {
-            current
-        } else {
-            ValueLocation::temp(self.alloc_temp())
-        };
+        let new_val = ValueLocation::temp(self.alloc_temp());
         self.instructions.push(Instruction::add(
-            result.register,
+            new_val.register,
             current.register,
             delta.register,
         ));
         self.release(delta);
-        let _ = self.assign_to_name(identifier.name.as_str(), result)?;
-        Ok(result)
+        let _ = self.assign_to_name(name, new_val)?;
+        if update.prefix {
+            self.release(current);
+            Ok(new_val)
+        } else {
+            self.release(new_val);
+            Ok(current)
+        }
+    }
+
+    /// `obj.prop++` / `--obj.prop`
+    fn compile_member_update_static(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let object = self.compile_expression(&member.object, module)?;
+        let object = self.stabilize_binding_value(object)?;
+        let prop = self.intern_property_name(member.property.name.as_str())?;
+
+        // Load current value.
+        let old_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::get_property(
+            old_val.register,
+            object.register,
+            prop,
+        ));
+
+        // Compute new value.
+        let delta = match update.operator {
+            UpdateOperator::Increment => self.load_i32(1)?,
+            UpdateOperator::Decrement => self.load_i32(-1)?,
+        };
+        let new_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::add(
+            new_val.register,
+            old_val.register,
+            delta.register,
+        ));
+        self.release(delta);
+
+        // Store new value back.
+        self.instructions.push(Instruction::set_property(
+            object.register,
+            new_val.register,
+            prop,
+        ));
+
+        if update.prefix {
+            self.release(old_val);
+            Ok(new_val)
+        } else {
+            self.release(new_val);
+            Ok(old_val)
+        }
+    }
+
+    /// `arr[i]++` / `--obj[key]`
+    fn compile_member_update_computed(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'_>,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let object = self.compile_expression(&member.object, module)?;
+        let object = self.stabilize_binding_value(object)?;
+        let key = self.compile_expression(&member.expression, module)?;
+        let key = self.stabilize_binding_value(key)?;
+
+        // Load current value.
+        let old_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::get_index(
+            old_val.register,
+            object.register,
+            key.register,
+        ));
+
+        // Compute new value.
+        let delta = match update.operator {
+            UpdateOperator::Increment => self.load_i32(1)?,
+            UpdateOperator::Decrement => self.load_i32(-1)?,
+        };
+        let new_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::add(
+            new_val.register,
+            old_val.register,
+            delta.register,
+        ));
+        self.release(delta);
+
+        // Store new value back.
+        self.instructions.push(Instruction::set_index(
+            object.register,
+            key.register,
+            new_val.register,
+        ));
+
+        if update.prefix {
+            self.release(old_val);
+            Ok(new_val)
+        } else {
+            self.release(new_val);
+            Ok(old_val)
+        }
     }
 
     fn compile_call_expression(
@@ -1579,6 +1705,176 @@ impl<'a> FunctionCompiler<'a> {
         result.ok_or_else(|| {
             SourceLoweringError::Unsupported("empty sequence expression".to_string())
         })
+    }
+
+    /// §13.3.7 Optional Chaining — `obj?.prop`, `obj?.[key]`, `obj?.method()`
+    /// Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
+    ///
+    /// Strategy: extract the base object, check if nullish, short-circuit to
+    /// undefined if so. Otherwise perform the member access / call normally.
+    fn compile_chain_expression(
+        &mut self,
+        chain: &oxc_ast::ast::ChainExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        use oxc_ast::ast::ChainElement;
+
+        // Pre-allocate result with `undefined` for the short-circuit path.
+        let result = self.allocate_local()?;
+        self.instructions
+            .push(Instruction::load_undefined(result));
+
+        match &chain.expression {
+            ChainElement::StaticMemberExpression(member) => {
+                let base = self.compile_expression(&member.object, module)?;
+                let base = self.stabilize_binding_value(base)?;
+
+                // if (base == null) jump to end
+                let null_val = self.load_null()?;
+                let is_nullish = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::loose_eq(
+                    is_nullish.register, base.register, null_val.register,
+                ));
+                self.release(null_val);
+                let jump_end = self.emit_conditional_placeholder(
+                    Opcode::JumpIfTrue, is_nullish.register,
+                );
+                self.release(is_nullish);
+
+                let prop = self.intern_property_name(member.property.name.as_str())?;
+                let val = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::get_property(
+                    val.register, base.register, prop,
+                ));
+                self.instructions.push(Instruction::move_(result, val.register));
+                self.release(val);
+                let end = self.instructions.len();
+                self.patch_jump(jump_end, end)?;
+            }
+            ChainElement::ComputedMemberExpression(member) => {
+                let base = self.compile_expression(&member.object, module)?;
+                let base = self.stabilize_binding_value(base)?;
+
+                let null_val = self.load_null()?;
+                let is_nullish = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::loose_eq(
+                    is_nullish.register, base.register, null_val.register,
+                ));
+                self.release(null_val);
+                let jump_end = self.emit_conditional_placeholder(
+                    Opcode::JumpIfTrue, is_nullish.register,
+                );
+                self.release(is_nullish);
+
+                let key = self.compile_expression(&member.expression, module)?;
+                let val = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::get_index(
+                    val.register, base.register, key.register,
+                ));
+                self.release(key);
+                self.instructions.push(Instruction::move_(result, val.register));
+                self.release(val);
+                let end = self.instructions.len();
+                self.patch_jump(jump_end, end)?;
+            }
+            ChainElement::CallExpression(_call) => {
+                // TODO: optional call `obj?.method()` — fall back for now.
+                return Err(SourceLoweringError::Unsupported(
+                    "optional call expressions (?.) are not yet implemented".to_string(),
+                ));
+            }
+            _ => {
+                return Err(SourceLoweringError::Unsupported(
+                    "unsupported chain element type".to_string(),
+                ));
+            }
+        }
+        Ok(ValueLocation::local(result))
+    }
+
+    /// §15.7 ClassExpression — `let x = class [Name] { ... }`
+    /// Spec: <https://tc39.es/ecma262/#sec-class-definitions-runtime-semantics-evaluation>
+    fn compile_class_expression(
+        &mut self,
+        class: &oxc_ast::ast::Class<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
+        let class_name = class.id.as_ref().map(|id| id.name.as_str()).unwrap_or("anonymous");
+
+        // First pass: extract constructor.
+        let mut constructor = None;
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method)
+                    if matches!(method.kind, MethodDefinitionKind::Constructor) =>
+                {
+                    constructor = Some(&method.value);
+                }
+                ClassElement::MethodDefinition(_) => {}
+                _ => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "unsupported class expression element".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let super_class = if let Some(super_class) = class.super_class.as_ref() {
+            let super_value = self.compile_expression(super_class, module)?;
+            Some(self.stabilize_binding_value(super_value)?)
+        } else {
+            None
+        };
+
+        let constructor_value = if let Some(ctor) = constructor {
+            self.compile_class_constructor(class_name, ctor, super_class.is_some(), module)?
+        } else if super_class.is_some() {
+            self.compile_default_derived_class_constructor(class_name, module)?
+        } else {
+            self.compile_default_base_class_constructor(class_name, module)?
+        };
+        let constructor_value = if constructor_value.is_temp {
+            self.stabilize_binding_value(constructor_value)?
+        } else {
+            constructor_value
+        };
+
+        if let Some(super_class) = super_class {
+            self.emit_object_method_call("setPrototypeOf", constructor_value, &[super_class], module)?;
+        }
+
+        let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
+        let prototype = self.stabilize_binding_value(prototype)?;
+        let prototype_parent = if let Some(super_class) = super_class {
+            self.emit_named_property_load(super_class, "prototype")?
+        } else {
+            let object_ctor = self.compile_identifier("Object")?;
+            let object_ctor = if object_ctor.is_temp {
+                self.stabilize_binding_value(object_ctor)?
+            } else {
+                object_ctor
+            };
+            self.emit_named_property_load(object_ctor, "prototype")?
+        };
+        self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
+
+        // Install methods.
+        for element in &class.body.body {
+            if let ClassElement::MethodDefinition(method) = element {
+                if !matches!(method.kind, MethodDefinitionKind::Constructor) {
+                    let target = if method.r#static {
+                        constructor_value
+                    } else {
+                        prototype
+                    };
+                    self.compile_class_method(method, target, module)?;
+                }
+            }
+        }
+
+        self.emit_make_class_prototype_non_writable(constructor_value, module)?;
+        Ok(constructor_value)
     }
 
     /// Template literal: `` `prefix${expr}mid${expr}suffix` ``

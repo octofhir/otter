@@ -661,6 +661,10 @@ fn object_to_string_tag(
         | HeapValueKind::Promise => Ok("Object"),
         HeapValueKind::Map => Ok("Map"),
         HeapValueKind::Set => Ok("Set"),
+        HeapValueKind::MapIterator => Ok("Map Iterator"),
+        HeapValueKind::SetIterator => Ok("Set Iterator"),
+        HeapValueKind::WeakMap => Ok("WeakMap"),
+        HeapValueKind::WeakSet => Ok("WeakSet"),
     }
 }
 

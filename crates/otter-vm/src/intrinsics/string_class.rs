@@ -1047,20 +1047,25 @@ fn number_to_string(number: f64) -> String {
     }
 }
 
-/// ES2024 §22.1.5.1 String.prototype[@@iterator]()
+/// String.prototype\[@@iterator\]()
+/// Spec: <https://tc39.es/ecma262/#sec-string.prototype-@@iterator>
 fn string_iterator(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // Get the string handle (primitive or wrapper).
     let text = runtime
         .js_to_string(*this)
         .map_err(|error| map_interpreter_error(error, runtime))?;
     let str_handle = runtime.alloc_string(text);
     let iterator = runtime
         .objects_mut()
-        .alloc_iterator(str_handle)
+        .alloc_string_iterator(str_handle);
+    // Set prototype to %StringIteratorPrototype%.
+    let proto = runtime.intrinsics().string_iterator_prototype();
+    runtime
+        .objects_mut()
+        .set_prototype(iterator, Some(proto))
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(iterator.0))
 }

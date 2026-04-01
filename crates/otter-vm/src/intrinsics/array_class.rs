@@ -42,19 +42,26 @@ impl IntrinsicInstaller for ArrayIntrinsic {
             cx,
         )?;
 
-        // Install Array.prototype[Symbol.iterator] — returns the array's values() iterator.
-        let iter_desc =
-            NativeFunctionDescriptor::method("values", 0, array_values_iterator);
-        let iter_id = cx.native_functions.register(iter_desc);
-        let iter_fn =
-            cx.alloc_intrinsic_host_function(iter_id, intrinsics.function_prototype())?;
+        // §23.1.3.35: Array.prototype[@@iterator] is the same function object as values().
+        // Spec: <https://tc39.es/ecma262/#sec-array.prototype-@@iterator>
+        let values_prop = cx.property_names.intern("values");
+        let values_fn = match cx
+            .heap
+            .get_property(intrinsics.array_prototype(), values_prop)
+        {
+            Ok(Some(lookup)) => match lookup.value() {
+                crate::object::PropertyValue::Data { value, .. } => value,
+                _ => RegisterValue::undefined(),
+            },
+            _ => RegisterValue::undefined(),
+        };
         let sym_iterator = cx
             .property_names
             .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
         cx.heap.set_property(
             intrinsics.array_prototype(),
             sym_iterator,
-            crate::value::RegisterValue::from_object_handle(iter_fn.0),
+            values_fn,
         )?;
 
         Ok(())
@@ -211,6 +218,21 @@ fn array_class_descriptor() -> JsClassDescriptor {
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("at", 1, array_at),
+        ))
+        // §23.1.3.16 keys() — <https://tc39.es/ecma262/#sec-array.prototype.keys>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("keys", 0, array_keys_iterator),
+        ))
+        // §23.1.3.34 values() — <https://tc39.es/ecma262/#sec-array.prototype.values>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("values", 0, array_values_iterator),
+        ))
+        // §23.1.3.7 entries() — <https://tc39.es/ecma262/#sec-array.prototype.entries>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("entries", 0, array_entries_iterator),
         ))
 }
 
@@ -1328,19 +1350,57 @@ fn array_of(
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
-/// ES2024 §23.1.3.34 Array.prototype.values() / Array.prototype[@@iterator]()
-/// Returns an internal ArrayIterator for the receiver.
+/// Array.prototype.values() / Array.prototype\[@@iterator\]()
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.values>
+/// Returns a new Array Iterator whose [[ArrayIteratorKind]] is `values`.
 fn array_values_iterator(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    create_array_iterator(this, crate::object::ArrayIteratorKind::Values, runtime)
+}
+
+/// Array.prototype.keys()
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.keys>
+/// Returns a new Array Iterator whose [[ArrayIteratorKind]] is `keys`.
+fn array_keys_iterator(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    create_array_iterator(this, crate::object::ArrayIteratorKind::Keys, runtime)
+}
+
+/// Array.prototype.entries()
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.entries>
+/// Returns a new Array Iterator whose [[ArrayIteratorKind]] is `entries`.
+fn array_entries_iterator(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    create_array_iterator(this, crate::object::ArrayIteratorKind::Entries, runtime)
+}
+
+/// §23.1.5.1 CreateArrayIterator(array, kind)
+/// Spec: <https://tc39.es/ecma262/#sec-createarrayiterator>
+fn create_array_iterator(
+    this: &RegisterValue,
+    kind: crate::object::ArrayIteratorKind,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
     let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype[Symbol.iterator] requires array receiver".into())
+        VmNativeCallError::Internal("Array iterator requires object receiver".into())
     })?;
     let iterator = runtime
         .objects_mut()
-        .alloc_iterator(handle)
+        .alloc_array_iterator(handle, kind);
+    // Set prototype to %ArrayIteratorPrototype%.
+    let proto = runtime.intrinsics().array_iterator_prototype();
+    runtime
+        .objects_mut()
+        .set_prototype(iterator, Some(proto))
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(iterator.0))
 }

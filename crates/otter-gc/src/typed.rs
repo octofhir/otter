@@ -159,13 +159,64 @@ impl TypedHeap {
     /// `roots` are the handles that are directly reachable (stack, globals).
     /// All objects transitively reachable from roots survive; the rest are freed.
     pub fn collect(&mut self, roots: &[Handle]) {
-        // Reset marks.
+        self.mark_phase(roots);
+        self.sweep_phase();
+    }
+
+    /// Runs only the mark phase (BFS from roots). Call `is_marked` afterwards
+    /// to inspect results, then `mark_additional` for ephemeron values,
+    /// and finally `sweep_phase` to free dead objects.
+    ///
+    /// This split allows the caller (ObjectHeap) to process ephemerons and
+    /// clear dead weak entries between mark and sweep.
+    pub fn run_mark_phase(&mut self, roots: &[Handle]) {
+        self.mark_phase(roots);
+    }
+
+    /// Marks additional handles discovered during ephemeron processing.
+    /// Call after `run_mark_phase` and before `run_sweep_phase`.
+    pub fn run_mark_additional(&mut self, handles: &[Handle]) {
+        self.mark_additional(handles);
+    }
+
+    /// Runs the sweep phase, freeing all unmarked objects.
+    /// Call after mark phase and ephemeron processing are complete.
+    pub fn run_sweep_phase(&mut self) {
+        self.sweep_phase();
+    }
+
+    /// Returns whether a handle was marked during the current collection cycle.
+    /// Valid between `run_mark_phase` and `run_sweep_phase`.
+    #[must_use]
+    pub fn is_marked(&self, handle: Handle) -> bool {
+        let idx = handle.0 as usize;
+        self.marks.get(idx).copied().unwrap_or(false)
+    }
+
+    /// Returns the mark bitmap as a slice. Valid between mark and sweep phases.
+    /// Index `i` is `true` if `Handle(i)` was marked.
+    #[must_use]
+    pub fn marks(&self) -> &[bool] {
+        &self.marks
+    }
+
+    /// Mark phase: BFS from roots, sets mark bits and traces children.
+    fn mark_phase(&mut self, roots: &[Handle]) {
         self.marks.resize(self.slots.len(), false);
         self.marks.fill(false);
 
-        // Mark phase: BFS from roots.
         let mut worklist: Vec<Handle> = roots.to_vec();
+        self.drain_worklist(&mut worklist);
+    }
 
+    /// Marks additional handles and traces their children (used by ephemeron fixpoint).
+    fn mark_additional(&mut self, handles: &[Handle]) {
+        let mut worklist: Vec<Handle> = handles.to_vec();
+        self.drain_worklist(&mut worklist);
+    }
+
+    /// Drains the mark worklist, marking and tracing each handle.
+    fn drain_worklist(&mut self, worklist: &mut Vec<Handle>) {
         while let Some(handle) = worklist.pop() {
             let idx = handle.0 as usize;
             if idx >= self.marks.len() || self.marks[idx] {
@@ -173,7 +224,6 @@ impl TypedHeap {
             }
             self.marks[idx] = true;
 
-            // Trace children.
             if let Some(Some(slot)) = self.slots.get(idx) {
                 slot.object.trace_handles(&mut |child| {
                     let cidx = child.0 as usize;
@@ -183,8 +233,10 @@ impl TypedHeap {
                 });
             }
         }
+    }
 
-        // Sweep: free unmarked slots.
+    /// Sweep phase: free all unmarked slots.
+    fn sweep_phase(&mut self) {
         for (idx, slot_opt) in self.slots.iter_mut().enumerate() {
             if slot_opt.is_some() && !self.marks.get(idx).copied().unwrap_or(false) {
                 *slot_opt = None;

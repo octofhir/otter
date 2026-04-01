@@ -619,6 +619,7 @@ impl<'a> FunctionCompiler<'a> {
         })?;
         let binding = self.declare_variable_binding(name.name.as_str(), false)?;
 
+        // First pass: extract constructor, validate elements.
         let mut constructor = None;
         for element in &class.body.body {
             match element {
@@ -637,14 +638,21 @@ impl<'a> FunctionCompiler<'a> {
                     }
                     constructor = Some(&method.value);
                 }
-                ClassElement::MethodDefinition(_) => {
+                // Non-constructor methods are handled in the second pass below.
+                ClassElement::MethodDefinition(_) => {}
+                ClassElement::PropertyDefinition(_) => {
                     return Err(SourceLoweringError::Unsupported(
-                        "class methods are not implemented yet on the new VM path".to_string(),
+                        "class field declarations are not implemented yet".to_string(),
+                    ));
+                }
+                ClassElement::StaticBlock(_) => {
+                    return Err(SourceLoweringError::Unsupported(
+                        "static blocks are not implemented yet".to_string(),
                     ));
                 }
                 _ => {
                     return Err(SourceLoweringError::Unsupported(
-                        "class elements beyond constructors are not implemented yet".to_string(),
+                        "unsupported class element".to_string(),
                     ));
                 }
             }
@@ -689,7 +697,10 @@ impl<'a> FunctionCompiler<'a> {
             )?;
         }
 
+        // Load and stabilize prototype early — it's needed for both setPrototypeOf
+        // and method installation.
         let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
+        let prototype = self.stabilize_binding_value(prototype)?;
         let prototype_parent = if let Some(super_class) = super_class {
             self.emit_named_property_load(super_class, "prototype")?
         } else {
@@ -702,6 +713,26 @@ impl<'a> FunctionCompiler<'a> {
             self.emit_named_property_load(object_ctor, "prototype")?
         };
         self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
+
+        // Second pass: install methods on prototype (instance) or constructor (static).
+        // §15.7.14 ClassDefinitionEvaluation step 26–28.
+        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method)
+                    if !matches!(method.kind, MethodDefinitionKind::Constructor) =>
+                {
+                    let target = if method.r#static {
+                        constructor_value
+                    } else {
+                        prototype
+                    };
+                    self.compile_class_method(method, target, module)?;
+                }
+                _ => {} // Constructor and other elements already handled.
+            }
+        }
+
         self.emit_make_class_prototype_non_writable(constructor_value, module)?;
 
         if constructor_value.register != binding {
@@ -712,7 +743,143 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    fn compile_class_constructor(
+    /// Compiles a class method and installs it on the target (prototype or constructor).
+    ///
+    /// Handles regular methods, getters, setters — named and computed keys.
+    /// §15.4.5 MethodDefinitionEvaluation
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
+    pub(super) fn compile_class_method(
+        &mut self,
+        method: &oxc_ast::ast::MethodDefinition<'_>,
+        target: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        use super::ast::{expected_function_length, extract_function_params, non_computed_property_key_name};
+
+        // Determine method name for debug/display.
+        let method_name = if method.computed {
+            None
+        } else {
+            non_computed_property_key_name(&method.key)
+        };
+
+        let display_name = match (&method.kind, &method_name) {
+            (MethodDefinitionKind::Get, Some(n)) => Some(format!("get {n}")),
+            (MethodDefinitionKind::Set, Some(n)) => Some(format!("set {n}")),
+            (_, Some(n)) => Some(n.to_string()),
+            _ => None,
+        };
+
+        // Compile the method body as a closure.
+        let function = &method.value;
+        let reserved = module.reserve_function();
+        let params = extract_function_params(function)?;
+        let kind = if method.value.r#async {
+            return Err(SourceLoweringError::Unsupported(
+                "async class methods".to_string(),
+            ));
+        } else if method.value.generator {
+            return Err(SourceLoweringError::Unsupported(
+                "generator class methods".to_string(),
+            ));
+        } else {
+            super::shared::FunctionKind::Ordinary
+        };
+        let compiled = module.compile_function_from_statements(
+            reserved,
+            super::module_compiler::FunctionIdentity {
+                debug_name: display_name.clone(),
+                self_binding_name: None,
+                length: expected_function_length(&params),
+            },
+            function
+                .body
+                .as_ref()
+                .map(|body| body.statements.as_slice())
+                .unwrap_or(&[]),
+            &params,
+            kind,
+            Some(self.env.clone()),
+            true, // class bodies are always strict
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let method_closure = ValueLocation::temp(self.alloc_temp());
+        self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+
+        // Install on target: getter, setter, or data method.
+        match method.kind {
+            MethodDefinitionKind::Get => {
+                if method.computed {
+                    let key = self.compile_expression(method.key.to_expression(), module)?;
+                    self.instructions.push(Instruction::define_computed_getter(
+                        target.register,
+                        key.register,
+                        method_closure.register,
+                    ));
+                    self.release(key);
+                } else {
+                    let name = method_name.as_ref().ok_or_else(|| {
+                        SourceLoweringError::Unsupported("unnamed class getter".to_string())
+                    })?;
+                    let prop = self.intern_property_name(name)?;
+                    self.instructions.push(Instruction::define_named_getter(
+                        target.register,
+                        method_closure.register,
+                        prop,
+                    ));
+                }
+            }
+            MethodDefinitionKind::Set => {
+                if method.computed {
+                    let key = self.compile_expression(method.key.to_expression(), module)?;
+                    self.instructions.push(Instruction::define_computed_setter(
+                        target.register,
+                        key.register,
+                        method_closure.register,
+                    ));
+                    self.release(key);
+                } else {
+                    let name = method_name.as_ref().ok_or_else(|| {
+                        SourceLoweringError::Unsupported("unnamed class setter".to_string())
+                    })?;
+                    let prop = self.intern_property_name(name)?;
+                    self.instructions.push(Instruction::define_named_setter(
+                        target.register,
+                        method_closure.register,
+                        prop,
+                    ));
+                }
+            }
+            MethodDefinitionKind::Method => {
+                if method.computed {
+                    let key = self.compile_expression(method.key.to_expression(), module)?;
+                    self.instructions.push(Instruction::set_index(
+                        target.register,
+                        key.register,
+                        method_closure.register,
+                    ));
+                    self.release(key);
+                } else {
+                    let name = method_name.as_ref().ok_or_else(|| {
+                        SourceLoweringError::Unsupported("unnamed class method".to_string())
+                    })?;
+                    let prop = self.intern_property_name(name)?;
+                    self.instructions.push(Instruction::set_property(
+                        target.register,
+                        method_closure.register,
+                        prop,
+                    ));
+                }
+            }
+            MethodDefinitionKind::Constructor => unreachable!("constructor handled in first pass"),
+        }
+
+        self.release(method_closure);
+        Ok(())
+    }
+
+    pub(super) fn compile_class_constructor(
         &mut self,
         class_name: &str,
         constructor: &Function<'_>,
@@ -750,7 +917,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(destination))
     }
 
-    fn compile_default_base_class_constructor(
+    pub(super) fn compile_default_base_class_constructor(
         &mut self,
         class_name: &str,
         module: &mut ModuleCompiler<'a>,
@@ -776,7 +943,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(destination))
     }
 
-    fn compile_default_derived_class_constructor(
+    pub(super) fn compile_default_derived_class_constructor(
         &mut self,
         class_name: &str,
         module: &mut ModuleCompiler<'a>,
@@ -819,7 +986,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(destination))
     }
 
-    fn emit_named_property_load(
+    pub(super) fn emit_named_property_load(
         &mut self,
         base: ValueLocation,
         name: &str,
@@ -834,7 +1001,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
-    fn emit_make_class_prototype_non_writable(
+    pub(super) fn emit_make_class_prototype_non_writable(
         &mut self,
         constructor: ValueLocation,
         module: &mut ModuleCompiler<'a>,
@@ -861,7 +1028,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    fn emit_object_method_call(
+    pub(super) fn emit_object_method_call(
         &mut self,
         method_name: &str,
         receiver: ValueLocation,

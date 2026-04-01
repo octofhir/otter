@@ -782,6 +782,29 @@ impl RuntimeState {
         &mut self,
         handle: ObjectHandle,
     ) -> Result<crate::object::IteratorStep, InterpreterError> {
+        use crate::object::{ArrayIteratorKind, ObjectError};
+
+        // Check if this is a values-kind array iterator (fast path) or string iterator.
+        // Non-values array iterators, Map/Set iterators return InvalidKind to use the
+        // protocol-based slow path via .next().
+        let kind_check = self.objects.array_iterator_kind(handle);
+        match kind_check {
+            Ok(ArrayIteratorKind::Keys | ArrayIteratorKind::Entries) => {
+                return Err(InterpreterError::InvalidHeapValueKind);
+            }
+            Err(ObjectError::InvalidKind) => {
+                // Not an ArrayIterator — check if string/other internal iterator.
+                if matches!(
+                    self.objects.kind(handle),
+                    Ok(crate::object::HeapValueKind::MapIterator
+                        | crate::object::HeapValueKind::SetIterator)
+                ) {
+                    return Err(InterpreterError::InvalidHeapValueKind);
+                }
+            }
+            _ => {} // Values kind — continue with fast path
+        }
+
         let cursor = self.objects.iterator_cursor(handle)?;
         if cursor.closed() {
             return Ok(crate::object::IteratorStep::done());
@@ -2668,7 +2691,11 @@ impl RuntimeState {
                 | HeapValueKind::Iterator
                 | HeapValueKind::Promise
                 | HeapValueKind::Map
-                | HeapValueKind::Set => "object",
+                | HeapValueKind::Set
+                | HeapValueKind::MapIterator
+                | HeapValueKind::SetIterator
+                | HeapValueKind::WeakMap
+                | HeapValueKind::WeakSet => "object",
             }
         } else {
             "undefined"

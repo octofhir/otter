@@ -123,6 +123,21 @@ fn install_map(
         },
     )?;
 
+    // §24.1.3.12: Map.prototype[@@iterator] is the same function as entries().
+    // Spec: <https://tc39.es/ecma262/#sec-map.prototype-@@iterator>
+    let entries_prop = cx.property_names.intern("entries");
+    let entries_fn = match cx.heap.get_property(map_prototype, entries_prop) {
+        Ok(Some(lookup)) => match lookup.value() {
+            crate::object::PropertyValue::Data { value, .. } => value,
+            _ => RegisterValue::undefined(),
+        },
+        _ => RegisterValue::undefined(),
+    };
+    let sym_iterator = cx
+        .property_names
+        .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
+    cx.heap.set_property(map_prototype, sym_iterator, entries_fn)?;
+
     Ok(())
 }
 
@@ -260,50 +275,51 @@ fn map_for_each(
     Ok(RegisterValue::undefined())
 }
 
+/// Map.prototype.keys()
+/// Spec: <https://tc39.es/ecma262/#sec-map.prototype.keys>
 fn map_keys(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = require_map(*this, runtime)?;
-    let entries = runtime.objects().map_entries(handle)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let result = runtime.alloc_array();
-    for (i, (key, _)) in entries.iter().enumerate() {
-        runtime.objects_mut().set_index(result, i, *key).ok();
-    }
-    Ok(RegisterValue::from_object_handle(result.0))
+    create_map_iterator(this, crate::object::MapIteratorKind::Keys, runtime)
 }
 
+/// Map.prototype.values()
+/// Spec: <https://tc39.es/ecma262/#sec-map.prototype.values>
 fn map_values(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = require_map(*this, runtime)?;
-    let entries = runtime.objects().map_entries(handle)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let result = runtime.alloc_array();
-    for (i, (_, value)) in entries.iter().enumerate() {
-        runtime.objects_mut().set_index(result, i, *value).ok();
-    }
-    Ok(RegisterValue::from_object_handle(result.0))
+    create_map_iterator(this, crate::object::MapIteratorKind::Values, runtime)
 }
 
+/// Map.prototype.entries() / Map.prototype\[@@iterator\]()
+/// Spec: <https://tc39.es/ecma262/#sec-map.prototype.entries>
 fn map_entries(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    create_map_iterator(this, crate::object::MapIteratorKind::Entries, runtime)
+}
+
+/// §24.1.5.1 CreateMapIterator(map, kind)
+/// Spec: <https://tc39.es/ecma262/#sec-createmapiterator>
+fn create_map_iterator(
+    this: &RegisterValue,
+    kind: crate::object::MapIteratorKind,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let entries = runtime.objects().map_entries(handle)
+    let iterator = runtime.objects_mut().alloc_map_iterator(handle, kind);
+    let proto = runtime.intrinsics().map_iterator_prototype();
+    runtime
+        .objects_mut()
+        .set_prototype(iterator, Some(proto))
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let result = runtime.alloc_array();
-    for (i, (key, value)) in entries.iter().enumerate() {
-        let pair = runtime.alloc_array_with_elements(&[*key, *value]);
-        runtime.objects_mut().set_index(result, i, RegisterValue::from_object_handle(pair.0)).ok();
-    }
-    Ok(RegisterValue::from_object_handle(result.0))
+    Ok(RegisterValue::from_object_handle(iterator.0))
 }
 
 fn require_map(
@@ -376,6 +392,21 @@ fn install_set(
             attributes: crate::object::PropertyAttributes::from_flags(false, true, true),
         },
     )?;
+
+    // §24.2.3.10: Set.prototype[@@iterator] is the same function as values().
+    // Spec: <https://tc39.es/ecma262/#sec-set.prototype-@@iterator>
+    let values_prop = cx.property_names.intern("values");
+    let values_fn = match cx.heap.get_property(set_prototype, values_prop) {
+        Ok(Some(lookup)) => match lookup.value() {
+            crate::object::PropertyValue::Data { value, .. } => value,
+            _ => RegisterValue::undefined(),
+        },
+        _ => RegisterValue::undefined(),
+    };
+    let sym_iterator = cx
+        .property_names
+        .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
+    cx.heap.set_property(set_prototype, sym_iterator, values_fn)?;
 
     Ok(())
 }
@@ -491,35 +522,41 @@ fn set_for_each(
     Ok(RegisterValue::undefined())
 }
 
+/// Set.prototype.values() / Set.prototype.keys() / Set.prototype\[@@iterator\]()
+/// Spec: <https://tc39.es/ecma262/#sec-set.prototype.values>
 fn set_values(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = require_set(*this, runtime)?;
-    let values = runtime.objects().set_values(handle)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let result = runtime.alloc_array();
-    for (i, value) in values.iter().enumerate() {
-        runtime.objects_mut().set_index(result, i, *value).ok();
-    }
-    Ok(RegisterValue::from_object_handle(result.0))
+    create_set_iterator(this, crate::object::SetIteratorKind::Values, runtime)
 }
 
+/// Set.prototype.entries()
+/// Spec: <https://tc39.es/ecma262/#sec-set.prototype.entries>
 fn set_entries(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    create_set_iterator(this, crate::object::SetIteratorKind::Entries, runtime)
+}
+
+/// §24.2.5.1 CreateSetIterator(set, kind)
+/// Spec: <https://tc39.es/ecma262/#sec-createsetiterator>
+fn create_set_iterator(
+    this: &RegisterValue,
+    kind: crate::object::SetIteratorKind,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let values = runtime.objects().set_values(handle)
+    let iterator = runtime.objects_mut().alloc_set_iterator(handle, kind);
+    let proto = runtime.intrinsics().set_iterator_prototype();
+    runtime
+        .objects_mut()
+        .set_prototype(iterator, Some(proto))
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let result = runtime.alloc_array();
-    for (i, value) in values.iter().enumerate() {
-        let pair = runtime.alloc_array_with_elements(&[*value, *value]);
-        runtime.objects_mut().set_index(result, i, RegisterValue::from_object_handle(pair.0)).ok();
-    }
-    Ok(RegisterValue::from_object_handle(result.0))
+    Ok(RegisterValue::from_object_handle(iterator.0))
 }
 
 fn require_set(

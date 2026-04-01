@@ -11,6 +11,7 @@ mod date_class;
 mod error_class;
 mod function_class;
 mod install;
+mod iterator_class;
 mod json;
 mod map_set_class;
 mod math;
@@ -23,6 +24,7 @@ mod species_support;
 mod string_class;
 mod symbol_class;
 pub(crate) mod timer_globals;
+mod weakmap_weakset_class;
 
 pub(crate) use boolean_class::box_boolean_object;
 pub(crate) use number_class::box_number_object;
@@ -237,6 +239,17 @@ pub struct VmIntrinsics {
     // Promise
     pub(crate) promise_constructor: ObjectHandle,
     pub(crate) promise_prototype: ObjectHandle,
+    // WeakMap / WeakSet (§24.3, §24.4)
+    pub(crate) weakmap_constructor: ObjectHandle,
+    pub(crate) weakmap_prototype: ObjectHandle,
+    pub(crate) weakset_constructor: ObjectHandle,
+    pub(crate) weakset_prototype: ObjectHandle,
+    // Iterator prototypes (§27.1.2, §23.1.5, §22.1.5, §24.1.5, §24.2.5)
+    pub(crate) iterator_prototype: ObjectHandle,
+    pub(crate) array_iterator_prototype: ObjectHandle,
+    pub(crate) string_iterator_prototype: ObjectHandle,
+    pub(crate) map_iterator_prototype: ObjectHandle,
+    pub(crate) set_iterator_prototype: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -280,6 +293,15 @@ impl VmIntrinsics {
         let set_prototype = heap.alloc_object();
         let promise_constructor = heap.alloc_object();
         let promise_prototype = heap.alloc_object();
+        let weakmap_constructor = heap.alloc_object();
+        let weakmap_prototype = heap.alloc_object();
+        let weakset_constructor = heap.alloc_object();
+        let weakset_prototype = heap.alloc_object();
+        let iterator_prototype = heap.alloc_object();
+        let array_iterator_prototype = heap.alloc_object();
+        let string_iterator_prototype = heap.alloc_object();
+        let map_iterator_prototype = heap.alloc_object();
+        let set_iterator_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -342,6 +364,15 @@ impl VmIntrinsics {
             set_prototype,
             promise_constructor,
             promise_prototype,
+            weakmap_constructor,
+            weakmap_prototype,
+            weakset_constructor,
+            weakset_prototype,
+            iterator_prototype,
+            array_iterator_prototype,
+            string_iterator_prototype,
+            map_iterator_prototype,
+            set_iterator_prototype,
         }
     }
 
@@ -390,6 +421,18 @@ impl VmIntrinsics {
         // Promise: constructor → Function.prototype, prototype → Object.prototype
         heap.set_prototype(self.promise_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.promise_prototype, Some(self.object_prototype))?;
+        // WeakMap/WeakSet (§24.3, §24.4)
+        heap.set_prototype(self.weakmap_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.weakmap_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.weakset_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.weakset_prototype, Some(self.object_prototype))?;
+        // Iterator prototypes (§27.1.2): %IteratorPrototype% → %Object.prototype%
+        // Concrete iterator prototypes → %IteratorPrototype%
+        heap.set_prototype(self.iterator_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.array_iterator_prototype, Some(self.iterator_prototype))?;
+        heap.set_prototype(self.string_iterator_prototype, Some(self.iterator_prototype))?;
+        heap.set_prototype(self.map_iterator_prototype, Some(self.iterator_prototype))?;
+        heap.set_prototype(self.set_iterator_prototype, Some(self.iterator_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -631,6 +674,36 @@ impl VmIntrinsics {
         self.promise_prototype
     }
 
+    /// Returns `%IteratorPrototype%` (§27.1.2).
+    #[must_use]
+    pub const fn iterator_prototype(&self) -> ObjectHandle {
+        self.iterator_prototype
+    }
+
+    /// Returns `%ArrayIteratorPrototype%` (§23.1.5).
+    #[must_use]
+    pub const fn array_iterator_prototype(&self) -> ObjectHandle {
+        self.array_iterator_prototype
+    }
+
+    /// Returns `%StringIteratorPrototype%` (§22.1.5).
+    #[must_use]
+    pub const fn string_iterator_prototype(&self) -> ObjectHandle {
+        self.string_iterator_prototype
+    }
+
+    /// Returns `%MapIteratorPrototype%` (§24.1.5).
+    #[must_use]
+    pub const fn map_iterator_prototype(&self) -> ObjectHandle {
+        self.map_iterator_prototype
+    }
+
+    /// Returns `%SetIteratorPrototype%` (§24.2.5).
+    #[must_use]
+    pub const fn set_iterator_prototype(&self) -> ObjectHandle {
+        self.set_iterator_prototype
+    }
+
     /// Registers an additional namespace root owned by the intrinsic registry.
     pub fn register_namespace_root(&mut self, handle: ObjectHandle) {
         self.namespace_roots.push(handle);
@@ -722,6 +795,15 @@ impl VmIntrinsics {
             self.syntax_error_constructor,
             self.promise_constructor,
             self.promise_prototype,
+            self.weakmap_constructor,
+            self.weakmap_prototype,
+            self.weakset_constructor,
+            self.weakset_prototype,
+            self.iterator_prototype,
+            self.array_iterator_prototype,
+            self.string_iterator_prototype,
+            self.map_iterator_prototype,
+            self.set_iterator_prototype,
         ]);
         if let Some(h) = self.math_namespace {
             roots.push(h);
@@ -768,8 +850,10 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 16] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 18] {
     [
+        // Iterator must be first — other installers reference iterator prototypes.
+        &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
         &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
@@ -786,6 +870,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 16] {
         &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
+        &weakmap_weakset_class::WEAKMAP_WEAKSET_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
 
@@ -869,7 +954,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 230);
+        assert_eq!(native_functions.len(), 246);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

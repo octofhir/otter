@@ -15,9 +15,7 @@ use crate::object::{
 };
 use crate::value::RegisterValue;
 
-use super::install::{
-    IntrinsicInstallContext, IntrinsicInstaller, install_function_length_name,
-};
+use super::install::{IntrinsicInstallContext, IntrinsicInstaller, install_function_length_name};
 use super::{IntrinsicsError, VmIntrinsics, WellKnownSymbol};
 
 pub(super) static ITERATOR_INTRINSIC: IteratorIntrinsic = IteratorIntrinsic;
@@ -50,11 +48,7 @@ impl IntrinsicInstaller for IteratorIntrinsic {
             intrinsics.function_prototype(),
             cx,
         )?;
-        install_to_string_tag(
-            intrinsics.array_iterator_prototype(),
-            "Array Iterator",
-            cx,
-        )?;
+        install_to_string_tag(intrinsics.array_iterator_prototype(), "Array Iterator", cx)?;
 
         // ─── §22.1.5.1 %StringIteratorPrototype% ───────────────────────
         install_next_method(
@@ -76,11 +70,7 @@ impl IntrinsicInstaller for IteratorIntrinsic {
             intrinsics.function_prototype(),
             cx,
         )?;
-        install_to_string_tag(
-            intrinsics.map_iterator_prototype(),
-            "Map Iterator",
-            cx,
-        )?;
+        install_to_string_tag(intrinsics.map_iterator_prototype(), "Map Iterator", cx)?;
 
         // ─── §24.2.5.1 %SetIteratorPrototype% ──────────────────────────
         install_next_method(
@@ -89,11 +79,7 @@ impl IntrinsicInstaller for IteratorIntrinsic {
             intrinsics.function_prototype(),
             cx,
         )?;
-        install_to_string_tag(
-            intrinsics.set_iterator_prototype(),
-            "Set Iterator",
-            cx,
-        )?;
+        install_to_string_tag(intrinsics.set_iterator_prototype(), "Set Iterator", cx)?;
 
         Ok(())
     }
@@ -299,21 +285,13 @@ fn array_iterator_next(
 
     match kind {
         ArrayIteratorKind::Values => create_iter_result_object(elem, false, runtime),
-        ArrayIteratorKind::Keys => create_iter_result_object(
-            RegisterValue::from_i32(index as i32),
-            false,
-            runtime,
-        ),
+        ArrayIteratorKind::Keys => {
+            create_iter_result_object(RegisterValue::from_i32(index as i32), false, runtime)
+        }
         ArrayIteratorKind::Entries => {
-            let pair = runtime.alloc_array_with_elements(&[
-                RegisterValue::from_i32(index as i32),
-                elem,
-            ]);
-            create_iter_result_object(
-                RegisterValue::from_object_handle(pair.0),
-                false,
-                runtime,
-            )
+            let pair =
+                runtime.alloc_array_with_elements(&[RegisterValue::from_i32(index as i32), elem]);
+            create_iter_result_object(RegisterValue::from_object_handle(pair.0), false, runtime)
         }
     }
 }

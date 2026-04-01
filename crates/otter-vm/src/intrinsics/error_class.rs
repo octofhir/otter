@@ -180,10 +180,9 @@ fn error_to_string(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Internal("Error.prototype.toString requires object".into()))?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Error.prototype.toString requires object".into())
+    })?;
 
     // 1. Let name be ? Get(O, "name").
     let name_prop = runtime.intern_property_name("name");

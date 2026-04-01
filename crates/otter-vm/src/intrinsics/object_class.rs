@@ -7,13 +7,12 @@ use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
-    IntrinsicsError, VmIntrinsics,
+    IntrinsicsError, VmIntrinsics, WellKnownSymbol,
     boolean_class::box_boolean_object,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
     number_class::box_number_object,
-    symbol_class::box_symbol_object,
     string_class::box_string_object,
-    WellKnownSymbol,
+    symbol_class::box_symbol_object,
 };
 
 pub(super) static OBJECT_INTRINSIC: ObjectIntrinsic = ObjectIntrinsic;
@@ -651,9 +650,13 @@ fn object_to_string_tag(
         VmNativeCallError::Internal(format!("toString kind lookup failed: {error:?}").into())
     })? {
         HeapValueKind::Array => Ok("Array"),
-        HeapValueKind::HostFunction | HeapValueKind::Closure | HeapValueKind::BoundFunction => {
-            Ok("Function")
-        }
+        HeapValueKind::HostFunction
+        | HeapValueKind::Closure
+        | HeapValueKind::BoundFunction
+        | HeapValueKind::PromiseCapabilityFunction
+        | HeapValueKind::PromiseCombinatorElement
+        | HeapValueKind::PromiseFinallyFunction
+        | HeapValueKind::PromiseValueThunk => Ok("Function"),
         HeapValueKind::Object
         | HeapValueKind::String
         | HeapValueKind::UpvalueCell
@@ -665,6 +668,7 @@ fn object_to_string_tag(
         HeapValueKind::SetIterator => Ok("Set Iterator"),
         HeapValueKind::WeakMap => Ok("WeakMap"),
         HeapValueKind::WeakSet => Ok("WeakSet"),
+        HeapValueKind::Generator => Ok("Generator"),
     }
 }
 
@@ -1385,10 +1389,7 @@ fn object_from_entries(
         )?);
     };
 
-    if matches!(
-        runtime.objects().kind(arr_handle),
-        Ok(HeapValueKind::Array)
-    ) {
+    if matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array)) {
         let length = runtime
             .objects()
             .array_length(arr_handle)
@@ -1430,12 +1431,9 @@ fn object_to_locale_string(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     // Calls this.toString().
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("toLocaleString requires object receiver".into())
-        })?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("toLocaleString requires object receiver".into())
+    })?;
     let to_string_prop = runtime.intern_property_name("toString");
     let to_string = runtime
         .ordinary_get(handle, to_string_prop, *this)
@@ -1448,14 +1446,10 @@ fn object_to_locale_string(
     {
         return runtime.call_callable(callable, *this, &[]);
     }
-    let text = runtime
-        .js_to_string(*this)
-        .map_err(|e| match e {
-            crate::interpreter::InterpreterError::UncaughtThrow(v) => {
-                VmNativeCallError::Thrown(v)
-            }
-            other => VmNativeCallError::Internal(format!("{other}").into()),
-        })?;
+    let text = runtime.js_to_string(*this).map_err(|e| match e {
+        crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+        other => VmNativeCallError::Internal(format!("{other}").into()),
+    })?;
     let handle = runtime.alloc_string(text);
     Ok(RegisterValue::from_object_handle(handle.0))
 }

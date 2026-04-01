@@ -79,13 +79,14 @@ impl<'a> FunctionCompiler<'a> {
             }
             // §15.7 ClassExpression
             // Spec: <https://tc39.es/ecma262/#sec-class-definitions-runtime-semantics-evaluation>
-            Expression::ClassExpression(class) => {
-                self.compile_class_expression(class, module)
-            }
+            Expression::ClassExpression(class) => self.compile_class_expression(class, module),
             // §13.3.7 Optional Chaining (`?.`)
             // Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
-            Expression::ChainExpression(chain) => {
-                self.compile_chain_expression(chain, module)
+            Expression::ChainExpression(chain) => self.compile_chain_expression(chain, module),
+            // §14.4 Yield — `yield expr` / `yield`
+            // Spec: <https://tc39.es/ecma262/#sec-yield>
+            Expression::YieldExpression(yield_expr) => {
+                self.compile_yield_expression(yield_expr, module)
             }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
@@ -1260,7 +1261,11 @@ impl<'a> FunctionCompiler<'a> {
                     )
                 })?,
             &params,
-            FunctionKind::Ordinary,
+            if function.generator {
+                FunctionKind::Generator
+            } else {
+                FunctionKind::Ordinary
+            },
             Some(self.env.clone()),
             self.strict_mode
                 || super::ast::has_use_strict_directive(
@@ -1274,7 +1279,11 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
-        self.emit_new_closure(destination, reserved, &compiled.captures)?;
+        if function.generator {
+            self.emit_new_closure_generator(destination, reserved, &compiled.captures)?;
+        } else {
+            self.emit_new_closure(destination, reserved, &compiled.captures)?;
+        }
         Ok(ValueLocation::temp(destination))
     }
 
@@ -1423,8 +1432,10 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let destination = self.alloc_temp();
-        let len = u16::try_from(array.elements.len()).map_err(|_| SourceLoweringError::TooManyLocals)?;
-        self.instructions.push(Instruction::new_array(destination, len));
+        let len =
+            u16::try_from(array.elements.len()).map_err(|_| SourceLoweringError::TooManyLocals)?;
+        self.instructions
+            .push(Instruction::new_array(destination, len));
 
         for (index, element) in array.elements.iter().enumerate() {
             let expr = match element {
@@ -1707,6 +1718,38 @@ impl<'a> FunctionCompiler<'a> {
         })
     }
 
+    /// §14.4 Yield — `yield expr` or bare `yield` (produces undefined).
+    /// Spec: <https://tc39.es/ecma262/#sec-yield>
+    ///
+    /// Emits `Yield dst, value` which suspends the generator.
+    /// On resume, the sent value (from `.next(v)`) is written to `dst`.
+    fn compile_yield_expression(
+        &mut self,
+        yield_expr: &oxc_ast::ast::YieldExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        if yield_expr.delegate {
+            // yield* — delegate to sub-iterator. Not yet implemented.
+            return Err(SourceLoweringError::Unsupported(
+                "yield* (delegating yield) is not implemented yet".to_string(),
+            ));
+        }
+
+        let value = if let Some(argument) = &yield_expr.argument {
+            self.compile_expression(argument, module)?
+        } else {
+            self.load_undefined()?
+        };
+
+        // Yield suspends execution and returns `value` to the caller.
+        // The register `dst` will receive the sent value when resumed.
+        let dst = self.allocate_local()?;
+        self.instructions
+            .push(Instruction::yield_(dst, value.register));
+        self.release(value);
+        Ok(ValueLocation::local(dst))
+    }
+
     /// §13.3.7 Optional Chaining — `obj?.prop`, `obj?.[key]`, `obj?.method()`
     /// Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
     ///
@@ -1721,8 +1764,7 @@ impl<'a> FunctionCompiler<'a> {
 
         // Pre-allocate result with `undefined` for the short-circuit path.
         let result = self.allocate_local()?;
-        self.instructions
-            .push(Instruction::load_undefined(result));
+        self.instructions.push(Instruction::load_undefined(result));
 
         match &chain.expression {
             ChainElement::StaticMemberExpression(member) => {
@@ -1733,20 +1775,24 @@ impl<'a> FunctionCompiler<'a> {
                 let null_val = self.load_null()?;
                 let is_nullish = ValueLocation::temp(self.alloc_temp());
                 self.instructions.push(Instruction::loose_eq(
-                    is_nullish.register, base.register, null_val.register,
+                    is_nullish.register,
+                    base.register,
+                    null_val.register,
                 ));
                 self.release(null_val);
-                let jump_end = self.emit_conditional_placeholder(
-                    Opcode::JumpIfTrue, is_nullish.register,
-                );
+                let jump_end =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, is_nullish.register);
                 self.release(is_nullish);
 
                 let prop = self.intern_property_name(member.property.name.as_str())?;
                 let val = ValueLocation::temp(self.alloc_temp());
                 self.instructions.push(Instruction::get_property(
-                    val.register, base.register, prop,
+                    val.register,
+                    base.register,
+                    prop,
                 ));
-                self.instructions.push(Instruction::move_(result, val.register));
+                self.instructions
+                    .push(Instruction::move_(result, val.register));
                 self.release(val);
                 let end = self.instructions.len();
                 self.patch_jump(jump_end, end)?;
@@ -1758,21 +1804,25 @@ impl<'a> FunctionCompiler<'a> {
                 let null_val = self.load_null()?;
                 let is_nullish = ValueLocation::temp(self.alloc_temp());
                 self.instructions.push(Instruction::loose_eq(
-                    is_nullish.register, base.register, null_val.register,
+                    is_nullish.register,
+                    base.register,
+                    null_val.register,
                 ));
                 self.release(null_val);
-                let jump_end = self.emit_conditional_placeholder(
-                    Opcode::JumpIfTrue, is_nullish.register,
-                );
+                let jump_end =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, is_nullish.register);
                 self.release(is_nullish);
 
                 let key = self.compile_expression(&member.expression, module)?;
                 let val = ValueLocation::temp(self.alloc_temp());
                 self.instructions.push(Instruction::get_index(
-                    val.register, base.register, key.register,
+                    val.register,
+                    base.register,
+                    key.register,
                 ));
                 self.release(key);
-                self.instructions.push(Instruction::move_(result, val.register));
+                self.instructions
+                    .push(Instruction::move_(result, val.register));
                 self.release(val);
                 let end = self.instructions.len();
                 self.patch_jump(jump_end, end)?;
@@ -1800,7 +1850,11 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
-        let class_name = class.id.as_ref().map(|id| id.name.as_str()).unwrap_or("anonymous");
+        let class_name = class
+            .id
+            .as_ref()
+            .map(|id| id.name.as_str())
+            .unwrap_or("anonymous");
 
         // First pass: extract constructor.
         let mut constructor = None;
@@ -1841,7 +1895,12 @@ impl<'a> FunctionCompiler<'a> {
         };
 
         if let Some(super_class) = super_class {
-            self.emit_object_method_call("setPrototypeOf", constructor_value, &[super_class], module)?;
+            self.emit_object_method_call(
+                "setPrototypeOf",
+                constructor_value,
+                &[super_class],
+                module,
+            )?;
         }
 
         let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
@@ -1898,8 +1957,10 @@ impl<'a> FunctionCompiler<'a> {
         for (i, expression) in template.expressions.iter().enumerate() {
             let expr_val = self.compile_expression(expression, module)?;
             let expr_string = ValueLocation::temp(self.alloc_temp());
-            self.instructions
-                .push(Instruction::to_string(expr_string.register, expr_val.register));
+            self.instructions.push(Instruction::to_string(
+                expr_string.register,
+                expr_val.register,
+            ));
             self.release(expr_val);
             let dst = if result.is_temp {
                 result

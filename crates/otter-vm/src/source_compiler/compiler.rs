@@ -273,6 +273,7 @@ impl<'a> FunctionCompiler<'a> {
                     reserved: reserved_index,
                     closure_register,
                     captures: Vec::new(),
+                    is_generator: function.generator,
                 },
             ));
         }
@@ -301,7 +302,11 @@ impl<'a> FunctionCompiler<'a> {
                         )
                     })?,
                 &extract_function_params(function)?,
-                FunctionKind::Ordinary,
+                if function.generator {
+                    FunctionKind::Generator
+                } else {
+                    FunctionKind::Ordinary
+                },
                 Some(self.env.clone()),
                 self.strict_mode
                     || super::ast::has_use_strict_directive(
@@ -317,6 +322,7 @@ impl<'a> FunctionCompiler<'a> {
                 captures: compiled.captures,
                 reserved: pending.reserved,
                 closure_register: pending.closure_register,
+                is_generator: function.generator,
             });
         }
 
@@ -325,11 +331,19 @@ impl<'a> FunctionCompiler<'a> {
 
     pub(super) fn emit_hoisted_function_initializers(&mut self) -> Result<(), SourceLoweringError> {
         for pending in self.hoisted_functions.clone() {
-            self.emit_new_closure(
-                pending.closure_register,
-                pending.reserved,
-                &pending.captures,
-            )?;
+            if pending.is_generator {
+                self.emit_new_closure_generator(
+                    pending.closure_register,
+                    pending.reserved,
+                    &pending.captures,
+                )?;
+            } else {
+                self.emit_new_closure(
+                    pending.closure_register,
+                    pending.reserved,
+                    &pending.captures,
+                )?;
+            }
             self.mirror_script_binding_to_global_by_register(pending.closure_register)?;
         }
         Ok(())
@@ -372,7 +386,8 @@ impl<'a> FunctionCompiler<'a> {
                 tables,
             )
             .with_strict(self.strict_mode)
-            .with_derived_constructor(self.is_derived_constructor),
+            .with_derived_constructor(self.is_derived_constructor)
+            .with_generator(self.kind == FunctionKind::Generator),
             captures: self.captures,
         })
     }
@@ -754,7 +769,9 @@ impl<'a> FunctionCompiler<'a> {
         target: ValueLocation,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
-        use super::ast::{expected_function_length, extract_function_params, non_computed_property_key_name};
+        use super::ast::{
+            expected_function_length, extract_function_params, non_computed_property_key_name,
+        };
 
         // Determine method name for debug/display.
         let method_name = if method.computed {
@@ -969,7 +986,8 @@ impl<'a> FunctionCompiler<'a> {
         compiler
             .instructions
             .push(Instruction::call_super_forward(forwarded.register));
-        if let Some(Binding::ThisRegister(this_register)) = compiler.env.bindings.get("this").copied()
+        if let Some(Binding::ThisRegister(this_register)) =
+            compiler.env.bindings.get("this").copied()
             && this_register != forwarded.register
         {
             compiler
@@ -1048,10 +1066,12 @@ impl<'a> FunctionCompiler<'a> {
             callee
         };
 
-        let argument_count =
-            RegisterIndex::try_from(args.len() + 1).map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let argument_count = RegisterIndex::try_from(args.len() + 1)
+            .map_err(|_| SourceLoweringError::TooManyLocals)?;
         let arg_start = self.reserve_temp_window(argument_count)?;
-        let values: Vec<ValueLocation> = std::iter::once(receiver).chain(args.iter().copied()).collect();
+        let values: Vec<ValueLocation> = std::iter::once(receiver)
+            .chain(args.iter().copied())
+            .collect();
         for (offset, value) in values.into_iter().enumerate() {
             let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
             if value.register != destination {
@@ -1063,8 +1083,11 @@ impl<'a> FunctionCompiler<'a> {
 
         let result = self.alloc_temp();
         let pc = self.instructions.len();
-        self.instructions
-            .push(Instruction::call_closure(result, callee.register, arg_start));
+        self.instructions.push(Instruction::call_closure(
+            result,
+            callee.register,
+            arg_start,
+        ));
         self.record_call_site(
             pc,
             CallSite::Closure(ClosureCall::new_with_receiver(
@@ -1208,6 +1231,20 @@ impl<'a> FunctionCompiler<'a> {
             callee,
             explicit_captures,
             crate::object::ClosureFlags::arrow(),
+        )
+    }
+
+    pub(super) fn emit_new_closure_generator(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::generator(),
         )
     }
 
@@ -1398,11 +1435,14 @@ impl<'a> FunctionCompiler<'a> {
             .env
             .bindings
             .iter()
-            .find(|(_, binding)| matches!(
-                binding,
-                Binding::Function { closure_register } if *closure_register == register
-            ))
-            .map(|(name, _)| name.clone()) else {
+            .find(|(_, binding)| {
+                matches!(
+                    binding,
+                    Binding::Function { closure_register } if *closure_register == register
+                )
+            })
+            .map(|(name, _)| name.clone())
+        else {
             return Ok(());
         };
         let property = self.intern_property_name(&name)?;
@@ -1575,7 +1615,9 @@ impl<'a> FunctionCompiler<'a> {
                 LoweringMode::Script => self.load_undefined()?,
                 LoweringMode::Test262Basic => self.load_i32(0)?,
             },
-            FunctionKind::Ordinary | FunctionKind::Arrow => self.load_undefined()?,
+            FunctionKind::Ordinary | FunctionKind::Arrow | FunctionKind::Generator => {
+                self.load_undefined()?
+            }
         };
         self.instructions.push(Instruction::ret(value.register));
         self.release(value);

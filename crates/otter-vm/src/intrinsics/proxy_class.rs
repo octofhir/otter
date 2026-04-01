@@ -20,11 +20,13 @@ impl IntrinsicInstaller for ProxyIntrinsic {
         intrinsics: &mut VmIntrinsics,
         cx: &mut IntrinsicInstallContext<'_>,
     ) -> Result<(), IntrinsicsError> {
-        let constructor_id = cx.native_functions.register(NativeFunctionDescriptor::constructor(
-            "Proxy",
-            2,
-            proxy_constructor,
-        ));
+        let constructor_id = cx
+            .native_functions
+            .register(NativeFunctionDescriptor::constructor(
+                "Proxy",
+                2,
+                proxy_constructor,
+            ));
         let constructor =
             cx.alloc_intrinsic_host_function(constructor_id, intrinsics.function_prototype())?;
         install_function_length_name(constructor, 2, "Proxy", cx)?;
@@ -70,7 +72,9 @@ fn proxy_constructor(
     )?;
 
     let prototype = runtime.objects().get_prototype(target).map_err(|error| {
-        VmNativeCallError::Internal(format!("Proxy target prototype lookup failed: {error:?}").into())
+        VmNativeCallError::Internal(
+            format!("Proxy target prototype lookup failed: {error:?}").into(),
+        )
     })?;
     let proxy = runtime.alloc_object_with_prototype(prototype);
     define_hidden_slot(proxy, PROXY_TARGET_SLOT, target, runtime)?;
@@ -110,7 +114,9 @@ fn define_hidden_slot(
             ),
         )
         .map_err(|error| {
-            VmNativeCallError::Internal(format!("Proxy internal slot install failed: {error:?}").into())
+            VmNativeCallError::Internal(
+                format!("Proxy internal slot install failed: {error:?}").into(),
+            )
         })?;
     Ok(())
 }

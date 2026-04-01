@@ -280,6 +280,17 @@ impl Activation {
         &self.registers
     }
 
+    /// Saves the entire register window as a boxed slice for generator suspension.
+    pub fn save_registers(&self) -> Box<[RegisterValue]> {
+        self.registers.clone()
+    }
+
+    /// Restores a previously saved register window into this activation.
+    pub fn restore_registers(&mut self, saved: &[RegisterValue]) {
+        let copy_len = saved.len().min(self.registers.len());
+        self.registers[..copy_len].copy_from_slice(&saved[..copy_len]);
+    }
+
     fn receiver_slot(&self, function: &Function) -> Result<RegisterIndex, InterpreterError> {
         function
             .frame_layout()
@@ -475,6 +486,13 @@ enum StepOutcome {
         awaited_promise: ObjectHandle,
         /// The register where the await result should be written on resume.
         resume_register: crate::frame::RegisterIndex,
+    },
+    /// The generator should yield a value and suspend.
+    GeneratorYield {
+        /// The value being yielded.
+        yielded_value: RegisterValue,
+        /// The register where the sent value should be written on resume.
+        resume_register: u16,
     },
 }
 
@@ -1720,6 +1738,62 @@ impl RuntimeState {
             return self.call_host_function(Some(target), bound_this, &full_args);
         }
 
+        // ES2024 §27.2.1.3 — Promise capability resolve/reject functions.
+        if let Ok(HeapValueKind::PromiseCapabilityFunction) = self.objects.kind(callable) {
+            let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+            Interpreter::invoke_promise_capability_function(self, callable, value)
+                .map_err(|e| match e {
+                    InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                    other => VmNativeCallError::Internal(format!("{other}").into()),
+                })?;
+            return Ok(RegisterValue::undefined());
+        }
+
+        // Promise combinator/finally/thunk dispatch.
+        match self.objects.kind(callable) {
+            Ok(HeapValueKind::PromiseCombinatorElement) => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                return Interpreter::invoke_promise_combinator_element(self, callable, value)
+                    .map_err(|e| match e {
+                        InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    });
+            }
+            Ok(HeapValueKind::PromiseFinallyFunction) => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                return Interpreter::invoke_promise_finally_function(self, callable, value)
+                    .map_err(|e| match e {
+                        InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                        other => VmNativeCallError::Internal(format!("{other}").into()),
+                    });
+            }
+            Ok(HeapValueKind::PromiseValueThunk) => {
+                if let Some((v, k)) = self.objects.promise_value_thunk_info(callable) {
+                    return match k {
+                        crate::promise::PromiseFinallyKind::ThenFinally => Ok(v),
+                        crate::promise::PromiseFinallyKind::CatchFinally => {
+                            Err(VmNativeCallError::Thrown(v))
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+
+        // If it's a Closure (compiled JS function), dispatch through Interpreter::call_function.
+        if let Ok(HeapValueKind::Closure) = self.objects.kind(callable) {
+            // call_function ignores the module param for closures (gets it from the closure).
+            // We need a Module reference, so extract from the closure itself.
+            let module = self.objects.closure_module(callable).map_err(|e| {
+                VmNativeCallError::Internal(format!("closure module lookup: {e:?}").into())
+            })?;
+            return Interpreter::call_function(self, &module, callable, receiver, arguments)
+                .map_err(|e| match e {
+                    InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                    other => VmNativeCallError::Internal(format!("{other}").into()),
+                });
+        }
+
         let host_function = self
             .objects
             .host_function(callable)
@@ -1942,14 +2016,14 @@ impl RuntimeState {
                             Completion::Throw(RegisterValue::from_object_handle(error.0))
                         }
                         Completion::Return(_) => {
-                            let this_value = if callee_function.frame_layout().receiver_slot().is_some()
-                            {
-                                activation.receiver(callee_function).map_err(|error| {
-                                    VmNativeCallError::Internal(format!("{error}").into())
-                                })?
-                            } else {
-                                RegisterValue::undefined()
-                            };
+                            let this_value =
+                                if callee_function.frame_layout().receiver_slot().is_some() {
+                                    activation.receiver(callee_function).map_err(|error| {
+                                        VmNativeCallError::Internal(format!("{error}").into())
+                                    })?
+                                } else {
+                                    RegisterValue::undefined()
+                                };
                             if this_value.as_object_handle().is_some() {
                                 Completion::Return(this_value)
                             } else {
@@ -2205,12 +2279,14 @@ impl RuntimeState {
 
         for method_name in method_names {
             let property = self.intern_property_name(method_name);
-            let method = self
-                .ordinary_get(handle, property, value)
-                .map_err(|error| match error {
-                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
-                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
-                })?;
+            let method =
+                self.ordinary_get(handle, property, value)
+                    .map_err(|error| match error {
+                        VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                        VmNativeCallError::Internal(message) => {
+                            InterpreterError::NativeCall(message)
+                        }
+                    })?;
             let Some(callable) = method.as_object_handle().map(ObjectHandle) else {
                 continue;
             };
@@ -2247,13 +2323,14 @@ impl RuntimeState {
             return Ok(value);
         }
 
-        let to_primitive = self.intern_symbol_property_name(WellKnownSymbol::ToPrimitive.stable_id());
-        let exotic = self
-            .ordinary_get(handle, to_primitive, value)
-            .map_err(|error| match error {
-                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
-                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
-            })?;
+        let to_primitive =
+            self.intern_symbol_property_name(WellKnownSymbol::ToPrimitive.stable_id());
+        let exotic =
+            self.ordinary_get(handle, to_primitive, value)
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+                })?;
 
         if exotic != RegisterValue::undefined() && exotic != RegisterValue::null() {
             let Some(callable) = exotic.as_object_handle().map(ObjectHandle) else {
@@ -2628,6 +2705,27 @@ impl RuntimeState {
         Ok(handle)
     }
 
+    /// Creates a { status: "...", [value_key]: value } object for Promise.allSettled.
+    /// ES2024 §27.2.4.2.1–2
+    pub fn alloc_settled_result_object(
+        &mut self,
+        status: &str,
+        value_key: &str,
+        value: RegisterValue,
+    ) -> ObjectHandle {
+        let obj = self.alloc_object();
+        let status_prop = self.intern_property_name("status");
+        let status_str = self.objects.alloc_string(status);
+        let _ = self.objects.set_property(
+            obj,
+            status_prop,
+            RegisterValue::from_object_handle(status_str.0),
+        );
+        let value_prop = self.intern_property_name(value_key);
+        let _ = self.objects.set_property(obj, value_prop, value);
+        obj
+    }
+
     /// Checks whether a value is a string type (heap string or string wrapper).
     fn value_is_string(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
@@ -2684,7 +2782,11 @@ impl RuntimeState {
                 HeapValueKind::String => "string",
                 HeapValueKind::HostFunction
                 | HeapValueKind::Closure
-                | HeapValueKind::BoundFunction => "function",
+                | HeapValueKind::BoundFunction
+                | HeapValueKind::PromiseCapabilityFunction
+                | HeapValueKind::PromiseCombinatorElement
+                | HeapValueKind::PromiseFinallyFunction
+                | HeapValueKind::PromiseValueThunk => "function",
                 HeapValueKind::Object
                 | HeapValueKind::Array
                 | HeapValueKind::UpvalueCell
@@ -2695,7 +2797,8 @@ impl RuntimeState {
                 | HeapValueKind::MapIterator
                 | HeapValueKind::SetIterator
                 | HeapValueKind::WeakMap
-                | HeapValueKind::WeakSet => "object",
+                | HeapValueKind::WeakSet
+                | HeapValueKind::Generator => "object",
             }
         } else {
             "undefined"
@@ -2703,6 +2806,54 @@ impl RuntimeState {
 
         let string = self.alloc_string(kind);
         Ok(RegisterValue::from_object_handle(string.0))
+    }
+
+    // ─── Generator Support (§27.5) ────────────────────────────────────
+
+    /// Creates a `{ value, done }` iterator result object.
+    /// Convenience wrapper around `create_iter_result_object`.
+    pub fn create_iter_result(
+        &mut self,
+        value: RegisterValue,
+        done: bool,
+    ) -> Result<ObjectHandle, VmNativeCallError> {
+        let obj = self.alloc_object();
+        let value_prop = self.intern_property_name("value");
+        let done_prop = self.intern_property_name("done");
+        self.objects
+            .set_property(obj, value_prop, value)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        self.objects
+            .set_property(obj, done_prop, RegisterValue::from_bool(done))
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        Ok(obj)
+    }
+
+    /// Allocates a generator object in SuspendedStart state.
+    ///
+    /// Called when a generator function is invoked — instead of executing the
+    /// body, we create a generator object that will lazily execute on `.next()`.
+    pub fn alloc_generator(
+        &mut self,
+        module: Module,
+        function_index: FunctionIndex,
+        closure_handle: Option<ObjectHandle>,
+        arguments: Vec<RegisterValue>,
+    ) -> ObjectHandle {
+        let prototype = self.intrinsics.generator_prototype();
+        self.objects
+            .alloc_generator(Some(prototype), module, function_index, closure_handle, arguments)
+    }
+
+    /// Resumes a suspended generator. Called by the native `.next()`, `.return()`,
+    /// and `.throw()` methods on `%GeneratorPrototype%`.
+    pub(crate) fn resume_generator(
+        &mut self,
+        generator: ObjectHandle,
+        sent_value: RegisterValue,
+        resume_kind: crate::intrinsics::GeneratorResumeKind,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        Interpreter::resume_generator_impl(self, generator, sent_value, resume_kind)
     }
 }
 
@@ -2919,9 +3070,316 @@ impl Interpreter {
                 let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
                 Ok(result.return_value())
             }
+            HeapValueKind::PromiseCapabilityFunction => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                Self::invoke_promise_capability_function(runtime, callable, value)?;
+                Ok(RegisterValue::undefined())
+            }
+            HeapValueKind::PromiseCombinatorElement => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                Self::invoke_promise_combinator_element(runtime, callable, value)
+            }
+            HeapValueKind::PromiseFinallyFunction => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                Self::invoke_promise_finally_function(runtime, callable, value)
+            }
+            HeapValueKind::PromiseValueThunk => {
+                // §27.2.5.3.1 step 8 / §27.2.5.3.2 step 8
+                let (thunk_value, thunk_kind) = runtime
+                    .objects
+                    .promise_value_thunk_info(callable)
+                    .ok_or(InterpreterError::InvalidHeapValueKind)?;
+                match thunk_kind {
+                    crate::promise::PromiseFinallyKind::ThenFinally => Ok(thunk_value),
+                    crate::promise::PromiseFinallyKind::CatchFinally => {
+                        Err(InterpreterError::UncaughtThrow(thunk_value))
+                    }
+                }
+            }
             _ => Err(InterpreterError::TypeError(
                 format!("{kind:?} is not a function").into(),
             )),
+        }
+    }
+
+    /// Invokes a PromiseCapabilityFunction (resolve or reject) with a value.
+    /// ES2024 §27.2.1.3.1 Promise Reject Functions / §27.2.1.3.2 Promise Resolve Functions
+    fn invoke_promise_capability_function(
+        runtime: &mut RuntimeState,
+        callable: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(), InterpreterError> {
+        let (promise_handle, kind) = runtime
+            .objects
+            .promise_capability_function_info(callable)
+            .ok_or_else(|| {
+                InterpreterError::TypeError("not a promise capability function".into())
+            })?;
+
+        let promise = runtime
+            .objects
+            .get_promise_mut(promise_handle)
+            .ok_or_else(|| {
+                InterpreterError::TypeError("promise capability target is not a promise".into())
+            })?;
+
+        // §27.2.1.3: If alreadyResolved is true, return undefined.
+        // We use is_pending() — once settled, further calls are no-ops.
+        if !promise.is_pending() {
+            return Ok(());
+        }
+
+        let jobs = match kind {
+            crate::promise::ReactionKind::Fulfill => {
+                // §27.2.1.3.2 step 8: If value is the same promise, reject with TypeError.
+                if let Some(h) = value.as_object_handle() {
+                    if h == promise_handle.0 {
+                        let err_handle = runtime
+                            .alloc_type_error("A promise cannot be resolved with itself")
+                            .map_err(|_| InterpreterError::InvalidHeapValueKind)?;
+                        let promise = runtime.objects.get_promise_mut(promise_handle).unwrap();
+                        promise.reject(RegisterValue::from_object_handle(err_handle.0))
+                    } else {
+                        // §27.2.1.3.2 step 9-11: If value is a thenable (another promise),
+                        // we need to chain. For now, check if value is a promise and chain.
+                        if runtime.objects.get_promise(ObjectHandle(h)).is_some() {
+                            // Value is a promise — register then reactions to forward settlement.
+                            Self::chain_promise_resolution(runtime, promise_handle, ObjectHandle(h));
+                            return Ok(());
+                        }
+                        let promise = runtime.objects.get_promise_mut(promise_handle).unwrap();
+                        promise.fulfill(value)
+                    }
+                } else {
+                    promise.fulfill(value)
+                }
+            }
+            crate::promise::ReactionKind::Reject => promise.reject(value),
+        };
+
+        if let Some(jobs) = jobs {
+            for job in jobs {
+                runtime.microtasks_mut().enqueue_promise_job(job);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Chains a thenable promise resolution: when `thenable` settles, forward to `promise`.
+    /// ES2024 §27.2.1.3.2 step 12 — HostEnqueuePromiseJob(PromiseResolveThenableJob)
+    fn chain_promise_resolution(
+        runtime: &mut RuntimeState,
+        promise: ObjectHandle,
+        thenable: ObjectHandle,
+    ) {
+        // Get or create resolve/reject for the target promise.
+        let resolve = runtime.objects.alloc_promise_capability_function(
+            promise,
+            crate::promise::ReactionKind::Fulfill,
+        );
+        let reject = runtime.objects.alloc_promise_capability_function(
+            promise,
+            crate::promise::ReactionKind::Reject,
+        );
+
+        let capability = crate::promise::PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        };
+
+        // Register reactions on the thenable.
+        let thenable_promise = runtime
+            .objects
+            .get_promise_mut(thenable)
+            .expect("thenable verified as promise");
+
+        if let Some(immediate_job) = thenable_promise.then(
+            Some(resolve),
+            Some(reject),
+            capability,
+        ) {
+            runtime.microtasks_mut().enqueue_promise_job(immediate_job);
+        }
+    }
+
+    /// Invokes a PromiseCombinatorElement (per-element resolve/reject for all/allSettled/any).
+    /// ES2024 §27.2.4.1.1, §27.2.4.2.1–2, §27.2.4.3.1
+    fn invoke_promise_combinator_element(
+        runtime: &mut RuntimeState,
+        callable: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        use crate::promise::PromiseCombinatorKind;
+
+        // Extract all fields from the combinator element.
+        let (combinator_kind, index, result_array, remaining_counter, result_cap, already_called) =
+            runtime
+                .objects
+                .promise_combinator_element_info(callable)
+                .ok_or_else(|| {
+                    InterpreterError::TypeError("not a promise combinator element".into())
+                })?;
+
+        // §27.2.4.1.1 step 1: If alreadyCalled is true, return undefined.
+        if already_called {
+            return Ok(RegisterValue::undefined());
+        }
+
+        // Set alreadyCalled to true.
+        runtime.objects.set_combinator_element_called(callable);
+
+        match combinator_kind {
+            PromiseCombinatorKind::AllResolve => {
+                // §27.2.4.1.1: Store value at result_array[index].
+                let _ = runtime
+                    .objects
+                    .set_index(result_array, index as usize, value);
+
+                // Decrement remaining counter.
+                if Self::decrement_combinator_counter(runtime, remaining_counter) {
+                    // All elements resolved — fulfill the result promise with the array.
+                    Self::invoke_promise_capability_function(
+                        runtime,
+                        result_cap.resolve,
+                        RegisterValue::from_object_handle(result_array.0),
+                    )?;
+                }
+            }
+            PromiseCombinatorKind::AllSettledResolve => {
+                // §27.2.4.2.1: Create { status: "fulfilled", value: value }.
+                let obj = runtime.alloc_settled_result_object("fulfilled", "value", value);
+                let _ = runtime.objects.set_index(
+                    result_array,
+                    index as usize,
+                    RegisterValue::from_object_handle(obj.0),
+                );
+
+                if Self::decrement_combinator_counter(runtime, remaining_counter) {
+                    Self::invoke_promise_capability_function(
+                        runtime,
+                        result_cap.resolve,
+                        RegisterValue::from_object_handle(result_array.0),
+                    )?;
+                }
+            }
+            PromiseCombinatorKind::AllSettledReject => {
+                // §27.2.4.2.2: Create { status: "rejected", reason: value }.
+                let obj = runtime.alloc_settled_result_object("rejected", "reason", value);
+                let _ = runtime.objects.set_index(
+                    result_array,
+                    index as usize,
+                    RegisterValue::from_object_handle(obj.0),
+                );
+
+                if Self::decrement_combinator_counter(runtime, remaining_counter) {
+                    Self::invoke_promise_capability_function(
+                        runtime,
+                        result_cap.resolve,
+                        RegisterValue::from_object_handle(result_array.0),
+                    )?;
+                }
+            }
+            PromiseCombinatorKind::AnyReject => {
+                // §27.2.4.3.1: Store error at result_array[index] (errors array).
+                let _ = runtime
+                    .objects
+                    .set_index(result_array, index as usize, value);
+
+                if Self::decrement_combinator_counter(runtime, remaining_counter) {
+                    // All elements rejected — reject with AggregateError.
+                    let err = runtime
+                        .alloc_type_error("All promises were rejected")
+                        .map_err(|_| InterpreterError::InvalidHeapValueKind)?;
+                    // Attach errors array as property.
+                    let errors_prop = runtime.intern_property_name("errors");
+                    let _ = runtime.objects.set_property(
+                        err,
+                        errors_prop,
+                        RegisterValue::from_object_handle(result_array.0),
+                    );
+                    Self::invoke_promise_capability_function(
+                        runtime,
+                        result_cap.reject,
+                        RegisterValue::from_object_handle(err.0),
+                    )?;
+                }
+            }
+        }
+
+        Ok(RegisterValue::undefined())
+    }
+
+    /// Decrements the counter in remaining_counter[0] and returns true if it reached 0.
+    fn decrement_combinator_counter(
+        runtime: &mut RuntimeState,
+        counter_handle: ObjectHandle,
+    ) -> bool {
+        let Ok(elements) = runtime.objects.array_elements(counter_handle) else {
+            return false;
+        };
+        let count = elements
+            .first()
+            .and_then(|v| v.as_i32())
+            .unwrap_or(0);
+        let new_count = count - 1;
+        let _ = runtime
+            .objects
+            .set_index(counter_handle, 0, RegisterValue::from_i32(new_count));
+        new_count == 0
+    }
+
+    /// Invokes a PromiseFinallyFunction (ThenFinally/CatchFinally wrapper).
+    /// ES2024 §27.2.5.3.1–2
+    fn invoke_promise_finally_function(
+        runtime: &mut RuntimeState,
+        callable: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        use crate::promise::PromiseFinallyKind;
+
+        let (on_finally, _constructor, kind) = runtime
+            .objects
+            .promise_finally_function_info(callable)
+            .ok_or_else(|| {
+                InterpreterError::TypeError("not a promise finally function".into())
+            })?;
+
+        // Call onFinally() with no arguments.
+        let finally_result = runtime.call_host_function(
+            Some(on_finally),
+            RegisterValue::undefined(),
+            &[],
+        );
+
+        match kind {
+            PromiseFinallyKind::ThenFinally => {
+                // §27.2.5.3.1: If onFinally() throws, propagate.
+                // If it returns normally, return the original value.
+                match finally_result {
+                    Ok(_) => Ok(value),
+                    Err(VmNativeCallError::Thrown(thrown)) => {
+                        Err(InterpreterError::UncaughtThrow(thrown))
+                    }
+                    Err(VmNativeCallError::Internal(msg)) => {
+                        Err(InterpreterError::NativeCall(msg))
+                    }
+                }
+            }
+            PromiseFinallyKind::CatchFinally => {
+                // §27.2.5.3.2: If onFinally() throws, propagate that throw.
+                // If it returns normally, re-throw the original reason.
+                match finally_result {
+                    Ok(_) => Err(InterpreterError::UncaughtThrow(value)),
+                    Err(VmNativeCallError::Thrown(thrown)) => {
+                        Err(InterpreterError::UncaughtThrow(thrown))
+                    }
+                    Err(VmNativeCallError::Internal(msg)) => {
+                        Err(InterpreterError::NativeCall(msg))
+                    }
+                }
+            }
         }
     }
 
@@ -3027,6 +3485,10 @@ impl Interpreter {
                         "await is not supported in this execution mode".into(),
                     ));
                 }
+                StepOutcome::GeneratorYield { .. } => {
+                    // Yield not supported in feedback-collection mode.
+                    return Ok(frame_runtime.property_feedback);
+                }
             }
         }
     }
@@ -3095,6 +3557,12 @@ impl Interpreter {
                     // when the event loop integrates suspend/resume).
                     runtime.restore_module(previous_module);
                     return Ok(Completion::Return(RegisterValue::undefined()));
+                }
+                StepOutcome::GeneratorYield { yielded_value, .. } => {
+                    // GeneratorYield inside a non-generator run loop — treat
+                    // as a return (shouldn't normally happen outside resume_generator).
+                    runtime.restore_module(previous_module);
+                    return Ok(Completion::Return(yielded_value));
                 }
             }
         }
@@ -3874,7 +4342,8 @@ impl Interpreter {
                 let primitive_base = runtime.is_primitive_property_base(base)?;
 
                 if primitive_base {
-                    let handled = Self::primitive_set_property(runtime, handle, base, property, value)?;
+                    let handled =
+                        Self::primitive_set_property(runtime, handle, base, property, value)?;
                     if !handled && function.is_strict() {
                         let error = runtime
                             .alloc_type_error("Cannot assign to property of primitive value")?;
@@ -3897,7 +4366,8 @@ impl Interpreter {
                                 runtime.objects.set_cached(handle, property, value, cache)?
                             }
                             Some(PropertyValue::Accessor { setter, .. }) => {
-                                let _ = runtime.call_callable_for_accessor(setter, base, &[value])?;
+                                let _ =
+                                    runtime.call_callable_for_accessor(setter, base, &[value])?;
                                 true
                             }
                             None => Self::generic_set_property(
@@ -4059,9 +4529,7 @@ impl Interpreter {
                 let handle = base
                     .as_object_handle()
                     .map(ObjectHandle)
-                    .ok_or(InterpreterError::TypeError(
-                        "Value is not iterable".into(),
-                    ))?;
+                    .ok_or(InterpreterError::TypeError("Value is not iterable".into()))?;
 
                 // Fast path: internal iterators for Array and String.
                 let iterator = match runtime.objects.alloc_iterator(handle) {
@@ -4071,16 +4539,12 @@ impl Interpreter {
                         let sym_iterator = runtime.intern_symbol_property_name(
                             super::WellKnownSymbol::Iterator.stable_id(),
                         );
-                        let method = runtime
-                            .ordinary_get(handle, sym_iterator, base)
-                            .map_err(|e| match e {
-                                VmNativeCallError::Thrown(v) => {
-                                    InterpreterError::UncaughtThrow(v)
-                                }
-                                VmNativeCallError::Internal(m) => {
-                                    InterpreterError::NativeCall(m)
-                                }
-                            })?;
+                        let method = runtime.ordinary_get(handle, sym_iterator, base).map_err(
+                            |e| match e {
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                            },
+                        )?;
                         let callable = method
                             .as_object_handle()
                             .map(ObjectHandle)
@@ -4088,22 +4552,22 @@ impl Interpreter {
                             .ok_or_else(|| {
                                 InterpreterError::TypeError("Value is not iterable".into())
                             })?;
-                        let iter_obj = runtime
-                            .call_callable(callable, base, &[])
-                            .map_err(|e| match e {
-                                VmNativeCallError::Thrown(v) => {
-                                    InterpreterError::UncaughtThrow(v)
-                                }
-                                VmNativeCallError::Internal(m) => {
-                                    InterpreterError::NativeCall(m)
-                                }
-                            })?;
-                        iter_obj
-                            .as_object_handle()
-                            .map(ObjectHandle)
-                            .ok_or(InterpreterError::TypeError(
+                        let iter_obj =
+                            runtime
+                                .call_callable(callable, base, &[])
+                                .map_err(|e| match e {
+                                    VmNativeCallError::Thrown(v) => {
+                                        InterpreterError::UncaughtThrow(v)
+                                    }
+                                    VmNativeCallError::Internal(m) => {
+                                        InterpreterError::NativeCall(m)
+                                    }
+                                })?;
+                        iter_obj.as_object_handle().map(ObjectHandle).ok_or(
+                            InterpreterError::TypeError(
                                 "Symbol.iterator must return an object".into(),
-                            ))?
+                            ),
+                        )?
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -4139,18 +4603,17 @@ impl Interpreter {
                                     "Iterator .next is not a function".into(),
                                 )
                             })?;
-                        let result_obj = runtime
-                            .call_callable(callable, iter_val, &[])
-                            .map_err(|e| match e {
+                        let result_obj = runtime.call_callable(callable, iter_val, &[]).map_err(
+                            |e| match e {
                                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-                            })?;
-                        let result_handle = result_obj
-                            .as_object_handle()
-                            .map(ObjectHandle)
-                            .ok_or(InterpreterError::TypeError(
+                            },
+                        )?;
+                        let result_handle = result_obj.as_object_handle().map(ObjectHandle).ok_or(
+                            InterpreterError::TypeError(
                                 "Iterator .next() must return an object".into(),
-                            ))?;
+                            ),
+                        )?;
                         let done_prop = runtime.intern_property_name("done");
                         let done_val = runtime
                             .ordinary_get(result_handle, done_prop, result_obj)
@@ -4234,11 +4697,7 @@ impl Interpreter {
                     None => RegisterValue::undefined(),
                 };
                 let type_val = runtime.js_typeof(val)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    type_val,
-                )?;
+                activation.write_bytecode_register(function, instruction.a(), type_val)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -4423,6 +4882,32 @@ impl Interpreter {
                     )));
                 }
 
+                // §27.3.3.1 — Generator function call: create a generator object
+                // instead of executing the body.
+                // Spec: <https://tc39.es/ecma262/#sec-generatorfunction-objects-call>
+                if matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
+                    && runtime
+                        .objects
+                        .closure_flags(callee)
+                        .is_ok_and(|flags| flags.is_generator())
+                {
+                    let callee_module = runtime.objects.closure_module(callee)?;
+                    let callee_fn_index = runtime.objects.closure_callee(callee)?;
+                    let gen_handle = runtime.alloc_generator(
+                        callee_module,
+                        callee_fn_index,
+                        Some(callee),
+                        arguments.clone(),
+                    );
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_object_handle(gen_handle.0),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+
                 if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callee) {
                     let receiver = Self::resolve_call_receiver(
                         caller_function,
@@ -4442,6 +4927,35 @@ impl Interpreter {
                             return Ok(StepOutcome::Throw(value));
                         }
                         Err(error) => return Err(error),
+                    }
+                }
+
+                // ES2024 §27.2.1.3 — Promise capability / combinator / finally functions.
+                if matches!(
+                    runtime.objects.kind(callee),
+                    Ok(HeapValueKind::PromiseCapabilityFunction
+                        | HeapValueKind::PromiseCombinatorElement
+                        | HeapValueKind::PromiseFinallyFunction
+                        | HeapValueKind::PromiseValueThunk)
+                ) {
+                    let receiver = Self::resolve_call_receiver(
+                        caller_function,
+                        activation,
+                        call.flags(),
+                        call.receiver(),
+                        None,
+                    )?;
+                    match Self::invoke_host_function_handle(
+                        runtime, callee, receiver, &arguments,
+                    )? {
+                        Completion::Return(value) => {
+                            activation.write_bytecode_register(function, instruction.a(), value)?;
+                            activation.advance();
+                            return Ok(StepOutcome::Continue);
+                        }
+                        Completion::Throw(value) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
                     }
                 }
 
@@ -4487,7 +5001,8 @@ impl Interpreter {
                 }
             }
             Opcode::CallSuper => {
-                if !function.is_derived_constructor() || !activation.metadata().flags().is_construct()
+                if !function.is_derived_constructor()
+                    || !activation.metadata().flags().is_construct()
                 {
                     let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
@@ -4508,10 +5023,8 @@ impl Interpreter {
                 let argc = instruction.c();
                 let mut arguments = Vec::with_capacity(usize::from(argc));
                 for offset in 0..argc {
-                    let value = activation.read_bytecode_register(
-                        function,
-                        instruction.b().saturating_add(offset),
-                    )?;
+                    let value = activation
+                        .read_bytecode_register(function, instruction.b().saturating_add(offset))?;
                     arguments.push(value);
                 }
 
@@ -4520,7 +5033,11 @@ impl Interpreter {
                         if function.frame_layout().receiver_slot().is_some() {
                             activation.set_receiver(function, this_value)?;
                         }
-                        activation.write_bytecode_register(function, instruction.a(), this_value)?;
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            this_value,
+                        )?;
                         activation.advance();
                         Ok(StepOutcome::Continue)
                     }
@@ -4531,7 +5048,8 @@ impl Interpreter {
                 }
             }
             Opcode::CallSuperForward => {
-                if !function.is_derived_constructor() || !activation.metadata().flags().is_construct()
+                if !function.is_derived_constructor()
+                    || !activation.metadata().flags().is_construct()
                 {
                     let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
@@ -4569,7 +5087,11 @@ impl Interpreter {
                         if function.frame_layout().receiver_slot().is_some() {
                             activation.set_receiver(function, this_value)?;
                         }
-                        activation.write_bytecode_register(function, instruction.a(), this_value)?;
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            this_value,
+                        )?;
                         activation.advance();
                         Ok(StepOutcome::Continue)
                     }
@@ -4671,6 +5193,19 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §14.4 Yield — suspend generator and produce a value.
+            // Spec: <https://tc39.es/ecma262/#sec-yield>
+            Opcode::Yield => {
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let resume_reg = instruction.a();
+                // Advance PC past the Yield instruction so resume continues
+                // at the next instruction.
+                activation.advance();
+                Ok(StepOutcome::GeneratorYield {
+                    yielded_value: value,
+                    resume_register: resume_reg,
+                })
+            }
         }
     }
 
@@ -4759,9 +5294,7 @@ impl Interpreter {
                     }
                 }
             }
-            None => {
-                Ok(RegisterValue::undefined())
-            }
+            None => Ok(RegisterValue::undefined()),
         }
     }
 
@@ -4781,7 +5314,8 @@ impl Interpreter {
                 return match runtime.property_lookup(handle, property)? {
                     Some(lookup) => match lookup.value() {
                         PropertyValue::Accessor { setter, .. } => {
-                            let _ = runtime.call_callable_for_accessor(setter, receiver, &[value])?;
+                            let _ =
+                                runtime.call_callable_for_accessor(setter, receiver, &[value])?;
                             Ok(true)
                         }
                         PropertyValue::Data { .. } => Ok(false),
@@ -4800,7 +5334,8 @@ impl Interpreter {
                 match lookup.value() {
                     PropertyValue::Data { .. } if lookup.owner() == handle => {
                         if let Some(cache) = lookup.cache() {
-                            let updated = runtime.objects.set_cached(handle, property, value, cache)?;
+                            let updated =
+                                runtime.objects.set_cached(handle, property, value, cache)?;
                             if updated {
                                 return Ok(true);
                             }
@@ -5053,6 +5588,45 @@ impl Interpreter {
             return Self::invoke_host_function_handle(runtime, target, bound_this, &full_args);
         }
 
+        // ES2024 §27.2.1.3 — Promise capability resolve/reject functions.
+        if let Ok(HeapValueKind::PromiseCapabilityFunction) = runtime.objects.kind(callable) {
+            let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+            Self::invoke_promise_capability_function(runtime, callable, value)?;
+            return Ok(Completion::Return(RegisterValue::undefined()));
+        }
+
+        // Promise combinator per-element / finally / value-thunk dispatch.
+        match runtime.objects.kind(callable) {
+            Ok(HeapValueKind::PromiseCombinatorElement) => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let result = Self::invoke_promise_combinator_element(runtime, callable, value)?;
+                return Ok(Completion::Return(result));
+            }
+            Ok(HeapValueKind::PromiseFinallyFunction) => {
+                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                match Self::invoke_promise_finally_function(runtime, callable, value) {
+                    Ok(v) => return Ok(Completion::Return(v)),
+                    Err(InterpreterError::UncaughtThrow(v)) => {
+                        return Ok(Completion::Throw(v));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(HeapValueKind::PromiseValueThunk) => {
+                if let Some((v, k)) = runtime.objects.promise_value_thunk_info(callable) {
+                    match k {
+                        crate::promise::PromiseFinallyKind::ThenFinally => {
+                            return Ok(Completion::Return(v));
+                        }
+                        crate::promise::PromiseFinallyKind::CatchFinally => {
+                            return Ok(Completion::Throw(v));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
         let host_function = runtime
             .objects
             .host_function(callable)?
@@ -5156,6 +5730,235 @@ impl Interpreter {
             }
             Completion::Return(_) => Completion::Return(default_receiver),
             Completion::Throw(value) => Completion::Throw(value),
+        }
+    }
+
+    /// Core generator resume implementation.
+    ///
+    /// Called from `RuntimeState::resume_generator` to execute generator body
+    /// until the next yield, return, or throw.
+    fn resume_generator_impl(
+        runtime: &mut RuntimeState,
+        generator: ObjectHandle,
+        sent_value: RegisterValue,
+        resume_kind: crate::intrinsics::GeneratorResumeKind,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        use crate::intrinsics::GeneratorResumeKind;
+        use crate::object::GeneratorState;
+
+        let (module, function_index, closure_handle, arguments, saved_registers, resume_pc, resume_reg) =
+            runtime
+                .objects
+                .generator_take_state(generator)
+                .map_err(|e| {
+                    VmNativeCallError::Internal(format!("generator take state: {e:?}").into())
+                })?;
+
+        let function = module.function(function_index).ok_or_else(|| {
+            VmNativeCallError::Internal("generator function index invalid".into())
+        })?;
+
+        let register_count = function.frame_layout().register_count();
+        let had_saved_registers = saved_registers.is_some();
+
+        // Build the activation.
+        let mut activation = if let Some(saved_regs) = saved_registers {
+            // Resuming from a yield point — restore the saved registers.
+            let mut act = Activation::with_context(
+                function_index,
+                register_count,
+                FrameMetadata::default(),
+                closure_handle,
+            );
+            act.restore_registers(&saved_regs);
+            act.set_pc(resume_pc);
+
+            match resume_kind {
+                GeneratorResumeKind::Next => {
+                    act.write_bytecode_register(function, resume_reg, sent_value)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("generator resume write: {e:?}").into(),
+                            )
+                        })?;
+                }
+                GeneratorResumeKind::Return => {
+                    // For .return() on a yielded generator, mark completed.
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("generator set state: {e:?}").into(),
+                            )
+                        })?;
+                    let result = runtime.create_iter_result(sent_value, true)?;
+                    return Ok(RegisterValue::from_object_handle(result.0));
+                }
+                GeneratorResumeKind::Throw => {
+                    // We will inject the throw at the first step.
+                }
+            }
+            act
+        } else {
+            // SuspendedStart — first call to .next().
+            // Set up arguments in the activation's parameter registers.
+            match resume_kind {
+                GeneratorResumeKind::Next => {
+                    let mut act = Activation::with_context(
+                        function_index,
+                        register_count,
+                        FrameMetadata::new(
+                            arguments.len() as u16,
+                            FrameFlags::empty(),
+                        ),
+                        closure_handle,
+                    );
+                    // Write arguments to parameter registers.
+                    let param_count = function.frame_layout().parameter_count();
+                    for (i, &arg) in arguments.iter().enumerate() {
+                        if i >= param_count as usize {
+                            break;
+                        }
+                        let _ = act.write_bytecode_register(function, i as u16, arg);
+                    }
+                    act
+                }
+                GeneratorResumeKind::Return => {
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("generator set state: {e:?}").into(),
+                            )
+                        })?;
+                    let result = runtime.create_iter_result(sent_value, true)?;
+                    return Ok(RegisterValue::from_object_handle(result.0));
+                }
+                GeneratorResumeKind::Throw => {
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("generator set state: {e:?}").into(),
+                            )
+                        })?;
+                    return Err(VmNativeCallError::Thrown(sent_value));
+                }
+            }
+        };
+
+        let interp = Interpreter::new();
+        let previous_module = runtime.enter_module(&module);
+        let mut frame_runtime = FrameRuntimeState::new(function);
+
+        // For Throw resume kind on a yielded generator, inject exception.
+        let mut inject_throw =
+            matches!(resume_kind, GeneratorResumeKind::Throw) && had_saved_registers;
+
+        loop {
+            activation.begin_step();
+
+            if inject_throw {
+                inject_throw = false;
+                if interp.transfer_exception(function, &mut activation, sent_value) {
+                    continue;
+                }
+                runtime.restore_module(previous_module);
+                runtime
+                    .objects
+                    .set_generator_state(generator, GeneratorState::Completed)
+                    .ok();
+                return Err(VmNativeCallError::Thrown(sent_value));
+            }
+
+            let outcome = match interp.step(
+                function,
+                &module,
+                &mut activation,
+                runtime,
+                &mut frame_runtime,
+            ) {
+                Ok(outcome) => outcome,
+                Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
+                Err(InterpreterError::TypeError(message)) => {
+                    let error = runtime
+                        .alloc_type_error(&message)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                    StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
+                }
+                Err(error) => {
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Err(VmNativeCallError::Internal(
+                        format!("generator execution error: {error:?}").into(),
+                    ));
+                }
+            };
+
+            match outcome {
+                StepOutcome::Continue => {
+                    activation
+                        .sync_written_open_upvalues(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                    activation
+                        .refresh_open_upvalues_from_cells(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                }
+                StepOutcome::Return(return_value) => {
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    let result = runtime.create_iter_result(return_value, true)?;
+                    return Ok(RegisterValue::from_object_handle(result.0));
+                }
+                StepOutcome::Throw(value) => {
+                    if interp.transfer_exception(function, &mut activation, value) {
+                        continue;
+                    }
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Err(VmNativeCallError::Thrown(value));
+                }
+                StepOutcome::Suspend { .. } => {
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Err(VmNativeCallError::Internal(
+                        "await inside generator not yet supported".into(),
+                    ));
+                }
+                StepOutcome::GeneratorYield {
+                    yielded_value,
+                    resume_register: yield_resume_reg,
+                } => {
+                    let saved_regs = activation.save_registers();
+                    let pc = activation.pc();
+                    runtime
+                        .objects
+                        .generator_save_state(generator, saved_regs, pc, yield_resume_reg)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("generator save state: {e:?}").into(),
+                            )
+                        })?;
+                    runtime.restore_module(previous_module);
+                    let result = runtime.create_iter_result(yielded_value, false)?;
+                    return Ok(RegisterValue::from_object_handle(result.0));
+                }
+            }
         }
     }
 }
@@ -6869,7 +7672,9 @@ mod tests {
             host_echo_receiver,
         ));
         let method = runtime.alloc_host_function(method);
-        let receiver = runtime.intrinsics().well_known_symbol_value(WellKnownSymbol::ToPrimitive);
+        let receiver = runtime
+            .intrinsics()
+            .well_known_symbol_value(WellKnownSymbol::ToPrimitive);
         let registers = [
             RegisterValue::from_object_handle(method.0),
             receiver,

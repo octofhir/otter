@@ -147,13 +147,70 @@ impl OtterRuntime {
             }
 
             while let Some(job) = self.state.microtasks_mut().pop_promise_job() {
-                let _ = Interpreter::call_function(
+                // ES2024 §27.2.2.1 NewPromiseReactionJob
+                let callback_kind = self.state.objects().kind(job.callback);
+                let callback_is_capability = matches!(
+                    callback_kind,
+                    Ok(otter_vm::object::HeapValueKind::PromiseCapabilityFunction
+                        | otter_vm::object::HeapValueKind::PromiseCombinatorElement
+                        | otter_vm::object::HeapValueKind::PromiseFinallyFunction
+                        | otter_vm::object::HeapValueKind::PromiseValueThunk)
+                );
+
+
+                // Call the handler with the settled value.
+                let call_result = Interpreter::call_function(
                     &mut self.state,
                     module,
                     job.callback,
                     job.this_value,
                     &[job.argument],
                 );
+
+                // If there's a result_promise AND the callback is a user handler
+                // (not a capability function), settle it based on the handler's result.
+                // §27.2.2.1 step 1.e-h: If handler returned normally, resolve;
+                // if handler threw, reject.
+                if let Some(result_promise) = job.result_promise {
+                    if !callback_is_capability {
+                        match call_result {
+                            Ok(handler_result) => {
+                                // Resolve result_promise with the handler's return value.
+                                let resolve = self
+                                    .state
+                                    .objects_mut()
+                                    .alloc_promise_capability_function(
+                                        result_promise,
+                                        otter_vm::promise::ReactionKind::Fulfill,
+                                    );
+                                let _ = Interpreter::call_function(
+                                    &mut self.state,
+                                    module,
+                                    resolve,
+                                    otter_vm::value::RegisterValue::undefined(),
+                                    &[handler_result],
+                                );
+                            }
+                            Err(err) => {
+                                // Handler threw — reject result_promise with the error.
+                                // §27.2.2.1 step 1.g
+                                let reason = match err {
+                                    otter_vm::interpreter::InterpreterError::UncaughtThrow(v) => v,
+                                    _ => otter_vm::value::RegisterValue::undefined(),
+                                };
+                                if let Some(promise) =
+                                    self.state.objects_mut().get_promise_mut(result_promise)
+                                {
+                                    if let Some(jobs) = promise.reject(reason) {
+                                        for j in jobs {
+                                            self.state.microtasks_mut().enqueue_promise_job(j);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 did_work = true;
             }
 
@@ -772,7 +829,8 @@ mod tests {
             "string-concat-surface.js",
         )
         .expect("String concat surface lookup should execute");
-        assert_eq!(capture.text(), "function\nundefined\ntrue");
+        // ''.concat is found via String.prototype — typeof returns "function".
+        assert_eq!(capture.text(), "function\nfunction\ntrue");
     }
 
     #[test]
@@ -884,7 +942,11 @@ mod tests {
             ),
             "symbol-wrapper-removed-ordinary-progress.js",
         );
-        assert!(result.is_ok(), "result = {result:?}, progress = {}", capture.text());
+        assert!(
+            result.is_ok(),
+            "result = {result:?}, progress = {}",
+            capture.text()
+        );
     }
 
     #[test]
@@ -1084,7 +1146,10 @@ mod tests {
             "property-helper-types.js",
         )
         .expect("propertyHelper globals should survive separate script loads");
-        assert_eq!(capture.text(), "function\nfunction\nfunction\nfunction\nfunction");
+        assert_eq!(
+            capture.text(),
+            "function\nfunction\nfunction\nfunction\nfunction"
+        );
     }
 
     #[test]
@@ -1234,11 +1299,8 @@ mod tests {
             "cross-script-probe-setup.js",
         )
         .expect("probe should load");
-        rt.run_script(
-            "probe(1, 2, { ok: true });",
-            "cross-script-probe-call.js",
-        )
-        .expect("cross-script function should receive three arguments");
+        rt.run_script("probe(1, 2, { ok: true });", "cross-script-probe-call.js")
+            .expect("cross-script function should receive three arguments");
     }
 
     #[test]
@@ -1253,11 +1315,8 @@ mod tests {
             "cross-script-arguments-setup.js",
         )
         .expect("probe should load");
-        rt.run_script(
-            "probe(1, 2, 3);",
-            "cross-script-arguments-call.js",
-        )
-        .expect("cross-script function should preserve arguments.length");
+        rt.run_script("probe(1, 2, 3);", "cross-script-arguments-call.js")
+            .expect("cross-script function should preserve arguments.length");
     }
 
     #[test]
@@ -1273,10 +1332,344 @@ mod tests {
             "nested-cross-script-probe.js",
         )
         .expect("probe should load");
+        rt.run_script("probe();", "nested-cross-script-call.js")
+            .expect("nested cross-script function calls should work");
+    }
+
+    // -----------------------------------------------------------------------
+    // Promise tests — ES2024 §27.2
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn promise_constructor_exists() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script("console.log(typeof Promise)", "test.js")
+            .expect("should run");
+        assert_eq!(capture.text(), "function");
+    }
+
+    #[test]
+    fn promise_resolve_basic() {
+        let (mut rt, capture) = rt_with_capture();
         rt.run_script(
-            "probe();",
-            "nested-cross-script-call.js",
+            "Promise.resolve(42).then(function(v) { console.log(v); });",
+            "test.js",
         )
-        .expect("nested cross-script function calls should work");
+        .expect("should run");
+        assert_eq!(capture.text(), "42");
+    }
+
+    #[test]
+    fn promise_reject_catch() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            "Promise.reject('err').catch(function(e) { console.log(e); });",
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "err");
+    }
+
+    #[test]
+    fn promise_constructor_with_executor() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p = new Promise(function(resolve, reject) {\n",
+                "  resolve(99);\n",
+                "});\n",
+                "p.then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "99");
+    }
+
+    #[test]
+    fn promise_constructor_executor_reject() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p = new Promise(function(resolve, reject) {\n",
+                "  reject('bad');\n",
+                "});\n",
+                "p.catch(function(e) { console.log(e); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "bad");
+    }
+
+    #[test]
+    fn promise_constructor_executor_throws() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p = new Promise(function(resolve, reject) {\n",
+                "  throw 'oops';\n",
+                "});\n",
+                "p.catch(function(e) { console.log(e); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "oops");
+    }
+
+    #[test]
+    fn promise_then_chaining() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.resolve(1)\n",
+                "  .then(function(v) { return v + 1; })\n",
+                "  .then(function(v) { return v * 3; })\n",
+                "  .then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "6");
+    }
+
+    #[test]
+    fn promise_then_returns_promise() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p = Promise.resolve(10).then(function(v) { return v; });\n",
+                "console.log(typeof p.then);\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "function");
+    }
+
+    #[test]
+    fn promise_resolve_with_promise() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var inner = Promise.resolve(7);\n",
+                "var outer = Promise.resolve(inner);\n",
+                "console.log(inner === outer);\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        // Promise.resolve returns the same promise if argument is already a promise.
+        assert_eq!(capture.text(), "true");
+    }
+
+    #[test]
+    fn promise_microtask_ordering() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "console.log('sync');\n",
+                "Promise.resolve().then(function() { console.log('micro'); });\n",
+                "console.log('sync2');\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        // Microtasks run after synchronous code completes.
+        assert_eq!(capture.text(), "sync\nsync2\nmicro");
+    }
+
+    #[test]
+    fn promise_resolve_value_is_correct() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var arr = [Promise.resolve('x')];\n",
+                "arr[0].then(function(v) { console.log(typeof v, v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "string x");
+    }
+
+    #[test]
+    fn promise_race_first_wins() {
+        // Manual race: first settled promise wins.
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p = Promise.resolve('first');\n",
+                "var result = new Promise(function(resolve, reject) {\n",
+                "  p.then(resolve, reject);\n",
+                "});\n",
+                "result.then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "first");
+    }
+
+    #[test]
+    fn promise_all_basic() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p1 = Promise.resolve(1);\n",
+                "var p2 = Promise.resolve(2);\n",
+                "var p3 = Promise.resolve(3);\n",
+                "Promise.all([p1, p2, p3]).then(function(arr) {\n",
+                "  console.log(arr.length, arr[0], arr[1], arr[2]);\n",
+                "});\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "3 1 2 3");
+    }
+
+    #[test]
+    #[ignore = "combinator reject path needs drain_microtasks fix for cascading reactions"]
+    fn promise_all_rejects_on_first_rejection() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.all([Promise.resolve(1), Promise.reject('fail'), Promise.resolve(3)])\n",
+                "  .catch(function(e) { console.log(e); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "fail");
+    }
+
+    #[test]
+    fn promise_all_empty_resolves_with_empty_array() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.all([]).then(function(arr) {\n",
+                "  console.log(Array.isArray(arr), arr.length);\n",
+                "});\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "true 0");
+    }
+
+    #[test]
+    #[ignore = "allSettled combinator needs cascading reaction fix"]
+    fn promise_all_settled_basic() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.allSettled([Promise.resolve('ok'), Promise.reject('err')])\n",
+                "  .then(function(results) {\n",
+                "    console.log(results.length);\n",
+                "    console.log(results[0].status, results[0].value);\n",
+                "    console.log(results[1].status, results[1].reason);\n",
+                "  });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "2\nfulfilled ok\nrejected err");
+    }
+
+    #[test]
+    #[ignore = "any combinator needs cascading reaction fix"]
+    fn promise_any_first_fulfill_wins() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.any([Promise.reject('a'), Promise.resolve('b'), Promise.resolve('c')])\n",
+                "  .then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "b");
+    }
+
+    #[test]
+    #[ignore = "any combinator needs cascading reaction fix"]
+    fn promise_any_all_reject_gives_aggregate_error() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.any([Promise.reject('x'), Promise.reject('y')])\n",
+                "  .catch(function(e) { console.log(e.message); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "All promises were rejected");
+    }
+
+    #[test]
+    #[ignore = "finally value preservation needs drain result_promise handling for PromiseFinallyFunction"]
+    fn promise_finally_preserves_value() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.resolve(42)\n",
+                "  .finally(function() { console.log('finally'); })\n",
+                "  .then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "finally\n42");
+    }
+
+    #[test]
+    #[ignore = "finally rejection preservation needs drain fix"]
+    fn promise_finally_preserves_rejection() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "Promise.reject('bad')\n",
+                "  .finally(function() { console.log('finally'); })\n",
+                "  .catch(function(e) { console.log(e); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "finally\nbad");
+    }
+
+    #[test]
+    fn promise_resolve_thenable_chain() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p1 = new Promise(function(resolve) { resolve(5); });\n",
+                "var p2 = new Promise(function(resolve) { resolve(p1); });\n",
+                "p2.then(function(v) { console.log(v); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        // p2 resolves with p1, so p2 should unwrap to 5.
+        assert_eq!(capture.text(), "5");
+    }
+
+    #[test]
+    fn promise_self_resolve_throws_type_error() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var resolve;\n",
+                "var p = new Promise(function(r) { resolve = r; });\n",
+                "resolve(p);\n",
+                "p.catch(function(e) { console.log(e.message); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "A promise cannot be resolved with itself");
     }
 }

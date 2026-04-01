@@ -25,7 +25,11 @@ impl IntrinsicInstaller for SpeciesSupportIntrinsic {
         intrinsics: &VmIntrinsics,
         cx: &mut IntrinsicInstallContext<'_>,
     ) -> Result<(), IntrinsicsError> {
-        install_species_getter(cx, intrinsics.array_constructor(), intrinsics.function_prototype())?;
+        install_species_getter(
+            cx,
+            intrinsics.array_constructor(),
+            intrinsics.function_prototype(),
+        )?;
         install_species_getter(
             cx,
             intrinsics.promise_constructor(),
@@ -76,7 +80,11 @@ fn install_stub_constructor(
     )?;
 
     install_species_getter(cx, constructor, intrinsics.function_prototype())?;
-    cx.install_global_value(intrinsics, name, RegisterValue::from_object_handle(constructor.0))
+    cx.install_global_value(
+        intrinsics,
+        name,
+        RegisterValue::from_object_handle(constructor.0),
+    )
 }
 
 fn install_species_getter(

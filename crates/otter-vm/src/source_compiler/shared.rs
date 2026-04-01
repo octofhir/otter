@@ -66,6 +66,8 @@ pub(super) enum FunctionKind {
     Script,
     Ordinary,
     Arrow,
+    /// §27.3 Generator functions — `function*`.
+    Generator,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,7 @@ pub(super) struct PendingFunction {
     pub(super) reserved: FunctionIndex,
     pub(super) closure_register: BytecodeRegister,
     pub(super) captures: Vec<CaptureSource>,
+    pub(super) is_generator: bool,
 }
 
 pub(super) struct CompiledFunction {

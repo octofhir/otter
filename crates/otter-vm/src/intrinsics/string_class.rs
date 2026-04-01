@@ -62,8 +62,7 @@ impl IntrinsicInstaller for StringIntrinsic {
         // Install String.prototype[Symbol.iterator].
         let iter_desc = NativeFunctionDescriptor::method("[Symbol.iterator]", 0, string_iterator);
         let iter_id = cx.native_functions.register(iter_desc);
-        let iter_fn =
-            cx.alloc_intrinsic_host_function(iter_id, intrinsics.function_prototype())?;
+        let iter_fn = cx.alloc_intrinsic_host_function(iter_id, intrinsics.function_prototype())?;
         let sym_iterator = cx
             .property_names
             .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
@@ -89,7 +88,15 @@ impl IntrinsicInstaller for StringIntrinsic {
     }
 }
 
-fn proto(name: &str, arity: u16, f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState) -> Result<RegisterValue, VmNativeCallError>) -> NativeBindingDescriptor {
+fn proto(
+    name: &str,
+    arity: u16,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
+) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
         NativeFunctionDescriptor::method(name, arity, f),
@@ -228,10 +235,12 @@ fn coerce_to_string(
             crate::interpreter::InterpreterError::UncaughtThrow(value) => {
                 VmNativeCallError::Thrown(value)
             }
-            crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
-                Ok(error) => error,
-                Err(error) => error,
-            },
+            crate::interpreter::InterpreterError::TypeError(message) => {
+                match type_error(runtime, &message) {
+                    Ok(error) => error,
+                    Err(error) => error,
+                }
+            }
             other => VmNativeCallError::Internal(format!("{other}").into()),
         });
     }
@@ -244,11 +253,15 @@ fn map_interpreter_error(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> VmNativeCallError {
     match error {
-        crate::interpreter::InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
-        crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
-            Ok(error) => error,
-            Err(error) => error,
-        },
+        crate::interpreter::InterpreterError::UncaughtThrow(value) => {
+            VmNativeCallError::Thrown(value)
+        }
+        crate::interpreter::InterpreterError::TypeError(message) => {
+            match type_error(runtime, &message) {
+                Ok(error) => error,
+                Err(error) => error,
+            }
+        }
         other => VmNativeCallError::Internal(format!("{other}").into()),
     }
 }
@@ -459,7 +472,11 @@ fn string_index_of(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let pos = int_arg(args, 1, 0).max(0) as usize;
@@ -488,7 +505,11 @@ fn string_last_index_of(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let s_units: Vec<u16> = s.encode_utf16().collect();
@@ -503,7 +524,13 @@ fn string_last_index_of(
                 v.as_number()
             }
         })
-        .map(|n| if n.is_nan() { s_units.len() } else { n.max(0.0) as usize })
+        .map(|n| {
+            if n.is_nan() {
+                s_units.len()
+            } else {
+                n.max(0.0) as usize
+            }
+        })
         .unwrap_or(s_units.len());
 
     if search_units.is_empty() {
@@ -529,7 +556,11 @@ fn string_includes(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let pos = int_arg(args, 1, 0).max(0) as usize;
@@ -558,7 +589,11 @@ fn string_starts_with(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let pos = int_arg(args, 1, 0).max(0) as usize;
@@ -583,7 +618,11 @@ fn string_ends_with(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let s_units: Vec<u16> = s.encode_utf16().collect();
@@ -646,11 +685,12 @@ fn string_substring(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let len = s_units.len() as i32;
     let raw_start = int_arg(args, 0, 0).clamp(0, len) as usize;
-    let raw_end = if args.get(1).copied() == Some(RegisterValue::undefined()) || args.get(1).is_none() {
-        s_units.len()
-    } else {
-        int_arg(args, 1, len).clamp(0, len) as usize
-    };
+    let raw_end =
+        if args.get(1).copied() == Some(RegisterValue::undefined()) || args.get(1).is_none() {
+            s_units.len()
+        } else {
+            int_arg(args, 1, len).clamp(0, len) as usize
+        };
     let (from, to) = if raw_start <= raw_end {
         (raw_start, raw_end)
     } else {
@@ -734,10 +774,7 @@ fn string_repeat(
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     let prototype = runtime.intrinsics().range_error_prototype;
     let handle = runtime.alloc_object_with_prototype(Some(prototype));
     let msg = runtime.alloc_string(message);
@@ -767,7 +804,11 @@ fn string_pad_start(
         .get(1)
         .copied()
         .filter(|v| *v != RegisterValue::undefined())
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| " ".into());
     let fill_units: Vec<u16> = fill.encode_utf16().collect();
@@ -804,7 +845,11 @@ fn string_pad_end(
         .get(1)
         .copied()
         .filter(|v| *v != RegisterValue::undefined())
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| " ".into());
     let fill_units: Vec<u16> = fill.encode_utf16().collect();
@@ -838,17 +883,24 @@ fn string_split(
             if v == RegisterValue::undefined() {
                 None
             } else {
-                v.as_i32().map(|n| n.max(0) as usize)
+                v.as_i32()
+                    .map(|n| n.max(0) as usize)
                     .or_else(|| v.as_number().map(|n| n.max(0.0) as usize))
             }
         })
         .unwrap_or(u32::MAX as usize);
 
-    let separator = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let separator = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     if separator == RegisterValue::undefined() {
         let result = runtime.alloc_array();
         let handle = runtime.alloc_string(&*s);
-        runtime.objects_mut().set_index(result, 0, RegisterValue::from_object_handle(handle.0)).ok();
+        runtime
+            .objects_mut()
+            .set_index(result, 0, RegisterValue::from_object_handle(handle.0))
+            .ok();
         return Ok(RegisterValue::from_object_handle(result.0));
     }
     let sep = runtime
@@ -868,7 +920,10 @@ fn string_split(
                 break;
             }
             let handle = runtime.alloc_string(ch.to_string());
-            runtime.objects_mut().set_index(result, i, RegisterValue::from_object_handle(handle.0)).ok();
+            runtime
+                .objects_mut()
+                .set_index(result, i, RegisterValue::from_object_handle(handle.0))
+                .ok();
         }
         return Ok(RegisterValue::from_object_handle(result.0));
     }
@@ -878,11 +933,17 @@ fn string_split(
     let s_bytes = s.as_bytes();
     let sep_bytes = sep.as_bytes();
     while start <= s_bytes.len() && count < limit {
-        match s_bytes[start..].windows(sep_bytes.len()).position(|w| w == sep_bytes) {
+        match s_bytes[start..]
+            .windows(sep_bytes.len())
+            .position(|w| w == sep_bytes)
+        {
             Some(pos) => {
                 let piece = &s[start..start + pos];
                 let handle = runtime.alloc_string(piece);
-                runtime.objects_mut().set_index(result, count, RegisterValue::from_object_handle(handle.0)).ok();
+                runtime
+                    .objects_mut()
+                    .set_index(result, count, RegisterValue::from_object_handle(handle.0))
+                    .ok();
                 count += 1;
                 start = start + pos + sep_bytes.len();
             }
@@ -894,7 +955,10 @@ fn string_split(
     if count < limit {
         let piece = &s[start..];
         let handle = runtime.alloc_string(piece);
-        runtime.objects_mut().set_index(result, count, RegisterValue::from_object_handle(handle.0)).ok();
+        runtime
+            .objects_mut()
+            .set_index(result, count, RegisterValue::from_object_handle(handle.0))
+            .ok();
     }
 
     Ok(RegisterValue::from_object_handle(result.0))
@@ -911,11 +975,18 @@ fn string_replace(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
 
-    let replace_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let replace_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let is_fn = replace_arg
         .as_object_handle()
         .map(ObjectHandle)
@@ -966,11 +1037,18 @@ fn string_replace_all(
     let search = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
 
-    let replace_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let replace_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let replace_str = runtime
         .js_to_string(replace_arg)
         .map_err(|e| map_interpreter_error(e, runtime))?;
@@ -1017,7 +1095,11 @@ fn string_locale_compare(
     let that = args
         .first()
         .copied()
-        .map(|v| runtime.js_to_string(v).map_err(|e| map_interpreter_error(e, runtime)))
+        .map(|v| {
+            runtime
+                .js_to_string(v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
     let cmp = s.cmp(&that);
@@ -1058,9 +1140,7 @@ fn string_iterator(
         .js_to_string(*this)
         .map_err(|error| map_interpreter_error(error, runtime))?;
     let str_handle = runtime.alloc_string(text);
-    let iterator = runtime
-        .objects_mut()
-        .alloc_string_iterator(str_handle);
+    let iterator = runtime.objects_mut().alloc_string_iterator(str_handle);
     // Set prototype to %StringIteratorPrototype%.
     let proto = runtime.intrinsics().string_iterator_prototype();
     runtime

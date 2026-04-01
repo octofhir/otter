@@ -19,7 +19,9 @@ pub(super) fn expected_function_length(params: &[ParamInfo<'_>]) -> u16 {
 }
 
 pub(super) fn has_use_strict_directive(directives: &[Directive<'_>]) -> bool {
-    directives.iter().any(|directive| directive.directive == "use strict")
+    directives
+        .iter()
+        .any(|directive| directive.directive == "use strict")
 }
 
 pub(super) fn identifier_name_for_parameter_pattern<'a>(

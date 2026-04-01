@@ -67,7 +67,11 @@ fn proto(
 
 fn map_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Map")
-        .with_constructor(NativeFunctionDescriptor::constructor("Map", 0, map_constructor))
+        .with_constructor(NativeFunctionDescriptor::constructor(
+            "Map",
+            0,
+            map_constructor,
+        ))
         .with_binding(proto("get", 1, map_get))
         .with_binding(proto("set", 2, map_set))
         .with_binding(proto("has", 1, map_has))
@@ -136,7 +140,8 @@ fn install_map(
     let sym_iterator = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
-    cx.heap.set_property(map_prototype, sym_iterator, entries_fn)?;
+    cx.heap
+        .set_property(map_prototype, sym_iterator, entries_fn)?;
 
     Ok(())
 }
@@ -156,27 +161,29 @@ fn map_constructor(
         && let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle)
         && matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array))
     {
-                    let length = runtime
-                        .objects()
-                        .array_length(arr_handle)
-                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
-                        .unwrap_or(0);
-                    for i in 0..length {
-                        let entry = runtime.get_array_index_value(arr_handle, i)?;
-                        if let Some(entry_val) = entry
-                            && let Some(eh) = entry_val.as_object_handle().map(ObjectHandle)
-                            && matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array))
-                        {
-                                let key = runtime
-                                    .get_array_index_value(eh, 0)?
-                                    .unwrap_or_else(RegisterValue::undefined);
-                                let value = runtime
-                                    .get_array_index_value(eh, 1)?
-                                    .unwrap_or_else(RegisterValue::undefined);
-                                runtime.objects_mut().map_set(handle, key, value)
-                                    .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-                        }
-                    }
+        let length = runtime
+            .objects()
+            .array_length(arr_handle)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or(0);
+        for i in 0..length {
+            let entry = runtime.get_array_index_value(arr_handle, i)?;
+            if let Some(entry_val) = entry
+                && let Some(eh) = entry_val.as_object_handle().map(ObjectHandle)
+                && matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array))
+            {
+                let key = runtime
+                    .get_array_index_value(eh, 0)?
+                    .unwrap_or_else(RegisterValue::undefined);
+                let value = runtime
+                    .get_array_index_value(eh, 1)?
+                    .unwrap_or_else(RegisterValue::undefined);
+                runtime
+                    .objects_mut()
+                    .map_set(handle, key, value)
+                    .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+            }
+        }
     }
 
     Ok(RegisterValue::from_object_handle(handle.0))
@@ -188,8 +195,13 @@ fn map_get(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    runtime.objects().map_get(handle, key)
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    runtime
+        .objects()
+        .map_get(handle, key)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))
 }
 
@@ -199,9 +211,17 @@ fn map_set(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let value = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
-    runtime.objects_mut().map_set(handle, key, value)
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    runtime
+        .objects_mut()
+        .map_set(handle, key, value)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(*this)
 }
@@ -212,8 +232,13 @@ fn map_has(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let result = runtime.objects().map_has(handle, key)
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let result = runtime
+        .objects()
+        .map_has(handle, key)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_bool(result))
 }
@@ -224,8 +249,13 @@ fn map_delete(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let key = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let result = runtime.objects_mut().map_delete(handle, key)
+    let key = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let result = runtime
+        .objects_mut()
+        .map_delete(handle, key)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_bool(result))
 }
@@ -236,7 +266,9 @@ fn map_clear(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    runtime.objects_mut().map_clear(handle)
+    runtime
+        .objects_mut()
+        .map_clear(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::undefined())
 }
@@ -247,7 +279,9 @@ fn map_size_getter(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let size = runtime.objects().map_size(handle)
+    let size = runtime
+        .objects()
+        .map_size(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_i32(size as i32))
 }
@@ -264,10 +298,17 @@ fn map_for_each(
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
         .filter(|h| runtime.objects().is_callable(*h))
-        .ok_or_else(|| VmNativeCallError::Internal("Map.prototype.forEach callback is not a function".into()))?;
-    let this_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("Map.prototype.forEach callback is not a function".into())
+        })?;
+    let this_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
-    let entries = runtime.objects().map_entries(handle)
+    let entries = runtime
+        .objects()
+        .map_entries(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for (key, value) in entries {
         runtime.call_callable(callback, this_arg, &[value, key, *this])?;
@@ -338,7 +379,11 @@ fn require_map(
 
 fn set_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Set")
-        .with_constructor(NativeFunctionDescriptor::constructor("Set", 0, set_constructor))
+        .with_constructor(NativeFunctionDescriptor::constructor(
+            "Set",
+            0,
+            set_constructor,
+        ))
         .with_binding(proto("add", 1, set_add))
         .with_binding(proto("has", 1, set_has))
         .with_binding(proto("delete", 1, set_delete))
@@ -406,7 +451,8 @@ fn install_set(
     let sym_iterator = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
-    cx.heap.set_property(set_prototype, sym_iterator, values_fn)?;
+    cx.heap
+        .set_property(set_prototype, sym_iterator, values_fn)?;
 
     Ok(())
 }
@@ -432,7 +478,9 @@ fn set_constructor(
             .unwrap_or(0);
         for i in 0..length {
             if let Some(value) = runtime.get_array_index_value(arr_handle, i)? {
-                runtime.objects_mut().set_add(handle, value)
+                runtime
+                    .objects_mut()
+                    .set_add(handle, value)
                     .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
             }
         }
@@ -447,8 +495,13 @@ fn set_add(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    runtime.objects_mut().set_add(handle, value)
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    runtime
+        .objects_mut()
+        .set_add(handle, value)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(*this)
 }
@@ -459,8 +512,13 @@ fn set_has(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let result = runtime.objects().set_has(handle, value)
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let result = runtime
+        .objects()
+        .set_has(handle, value)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_bool(result))
 }
@@ -471,8 +529,13 @@ fn set_delete(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let result = runtime.objects_mut().set_delete(handle, value)
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let result = runtime
+        .objects_mut()
+        .set_delete(handle, value)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_bool(result))
 }
@@ -483,7 +546,9 @@ fn set_clear(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    runtime.objects_mut().set_clear(handle)
+    runtime
+        .objects_mut()
+        .set_clear(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::undefined())
 }
@@ -494,7 +559,9 @@ fn set_size_getter(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let size = runtime.objects().set_size(handle)
+    let size = runtime
+        .objects()
+        .set_size(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_i32(size as i32))
 }
@@ -511,10 +578,17 @@ fn set_for_each(
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
         .filter(|h| runtime.objects().is_callable(*h))
-        .ok_or_else(|| VmNativeCallError::Internal("Set.prototype.forEach callback is not a function".into()))?;
-    let this_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("Set.prototype.forEach callback is not a function".into())
+        })?;
+    let this_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
-    let values = runtime.objects().set_values(handle)
+    let values = runtime
+        .objects()
+        .set_values(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for value in values {
         runtime.call_callable(callback, this_arg, &[value, value, *this])?;

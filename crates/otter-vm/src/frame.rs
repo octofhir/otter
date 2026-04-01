@@ -229,6 +229,7 @@ impl FrameFlags {
     const CONSTRUCT: u8 = 1 << 0;
     const HAS_RECEIVER: u8 = 1 << 1;
     const MAY_SUSPEND: u8 = 1 << 2;
+    const GENERATOR: u8 = 1 << 3;
 
     /// Returns an empty flag set.
     #[must_use]
@@ -270,6 +271,18 @@ impl FrameFlags {
     #[must_use]
     pub const fn may_suspend(self) -> bool {
         self.0 & Self::MAY_SUSPEND != 0
+    }
+
+    /// Returns `true` if the frame is a generator function body.
+    #[must_use]
+    pub const fn is_generator(self) -> bool {
+        self.0 & Self::GENERATOR != 0
+    }
+
+    /// Returns a copy with the generator flag set.
+    #[must_use]
+    pub const fn with_generator(self) -> Self {
+        Self(self.0 | Self::GENERATOR)
     }
 }
 

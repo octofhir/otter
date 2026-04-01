@@ -408,10 +408,11 @@ fn map_interpreter_error(
         crate::interpreter::InterpreterError::UncaughtThrow(value) => {
             VmNativeCallError::Thrown(value)
         }
-        crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message)
-        {
-            Ok(error) => error,
-            Err(error) => error,
+        crate::interpreter::InterpreterError::TypeError(message) => {
+            match type_error(runtime, &message) {
+                Ok(error) => error,
+                Err(error) => error,
+            }
         }
         crate::interpreter::InterpreterError::NativeCall(message) => {
             VmNativeCallError::Internal(message)

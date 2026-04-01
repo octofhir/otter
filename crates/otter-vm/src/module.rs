@@ -134,6 +134,8 @@ pub struct Function {
     length: u16,
     strict: bool,
     derived_constructor: bool,
+    /// §27.3 — this function is a generator (`function*`).
+    generator: bool,
     frame_layout: FrameLayout,
     bytecode: Bytecode,
     property_names: PropertyNameTable,
@@ -179,6 +181,7 @@ impl Function {
             length,
             strict: false,
             derived_constructor: false,
+            generator: false,
             frame_layout,
             bytecode,
             property_names: tables.side_tables.property_names,
@@ -239,6 +242,20 @@ impl Function {
     #[must_use]
     pub const fn is_derived_constructor(&self) -> bool {
         self.derived_constructor
+    }
+
+    /// Builder-style setter for the generator flag.
+    #[must_use]
+    pub fn with_generator(mut self, generator: bool) -> Self {
+        self.generator = generator;
+        self
+    }
+
+    /// Returns whether this function is a generator (`function*`).
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions>
+    #[must_use]
+    pub const fn is_generator(&self) -> bool {
+        self.generator
     }
 
     /// Returns the frame layout.

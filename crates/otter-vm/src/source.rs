@@ -3964,7 +3964,8 @@ mod tests {
     }
 
     #[test]
-    fn symbol_wrapper_property_key_uses_ordinary_to_primitive_when_symbol_to_primitive_is_undefined() {
+    fn symbol_wrapper_property_key_uses_ordinary_to_primitive_when_symbol_to_primitive_is_undefined()
+     {
         let result = execute_test262_basic(
             concat!(
                 "Object.defineProperty(Symbol.prototype, Symbol.toPrimitive, { value: undefined });\n",
@@ -4294,9 +4295,8 @@ mod tests {
 
     #[test]
     fn compile_script_marks_use_strict_entry_function_as_strict() {
-        let module =
-            compile_script("\"use strict\";\nvar x = 1;\n", "strict-flag-entry.js")
-                .expect("strict script should compile");
+        let module = compile_script("\"use strict\";\nvar x = 1;\n", "strict-flag-entry.js")
+            .expect("strict script should compile");
         assert!(module.entry_function().is_strict());
     }
 

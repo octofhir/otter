@@ -441,24 +441,20 @@ fn json_stringify(
     }
 }
 
-fn resolve_indent(
-    space: RegisterValue,
-    runtime: &mut crate::interpreter::RuntimeState,
-) -> String {
+fn resolve_indent(space: RegisterValue, runtime: &mut crate::interpreter::RuntimeState) -> String {
     if space == RegisterValue::undefined() || space == RegisterValue::null() {
         return String::new();
     }
-    if let Some(n) = space.as_i32().or_else(|| space.as_number().map(|f| f as i32)) {
+    if let Some(n) = space
+        .as_i32()
+        .or_else(|| space.as_number().map(|f| f as i32))
+    {
         let n = n.clamp(0, 10) as usize;
         " ".repeat(n)
     } else if let Some(handle) = space.as_object_handle().map(ObjectHandle) {
         if let Ok(Some(s)) = runtime.objects().string_value(handle) {
             let s = s.to_string();
-            if s.len() > 10 {
-                s[..10].to_string()
-            } else {
-                s
-            }
+            if s.len() > 10 { s[..10].to_string() } else { s }
         } else {
             String::new()
         }
@@ -538,10 +534,7 @@ fn stringify_value(
 
     // Cycle detection.
     if visited.contains(&handle.0) {
-        return Err(type_error(
-            runtime,
-            "Converting circular structure to JSON",
-        ));
+        return Err(type_error(runtime, "Converting circular structure to JSON"));
     }
     visited.push(handle.0);
 
@@ -718,11 +711,7 @@ fn stringify_object(
             PropertyValue::Accessor { getter, .. } => {
                 if let Some(getter) = getter {
                     runtime
-                        .call_callable(
-                            getter,
-                            RegisterValue::from_object_handle(handle.0),
-                            &[],
-                        )
+                        .call_callable(getter, RegisterValue::from_object_handle(handle.0), &[])
                         .unwrap_or_else(|_| RegisterValue::undefined())
                 } else {
                     RegisterValue::undefined()
@@ -872,10 +861,7 @@ fn syntax_error(
     VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
         Err(error) => VmNativeCallError::Internal(format!("{error}").into()),

@@ -58,11 +58,8 @@ impl IntrinsicInstaller for ArrayIntrinsic {
         let sym_iterator = cx
             .property_names
             .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
-        cx.heap.set_property(
-            intrinsics.array_prototype(),
-            sym_iterator,
-            values_fn,
-        )?;
+        cx.heap
+            .set_property(intrinsics.array_prototype(), sym_iterator, values_fn)?;
 
         Ok(())
     }
@@ -583,10 +580,7 @@ fn callback_and_this_arg(
     Ok((callback, this_arg))
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
         Err(error) => VmNativeCallError::Internal(format!("{error}").into()),
@@ -674,8 +668,7 @@ fn array_for_each(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.forEach")?;
 
     for index in 0..length {
-        let Some(value) =
-            array_index_value(receiver, index, runtime, "Array.prototype.forEach")?
+        let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.forEach")?
         else {
             continue;
         };
@@ -797,8 +790,7 @@ fn array_find_index(
         VmNativeCallError::Internal("Array.prototype.findIndex requires array receiver".into())
     })?;
     let length = array_length(receiver, runtime, "Array.prototype.findIndex")?;
-    let (callback, this_arg) =
-        callback_and_this_arg(args, runtime, "Array.prototype.findIndex")?;
+    let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findIndex")?;
 
     for index in 0..length {
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findIndex")?
@@ -962,10 +954,7 @@ fn array_fill(
     };
 
     for index in start..end {
-        runtime
-            .objects_mut()
-            .set_index(receiver, index, value)
-            .ok();
+        runtime.objects_mut().set_index(receiver, index, value).ok();
     }
 
     Ok(*this)
@@ -1059,9 +1048,7 @@ fn array_shift(
         .unwrap_or_else(RegisterValue::undefined);
     // Shift elements left.
     for index in 1..length {
-        if let Some(value) =
-            array_index_value(receiver, index, runtime, "Array.prototype.shift")?
-        {
+        if let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.shift")? {
             runtime
                 .objects_mut()
                 .set_index(receiver, index - 1, value)
@@ -1151,10 +1138,7 @@ fn array_splice(
             runtime,
             "Array.prototype.splice",
         )? {
-            runtime
-                .objects_mut()
-                .set_index(deleted, offset, value)
-                .ok();
+            runtime.objects_mut().set_index(deleted, offset, value).ok();
         }
     }
 
@@ -1241,8 +1225,7 @@ fn array_last_index_of(
     let mut index = start;
     while index >= 0 {
         let i = index as usize;
-        if let Some(elem) =
-            array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
+        if let Some(elem) = array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
             && elem == search
         {
             return Ok(RegisterValue::from_i32(index));
@@ -1280,9 +1263,7 @@ fn array_from(
         .unwrap_or_else(RegisterValue::undefined);
 
     let Some(source_handle) = items.as_object_handle().map(ObjectHandle) else {
-        return Ok(RegisterValue::from_object_handle(
-            runtime.alloc_array().0,
-        ));
+        return Ok(RegisterValue::from_object_handle(runtime.alloc_array().0));
     };
 
     if matches!(
@@ -1393,9 +1374,7 @@ fn create_array_iterator(
     let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Array iterator requires object receiver".into())
     })?;
-    let iterator = runtime
-        .objects_mut()
-        .alloc_array_iterator(handle, kind);
+    let iterator = runtime.objects_mut().alloc_array_iterator(handle, kind);
     // Set prototype to %ArrayIteratorPrototype%.
     let proto = runtime.intrinsics().array_iterator_prototype();
     runtime
@@ -1480,19 +1459,18 @@ fn sort_compare(
     }
     if let Some(callback) = comparefn {
         let result = runtime.call_callable(callback, RegisterValue::undefined(), &[x, y])?;
-        let n = result.as_number().or_else(|| result.as_i32().map(|i| i as f64)).unwrap_or(0.0);
+        let n = result
+            .as_number()
+            .or_else(|| result.as_i32().map(|i| i as f64))
+            .unwrap_or(0.0);
         if n.is_nan() {
             return Ok(0.0);
         }
         return Ok(n);
     }
     // Default: compare as strings.
-    let xs = runtime
-        .js_to_string_infallible(x)
-        .to_string();
-    let ys = runtime
-        .js_to_string_infallible(y)
-        .to_string();
+    let xs = runtime.js_to_string_infallible(x).to_string();
+    let ys = runtime.js_to_string_infallible(y).to_string();
     Ok(match xs.cmp(&ys) {
         std::cmp::Ordering::Less => -1.0,
         std::cmp::Ordering::Equal => 0.0,
@@ -1516,7 +1494,12 @@ fn array_reduce_right(
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle)
         .filter(|h| runtime.objects().is_callable(*h))
-        .ok_or_else(|| type_error(runtime, "Array.prototype.reduceRight callback is not a function"))?;
+        .ok_or_else(|| {
+            type_error(
+                runtime,
+                "Array.prototype.reduceRight callback is not a function",
+            )
+        })?;
 
     let mut accumulator;
     let mut start: i64;
@@ -1529,9 +1512,12 @@ fn array_reduce_right(
         accumulator = RegisterValue::undefined();
         start = length as i64 - 1;
         while start >= 0 {
-            if let Some(value) =
-                array_index_value(receiver, start as usize, runtime, "Array.prototype.reduceRight")?
-            {
+            if let Some(value) = array_index_value(
+                receiver,
+                start as usize,
+                runtime,
+                "Array.prototype.reduceRight",
+            )? {
                 accumulator = value;
                 start -= 1;
                 found = true;
@@ -1540,7 +1526,10 @@ fn array_reduce_right(
             start -= 1;
         }
         if !found {
-            return Err(type_error(runtime, "Reduce of empty array with no initial value"));
+            return Err(type_error(
+                runtime,
+                "Reduce of empty array with no initial value",
+            ));
         }
     }
 
@@ -1552,7 +1541,12 @@ fn array_reduce_right(
             accumulator = runtime.call_callable(
                 callback,
                 RegisterValue::undefined(),
-                &[accumulator, value, RegisterValue::from_i32(index as i32), *this],
+                &[
+                    accumulator,
+                    value,
+                    RegisterValue::from_i32(index as i32),
+                    *this,
+                ],
             )?;
         }
         start -= 1;
@@ -1581,7 +1575,10 @@ fn array_find_last(
             this_arg,
             &[value, RegisterValue::from_i32(index as i32), *this],
         )?;
-        if runtime.js_to_boolean(test_result).map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))? {
+        if runtime
+            .js_to_boolean(test_result)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?
+        {
             return Ok(value);
         }
     }
@@ -1598,7 +1595,8 @@ fn array_find_last_index(
         VmNativeCallError::Internal("Array.prototype.findLastIndex requires array receiver".into())
     })?;
     let length = array_length(receiver, runtime, "Array.prototype.findLastIndex")?;
-    let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findLastIndex")?;
+    let (callback, this_arg) =
+        callback_and_this_arg(args, runtime, "Array.prototype.findLastIndex")?;
 
     for index in (0..length).rev() {
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findLastIndex")?
@@ -1608,7 +1606,10 @@ fn array_find_last_index(
             this_arg,
             &[value, RegisterValue::from_i32(index as i32), *this],
         )?;
-        if runtime.js_to_boolean(test_result).map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))? {
+        if runtime
+            .js_to_boolean(test_result)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?
+        {
             return Ok(RegisterValue::from_i32(index as i32));
         }
     }
@@ -1628,7 +1629,11 @@ fn array_flat(
         .first()
         .copied()
         .and_then(|v| {
-            if v == RegisterValue::undefined() { None } else { v.as_i32() }
+            if v == RegisterValue::undefined() {
+                None
+            } else {
+                v.as_i32()
+            }
         })
         .unwrap_or(1)
         .max(0) as usize;
@@ -1675,7 +1680,8 @@ fn array_flat_map(
 
     let result = runtime.alloc_array();
     for index in 0..length {
-        let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.flatMap")? else {
+        let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.flatMap")?
+        else {
             continue;
         };
         let mapped = runtime.call_callable(
@@ -1716,21 +1722,44 @@ fn array_copy_within(
     let len = array_length(receiver, runtime, "Array.prototype.copyWithin")? as i32;
 
     let raw_target = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
-    let to = if raw_target < 0 { (len + raw_target).max(0) as usize } else { raw_target.min(len) as usize };
+    let to = if raw_target < 0 {
+        (len + raw_target).max(0) as usize
+    } else {
+        raw_target.min(len) as usize
+    };
     let raw_start = args.get(1).and_then(|v| v.as_i32()).unwrap_or(0);
-    let from = if raw_start < 0 { (len + raw_start).max(0) as usize } else { raw_start.min(len) as usize };
+    let from = if raw_start < 0 {
+        (len + raw_start).max(0) as usize
+    } else {
+        raw_start.min(len) as usize
+    };
     let raw_end = args
         .get(2)
-        .and_then(|v| if *v == RegisterValue::undefined() { None } else { v.as_i32() })
+        .and_then(|v| {
+            if *v == RegisterValue::undefined() {
+                None
+            } else {
+                v.as_i32()
+            }
+        })
         .unwrap_or(len);
-    let fin = if raw_end < 0 { (len + raw_end).max(0) as usize } else { raw_end.min(len) as usize };
+    let fin = if raw_end < 0 {
+        (len + raw_end).max(0) as usize
+    } else {
+        raw_end.min(len) as usize
+    };
 
     let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
 
     // Collect values first to avoid aliasing issues.
     let mut vals = Vec::with_capacity(count);
     for i in 0..count {
-        vals.push(array_index_value(receiver, from + i, runtime, "copyWithin")?);
+        vals.push(array_index_value(
+            receiver,
+            from + i,
+            runtime,
+            "copyWithin",
+        )?);
     }
     for (i, val) in vals.into_iter().enumerate() {
         if let Some(v) = val {
@@ -1755,6 +1784,8 @@ fn array_at(
     if actual < 0 || actual >= length {
         return Ok(RegisterValue::undefined());
     }
-    Ok(array_index_value(receiver, actual as usize, runtime, "Array.prototype.at")?
-        .unwrap_or_else(RegisterValue::undefined))
+    Ok(
+        array_index_value(receiver, actual as usize, runtime, "Array.prototype.at")?
+            .unwrap_or_else(RegisterValue::undefined),
+    )
 }

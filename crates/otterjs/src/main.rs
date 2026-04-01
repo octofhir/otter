@@ -423,8 +423,7 @@ async fn run_file(path: &PathBuf, _script_args: &[String], _cli: &Cli) -> Result
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", path.display()))?;
     let mut rt = otter_runtime::OtterRuntime::builder().build();
-    rt.run_file(path_str)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rt.run_file(path_str).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 

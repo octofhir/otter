@@ -121,14 +121,21 @@ fn number_to_fixed(
         .and_then(|v| v.as_i32().or_else(|| v.as_number().map(|n| n as i32)))
         .unwrap_or(0);
     if !(0..=100).contains(&digits) {
-        return Err(type_error(runtime, "toFixed() digits argument must be between 0 and 100")?);
+        return Err(type_error(
+            runtime,
+            "toFixed() digits argument must be between 0 and 100",
+        )?);
     }
     if number.is_nan() {
         let handle = runtime.alloc_string("NaN");
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     if number.is_infinite() {
-        let s = if number > 0.0 { "Infinity" } else { "-Infinity" };
+        let s = if number > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        };
         let handle = runtime.alloc_string(s);
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
@@ -144,7 +151,10 @@ fn number_to_precision(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let number = this_number_value(*this, runtime)?;
-    let precision = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let precision = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     if precision == RegisterValue::undefined() {
         let text = number_to_decimal_string(number);
         let handle = runtime.alloc_string(text);
@@ -155,7 +165,10 @@ fn number_to_precision(
         .or_else(|| precision.as_number().map(|n| n as i32))
         .unwrap_or(0);
     if !(1..=100).contains(&p) {
-        return Err(type_error(runtime, "toPrecision() argument must be between 1 and 100")?);
+        return Err(type_error(
+            runtime,
+            "toPrecision() argument must be between 1 and 100",
+        )?);
     }
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
@@ -168,7 +181,11 @@ fn number_to_precision(
     let text = if number.abs() < 1e-6 || number.abs() >= 1e21 {
         text
     } else {
-        format!("{number:.prec$}", prec = (p as usize).saturating_sub(1 + (number.abs().log10().floor().max(0.0) as usize)))
+        format!(
+            "{number:.prec$}",
+            prec =
+                (p as usize).saturating_sub(1 + (number.abs().log10().floor().max(0.0) as usize))
+        )
     };
     let handle = runtime.alloc_string(text);
     Ok(RegisterValue::from_object_handle(handle.0))
@@ -186,16 +203,20 @@ fn number_to_exponential(
         let handle = runtime.alloc_string(text);
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
-    let frac = args
-        .first()
-        .copied()
-        .and_then(|v| {
-            if v == RegisterValue::undefined() { None } else { v.as_i32() }
-        });
+    let frac = args.first().copied().and_then(|v| {
+        if v == RegisterValue::undefined() {
+            None
+        } else {
+            v.as_i32()
+        }
+    });
     let text = match frac {
         Some(f) => {
             if !(0..=100).contains(&f) {
-                return Err(type_error(runtime, "toExponential() argument must be between 0 and 100")?);
+                return Err(type_error(
+                    runtime,
+                    "toExponential() argument must be between 0 and 100",
+                )?);
             }
             format!("{number:.prec$e}", prec = f as usize)
         }
@@ -269,7 +290,10 @@ fn number_to_string(
             .unwrap_or(10);
         // 4. If radixMV < 2 or radixMV > 36, throw a RangeError.
         if !(2..=36).contains(&r) {
-            return Err(type_error(runtime, "toString() radix must be between 2 and 36")?);
+            return Err(type_error(
+                runtime,
+                "toString() radix must be between 2 and 36",
+            )?);
         }
         r as u32
     };
@@ -375,10 +399,12 @@ fn coerce_to_number(
             crate::interpreter::InterpreterError::UncaughtThrow(value) => {
                 VmNativeCallError::Thrown(value)
             }
-            crate::interpreter::InterpreterError::TypeError(message) => match type_error(runtime, &message) {
-                Ok(error) => error,
-                Err(error) => error,
-            },
+            crate::interpreter::InterpreterError::TypeError(message) => {
+                match type_error(runtime, &message) {
+                    Ok(error) => error,
+                    Err(error) => error,
+                }
+            }
             other => VmNativeCallError::Internal(format!("{other}").into()),
         })
 }

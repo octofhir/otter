@@ -210,6 +210,11 @@ pub enum Opcode {
     ToNumber = 0x5D,
     /// ToString conversion.
     ToString = 0x5E,
+    /// Generator yield: suspend execution, produce `value` to caller.
+    /// `Yield dst, value` — suspends the generator, returns `value` to the
+    /// caller's `.next()`. On resume, the sent value is written to `dst`.
+    /// Spec: <https://tc39.es/ecma262/#sec-yield>
+    Yield = 0x60,
 }
 
 impl Opcode {
@@ -293,6 +298,7 @@ impl Opcode {
             0x52 => Some(Self::CallSuperForward),
             0x5D => Some(Self::ToNumber),
             0x5E => Some(Self::ToString),
+            0x60 => Some(Self::Yield),
             _ => None,
         }
     }
@@ -824,7 +830,12 @@ impl Instruction {
         args_base: BytecodeRegister,
         argc: RegisterIndex,
     ) -> Self {
-        Self::encode_abc(Opcode::CallSuper, dst, args_base, BytecodeRegister::new(argc))
+        Self::encode_abc(
+            Opcode::CallSuper,
+            dst,
+            args_base,
+            BytecodeRegister::new(argc),
+        )
     }
 
     /// Calls the default derived constructor forwarding the original arguments.
@@ -1030,6 +1041,14 @@ impl Instruction {
     #[must_use]
     pub const fn r#await(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Await, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes a yield instruction: suspend generator, produce `value`.
+    /// On resume, the sent value is written to `dst`.
+    /// Spec: <https://tc39.es/ecma262/#sec-yield>
+    #[must_use]
+    pub const fn yield_(dst: BytecodeRegister, value: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::Yield, dst, value, BytecodeRegister::new(0))
     }
 
     /// Returns the decoded opcode.

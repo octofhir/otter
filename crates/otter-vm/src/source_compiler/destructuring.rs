@@ -248,7 +248,8 @@ impl<'a> FunctionCompiler<'a> {
 
         if let Some(rest) = &pattern.rest {
             let rest_array = self.allocate_local()?;
-            self.instructions.push(Instruction::new_array(rest_array, 0));
+            self.instructions
+                .push(Instruction::new_array(rest_array, 0));
             let rest_index = self.allocate_local()?;
             self.instructions.push(Instruction::load_i32(rest_index, 0));
             let one = self.allocate_local()?;
@@ -430,7 +431,8 @@ impl<'a> FunctionCompiler<'a> {
 
         if let Some(rest) = &pattern.rest {
             let rest_array = self.allocate_local()?;
-            self.instructions.push(Instruction::new_array(rest_array, 0));
+            self.instructions
+                .push(Instruction::new_array(rest_array, 0));
             let rest_index = self.allocate_local()?;
             self.instructions.push(Instruction::load_i32(rest_index, 0));
             let one = self.allocate_local()?;

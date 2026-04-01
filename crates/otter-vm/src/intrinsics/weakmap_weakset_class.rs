@@ -75,7 +75,9 @@ fn proto(
 fn weakmap_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("WeakMap")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "WeakMap", 0, weakmap_constructor,
+            "WeakMap",
+            0,
+            weakmap_constructor,
         ))
         .with_binding(proto("get", 1, weakmap_get))
         .with_binding(proto("set", 2, weakmap_set))
@@ -153,10 +155,7 @@ fn weakmap_constructor(
                         let entry = runtime.get_array_index_value(arr_handle, i)?;
                         if let Some(entry_val) = entry {
                             if let Some(eh) = entry_val.as_object_handle().map(ObjectHandle) {
-                                if matches!(
-                                    runtime.objects().kind(eh),
-                                    Ok(HeapValueKind::Array)
-                                ) {
+                                if matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array)) {
                                     let key = runtime
                                         .get_array_index_value(eh, 0)?
                                         .unwrap_or(RegisterValue::undefined());
@@ -172,9 +171,7 @@ fn weakmap_constructor(
                                         .objects_mut()
                                         .weakmap_set(handle, key_handle, value)
                                         .map_err(|e| {
-                                            VmNativeCallError::Internal(
-                                                format!("{e:?}").into(),
-                                            )
+                                            VmNativeCallError::Internal(format!("{e:?}").into())
                                         })?;
                                 }
                             }
@@ -218,9 +215,9 @@ fn weakmap_set(
     let handle = require_weakmap(*this, runtime)?;
     let key = args.first().copied().unwrap_or(RegisterValue::undefined());
     let value = args.get(1).copied().unwrap_or(RegisterValue::undefined());
-    let key_handle = key.as_object_handle().ok_or_else(|| {
-        VmNativeCallError::Internal("Invalid value used as weak map key".into())
-    })?;
+    let key_handle = key
+        .as_object_handle()
+        .ok_or_else(|| VmNativeCallError::Internal("Invalid value used as weak map key".into()))?;
     runtime
         .objects_mut()
         .weakmap_set(handle, key_handle, value)
@@ -275,9 +272,7 @@ fn require_weakmap(
     this.as_object_handle()
         .map(ObjectHandle)
         .filter(|h| matches!(runtime.objects().kind(*h), Ok(HeapValueKind::WeakMap)))
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Method requires a WeakMap receiver".into())
-        })
+        .ok_or_else(|| VmNativeCallError::Internal("Method requires a WeakMap receiver".into()))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -288,7 +283,9 @@ fn require_weakmap(
 fn weakset_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("WeakSet")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "WeakSet", 0, weakset_constructor,
+            "WeakSet",
+            0,
+            weakset_constructor,
         ))
         .with_binding(proto("add", 1, weakset_add))
         .with_binding(proto("has", 1, weakset_has))
@@ -363,9 +360,7 @@ fn weakset_constructor(
                     for i in 0..length {
                         if let Some(value) = runtime.get_array_index_value(arr_handle, i)? {
                             let key_handle = value.as_object_handle().ok_or_else(|| {
-                                VmNativeCallError::Internal(
-                                    "Invalid value used in weak set".into(),
-                                )
+                                VmNativeCallError::Internal("Invalid value used in weak set".into())
                             })?;
                             runtime
                                 .objects_mut()
@@ -392,9 +387,9 @@ fn weakset_add(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_weakset(*this, runtime)?;
     let value = args.first().copied().unwrap_or(RegisterValue::undefined());
-    let key_handle = value.as_object_handle().ok_or_else(|| {
-        VmNativeCallError::Internal("Invalid value used in weak set".into())
-    })?;
+    let key_handle = value
+        .as_object_handle()
+        .ok_or_else(|| VmNativeCallError::Internal("Invalid value used in weak set".into()))?;
     runtime
         .objects_mut()
         .weakset_add(handle, key_handle)
@@ -449,7 +444,5 @@ fn require_weakset(
     this.as_object_handle()
         .map(ObjectHandle)
         .filter(|h| matches!(runtime.objects().kind(*h), Ok(HeapValueKind::WeakSet)))
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Method requires a WeakSet receiver".into())
-        })
+        .ok_or_else(|| VmNativeCallError::Internal("Method requires a WeakSet receiver".into()))
 }

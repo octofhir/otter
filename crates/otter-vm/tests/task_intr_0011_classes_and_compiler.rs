@@ -10,8 +10,7 @@ use otter_vm::value::RegisterValue;
 use otter_vm::{Interpreter, RuntimeState};
 
 fn execute_test262_basic(source: &str, source_url: &str) -> RegisterValue {
-    let module = compile_test262_basic_script(source, source_url)
-        .expect("should compile");
+    let module = compile_test262_basic_script(source, source_url).expect("should compile");
     let mut runtime = RuntimeState::new();
     let global = runtime.intrinsics().global_object();
     let registers = [RegisterValue::from_object_handle(global.0)];

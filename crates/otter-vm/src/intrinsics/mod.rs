@@ -10,6 +10,7 @@ mod boolean_class;
 mod date_class;
 mod error_class;
 mod function_class;
+mod generator_class;
 mod install;
 mod iterator_class;
 mod json;
@@ -27,6 +28,7 @@ pub(crate) mod timer_globals;
 mod weakmap_weakset_class;
 
 pub(crate) use boolean_class::box_boolean_object;
+pub(crate) use generator_class::GeneratorResumeKind;
 pub(crate) use number_class::box_number_object;
 pub(crate) use symbol_class::{box_symbol_object, symbol_descriptive_string};
 
@@ -250,6 +252,9 @@ pub struct VmIntrinsics {
     pub(crate) string_iterator_prototype: ObjectHandle,
     pub(crate) map_iterator_prototype: ObjectHandle,
     pub(crate) set_iterator_prototype: ObjectHandle,
+    // Generator (§27.3, §27.5)
+    pub(crate) generator_function_prototype: ObjectHandle,
+    pub(crate) generator_prototype: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -302,6 +307,8 @@ impl VmIntrinsics {
         let string_iterator_prototype = heap.alloc_object();
         let map_iterator_prototype = heap.alloc_object();
         let set_iterator_prototype = heap.alloc_object();
+        let generator_function_prototype = heap.alloc_object();
+        let generator_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -373,6 +380,8 @@ impl VmIntrinsics {
             string_iterator_prototype,
             map_iterator_prototype,
             set_iterator_prototype,
+            generator_function_prototype,
+            generator_prototype,
         }
     }
 
@@ -430,9 +439,20 @@ impl VmIntrinsics {
         // Concrete iterator prototypes → %IteratorPrototype%
         heap.set_prototype(self.iterator_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.array_iterator_prototype, Some(self.iterator_prototype))?;
-        heap.set_prototype(self.string_iterator_prototype, Some(self.iterator_prototype))?;
+        heap.set_prototype(
+            self.string_iterator_prototype,
+            Some(self.iterator_prototype),
+        )?;
         heap.set_prototype(self.map_iterator_prototype, Some(self.iterator_prototype))?;
         heap.set_prototype(self.set_iterator_prototype, Some(self.iterator_prototype))?;
+        // Generator (§27.3, §27.5):
+        // %GeneratorFunction.prototype% → %Function.prototype%
+        // %GeneratorPrototype% → %IteratorPrototype% (generators are iterators!)
+        heap.set_prototype(
+            self.generator_function_prototype,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(self.generator_prototype, Some(self.iterator_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -704,6 +724,18 @@ impl VmIntrinsics {
         self.set_iterator_prototype
     }
 
+    /// Returns `%GeneratorFunction.prototype%` (§27.3).
+    #[must_use]
+    pub const fn generator_function_prototype(&self) -> ObjectHandle {
+        self.generator_function_prototype
+    }
+
+    /// Returns `%Generator.prototype%` (§27.5).
+    #[must_use]
+    pub const fn generator_prototype(&self) -> ObjectHandle {
+        self.generator_prototype
+    }
+
     /// Registers an additional namespace root owned by the intrinsic registry.
     pub fn register_namespace_root(&mut self, handle: ObjectHandle) {
         self.namespace_roots.push(handle);
@@ -804,6 +836,8 @@ impl VmIntrinsics {
             self.string_iterator_prototype,
             self.map_iterator_prototype,
             self.set_iterator_prototype,
+            self.generator_function_prototype,
+            self.generator_prototype,
         ]);
         if let Some(h) = self.math_namespace {
             roots.push(h);
@@ -836,6 +870,8 @@ impl VmIntrinsics {
             self.boolean_prototype,
             self.date_prototype,
             self.proxy_constructor,
+            self.generator_function_prototype,
+            self.generator_prototype,
         ] {
             tracer(IntrinsicRoot::Object(handle));
         }
@@ -850,7 +886,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 18] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 19] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -859,6 +895,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 18] {
         &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
         &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
+        &generator_class::GENERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &json::JSON_INTRINSIC as &dyn IntrinsicInstaller,
         &map_set_class::MAP_SET_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
@@ -954,7 +991,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 246);
+        assert_eq!(native_functions.len(), 253);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

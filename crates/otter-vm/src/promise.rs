@@ -57,6 +57,36 @@ pub enum ReactionKind {
     Reject,
 }
 
+/// Which Promise combinator a per-element function belongs to.
+/// ES2024 §27.2.4
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseCombinatorKind {
+    /// Promise.all resolve element — §27.2.4.1.1
+    /// Spec: <https://tc39.es/ecma262/#sec-promise.all-resolve-element-functions>
+    AllResolve,
+    /// Promise.allSettled resolve element — §27.2.4.2.1
+    /// Spec: <https://tc39.es/ecma262/#sec-promise.allsettled-resolve-element-functions>
+    AllSettledResolve,
+    /// Promise.allSettled reject element — §27.2.4.2.2
+    /// Spec: <https://tc39.es/ecma262/#sec-promise.allsettled-reject-element-functions>
+    AllSettledReject,
+    /// Promise.any reject element — §27.2.4.3.1
+    /// Spec: <https://tc39.es/ecma262/#sec-promise.any-reject-element-functions>
+    AnyReject,
+}
+
+/// Whether a finally wrapper is for the fulfill or reject path.
+/// ES2024 §27.2.5.3.1–2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseFinallyKind {
+    /// §27.2.5.3.1 Then Finally Functions — called on fulfillment.
+    /// Spec: <https://tc39.es/ecma262/#sec-thenfinallyfunctions>
+    ThenFinally,
+    /// §27.2.5.3.2 Catch Finally Functions — called on rejection.
+    /// Spec: <https://tc39.es/ecma262/#sec-catchfinallyfunctions>
+    CatchFinally,
+}
+
 /// A { promise, resolve, reject } triple from `NewPromiseCapability`.
 ///
 /// `resolve` and `reject` are ObjectHandles to native resolve/reject functions

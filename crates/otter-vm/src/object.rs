@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 
 use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
 
+use crate::bytecode::ProgramCounter;
 use crate::host::HostFunctionId;
-use crate::module::Module;
 use crate::module::FunctionIndex;
+use crate::module::Module;
 use crate::payload::NativePayloadId;
 use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::value::RegisterValue;
@@ -138,6 +139,16 @@ pub enum HeapValueKind {
     WeakMap,
     /// ES2024 §24.4 WeakSet object.
     WeakSet,
+    /// ES2024 §27.5 Generator object.
+    Generator,
+    /// ES2024 §27.2.1.5 — Promise capability resolve/reject function.
+    PromiseCapabilityFunction,
+    /// Promise combinator per-element function (all/allSettled/any).
+    PromiseCombinatorElement,
+    /// Promise.prototype.finally wrapper function.
+    PromiseFinallyFunction,
+    /// Value thunk for finally (returns or throws a captured value).
+    PromiseValueThunk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,6 +241,19 @@ pub enum SetIteratorKind {
     Values,
     /// `Set.prototype.entries()` — yields `[value, value]` pairs.
     Entries,
+}
+
+/// ES2024 §27.5.3 — Generator state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GeneratorState {
+    /// Created but body not yet started executing.
+    SuspendedStart,
+    /// Suspended at a `yield` point.
+    SuspendedYield,
+    /// Currently executing (inside a `.next()` call).
+    Executing,
+    /// Completed (returned or threw).
+    Completed,
 }
 
 /// ES2024 §10.2 — Closure function kind flags.
@@ -679,6 +703,7 @@ enum HeapValue {
         next_index: usize,
     },
     Promise {
+        prototype: Option<ObjectHandle>,
         promise: crate::promise::JsPromise,
     },
     /// ES2024 §24.1 Map Objects — insertion-ordered key-value pairs with SameValueZero.
@@ -720,6 +745,57 @@ enum HeapValue {
         prototype: Option<ObjectHandle>,
         /// Stores ObjectHandle indices. Keys must be objects.
         entries: std::collections::HashSet<u32>,
+    },
+    /// ES2024 §27.5 — Generator Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-generator-instances>
+    Generator {
+        prototype: Option<ObjectHandle>,
+        /// The generator's execution state.
+        state: GeneratorState,
+        /// Module containing the generator function's bytecode.
+        module: Module,
+        /// Function index of the generator function within the module.
+        function_index: FunctionIndex,
+        /// Closure handle (if the generator function was a closure).
+        closure_handle: Option<ObjectHandle>,
+        /// Arguments passed when the generator function was called.
+        /// Available for the first `.next()` which starts execution.
+        arguments: Vec<RegisterValue>,
+        /// Saved register window (captured at yield, restored at resume).
+        registers: Option<Box<[RegisterValue]>>,
+        /// Program counter to resume from.
+        resume_pc: ProgramCounter,
+        /// Register index where the sent value should be written on resume.
+        resume_register: u16,
+    },
+    /// ES2024 §27.2.1.5 — Internal resolve/reject function for a PromiseCapability.
+    /// Spec: <https://tc39.es/ecma262/#sec-promise-resolve-functions>
+    /// Spec: <https://tc39.es/ecma262/#sec-promise-reject-functions>
+    PromiseCapabilityFunction {
+        /// The promise this function settles.
+        promise: ObjectHandle,
+        /// Whether this is the resolve or reject function.
+        kind: crate::promise::ReactionKind,
+    },
+    /// ES2024 §27.2.4 per-element functions for Promise.all/allSettled/any.
+    PromiseCombinatorElement {
+        combinator_kind: crate::promise::PromiseCombinatorKind,
+        index: u32,
+        result_array: ObjectHandle,
+        remaining_counter: ObjectHandle,
+        result_capability: crate::promise::PromiseCapability,
+        already_called: bool,
+    },
+    /// ES2024 §27.2.5.3.1–2 wrapper for Promise.prototype.finally.
+    PromiseFinallyFunction {
+        on_finally: ObjectHandle,
+        constructor: ObjectHandle,
+        kind: crate::promise::PromiseFinallyKind,
+    },
+    /// Thunk that returns or throws a captured value (for finally chaining).
+    PromiseValueThunk {
+        value: crate::value::RegisterValue,
+        kind: crate::promise::PromiseFinallyKind,
     },
 }
 
@@ -863,7 +939,12 @@ impl Traceable for HeapValue {
                     trace_handle(*h, visitor);
                 }
             }
-            HeapValue::Promise { promise } => {
+            HeapValue::Promise {
+                prototype, promise, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
                 promise.trace_handles(visitor);
             }
             HeapValue::Map {
@@ -893,6 +974,51 @@ impl Traceable for HeapValue {
                 }
                 // Entries are intentionally NOT traced — they are weak references.
                 // Ephemeron fixpoint in collect_with_ephemerons handles value liveness.
+            }
+            HeapValue::Generator {
+                prototype,
+                closure_handle,
+                registers,
+                ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                if let Some(c) = closure_handle {
+                    trace_handle(*c, visitor);
+                }
+                // Module is not traced (it's an Arc-wrapped shared reference).
+                if let Some(regs) = registers {
+                    for reg in regs.iter() {
+                        trace_register_value(*reg, visitor);
+                    }
+                }
+            }
+            HeapValue::PromiseCapabilityFunction { promise, .. } => {
+                trace_handle(*promise, visitor);
+            }
+            HeapValue::PromiseCombinatorElement {
+                result_array,
+                remaining_counter,
+                result_capability,
+                ..
+            } => {
+                trace_handle(*result_array, visitor);
+                trace_handle(*remaining_counter, visitor);
+                visitor(GcHandle(result_capability.promise.0));
+                visitor(GcHandle(result_capability.resolve.0));
+                visitor(GcHandle(result_capability.reject.0));
+            }
+            HeapValue::PromiseFinallyFunction {
+                on_finally,
+                constructor,
+                ..
+            } => {
+                trace_handle(*on_finally, visitor);
+                trace_handle(*constructor, visitor);
+            }
+            HeapValue::PromiseValueThunk { value, .. } => {
+                trace_register_value(*value, visitor);
             }
         }
     }
@@ -1015,7 +1141,7 @@ impl ObjectHeap {
         match self.object(handle)? {
             HeapValue::Map { entries, .. } => {
                 for entry in entries.iter().flatten() {
-                    if svz(&self.heap,entry.0, key) {
+                    if svz(&self.heap, entry.0, key) {
                         return Ok(entry.1);
                     }
                 }
@@ -1029,7 +1155,7 @@ impl ObjectHeap {
     pub fn map_has(&self, handle: ObjectHandle, key: RegisterValue) -> Result<bool, ObjectError> {
         match self.object(handle)? {
             HeapValue::Map { entries, .. } => {
-                Ok(entries.iter().flatten().any(|e| svz(&self.heap,e.0, key)))
+                Ok(entries.iter().flatten().any(|e| svz(&self.heap, e.0, key)))
             }
             _ => Err(ObjectError::InvalidKind),
         }
@@ -1104,9 +1230,7 @@ impl ObjectHeap {
         handle: ObjectHandle,
     ) -> Result<Vec<(RegisterValue, RegisterValue)>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::Map { entries, .. } => {
-                Ok(entries.iter().filter_map(|e| *e).collect())
-            }
+            HeapValue::Map { entries, .. } => Ok(entries.iter().filter_map(|e| *e).collect()),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -1115,7 +1239,7 @@ impl ObjectHeap {
     pub fn set_has(&self, handle: ObjectHandle, value: RegisterValue) -> Result<bool, ObjectError> {
         match self.object(handle)? {
             HeapValue::Set { entries, .. } => {
-                Ok(entries.iter().flatten().any(|e| svz(&self.heap,*e, value)))
+                Ok(entries.iter().flatten().any(|e| svz(&self.heap, *e, value)))
             }
             _ => Err(ObjectError::InvalidKind),
         }
@@ -1178,14 +1302,9 @@ impl ObjectHeap {
     }
 
     /// Collect all live Set values.
-    pub fn set_values(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<Vec<RegisterValue>, ObjectError> {
+    pub fn set_values(&self, handle: ObjectHandle) -> Result<Vec<RegisterValue>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::Set { entries, .. } => {
-                Ok(entries.iter().filter_map(|e| *e).collect())
-            }
+            HeapValue::Set { entries, .. } => Ok(entries.iter().filter_map(|e| *e).collect()),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -1318,6 +1437,126 @@ impl ObjectHeap {
         }
     }
 
+    // ─── Generator Objects (§27.5) ──────────────────────────────────────
+
+    /// Allocates a generator object in `SuspendedStart` state.
+    /// Spec: <https://tc39.es/ecma262/#sec-generatorstart>
+    pub fn alloc_generator(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+        module: Module,
+        function_index: FunctionIndex,
+        closure_handle: Option<ObjectHandle>,
+        arguments: Vec<RegisterValue>,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Generator {
+            prototype,
+            state: GeneratorState::SuspendedStart,
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+            registers: None,
+            resume_pc: 0,
+            resume_register: 0,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the current generator state.
+    pub fn generator_state(&self, handle: ObjectHandle) -> Result<GeneratorState, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Generator { state, .. } => Ok(*state),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Sets the generator state.
+    pub fn set_generator_state(
+        &mut self,
+        handle: ObjectHandle,
+        new_state: GeneratorState,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Generator { state, .. } => {
+                *state = new_state;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Saves the register window and PC into the generator for suspension.
+    pub fn generator_save_state(
+        &mut self,
+        handle: ObjectHandle,
+        saved_registers: Box<[RegisterValue]>,
+        pc: ProgramCounter,
+        resume_reg: u16,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Generator {
+                registers,
+                resume_pc,
+                resume_register,
+                state,
+                ..
+            } => {
+                *registers = Some(saved_registers);
+                *resume_pc = pc;
+                *resume_register = resume_reg;
+                *state = GeneratorState::SuspendedYield;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Takes the saved state from a generator, transitioning it to `Executing`.
+    /// Returns `(module, function_index, closure_handle, arguments, registers, resume_pc, resume_register)`.
+    #[allow(clippy::type_complexity)]
+    pub fn generator_take_state(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<
+        (
+            Module,
+            FunctionIndex,
+            Option<ObjectHandle>,
+            Vec<RegisterValue>,
+            Option<Box<[RegisterValue]>>,
+            ProgramCounter,
+            u16,
+        ),
+        ObjectError,
+    > {
+        match self.object_mut(handle)? {
+            HeapValue::Generator {
+                module,
+                function_index,
+                closure_handle,
+                arguments,
+                registers,
+                resume_pc,
+                resume_register,
+                state,
+                ..
+            } => {
+                *state = GeneratorState::Executing;
+                Ok((
+                    module.clone(),
+                    *function_index,
+                    *closure_handle,
+                    std::mem::take(arguments),
+                    registers.take(),
+                    *resume_pc,
+                    *resume_register,
+                ))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Allocates a string value.
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::String {
@@ -1370,9 +1609,19 @@ impl ObjectHeap {
         ObjectHandle(h.0)
     }
 
-    /// Allocates a new pending promise.
+    /// Allocates a new pending promise with an optional prototype.
     pub fn alloc_promise(&mut self) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::Promise {
+            prototype: None,
+            promise: crate::promise::JsPromise::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a new pending promise with the given prototype.
+    pub fn alloc_promise_with_proto(&mut self, prototype: ObjectHandle) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Promise {
+            prototype: Some(prototype),
             promise: crate::promise::JsPromise::new(),
         });
         ObjectHandle(h.0)
@@ -1381,7 +1630,7 @@ impl ObjectHeap {
     /// Reads a reference to a JsPromise stored in the heap.
     pub fn get_promise(&self, handle: ObjectHandle) -> Option<&crate::promise::JsPromise> {
         match self.object(handle).ok()? {
-            HeapValue::Promise { promise } => Some(promise),
+            HeapValue::Promise { promise, .. } => Some(promise),
             _ => None,
         }
     }
@@ -1392,7 +1641,169 @@ impl ObjectHeap {
         handle: ObjectHandle,
     ) -> Option<&mut crate::promise::JsPromise> {
         match self.object_mut(handle).ok()? {
-            HeapValue::Promise { promise } => Some(promise),
+            HeapValue::Promise { promise, .. } => Some(promise),
+            _ => None,
+        }
+    }
+
+    /// Allocates a promise capability resolve or reject function.
+    /// ES2024 §27.2.1.5 NewPromiseCapability — creates the internal resolve/reject functions.
+    /// Spec: <https://tc39.es/ecma262/#sec-newpromisecapability>
+    pub fn alloc_promise_capability_function(
+        &mut self,
+        promise: ObjectHandle,
+        kind: crate::promise::ReactionKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::PromiseCapabilityFunction {
+            promise,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Creates a full promise capability: promise + resolve function + reject function.
+    /// Returns (promise, resolve, reject) triple.
+    /// ES2024 §27.2.1.5 NewPromiseCapability
+    /// Spec: <https://tc39.es/ecma262/#sec-newpromisecapability>
+    pub fn alloc_promise_capability(
+        &mut self,
+    ) -> crate::promise::PromiseCapability {
+        let promise = self.alloc_promise();
+        let resolve = self.alloc_promise_capability_function(
+            promise,
+            crate::promise::ReactionKind::Fulfill,
+        );
+        let reject = self.alloc_promise_capability_function(
+            promise,
+            crate::promise::ReactionKind::Reject,
+        );
+        crate::promise::PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        }
+    }
+
+    /// Allocates a per-element function for Promise.all/allSettled/any combinators.
+    pub fn alloc_promise_combinator_element(
+        &mut self,
+        combinator_kind: crate::promise::PromiseCombinatorKind,
+        index: u32,
+        result_array: ObjectHandle,
+        remaining_counter: ObjectHandle,
+        result_capability: crate::promise::PromiseCapability,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::PromiseCombinatorElement {
+            combinator_kind,
+            index,
+            result_array,
+            remaining_counter,
+            result_capability,
+            already_called: false,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a finally wrapper function.
+    pub fn alloc_promise_finally_function(
+        &mut self,
+        on_finally: ObjectHandle,
+        constructor: ObjectHandle,
+        kind: crate::promise::PromiseFinallyKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::PromiseFinallyFunction {
+            on_finally,
+            constructor,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a value thunk for finally chaining.
+    pub fn alloc_promise_value_thunk(
+        &mut self,
+        value: crate::value::RegisterValue,
+        kind: crate::promise::PromiseFinallyKind,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::PromiseValueThunk { value, kind });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the target promise and kind for a PromiseCapabilityFunction.
+    pub fn promise_capability_function_info(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<(ObjectHandle, crate::promise::ReactionKind)> {
+        match self.object(handle).ok()? {
+            HeapValue::PromiseCapabilityFunction { promise, kind } => Some((*promise, *kind)),
+            _ => None,
+        }
+    }
+
+    /// Returns combinator element info: (kind, index, result_array, counter, capability, already_called).
+    pub fn promise_combinator_element_info(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<(
+        crate::promise::PromiseCombinatorKind,
+        u32,
+        ObjectHandle,
+        ObjectHandle,
+        crate::promise::PromiseCapability,
+        bool,
+    )> {
+        match self.object(handle).ok()? {
+            HeapValue::PromiseCombinatorElement {
+                combinator_kind,
+                index,
+                result_array,
+                remaining_counter,
+                result_capability,
+                already_called,
+            } => Some((
+                *combinator_kind,
+                *index,
+                *result_array,
+                *remaining_counter,
+                result_capability.clone(),
+                *already_called,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Sets the already_called flag on a combinator element.
+    pub fn set_combinator_element_called(&mut self, handle: ObjectHandle) {
+        if let Ok(HeapValue::PromiseCombinatorElement {
+            already_called, ..
+        }) = self.object_mut(handle)
+        {
+            *already_called = true;
+        }
+    }
+
+    /// Returns finally function info: (on_finally, constructor, kind).
+    pub fn promise_finally_function_info(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<(ObjectHandle, ObjectHandle, crate::promise::PromiseFinallyKind)> {
+        match self.object(handle).ok()? {
+            HeapValue::PromiseFinallyFunction {
+                on_finally,
+                constructor,
+                kind,
+            } => Some((*on_finally, *constructor, *kind)),
+            _ => None,
+        }
+    }
+
+    /// Returns value thunk info: (value, kind).
+    pub fn promise_value_thunk_info(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<(crate::value::RegisterValue, crate::promise::PromiseFinallyKind)> {
+        match self.object(handle).ok()? {
+            HeapValue::PromiseValueThunk { value, kind } => Some((*value, *kind)),
             _ => None,
         }
     }
@@ -1412,12 +1823,23 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. } => Ok(HeapValueKind::Iterator),
             HeapValue::Promise { .. } => Ok(HeapValueKind::Promise),
+            HeapValue::PromiseCapabilityFunction { .. } => {
+                Ok(HeapValueKind::PromiseCapabilityFunction)
+            }
+            HeapValue::PromiseCombinatorElement { .. } => {
+                Ok(HeapValueKind::PromiseCombinatorElement)
+            }
+            HeapValue::PromiseFinallyFunction { .. } => {
+                Ok(HeapValueKind::PromiseFinallyFunction)
+            }
+            HeapValue::PromiseValueThunk { .. } => Ok(HeapValueKind::PromiseValueThunk),
             HeapValue::Map { .. } => Ok(HeapValueKind::Map),
             HeapValue::Set { .. } => Ok(HeapValueKind::Set),
             HeapValue::MapIterator { .. } => Ok(HeapValueKind::MapIterator),
             HeapValue::SetIterator { .. } => Ok(HeapValueKind::SetIterator),
             HeapValue::WeakMap { .. } => Ok(HeapValueKind::WeakMap),
             HeapValue::WeakSet { .. } => Ok(HeapValueKind::WeakSet),
+            HeapValue::Generator { .. } => Ok(HeapValueKind::Generator),
         }
     }
 
@@ -1438,10 +1860,15 @@ impl ObjectHeap {
             | HeapValue::MapIterator { prototype, .. }
             | HeapValue::SetIterator { prototype, .. }
             | HeapValue::WeakMap { prototype, .. }
-            | HeapValue::WeakSet { prototype, .. } => Ok(*prototype),
+            | HeapValue::WeakSet { prototype, .. }
+            | HeapValue::Generator { prototype, .. }
+            | HeapValue::Promise { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1527,13 +1954,22 @@ impl ObjectHeap {
             }
             | HeapValue::WeakSet {
                 prototype: slot, ..
+            }
+            | HeapValue::Generator {
+                prototype: slot, ..
+            }
+            | HeapValue::Promise {
+                prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1553,12 +1989,17 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -1638,12 +2079,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -1704,12 +2150,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -2239,12 +2690,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Ok(None),
         }
     }
 
@@ -2263,12 +2719,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Ok(None),
         }
     }
 
@@ -2287,12 +2748,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Ok(None),
         }
     }
 
@@ -2329,12 +2795,17 @@ impl ObjectHeap {
             | HeapValue::PropertyIterator { .. }
             | HeapValue::BoundFunction { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => Ok(None),
         }
     }
 
@@ -3021,12 +3492,17 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -3249,7 +3725,13 @@ impl ObjectHeap {
     pub fn is_callable(&self, handle: ObjectHandle) -> bool {
         matches!(
             self.kind(handle),
-            Ok(HeapValueKind::HostFunction | HeapValueKind::Closure | HeapValueKind::BoundFunction)
+            Ok(HeapValueKind::HostFunction
+                | HeapValueKind::Closure
+                | HeapValueKind::BoundFunction
+                | HeapValueKind::PromiseCapabilityFunction
+                | HeapValueKind::PromiseCombinatorElement
+                | HeapValueKind::PromiseFinallyFunction
+                | HeapValueKind::PromiseValueThunk)
         )
     }
 
@@ -3277,7 +3759,9 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             // WeakMap/WeakSet are extensible (prototype must be settable during init).
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => Ok(true),
+            | HeapValue::WeakSet { .. }
+            // Generators are extensible (can have own properties).
+            | HeapValue::Generator { .. } => Ok(true),
             // Strings, promises, upvalue cells are not extensible objects.
             _ => Ok(false),
         }
@@ -3730,12 +4214,17 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => {
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -3968,6 +4457,10 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::Promise { .. }
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. }
             | HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::MapIterator { .. }
@@ -4273,8 +4766,11 @@ impl ObjectHeap {
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => return Err(ObjectError::InvalidKind),
-            // Iterators have no own properties but participate in prototype chain.
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. } => return Err(ObjectError::InvalidKind),
+            // Objects with no own named properties but participate in prototype chain.
             HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
             | HeapValue::MapIterator { .. }
@@ -4282,7 +4778,9 @@ impl ObjectHeap {
             HeapValue::Map { .. }
             | HeapValue::Set { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => return Ok(None),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::Generator { .. }
+            | HeapValue::Promise { .. } => return Ok(None),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -4311,10 +4809,15 @@ impl ObjectHeap {
             | HeapValue::MapIterator { prototype, .. }
             | HeapValue::SetIterator { prototype, .. }
             | HeapValue::WeakMap { prototype, .. }
-            | HeapValue::WeakSet { prototype, .. } => Ok(*prototype),
+            | HeapValue::WeakSet { prototype, .. }
+            | HeapValue::Generator { prototype, .. }
+            | HeapValue::Promise { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
-            | HeapValue::Promise { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::PromiseCapabilityFunction { .. }
+            | HeapValue::PromiseCombinatorElement { .. }
+            | HeapValue::PromiseFinallyFunction { .. }
+            | HeapValue::PromiseValueThunk { .. } => Err(ObjectError::InvalidKind),
         }
     }
 }
@@ -4624,8 +5127,12 @@ mod tests {
             FunctionIndex(0),
         )
         .expect("test module should construct");
-        let closure =
-            heap.alloc_closure(module, FunctionIndex(7), vec![upvalue], ClosureFlags::normal());
+        let closure = heap.alloc_closure(
+            module,
+            FunctionIndex(7),
+            vec![upvalue],
+            ClosureFlags::normal(),
+        );
 
         assert_eq!(heap.kind(closure), Ok(HeapValueKind::Closure));
         assert_eq!(heap.kind(upvalue), Ok(HeapValueKind::UpvalueCell));
@@ -4752,7 +5259,9 @@ fn svz(heap: &TypedHeap, a: RegisterValue, b: RegisterValue) -> bool {
             heap.get::<HeapValue>(GcHandle(ah)),
             heap.get::<HeapValue>(GcHandle(bh)),
         ) {
-            if let (HeapValue::String { value: sa, .. }, HeapValue::String { value: sb, .. }) = (hva, hvb) {
+            if let (HeapValue::String { value: sa, .. }, HeapValue::String { value: sb, .. }) =
+                (hva, hvb)
+            {
                 return sa == sb;
             }
         }
@@ -4762,7 +5271,11 @@ fn svz(heap: &TypedHeap, a: RegisterValue, b: RegisterValue) -> bool {
 
 impl ObjectHeap {
     /// Find the index of a matching Map entry by key using SameValueZero.
-    fn map_find_index(&self, handle: ObjectHandle, key: RegisterValue) -> Result<Option<usize>, ObjectError> {
+    fn map_find_index(
+        &self,
+        handle: ObjectHandle,
+        key: RegisterValue,
+    ) -> Result<Option<usize>, ObjectError> {
         match self.object(handle)? {
             HeapValue::Map { entries, .. } => {
                 for (i, entry) in entries.iter().enumerate() {
@@ -4779,7 +5292,11 @@ impl ObjectHeap {
     }
 
     /// Find the index of a matching Set entry by value using SameValueZero.
-    fn set_find_index(&self, handle: ObjectHandle, value: RegisterValue) -> Result<Option<usize>, ObjectError> {
+    fn set_find_index(
+        &self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<Option<usize>, ObjectError> {
         match self.object(handle)? {
             HeapValue::Set { entries, .. } => {
                 for (i, entry) in entries.iter().enumerate() {

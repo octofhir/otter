@@ -155,9 +155,9 @@ fn date_argument_to_timestamp(
                     format!("TypeError allocation failed: {alloc_error}").into(),
                 )
             })?;
-            Err(VmNativeCallError::Thrown(RegisterValue::from_object_handle(
-                error.0,
-            )))
+            Err(VmNativeCallError::Thrown(
+                RegisterValue::from_object_handle(error.0),
+            ))
         }
         Err(other) => Err(VmNativeCallError::Internal(format!("{other}").into())),
     }
@@ -175,16 +175,29 @@ fn date_data(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<f64, VmNativeCallError> {
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
-        return Err(type_error(runtime, "Date.prototype.getTime requires a Date receiver")?);
+        return Err(type_error(
+            runtime,
+            "Date.prototype.getTime requires a Date receiver",
+        )?);
     };
     let backing = runtime.intern_property_name(DATE_DATA_SLOT);
-    let Some(lookup) = runtime.objects().get_property(handle, backing).map_err(|error| {
-        VmNativeCallError::Internal(format!("Date data lookup failed: {error:?}").into())
-    })? else {
-        return Err(type_error(runtime, "Date.prototype.getTime requires a Date receiver")?);
+    let Some(lookup) = runtime
+        .objects()
+        .get_property(handle, backing)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("Date data lookup failed: {error:?}").into())
+        })?
+    else {
+        return Err(type_error(
+            runtime,
+            "Date.prototype.getTime requires a Date receiver",
+        )?);
     };
     let crate::object::PropertyValue::Data { value, .. } = lookup.value() else {
-        return Err(type_error(runtime, "Date.prototype.getTime requires a Date receiver")?);
+        return Err(type_error(
+            runtime,
+            "Date.prototype.getTime requires a Date receiver",
+        )?);
     };
     Ok(value.as_number().unwrap_or(f64::NAN))
 }
@@ -206,7 +219,9 @@ fn set_date_data(
             ),
         )
         .map_err(|error| {
-            VmNativeCallError::Internal(format!("Date constructor backing store failed: {error:?}").into())
+            VmNativeCallError::Internal(
+                format!("Date constructor backing store failed: {error:?}").into(),
+            )
         })?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
-use crate::object::{ObjectHandle, PropertyAttributes, PropertyValue};
+use crate::object::ObjectHandle;
 use crate::value::RegisterValue;
 
 use super::{
@@ -36,55 +36,13 @@ impl IntrinsicInstaller for SpeciesSupportIntrinsic {
             intrinsics.function_prototype(),
         )?;
 
-        install_stub_constructor(cx, intrinsics, "RegExp", 2)?;
+        install_species_getter(
+            cx,
+            intrinsics.regexp_constructor(),
+            intrinsics.function_prototype(),
+        )?;
         Ok(())
     }
-}
-
-fn install_stub_constructor(
-    cx: &mut IntrinsicInstallContext<'_>,
-    intrinsics: &VmIntrinsics,
-    name: &str,
-    length: u16,
-) -> Result<(), IntrinsicsError> {
-    let constructor_id = cx
-        .native_functions
-        .register(NativeFunctionDescriptor::constructor(
-            name,
-            length,
-            stub_constructor,
-        ));
-    let constructor =
-        cx.alloc_intrinsic_host_function(constructor_id, intrinsics.function_prototype())?;
-    install_function_length_name(constructor, length, name, cx)?;
-
-    let prototype = cx.alloc_intrinsic_object(Some(intrinsics.object_prototype()))?;
-    let prototype_property = cx.property_names.intern("prototype");
-    cx.heap.define_own_property(
-        constructor,
-        prototype_property,
-        PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(prototype.0),
-            PropertyAttributes::frozen(),
-        ),
-    )?;
-
-    let constructor_property = cx.property_names.intern("constructor");
-    cx.heap.define_own_property(
-        prototype,
-        constructor_property,
-        PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(constructor.0),
-            PropertyAttributes::constructor_link(),
-        ),
-    )?;
-
-    install_species_getter(cx, constructor, intrinsics.function_prototype())?;
-    cx.install_global_value(
-        intrinsics,
-        name,
-        RegisterValue::from_object_handle(constructor.0),
-    )
 }
 
 fn install_species_getter(
@@ -114,16 +72,4 @@ fn species_getter(
     _runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     Ok(*this)
-}
-
-fn stub_constructor(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut crate::interpreter::RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    if this.as_object_handle().is_some() {
-        return Ok(*this);
-    }
-    let object = runtime.alloc_object();
-    Ok(RegisterValue::from_object_handle(object.0))
 }

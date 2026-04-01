@@ -72,6 +72,15 @@ pub fn compile_script(source: &str, source_url: &str) -> Result<Module, SourceLo
     crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Script)
 }
 
+/// Parse, lower, and compile a JS module (ESM) into an `otter-vm` module.
+/// Module mode enables top-level `await` and strict mode by default.
+/// Spec: <https://tc39.es/ecma262/#sec-modules>
+pub fn compile_module(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
+    let allocator = Allocator::default();
+    let ast = parse_module(&allocator, source, source_url)?;
+    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Script)
+}
+
 /// Parse, lower, and compile a tiny native Test262 script into an `otter-vm` module.
 pub fn compile_test262_basic_script(
     source: &str,
@@ -95,6 +104,22 @@ fn lower_script_with_mode(
     let allocator = Allocator::default();
     let program = parse_script(&allocator, source, source_url)?;
     TinyScriptLowerer::new(source_url, mode).lower_program(&program)
+}
+
+fn parse_module<'a>(
+    allocator: &'a Allocator,
+    source: &'a str,
+    source_url: &str,
+) -> Result<AstProgram<'a>, SourceLoweringError> {
+    let source_type = SourceType::from_path(source_url)
+        .unwrap_or_default()
+        .with_module(true);
+
+    let parsed = Parser::new(allocator, source, source_type).parse();
+    if let Some(error) = parsed.errors.first() {
+        return Err(SourceLoweringError::Parse(error.to_string()));
+    }
+    Ok(parsed.program)
 }
 
 fn parse_script<'a>(

@@ -173,6 +173,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
                     FeedbackSlotId(0),

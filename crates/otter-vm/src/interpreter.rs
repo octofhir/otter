@@ -1740,19 +1740,26 @@ impl RuntimeState {
 
         // ES2024 §27.2.1.3 — Promise capability resolve/reject functions.
         if let Ok(HeapValueKind::PromiseCapabilityFunction) = self.objects.kind(callable) {
-            let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
-            Interpreter::invoke_promise_capability_function(self, callable, value)
-                .map_err(|e| match e {
+            let value = arguments
+                .first()
+                .copied()
+                .unwrap_or(RegisterValue::undefined());
+            Interpreter::invoke_promise_capability_function(self, callable, value).map_err(
+                |e| match e {
                     InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
                     other => VmNativeCallError::Internal(format!("{other}").into()),
-                })?;
+                },
+            )?;
             return Ok(RegisterValue::undefined());
         }
 
         // Promise combinator/finally/thunk dispatch.
         match self.objects.kind(callable) {
             Ok(HeapValueKind::PromiseCombinatorElement) => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 return Interpreter::invoke_promise_combinator_element(self, callable, value)
                     .map_err(|e| match e {
                         InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
@@ -1760,7 +1767,10 @@ impl RuntimeState {
                     });
             }
             Ok(HeapValueKind::PromiseFinallyFunction) => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 return Interpreter::invoke_promise_finally_function(self, callable, value)
                     .map_err(|e| match e {
                         InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
@@ -2798,7 +2808,8 @@ impl RuntimeState {
                 | HeapValueKind::SetIterator
                 | HeapValueKind::WeakMap
                 | HeapValueKind::WeakSet
-                | HeapValueKind::Generator => "object",
+                | HeapValueKind::Generator
+                | HeapValueKind::RegExp => "object",
             }
         } else {
             "undefined"
@@ -2841,8 +2852,13 @@ impl RuntimeState {
         arguments: Vec<RegisterValue>,
     ) -> ObjectHandle {
         let prototype = self.intrinsics.generator_prototype();
-        self.objects
-            .alloc_generator(Some(prototype), module, function_index, closure_handle, arguments)
+        self.objects.alloc_generator(
+            Some(prototype),
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+        )
     }
 
     /// Resumes a suspended generator. Called by the native `.next()`, `.return()`,
@@ -3029,6 +3045,12 @@ impl Interpreter {
                         "Class constructor cannot be invoked without 'new'".into(),
                     ));
                 }
+
+                let is_async = runtime
+                    .objects
+                    .closure_flags(callable)
+                    .is_ok_and(|flags| flags.is_async());
+
                 let module = runtime.objects.closure_module(callable)?;
                 let callee_index = runtime.objects.closure_callee(callable)?;
                 let callee_function = module
@@ -3066,21 +3088,36 @@ impl Interpreter {
                 activation.metadata =
                     FrameMetadata::new(arguments.len() as RegisterIndex, FrameFlags::default());
 
-                let interpreter = Interpreter::new();
-                let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
-                Ok(result.return_value())
+                if is_async {
+                    // §27.7.5.1 AsyncFunctionStart — create a result promise,
+                    // execute the body, and settle the promise on completion.
+                    Self::execute_async_function_body(runtime, &module, &mut activation)
+                } else {
+                    let interpreter = Interpreter::new();
+                    let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
+                    Ok(result.return_value())
+                }
             }
             HeapValueKind::PromiseCapabilityFunction => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 Self::invoke_promise_capability_function(runtime, callable, value)?;
                 Ok(RegisterValue::undefined())
             }
             HeapValueKind::PromiseCombinatorElement => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 Self::invoke_promise_combinator_element(runtime, callable, value)
             }
             HeapValueKind::PromiseFinallyFunction => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 Self::invoke_promise_finally_function(runtime, callable, value)
             }
             HeapValueKind::PromiseValueThunk => {
@@ -3100,6 +3137,60 @@ impl Interpreter {
                 format!("{kind:?} is not a function").into(),
             )),
         }
+    }
+
+    /// Executes an async function body, wrapping the result in a Promise.
+    ///
+    /// ES2024 §27.7.5.1 AsyncFunctionStart
+    /// Spec: <https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start>
+    ///
+    /// Creates a result promise, runs the function body via `run_completion_with_runtime`,
+    /// and settles the promise based on the outcome (return → resolve, throw → reject).
+    fn execute_async_function_body(
+        runtime: &mut RuntimeState,
+        module: &Module,
+        activation: &mut Activation,
+    ) -> Result<RegisterValue, InterpreterError> {
+        // §27.7.5.1 step 2: Let promiseCapability be ! NewPromiseCapability(%Promise%).
+        let proto = runtime.intrinsics().promise_prototype();
+        let promise = runtime.objects.alloc_promise_with_proto(proto);
+        let resolve = runtime
+            .objects
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+        let reject = runtime
+            .objects
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
+        let capability = crate::promise::PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        };
+
+        // §27.7.5.1 step 4: Execute the async function body.
+        let interpreter = Interpreter::new();
+        let result = interpreter.run_completion_with_runtime(module, activation, runtime);
+
+        match result {
+            Ok(Completion::Return(return_value)) => {
+                // §27.7.5.1 step 4.a: Function completed normally — resolve the promise.
+                Self::invoke_promise_capability_function(
+                    runtime,
+                    capability.resolve,
+                    return_value,
+                )?;
+            }
+            Ok(Completion::Throw(thrown)) => {
+                // §27.7.5.1 step 4.c: Function threw — reject the promise.
+                Self::invoke_promise_capability_function(runtime, capability.reject, thrown)?;
+            }
+            Err(InterpreterError::UncaughtThrow(thrown)) => {
+                // Uncaught exception — reject the promise.
+                Self::invoke_promise_capability_function(runtime, capability.reject, thrown)?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(RegisterValue::from_object_handle(capability.promise.0))
     }
 
     /// Invokes a PromiseCapabilityFunction (resolve or reject) with a value.
@@ -3144,7 +3235,11 @@ impl Interpreter {
                         // we need to chain. For now, check if value is a promise and chain.
                         if runtime.objects.get_promise(ObjectHandle(h)).is_some() {
                             // Value is a promise — register then reactions to forward settlement.
-                            Self::chain_promise_resolution(runtime, promise_handle, ObjectHandle(h));
+                            Self::chain_promise_resolution(
+                                runtime,
+                                promise_handle,
+                                ObjectHandle(h),
+                            );
                             return Ok(());
                         }
                         let promise = runtime.objects.get_promise_mut(promise_handle).unwrap();
@@ -3174,14 +3269,12 @@ impl Interpreter {
         thenable: ObjectHandle,
     ) {
         // Get or create resolve/reject for the target promise.
-        let resolve = runtime.objects.alloc_promise_capability_function(
-            promise,
-            crate::promise::ReactionKind::Fulfill,
-        );
-        let reject = runtime.objects.alloc_promise_capability_function(
-            promise,
-            crate::promise::ReactionKind::Reject,
-        );
+        let resolve = runtime
+            .objects
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+        let reject = runtime
+            .objects
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
 
         let capability = crate::promise::PromiseCapability {
             promise,
@@ -3195,11 +3288,8 @@ impl Interpreter {
             .get_promise_mut(thenable)
             .expect("thenable verified as promise");
 
-        if let Some(immediate_job) = thenable_promise.then(
-            Some(resolve),
-            Some(reject),
-            capability,
-        ) {
+        if let Some(immediate_job) = thenable_promise.then(Some(resolve), Some(reject), capability)
+        {
             runtime.microtasks_mut().enqueue_promise_job(immediate_job);
         }
     }
@@ -3319,10 +3409,7 @@ impl Interpreter {
         let Ok(elements) = runtime.objects.array_elements(counter_handle) else {
             return false;
         };
-        let count = elements
-            .first()
-            .and_then(|v| v.as_i32())
-            .unwrap_or(0);
+        let count = elements.first().and_then(|v| v.as_i32()).unwrap_or(0);
         let new_count = count - 1;
         let _ = runtime
             .objects
@@ -3342,16 +3429,11 @@ impl Interpreter {
         let (on_finally, _constructor, kind) = runtime
             .objects
             .promise_finally_function_info(callable)
-            .ok_or_else(|| {
-                InterpreterError::TypeError("not a promise finally function".into())
-            })?;
+            .ok_or_else(|| InterpreterError::TypeError("not a promise finally function".into()))?;
 
         // Call onFinally() with no arguments.
-        let finally_result = runtime.call_host_function(
-            Some(on_finally),
-            RegisterValue::undefined(),
-            &[],
-        );
+        let finally_result =
+            runtime.call_host_function(Some(on_finally), RegisterValue::undefined(), &[]);
 
         match kind {
             PromiseFinallyKind::ThenFinally => {
@@ -3362,9 +3444,7 @@ impl Interpreter {
                     Err(VmNativeCallError::Thrown(thrown)) => {
                         Err(InterpreterError::UncaughtThrow(thrown))
                     }
-                    Err(VmNativeCallError::Internal(msg)) => {
-                        Err(InterpreterError::NativeCall(msg))
-                    }
+                    Err(VmNativeCallError::Internal(msg)) => Err(InterpreterError::NativeCall(msg)),
                 }
             }
             PromiseFinallyKind::CatchFinally => {
@@ -3375,9 +3455,7 @@ impl Interpreter {
                     Err(VmNativeCallError::Thrown(thrown)) => {
                         Err(InterpreterError::UncaughtThrow(thrown))
                     }
-                    Err(VmNativeCallError::Internal(msg)) => {
-                        Err(InterpreterError::NativeCall(msg))
-                    }
+                    Err(VmNativeCallError::Internal(msg)) => Err(InterpreterError::NativeCall(msg)),
                 }
             }
         }
@@ -3550,13 +3628,46 @@ impl Interpreter {
                     runtime.restore_module(previous_module);
                     return Ok(Completion::Throw(value));
                 }
-                StepOutcome::Suspend { .. } => {
-                    // TODO: Capture SuspendedFrame and return to event loop.
-                    // For now, async functions are not fully wired — treat as
-                    // returning undefined (the result_promise will be settled
-                    // when the event loop integrates suspend/resume).
-                    runtime.restore_module(previous_module);
-                    return Ok(Completion::Return(RegisterValue::undefined()));
+                StepOutcome::Suspend {
+                    awaited_promise,
+                    resume_register,
+                } => {
+                    // ES2024 §27.7.5.3 Await — suspend until the promise settles.
+                    // Drain microtasks inline; if the promise settles, resume.
+                    // This handles synchronously-resolvable chains (most common case).
+                    Self::drain_microtasks_for_await(runtime, module);
+
+                    // Check if the awaited promise settled during drain.
+                    if let Some(promise) = runtime.objects.get_promise(awaited_promise) {
+                        match &promise.state {
+                            crate::promise::PromiseState::Fulfilled(value) => {
+                                let value = *value;
+                                activation.set_register(resume_register, value)?;
+                                // Continue execution loop — the await resolved.
+                                continue;
+                            }
+                            crate::promise::PromiseState::Rejected(reason) => {
+                                let reason = *reason;
+                                // Feed rejection through exception handling.
+                                if self.transfer_exception(function, activation, reason) {
+                                    continue;
+                                }
+                                runtime.restore_module(previous_module);
+                                return Ok(Completion::Throw(reason));
+                            }
+                            crate::promise::PromiseState::Pending => {
+                                // Promise still pending after draining microtasks.
+                                // This would require full event-loop integration
+                                // (timers, I/O) to resolve. For now, return undefined.
+                                runtime.restore_module(previous_module);
+                                return Ok(Completion::Return(RegisterValue::undefined()));
+                            }
+                        }
+                    } else {
+                        // Not a promise — treat as fulfilled with the value.
+                        runtime.restore_module(previous_module);
+                        return Ok(Completion::Return(RegisterValue::undefined()));
+                    }
                 }
                 StepOutcome::GeneratorYield { yielded_value, .. } => {
                     // GeneratorYield inside a non-generator run loop — treat
@@ -3564,6 +3675,67 @@ impl Interpreter {
                     runtime.restore_module(previous_module);
                     return Ok(Completion::Return(yielded_value));
                 }
+            }
+        }
+    }
+
+    /// Drains microtasks inline during an await suspension.
+    /// This settles promise chains that resolve synchronously (without timers/IO).
+    fn drain_microtasks_for_await(runtime: &mut RuntimeState, module: &Module) {
+        // Simple drain loop — process all promise jobs until exhausted.
+        // This mirrors OtterRuntime::drain_microtasks but runs inside the interpreter.
+        loop {
+            let mut did_work = false;
+            while let Some(job) = runtime.microtasks_mut().pop_promise_job() {
+                let callback_is_self_settling = matches!(
+                    runtime.objects.kind(job.callback),
+                    Ok(HeapValueKind::PromiseCapabilityFunction
+                        | HeapValueKind::PromiseCombinatorElement)
+                );
+
+                let call_result = Self::call_function(
+                    runtime,
+                    module,
+                    job.callback,
+                    job.this_value,
+                    &[job.argument],
+                );
+
+                if let Some(result_promise) = job.result_promise {
+                    if !callback_is_self_settling {
+                        match call_result {
+                            Ok(handler_result) => {
+                                let resolve = runtime.objects.alloc_promise_capability_function(
+                                    result_promise,
+                                    crate::promise::ReactionKind::Fulfill,
+                                );
+                                let _ = Self::call_function(
+                                    runtime,
+                                    module,
+                                    resolve,
+                                    RegisterValue::undefined(),
+                                    &[handler_result],
+                                );
+                            }
+                            Err(InterpreterError::UncaughtThrow(reason)) => {
+                                if let Some(promise) =
+                                    runtime.objects.get_promise_mut(result_promise)
+                                {
+                                    if let Some(jobs) = promise.reject(reason) {
+                                        for j in jobs {
+                                            runtime.microtasks_mut().enqueue_promise_job(j);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                did_work = true;
+            }
+            if !did_work {
+                break;
             }
         }
     }
@@ -3666,6 +3838,24 @@ impl Interpreter {
             Opcode::LoadString => {
                 let string = Self::resolve_string_literal(function, instruction.b())?;
                 let handle = runtime.alloc_string(string);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(handle.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §22.2.3 — RegExpLiteral evaluation: allocate a fresh RegExp object.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-regularexpressionliteral>
+            Opcode::NewRegExp => {
+                let entry = Self::resolve_regexp_literal(function, instruction.b())?;
+                let prototype = runtime.intrinsics().regexp_prototype();
+                let handle = runtime.objects_mut().alloc_regexp(
+                    &entry.pattern,
+                    &entry.flags,
+                    Some(prototype),
+                );
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -4908,6 +5098,40 @@ impl Interpreter {
                     return Ok(StepOutcome::Continue);
                 }
 
+                // §27.7.5.1 — Async function call: execute the body and wrap
+                // the result in a Promise.
+                // Spec: <https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start>
+                if matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
+                    && runtime
+                        .objects
+                        .closure_flags(callee)
+                        .is_ok_and(|flags| flags.is_async())
+                {
+                    let receiver = Self::resolve_call_receiver(
+                        caller_function,
+                        activation,
+                        call.flags(),
+                        call.receiver(),
+                        None,
+                    )?;
+                    match Self::call_function(runtime, module, callee, receiver, &arguments) {
+                        Ok(promise_value) => {
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
+                            activation.write_bytecode_register(
+                                function,
+                                instruction.a(),
+                                promise_value,
+                            )?;
+                            activation.advance();
+                            return Ok(StepOutcome::Continue);
+                        }
+                        Err(InterpreterError::UncaughtThrow(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+
                 if let Ok(HeapValueKind::BoundFunction) = runtime.objects.kind(callee) {
                     let receiver = Self::resolve_call_receiver(
                         caller_function,
@@ -4945,9 +5169,8 @@ impl Interpreter {
                         call.receiver(),
                         None,
                     )?;
-                    match Self::invoke_host_function_handle(
-                        runtime, callee, receiver, &arguments,
-                    )? {
+                    match Self::invoke_host_function_handle(runtime, callee, receiver, &arguments)?
+                    {
                         Completion::Return(value) => {
                             activation.write_bytecode_register(function, instruction.a(), value)?;
                             activation.advance();
@@ -5228,6 +5451,19 @@ impl Interpreter {
         function
             .string_literals()
             .get(StringId(raw_id))
+            .ok_or(InterpreterError::UnknownStringLiteral)
+    }
+
+    /// Resolves a RegExp-literal entry from the function's regexp side table.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-literals-regular-expression-literals>
+    fn resolve_regexp_literal(
+        function: &Function,
+        raw_id: RegisterIndex,
+    ) -> Result<&crate::regexp::RegExpEntry, InterpreterError> {
+        function
+            .regexp_literals()
+            .get(crate::regexp::RegExpId(raw_id))
             .ok_or(InterpreterError::UnknownStringLiteral)
     }
 
@@ -5590,7 +5826,10 @@ impl Interpreter {
 
         // ES2024 §27.2.1.3 — Promise capability resolve/reject functions.
         if let Ok(HeapValueKind::PromiseCapabilityFunction) = runtime.objects.kind(callable) {
-            let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+            let value = arguments
+                .first()
+                .copied()
+                .unwrap_or(RegisterValue::undefined());
             Self::invoke_promise_capability_function(runtime, callable, value)?;
             return Ok(Completion::Return(RegisterValue::undefined()));
         }
@@ -5598,12 +5837,18 @@ impl Interpreter {
         // Promise combinator per-element / finally / value-thunk dispatch.
         match runtime.objects.kind(callable) {
             Ok(HeapValueKind::PromiseCombinatorElement) => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 let result = Self::invoke_promise_combinator_element(runtime, callable, value)?;
                 return Ok(Completion::Return(result));
             }
             Ok(HeapValueKind::PromiseFinallyFunction) => {
-                let value = arguments.first().copied().unwrap_or(RegisterValue::undefined());
+                let value = arguments
+                    .first()
+                    .copied()
+                    .unwrap_or(RegisterValue::undefined());
                 match Self::invoke_promise_finally_function(runtime, callable, value) {
                     Ok(v) => return Ok(Completion::Return(v)),
                     Err(InterpreterError::UncaughtThrow(v)) => {
@@ -5746,13 +5991,20 @@ impl Interpreter {
         use crate::intrinsics::GeneratorResumeKind;
         use crate::object::GeneratorState;
 
-        let (module, function_index, closure_handle, arguments, saved_registers, resume_pc, resume_reg) =
-            runtime
-                .objects
-                .generator_take_state(generator)
-                .map_err(|e| {
-                    VmNativeCallError::Internal(format!("generator take state: {e:?}").into())
-                })?;
+        let (
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+            saved_registers,
+            resume_pc,
+            resume_reg,
+        ) = runtime
+            .objects
+            .generator_take_state(generator)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("generator take state: {e:?}").into())
+            })?;
 
         let function = module.function(function_index).ok_or_else(|| {
             VmNativeCallError::Internal("generator function index invalid".into())
@@ -5808,10 +6060,7 @@ impl Interpreter {
                     let mut act = Activation::with_context(
                         function_index,
                         register_count,
-                        FrameMetadata::new(
-                            arguments.len() as u16,
-                            FrameFlags::empty(),
-                        ),
+                        FrameMetadata::new(arguments.len() as u16, FrameFlags::empty()),
                         closure_handle,
                     );
                     // Write arguments to parameter registers.
@@ -6495,6 +6744,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 feedback,
                 DeoptTable::default(),
@@ -6534,6 +6784,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6607,6 +6858,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6667,6 +6919,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -6737,6 +6990,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6768,6 +7022,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6835,6 +7090,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6899,6 +7155,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -6992,6 +7249,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -7111,6 +7369,7 @@ mod tests {
                         None,
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -7173,6 +7432,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -7256,6 +7516,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -7397,6 +7658,7 @@ mod tests {
                         None,
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -7473,6 +7735,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
                     FeedbackSlotId(0),
@@ -7526,6 +7789,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -7593,6 +7857,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -7653,6 +7918,7 @@ mod tests {
                         ))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
                     FeedbackSlotId(0),
@@ -7788,6 +8054,7 @@ mod tests {
                         Some(CallSite::Closure(ClosureCall::new(1, FrameFlags::empty()))),
                         None,
                     ]),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::new(vec![
                     FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),

@@ -35,6 +35,8 @@ impl<'a> FunctionCompiler<'a> {
             string_literals: Vec::new(),
             string_ids: BTreeMap::new(),
             float_constants: Vec::new(),
+            regexp_literals: Vec::new(),
+            regexp_ids: BTreeMap::new(),
             closure_templates: Vec::new(),
             call_sites: Vec::new(),
             exception_handlers: Vec::new(),
@@ -274,6 +276,7 @@ impl<'a> FunctionCompiler<'a> {
                     closure_register,
                     captures: Vec::new(),
                     is_generator: function.generator,
+                    is_async: function.r#async,
                 },
             ));
         }
@@ -304,6 +307,8 @@ impl<'a> FunctionCompiler<'a> {
                 &extract_function_params(function)?,
                 if function.generator {
                     FunctionKind::Generator
+                } else if function.r#async {
+                    FunctionKind::Async
                 } else {
                     FunctionKind::Ordinary
                 },
@@ -323,6 +328,7 @@ impl<'a> FunctionCompiler<'a> {
                 reserved: pending.reserved,
                 closure_register: pending.closure_register,
                 is_generator: function.generator,
+                is_async: function.r#async,
             });
         }
 
@@ -333,6 +339,12 @@ impl<'a> FunctionCompiler<'a> {
         for pending in self.hoisted_functions.clone() {
             if pending.is_generator {
                 self.emit_new_closure_generator(
+                    pending.closure_register,
+                    pending.reserved,
+                    &pending.captures,
+                )?;
+            } else if pending.is_async {
+                self.emit_new_closure_async(
                     pending.closure_register,
                     pending.reserved,
                     &pending.captures,
@@ -370,6 +382,7 @@ impl<'a> FunctionCompiler<'a> {
                 FloatTable::new(self.float_constants),
                 ClosureTable::new(self.closure_templates),
                 CallTable::new(self.call_sites),
+                crate::regexp::RegExpTable::new(self.regexp_literals),
             ),
             FeedbackTableLayout::default(),
             DeoptTable::default(),
@@ -387,7 +400,8 @@ impl<'a> FunctionCompiler<'a> {
             )
             .with_strict(self.strict_mode)
             .with_derived_constructor(self.is_derived_constructor)
-            .with_generator(self.kind == FunctionKind::Generator),
+            .with_generator(self.kind == FunctionKind::Generator)
+            .with_async(self.kind.is_async()),
             captures: self.captures,
         })
     }
@@ -792,9 +806,7 @@ impl<'a> FunctionCompiler<'a> {
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
         let kind = if method.value.r#async {
-            return Err(SourceLoweringError::Unsupported(
-                "async class methods".to_string(),
-            ));
+            super::shared::FunctionKind::Async
         } else if method.value.generator {
             return Err(SourceLoweringError::Unsupported(
                 "generator class methods".to_string(),
@@ -822,7 +834,11 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let method_closure = ValueLocation::temp(self.alloc_temp());
-        self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+        if kind.is_async() {
+            self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
+        } else {
+            self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+        }
 
         // Install on target: getter, setter, or data method.
         match method.kind {
@@ -1248,6 +1264,34 @@ impl<'a> FunctionCompiler<'a> {
         )
     }
 
+    pub(super) fn emit_new_closure_async(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::async_fn(),
+        )
+    }
+
+    pub(super) fn emit_new_closure_async_arrow(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::async_arrow(),
+        )
+    }
+
     pub(super) fn emit_new_closure_class_constructor(
         &mut self,
         destination: BytecodeRegister,
@@ -1615,9 +1659,11 @@ impl<'a> FunctionCompiler<'a> {
                 LoweringMode::Script => self.load_undefined()?,
                 LoweringMode::Test262Basic => self.load_i32(0)?,
             },
-            FunctionKind::Ordinary | FunctionKind::Arrow | FunctionKind::Generator => {
-                self.load_undefined()?
-            }
+            FunctionKind::Ordinary
+            | FunctionKind::Arrow
+            | FunctionKind::Generator
+            | FunctionKind::Async
+            | FunctionKind::AsyncArrow => self.load_undefined()?,
         };
         self.instructions.push(Instruction::ret(value.register));
         self.release(value);
@@ -1654,6 +1700,30 @@ impl<'a> FunctionCompiler<'a> {
         self.string_literals
             .push(value.to_string().into_boxed_str());
         self.string_ids.insert(value.to_string(), id);
+        Ok(id)
+    }
+
+    /// Interns a RegExp literal `(pattern, flags)` pair and returns its stable id.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-literals-regular-expression-literals>
+    pub(super) fn intern_regexp(
+        &mut self,
+        pattern: &str,
+        flags: &str,
+    ) -> Result<crate::regexp::RegExpId, SourceLoweringError> {
+        let key = (pattern.to_string(), flags.to_string());
+        if let Some(existing) = self.regexp_ids.get(&key).copied() {
+            return Ok(existing);
+        }
+        let id = crate::regexp::RegExpId(
+            u16::try_from(self.regexp_literals.len())
+                .map_err(|_| SourceLoweringError::TooManyLocals)?,
+        );
+        self.regexp_literals.push((
+            pattern.to_string().into_boxed_str(),
+            flags.to_string().into_boxed_str(),
+        ));
+        self.regexp_ids.insert(key, id);
         Ok(id)
     }
 

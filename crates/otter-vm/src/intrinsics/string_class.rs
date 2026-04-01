@@ -7,7 +7,7 @@ use crate::object::{HeapValueKind, ObjectHandle, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
-    IntrinsicsError, VmIntrinsics,
+    IntrinsicsError, VmIntrinsics, WellKnownSymbol,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
     symbol_descriptive_string,
 };
@@ -133,6 +133,8 @@ fn string_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("padEnd", 1, string_pad_end))
         .with_binding(proto("split", 2, string_split))
         .with_binding(proto("at", 1, string_at))
+        .with_binding(proto("match", 1, string_match))
+        .with_binding(proto("search", 1, string_search))
         .with_binding(proto("replace", 2, string_replace))
         .with_binding(proto("replaceAll", 2, string_replace_all))
         .with_binding(proto("normalize", 0, string_normalize))
@@ -868,6 +870,121 @@ fn string_pad_end(
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
+/// Try to call `arg[symbolKey](this, ...extra_args)`.
+/// Returns `Some(result)` if the symbol method exists and is callable, `None` otherwise.
+fn try_symbol_dispatch(
+    symbol: WellKnownSymbol,
+    arg: RegisterValue,
+    this: &RegisterValue,
+    extra_args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<Option<RegisterValue>, VmNativeCallError> {
+    let handle = match arg.as_object_handle().map(ObjectHandle) {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    let sym_prop = runtime.intern_symbol_property_name(symbol.stable_id());
+    let method_val = runtime.ordinary_get(handle, sym_prop, arg)?;
+    if method_val == RegisterValue::undefined() || method_val == RegisterValue::null() {
+        return Ok(None);
+    }
+    let method_handle = match method_val.as_object_handle().map(ObjectHandle) {
+        Some(h) if runtime.objects().is_callable(h) => h,
+        _ => return Ok(None),
+    };
+    let mut call_args = Vec::with_capacity(1 + extra_args.len());
+    call_args.push(*this);
+    call_args.extend_from_slice(extra_args);
+    let result = runtime.call_callable(method_handle, arg, &call_args)?;
+    Ok(Some(result))
+}
+
+fn set_regexp_last_index(
+    handle: ObjectHandle,
+    value: f64,
+    runtime: &mut crate::interpreter::RuntimeState,
+) {
+    let prop = runtime.intern_property_name("lastIndex");
+    let val =
+        if value == (value as i32) as f64 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
+            RegisterValue::from_i32(value as i32)
+        } else {
+            RegisterValue::from_number(value)
+        };
+    runtime.objects_mut().set_property(handle, prop, val).ok();
+}
+
+// ── §22.1.3.12 String.prototype.match(regexp) ────────────────────────────
+
+fn string_match(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let regexp_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // Step 1-2: If regexp has Symbol.match, call regexp[Symbol.match](this).
+    if let Some(result) =
+        try_symbol_dispatch(WellKnownSymbol::Match, regexp_arg, this, &[], runtime)?
+    {
+        return Ok(result);
+    }
+
+    // Step 3-4: Coerce to string, create a RegExp, then delegate via Symbol.match.
+    let search_str = runtime
+        .js_to_string(regexp_arg)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    let prototype = runtime.intrinsics().regexp_prototype;
+    let re = runtime
+        .objects_mut()
+        .alloc_regexp(&search_str, "", Some(prototype));
+    set_regexp_last_index(re, 0.0, runtime);
+    let re_val = RegisterValue::from_object_handle(re.0);
+    if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Match, re_val, this, &[], runtime)? {
+        return Ok(result);
+    }
+    Ok(RegisterValue::null())
+}
+
+// ── §22.1.3.21 String.prototype.search(regexp) ───────────────────────────
+
+fn string_search(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let regexp_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // Step 1-2: If regexp has Symbol.search, call regexp[Symbol.search](this).
+    if let Some(result) =
+        try_symbol_dispatch(WellKnownSymbol::Search, regexp_arg, this, &[], runtime)?
+    {
+        return Ok(result);
+    }
+
+    // Step 3-4: Coerce to string, create a RegExp, then delegate via Symbol.search.
+    let search_str = runtime
+        .js_to_string(regexp_arg)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    let prototype = runtime.intrinsics().regexp_prototype;
+    let re = runtime
+        .objects_mut()
+        .alloc_regexp(&search_str, "", Some(prototype));
+    set_regexp_last_index(re, 0.0, runtime);
+    let re_val = RegisterValue::from_object_handle(re.0);
+    if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Search, re_val, this, &[], runtime)?
+    {
+        return Ok(result);
+    }
+    Ok(RegisterValue::from_i32(-1))
+}
+
 // ── §22.1.3.20 String.prototype.split(separator, limit) ────────────────────
 
 fn string_split(
@@ -875,6 +992,25 @@ fn string_split(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    // Step 2: If separator has Symbol.split, delegate.
+    let separator_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let limit_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    if let Some(result) = try_symbol_dispatch(
+        WellKnownSymbol::Split,
+        separator_arg,
+        this,
+        &[limit_arg],
+        runtime,
+    )? {
+        return Ok(result);
+    }
+
     let s = this_string_value(this, runtime)?;
     let limit = args
         .get(1)
@@ -971,17 +1107,29 @@ fn string_replace(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
+    // Step 2: If searchValue has Symbol.replace, delegate.
+    let search_arg = args
         .first()
         .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
+        .unwrap_or_else(RegisterValue::undefined);
+    let replace_arg_raw = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    if let Some(result) = try_symbol_dispatch(
+        WellKnownSymbol::Replace,
+        search_arg,
+        this,
+        &[replace_arg_raw],
+        runtime,
+    )? {
+        return Ok(result);
+    }
+
+    let s = this_string_value(this, runtime)?;
+    let search = runtime
+        .js_to_string(search_arg)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
 
     let replace_arg = args
         .get(1)

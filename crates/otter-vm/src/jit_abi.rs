@@ -144,6 +144,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
+                    crate::regexp::RegExpTable::default(),
                 ),
                 FeedbackTableLayout::default(),
                 DeoptTable::default(),

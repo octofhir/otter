@@ -278,6 +278,7 @@ fn object_property_case() -> SmokeCase {
                 FloatTable::default(),
                 ClosureTable::default(),
                 CallTable::default(),
+                crate::regexp::RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -361,6 +362,7 @@ fn string_array_case() -> SmokeCase {
                 FloatTable::default(),
                 ClosureTable::default(),
                 CallTable::default(),
+                crate::regexp::RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -415,6 +417,7 @@ fn direct_call_case() -> SmokeCase {
                     ))),
                     None,
                 ]),
+                crate::regexp::RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
@@ -498,6 +501,7 @@ fn closure_case() -> SmokeCase {
                     Some(CallSite::Closure(ClosureCall::new(1, FrameFlags::empty()))),
                     None,
                 ]),
+                crate::regexp::RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),

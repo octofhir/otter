@@ -4,6 +4,7 @@ use crate::closure::UpvalueId;
 use crate::float::FloatId;
 use crate::frame::{FrameLayout, RegisterIndex};
 use crate::property::PropertyNameId;
+use crate::regexp::RegExpId;
 use crate::string::StringId;
 
 /// Program counter type for the new VM bytecode.
@@ -215,6 +216,11 @@ pub enum Opcode {
     /// caller's `.next()`. On resume, the sent value is written to `dst`.
     /// Spec: <https://tc39.es/ecma262/#sec-yield>
     Yield = 0x60,
+    /// Allocate a RegExp object from the current function regexp-literal side table.
+    /// `NewRegExp dst, regexp_id` — creates a new RegExp instance with the given
+    /// pattern and flags, and stores the handle in `dst`.
+    /// Spec: <https://tc39.es/ecma262/#sec-regexp-regular-expression-literals>
+    NewRegExp = 0x61,
 }
 
 impl Opcode {
@@ -299,6 +305,7 @@ impl Opcode {
             0x5D => Some(Self::ToNumber),
             0x5E => Some(Self::ToString),
             0x60 => Some(Self::Yield),
+            0x61 => Some(Self::NewRegExp),
             _ => None,
         }
     }
@@ -611,6 +618,18 @@ impl Instruction {
             Opcode::LoadF64,
             dst,
             BytecodeRegister::new(float_id.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a RegExp-literal allocation from the function's regexp side table.
+    /// Spec: <https://tc39.es/ecma262/#sec-regexp-regular-expression-literals>
+    #[must_use]
+    pub const fn new_regexp(dst: BytecodeRegister, regexp_id: RegExpId) -> Self {
+        Self::encode_abc(
+            Opcode::NewRegExp,
+            dst,
+            BytecodeRegister::new(regexp_id.0),
             BytecodeRegister::new(0),
         )
     }

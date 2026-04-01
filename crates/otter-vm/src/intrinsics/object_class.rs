@@ -669,6 +669,7 @@ fn object_to_string_tag(
         HeapValueKind::WeakMap => Ok("WeakMap"),
         HeapValueKind::WeakSet => Ok("WeakSet"),
         HeapValueKind::Generator => Ok("Generator"),
+        HeapValueKind::RegExp => Ok("RegExp"),
     }
 }
 

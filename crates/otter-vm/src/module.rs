@@ -11,6 +11,7 @@ use crate::feedback::FeedbackTableLayout;
 use crate::float::FloatTable;
 use crate::frame::FrameLayout;
 use crate::property::PropertyNameTable;
+use crate::regexp::RegExpTable;
 use crate::source_map::SourceMap;
 use crate::string::StringTable;
 
@@ -45,6 +46,7 @@ pub struct FunctionSideTables {
     float_constants: FloatTable,
     closures: ClosureTable,
     calls: CallTable,
+    regexp_literals: RegExpTable,
 }
 
 impl FunctionSideTables {
@@ -56,6 +58,7 @@ impl FunctionSideTables {
         float_constants: FloatTable,
         closures: ClosureTable,
         calls: CallTable,
+        regexp_literals: RegExpTable,
     ) -> Self {
         Self {
             property_names,
@@ -63,7 +66,14 @@ impl FunctionSideTables {
             float_constants,
             closures,
             calls,
+            regexp_literals,
         }
+    }
+
+    /// Returns the regexp-literal side table.
+    #[must_use]
+    pub fn regexp_literals(&self) -> &RegExpTable {
+        &self.regexp_literals
     }
 }
 
@@ -75,6 +85,7 @@ impl Default for FunctionSideTables {
             FloatTable::default(),
             ClosureTable::default(),
             CallTable::default(),
+            RegExpTable::default(),
         )
     }
 }
@@ -136,6 +147,8 @@ pub struct Function {
     derived_constructor: bool,
     /// §27.3 — this function is a generator (`function*`).
     generator: bool,
+    /// §27.7 — this function is async (`async function`).
+    r#async: bool,
     frame_layout: FrameLayout,
     bytecode: Bytecode,
     property_names: PropertyNameTable,
@@ -143,6 +156,7 @@ pub struct Function {
     float_constants: FloatTable,
     closures: ClosureTable,
     calls: CallTable,
+    regexp_literals: RegExpTable,
     feedback: FeedbackTableLayout,
     deopt: DeoptTable,
     exceptions: ExceptionTable,
@@ -182,6 +196,7 @@ impl Function {
             strict: false,
             derived_constructor: false,
             generator: false,
+            r#async: false,
             frame_layout,
             bytecode,
             property_names: tables.side_tables.property_names,
@@ -189,6 +204,7 @@ impl Function {
             float_constants: tables.side_tables.float_constants,
             closures: tables.side_tables.closures,
             calls: tables.side_tables.calls,
+            regexp_literals: tables.side_tables.regexp_literals,
             feedback: tables.feedback,
             deopt: tables.deopt,
             exceptions: tables.exceptions,
@@ -258,6 +274,21 @@ impl Function {
         self.generator
     }
 
+    /// Builder-style setter for the async flag.
+    /// Spec: <https://tc39.es/ecma262/#sec-async-function-definitions>
+    #[must_use]
+    pub fn with_async(mut self, r#async: bool) -> Self {
+        self.r#async = r#async;
+        self
+    }
+
+    /// Returns whether this function is async (`async function`).
+    /// Spec: <https://tc39.es/ecma262/#sec-async-function-definitions>
+    #[must_use]
+    pub const fn is_async(&self) -> bool {
+        self.r#async
+    }
+
     /// Returns the frame layout.
     #[must_use]
     pub const fn frame_layout(&self) -> FrameLayout {
@@ -304,6 +335,12 @@ impl Function {
     #[must_use]
     pub fn calls(&self) -> &CallTable {
         &self.calls
+    }
+
+    /// Returns the regexp-literal side table.
+    #[must_use]
+    pub fn regexp_literals(&self) -> &RegExpTable {
+        &self.regexp_literals
     }
 
     /// Returns the deoptimization table.
@@ -446,6 +483,7 @@ mod tests {
                     FloatTable::default(),
                     ClosureTable::default(),
                     calls,
+                    crate::regexp::RegExpTable::default(),
                 ),
                 feedback,
                 deopt,

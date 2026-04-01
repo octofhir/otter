@@ -68,6 +68,17 @@ pub(super) enum FunctionKind {
     Arrow,
     /// §27.3 Generator functions — `function*`.
     Generator,
+    /// §27.7 Async functions — `async function`.
+    /// Spec: <https://tc39.es/ecma262/#sec-async-function-definitions>
+    Async,
+    /// §27.7 Async arrow functions — `async () => {}`.
+    AsyncArrow,
+}
+
+impl FunctionKind {
+    pub(super) fn is_async(self) -> bool {
+        matches!(self, Self::Async | Self::AsyncArrow)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +87,7 @@ pub(super) struct PendingFunction {
     pub(super) closure_register: BytecodeRegister,
     pub(super) captures: Vec<CaptureSource>,
     pub(super) is_generator: bool,
+    pub(super) is_async: bool,
 }
 
 pub(super) struct CompiledFunction {
@@ -117,6 +129,8 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) string_literals: Vec<Box<str>>,
     pub(super) string_ids: BTreeMap<String, StringId>,
     pub(super) float_constants: Vec<f64>,
+    pub(super) regexp_literals: Vec<(Box<str>, Box<str>)>,
+    pub(super) regexp_ids: BTreeMap<(String, String), crate::regexp::RegExpId>,
     pub(super) closure_templates: Vec<Option<ClosureTemplate>>,
     pub(super) call_sites: Vec<Option<CallSite>>,
     pub(super) exception_handlers: Vec<ExceptionHandler>,

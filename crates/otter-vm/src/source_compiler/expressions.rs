@@ -88,6 +88,18 @@ impl<'a> FunctionCompiler<'a> {
             Expression::YieldExpression(yield_expr) => {
                 self.compile_yield_expression(yield_expr, module)
             }
+            // §14.7 Await — `await expr`
+            // Spec: <https://tc39.es/ecma262/#sec-await>
+            Expression::AwaitExpression(await_expr) => {
+                self.compile_await_expression(await_expr, module)
+            }
+            // §12.9 Regular Expression Literals
+            // Spec: <https://tc39.es/ecma262/#sec-literals-regular-expression-literals>
+            Expression::RegExpLiteral(regexp) => {
+                let pattern = regexp.regex.pattern.text.as_str();
+                let flags = regexp.regex.flags.to_string();
+                self.compile_regexp_literal(pattern, &flags)
+            }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
                 expression
@@ -1263,6 +1275,8 @@ impl<'a> FunctionCompiler<'a> {
             &params,
             if function.generator {
                 FunctionKind::Generator
+            } else if function.r#async {
+                FunctionKind::Async
             } else {
                 FunctionKind::Ordinary
             },
@@ -1281,6 +1295,8 @@ impl<'a> FunctionCompiler<'a> {
         let destination = self.alloc_temp();
         if function.generator {
             self.emit_new_closure_generator(destination, reserved, &compiled.captures)?;
+        } else if function.r#async {
+            self.emit_new_closure_async(destination, reserved, &compiled.captures)?;
         } else {
             self.emit_new_closure(destination, reserved, &compiled.captures)?;
         }
@@ -1609,6 +1625,11 @@ impl<'a> FunctionCompiler<'a> {
         let public_name = inferred_name.map(ToOwned::to_owned);
         let reserved = module.reserve_function();
         let params = extract_function_params_from_formal(&arrow.params)?;
+        let arrow_kind = if arrow.r#async {
+            FunctionKind::AsyncArrow
+        } else {
+            FunctionKind::Arrow
+        };
 
         let compiled = if arrow.expression {
             let body_statements = &arrow.body.statements;
@@ -1633,7 +1654,7 @@ impl<'a> FunctionCompiler<'a> {
                 },
                 expression,
                 &params,
-                FunctionKind::Arrow,
+                arrow_kind,
                 Some(self.env.clone()),
                 self.strict_mode,
             )?
@@ -1651,7 +1672,7 @@ impl<'a> FunctionCompiler<'a> {
                 },
                 &arrow.body.statements,
                 &params,
-                FunctionKind::Arrow,
+                arrow_kind,
                 Some(self.env.clone()),
                 self.strict_mode
                     || super::ast::has_use_strict_directive(arrow.body.directives.as_slice()),
@@ -1660,7 +1681,11 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
-        self.emit_new_closure_arrow(destination, reserved, &compiled.captures)?;
+        if arrow.r#async {
+            self.emit_new_closure_async_arrow(destination, reserved, &compiled.captures)?;
+        } else {
+            self.emit_new_closure_arrow(destination, reserved, &compiled.captures)?;
+        }
         Ok(ValueLocation::temp(destination))
     }
 
@@ -1747,6 +1772,24 @@ impl<'a> FunctionCompiler<'a> {
         self.instructions
             .push(Instruction::yield_(dst, value.register));
         self.release(value);
+        Ok(ValueLocation::local(dst))
+    }
+
+    /// Compiles `await expr` — §14.7 Await.
+    /// Spec: <https://tc39.es/ecma262/#sec-await>
+    ///
+    /// Emits `Await dst, src` which suspends the async function.
+    /// On resume, the awaited result is written to `dst`.
+    fn compile_await_expression(
+        &mut self,
+        await_expr: &oxc_ast::ast::AwaitExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let operand = self.compile_expression(&await_expr.argument, module)?;
+        let dst = self.allocate_local()?;
+        self.instructions
+            .push(Instruction::r#await(dst, operand.register));
+        self.release(operand);
         Ok(ValueLocation::local(dst))
     }
 
@@ -2007,5 +2050,24 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         Ok(result)
+    }
+
+    /// §12.9 Regular Expression Literals — emits a `NewRegExp` instruction.
+    ///
+    /// Interns the (pattern, flags) pair into the function's regexp side table
+    /// and emits `NewRegExp dst, regexp_id` which creates a fresh RegExp object
+    /// at runtime.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-literals-regular-expression-literals>
+    fn compile_regexp_literal(
+        &mut self,
+        pattern: &str,
+        flags: &str,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let regexp_id = self.intern_regexp(pattern, flags)?;
+        let dst = self.allocate_local()?;
+        self.instructions
+            .push(Instruction::new_regexp(dst, regexp_id));
+        Ok(ValueLocation::local(dst))
     }
 }

@@ -130,14 +130,12 @@ fn alloc_promise_capability_with_proto(
     proto: ObjectHandle,
 ) -> PromiseCapability {
     let promise = runtime.objects_mut().alloc_promise_with_proto(proto);
-    let resolve = runtime.objects_mut().alloc_promise_capability_function(
-        promise,
-        crate::promise::ReactionKind::Fulfill,
-    );
-    let reject = runtime.objects_mut().alloc_promise_capability_function(
-        promise,
-        crate::promise::ReactionKind::Reject,
-    );
+    let resolve = runtime
+        .objects_mut()
+        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+    let reject = runtime
+        .objects_mut()
+        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
     PromiseCapability {
         promise,
         resolve,
@@ -175,9 +173,7 @@ fn promise_constructor(
         .as_object_handle()
         .map(ObjectHandle)
         .ok_or_else(|| {
-            VmNativeCallError::Internal(
-                "Promise resolver undefined is not a function".into(),
-            )
+            VmNativeCallError::Internal("Promise resolver undefined is not a function".into())
         })?;
 
     // §27.2.3 step 3-6: Create promise and capability.
@@ -384,11 +380,7 @@ fn collect_promises_from_iterable(
         let elements = elements.to_vec();
         let mut promises = Vec::with_capacity(elements.len());
         for elem in &elements {
-            let resolved = promise_static_resolve(
-                &RegisterValue::undefined(),
-                &[*elem],
-                runtime,
-            )?;
+            let resolved = promise_static_resolve(&RegisterValue::undefined(), &[*elem], runtime)?;
             let h = resolved.as_object_handle().map(ObjectHandle).unwrap();
             promises.push(h);
         }
@@ -401,11 +393,7 @@ fn collect_promises_from_iterable(
     }
 
     // Single non-iterable value — wrap it.
-    let resolved = promise_static_resolve(
-        &RegisterValue::undefined(),
-        &[iterable],
-        runtime,
-    )?;
+    let resolved = promise_static_resolve(&RegisterValue::undefined(), &[iterable], runtime)?;
     let h = resolved.as_object_handle().map(ObjectHandle).unwrap();
     Ok(vec![h])
 }
@@ -427,7 +415,10 @@ fn promise_static_all(
 
     if promises.is_empty() {
         let arr = runtime.objects_mut().alloc_array();
-        let promise = runtime.objects_mut().get_promise_mut(result_cap.promise).unwrap();
+        let promise = runtime
+            .objects_mut()
+            .get_promise_mut(result_cap.promise)
+            .unwrap();
         promise.fulfill(RegisterValue::from_object_handle(arr.0));
         return Ok(RegisterValue::from_object_handle(result_cap.promise.0));
     }
@@ -437,12 +428,18 @@ fn promise_static_all(
     // Allocate result array pre-filled with undefined at each index.
     let result_array = runtime.objects_mut().alloc_array();
     for _ in 0..count {
-        runtime.objects_mut().push_element(result_array, RegisterValue::undefined()).ok();
+        runtime
+            .objects_mut()
+            .push_element(result_array, RegisterValue::undefined())
+            .ok();
     }
 
     // Shared mutable counter: 1-element array with initial value = count.
     let counter = runtime.objects_mut().alloc_array();
-    runtime.objects_mut().push_element(counter, RegisterValue::from_i32(count as i32)).ok();
+    runtime
+        .objects_mut()
+        .push_element(counter, RegisterValue::from_i32(count as i32))
+        .ok();
 
     for (index, input_promise) in promises.into_iter().enumerate() {
         // §27.2.4.1.1: Per-element resolve function.
@@ -461,9 +458,12 @@ fn promise_static_all(
             reject: result_cap.reject,
         };
 
-        let input = runtime.objects_mut().get_promise_mut(input_promise).ok_or_else(|| {
-            VmNativeCallError::Internal("Promise.all element is not a promise".into())
-        })?;
+        let input = runtime
+            .objects_mut()
+            .get_promise_mut(input_promise)
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("Promise.all element is not a promise".into())
+            })?;
 
         // on fulfill → per-element resolve, on reject → reject the whole result.
         if let Some(job) = input.then(Some(resolve_element), Some(result_cap.reject), cap) {
@@ -526,7 +526,10 @@ fn promise_static_all_settled(
 
     if promises.is_empty() {
         let arr = runtime.objects_mut().alloc_array();
-        let promise = runtime.objects_mut().get_promise_mut(result_cap.promise).unwrap();
+        let promise = runtime
+            .objects_mut()
+            .get_promise_mut(result_cap.promise)
+            .unwrap();
         promise.fulfill(RegisterValue::from_object_handle(arr.0));
         return Ok(RegisterValue::from_object_handle(result_cap.promise.0));
     }
@@ -535,11 +538,17 @@ fn promise_static_all_settled(
 
     let result_array = runtime.objects_mut().alloc_array();
     for _ in 0..count {
-        runtime.objects_mut().push_element(result_array, RegisterValue::undefined()).ok();
+        runtime
+            .objects_mut()
+            .push_element(result_array, RegisterValue::undefined())
+            .ok();
     }
 
     let counter = runtime.objects_mut().alloc_array();
-    runtime.objects_mut().push_element(counter, RegisterValue::from_i32(count as i32)).ok();
+    runtime
+        .objects_mut()
+        .push_element(counter, RegisterValue::from_i32(count as i32))
+        .ok();
 
     for (index, input_promise) in promises.into_iter().enumerate() {
         // §27.2.4.2.1: Per-element resolve function creates { status: "fulfilled", value }.
@@ -565,9 +574,12 @@ fn promise_static_all_settled(
             reject: result_cap.reject,
         };
 
-        let input = runtime.objects_mut().get_promise_mut(input_promise).ok_or_else(|| {
-            VmNativeCallError::Internal("Promise.allSettled element is not a promise".into())
-        })?;
+        let input = runtime
+            .objects_mut()
+            .get_promise_mut(input_promise)
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("Promise.allSettled element is not a promise".into())
+            })?;
 
         if let Some(job) = input.then(Some(resolve_element), Some(reject_element), cap) {
             runtime.microtasks_mut().enqueue_promise_job(job);
@@ -593,10 +605,15 @@ fn promise_static_any(
     let result_cap = alloc_promise_capability(runtime);
 
     if promises.is_empty() {
-        let err = runtime.alloc_type_error("All promises were rejected").map_err(|e| {
-            VmNativeCallError::Internal(format!("AggregateError alloc failed: {e:?}").into())
-        })?;
-        let promise = runtime.objects_mut().get_promise_mut(result_cap.promise).unwrap();
+        let err = runtime
+            .alloc_type_error("All promises were rejected")
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("AggregateError alloc failed: {e:?}").into())
+            })?;
+        let promise = runtime
+            .objects_mut()
+            .get_promise_mut(result_cap.promise)
+            .unwrap();
         promise.reject(RegisterValue::from_object_handle(err.0));
         return Ok(RegisterValue::from_object_handle(result_cap.promise.0));
     }
@@ -606,11 +623,17 @@ fn promise_static_any(
     // Errors array — collects rejection reasons.
     let errors_array = runtime.objects_mut().alloc_array();
     for _ in 0..count {
-        runtime.objects_mut().push_element(errors_array, RegisterValue::undefined()).ok();
+        runtime
+            .objects_mut()
+            .push_element(errors_array, RegisterValue::undefined())
+            .ok();
     }
 
     let counter = runtime.objects_mut().alloc_array();
-    runtime.objects_mut().push_element(counter, RegisterValue::from_i32(count as i32)).ok();
+    runtime
+        .objects_mut()
+        .push_element(counter, RegisterValue::from_i32(count as i32))
+        .ok();
 
     for (index, input_promise) in promises.into_iter().enumerate() {
         // §27.2.4.3.1: Per-element reject function.
@@ -628,9 +651,12 @@ fn promise_static_any(
             reject: result_cap.reject,
         };
 
-        let input = runtime.objects_mut().get_promise_mut(input_promise).ok_or_else(|| {
-            VmNativeCallError::Internal("Promise.any element is not a promise".into())
-        })?;
+        let input = runtime
+            .objects_mut()
+            .get_promise_mut(input_promise)
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("Promise.any element is not a promise".into())
+            })?;
 
         // on fulfill → resolve result (first wins), on reject → per-element reject.
         if let Some(job) = input.then(Some(result_cap.resolve), Some(reject_element), cap) {

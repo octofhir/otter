@@ -21,6 +21,7 @@ mod object_class;
 mod promise_class;
 mod proxy_class;
 mod reflect;
+mod regexp_class;
 mod species_support;
 mod string_class;
 mod symbol_class;
@@ -255,6 +256,9 @@ pub struct VmIntrinsics {
     // Generator (§27.3, §27.5)
     pub(crate) generator_function_prototype: ObjectHandle,
     pub(crate) generator_prototype: ObjectHandle,
+    // RegExp (§22.2)
+    pub(crate) regexp_constructor: ObjectHandle,
+    pub(crate) regexp_prototype: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -309,6 +313,8 @@ impl VmIntrinsics {
         let set_iterator_prototype = heap.alloc_object();
         let generator_function_prototype = heap.alloc_object();
         let generator_prototype = heap.alloc_object();
+        let regexp_constructor = heap.alloc_object();
+        let regexp_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -382,6 +388,8 @@ impl VmIntrinsics {
             set_iterator_prototype,
             generator_function_prototype,
             generator_prototype,
+            regexp_constructor,
+            regexp_prototype,
         }
     }
 
@@ -453,6 +461,9 @@ impl VmIntrinsics {
             Some(self.function_prototype),
         )?;
         heap.set_prototype(self.generator_prototype, Some(self.iterator_prototype))?;
+        // RegExp (§22.2): RegExp.prototype → Object.prototype
+        heap.set_prototype(self.regexp_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.regexp_prototype, Some(self.object_prototype))?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -736,6 +747,18 @@ impl VmIntrinsics {
         self.generator_prototype
     }
 
+    /// Returns `%RegExp%` (§22.2).
+    #[must_use]
+    pub const fn regexp_constructor(&self) -> ObjectHandle {
+        self.regexp_constructor
+    }
+
+    /// Returns `%RegExp.prototype%` (§22.2).
+    #[must_use]
+    pub const fn regexp_prototype(&self) -> ObjectHandle {
+        self.regexp_prototype
+    }
+
     /// Registers an additional namespace root owned by the intrinsic registry.
     pub fn register_namespace_root(&mut self, handle: ObjectHandle) {
         self.namespace_roots.push(handle);
@@ -838,6 +861,8 @@ impl VmIntrinsics {
             self.set_iterator_prototype,
             self.generator_function_prototype,
             self.generator_prototype,
+            self.regexp_constructor,
+            self.regexp_prototype,
         ]);
         if let Some(h) = self.math_namespace {
             roots.push(h);
@@ -886,7 +911,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 19] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 20] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -904,6 +929,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 19] {
         &promise_class::PROMISE_INTRINSIC as &dyn IntrinsicInstaller,
         &proxy_class::PROXY_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
+        &regexp_class::REGEXP_INTRINSIC as &dyn IntrinsicInstaller,
         &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
@@ -991,7 +1017,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 253);
+        assert_eq!(native_functions.len(), 275);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

@@ -141,6 +141,8 @@ pub enum HeapValueKind {
     WeakSet,
     /// ES2024 §27.5 Generator object.
     Generator,
+    /// ES2024 §22.2 RegExp object.
+    RegExp,
     /// ES2024 §27.2.1.5 — Promise capability resolve/reject function.
     PromiseCapabilityFunction,
     /// Promise combinator per-element function (all/allSettled/any).
@@ -299,6 +301,12 @@ impl ClosureFlags {
     #[must_use]
     pub const fn async_fn() -> Self {
         Self(FLAG_ASYNC)
+    }
+
+    /// Async arrow function — no `[[Construct]]`, no own `this`, async body.
+    #[must_use]
+    pub const fn async_arrow() -> Self {
+        Self(FLAG_ASYNC | FLAG_ARROW)
     }
 
     /// Class constructor (§15.7) — constructable, but plain calls throw.
@@ -797,6 +805,19 @@ enum HeapValue {
         value: crate::value::RegisterValue,
         kind: crate::promise::PromiseFinallyKind,
     },
+    /// ES2024 §22.2 RegExp Objects — ordinary object with [[OriginalSource]] and [[OriginalFlags]].
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
+    RegExp {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        /// The pattern string without surrounding `/` characters.
+        pattern: Box<str>,
+        /// Canonical flags string (alphabetically sorted).
+        flags: Box<str>,
+    },
 }
 
 /// Visit an ObjectHandle as a GcHandle for tracing.
@@ -1020,6 +1041,16 @@ impl Traceable for HeapValue {
             HeapValue::PromiseValueThunk { value, .. } => {
                 trace_register_value(*value, visitor);
             }
+            HeapValue::RegExp {
+                prototype, values, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+            }
         }
     }
 }
@@ -1130,6 +1161,66 @@ impl ObjectHeap {
             entries: Vec::new(),
         });
         ObjectHandle(h.0)
+    }
+
+    /// Allocates a RegExp object with the given pattern and flags.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-regexp-objects>
+    pub fn alloc_regexp(
+        &mut self,
+        pattern: &str,
+        flags: &str,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
+        let h = self.heap.alloc(HeapValue::RegExp {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            pattern: pattern.into(),
+            flags: flags.into(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the pattern string of a RegExp object.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
+    pub fn regexp_pattern<'h>(&'h self, handle: ObjectHandle) -> Result<&'h str, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::RegExp { pattern, .. } => Ok(pattern),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the flags string of a RegExp object.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
+    pub fn regexp_flags<'h>(&'h self, handle: ObjectHandle) -> Result<&'h str, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::RegExp { flags, .. } => Ok(flags),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Mutates the pattern and flags of a RegExp object in place.
+    /// Used by the deprecated `RegExp.prototype.compile` (Annex B §B.2.4).
+    pub fn set_regexp_pattern_flags(
+        &mut self,
+        handle: ObjectHandle,
+        new_pattern: &str,
+        new_flags: &str,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::RegExp { pattern, flags, .. } => {
+                *pattern = new_pattern.into();
+                *flags = new_flags.into();
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
     }
 
     /// Map.prototype.get — returns the value for the key, or undefined.
@@ -1654,10 +1745,9 @@ impl ObjectHeap {
         promise: ObjectHandle,
         kind: crate::promise::ReactionKind,
     ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::PromiseCapabilityFunction {
-            promise,
-            kind,
-        });
+        let h = self
+            .heap
+            .alloc(HeapValue::PromiseCapabilityFunction { promise, kind });
         ObjectHandle(h.0)
     }
 
@@ -1665,18 +1755,12 @@ impl ObjectHeap {
     /// Returns (promise, resolve, reject) triple.
     /// ES2024 §27.2.1.5 NewPromiseCapability
     /// Spec: <https://tc39.es/ecma262/#sec-newpromisecapability>
-    pub fn alloc_promise_capability(
-        &mut self,
-    ) -> crate::promise::PromiseCapability {
+    pub fn alloc_promise_capability(&mut self) -> crate::promise::PromiseCapability {
         let promise = self.alloc_promise();
-        let resolve = self.alloc_promise_capability_function(
-            promise,
-            crate::promise::ReactionKind::Fulfill,
-        );
-        let reject = self.alloc_promise_capability_function(
-            promise,
-            crate::promise::ReactionKind::Reject,
-        );
+        let resolve =
+            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+        let reject =
+            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
         crate::promise::PromiseCapability {
             promise,
             resolve,
@@ -1725,7 +1809,9 @@ impl ObjectHeap {
         value: crate::value::RegisterValue,
         kind: crate::promise::PromiseFinallyKind,
     ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::PromiseValueThunk { value, kind });
+        let h = self
+            .heap
+            .alloc(HeapValue::PromiseValueThunk { value, kind });
         ObjectHandle(h.0)
     }
 
@@ -1774,9 +1860,8 @@ impl ObjectHeap {
 
     /// Sets the already_called flag on a combinator element.
     pub fn set_combinator_element_called(&mut self, handle: ObjectHandle) {
-        if let Ok(HeapValue::PromiseCombinatorElement {
-            already_called, ..
-        }) = self.object_mut(handle)
+        if let Ok(HeapValue::PromiseCombinatorElement { already_called, .. }) =
+            self.object_mut(handle)
         {
             *already_called = true;
         }
@@ -1786,7 +1871,11 @@ impl ObjectHeap {
     pub fn promise_finally_function_info(
         &self,
         handle: ObjectHandle,
-    ) -> Option<(ObjectHandle, ObjectHandle, crate::promise::PromiseFinallyKind)> {
+    ) -> Option<(
+        ObjectHandle,
+        ObjectHandle,
+        crate::promise::PromiseFinallyKind,
+    )> {
         match self.object(handle).ok()? {
             HeapValue::PromiseFinallyFunction {
                 on_finally,
@@ -1801,7 +1890,10 @@ impl ObjectHeap {
     pub fn promise_value_thunk_info(
         &self,
         handle: ObjectHandle,
-    ) -> Option<(crate::value::RegisterValue, crate::promise::PromiseFinallyKind)> {
+    ) -> Option<(
+        crate::value::RegisterValue,
+        crate::promise::PromiseFinallyKind,
+    )> {
         match self.object(handle).ok()? {
             HeapValue::PromiseValueThunk { value, kind } => Some((*value, *kind)),
             _ => None,
@@ -1829,9 +1921,7 @@ impl ObjectHeap {
             HeapValue::PromiseCombinatorElement { .. } => {
                 Ok(HeapValueKind::PromiseCombinatorElement)
             }
-            HeapValue::PromiseFinallyFunction { .. } => {
-                Ok(HeapValueKind::PromiseFinallyFunction)
-            }
+            HeapValue::PromiseFinallyFunction { .. } => Ok(HeapValueKind::PromiseFinallyFunction),
             HeapValue::PromiseValueThunk { .. } => Ok(HeapValueKind::PromiseValueThunk),
             HeapValue::Map { .. } => Ok(HeapValueKind::Map),
             HeapValue::Set { .. } => Ok(HeapValueKind::Set),
@@ -1840,6 +1930,7 @@ impl ObjectHeap {
             HeapValue::WeakMap { .. } => Ok(HeapValueKind::WeakMap),
             HeapValue::WeakSet { .. } => Ok(HeapValueKind::WeakSet),
             HeapValue::Generator { .. } => Ok(HeapValueKind::Generator),
+            HeapValue::RegExp { .. } => Ok(HeapValueKind::RegExp),
         }
     }
 
@@ -1862,7 +1953,8 @@ impl ObjectHeap {
             | HeapValue::WeakMap { prototype, .. }
             | HeapValue::WeakSet { prototype, .. }
             | HeapValue::Generator { prototype, .. }
-            | HeapValue::Promise { prototype, .. } => Ok(*prototype),
+            | HeapValue::Promise { prototype, .. }
+            | HeapValue::RegExp { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
@@ -1960,6 +2052,9 @@ impl ObjectHeap {
             }
             | HeapValue::Promise {
                 prototype: slot, ..
+            }
+            | HeapValue::RegExp {
+                prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
@@ -1999,7 +2094,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Ok(None),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -2089,7 +2185,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -2160,7 +2257,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -2603,6 +2701,9 @@ impl ObjectHeap {
                 } => (keys.clone(), *prototype),
                 HeapValue::Array {
                     keys, prototype, ..
+                }
+                | HeapValue::RegExp {
+                    keys, prototype, ..
                 } => (keys.clone(), *prototype),
                 _ => (Vec::new(), None),
             };
@@ -2700,7 +2801,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Ok(None),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Ok(None),
         }
     }
 
@@ -2729,7 +2831,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Ok(None),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Ok(None),
         }
     }
 
@@ -2758,7 +2861,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Ok(None),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Ok(None),
         }
     }
 
@@ -2805,7 +2909,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => Ok(None),
+            | HeapValue::Generator { .. }
+            | HeapValue::RegExp { .. } => Ok(None),
         }
     }
 
@@ -2878,6 +2983,12 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::BoundFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::RegExp {
                 shape_id,
                 keys,
                 values,
@@ -2957,6 +3068,11 @@ impl ObjectHeap {
                 shape_id: object_shape_id,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id: object_shape_id,
+                values,
+                ..
             } => (object_shape_id, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -3005,6 +3121,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id,
+                keys,
+                values,
+                ..
             } => (shape_id, keys, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -3046,9 +3168,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::BoundFunction { .. } => {
-                self.set_named_property_storage(handle, property, value)
-            }
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::RegExp { .. } => self.set_named_property_storage(handle, property, value),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -3091,7 +3212,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::BoundFunction { .. } => self.delete_ordinary_property(handle, property),
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::RegExp { .. } => self.delete_ordinary_property(handle, property),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -3108,7 +3230,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::BoundFunction { .. } => self.delete_ordinary_property(handle, property),
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::RegExp { .. } => self.delete_ordinary_property(handle, property),
             HeapValue::Array { .. } => self.delete_array_property(handle, property, property_names),
             _ => Err(ObjectError::InvalidKind),
         }
@@ -3198,7 +3321,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::BoundFunction { .. } => {
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::RegExp { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
             _ => Err(ObjectError::InvalidKind),
@@ -3218,7 +3342,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { .. }
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
-            | HeapValue::BoundFunction { .. } => {
+            | HeapValue::BoundFunction { .. }
+            | HeapValue::RegExp { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
             HeapValue::Array { .. } => self.define_array_own_property_from_descriptor(
@@ -3456,6 +3581,11 @@ impl ObjectHeap {
                 shape_id: object_shape_id,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id: object_shape_id,
+                values,
+                ..
             } => (object_shape_id, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -3485,6 +3615,7 @@ impl ObjectHeap {
             HeapValue::Closure { keys, .. } => property_slot(keys, property),
             HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
@@ -3559,6 +3690,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
             } => (object_shape_id, keys, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -3591,7 +3728,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
-            | HeapValue::BoundFunction { keys, .. } => Ok(keys.clone()),
+            | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::RegExp { keys, .. } => Ok(keys.clone()),
             HeapValue::Array { keys, .. } => Ok(keys.clone()),
             _ => Ok(Vec::new()),
         }
@@ -3608,7 +3746,8 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
-            | HeapValue::BoundFunction { keys, .. } => Ok(keys.clone()),
+            | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::RegExp { keys, .. } => Ok(keys.clone()),
             HeapValue::Array {
                 elements,
                 indexed_properties,
@@ -3678,6 +3817,7 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::RegExp { keys, .. }
             | HeapValue::Array { keys, .. } => Ok(property_slot(keys, property).is_some()),
             _ => Ok(false),
         }
@@ -3751,7 +3891,8 @@ impl ObjectHeap {
             | HeapValue::Array { extensible, .. }
             | HeapValue::Closure { extensible, .. }
             | HeapValue::HostFunction { extensible, .. }
-            | HeapValue::BoundFunction { extensible, .. } => Ok(*extensible),
+            | HeapValue::BoundFunction { extensible, .. }
+            | HeapValue::RegExp { extensible, .. } => Ok(*extensible),
             // Iterator objects are extensible (prototype must be settable during init).
             HeapValue::ArrayIterator { .. }
             | HeapValue::StringIterator { .. }
@@ -3775,7 +3916,8 @@ impl ObjectHeap {
             | HeapValue::Array { extensible, .. }
             | HeapValue::Closure { extensible, .. }
             | HeapValue::HostFunction { extensible, .. }
-            | HeapValue::BoundFunction { extensible, .. } => {
+            | HeapValue::BoundFunction { extensible, .. }
+            | HeapValue::RegExp { extensible, .. } => {
                 *extensible = false;
                 Ok(true)
             }
@@ -4207,7 +4349,8 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
-            | HeapValue::Array { keys, .. } => property_slot(keys, property),
+            | HeapValue::Array { keys, .. }
+            | HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
             | HeapValue::ArrayIterator { .. }
@@ -4247,6 +4390,9 @@ impl ObjectHeap {
                 }
                 | HeapValue::Array {
                     shape_id, values, ..
+                }
+                | HeapValue::RegExp {
+                    shape_id, values, ..
                 } => (shape_id, values),
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -4272,7 +4418,8 @@ impl ObjectHeap {
                 | HeapValue::Closure { shape_id, .. }
                 | HeapValue::HostFunction { shape_id, .. }
                 | HeapValue::BoundFunction { shape_id, .. }
-                | HeapValue::Array { shape_id, .. } => *shape_id,
+                | HeapValue::Array { shape_id, .. }
+                | HeapValue::RegExp { shape_id, .. } => *shape_id,
                 _ => return Err(ObjectError::InvalidKind),
             };
             return Ok(PropertyInlineCache::new(shape_id, 0));
@@ -4316,6 +4463,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
             } => (object_shape_id, keys, values),
             _ => return Err(ObjectError::InvalidKind),
         };
@@ -4349,6 +4502,7 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
             _ => None,
         };
@@ -4361,7 +4515,8 @@ impl ObjectHeap {
                     | HeapValue::NativeObject { values, .. }
                     | HeapValue::Closure { values, .. }
                     | HeapValue::HostFunction { values, .. }
-                    | HeapValue::BoundFunction { values, .. } => values,
+                    | HeapValue::BoundFunction { values, .. }
+                    | HeapValue::RegExp { values, .. } => values,
                     HeapValue::Array { values, .. } if include_array => values,
                     _ => return Err(ObjectError::InvalidKind),
                 };
@@ -4377,7 +4532,8 @@ impl ObjectHeap {
                 | HeapValue::NativeObject { values, .. }
                 | HeapValue::Closure { values, .. }
                 | HeapValue::HostFunction { values, .. }
-                | HeapValue::BoundFunction { values, .. } => values,
+                | HeapValue::BoundFunction { values, .. }
+                | HeapValue::RegExp { values, .. } => values,
                 HeapValue::Array { values, .. } if include_array => values,
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -4419,6 +4575,12 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::BoundFunction {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::RegExp {
                 shape_id: s,
                 keys,
                 values,
@@ -4686,6 +4848,12 @@ impl ObjectHeap {
                 keys,
                 values,
                 ..
+            }
+            | HeapValue::RegExp {
+                shape_id,
+                keys,
+                values,
+                ..
             } => (shape_id, keys, values),
             HeapValue::Array {
                 shape_id,
@@ -4811,7 +4979,8 @@ impl ObjectHeap {
             | HeapValue::WeakMap { prototype, .. }
             | HeapValue::WeakSet { prototype, .. }
             | HeapValue::Generator { prototype, .. }
-            | HeapValue::Promise { prototype, .. } => Ok(*prototype),
+            | HeapValue::Promise { prototype, .. }
+            | HeapValue::RegExp { prototype, .. } => Ok(*prototype),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }

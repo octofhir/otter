@@ -93,6 +93,19 @@ impl OtterRuntime {
         self.run_script(code, "<eval>")
     }
 
+    /// Compiles and executes a JavaScript module (ESM mode).
+    /// Supports top-level `await`.
+    /// Spec: <https://tc39.es/ecma262/#sec-modules>
+    pub fn run_module_source(
+        &mut self,
+        source: &str,
+        source_url: &str,
+    ) -> Result<ExecutionResult, RunError> {
+        let module = otter_vm::source::compile_module(source, source_url)
+            .map_err(|e| RunError::Compile(e.to_string()))?;
+        self.run_module(&module)
+    }
+
     /// Executes a pre-compiled module to completion with the runtime's state.
     pub fn run_module(&mut self, module: &Module) -> Result<ExecutionResult, RunError> {
         // Set up timeout interrupt if configured.
@@ -149,14 +162,14 @@ impl OtterRuntime {
             while let Some(job) = self.state.microtasks_mut().pop_promise_job() {
                 // ES2024 §27.2.2.1 NewPromiseReactionJob
                 let callback_kind = self.state.objects().kind(job.callback);
-                let callback_is_capability = matches!(
+                // Self-settling callables handle their own promise settlement.
+                // PromiseFinallyFunction/PromiseValueThunk return values that
+                // MUST be used to settle the downstream promise.
+                let callback_is_self_settling = matches!(
                     callback_kind,
                     Ok(otter_vm::object::HeapValueKind::PromiseCapabilityFunction
-                        | otter_vm::object::HeapValueKind::PromiseCombinatorElement
-                        | otter_vm::object::HeapValueKind::PromiseFinallyFunction
-                        | otter_vm::object::HeapValueKind::PromiseValueThunk)
+                        | otter_vm::object::HeapValueKind::PromiseCombinatorElement)
                 );
-
 
                 // Call the handler with the settled value.
                 let call_result = Interpreter::call_function(
@@ -172,14 +185,12 @@ impl OtterRuntime {
                 // §27.2.2.1 step 1.e-h: If handler returned normally, resolve;
                 // if handler threw, reject.
                 if let Some(result_promise) = job.result_promise {
-                    if !callback_is_capability {
+                    if !callback_is_self_settling {
                         match call_result {
                             Ok(handler_result) => {
                                 // Resolve result_promise with the handler's return value.
-                                let resolve = self
-                                    .state
-                                    .objects_mut()
-                                    .alloc_promise_capability_function(
+                                let resolve =
+                                    self.state.objects_mut().alloc_promise_capability_function(
                                         result_promise,
                                         otter_vm::promise::ReactionKind::Fulfill,
                                     );
@@ -1531,13 +1542,48 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "combinator reject path needs drain_microtasks fix for cascading reactions"]
+    fn promise_deferred_reject_triggers_catch() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var reject;\n",
+                "var p = new Promise(function(res, rej) { reject = rej; });\n",
+                "p.catch(function(e) { console.log('caught:', e); });\n",
+                "reject('deferred');\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "caught: deferred");
+    }
+
+    #[test]
+    fn promise_reject_via_microtask_chain() {
+        // Tests that rejection cascading works during microtask drain.
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_script(
+            concat!(
+                "var p1 = Promise.reject('oops');\n",
+                "var p2 = new Promise(function(resolve, reject) {\n",
+                "  p1.then(resolve, reject);\n",
+                "});\n",
+                "p2.catch(function(e) { console.log(e); });\n",
+            ),
+            "test.js",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "oops");
+    }
+
+    #[test]
     fn promise_all_rejects_on_first_rejection() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
             concat!(
-                "Promise.all([Promise.resolve(1), Promise.reject('fail'), Promise.resolve(3)])\n",
-                "  .catch(function(e) { console.log(e); });\n",
+                "var p1 = Promise.resolve(1);\n",
+                "var p2 = Promise.reject('fail');\n",
+                "var p3 = Promise.resolve(3);\n",
+                "Promise.all([p1, p2, p3]).catch(function(e) { console.log(e); });\n",
             ),
             "test.js",
         )
@@ -1561,17 +1607,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "allSettled combinator needs cascading reaction fix"]
     fn promise_all_settled_basic() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
             concat!(
-                "Promise.allSettled([Promise.resolve('ok'), Promise.reject('err')])\n",
-                "  .then(function(results) {\n",
-                "    console.log(results.length);\n",
-                "    console.log(results[0].status, results[0].value);\n",
-                "    console.log(results[1].status, results[1].reason);\n",
-                "  });\n",
+                "var p1 = Promise.resolve('ok');\n",
+                "var p2 = Promise.reject('err');\n",
+                "Promise.allSettled([p1, p2]).then(function(results) {\n",
+                "  console.log(results.length);\n",
+                "  console.log(results[0].status, results[0].value);\n",
+                "  console.log(results[1].status, results[1].reason);\n",
+                "});\n",
             ),
             "test.js",
         )
@@ -1580,13 +1626,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "any combinator needs cascading reaction fix"]
     fn promise_any_first_fulfill_wins() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
             concat!(
-                "Promise.any([Promise.reject('a'), Promise.resolve('b'), Promise.resolve('c')])\n",
-                "  .then(function(v) { console.log(v); });\n",
+                "var p1 = Promise.reject('a');\n",
+                "var p2 = Promise.resolve('b');\n",
+                "var p3 = Promise.resolve('c');\n",
+                "Promise.any([p1, p2, p3]).then(function(v) { console.log(v); });\n",
             ),
             "test.js",
         )
@@ -1595,13 +1642,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "any combinator needs cascading reaction fix"]
     fn promise_any_all_reject_gives_aggregate_error() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
             concat!(
-                "Promise.any([Promise.reject('x'), Promise.reject('y')])\n",
-                "  .catch(function(e) { console.log(e.message); });\n",
+                "var p1 = Promise.reject('x');\n",
+                "var p2 = Promise.reject('y');\n",
+                "Promise.any([p1, p2]).catch(function(e) { console.log(e.message); });\n",
             ),
             "test.js",
         )
@@ -1610,7 +1657,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "finally value preservation needs drain result_promise handling for PromiseFinallyFunction"]
     fn promise_finally_preserves_value() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
@@ -1626,7 +1672,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "finally rejection preservation needs drain fix"]
     fn promise_finally_preserves_rejection() {
         let (mut rt, capture) = rt_with_capture();
         rt.run_script(
@@ -1671,5 +1716,58 @@ mod tests {
         )
         .expect("should run");
         assert_eq!(capture.text(), "A promise cannot be resolved with itself");
+    }
+
+    // -----------------------------------------------------------------------
+    // Top-level await tests — ES2022 §16.2
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn top_level_await_resolved_value() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_module_source(
+            "var x = await Promise.resolve(42); console.log(x);",
+            "tla.mjs",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "42");
+    }
+
+    #[test]
+    fn top_level_await_non_promise() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_module_source("var x = await 99; console.log(x);", "tla.mjs")
+            .expect("should run");
+        assert_eq!(capture.text(), "99");
+    }
+
+    #[test]
+    fn top_level_await_chained_promises() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_module_source(
+            concat!(
+                "var a = await Promise.resolve(10);\n",
+                "var b = await Promise.resolve(20);\n",
+                "console.log(a + b);\n",
+            ),
+            "tla.mjs",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "30");
+    }
+
+    #[test]
+    fn top_level_await_async_function() {
+        let (mut rt, capture) = rt_with_capture();
+        rt.run_module_source(
+            concat!(
+                "async function fetchData() { return 'data'; }\n",
+                "var result = await fetchData();\n",
+                "console.log(result);\n",
+            ),
+            "tla.mjs",
+        )
+        .expect("should run");
+        assert_eq!(capture.text(), "data");
     }
 }

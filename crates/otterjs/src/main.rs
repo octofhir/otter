@@ -2,6 +2,10 @@
 //!
 //! VM-based JavaScript execution with pluggable builtins.
 
+// Migration period: old-engine code paths (REPL, profiling helpers) are kept
+// but partially unused while `-e`/`-p`/`run` move to the new VM.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -275,12 +279,12 @@ async fn main() -> Result<()> {
 
     // Handle --print flag (evaluate and print result)
     if let Some(ref code) = cli.print {
-        return run_code(code, "<eval>", &[], &cli, true).await;
+        return run_eval_new_vm(code, true);
     }
 
     // Handle --eval flag (evaluate silently, only console.log produces output)
     if let Some(ref code) = cli.eval {
-        return run_code(code, "<eval>", &[], &cli, false).await;
+        return run_eval_new_vm(code, false);
     }
 
     // Handle direct file argument (otter script.js)
@@ -425,6 +429,22 @@ async fn run_file(path: &PathBuf, _script_args: &[String], _cli: &Cli) -> Result
     let mut rt = otter_runtime::OtterRuntime::builder().build();
     rt.run_file(path_str).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// Run JavaScript code using the new VM (otter-runtime), for -e / -p flags.
+fn run_eval_new_vm(source: &str, print_result: bool) -> Result<()> {
+    let mut rt = otter_runtime::OtterRuntime::builder().build();
+    match rt.eval(source) {
+        Ok(result) => {
+            if print_result {
+                let formatted =
+                    otter_runtime::console::format_value(result.return_value(), rt.state());
+                println!("{formatted}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
 }
 
 struct ProcessArgvOverrideGuard;
@@ -709,7 +729,8 @@ fn finish_cpu_sampling(session: CpuSamplingSession) -> Result<CpuProfileArtifact
     })
 }
 
-/// Run JavaScript code using EngineBuilder
+/// Run JavaScript code using EngineBuilder (legacy path, kept for migration period).
+#[allow(dead_code)]
 async fn run_code(
     source: &str,
     source_url: &str,

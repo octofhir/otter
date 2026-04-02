@@ -87,10 +87,13 @@ impl OtterRuntime {
         self.run_script(&source, &url)
     }
 
-    /// Evaluates a JavaScript expression and returns the result.
-    /// Convenience wrapper over [`run_script`].
+    /// Evaluates JavaScript source and returns the completion value of the
+    /// last expression statement. Uses eval-mode compilation.
+    /// Spec: <https://tc39.es/ecma262/#sec-eval-x>
     pub fn eval(&mut self, code: &str) -> Result<ExecutionResult, RunError> {
-        self.run_script(code, "<eval>")
+        let module = otter_vm::source::compile_eval(code, "<eval>")
+            .map_err(|e| RunError::Compile(e.to_string()))?;
+        self.run_module(&module)
     }
 
     /// Compiles and executes a JavaScript module (ESM mode).

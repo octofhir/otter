@@ -149,5 +149,8 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) parameter_binding_registers: Vec<crate::bytecode::BytecodeRegister>,
     /// While true, reads of register-backed bindings must reject the internal hole sentinel.
     pub(super) parameter_tdz_active: bool,
+    /// In eval mode, holds the register for the completion value of the last
+    /// expression statement. Allocated lazily on the first expression statement.
+    pub(super) eval_completion_register: Option<crate::bytecode::BytecodeRegister>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

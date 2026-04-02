@@ -50,6 +50,7 @@ impl<'a> FunctionCompiler<'a> {
             rest_local: None,
             parameter_binding_registers: Vec::new(),
             parameter_tdz_active: false,
+            eval_completion_register: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1122,13 +1123,39 @@ impl<'a> FunctionCompiler<'a> {
         expression: &Expression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
-        if matches!(expression, Expression::StringLiteral(_)) {
+        // Skip bare string literals (directive prologues like "use strict"),
+        // except in eval mode where they contribute to the completion value.
+        if matches!(expression, Expression::StringLiteral(_))
+            && !(self.mode == LoweringMode::Eval && self.kind == FunctionKind::Script)
+        {
             return Ok(());
         }
 
         let value = self.compile_expression(expression, module)?;
+
+        // In eval mode at top-level, store every expression statement's result
+        // as the completion value (ES spec: the value of the last evaluated
+        // expression statement).
+        if self.mode == LoweringMode::Eval && self.kind == FunctionKind::Script {
+            let completion_reg = self.ensure_eval_completion_register()?;
+            self.instructions
+                .push(Instruction::move_(completion_reg, value.register));
+        }
+
         self.release(value);
         Ok(())
+    }
+
+    /// Lazily allocates a local register for eval completion value tracking.
+    fn ensure_eval_completion_register(
+        &mut self,
+    ) -> Result<BytecodeRegister, SourceLoweringError> {
+        if let Some(reg) = self.eval_completion_register {
+            return Ok(reg);
+        }
+        let reg = self.allocate_local()?;
+        self.eval_completion_register = Some(reg);
+        Ok(reg)
     }
 
     fn compile_return_statement(
@@ -1658,6 +1685,15 @@ impl<'a> FunctionCompiler<'a> {
             FunctionKind::Script => match self.mode {
                 LoweringMode::Script => self.load_undefined()?,
                 LoweringMode::Test262Basic => self.load_i32(0)?,
+                LoweringMode::Eval => {
+                    if let Some(reg) = self.eval_completion_register {
+                        // Return the completion value collected during execution.
+                        self.instructions.push(Instruction::ret(reg));
+                        return Ok(());
+                    }
+                    // No expression statements were compiled; return undefined.
+                    self.load_undefined()?
+                }
             },
             FunctionKind::Ordinary
             | FunctionKind::Arrow

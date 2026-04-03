@@ -2,11 +2,11 @@
 
 use core::fmt;
 
+use crate::bigint::BigIntTable;
 use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
 use crate::closure::{CaptureDescriptor, ClosureTable, ClosureTemplate, UpvalueId};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
-use crate::bigint::BigIntTable;
 use crate::float::FloatTable;
 use crate::frame::{FrameFlags, FrameLayout};
 use crate::interpreter::{ExecutionResult, Interpreter, InterpreterError};

@@ -1,15 +1,11 @@
-use otter_jit::deopt::{
-    execute_next_function_profiled_with_fallback, execute_next_function_with_fallback,
-};
-use otter_jit::pipeline::{
-    JitExecResult, execute_next_function, execute_next_function_with_interrupt,
-};
+use otter_jit::deopt::{execute_function_profiled_with_fallback, execute_function_with_fallback};
+use otter_jit::pipeline::{JitExecResult, execute_function, execute_function_with_interrupt};
 use otter_vm::FunctionIndex;
 use otter_vm::RegisterValue;
+use otter_vm::bigint::BigIntTable;
 use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use otter_vm::call::{CallSite, CallTable, DirectCall};
 use otter_vm::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
-use otter_vm::bigint::BigIntTable;
 use otter_vm::float::FloatTable;
 use otter_vm::frame::FrameFlags;
 use otter_vm::frame::FrameLayout;
@@ -184,7 +180,7 @@ fn direct_call_module() -> Module {
 }
 
 #[test]
-fn next_vm_loop_smoke_matches_interpreter() {
+fn tier1_loop_smoke_matches_interpreter() {
     let module = compile_module(&arithmetic_loop_program(128)).expect("module should lower");
     let function = module.entry_function();
 
@@ -194,7 +190,7 @@ fn next_vm_loop_smoke_matches_interpreter() {
 
     let mut registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
-    let jit_result = execute_next_function(function, &mut registers).expect("jit should compile");
+    let jit_result = execute_function(function, &mut registers).expect("jit should compile");
 
     let raw = match jit_result {
         JitExecResult::Ok(raw) => raw,
@@ -211,9 +207,9 @@ fn next_vm_loop_smoke_matches_interpreter() {
     };
 
     let jit_value =
-        RegisterValue::from_raw_bits(raw).expect("jit should return a valid new-vm register value");
+        RegisterValue::from_raw_bits(raw).expect("jit should return a valid vm register value");
     println!(
-        "next-vm tier1 loop smoke: interpreter={:?} jit={:?}",
+        "tier1 loop smoke: interpreter={:?} jit={:?}",
         interpreter_result.return_value(),
         jit_value
     );
@@ -222,7 +218,7 @@ fn next_vm_loop_smoke_matches_interpreter() {
 }
 
 #[test]
-fn next_vm_unsupported_path_deopts_and_resumes() {
+fn unsupported_path_deopts_and_resumes() {
     let layout = FrameLayout::new(0, 0, 0, 5).expect("layout should be valid");
     let function = Function::with_bytecode(
         Some("deopt_resume"),
@@ -244,26 +240,22 @@ fn next_vm_unsupported_path_deopts_and_resumes() {
         .expect("module should be valid");
 
     let mut registers = vec![RegisterValue::undefined(); usize::from(layout.register_count())];
-    let result = execute_next_function_with_fallback(
-        &module,
-        FunctionIndex(0),
-        &mut registers,
-        std::ptr::null(),
-    )
-    .expect("fallback path should succeed");
+    let result =
+        execute_function_with_fallback(&module, FunctionIndex(0), &mut registers, std::ptr::null())
+            .expect("fallback path should succeed");
 
     assert_eq!(result.return_value(), RegisterValue::from_i32(42));
 }
 
 #[test]
-fn next_vm_safepoint_interrupt_deopts_and_resumes() {
+fn safepoint_interrupt_deopts_and_resumes() {
     let module = compile_module(&arithmetic_loop_program(128)).expect("module should lower");
     let function = module.entry_function();
     let mut interrupt_flag = 1_u8;
     let mut registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
 
-    let deopt = execute_next_function_with_interrupt(
+    let deopt = execute_function_with_interrupt(
         function,
         &mut registers,
         std::ptr::addr_of!(interrupt_flag),
@@ -281,7 +273,7 @@ fn next_vm_safepoint_interrupt_deopts_and_resumes() {
     assert!(bytecode_pc > 0);
 
     interrupt_flag = 0;
-    let result = execute_next_function_with_fallback(
+    let result = execute_function_with_fallback(
         &module,
         module.entry(),
         &mut registers,
@@ -293,14 +285,14 @@ fn next_vm_safepoint_interrupt_deopts_and_resumes() {
 }
 
 #[test]
-fn next_vm_property_fast_path_smoke() {
+fn property_fast_path_smoke() {
     let module = property_loop_module();
     let mut registers = vec![
         RegisterValue::undefined();
         usize::from(module.entry_function().frame_layout().register_count())
     ];
 
-    let result = execute_next_function_profiled_with_fallback(
+    let result = execute_function_profiled_with_fallback(
         &module,
         module.entry(),
         &mut registers,
@@ -312,14 +304,14 @@ fn next_vm_property_fast_path_smoke() {
 }
 
 #[test]
-fn next_vm_direct_call_fast_path_smoke() {
+fn direct_call_fast_path_smoke() {
     let module = direct_call_module();
     let mut registers = vec![
         RegisterValue::undefined();
         usize::from(module.entry_function().frame_layout().register_count())
     ];
 
-    let result = execute_next_function_profiled_with_fallback(
+    let result = execute_function_profiled_with_fallback(
         &module,
         module.entry(),
         &mut registers,

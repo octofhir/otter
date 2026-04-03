@@ -36,9 +36,18 @@
 //! ```
 
 mod builder;
+mod host;
 mod runtime;
 
 pub use builder::RuntimeBuilder;
+pub use host::{
+    Capabilities, CapabilitiesBuilder, DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder,
+    EnvWriteError, HostConfig, HostedExtension, HostedExtensionModule, HostedExtensionRegistry,
+    HostedNativeModule, HostedNativeModuleKind, HostedNativeModuleLoader,
+    HostedNativeModuleRegistry, ImportContext, IsolatedEnvStore, ModuleDependency, ModuleGraph,
+    ModuleGraphError, ModuleGraphNode, ModuleLoader, ModuleLoaderConfig, ModuleLoaderError,
+    ModuleType, PermissionDenied, ResolvedModule, RuntimeProfile, SourceType, parse_env_file,
+};
 pub use runtime::{OtterRuntime, RunError};
 
 // Re-export commonly used types from otter-vm so users don't need to

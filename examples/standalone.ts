@@ -1,13 +1,12 @@
-// Example script for building a standalone executable
-// Usage: otter build examples/standalone.ts --compile -o myapp
+// Example script for direct execution with the active CLI surface.
+// Usage: otter run examples/standalone.ts
 
-console.log("Otter Standalone Executable Demo");
-console.log("================================");
+console.log("Otter Standalone Script Demo");
+console.log("============================");
 console.log();
 console.log(`Platform: ${process.platform}`);
 console.log(`Architecture: ${process.arch}`);
-console.log(`Executable: ${process.argv[0]}`);
+console.log(`Runtime entry: ${process.argv[0]}`);
 console.log(`Arguments: ${JSON.stringify(process.argv.slice(1))}`);
 console.log();
-console.log("This executable was compiled with 'otter build --compile'");
-console.log("It runs without requiring Otter to be installed!");
+console.log("This script is meant to run through 'otter run'.");

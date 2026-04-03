@@ -18,7 +18,9 @@ use super::payload::{TemporalPayload, construct_temporal, require_temporal_paylo
 pub fn duration_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Duration")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "Duration", 0, duration_constructor,
+            "Duration",
+            0,
+            duration_constructor,
         ))
         .with_binding(stat("from", 1, duration_from))
         .with_binding(stat("compare", 2, duration_compare))
@@ -46,8 +48,11 @@ pub fn duration_class_descriptor() -> JsClassDescriptor {
 fn proto(
     name: &str,
     arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
@@ -58,8 +63,11 @@ fn proto(
 fn stat(
     name: &str,
     arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,

@@ -1954,13 +1954,12 @@ fn date_prototype_to_primitive(
             && let Some(fn_handle) = func_val.as_object_handle().map(ObjectHandle)
             && runtime.objects().is_callable(fn_handle)
         {
-            let result =
-                runtime
-                    .call_callable(fn_handle, *this, &[])
-                    .map_err(|e| match e {
-                        VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
-                        other => other,
-                    })?;
+            let result = runtime
+                .call_callable(fn_handle, *this, &[])
+                .map_err(|e| match e {
+                    VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+                    other => other,
+                })?;
             // If result is not an object, return it.
             if result.as_object_handle().is_none()
                 || result.as_number().is_some()

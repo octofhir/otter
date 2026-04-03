@@ -6,10 +6,10 @@ Embeddable TypeScript/JavaScript runtime and CLI powered by a custom bytecode VM
 
 Otter is designed to embed scripting in Rust applications or run scripts directly from the CLI:
 
-1. **Embeddable engine** - Use `otter-engine` (high-level) or `otter-vm-runtime` (lower-level)
+1. **Embeddable runtime** - Use `otter-runtime` as the active public embedding API
 2. **Standalone CLI** - Run scripts with the `otter` binary (`otterjs` crate)
 
-The runtime is a custom VM with garbage collection, written in Rust. This is a new runtime under active development — we are continuously adding features and compatibility, and APIs may evolve between releases.
+The runtime is a custom VM with garbage collection, written in Rust. The active stack is `otter-gc` + `otter-vm` + `otter-runtime`; older engine crates are frozen while functionality is ported over.
 
 ## Installation
 
@@ -17,7 +17,7 @@ The runtime is a custom VM with garbage collection, written in Rust. This is a n
 
 ```toml
 [dependencies]
-otter-engine = "0.1"
+otter-runtime = "0.1"
 ```
 
 ### As a CLI
@@ -41,9 +41,11 @@ otter info
 otter init
 ```
 
+The current fast-path CLI intentionally keeps a smaller active surface during migration. `repl`, `test`, and `build` are not active commands at this stage.
+
 ### Permissions
 
-Deny-by-default capability system:
+Capability and host-integration work is being ported to the active runtime stack. Expect this surface to keep evolving while the legacy stack stays frozen.
 
 ```bash
 otter run app.ts --allow-read           # file system read
@@ -56,22 +58,11 @@ otter run app.ts --allow-all            # all permissions
 ## Embedding in Rust
 
 ```rust
-use otter_engine::{CapabilitiesBuilder, EngineBuilder};
+use otter_runtime::OtterRuntime;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut engine = EngineBuilder::new()
-        .capabilities(CapabilitiesBuilder::new().allow_net_all().build())
-        .with_http() // Enable Otter.serve()
-        .build();
-
-    engine
-        .eval(r#"
-            const res = await fetch("https://example.com");
-            console.log(res.status);
-        "#)
-        .await?;
-
+fn main() -> anyhow::Result<()> {
+    let mut rt = OtterRuntime::builder().build();
+    rt.run_script("console.log('hello from otter-runtime')", "main.js")?;
     Ok(())
 }
 ```
@@ -79,32 +70,25 @@ async fn main() -> anyhow::Result<()> {
 ## Runtime Features (current)
 
 - Custom bytecode VM + JS/TS compiler with TypeScript support out of the box
-- ESM and CommonJS module loader with resolution and import maps
-- Remote modules over `https://` with allowlist-based security
-- Capability-based permissions for `read`, `write`, `net`, and `env`
-- Web-compatible `fetch` with `Headers`, `Request`, and `Response`
-- Optional HTTP server API: `Otter.serve()` (enabled via `EngineBuilder::with_http()` and in the CLI)
+- Module/runtime host features are being ported onto `otter-runtime`
+- Capability-based permissions remain a design requirement during migration
+- Web/API and extension surfaces are being reintroduced incrementally on the active stack
 - Core JavaScript builtins (Object/Array/Map/Set/Date/RegExp/JSON/Promise/Proxy/Reflect/Symbol, etc.)
-- Extension system for native ops + JS shims
+- Test262 runner is active on the new runtime stack
 
 ## Status
 
-Otter is actively evolving. The package ecosystem support is in progress (see `crates/otter-pm`). Expect regular additions to the runtime surface — follow `ROADMAP.md` for planned work.
+Otter is actively evolving. The package ecosystem support is in progress (see `crates/otter-pm`). Expect regular additions to the runtime surface as deferred host features are ported to `otter-runtime`.
 
 ## Project Structure
 
 ```text
 crates/
-├── otter-vm-bytecode  # Bytecode definitions
-├── otter-vm-gc        # Garbage collector
-├── otter-vm-core      # VM interpreter
-├── otter-vm-compiler  # JS/TS to bytecode compiler
-├── otter-vm-runtime   # Runtime and event loop primitives
-├── otter-engine       # Module loader, capabilities, extensions
+├── otter-gc           # Active garbage collector
+├── otter-vm           # Active VM, compiler, intrinsics
+├── otter-runtime      # Active public runtime API
 ├── otter-pm           # Package manager integration (in progress)
-├── otter-sql          # SQL extension (SQLite + PostgreSQL)
-├── otter-kv           # Key-value store extension
-├── otter-profiler     # Runtime profiler
+├── otter-test262      # Active conformance runner
 └── otterjs            # CLI binary
 ```
 

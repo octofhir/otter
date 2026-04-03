@@ -4,11 +4,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use otter_jit::deopt::execute_module_entry_with_runtime;
 use otter_vm::Interpreter;
 use otter_vm::interpreter::{ExecutionResult, RuntimeState};
 use otter_vm::module::Module;
 
 use crate::builder::RuntimeBuilder;
+use crate::host::{
+    HostConfig, HostState, ModuleLoader, ResolvedModule, execute_preloaded_entry,
+    preload_module_graph,
+};
 
 /// Error from script execution.
 #[derive(Debug)]
@@ -46,6 +51,8 @@ impl std::error::Error for RunError {}
 pub struct OtterRuntime {
     state: RuntimeState,
     timeout: Option<Duration>,
+    host: HostConfig,
+    host_state: HostState,
 }
 
 impl OtterRuntime {
@@ -55,8 +62,17 @@ impl OtterRuntime {
     }
 
     /// Creates a runtime from pre-configured state. Called by the builder.
-    pub(crate) fn from_state(state: RuntimeState, timeout: Option<Duration>) -> Self {
-        Self { state, timeout }
+    pub(crate) fn from_state(
+        state: RuntimeState,
+        timeout: Option<Duration>,
+        host: HostConfig,
+    ) -> Self {
+        Self {
+            state,
+            timeout,
+            host,
+            host_state: HostState::default(),
+        }
     }
 
     /// Compiles and executes a JavaScript source string to completion.
@@ -112,16 +128,21 @@ impl OtterRuntime {
     /// Executes a pre-compiled module to completion with the runtime's state.
     pub fn run_module(&mut self, module: &Module) -> Result<ExecutionResult, RunError> {
         // Set up timeout interrupt if configured.
-        let mut interpreter = Interpreter::new();
-        let _interrupt_guard = self.timeout.map(|timeout| {
-            let flag = interpreter.interrupt_flag();
-            TimeoutGuard::arm(flag, timeout)
-        });
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let interpreter = Interpreter::new().with_interrupt_flag(interrupt_flag.clone());
+        let _interrupt_guard = self
+            .timeout
+            .map(|timeout| TimeoutGuard::arm(interrupt_flag.clone(), timeout));
+        let interrupt_ptr = Arc::as_ptr(&interrupt_flag).cast::<u8>();
 
         // 1. Execute top-level code.
-        let result = interpreter
-            .execute_module(module, &mut self.state)
-            .map_err(|e| RunError::Runtime(e.to_string()))?;
+        let result = match execute_module_entry_with_runtime(module, &mut self.state, interrupt_ptr)
+        {
+            Ok(result) => result,
+            Err(_) => interpreter
+                .execute_module(module, &mut self.state)
+                .map_err(|e| RunError::Runtime(e.to_string()))?,
+        };
 
         // 2. Drain microtasks after top-level execution (ES spec).
         self.drain_microtasks(module);
@@ -141,6 +162,64 @@ impl OtterRuntime {
     /// Returns a mutable reference to the underlying VM runtime state.
     pub fn state_mut(&mut self) -> &mut RuntimeState {
         &mut self.state
+    }
+
+    /// Returns the runtime host configuration.
+    pub fn host(&self) -> &HostConfig {
+        &self.host
+    }
+
+    /// Resolve and load one hosted entry specifier through the runtime's
+    /// module loader configuration.
+    pub fn load_entry_specifier(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+    ) -> Result<ResolvedModule, RunError> {
+        let loader = ModuleLoader::new(self.host.loader().clone());
+        loader
+            .load(specifier, referrer)
+            .map_err(|error| RunError::Runtime(error.to_string()))
+    }
+
+    /// Execute one hosted entry specifier through the runtime-owned host state.
+    ///
+    /// The current hosted path supports multi-module ESM/CommonJS graphs and
+    /// hosted JSON modules through runtime-local module session state. Native
+    /// hosted modules still need dedicated follow-up work.
+    pub fn run_entry_specifier(
+        &mut self,
+        specifier: &str,
+        referrer: Option<&str>,
+    ) -> Result<ExecutionResult, RunError> {
+        let loader = ModuleLoader::new(self.host.loader().clone());
+        let graph = loader
+            .load_graph(specifier, referrer)
+            .map_err(|error| RunError::Runtime(error.to_string()))?;
+        let entry = graph.entry().ok_or_else(|| {
+            RunError::Runtime(format!(
+                "hosted module graph for '{specifier}' did not produce an entry node"
+            ))
+        })?;
+        let module = &entry.module;
+
+        if module.url.starts_with("otter:") {
+            let has_native_module = self.host.native_modules().contains(&module.url);
+            if !has_native_module {
+                return Err(RunError::Runtime(format!(
+                    "hosted native module '{}' is not registered on this runtime",
+                    module.url
+                )));
+            }
+        }
+
+        let session = self
+            .host_state
+            .ensure_module_runtime(&mut self.state, &self.host);
+        preload_module_graph(&mut self.state, session, self.host.loader().clone(), &graph)
+            .map_err(RunError::Runtime)?;
+        return execute_preloaded_entry(&mut self.state, session, &module.url)
+            .map_err(RunError::Runtime);
     }
 
     // -----------------------------------------------------------------------

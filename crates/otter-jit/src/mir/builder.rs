@@ -1,4 +1,4 @@
-//! New-VM bytecode -> MIR lowering for the early Tier 1 subset.
+//! VM bytecode -> MIR lowering for the early Tier 1 subset.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -13,8 +13,8 @@ use crate::mir::graph::{BlockId, DeoptInfo, MirGraph, ResumeMode, ValueId};
 use crate::mir::nodes::MirOp;
 use crate::mir::types::CmpOp;
 
-/// Build MIR from a new-VM function for the currently supported Tier 1 subset.
-pub fn build_next_mir(
+/// Build MIR from a VM function for the currently supported Tier 1 subset.
+pub fn build_mir(
     function: &Function,
     property_profile: Option<&[Option<PropertyInlineCache>]>,
 ) -> Result<MirGraph, JitError> {
@@ -106,17 +106,15 @@ fn resolve_target_block(
     pc_to_block: &HashMap<u32, BlockId>,
 ) -> Result<BlockId, JitError> {
     let target_pc = resolve_target_pc(pc, offset);
-    pc_to_block.get(&target_pc).copied().ok_or_else(|| {
-        JitError::Internal(format!("new-vm jump target pc={} is not mapped", target_pc))
-    })
+    pc_to_block
+        .get(&target_pc)
+        .copied()
+        .ok_or_else(|| JitError::Internal(format!("vm jump target pc={} is not mapped", target_pc)))
 }
 
 fn resolve_direct_call(function: &Function, pc: u32) -> Result<DirectCall, JitError> {
     function.calls().get_direct(pc).ok_or_else(|| {
-        JitError::Internal(format!(
-            "new-vm direct call site at pc={} is not mapped",
-            pc
-        ))
+        JitError::Internal(format!("vm direct call site at pc={} is not mapped", pc))
     })
 }
 
@@ -131,7 +129,7 @@ fn create_deopt(graph: &mut MirGraph, pc: u32) -> crate::mir::graph::DeoptId {
 fn resolve_register(layout: FrameLayout, raw: u16) -> Result<RegisterIndex, JitError> {
     layout
         .resolve_user_visible(raw)
-        .ok_or_else(|| JitError::Internal(format!("new-vm register {} is out of bounds", raw)))
+        .ok_or_else(|| JitError::Internal(format!("vm register {} is out of bounds", raw)))
 }
 
 fn load_register(
@@ -454,7 +452,7 @@ fn lower_instruction(
             let mut args = Vec::with_capacity(usize::from(call.argument_count()));
             for offset in 0..usize::from(call.argument_count()) {
                 let offset = u16::try_from(offset).map_err(|_| {
-                    JitError::Internal("new-vm direct call argument index overflow".to_string())
+                    JitError::Internal("vm direct call argument index overflow".to_string())
                 })?;
                 args.push(load_register(
                     graph,

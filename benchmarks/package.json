@@ -5,8 +5,6 @@
 	"main": "src/index.ts",
 	"scripts": {
 		"start": "otter run src/index.ts",
-		"dev": "otter run --watch src/index.ts",
-		"test": "otter test",
 		"check": "otter check src/**/*.ts"
 	},
 	"dependencies": {

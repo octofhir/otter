@@ -22,6 +22,12 @@ use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use otter_vm::interpreter::RuntimeState;
 use otter_vm::value::RegisterValue;
 
+use std::sync::Arc;
+
+use crate::host::{
+    Capabilities, EnvStoreBuilder, HostConfig, HostedExtension, HostedNativeModuleLoader,
+    IsolatedEnvStore, ModuleLoaderConfig, RuntimeProfile,
+};
 use crate::runtime::OtterRuntime;
 
 /// Epoch for performance.now() — set once at process start.
@@ -63,6 +69,7 @@ fn performance_now(
 pub struct RuntimeBuilder {
     console: Option<Box<dyn ConsoleBackend>>,
     timeout: Option<Duration>,
+    host: HostConfig,
 }
 
 impl RuntimeBuilder {
@@ -71,6 +78,7 @@ impl RuntimeBuilder {
         Self {
             console: None,
             timeout: None,
+            host: HostConfig::default(),
         }
     }
 
@@ -88,12 +96,65 @@ impl RuntimeBuilder {
         self
     }
 
-    // Future: .with_node_builtins(), .module(), .permissions()
-    // These will be added when the module system is implemented.
+    /// Sets host capabilities for the runtime instance.
+    pub fn capabilities(mut self, caps: Capabilities) -> Self {
+        self.host.set_capabilities(caps);
+        self
+    }
+
+    /// Sets an explicit isolated environment store.
+    pub fn env_store(mut self, store: IsolatedEnvStore) -> Self {
+        self.host.set_env_store(std::sync::Arc::new(store));
+        self
+    }
+
+    /// Builds an isolated environment store with the provided closure.
+    pub fn env(mut self, f: impl FnOnce(EnvStoreBuilder) -> EnvStoreBuilder) -> Self {
+        self.host
+            .set_env_store(std::sync::Arc::new(f(EnvStoreBuilder::new()).build()));
+        self
+    }
+
+    /// Sets the runtime host profile.
+    pub fn profile(mut self, profile: RuntimeProfile) -> Self {
+        self.host.set_profile(profile);
+        self
+    }
+
+    /// Sets hosted module loader configuration.
+    pub fn module_loader(mut self, loader: ModuleLoaderConfig) -> Self {
+        self.host.set_loader(loader);
+        self
+    }
+
+    /// Registers one native hosted module specifier on the new host layer.
+    pub fn native_module(
+        mut self,
+        specifier: impl Into<String>,
+        module: impl HostedNativeModuleLoader + 'static,
+    ) -> Self {
+        let mut registry = self.host.native_modules().clone();
+        registry
+            .register(specifier, Arc::new(module))
+            .expect("native hosted module registration should be unique");
+        self.host.set_native_modules(registry);
+        self
+    }
+
+    /// Registers one hosted extension on the new host layer.
+    pub fn extension(mut self, extension: impl HostedExtension + 'static) -> Self {
+        let mut registry = self.host.extensions().clone();
+        registry
+            .register(Arc::new(extension))
+            .expect("hosted extension registration should be valid");
+        self.host.set_extensions(registry);
+        self
+    }
 
     /// Builds the configured runtime.
     pub fn build(self) -> OtterRuntime {
         let mut state = RuntimeState::new();
+        let mut host = self.host;
 
         // Apply console backend.
         if let Some(console) = self.console {
@@ -104,6 +165,22 @@ impl RuntimeBuilder {
         // Install performance.now() on the global object.
         install_performance_global(&mut state);
 
-        OtterRuntime::from_state(state, self.timeout)
+        host.extensions()
+            .bootstrap(&mut state, host.profile())
+            .expect("hosted extension bootstrap should succeed");
+
+        let mut native_modules = host.native_modules().clone();
+        let extension_modules = host
+            .extensions()
+            .native_module_registry(host.profile())
+            .expect("hosted extension native modules should register");
+        for (specifier, loader) in extension_modules.into_entries() {
+            native_modules
+                .register(specifier, loader)
+                .expect("extension/native module specifiers should not conflict");
+        }
+        host.set_native_modules(native_modules);
+
+        OtterRuntime::from_state(state, self.timeout, host)
     }
 }

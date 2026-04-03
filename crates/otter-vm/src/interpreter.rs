@@ -3010,8 +3010,8 @@ impl RuntimeState {
             ));
         }
         if value.is_bigint() {
-            let wrapper = self
-                .alloc_object_with_prototype(Some(self.intrinsics.bigint_prototype()));
+            let wrapper =
+                self.alloc_object_with_prototype(Some(self.intrinsics.bigint_prototype()));
             return Ok(wrapper);
         }
         if value.is_symbol() {
@@ -3491,7 +3491,10 @@ impl RuntimeState {
     pub(crate) fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         // §7.1.2 step 7: BigInt — 0n is falsy, all others truthy.
         if let Some(handle) = value.as_bigint_handle() {
-            let str_val = self.objects.bigint_value(ObjectHandle(handle))?.unwrap_or("0");
+            let str_val = self
+                .objects
+                .bigint_value(ObjectHandle(handle))?
+                .unwrap_or("0");
             return Ok(str_val != "0");
         }
         // Fast path: non-object values use the NaN-box check.
@@ -3767,7 +3770,12 @@ impl RuntimeState {
         .and_then(|result| {
             // Re-check for division by zero via the original rhs.
             let rhs_handle = ObjectHandle(rhs.as_bigint_handle().unwrap());
-            let rhs_str = self.objects.bigint_value(rhs_handle).ok().flatten().unwrap_or("0");
+            let rhs_str = self
+                .objects
+                .bigint_value(rhs_handle)
+                .ok()
+                .flatten()
+                .unwrap_or("0");
             if rhs_str == "0" {
                 return Err(InterpreterError::TypeError("Division by zero".into()));
             }
@@ -4787,8 +4795,7 @@ impl Interpreter {
                             );
                         }
                         Err(InterpreterError::UncaughtThrow(reason)) => {
-                            if let Some(promise) =
-                                runtime.objects.get_promise_mut(result_promise)
+                            if let Some(promise) = runtime.objects.get_promise_mut(result_promise)
                                 && let Some(jobs) = promise.reject(reason)
                             {
                                 for j in jobs {
@@ -5859,11 +5866,10 @@ impl Interpreter {
                 {
                     if index >= 0.0 && index == index.floor() {
                         let num = runtime.js_to_number(value)?;
-                        let _ = runtime.objects.typed_array_set_element(
-                            handle,
-                            index as usize,
-                            num,
-                        );
+                        let _ =
+                            runtime
+                                .objects
+                                .typed_array_set_element(handle, index as usize, num);
                     }
                     activation.advance();
                     return Ok(StepOutcome::Continue);
@@ -7577,6 +7583,7 @@ fn canonical_string_exotic_index(property_name: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use crate::bigint::BigIntTable;
     use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
     use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
     use crate::closure::{CaptureDescriptor, ClosureTable, ClosureTemplate, UpvalueId};
@@ -7584,7 +7591,6 @@ mod tests {
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::exception::ExceptionTable;
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
-    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::{FrameFlags, FrameLayout};
     use crate::intrinsics::WellKnownSymbol;

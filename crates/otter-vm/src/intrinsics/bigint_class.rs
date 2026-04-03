@@ -123,27 +123,27 @@ fn bigint_class_descriptor() -> JsClassDescriptor {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    msg: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(msg) {
         Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
-        Err(error) => VmNativeCallError::Internal(format!("TypeError alloc failed: {error}").into()),
+        Err(error) => {
+            VmNativeCallError::Internal(format!("TypeError alloc failed: {error}").into())
+        }
     }
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    msg: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
     let prototype = runtime.intrinsics().range_error_prototype;
     let handle = runtime.alloc_object_with_prototype(Some(prototype));
     let msg_str = runtime.alloc_string(msg);
     let msg_prop = runtime.intern_property_name("message");
     runtime
         .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg_str.0))
+        .set_property(
+            handle,
+            msg_prop,
+            RegisterValue::from_object_handle(msg_str.0),
+        )
         .ok();
     VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
 }
@@ -155,9 +155,7 @@ fn require_bigint_value<'a>(
 ) -> Result<&'a str, VmNativeCallError> {
     let handle = value
         .as_bigint_handle()
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("expected BigInt value".into())
-        })?;
+        .ok_or_else(|| VmNativeCallError::Internal("expected BigInt value".into()))?;
     runtime
         .bigint_value(ObjectHandle(handle))
         .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))
@@ -183,7 +181,10 @@ fn to_bigint(
         ));
     }
     if value.is_symbol() {
-        return Err(type_error(runtime, "Cannot convert a Symbol value to a BigInt"));
+        return Err(type_error(
+            runtime,
+            "Cannot convert a Symbol value to a BigInt",
+        ));
     }
 
     // Boolean → 0n / 1n.
@@ -285,7 +286,10 @@ fn bigint_to_string(
         if *r == RegisterValue::undefined() {
             10
         } else {
-            let n = r.as_number().or_else(|| r.as_i32().map(f64::from)).unwrap_or(10.0);
+            let n = r
+                .as_number()
+                .or_else(|| r.as_i32().map(f64::from))
+                .unwrap_or(10.0);
             let n = n as u32;
             if !(2..=36).contains(&n) {
                 return Err(range_error(
@@ -331,7 +335,10 @@ fn bigint_value_of(
     if this.is_bigint() {
         return Ok(*this);
     }
-    Err(type_error(runtime, "BigInt.prototype.valueOf requires a BigInt"))
+    Err(type_error(
+        runtime,
+        "BigInt.prototype.valueOf requires a BigInt",
+    ))
 }
 
 // ─── Static methods ──────────────────────────────────────────────────
@@ -419,11 +426,7 @@ fn bigint_to_radix_string(value: &num_bigint::BigInt, radix: u32) -> String {
 
     while !abs.is_zero() {
         let remainder = &abs % &radix_big;
-        let digit = remainder
-            .to_u32_digits()
-            .first()
-            .copied()
-            .unwrap_or(0);
+        let digit = remainder.to_u32_digits().first().copied().unwrap_or(0);
         digits.push(std::char::from_digit(digit, radix).unwrap_or('?'));
         abs /= &radix_big;
     }

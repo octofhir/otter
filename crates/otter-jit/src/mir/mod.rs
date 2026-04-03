@@ -8,7 +8,6 @@
 pub mod builder;
 pub mod display;
 pub mod graph;
-pub mod next_builder;
 pub mod nodes;
 pub mod passes;
 pub mod types;

@@ -18,11 +18,10 @@ pub mod codegen;
 pub mod config;
 pub mod context;
 pub mod deopt;
-pub mod feedback;
 pub mod helpers;
 pub mod mir;
-mod next_helpers;
 pub mod pipeline;
+mod runtime_helpers;
 pub mod telemetry;
 
 pub use deopt::{BAILOUT_SENTINEL, BailoutReason};

@@ -450,11 +450,11 @@ impl Module {
 
 #[cfg(test)]
 mod tests {
+    use crate::bigint::BigIntTable;
     use crate::bytecode::{Bytecode, BytecodeRegister, Instruction};
     use crate::deopt::{DeoptId, DeoptSite, DeoptTable};
     use crate::exception::{ExceptionHandler, ExceptionTable};
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
-    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::property::PropertyNameTable;

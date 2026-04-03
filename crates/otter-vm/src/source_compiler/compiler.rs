@@ -1755,7 +1755,8 @@ impl<'a> FunctionCompiler<'a> {
             u16::try_from(self.bigint_constants.len())
                 .map_err(|_| SourceLoweringError::TooManyLocals)?,
         );
-        self.bigint_constants.push(value.to_string().into_boxed_str());
+        self.bigint_constants
+            .push(value.to_string().into_boxed_str());
         self.bigint_ids.insert(value.to_string(), id);
         Ok(id)
     }

@@ -406,7 +406,7 @@ impl<'a> OpLowerer<'a> {
                 offsets::THIS_RAW,
             ))),
 
-            // ---- New-VM property fast paths ----
+            // ---- Property fast paths ----
             MirOp::GetPropShaped {
                 obj,
                 shape_id,
@@ -419,7 +419,7 @@ impl<'a> OpLowerer<'a> {
                 let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
                 let result = self.emit_direct_host_call(
                     builder,
-                    crate::next_helpers::otter_next_get_prop_shaped as *const () as usize,
+                    crate::runtime_helpers::otter_get_prop_shaped as *const () as usize,
                     &[obj, shape, offset, pc],
                 );
                 let result = self.emit_return_if_bailout_sentinel(builder, result);
@@ -439,7 +439,7 @@ impl<'a> OpLowerer<'a> {
                 let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
                 let result = self.emit_direct_host_call(
                     builder,
-                    crate::next_helpers::otter_next_set_prop_shaped as *const () as usize,
+                    crate::runtime_helpers::otter_set_prop_shaped as *const () as usize,
                     &[obj, shape, offset, value, pc],
                 );
                 let _ = self.emit_return_if_bailout_sentinel(builder, result);
@@ -499,7 +499,7 @@ impl<'a> OpLowerer<'a> {
                 }
                 let result = self.emit_direct_host_call(
                     builder,
-                    crate::next_helpers::otter_next_call_direct as *const () as usize,
+                    crate::runtime_helpers::otter_call_direct as *const () as usize,
                     &call_args,
                 );
                 let result = self.emit_return_if_bailout_sentinel(builder, result);

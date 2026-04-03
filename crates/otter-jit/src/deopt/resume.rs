@@ -1,5 +1,6 @@
-//! Explicit deopt handoff and interpreter-resume helpers for the new VM path.
+//! Explicit deopt handoff and interpreter-resume helpers for the JIT path.
 
+use otter_vm::RuntimeState;
 use otter_vm::deopt::{DeoptHandoff, DeoptId, DeoptReason, DeoptSite};
 use otter_vm::interpreter::{ExecutionResult, InterpreterError};
 use otter_vm::{FunctionIndex, Interpreter, Module, RegisterValue};
@@ -7,13 +8,12 @@ use otter_vm::{FunctionIndex, Interpreter, Module, RegisterValue};
 use crate::JitError;
 use crate::deopt::BailoutReason;
 use crate::pipeline::{
-    JitExecResult, execute_next_function_profiled_with_runtime,
-    execute_next_function_with_interrupt,
+    JitExecResult, execute_function_profiled_with_runtime, execute_function_with_interrupt,
 };
 
-/// Errors produced while deopting back into the new interpreter.
+/// Errors produced while deopting back into the interpreter.
 #[derive(Debug, thiserror::Error)]
-pub enum NextDeoptError {
+pub enum DeoptError {
     #[error("{0}")]
     Jit(#[from] JitError),
     #[error("{0}")]
@@ -38,9 +38,9 @@ fn map_bailout_reason(reason: BailoutReason) -> DeoptReason {
     }
 }
 
-/// Resolve a deopt handoff for one new-VM bailout.
+/// Resolve a deopt handoff for one bailout.
 #[must_use]
-pub fn handoff_for_next_bailout(
+pub fn handoff_for_bailout(
     function: &otter_vm::Function,
     bytecode_pc: u32,
     reason: BailoutReason,
@@ -52,33 +52,33 @@ pub fn handoff_for_next_bailout(
     DeoptHandoff::new(site, bytecode_pc, map_bailout_reason(reason))
 }
 
-/// Resume a new-VM function in the interpreter from an explicit deopt handoff.
-pub fn resume_next_function(
+/// Resume a function in the interpreter from an explicit deopt handoff.
+pub fn resume_function(
     module: &Module,
     function_index: FunctionIndex,
     handoff: DeoptHandoff,
     registers: &[RegisterValue],
-) -> Result<ExecutionResult, NextDeoptError> {
+) -> Result<ExecutionResult, DeoptError> {
     let _ = module
         .function(function_index)
-        .ok_or(NextDeoptError::InvalidFunctionIndex)?;
+        .ok_or(DeoptError::InvalidFunctionIndex)?;
     Ok(Interpreter::new().resume(module, function_index, handoff.resume_pc(), registers)?)
 }
 
-/// Execute a new-VM function in JIT code and explicitly fall back to the interpreter on deopt.
-pub fn execute_next_function_with_fallback(
+/// Execute a function in JIT code and explicitly fall back to the interpreter on deopt.
+pub fn execute_function_with_fallback(
     module: &Module,
     function_index: FunctionIndex,
     registers: &mut [RegisterValue],
     interrupt_flag: *const u8,
-) -> Result<ExecutionResult, NextDeoptError> {
+) -> Result<ExecutionResult, DeoptError> {
     let function = module
         .function(function_index)
-        .ok_or(NextDeoptError::InvalidFunctionIndex)?;
-    match execute_next_function_with_interrupt(function, registers, interrupt_flag)? {
+        .ok_or(DeoptError::InvalidFunctionIndex)?;
+    match execute_function_with_interrupt(function, registers, interrupt_flag)? {
         JitExecResult::Ok(raw) => {
             let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
-                JitError::Internal("jit returned invalid new-vm register bits".to_string())
+                JitError::Internal("jit returned invalid vm register bits".to_string())
             })?;
             Ok(ExecutionResult::new(value))
         }
@@ -86,8 +86,8 @@ pub fn execute_next_function_with_fallback(
             bytecode_pc,
             reason,
         } => {
-            let handoff = handoff_for_next_bailout(function, bytecode_pc, reason);
-            resume_next_function(module, function_index, handoff, registers)
+            let handoff = handoff_for_bailout(function, bytecode_pc, reason);
+            resume_function(module, function_index, handoff, registers)
         }
         JitExecResult::NotCompiled => {
             Ok(Interpreter::new().resume(module, function_index, 0, registers)?)
@@ -95,16 +95,16 @@ pub fn execute_next_function_with_fallback(
     }
 }
 
-/// Execute a profiled new-VM function on shared runtime state and fall back to the interpreter.
-pub fn execute_next_function_profiled_with_fallback(
+/// Execute a profiled function on shared runtime state and fall back to the interpreter.
+pub fn execute_function_profiled_with_fallback(
     module: &Module,
     function_index: FunctionIndex,
     registers: &mut [RegisterValue],
     interrupt_flag: *const u8,
-) -> Result<ExecutionResult, NextDeoptError> {
+) -> Result<ExecutionResult, DeoptError> {
     let profile = Interpreter::new().profile_property_caches(module, function_index, registers)?;
     let mut runtime = otter_vm::RuntimeState::new();
-    match execute_next_function_profiled_with_runtime(
+    match execute_function_profiled_with_runtime(
         module,
         function_index,
         registers,
@@ -114,7 +114,7 @@ pub fn execute_next_function_profiled_with_fallback(
     )? {
         JitExecResult::Ok(raw) => {
             let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
-                JitError::Internal("jit returned invalid new-vm register bits".to_string())
+                JitError::Internal("jit returned invalid vm register bits".to_string())
             })?;
             Ok(ExecutionResult::new(value))
         }
@@ -130,6 +130,61 @@ pub fn execute_next_function_profiled_with_fallback(
             function_index,
             registers,
             &mut runtime,
+        )?),
+    }
+}
+
+/// Execute the module entry through the JIT on an existing runtime and fall back
+/// to the interpreter on bailout or unsupported paths.
+pub fn execute_module_entry_with_runtime(
+    module: &Module,
+    runtime: &mut RuntimeState,
+    interrupt_flag: *const u8,
+) -> Result<ExecutionResult, DeoptError> {
+    let function_index = module.entry();
+    let function = module
+        .function(function_index)
+        .ok_or(DeoptError::InvalidFunctionIndex)?;
+    let register_count = usize::from(function.frame_layout().register_count());
+    let mut registers = vec![RegisterValue::undefined(); register_count];
+
+    if let Some(receiver_slot) = function.frame_layout().receiver_slot() {
+        let global = runtime.intrinsics().global_object();
+        registers[usize::from(receiver_slot)] = RegisterValue::from_object_handle(global.0);
+    }
+
+    match execute_function_profiled_with_runtime(
+        module,
+        function_index,
+        &mut registers,
+        runtime,
+        &[],
+        interrupt_flag,
+    )? {
+        JitExecResult::Ok(raw) => {
+            let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
+                JitError::Internal("jit returned invalid vm register bits".to_string())
+            })?;
+            Ok(ExecutionResult::new(value))
+        }
+        JitExecResult::Bailout {
+            bytecode_pc,
+            reason,
+        } => {
+            let handoff = handoff_for_bailout(function, bytecode_pc, reason);
+            Ok(Interpreter::new().resume_with_runtime(
+                module,
+                function_index,
+                handoff.resume_pc(),
+                &registers,
+                runtime,
+            )?)
+        }
+        JitExecResult::NotCompiled => Ok(Interpreter::new().execute_with_runtime(
+            module,
+            function_index,
+            &registers,
+            runtime,
         )?),
     }
 }

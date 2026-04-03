@@ -43,28 +43,28 @@ pub fn temporal_err(
 }
 
 /// Allocates a TypeError and returns it as a throwable error.
-pub fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    msg: &str,
-) -> VmNativeCallError {
+pub fn type_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(msg) {
         Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
-        Err(error) => VmNativeCallError::Internal(format!("TypeError alloc failed: {error}").into()),
+        Err(error) => {
+            VmNativeCallError::Internal(format!("TypeError alloc failed: {error}").into())
+        }
     }
 }
 
 /// Allocates a RangeError and returns it as a throwable error.
-pub fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    msg: &str,
-) -> VmNativeCallError {
+pub fn range_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
     let prototype = runtime.intrinsics().range_error_prototype;
     let handle = runtime.alloc_object_with_prototype(Some(prototype));
     let msg_str = runtime.alloc_string(msg);
     let msg_prop = runtime.intern_property_name("message");
     runtime
         .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg_str.0))
+        .set_property(
+            handle,
+            msg_prop,
+            RegisterValue::from_object_handle(msg_str.0),
+        )
         .ok();
     VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
 }
@@ -116,13 +116,11 @@ pub fn to_bigint_i128(
         .get(index)
         .copied()
         .unwrap_or(RegisterValue::undefined());
-    let handle = val
-        .as_bigint_handle()
-        .ok_or_else(|| {
-            VmNativeCallError::Internal(
-                "Temporal.Instant requires a BigInt epoch nanoseconds argument".into(),
-            )
-        })?;
+    let handle = val.as_bigint_handle().ok_or_else(|| {
+        VmNativeCallError::Internal(
+            "Temporal.Instant requires a BigInt epoch nanoseconds argument".into(),
+        )
+    })?;
     let s = runtime
         .bigint_value(ObjectHandle(handle))
         .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;

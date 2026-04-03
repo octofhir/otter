@@ -12,16 +12,18 @@ use crate::descriptors::{
 use crate::object::ObjectHandle;
 use crate::value::RegisterValue;
 
+use super::duration::to_duration;
 use super::helpers::{self, temporal_err, to_integer_or_zero, to_string_arg};
 use super::payload::{TemporalPayload, construct_temporal, require_temporal_payload};
-use super::duration::to_duration;
 
 // ── Descriptor ──────────────────────────────────────────────────────
 
 pub fn plain_date_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("PlainDate")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "PlainDate", 3, plain_date_constructor,
+            "PlainDate",
+            3,
+            plain_date_constructor,
         ))
         .with_binding(stat("from", 1, plain_date_from))
         .with_binding(stat("compare", 2, plain_date_compare))
@@ -50,8 +52,11 @@ pub fn plain_date_class_descriptor() -> JsClassDescriptor {
 fn proto(
     name: &str,
     arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
@@ -62,8 +67,11 @@ fn proto(
 fn stat(
     name: &str,
     arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,
@@ -294,7 +302,9 @@ fn pd_equals(
     let pd = require_plain_date(this, runtime)?;
     let other_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let other = to_plain_date(other_val, runtime)?;
-    Ok(RegisterValue::from_bool(pd.compare_iso(&other) == Ordering::Equal))
+    Ok(RegisterValue::from_bool(
+        pd.compare_iso(&other) == Ordering::Equal,
+    ))
 }
 
 /// §10.2.3.21 Temporal.PlainDate.prototype.toString ( [ options ] )

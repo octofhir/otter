@@ -1,4 +1,4 @@
-//! Small host helpers for the new-VM tier1 path.
+//! Small host helpers for the tier1 runtime path.
 
 use crate::context::JitContext;
 use crate::{BAILOUT_SENTINEL, BailoutReason};
@@ -13,17 +13,17 @@ fn write_bailout(ctx: &mut JitContext, reason: BailoutReason, bytecode_pc: u32) 
     BAILOUT_SENTINEL
 }
 
-unsafe fn next_module(ctx: &JitContext) -> Option<&Module> {
-    let ptr = ctx.next_module.cast::<Module>();
+unsafe fn module(ctx: &JitContext) -> Option<&Module> {
+    let ptr = ctx.module_ptr.cast::<Module>();
     (!ptr.is_null()).then(|| unsafe { &*ptr })
 }
 
-unsafe fn next_runtime(ctx: &mut JitContext) -> Option<&mut RuntimeState> {
-    let ptr = ctx.next_runtime.cast::<RuntimeState>();
+unsafe fn runtime(ctx: &mut JitContext) -> Option<&mut RuntimeState> {
+    let ptr = ctx.runtime_ptr.cast::<RuntimeState>();
     (!ptr.is_null()).then(|| unsafe { &mut *ptr })
 }
 
-pub extern "C" fn otter_next_get_prop_shaped(
+pub extern "C" fn otter_get_prop_shaped(
     ctx: *mut JitContext,
     obj_handle: i64,
     shape_id: i64,
@@ -33,7 +33,7 @@ pub extern "C" fn otter_next_get_prop_shaped(
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
-    let Some(runtime) = (unsafe { next_runtime(ctx) }) else {
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
         return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
     };
     let Some(handle) = u32::try_from(obj_handle).ok().map(ObjectHandle) else {
@@ -55,7 +55,7 @@ pub extern "C" fn otter_next_get_prop_shaped(
     }
 }
 
-pub extern "C" fn otter_next_set_prop_shaped(
+pub extern "C" fn otter_set_prop_shaped(
     ctx: *mut JitContext,
     obj_handle: i64,
     shape_id: i64,
@@ -66,7 +66,7 @@ pub extern "C" fn otter_next_set_prop_shaped(
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
-    let Some(runtime) = (unsafe { next_runtime(ctx) }) else {
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
         return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
     };
     let Some(handle) = u32::try_from(obj_handle).ok().map(ObjectHandle) else {
@@ -92,7 +92,7 @@ pub extern "C" fn otter_next_set_prop_shaped(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn otter_next_call_direct(
+pub extern "C" fn otter_call_direct(
     ctx: *mut JitContext,
     callee_index: i64,
     bytecode_pc: i64,
@@ -109,7 +109,7 @@ pub extern "C" fn otter_next_call_direct(
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
-    let Some(module) = (unsafe { next_module(ctx) }) else {
+    let Some(module) = (unsafe { module(ctx) }) else {
         return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
     };
     let Some(callee_index) = u32::try_from(callee_index).ok().map(FunctionIndex) else {
@@ -142,7 +142,7 @@ pub extern "C" fn otter_next_call_direct(
         callee_registers[usize::from(dst)] = value;
     }
 
-    match crate::deopt::execute_next_function_with_fallback(
+    match crate::deopt::execute_function_with_fallback(
         module,
         callee_index,
         &mut callee_registers,

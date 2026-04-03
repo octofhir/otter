@@ -9,12 +9,12 @@
 
 /// Shared execution ABI.
 pub mod abi;
-/// BigInt-constant side tables.
-pub mod bigint;
 /// ECMAScript abstract operations shared across interpreter and intrinsics.
 pub mod abstract_ops;
 /// Suspended async function context for await support.
 pub mod async_context;
+/// BigInt-constant side tables.
+pub mod bigint;
 /// Engine/runtime integration boundary.
 pub mod bridge;
 /// Builder-side adapters for descriptor-driven bootstrap.

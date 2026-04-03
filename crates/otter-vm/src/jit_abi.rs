@@ -116,13 +116,13 @@ pub fn compile_request(
 
 #[cfg(test)]
 mod tests {
+    use crate::bigint::BigIntTable;
     use crate::bytecode::{Bytecode, BytecodeRegister, Instruction};
     use crate::call::CallTable;
     use crate::closure::ClosureTable;
     use crate::deopt::{DeoptHandoff, DeoptId, DeoptReason, DeoptSite, DeoptTable};
     use crate::exception::ExceptionTable;
     use crate::feedback::FeedbackTableLayout;
-    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};

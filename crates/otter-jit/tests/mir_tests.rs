@@ -2,21 +2,18 @@
 
 use otter_jit::mir::builder::build_mir;
 use otter_jit::mir::verify::verify;
-use otter_vm_compiler::Compiler;
+use otter_vm::source;
 
 fn compile_and_build_mir(source: &str) -> otter_jit::mir::graph::MirGraph {
-    let compiler = Compiler::new();
-    let module = compiler
-        .compile(source, "test.js", false)
-        .expect("compilation failed");
+    let module = source::compile_script(source, "test.js").expect("compilation failed");
     // The compiler puts user functions first, module body ("main") last.
     // Pick the first non-"main" function, or index 0 if only one.
     let func = module
-        .functions
+        .functions()
         .iter()
-        .find(|f| f.name.as_deref() != Some("main"))
-        .unwrap_or(&module.functions[0]);
-    build_mir(func)
+        .find(|f| f.name() != Some("main"))
+        .unwrap_or_else(|| &module.functions()[0]);
+    build_mir(func, None).expect("MIR should build")
 }
 
 #[test]

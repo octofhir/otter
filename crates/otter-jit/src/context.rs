@@ -4,8 +4,6 @@
 //! offsets. Fields are ordered hot-first: registers and constants are accessed
 //! on nearly every instruction, while bailout fields are written only on deopt.
 
-use otter_vm_bytecode::Function;
-
 /// Opaque context pointer passed as the first argument to every JIT-compiled
 /// function: `extern "C" fn(*mut JitContext) -> u64`.
 ///
@@ -41,8 +39,8 @@ pub struct JitContext {
     /// Pointer to VmContext (for VM reentry calls).
     pub vm_ctx: *mut (),
 
-    /// Pointer to the bytecode Function (for feedback vector access).
-    pub function_ptr: *const Function,
+    /// Reserved function pointer slot in the shared JIT ABI.
+    pub function_ptr: *const (),
 
     /// Pointer to the upvalue cells array (closure captures).
     pub upvalues_ptr: *const (),
@@ -70,11 +68,11 @@ pub struct JitContext {
     /// (e.g., IteratorNext done flag).
     pub secondary_result: u64,
 
-    /// Pointer to the active new-VM module for specialized tier1 execution.
-    pub next_module: *const (),
+    /// Pointer to the active module for specialized tier1 execution.
+    pub module_ptr: *const (),
 
-    /// Pointer to the active new-VM runtime state for specialized tier1 execution.
-    pub next_runtime: *mut (),
+    /// Pointer to the active runtime state for specialized tier1 execution.
+    pub runtime_ptr: *mut (),
 }
 
 // Compile-time offset verification. These constants are used by codegen to
@@ -107,8 +105,8 @@ assert_offset!(proto_epoch, 96);
 assert_offset!(bailout_reason, 104);
 assert_offset!(bailout_pc, 108);
 assert_offset!(secondary_result, 112);
-assert_offset!(next_module, 120);
-assert_offset!(next_runtime, 128);
+assert_offset!(module_ptr, 120);
+assert_offset!(runtime_ptr, 128);
 
 /// Byte offset constants for use in Cranelift IR codegen.
 pub mod offsets {
@@ -129,8 +127,8 @@ pub mod offsets {
     pub const BAILOUT_REASON: i32 = 104;
     pub const BAILOUT_PC: i32 = 108;
     pub const SECONDARY_RESULT: i32 = 112;
-    pub const NEXT_MODULE: i32 = 120;
-    pub const NEXT_RUNTIME: i32 = 128;
+    pub const MODULE_PTR: i32 = 120;
+    pub const RUNTIME_PTR: i32 = 128;
 }
 
 #[cfg(test)]

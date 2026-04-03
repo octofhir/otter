@@ -78,9 +78,7 @@ fn now_time_zone_id(
     let tz = temporal_rs::Temporal::local_now()
         .time_zone()
         .map_err(|e| temporal_err(e, runtime))?;
-    let id = tz
-        .identifier()
-        .map_err(|e| temporal_err(e, runtime))?;
+    let id = tz.identifier().map_err(|e| temporal_err(e, runtime))?;
     let handle = runtime.alloc_string(id);
     Ok(RegisterValue::from_object_handle(handle.0))
 }

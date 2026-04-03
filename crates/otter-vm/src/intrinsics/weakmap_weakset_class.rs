@@ -143,7 +143,8 @@ fn weakmap_constructor(
 
     // If iterable argument provided, add entries.
     if let Some(iterable) = args.first().copied()
-        && iterable != RegisterValue::undefined() && iterable != RegisterValue::null()
+        && iterable != RegisterValue::undefined()
+        && iterable != RegisterValue::null()
         && let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle)
         && matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array))
     {
@@ -165,16 +166,12 @@ fn weakmap_constructor(
                     .get_array_index_value(eh, 1)?
                     .unwrap_or(RegisterValue::undefined());
                 let key_handle = key.as_object_handle().ok_or_else(|| {
-                    VmNativeCallError::Internal(
-                        "Invalid value used as weak map key".into(),
-                    )
+                    VmNativeCallError::Internal("Invalid value used as weak map key".into())
                 })?;
                 runtime
                     .objects_mut()
                     .weakmap_set(handle, key_handle, value)
-                    .map_err(|e| {
-                        VmNativeCallError::Internal(format!("{e:?}").into())
-                    })?;
+                    .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
             }
         }
     }
@@ -346,7 +343,8 @@ fn weakset_constructor(
     let handle = runtime.objects_mut().alloc_weakset(prototype);
 
     if let Some(iterable) = args.first().copied()
-        && iterable != RegisterValue::undefined() && iterable != RegisterValue::null()
+        && iterable != RegisterValue::undefined()
+        && iterable != RegisterValue::null()
         && let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle)
         && matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array))
     {
@@ -363,9 +361,7 @@ fn weakset_constructor(
                 runtime
                     .objects_mut()
                     .weakset_add(handle, key_handle)
-                    .map_err(|e| {
-                        VmNativeCallError::Internal(format!("{e:?}").into())
-                    })?;
+                    .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
             }
         }
     }

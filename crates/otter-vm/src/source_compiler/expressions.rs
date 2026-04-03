@@ -2071,10 +2071,7 @@ impl<'a> FunctionCompiler<'a> {
     ///
     /// §6.1.6.2 The BigInt Type
     /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-    fn compile_bigint_literal(
-        &mut self,
-        raw: &str,
-    ) -> Result<ValueLocation, SourceLoweringError> {
+    fn compile_bigint_literal(&mut self, raw: &str) -> Result<ValueLocation, SourceLoweringError> {
         // The raw text includes the trailing `n` suffix — strip it.
         let value = raw.strip_suffix('n').unwrap_or(raw);
         self.compile_bigint_literal_value(value)

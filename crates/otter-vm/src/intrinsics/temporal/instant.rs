@@ -22,7 +22,9 @@ fn tz_provider() -> &'static impl temporal_rs::provider::TimeZoneProvider {
 pub fn instant_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Instant")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "Instant", 1, instant_constructor,
+            "Instant",
+            1,
+            instant_constructor,
         ))
         .with_binding(stat("from", 1, instant_from))
         .with_binding(stat("compare", 2, instant_compare))
@@ -192,7 +194,7 @@ fn instant_epoch_ms(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let instant = require_instant(this, runtime)?;
     Ok(RegisterValue::from_number(
-        instant.epoch_milliseconds() as f64,
+        instant.epoch_milliseconds() as f64
     ))
 }
 
@@ -233,7 +235,9 @@ fn instant_subtract(
     let instant = require_instant(this, runtime)?;
     let dur_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(dur_val, runtime)?;
-    let result = instant.subtract(&dur).map_err(|e| temporal_err(e, runtime))?;
+    let result = instant
+        .subtract(&dur)
+        .map_err(|e| temporal_err(e, runtime))?;
     Ok(wrap_instant(result, runtime))
 }
 

@@ -24,7 +24,7 @@ thread_local! {
 }
 
 /// Look up a compiled function by its bytecode Function pointer.
-pub fn get(func_ptr: *const otter_vm_bytecode::Function) -> Option<*const u8> {
+pub fn get(func_ptr: *const otter_vm::Function) -> Option<*const u8> {
     CACHE.with(|cache| {
         cache
             .borrow()
@@ -35,7 +35,7 @@ pub fn get(func_ptr: *const otter_vm_bytecode::Function) -> Option<*const u8> {
 }
 
 /// Store a compiled function in the cache.
-pub fn insert(func_ptr: *const otter_vm_bytecode::Function, compiled: CompiledFunction) {
+pub fn insert(func_ptr: *const otter_vm::Function, compiled: CompiledFunction) {
     CACHE.with(|cache| {
         cache
             .borrow_mut()
@@ -45,7 +45,7 @@ pub fn insert(func_ptr: *const otter_vm_bytecode::Function, compiled: CompiledFu
 }
 
 /// Check if a function is already compiled.
-pub fn contains(func_ptr: *const otter_vm_bytecode::Function) -> bool {
+pub fn contains(func_ptr: *const otter_vm::Function) -> bool {
     CACHE.with(|cache| cache.borrow().entries.contains_key(&(func_ptr as usize)))
 }
 
@@ -60,7 +60,7 @@ pub fn clear() {
 }
 
 /// Remove a single function from the cache.
-pub fn invalidate(func_ptr: *const otter_vm_bytecode::Function) {
+pub fn invalidate(func_ptr: *const otter_vm::Function) {
     CACHE.with(|cache| {
         cache.borrow_mut().entries.remove(&(func_ptr as usize));
     });

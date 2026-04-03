@@ -51,7 +51,7 @@ fn print_human_readable(info: &RuntimeInfo) {
     println!(
         "  VM Engine:   {}",
         if info.features.vm {
-            "otter-vm + otter-runtime"
+            "otter-vm + otter-runtime + otter-jit"
         } else {
             "disabled"
         }

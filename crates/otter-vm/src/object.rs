@@ -6768,7 +6768,8 @@ impl ObjectHeap {
 /// Normalize -0.0 to +0.0 per ES2024 §24.1.3.9 step 6.
 fn normalize_zero(v: RegisterValue) -> RegisterValue {
     if let Some(n) = v.as_number()
-        && n == 0.0 && n.is_sign_negative()
+        && n == 0.0
+        && n.is_sign_negative()
     {
         return RegisterValue::from_number(0.0);
     }

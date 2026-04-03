@@ -30,12 +30,17 @@ just run examples/basic.ts
 just test262-filter "Array/prototype/map"
 ```
 
+Current fast-path CLI surface during migration:
+- enabled: `run`, direct file execution, `-e`, `-p`, package-management commands
+- disabled: `repl`, `test`, `build`
+
 ## Key Architecture
 
 Target stack:
 - `crates/otter-gc`
 - `crates/otter-vm`
 - `crates/otter-runtime`
+- `crates/otter-jit`
 
 Legacy stack being retired:
 - `crates/otter-engine`
@@ -106,14 +111,13 @@ just test262-dir "language/expressions"  # Specific directory
 ```
 
 ### Node.js Compatibility
-```bash
-just node-compat                     # Fetch and run Node.js tests
-just node-compat-module fs           # Test specific module
-just node-compat-status              # Show pass rate
-```
+
+`node-compat` is parked while the legacy stack stays frozen. Do not treat the
+old Node.js compatibility runner as an active workflow until it is rebuilt on
+top of `otter-runtime` + `otter-vm`.
 
 ### Test-Driven Development Workflow
-When working on features with conformance tests (Test262, Node.js compat):
+When working on features with conformance tests:
 
 1. **Measure before**: Run tests, note the pass rate (e.g., "JSON: 39% passing")
 2. **Fix incrementally**: Focus on the most common failure patterns first

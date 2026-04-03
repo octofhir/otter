@@ -333,18 +333,12 @@ fn require_regexp_this(
 }
 
 /// Gets the pattern string from a RegExp handle.
-fn regexp_pattern(
-    handle: ObjectHandle,
-    runtime: &crate::interpreter::RuntimeState,
-) -> &str {
+fn regexp_pattern(handle: ObjectHandle, runtime: &crate::interpreter::RuntimeState) -> &str {
     runtime.objects().regexp_pattern(handle).unwrap_or("")
 }
 
 /// Gets the flags string from a RegExp handle.
-fn regexp_flags_str(
-    handle: ObjectHandle,
-    runtime: &crate::interpreter::RuntimeState,
-) -> &str {
+fn regexp_flags_str(handle: ObjectHandle, runtime: &crate::interpreter::RuntimeState) -> &str {
     runtime.objects().regexp_flags(handle).unwrap_or("")
 }
 
@@ -1298,13 +1292,10 @@ fn apply_replacement_template(
                             && let Some(gh) = gv.as_object_handle().map(ObjectHandle)
                         {
                             let name_prop = runtime.intern_property_name(&name);
-                            let nlookup =
-                                runtime.property_lookup(gh, name_prop).ok().flatten();
+                            let nlookup = runtime.property_lookup(gh, name_prop).ok().flatten();
                             if let Some(nl) = nlookup
-                                && let crate::object::PropertyValue::Data {
-                                    value: nv,
-                                    ..
-                                } = nl.value()
+                                && let crate::object::PropertyValue::Data { value: nv, .. } =
+                                    nl.value()
                                 && let Ok(s) = runtime.js_to_string(nv)
                             {
                                 result.push_str(&s);

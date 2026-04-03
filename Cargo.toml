@@ -4,6 +4,8 @@ members = [
     "crates/otter-gc",
     "crates/otter-runtime",
     "crates/otter-vm",
+    "crates/otter-jit",
+    "crates/otter-modules",
     "crates/otter-pm",
     "crates/otter-test262",
     "crates/otterjs",

@@ -40,7 +40,7 @@ This document tracks tooling development for Otter. Tooling is **non-blocking** 
 
 ## 2. Bundler
 
-**Location**: `crates/otter-bundler/` (to be created)
+**Location**: TBD after a fresh new-stack design
 
 **Status**: Not started
 
@@ -75,7 +75,7 @@ Source files → oxc parser → Module graph → Tree shaking → Code generatio
 
 ## 3. Test Runner
 
-**Location**: `crates/otter-test/` (to be created)
+**Location**: separate from `otter-test262`; product test-runner crate TBD
 
 **Status**: Not started
 
@@ -108,7 +108,7 @@ describe('MyModule', () => {
 
 ### Implementation
 
-Test runner builtins in runtime extensions (planned under `crates/otter-engine/src/`):
+Test runner builtins must be implemented on top of `otter-runtime`:
 
 - `describe(name, fn)` - Test suite
 - `it(name, fn)` / `test(name, fn)` - Test case
@@ -117,7 +117,7 @@ Test runner builtins in runtime extensions (planned under `crates/otter-engine/s
 
 ### Dependencies
 
-- Requires event loop for async tests (Phase 4 Runtime)
+- Requires active runtime host integration on `otter-runtime`
 - Requires stable Promise implementation
 
 ---
@@ -159,7 +159,7 @@ Test runner builtins in runtime extensions (planned under `crates/otter-engine/s
 
 ## 5. CLI Integration
 
-All tools integrate via `otter` CLI:
+Target CLI integration after the new-stack design is ready:
 
 ```bash
 # Package manager
@@ -168,13 +168,10 @@ otter install                # Install from lockfile
 otter update                 # Update dependencies
 
 # Bundler
-otter build                  # Bundle for production
-otter build --watch          # Watch mode
+otter build                  # Future command; currently not active
 
 # Test runner
-otter test                   # Run all tests
-otter test --watch           # Watch mode
-otter test path/to/file      # Run specific file
+otter test                   # Future command; currently not active
 
 # Debugger
 otter debug script.ts        # Start debug session
@@ -184,7 +181,7 @@ otter debug script.ts        # Start debug session
 
 ## Timeline
 
-Tooling development happens **after** VM Phase 4 (Runtime Integration) is complete.
+Tooling development happens only after the target runtime stack has the required host integration.
 
 | Phase | Tooling Work |
 |-------|--------------|

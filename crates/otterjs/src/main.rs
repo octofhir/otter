@@ -7,6 +7,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::filter::EnvFilter;
 
 mod commands;
@@ -301,17 +302,20 @@ fn command_temporarily_disabled(command: &str) -> Result<()> {
     ))
 }
 
-async fn run_file(path: &PathBuf, _script_args: &[String], _cli: &Cli) -> Result<()> {
+async fn run_file(path: &PathBuf, _script_args: &[String], cli: &Cli) -> Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", path.display()))?;
-    let mut rt = otter_runtime::OtterRuntime::builder().build();
-    rt.run_file(path_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut rt = build_runtime_for_cli(cli)?;
+    rt.run_entry_specifier(path_str, None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
 fn run_eval_new_vm(source: &str, print_result: bool) -> Result<()> {
-    let mut rt = otter_runtime::OtterRuntime::builder().build();
+    let mut rt = otter_runtime::OtterRuntime::builder()
+        .extension(otter_modules::modules_extension())
+        .build();
     match rt.eval(source) {
         Ok(result) => {
             if print_result {
@@ -323,4 +327,26 @@ fn run_eval_new_vm(source: &str, print_result: bool) -> Result<()> {
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
+}
+
+fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
+    let mut loader = otter_runtime::ModuleLoaderConfig::default();
+    loader.base_dir = std::env::current_dir()?;
+
+    let profile = match cli.node_api {
+        NodeApiMode::None => otter_runtime::RuntimeProfile::Core,
+        NodeApiMode::SafeCore => otter_runtime::RuntimeProfile::SafeCore,
+        NodeApiMode::Full => otter_runtime::RuntimeProfile::Full,
+    };
+
+    let mut builder = otter_runtime::OtterRuntime::builder()
+        .profile(profile)
+        .module_loader(loader)
+        .extension(otter_modules::modules_extension());
+
+    if cli.timeout > 0 {
+        builder = builder.timeout(Duration::from_secs(cli.timeout));
+    }
+
+    Ok(builder.build())
 }

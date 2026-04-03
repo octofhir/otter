@@ -17,6 +17,7 @@ The target runtime stack is:
 - `crates/otter-gc`
 - `crates/otter-vm`
 - `crates/otter-runtime`
+- `crates/otter-jit`
 
 The legacy stack is frozen and must be retired incrementally:
 
@@ -53,12 +54,12 @@ Migration policy:
 - `crates/otter-runtime`: target public runtime and embedding surface.
 
 ### Supporting crates
+- `crates/otter-jit`: JIT pipeline for the target VM and an active part of the new stack.
 - `crates/otter-macros`: `#[dive]` proc-macro for native function bindings.
 - `crates/otter-nodejs`: Node.js API compatibility layer to be ported onto the target stack.
 - `crates/otter-ffi`: FFI bridge to be ported onto the target stack.
 - `crates/otter-pm`: package management + bundled type definitions (`@types/otter`).
-- `crates/otter-sql`: SQLite + PostgreSQL support to be exposed through the target extension/runtime layer.
-- `crates/otter-kv`: key-value store to be exposed through the target extension/runtime layer.
+- `crates/otter-modules`: active home for otter-specific hosted modules on the target stack (`otter:kv`, future `otter:sql`, and similar surfaces).
 - `crates/otterjs`: CLI (`otter`) and config (`otter.toml`).
 
 ### Legacy Stack (frozen; port away from it)
@@ -66,7 +67,6 @@ Migration policy:
 - `crates/otter-vm-runtime`
 - `crates/otter-vm-core`
 - `crates/otter-vm-gc`
-- `crates/otter-jit`
 - `crates/otter-node-compat`
 
 ## File Naming Conventions
@@ -190,7 +190,7 @@ Justfile shortcuts available: `just fmt`, `just lint`, `just test`, `just build`
 Fast iteration tips:
 - Run target VM tests: `cargo test -p otter-vm`
 - Run target runtime tests: `cargo test -p otter-runtime`
-- Run a single support crate after porting work there: `cargo test -p otter-nodejs`, `cargo test -p otter-kv`, etc.
+- Run a single support crate after porting work there: `cargo test -p otter-nodejs`, `cargo test -p otter-modules`, etc.
 
 ## Architecture
 
@@ -210,7 +210,7 @@ otter-gc
 
 Supporting crates:
 - `otter-macros` - `#[dive]` proc-macro for registering native Rust functions callable from JS
-- `otter-nodejs` / `otter-ffi` / `otter-kv` / `otter-sql` - support crates to be ported onto the target runtime
+- `otter-nodejs` / `otter-ffi` / `otter-modules` - support crates on or moving onto the target runtime
 - `otter-pm` - NPM package manager integration
 
 ### Key Architectural Constraints

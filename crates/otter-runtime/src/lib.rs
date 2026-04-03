@@ -46,7 +46,8 @@ pub use host::{
     HostedNativeModule, HostedNativeModuleKind, HostedNativeModuleLoader,
     HostedNativeModuleRegistry, ImportContext, IsolatedEnvStore, ModuleDependency, ModuleGraph,
     ModuleGraphError, ModuleGraphNode, ModuleLoader, ModuleLoaderConfig, ModuleLoaderError,
-    ModuleType, PermissionDenied, ResolvedModule, RuntimeProfile, SourceType, parse_env_file,
+    ModuleType, PermissionDenied, ResolvedModule, RuntimeProfile, SourceType, current_capabilities,
+    parse_env_file,
 };
 pub use runtime::{OtterRuntime, RunError};
 

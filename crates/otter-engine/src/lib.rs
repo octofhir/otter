@@ -366,11 +366,6 @@ impl EngineBuilder {
             }
         }
 
-        // Register otter:ffi extension (available in Full profile)
-        runtime
-            .register_native_extension(otter_ffi::otter_ffi_extension())
-            .expect("Failed to register FFI extension");
-
         // Pre-compile extensions to speed up every eval()
         runtime
             .compile_extensions()

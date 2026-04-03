@@ -73,6 +73,8 @@ fn main() -> anyhow::Result<()> {
 - Module/runtime host features are being ported onto `otter-runtime`
 - Capability-based permissions remain a design requirement during migration
 - Web/API and extension surfaces are being reintroduced incrementally on the active stack
+- Standards-facing Web APIs now land in `crates/otter-web`, with `TextEncoder`, `TextDecoder`, `URL`, and `URLSearchParams` already active
+- Active otter-specific hosted modules now live in `crates/otter-modules`, including `otter:kv`, `otter:sql`, and `otter:ffi`
 - Core JavaScript builtins (Object/Array/Map/Set/Date/RegExp/JSON/Promise/Proxy/Reflect/Symbol, etc.)
 - Test262 runner is active on the new runtime stack
 
@@ -87,6 +89,9 @@ crates/
 ├── otter-gc           # Active garbage collector
 ├── otter-vm           # Active VM, compiler, intrinsics
 ├── otter-runtime      # Active public runtime API
+├── otter-jit          # Active JIT pipeline for the new VM
+├── otter-modules      # Active otter:* hosted modules (kv/sql/ffi)
+├── otter-web          # Active Web API crate on the new stack
 ├── otter-pm           # Package manager integration (in progress)
 ├── otter-test262      # Active conformance runner
 └── otterjs            # CLI binary

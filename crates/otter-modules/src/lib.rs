@@ -1,6 +1,8 @@
+mod ffi;
 mod kv;
 mod sql;
 
+pub use ffi::{FFIType, FfiError, FfiResult, FfiSignature};
 pub use kv::{KvError, KvResult, KvStore};
 pub use sql::{SqlDatabase, SqlError, SqlResult};
 
@@ -29,6 +31,10 @@ impl HostedExtension for OtterModulesExtension {
             HostedExtensionModule {
                 specifier: "otter:kv".to_string(),
                 loader: Arc::new(kv::KvModule),
+            },
+            HostedExtensionModule {
+                specifier: "otter:ffi".to_string(),
+                loader: Arc::new(ffi::FfiModule),
             },
             HostedExtensionModule {
                 specifier: "otter:sql".to_string(),

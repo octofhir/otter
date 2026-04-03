@@ -51,11 +51,8 @@ echo ""
 rm -rf "$ROOT_DIR/packages/otter-types"
 mkdir -p "$ROOT_DIR/packages/otter-types"
 
-# Copy types
-cp "$ROOT_DIR/crates/otter-pm/src/types/otter/index.d.ts" "$ROOT_DIR/packages/otter-types/"
-cp "$ROOT_DIR/crates/otter-pm/src/types/otter/globals.d.ts" "$ROOT_DIR/packages/otter-types/"
-cp "$ROOT_DIR/crates/otter-pm/src/types/otter/sql.d.ts" "$ROOT_DIR/packages/otter-types/"
-cp "$ROOT_DIR/crates/otter-pm/src/types/otter/serve.d.ts" "$ROOT_DIR/packages/otter-types/"
+# Copy types from the single source-of-truth directory
+cp "$ROOT_DIR"/crates/otter-pm/src/types/otter/*.d.ts "$ROOT_DIR/packages/otter-types/"
 
 # Generate package.json
 cat > "$ROOT_DIR/packages/otter-types/package.json" << EOF

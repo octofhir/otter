@@ -253,11 +253,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(ref code) = cli.print {
-        return run_eval_new_vm(code, true);
+        return run_eval_new_vm(code, true, &cli);
     }
 
     if let Some(ref code) = cli.eval {
-        return run_eval_new_vm(code, false);
+        return run_eval_new_vm(code, false, &cli);
     }
 
     if let Some(ref file) = cli.file {
@@ -312,10 +312,8 @@ async fn run_file(path: &PathBuf, _script_args: &[String], cli: &Cli) -> Result<
     Ok(())
 }
 
-fn run_eval_new_vm(source: &str, print_result: bool) -> Result<()> {
-    let mut rt = otter_runtime::OtterRuntime::builder()
-        .extension(otter_modules::modules_extension())
-        .build();
+fn run_eval_new_vm(source: &str, print_result: bool, cli: &Cli) -> Result<()> {
+    let mut rt = build_runtime_for_cli(cli)?;
     match rt.eval(source) {
         Ok(result) => {
             if print_result {
@@ -330,6 +328,31 @@ fn run_eval_new_vm(source: &str, print_result: bool) -> Result<()> {
 }
 
 fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
+    let capabilities = if cli.allow_all {
+        otter_runtime::Capabilities::all()
+    } else {
+        let mut builder = otter_runtime::CapabilitiesBuilder::new();
+        if cli.allow_read {
+            builder = builder.allow_read_all();
+        }
+        if cli.allow_write {
+            builder = builder.allow_write_all();
+        }
+        if cli.allow_net {
+            builder = builder.allow_net_all();
+        }
+        if cli.allow_env {
+            builder = builder.allow_env_all();
+        }
+        if cli.allow_run {
+            builder = builder.allow_subprocess();
+        }
+        if cli.allow_ffi {
+            builder = builder.allow_ffi();
+        }
+        builder.build()
+    };
+
     let mut loader = otter_runtime::ModuleLoaderConfig::default();
     loader.base_dir = std::env::current_dir()?;
 
@@ -341,8 +364,10 @@ fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
 
     let mut builder = otter_runtime::OtterRuntime::builder()
         .profile(profile)
+        .capabilities(capabilities)
         .module_loader(loader)
-        .extension(otter_modules::modules_extension());
+        .extension(otter_modules::modules_extension())
+        .extension(otter_web::web_extension());
 
     if cli.timeout > 0 {
         builder = builder.timeout(Duration::from_secs(cli.timeout));

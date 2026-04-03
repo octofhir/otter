@@ -1441,6 +1441,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
+name = "libffi"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0feebbe0ccd382a2790f78d380540500d7b78ed7a3498b68fcfbc1593749a94"
+dependencies = [
+ "libc",
+ "libffi-sys",
+]
+
+[[package]]
+name = "libffi-sys"
+version = "3.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90c6c6e17136d4bc439d43a2f3c6ccf0731cccc016d897473a29791d3c2160c3"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1644,6 +1673,8 @@ dependencies = [
 name = "otter-modules"
 version = "0.1.0"
 dependencies = [
+ "libffi",
+ "libloading",
  "otter-runtime",
  "otter-vm",
  "redb",
@@ -1740,6 +1771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-web"
+version = "0.1.0"
+dependencies = [
+ "otter-runtime",
+ "otter-vm",
+ "url",
+]
+
+[[package]]
 name = "otterjs"
 version = "0.1.2"
 dependencies = [
@@ -1750,6 +1790,7 @@ dependencies = [
  "otter-modules",
  "otter-pm",
  "otter-runtime",
+ "otter-web",
  "serde",
  "serde_json",
  "tokio",

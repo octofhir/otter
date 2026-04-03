@@ -262,7 +262,7 @@ impl otter_vm_gc::GcTraceable for Closure {
 
 /// Opaque FFI call metadata for JIT fast path.
 ///
-/// Created by `otter-ffi` when binding FFI symbols. The trampoline function
+/// Created by the hosted `otter:ffi` module when binding FFI symbols. The trampoline function
 /// performs the actual C call (marshaling JS values to C types and back)
 /// without requiring `otter-vm-core` to depend on `libffi`.
 pub struct FfiCallInfo {

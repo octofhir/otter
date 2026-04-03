@@ -1,0 +1,11 @@
+[package]
+name = "otter-web"
+version = "0.1.0"
+edition = "2024"
+description = "Web API surfaces for the new Otter runtime stack"
+license = "MIT"
+
+[dependencies]
+otter-runtime = { path = "../otter-runtime" }
+otter-vm = { path = "../otter-vm" }
+url = "2"

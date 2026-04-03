@@ -173,6 +173,19 @@ impl Capabilities {
             ))
         }
     }
+
+    /// Check FFI permission and return a `Result`.
+    pub fn require_ffi(&self) -> Result<(), PermissionDenied> {
+        if self.can_ffi() {
+            Ok(())
+        } else {
+            Err(PermissionDenied::new(
+                "ffi",
+                "native".to_string(),
+                "Use --allow-ffi to grant FFI access",
+            ))
+        }
+    }
 }
 
 /// Builder for constructing capabilities.

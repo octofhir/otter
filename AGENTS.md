@@ -57,9 +57,9 @@ Migration policy:
 - `crates/otter-jit`: JIT pipeline for the target VM and an active part of the new stack.
 - `crates/otter-macros`: `#[dive]` proc-macro for native function bindings.
 - `crates/otter-nodejs`: Node.js API compatibility layer to be ported onto the target stack.
-- `crates/otter-ffi`: FFI bridge to be ported onto the target stack.
 - `crates/otter-pm`: package management + bundled type definitions (`@types/otter`).
-- `crates/otter-modules`: active home for otter-specific hosted modules on the target stack (`otter:kv`, future `otter:sql`, and similar surfaces).
+- `crates/otter-modules`: active home for otter-specific hosted modules on the target stack (`otter:kv`, `otter:sql`, `otter:ffi`, and similar surfaces).
+- `crates/otter-web`: active home for standards-facing Web API surfaces on the target stack (`TextEncoder`, `TextDecoder`, future `URL`, `fetch`, etc.).
 - `crates/otterjs`: CLI (`otter`) and config (`otter.toml`).
 
 ### Legacy Stack (frozen; port away from it)
@@ -210,7 +210,7 @@ otter-gc
 
 Supporting crates:
 - `otter-macros` - `#[dive]` proc-macro for registering native Rust functions callable from JS
-- `otter-nodejs` / `otter-ffi` / `otter-modules` - support crates on or moving onto the target runtime
+- `otter-nodejs` / `otter-modules` - support crates on or moving onto the target runtime
 - `otter-pm` - NPM package manager integration
 
 ### Key Architectural Constraints
@@ -343,6 +343,8 @@ Practical rules when adding/altering APIs:
 ## TypeScript / Types
 
 - Bundled types live in `crates/otter-pm/src/types/` and get installed into `node_modules/@types` for editor resolution.
+- `crates/otter-pm/src/types/otter/` is the source of truth for Otter `.d.ts` files.
+- `packages/otter-types/` is a publish artifact and should be generated from that source, not edited independently.
 - If you add a new global API or built-in module surface, update the corresponding `.d.ts` file(s).
 - Type checking integration (tsgo) is being ported to the new VM.
 

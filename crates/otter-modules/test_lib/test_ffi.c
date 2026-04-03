@@ -1,6 +1,6 @@
 // Test library for otter:ffi integration tests
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 int add(int a, int b) {
     return a + b;
@@ -31,21 +31,25 @@ int is_positive(int x) {
 }
 
 void do_nothing(void) {
-    // No-op
 }
 
-// Callback test: apply a function to two ints and return the result
 typedef int (*int_binop)(int, int);
+typedef int (*int_transform)(int);
 
 int apply_binop(int a, int b, int_binop fn) {
     return fn(a, b);
 }
 
-// Callback test: transform array elements via callback
-typedef int (*int_transform)(int);
-
 void transform_array(int* arr, int len, int_transform fn) {
     for (int i = 0; i < len; i++) {
         arr[i] = fn(arr[i]);
     }
+}
+
+void* add_ptr(void) {
+    return (void*)add;
+}
+
+void* negate_ptr(void) {
+    return (void*)negate;
 }

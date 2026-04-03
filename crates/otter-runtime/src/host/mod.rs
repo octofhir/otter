@@ -6,6 +6,7 @@ mod module_graph;
 mod module_loader;
 mod module_runtime;
 mod native_modules;
+mod runtime_capabilities;
 mod state;
 
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};
@@ -25,4 +26,6 @@ pub use native_modules::{
     HostedNativeModule, HostedNativeModuleKind, HostedNativeModuleLoader,
     HostedNativeModuleRegistry,
 };
+pub use runtime_capabilities::current_capabilities;
+pub(crate) use runtime_capabilities::install_runtime_capabilities;
 pub(crate) use state::HostState;

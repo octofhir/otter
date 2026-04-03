@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::host::{
     Capabilities, EnvStoreBuilder, HostConfig, HostedExtension, HostedNativeModuleLoader,
-    IsolatedEnvStore, ModuleLoaderConfig, RuntimeProfile,
+    IsolatedEnvStore, ModuleLoaderConfig, RuntimeProfile, install_runtime_capabilities,
 };
 use crate::runtime::OtterRuntime;
 
@@ -164,6 +164,7 @@ impl RuntimeBuilder {
 
         // Install performance.now() on the global object.
         install_performance_global(&mut state);
+        install_runtime_capabilities(&mut state, host.capabilities().clone());
 
         host.extensions()
             .bootstrap(&mut state, host.profile())

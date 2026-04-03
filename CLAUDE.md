@@ -76,15 +76,18 @@ otter-gc
 3. **GC Safety**: Use `GcRef<T>` for references. Values must be properly rooted across GC boundaries.
 
 4. **Native Functions**: Port native bindings toward the target runtime/VM ABI. Do not add new JS-visible host bindings to legacy crates.
+   `otter:kv`, `otter:sql`, and `otter:ffi` now live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path on the new stack.
+5. **Types Source Of Truth**: keep Otter `.d.ts` files under `crates/otter-pm/src/types/otter/`; treat `packages/otter-types/` as generated publish output.
+6. **Web API Placement**: standards-facing Web API work belongs in `crates/otter-web`, not in `crates/otter-modules`.
 
-5. **Module System**:
+7. **Module System**:
    - Must move onto the target runtime integration layer
    - Support for `file://`, `node:`, and `https://` URLs remains required during migration
    - Import maps and graph semantics should be preserved while removing legacy dependencies
 
-6. **Async Operations**: Require Tokio runtime handle. New async/runtime behavior must move toward `otter-runtime` + `otter-vm`, not `otter-vm-runtime`.
+8. **Async Operations**: Require Tokio runtime handle. New async/runtime behavior must move toward `otter-runtime` + `otter-vm`, not `otter-vm-runtime`.
 
-7. **Parsing**: Always use ASTs via `oxc` parser. **Never use regex to parse JS/TS code.**
+9. **Parsing**: Always use ASTs via `oxc` parser. **Never use regex to parse JS/TS code.**
 
 ### File Naming for Builtin Modules
 

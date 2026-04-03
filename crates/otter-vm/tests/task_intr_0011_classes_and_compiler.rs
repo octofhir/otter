@@ -114,6 +114,56 @@ fn class_expression() {
 }
 
 #[test]
+fn constructor_call_argument_keeps_earlier_temp_values() {
+    let result = execute_test262_basic(
+        concat!(
+            "class Box {\n",
+            "  constructor(value) { this.value = value; }\n",
+            "}\n",
+            "function second(a, b, c) { return b; }\n",
+            "var box = second('left', new Box(41), 'right');\n",
+            "assert.sameValue(box.value, 41, 'inline new-expression argument must survive later args');\n",
+        ),
+        "call-arg-new-expression-stability.js",
+    );
+    assert_eq!(result, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn array_literal_element_keeps_nested_constructor_result() {
+    let result = execute_test262_basic(
+        concat!(
+            "class Box {\n",
+            "  constructor(value) { this.value = value; }\n",
+            "}\n",
+            "var arr = ['left', new Box(41), 'right'];\n",
+            "assert.sameValue(arr[1].value, 41, 'array element new-expression must survive later elements');\n",
+        ),
+        "array-element-new-expression-stability.js",
+    );
+    assert_eq!(result, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn object_literal_property_values_keep_earlier_call_results() {
+    let result = execute_test262_basic(
+        concat!(
+            "class Box {\n",
+            "  constructor(value) { this.value = value; }\n",
+            "  get() { return this.value; }\n",
+            "}\n",
+            "var left = new Box(1);\n",
+            "var right = new Box(2);\n",
+            "var obj = { first: left.get(), second: right.get() };\n",
+            "assert.sameValue(obj.first, 1, 'first call result survives later object properties');\n",
+            "assert.sameValue(obj.second, 2, 'second call result is preserved');\n",
+        ),
+        "object-literal-call-result-stability.js",
+    );
+    assert_eq!(result, RegisterValue::from_i32(0));
+}
+
+#[test]
 fn member_update_expressions() {
     let result = execute_test262_basic(
         concat!(

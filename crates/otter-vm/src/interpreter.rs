@@ -518,6 +518,7 @@ pub struct RuntimeState {
     native_functions: NativeFunctionRegistry,
     native_payloads: NativePayloadRegistry,
     microtasks: crate::microtask::MicrotaskQueue,
+    host_callbacks: crate::host_callbacks::HostCallbackQueue,
     timers: crate::event_loop::TimerRegistry,
     console_backend: Box<dyn crate::console::ConsoleBackend>,
     current_module: Option<Module>,
@@ -558,6 +559,7 @@ impl RuntimeState {
             native_functions,
             native_payloads: NativePayloadRegistry::new(),
             microtasks: crate::microtask::MicrotaskQueue::new(),
+            host_callbacks: crate::host_callbacks::HostCallbackQueue::new(),
             timers: crate::event_loop::TimerRegistry::new(),
             console_backend: Box::new(crate::console::StdioConsoleBackend),
             current_module: None,
@@ -1049,6 +1051,42 @@ impl RuntimeState {
     #[must_use]
     pub fn timers(&self) -> &crate::event_loop::TimerRegistry {
         &self.timers
+    }
+
+    /// Returns whether any cross-thread host completions are still pending.
+    #[must_use]
+    pub fn has_pending_host_callbacks(&self) -> bool {
+        self.host_callbacks.has_pending()
+    }
+
+    /// Returns a sender that background host tasks can use to resume work on the VM thread.
+    #[must_use]
+    pub fn host_callback_sender(&self) -> crate::host_callbacks::HostCallbackSender {
+        self.host_callbacks.sender()
+    }
+
+    /// Drains ready host completions without blocking.
+    pub fn drain_host_callbacks(&mut self) {
+        let callbacks = self.host_callbacks.drain_ready();
+        for callback in callbacks {
+            self.host_callbacks.complete_one();
+            callback(self);
+        }
+    }
+
+    /// Blocks until at least one pending host completion is ready, or timeout elapses.
+    ///
+    /// Returns `true` when at least one callback was invoked.
+    pub fn wait_for_host_callbacks(&mut self, timeout: Option<std::time::Duration>) -> bool {
+        let callbacks = self.host_callbacks.wait_and_drain(timeout);
+        if callbacks.is_empty() {
+            return false;
+        }
+        for callback in callbacks {
+            self.host_callbacks.complete_one();
+            callback(self);
+        }
+        true
     }
 
     /// Returns the mutable timer registry.
@@ -2585,6 +2623,93 @@ impl RuntimeState {
             Err(VmNativeCallError::Thrown(value)) => Err(VmNativeCallError::Thrown(value)),
             Err(VmNativeCallError::Internal(message)) => Err(VmNativeCallError::Internal(message)),
         }
+    }
+
+    /// Allocates a reusable VM promise backed by the runtime's intrinsic Promise prototype.
+    pub fn alloc_vm_promise(&mut self) -> crate::promise::VmPromise {
+        let promise_prototype = self.intrinsics().promise_prototype();
+        let promise = self
+            .objects_mut()
+            .alloc_promise_with_proto(promise_prototype);
+        let resolve = self
+            .objects_mut()
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+        let reject = self
+            .objects_mut()
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
+        if let Some(js_promise) = self.objects_mut().get_promise_mut(promise) {
+            js_promise.resolve_function = Some(resolve);
+            js_promise.reject_function = Some(reject);
+        }
+        crate::promise::VmPromise::new(crate::promise::PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        })
+    }
+
+    /// Settles one reusable VM promise through its resolve capability function.
+    pub fn fulfill_vm_promise(
+        &mut self,
+        promise: crate::promise::VmPromise,
+        value: RegisterValue,
+    ) -> Result<(), VmNativeCallError> {
+        self.call_host_function(
+            Some(promise.resolve_handle()),
+            RegisterValue::undefined(),
+            &[value],
+        )?;
+        Ok(())
+    }
+
+    /// Settles one reusable VM promise through its reject capability function.
+    pub fn reject_vm_promise(
+        &mut self,
+        promise: crate::promise::VmPromise,
+        reason: RegisterValue,
+    ) -> Result<(), VmNativeCallError> {
+        self.call_host_function(
+            Some(promise.reject_handle()),
+            RegisterValue::undefined(),
+            &[reason],
+        )?;
+        Ok(())
+    }
+
+    /// Allocates and immediately fulfills one reusable VM promise.
+    pub fn alloc_fulfilled_vm_promise(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<crate::promise::VmPromise, VmNativeCallError> {
+        let promise = self.alloc_vm_promise();
+        self.fulfill_vm_promise(promise, value)?;
+        Ok(promise)
+    }
+
+    /// Allocates and immediately rejects one reusable VM promise.
+    pub fn alloc_rejected_vm_promise(
+        &mut self,
+        reason: RegisterValue,
+    ) -> Result<crate::promise::VmPromise, VmNativeCallError> {
+        let promise = self.alloc_vm_promise();
+        self.reject_vm_promise(promise, reason)?;
+        Ok(promise)
+    }
+
+    /// Allocates a promise already fulfilled with the provided value.
+    pub fn alloc_resolved_promise(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<ObjectHandle, VmNativeCallError> {
+        Ok(self.alloc_fulfilled_vm_promise(value)?.promise_handle())
+    }
+
+    /// Allocates a promise already rejected with the provided reason.
+    pub fn alloc_rejected_promise(
+        &mut self,
+        reason: RegisterValue,
+    ) -> Result<ObjectHandle, VmNativeCallError> {
+        Ok(self.alloc_rejected_vm_promise(reason)?.promise_handle())
     }
 
     pub fn call_callable(

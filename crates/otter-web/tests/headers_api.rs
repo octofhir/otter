@@ -34,6 +34,14 @@ fn string_property(runtime: &mut OtterRuntime, object: RegisterValue, name: &str
         .into_string()
 }
 
+fn string_global(runtime: &mut OtterRuntime, name: &str) -> String {
+    let value = global_property(runtime, name);
+    runtime
+        .state_mut()
+        .js_to_string_infallible(value)
+        .into_string()
+}
+
 fn configure_runtime() -> OtterRuntime {
     OtterRuntime::builder()
         .module_loader(ModuleLoaderConfig::default())
@@ -47,25 +55,22 @@ fn headers_support_record_init_and_normalization() {
     runtime
         .run_script(
             "const headers = new Headers({ 'Content-Type': ' application/json ', 'X-Test': '42' }); \
-             var __otter = { \
-               hasContentType: headers.has('content-type'), \
-               contentType: headers.get('CONTENT-TYPE'), \
-               xTest: headers.get('x-test'), \
-             };",
+             var __hasContentType = headers.has('content-type'); \
+             var __contentType = headers.get('CONTENT-TYPE'); \
+             var __xTest = headers.get('x-test');",
             "main.js",
         )
         .expect("headers script should execute");
 
-    let value = global_property(&mut runtime, "__otter");
     assert_eq!(
-        namespace_property(&mut runtime, value, "hasContentType"),
+        global_property(&mut runtime, "__hasContentType"),
         RegisterValue::from_bool(true)
     );
     assert_eq!(
-        string_property(&mut runtime, value, "contentType"),
+        string_global(&mut runtime, "__contentType"),
         "application/json"
     );
-    assert_eq!(string_property(&mut runtime, value, "xTest"), "42");
+    assert_eq!(string_global(&mut runtime, "__xTest"), "42");
 }
 
 #[test]
@@ -77,28 +82,25 @@ fn headers_support_sequence_init_and_mutation_methods() {
              headers.append('set-cookie', 'b=2'); \
              headers.append('x-test', '2'); \
              headers.set('x-test', '3'); \
-             var __otter = { \
-               joined: headers.get('x-test'), \
-               cookieLength: headers.getSetCookie().length, \
-               firstCookie: headers.getSetCookie()[0], \
-               secondCookie: headers.getSetCookie()[1], \
-             }; \
+             var __joined = headers.get('x-test'); \
+             var __cookieLength = headers.getSetCookie().length; \
+             var __firstCookie = headers.getSetCookie()[0]; \
+             var __secondCookie = headers.getSetCookie()[1]; \
              headers.delete('x-test'); \
-             __otter.hasDeleted = headers.has('x-test');",
+             var __hasDeleted = headers.has('x-test');",
             "main.js",
         )
         .expect("headers mutation script should execute");
 
-    let value = global_property(&mut runtime, "__otter");
-    assert_eq!(string_property(&mut runtime, value, "joined"), "3");
+    assert_eq!(string_global(&mut runtime, "__joined"), "3");
     assert_eq!(
-        namespace_property(&mut runtime, value, "cookieLength"),
+        global_property(&mut runtime, "__cookieLength"),
         RegisterValue::from_i32(2)
     );
-    assert_eq!(string_property(&mut runtime, value, "firstCookie"), "a=1");
-    assert_eq!(string_property(&mut runtime, value, "secondCookie"), "b=2");
+    assert_eq!(string_global(&mut runtime, "__firstCookie"), "a=1");
+    assert_eq!(string_global(&mut runtime, "__secondCookie"), "b=2");
     assert_eq!(
-        namespace_property(&mut runtime, value, "hasDeleted"),
+        global_property(&mut runtime, "__hasDeleted"),
         RegisterValue::from_bool(false)
     );
 }

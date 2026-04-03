@@ -330,10 +330,14 @@ impl OtterRuntime {
 
     fn run_event_loop(&mut self, module: &Module) {
         loop {
+            self.state.drain_host_callbacks();
+            self.drain_microtasks(module);
+
             let has_timers = self.state.timers().has_pending();
             let has_microtasks = !self.state.microtasks().is_empty();
+            let has_host_callbacks = self.state.has_pending_host_callbacks();
 
-            if !has_timers && !has_microtasks {
+            if !has_timers && !has_microtasks && !has_host_callbacks {
                 break;
             }
 
@@ -343,6 +347,16 @@ impl OtterRuntime {
                 .collect_fired(std::time::Instant::now());
 
             if fired.is_empty() && !has_microtasks {
+                if has_host_callbacks {
+                    let timeout = self.state.timers().next_deadline().map(|deadline| {
+                        deadline.saturating_duration_since(std::time::Instant::now())
+                    });
+                    if self.state.wait_for_host_callbacks(timeout) {
+                        self.drain_microtasks(module);
+                        continue;
+                    }
+                }
+
                 if let Some(deadline) = self.state.timers().next_deadline() {
                     let now = std::time::Instant::now();
                     if deadline > now {

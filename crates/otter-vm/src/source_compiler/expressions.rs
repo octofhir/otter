@@ -789,7 +789,11 @@ impl<'a> FunctionCompiler<'a> {
                     module,
                 )?,
             };
-            argument_values.push(value);
+            argument_values.push(if value.is_temp {
+                self.stabilize_binding_value(value)?
+            } else {
+                value
+            });
         }
 
         let arg_start = if argument_count == 0 {
@@ -880,7 +884,11 @@ impl<'a> FunctionCompiler<'a> {
                 })?,
                 module,
             )?;
-            argument_values.push(value);
+            argument_values.push(if value.is_temp {
+                self.stabilize_binding_value(value)?
+            } else {
+                value
+            });
         }
 
         let arg_start = if argument_count == 0 {
@@ -959,7 +967,11 @@ impl<'a> FunctionCompiler<'a> {
                     module,
                 )?,
             };
-            argument_values.push(value);
+            argument_values.push(if value.is_temp {
+                self.stabilize_binding_value(value)?
+            } else {
+                value
+            });
         }
 
         let arg_start = if argument_count == 0 {
@@ -1319,19 +1331,9 @@ impl<'a> FunctionCompiler<'a> {
         object: &oxc_ast::ast::ObjectExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        // Computed property keys may contain call expressions (e.g. IIFEs)
-        // whose `stabilize_binding_value` would clobber a temp destination.
-        // Pre-allocate a local in that case so it sits below the temp region.
-        let has_computed = object.properties.iter().any(|p| {
-            matches!(p, ObjectPropertyKind::ObjectProperty(p) if p.computed)
-                || matches!(p, ObjectPropertyKind::SpreadProperty(_))
-        });
-        let (destination, is_local) = if has_computed {
-            (self.allocate_local()?, true)
-        } else {
-            (self.alloc_temp(), false)
-        };
-        self.instructions.push(Instruction::new_object(destination));
+        let destination = ValueLocation::local(self.allocate_local()?);
+        self.instructions
+            .push(Instruction::new_object(destination.register));
 
         for property in &object.properties {
             let ObjectPropertyKind::ObjectProperty(property) = property else {
@@ -1340,7 +1342,7 @@ impl<'a> FunctionCompiler<'a> {
                 };
                 let source = self.compile_expression(&spread.argument, module)?;
                 self.instructions.push(Instruction::copy_data_properties(
-                    destination,
+                    destination.register,
                     source.register,
                 ));
                 self.release(source);
@@ -1376,14 +1378,14 @@ impl<'a> FunctionCompiler<'a> {
                     match property.kind {
                         PropertyKind::Get => {
                             self.instructions.push(Instruction::define_computed_getter(
-                                destination,
+                                destination.register,
                                 key.register,
                                 accessor.register,
                             ))
                         }
                         PropertyKind::Set => {
                             self.instructions.push(Instruction::define_computed_setter(
-                                destination,
+                                destination.register,
                                 key.register,
                                 accessor.register,
                             ))
@@ -1399,14 +1401,14 @@ impl<'a> FunctionCompiler<'a> {
                     match property.kind {
                         PropertyKind::Get => {
                             self.instructions.push(Instruction::define_named_getter(
-                                destination,
+                                destination.register,
                                 accessor.register,
                                 property_id,
                             ))
                         }
                         PropertyKind::Set => {
                             self.instructions.push(Instruction::define_named_setter(
-                                destination,
+                                destination.register,
                                 accessor.register,
                                 property_id,
                             ))
@@ -1419,9 +1421,14 @@ impl<'a> FunctionCompiler<'a> {
             }
             if property.computed {
                 let key = self.compile_expression(property.key.to_expression(), module)?;
+                let key = if key.is_temp {
+                    self.stabilize_binding_value(key)?
+                } else {
+                    key
+                };
                 let value = self.compile_expression(&property.value, module)?;
                 self.instructions.push(Instruction::set_index(
-                    destination,
+                    destination.register,
                     key.register,
                     value.register,
                 ));
@@ -1438,7 +1445,7 @@ impl<'a> FunctionCompiler<'a> {
                     module,
                 )?;
                 self.instructions.push(Instruction::set_property(
-                    destination,
+                    destination.register,
                     value.register,
                     property_id,
                 ));
@@ -1446,11 +1453,7 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        if is_local {
-            Ok(ValueLocation::local(destination))
-        } else {
-            Ok(ValueLocation::temp(destination))
-        }
+        Ok(destination)
     }
 
     fn compile_array_expression(
@@ -1458,11 +1461,12 @@ impl<'a> FunctionCompiler<'a> {
         array: &oxc_ast::ast::ArrayExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let destination = self.alloc_temp();
+        let destination = ValueLocation::temp(self.alloc_temp());
         let len =
             u16::try_from(array.elements.len()).map_err(|_| SourceLoweringError::TooManyLocals)?;
         self.instructions
-            .push(Instruction::new_array(destination, len));
+            .push(Instruction::new_array(destination.register, len));
+        let destination = self.stabilize_binding_value(destination)?;
 
         for (index, element) in array.elements.iter().enumerate() {
             let expr = match element {
@@ -1476,10 +1480,15 @@ impl<'a> FunctionCompiler<'a> {
             };
 
             let value = self.compile_expression(expr, module)?;
+            let value = if value.is_temp {
+                self.stabilize_binding_value(value)?
+            } else {
+                value
+            };
             let index_value = self
                 .load_i32(i32::try_from(index).map_err(|_| SourceLoweringError::TooManyLocals)?)?;
             self.instructions.push(Instruction::set_index(
-                destination,
+                destination.register,
                 index_value.register,
                 value.register,
             ));
@@ -1487,7 +1496,7 @@ impl<'a> FunctionCompiler<'a> {
             self.release(value);
         }
 
-        Ok(ValueLocation::temp(destination))
+        Ok(destination)
     }
 
     fn compile_static_member_expression(

@@ -1,4 +1,6 @@
+mod blob_api;
 mod headers_api;
+mod request_response_api;
 mod url_api;
 
 use otter_runtime::{HostedExtension, RuntimeProfile, RuntimeState};
@@ -24,6 +26,8 @@ impl HostedExtension for OtterWebExtension {
         install_text_decoder(runtime)?;
         url_api::install(runtime)?;
         headers_api::install(runtime)?;
+        blob_api::install(runtime)?;
+        request_response_api::install(runtime)?;
         Ok(())
     }
 }
@@ -287,7 +291,7 @@ fn validate_utf8_label(
     }
 }
 
-fn bytes_from_buffer_source(
+pub(crate) fn bytes_from_buffer_source(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<Vec<u8>, VmNativeCallError> {

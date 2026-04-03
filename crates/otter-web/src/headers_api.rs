@@ -56,15 +56,8 @@ fn headers_constructor(
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let prototype = class_prototype(runtime, "Headers")?;
     let entries = parse_headers_init(runtime, init)?;
-    let instance = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        HeadersPayload {
-            entries: Arc::new(Mutex::new(entries)),
-        },
-    );
-    Ok(RegisterValue::from_object_handle(instance.0))
+    alloc_headers_instance(runtime, entries)
 }
 
 fn headers_append(
@@ -154,7 +147,7 @@ fn headers_set(
     Ok(RegisterValue::undefined())
 }
 
-fn parse_headers_init(
+pub(crate) fn parse_headers_init(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<Vec<(String, String)>, VmNativeCallError> {
@@ -268,7 +261,7 @@ fn require_headers_entries(
     Ok(payload.entries.clone())
 }
 
-fn header_entries(
+pub(crate) fn header_entries(
     runtime: &mut RuntimeState,
     value: &RegisterValue,
 ) -> Result<Vec<(String, String)>, VmNativeCallError> {
@@ -277,6 +270,20 @@ fn header_entries(
         .lock()
         .map_err(|_| VmNativeCallError::Internal("Headers state mutex poisoned".into()))?;
     Ok(entries.clone())
+}
+
+pub(crate) fn alloc_headers_instance(
+    runtime: &mut RuntimeState,
+    entries: Vec<(String, String)>,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let prototype = class_prototype(runtime, "Headers")?;
+    let instance = runtime.alloc_native_object_with_prototype(
+        Some(prototype),
+        HeadersPayload {
+            entries: Arc::new(Mutex::new(entries)),
+        },
+    );
+    Ok(RegisterValue::from_object_handle(instance.0))
 }
 
 fn with_headers_mut(

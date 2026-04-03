@@ -91,7 +91,7 @@ pub enum PromiseFinallyKind {
 ///
 /// `resolve` and `reject` are ObjectHandles to native resolve/reject functions
 /// that, when called, settle the `promise`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromiseCapability {
     /// The promise object.
     pub promise: ObjectHandle,
@@ -99,6 +99,50 @@ pub struct PromiseCapability {
     pub resolve: ObjectHandle,
     /// The reject function (native, settles `promise` as rejected).
     pub reject: ObjectHandle,
+}
+
+/// Host-facing wrapper for one VM-managed JS promise and its capability functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmPromise {
+    capability: PromiseCapability,
+}
+
+impl VmPromise {
+    /// Wraps one promise capability as a reusable VM promise handle.
+    #[must_use]
+    pub const fn new(capability: PromiseCapability) -> Self {
+        Self { capability }
+    }
+
+    /// Returns the underlying JS promise object handle.
+    #[must_use]
+    pub const fn promise_handle(self) -> ObjectHandle {
+        self.capability.promise
+    }
+
+    /// Returns the JS promise as a register value.
+    #[must_use]
+    pub const fn promise_value(self) -> RegisterValue {
+        RegisterValue::from_object_handle(self.capability.promise.0)
+    }
+
+    /// Returns the capability resolve function handle.
+    #[must_use]
+    pub const fn resolve_handle(self) -> ObjectHandle {
+        self.capability.resolve
+    }
+
+    /// Returns the capability reject function handle.
+    #[must_use]
+    pub const fn reject_handle(self) -> ObjectHandle {
+        self.capability.reject
+    }
+
+    /// Returns the full underlying capability triple.
+    #[must_use]
+    pub const fn capability(self) -> PromiseCapability {
+        self.capability
+    }
 }
 
 /// The Promise heap object stored in the GC heap.
@@ -327,6 +371,18 @@ mod tests {
             resolve: ObjectHandle(101),
             reject: ObjectHandle(102),
         }
+    }
+
+    #[test]
+    fn vm_promise_exposes_capability_handles() {
+        let promise = VmPromise::new(dummy_capability());
+        assert_eq!(promise.promise_handle(), ObjectHandle(100));
+        assert_eq!(promise.resolve_handle(), ObjectHandle(101));
+        assert_eq!(promise.reject_handle(), ObjectHandle(102));
+        assert_eq!(
+            promise.promise_value(),
+            RegisterValue::from_object_handle(100)
+        );
     }
 
     #[test]

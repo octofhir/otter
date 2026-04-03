@@ -45,6 +45,8 @@ pub mod float;
 pub mod frame;
 /// Runtime host-function registry for native callbacks.
 pub mod host;
+/// Cross-thread host completion queue drained on the VM thread.
+pub mod host_callbacks;
 /// Bytecode interpreter entry points.
 pub mod interpreter;
 /// Runtime-owned intrinsic registry and root model.
@@ -95,6 +97,7 @@ pub use descriptors::{
 };
 pub use frame::FrameLayout;
 pub use host::{HostFunctionId, NativeFunctionRegistry};
+pub use host_callbacks::HostCallbackSender;
 pub use interpreter::{Interpreter, RuntimeState};
 pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
 pub use module::{Function, FunctionIndex, Module, ModuleError};
@@ -103,6 +106,7 @@ pub use payload::{
     NativePayloadError, NativePayloadId, NativePayloadRegistry, VmNativePayload, VmTrace,
     VmValueTracer,
 };
+pub use promise::VmPromise;
 pub use value::RegisterValue;
 
 /// Returns the current execution ABI version of the new VM.

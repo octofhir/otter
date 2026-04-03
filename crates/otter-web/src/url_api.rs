@@ -765,6 +765,39 @@ fn encode_pairs(pairs: &[(String, String)]) -> String {
     serializer.finish()
 }
 
+pub(crate) fn serialize_url_search_params_value(
+    runtime: &mut RuntimeState,
+    value: &RegisterValue,
+) -> Result<Option<String>, VmNativeCallError> {
+    let Some(payload) = runtime
+        .native_payload_from_value::<UrlSearchParamsPayload>(value)
+        .ok()
+    else {
+        return Ok(None);
+    };
+
+    match &payload.backing {
+        UrlSearchParamsBacking::Linked(shared) => {
+            let state = shared
+                .lock()
+                .map_err(|_| VmNativeCallError::Internal("URL state mutex poisoned".into()))?;
+            Ok(Some(encode_pairs(
+                &state
+                    .url
+                    .query_pairs()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        UrlSearchParamsBacking::Standalone(shared) => {
+            let pairs = shared.lock().map_err(|_| {
+                VmNativeCallError::Internal("URLSearchParams state mutex poisoned".into())
+            })?;
+            Ok(Some(encode_pairs(&pairs)))
+        }
+    }
+}
+
 fn string_arg(
     runtime: &mut RuntimeState,
     value: Option<&RegisterValue>,

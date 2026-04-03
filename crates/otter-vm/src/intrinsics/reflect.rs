@@ -270,6 +270,19 @@ fn reflect_define_property(
         "Reflect.defineProperty target must be an object",
     )?;
     let property = to_property_key(args, 1, runtime)?;
+
+    // §10.5.6 — Proxy [[DefineOwnProperty]] trap
+    if runtime.is_proxy(target) {
+        let desc_value = args
+            .get(2)
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        let success = runtime
+            .proxy_define_own_property(target, property, desc_value)
+            .map_err(interp_to_native)?;
+        return Ok(RegisterValue::from_bool(success));
+    }
+
     let attrs = args
         .get(2)
         .copied()
@@ -303,13 +316,20 @@ fn reflect_delete_property(
         "Reflect.deleteProperty target must be an object",
     )?;
     let property = to_property_key(args, 1, runtime)?;
-    let property_names = runtime.property_names().clone();
-    let deleted = runtime
-        .objects_mut()
-        .delete_property_with_registry(target, property, &property_names)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Reflect.deleteProperty failed: {e:?}").into())
-        })?;
+    // §10.5.10 — Proxy [[Delete]] trap
+    let deleted = if runtime.is_proxy(target) {
+        runtime
+            .proxy_delete_property(target, property)
+            .map_err(interp_to_native)?
+    } else {
+        let property_names = runtime.property_names().clone();
+        runtime
+            .objects_mut()
+            .delete_property_with_registry(target, property, &property_names)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Reflect.deleteProperty failed: {e:?}").into())
+            })?
+    };
     Ok(RegisterValue::from_bool(deleted))
 }
 
@@ -327,6 +347,12 @@ fn reflect_get(
         .get(2)
         .copied()
         .unwrap_or_else(|| RegisterValue::from_object_handle(target.0));
+    // §10.5.8 — Proxy [[Get]] trap
+    if runtime.is_proxy(target) {
+        return runtime
+            .proxy_get(target, property, receiver)
+            .map_err(interp_to_native);
+    }
     runtime.ordinary_get(target, property, receiver)
 }
 
@@ -346,14 +372,22 @@ fn reflect_get_own_property_descriptor(
     )?;
     let property = to_property_key(args, 1, runtime)?;
 
-    let Some(descriptor) = runtime
-        .own_property_descriptor(target, property)
-        .map_err(|e| {
-            VmNativeCallError::Internal(
-                format!("Reflect.getOwnPropertyDescriptor failed: {e:?}").into(),
-            )
-        })?
-    else {
+    // §10.5.5 — Proxy [[GetOwnProperty]] trap
+    let descriptor = if runtime.is_proxy(target) {
+        runtime
+            .proxy_get_own_property_descriptor(target, property)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .own_property_descriptor(target, property)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("Reflect.getOwnPropertyDescriptor failed: {e:?}").into(),
+                )
+            })?
+    };
+
+    let Some(descriptor) = descriptor else {
         return Ok(RegisterValue::undefined());
     };
 
@@ -374,9 +408,16 @@ fn reflect_get_prototype_of(
         runtime,
         "Reflect.getPrototypeOf target must be an object",
     )?;
-    let proto = runtime.objects().get_prototype(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Reflect.getPrototypeOf failed: {e:?}").into())
-    })?;
+    // §10.5.1 — Proxy [[GetPrototypeOf]] trap
+    let proto = if runtime.is_proxy(target) {
+        runtime
+            .proxy_get_prototype_of(target)
+            .map_err(interp_to_native)?
+    } else {
+        runtime.objects().get_prototype(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Reflect.getPrototypeOf failed: {e:?}").into())
+        })?
+    };
     Ok(proto
         .map(|h| RegisterValue::from_object_handle(h.0))
         .unwrap_or_else(RegisterValue::null))
@@ -392,9 +433,16 @@ fn reflect_has(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let target = require_target_object(args, 0, runtime, "Reflect.has target must be an object")?;
     let property = to_property_key(args, 1, runtime)?;
-    let found = runtime
-        .has_property(target, property)
-        .map_err(|e| VmNativeCallError::Internal(format!("Reflect.has failed: {e:?}").into()))?;
+    // §10.5.7 — Proxy [[HasProperty]] trap
+    let found = if runtime.is_proxy(target) {
+        runtime
+            .proxy_has(target, property)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .has_property(target, property)
+            .map_err(|e| VmNativeCallError::Internal(format!("Reflect.has failed: {e:?}").into()))?
+    };
     Ok(RegisterValue::from_bool(found))
 }
 
@@ -412,9 +460,16 @@ fn reflect_is_extensible(
         runtime,
         "Reflect.isExtensible target must be an object",
     )?;
-    let extensible = runtime.objects().is_extensible(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Reflect.isExtensible failed: {e:?}").into())
-    })?;
+    // §10.5.3 — Proxy [[IsExtensible]] trap
+    let extensible = if runtime.is_proxy(target) {
+        runtime
+            .proxy_is_extensible(target)
+            .map_err(interp_to_native)?
+    } else {
+        runtime.objects().is_extensible(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Reflect.isExtensible failed: {e:?}").into())
+        })?
+    };
     Ok(RegisterValue::from_bool(extensible))
 }
 
@@ -428,9 +483,14 @@ fn reflect_own_keys(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let target =
         require_target_object(args, 0, runtime, "Reflect.ownKeys target must be an object")?;
-    let keys = runtime.own_property_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Reflect.ownKeys failed: {e:?}").into())
-    })?;
+    // §10.5.11 — Proxy [[OwnPropertyKeys]] trap
+    let keys = if runtime.is_proxy(target) {
+        runtime.proxy_own_keys(target).map_err(interp_to_native)?
+    } else {
+        runtime.own_property_keys(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Reflect.ownKeys failed: {e:?}").into())
+        })?
+    };
 
     // Collect key names first to avoid borrow conflict.
     let key_names: Vec<String> = keys
@@ -470,12 +530,21 @@ fn reflect_prevent_extensions(
         runtime,
         "Reflect.preventExtensions target must be an object",
     )?;
-    let success = runtime
-        .objects_mut()
-        .prevent_extensions(target)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Reflect.preventExtensions failed: {e:?}").into())
-        })?;
+    // §10.5.4 — Proxy [[PreventExtensions]] trap
+    let success = if runtime.is_proxy(target) {
+        runtime
+            .proxy_prevent_extensions(target)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .objects_mut()
+            .prevent_extensions(target)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("Reflect.preventExtensions failed: {e:?}").into(),
+                )
+            })?
+    };
     Ok(RegisterValue::from_bool(success))
 }
 
@@ -497,6 +566,13 @@ fn reflect_set(
         .get(3)
         .copied()
         .unwrap_or_else(|| RegisterValue::from_object_handle(target.0));
+    // §10.5.9 — Proxy [[Set]] trap
+    if runtime.is_proxy(target) {
+        let success = runtime
+            .proxy_set(target, property, value, receiver)
+            .map_err(interp_to_native)?;
+        return Ok(RegisterValue::from_bool(success));
+    }
     let success = runtime.ordinary_set(target, property, receiver, value)?;
     Ok(RegisterValue::from_bool(success))
 }
@@ -528,11 +604,27 @@ fn reflect_set_prototype_of(
             "Reflect.setPrototypeOf proto must be an object or null",
         )?)
     };
-    runtime
-        .objects_mut()
-        .set_prototype(target, proto)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Reflect.setPrototypeOf failed: {e:?}").into())
-        })
-        .map(RegisterValue::from_bool)
+    // §10.5.2 — Proxy [[SetPrototypeOf]] trap
+    let success = if runtime.is_proxy(target) {
+        runtime
+            .proxy_set_prototype_of(target, proto)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .objects_mut()
+            .set_prototype(target, proto)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Reflect.setPrototypeOf failed: {e:?}").into())
+            })?
+    };
+    Ok(RegisterValue::from_bool(success))
+}
+
+/// Converts an `InterpreterError` to a `VmNativeCallError`.
+fn interp_to_native(e: crate::interpreter::InterpreterError) -> VmNativeCallError {
+    match e {
+        crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+        crate::interpreter::InterpreterError::TypeError(msg) => VmNativeCallError::Internal(msg),
+        other => VmNativeCallError::Internal(format!("{other}").into()),
+    }
 }

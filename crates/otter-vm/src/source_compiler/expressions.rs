@@ -493,21 +493,19 @@ impl<'a> FunctionCompiler<'a> {
             UnaryOperator::UnaryNegation => {
                 let zero = self.load_i32(0)?;
                 let argument = self.compile_expression(&unary.argument, module)?;
-                let result = if argument.is_temp {
-                    argument
-                } else {
-                    ValueLocation::temp(self.alloc_temp())
-                };
+                // Use `zero` as the result register since it was allocated first —
+                // the stack-based temp allocator requires LIFO release order.
+                // Putting the result in `zero` (lower on the stack) and releasing
+                // `argument` (higher) preserves the invariant.
                 self.instructions.push(Instruction::sub(
-                    result.register,
+                    zero.register,
                     zero.register,
                     argument.register,
                 ));
-                self.release(zero);
-                if result.register != argument.register {
+                if argument.is_temp {
                     self.release(argument);
                 }
-                Ok(result)
+                Ok(zero)
             }
             UnaryOperator::UnaryPlus => {
                 let argument = self.compile_expression(&unary.argument, module)?;

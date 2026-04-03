@@ -669,7 +669,12 @@ fn object_to_string_tag(
         HeapValueKind::WeakMap => Ok("WeakMap"),
         HeapValueKind::WeakSet => Ok("WeakSet"),
         HeapValueKind::Generator => Ok("Generator"),
+        HeapValueKind::ArrayBuffer => Ok("ArrayBuffer"),
+        HeapValueKind::SharedArrayBuffer => Ok("SharedArrayBuffer"),
         HeapValueKind::RegExp => Ok("RegExp"),
+        HeapValueKind::Proxy => Ok("Object"),
+        HeapValueKind::TypedArray => Ok("TypedArray"),
+        HeapValueKind::DataView => Ok("DataView"),
     }
 }
 
@@ -693,12 +698,20 @@ fn object_get_own_property_descriptor(
         .unwrap_or_else(RegisterValue::undefined);
     let property = runtime.property_name_from_value(key)?;
 
-    let Some(descriptor) = runtime
-        .own_property_descriptor(target, property)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("getOwnPropertyDescriptor: {e:?}").into())
-        })?
-    else {
+    // §10.5.5 — Proxy [[GetOwnProperty]] trap
+    let descriptor = if runtime.is_proxy(target) {
+        runtime
+            .proxy_get_own_property_descriptor(target, property)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .own_property_descriptor(target, property)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("getOwnPropertyDescriptor: {e:?}").into())
+            })?
+    };
+
+    let Some(descriptor) = descriptor else {
         return Ok(RegisterValue::undefined());
     };
 
@@ -720,18 +733,29 @@ fn object_get_own_property_descriptors(
         runtime,
     )?;
 
-    let keys = runtime.own_property_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.getOwnPropertyDescriptors: {e:?}").into())
-    })?;
+    // §10.5.11 / §10.5.5 — Proxy trap dispatch
+    let keys = if runtime.is_proxy(target) {
+        runtime.proxy_own_keys(target).map_err(interp_to_native)?
+    } else {
+        runtime.own_property_keys(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.getOwnPropertyDescriptors: {e:?}").into())
+        })?
+    };
     let result = runtime.alloc_object();
 
     for key in keys {
-        let Some(descriptor) = runtime.own_property_descriptor(target, key).map_err(|e| {
-            VmNativeCallError::Internal(
-                format!("Object.getOwnPropertyDescriptors descriptor: {e:?}").into(),
-            )
-        })?
-        else {
+        let descriptor = if runtime.is_proxy(target) {
+            runtime
+                .proxy_get_own_property_descriptor(target, key)
+                .map_err(interp_to_native)?
+        } else {
+            runtime.own_property_descriptor(target, key).map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("Object.getOwnPropertyDescriptors descriptor: {e:?}").into(),
+                )
+            })?
+        };
+        let Some(descriptor) = descriptor else {
             continue;
         };
         let descriptor_object = crate::abstract_ops::from_property_descriptor(descriptor, runtime)?;
@@ -774,6 +798,24 @@ fn object_define_property(
         .copied()
         .and_then(RegisterValue::as_object_handle)
         .map(ObjectHandle);
+
+    // §10.5.6 — Proxy [[DefineOwnProperty]] trap
+    if runtime.is_proxy(target) {
+        let desc_value = args
+            .get(2)
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        let success = runtime
+            .proxy_define_own_property(target, property, desc_value)
+            .map_err(interp_to_native)?;
+        if !success {
+            return Err(throw_type_error(
+                runtime,
+                "Object.defineProperty could not define property",
+            )?);
+        }
+        return Ok(RegisterValue::from_object_handle(target.0));
+    }
 
     let desc = crate::abstract_ops::to_property_descriptor(desc_obj, runtime)?;
     let property_names = runtime.property_names().clone();
@@ -901,9 +943,14 @@ fn object_keys(
         runtime,
     )?;
 
-    let keys = runtime
-        .enumerable_own_property_keys(target)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.keys: {e}").into()))?;
+    // §10.5.11 — Proxy [[OwnPropertyKeys]] trap (filtered to enumerable string keys)
+    let keys = if runtime.is_proxy(target) {
+        proxy_enumerable_own_keys(runtime, target)?
+    } else {
+        runtime
+            .enumerable_own_property_keys(target)
+            .map_err(|e| VmNativeCallError::Internal(format!("Object.keys: {e}").into()))?
+    };
 
     let array = runtime.alloc_array();
     for key_id in &keys {
@@ -937,9 +984,13 @@ fn object_values(
         runtime,
     )?;
 
-    let keys = runtime
-        .enumerable_own_property_keys(target)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.values: {e}").into()))?;
+    let keys = if runtime.is_proxy(target) {
+        proxy_enumerable_own_keys(runtime, target)?
+    } else {
+        runtime
+            .enumerable_own_property_keys(target)
+            .map_err(|e| VmNativeCallError::Internal(format!("Object.values: {e}").into()))?
+    };
 
     let array = runtime.alloc_array();
     for key_id in &keys {
@@ -967,9 +1018,13 @@ fn object_entries(
         runtime,
     )?;
 
-    let keys = runtime
-        .enumerable_own_property_keys(target)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.entries: {e}").into()))?;
+    let keys = if runtime.is_proxy(target) {
+        proxy_enumerable_own_keys(runtime, target)?
+    } else {
+        runtime
+            .enumerable_own_property_keys(target)
+            .map_err(|e| VmNativeCallError::Internal(format!("Object.entries: {e}").into()))?
+    };
 
     let result = runtime.alloc_array();
     for key_id in &keys {
@@ -1057,12 +1112,19 @@ fn object_prevent_extensions(
     let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(target);
     };
-    runtime
-        .objects_mut()
-        .prevent_extensions(handle)
-        .map_err(|e| {
-            VmNativeCallError::Internal(format!("Object.preventExtensions: {e:?}").into())
-        })?;
+    // §10.5.4 — Proxy [[PreventExtensions]] trap
+    if runtime.is_proxy(handle) {
+        runtime
+            .proxy_prevent_extensions(handle)
+            .map_err(interp_to_native)?;
+    } else {
+        runtime
+            .objects_mut()
+            .prevent_extensions(handle)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.preventExtensions: {e:?}").into())
+            })?;
+    }
     Ok(target)
 }
 
@@ -1081,10 +1143,16 @@ fn object_is_extensible(
     let Some(handle) = non_string_object_target(target, runtime) else {
         return Ok(RegisterValue::from_bool(false));
     };
-    let extensible = runtime
-        .objects()
-        .is_extensible(handle)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.isExtensible: {e:?}").into()))?;
+    // §10.5.3 — Proxy [[IsExtensible]] trap
+    let extensible = if runtime.is_proxy(handle) {
+        runtime
+            .proxy_is_extensible(handle)
+            .map_err(interp_to_native)?
+    } else {
+        runtime.objects().is_extensible(handle).map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.isExtensible: {e:?}").into())
+        })?
+    };
     Ok(RegisterValue::from_bool(extensible))
 }
 
@@ -1158,10 +1226,16 @@ fn object_get_prototype_of(
     let target = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Object.getPrototypeOf target kind invalid".into())
     })?;
-    let proto = runtime
-        .objects()
-        .get_prototype(target)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.getPrototypeOf: {e:?}").into()))?;
+    // §10.5.1 — Proxy [[GetPrototypeOf]] trap
+    let proto = if runtime.is_proxy(target) {
+        runtime
+            .proxy_get_prototype_of(target)
+            .map_err(interp_to_native)?
+    } else {
+        runtime.objects().get_prototype(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.getPrototypeOf: {e:?}").into())
+        })?
+    };
     Ok(proto
         .map(|h| RegisterValue::from_object_handle(h.0))
         .unwrap_or_else(RegisterValue::null))
@@ -1198,15 +1272,25 @@ fn object_set_prototype_of(
     let target = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
         VmNativeCallError::Internal("Object.setPrototypeOf target kind invalid".into())
     })?;
-    runtime
-        .objects_mut()
-        .set_prototype(target, proto)
-        .map_err(|e| VmNativeCallError::Internal(format!("Object.setPrototypeOf: {e:?}").into()))?
-        .then_some(())
-        .ok_or_else(|| {
-            throw_type_error(runtime, "Object.setPrototypeOf could not set prototype")
-                .unwrap_or_else(|error| error)
-        })?;
+    // §10.5.2 — Proxy [[SetPrototypeOf]] trap
+    let success = if runtime.is_proxy(target) {
+        runtime
+            .proxy_set_prototype_of(target, proto)
+            .map_err(interp_to_native)?
+    } else {
+        runtime
+            .objects_mut()
+            .set_prototype(target, proto)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.setPrototypeOf: {e:?}").into())
+            })?
+    };
+    if !success {
+        return Err(throw_type_error(
+            runtime,
+            "Object.setPrototypeOf could not set prototype",
+        )?);
+    }
     Ok(RegisterValue::from_object_handle(target.0))
 }
 
@@ -1231,9 +1315,13 @@ fn object_assign(
         }
 
         let source = to_object_for_introspection(*source_arg, runtime)?;
-        let keys = runtime
-            .enumerable_own_property_keys(source)
-            .map_err(|e| VmNativeCallError::Internal(format!("Object.assign keys: {e}").into()))?;
+        let keys = if runtime.is_proxy(source) {
+            proxy_enumerable_own_keys(runtime, source)?
+        } else {
+            runtime.enumerable_own_property_keys(source).map_err(|e| {
+                VmNativeCallError::Internal(format!("Object.assign keys: {e}").into())
+            })?
+        };
 
         for key_id in keys {
             let value = runtime
@@ -1278,9 +1366,14 @@ fn object_get_own_property_names(
         runtime,
     )?;
 
-    let keys = runtime.own_property_keys(target).map_err(|e| {
-        VmNativeCallError::Internal(format!("Object.getOwnPropertyNames: {e:?}").into())
-    })?;
+    // §10.5.11 — Proxy [[OwnPropertyKeys]] trap
+    let keys = if runtime.is_proxy(target) {
+        runtime.proxy_own_keys(target).map_err(interp_to_native)?
+    } else {
+        runtime.own_property_keys(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.getOwnPropertyNames: {e:?}").into())
+        })?
+    };
 
     // All own string-keyed properties (no enumerable filter).
     let key_names: Vec<String> = keys
@@ -1453,4 +1546,37 @@ fn object_to_locale_string(
     })?;
     let handle = runtime.alloc_string(text);
     Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// Returns enumerable own string keys for a proxy target, using proxy traps.
+fn proxy_enumerable_own_keys(
+    runtime: &mut crate::interpreter::RuntimeState,
+    target: ObjectHandle,
+) -> Result<Vec<crate::property::PropertyNameId>, VmNativeCallError> {
+    let all_keys = runtime.proxy_own_keys(target).map_err(interp_to_native)?;
+    let mut result = Vec::with_capacity(all_keys.len());
+    for key in all_keys {
+        if runtime.property_names().is_symbol(key) {
+            continue;
+        }
+        let desc = runtime
+            .proxy_get_own_property_descriptor(target, key)
+            .map_err(interp_to_native)?;
+        if let Some(pv) = desc {
+            if pv.attributes().enumerable() {
+                result.push(key);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Converts an `InterpreterError` to a `VmNativeCallError` for use in intrinsic functions.
+/// Must be called through `interp_to_native_with_rt` when the error might be a TypeError
+/// that needs to be catchable in JS.
+fn interp_to_native(e: crate::interpreter::InterpreterError) -> VmNativeCallError {
+    match e {
+        crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+        other => VmNativeCallError::Internal(format!("{other}").into()),
+    }
 }

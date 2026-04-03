@@ -9,12 +9,14 @@ use otter_vm::RegisterValue;
 use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use otter_vm::call::{CallSite, CallTable, DirectCall};
 use otter_vm::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+use otter_vm::float::FloatTable;
 use otter_vm::frame::FrameFlags;
 use otter_vm::frame::FrameLayout;
 use otter_vm::interpreter::Interpreter;
 use otter_vm::lowering::{BinaryOp, Expr, LocalId, Program, Statement, compile_module};
 use otter_vm::module::{Function, FunctionSideTables, FunctionTables, Module};
 use otter_vm::property::{PropertyNameId, PropertyNameTable};
+use otter_vm::regexp::RegExpTable;
 use otter_vm::string::StringTable;
 
 fn arithmetic_loop_program(limit: i32) -> Program {
@@ -90,8 +92,10 @@ fn property_loop_module() -> Module {
             FunctionSideTables::new(
                 PropertyNameTable::new(vec!["count"]),
                 StringTable::default(),
+                FloatTable::default(),
                 otter_vm::closure::ClosureTable::default(),
                 CallTable::default(),
+                RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
@@ -131,6 +135,7 @@ fn direct_call_module() -> Module {
             FunctionSideTables::new(
                 PropertyNameTable::default(),
                 StringTable::default(),
+                FloatTable::default(),
                 otter_vm::closure::ClosureTable::default(),
                 CallTable::new(vec![
                     None,
@@ -142,6 +147,7 @@ fn direct_call_module() -> Module {
                     ))),
                     None,
                 ]),
+                RegExpTable::default(),
             ),
             FeedbackTableLayout::new(vec![
                 FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),

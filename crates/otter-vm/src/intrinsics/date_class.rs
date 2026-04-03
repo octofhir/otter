@@ -227,7 +227,13 @@ fn week_day(t: f64) -> f64 {
 fn utc_components(ts: f64) -> (f64, f64, f64, f64, f64, f64, f64) {
     if !ts.is_finite() {
         return (
-            f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
         );
     }
     (
@@ -323,7 +329,11 @@ fn parse_date_string(s: &str) -> f64 {
         parse_date_string_internal(s)
     };
 
-    if result.is_nan() { f64::NAN } else { time_clip(result) }
+    if result.is_nan() {
+        f64::NAN
+    } else {
+        time_clip(result)
+    }
 }
 
 fn parse_extended_year(year: i64, rest: &str) -> f64 {
@@ -408,11 +418,7 @@ fn parse_date_string_internal(s: &str) -> f64 {
             return dt.and_utc().timestamp_millis() as f64;
         }
         if let Ok(d) = NaiveDate::parse_from_str(base, "%Y-%m-%d") {
-            return d
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp_millis() as f64;
+            return d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64;
         }
         return f64::NAN;
     }
@@ -428,11 +434,7 @@ fn parse_date_string_internal(s: &str) -> f64 {
     }
     // Date-only → UTC per ES spec.
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return d
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis() as f64;
+        return d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64;
     }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m") {
         return NaiveDate::from_ymd_opt(d.year(), d.month(), 1)
@@ -501,10 +503,7 @@ fn current_time_millis() -> f64 {
 }
 
 /// Read the [[DateValue]] from a Date object.
-fn date_data(
-    value: RegisterValue,
-    runtime: &mut RuntimeState,
-) -> Result<f64, VmNativeCallError> {
+fn date_data(value: RegisterValue, runtime: &mut RuntimeState) -> Result<f64, VmNativeCallError> {
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
         return Err(type_error(runtime, "Method requires a Date receiver")?);
     };
@@ -529,9 +528,10 @@ fn set_date_data(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let new_ts = time_clip(ts);
-    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Date set requires object receiver".into())
-    })?;
+    let handle = this
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("Date set requires object receiver".into()))?;
     let backing = runtime.intern_property_name(DATE_DATA_SLOT);
     runtime
         .objects_mut()
@@ -550,18 +550,19 @@ fn set_date_data(
 }
 
 /// Wrap RuntimeState::js_to_number for use in native callbacks.
-fn to_number(
-    value: RegisterValue,
-    runtime: &mut RuntimeState,
-) -> Result<f64, VmNativeCallError> {
-    runtime.js_to_number(value).map_err(|e| interp_err(e, runtime))
+fn to_number(value: RegisterValue, runtime: &mut RuntimeState) -> Result<f64, VmNativeCallError> {
+    runtime
+        .js_to_number(value)
+        .map_err(|e| interp_err(e, runtime))
 }
 
 fn to_string(
     value: RegisterValue,
     runtime: &mut RuntimeState,
 ) -> Result<Box<str>, VmNativeCallError> {
-    runtime.js_to_string(value).map_err(|e| interp_err(e, runtime))
+    runtime
+        .js_to_string(value)
+        .map_err(|e| interp_err(e, runtime))
 }
 
 fn to_primitive_default(
@@ -590,9 +591,9 @@ fn type_error(
     runtime: &mut RuntimeState,
     message: &str,
 ) -> Result<VmNativeCallError, VmNativeCallError> {
-    let error = runtime.alloc_type_error(message).map_err(|e| {
-        VmNativeCallError::Internal(format!("TypeError alloc failed: {e}").into())
-    })?;
+    let error = runtime
+        .alloc_type_error(message)
+        .map_err(|e| VmNativeCallError::Internal(format!("TypeError alloc failed: {e}").into()))?;
     Ok(VmNativeCallError::Thrown(
         RegisterValue::from_object_handle(error.0),
     ))
@@ -629,7 +630,10 @@ fn req_number_arg(
     index: usize,
     runtime: &mut RuntimeState,
 ) -> Result<f64, VmNativeCallError> {
-    let val = args.get(index).copied().unwrap_or(RegisterValue::undefined());
+    let val = args
+        .get(index)
+        .copied()
+        .unwrap_or(RegisterValue::undefined());
     Ok(to_number(val, runtime)?.trunc())
 }
 
@@ -710,7 +714,11 @@ fn install_symbol_method(
     name: &str,
     symbol: WellKnownSymbol,
     length: u16,
-    callback: fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>,
+    callback: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
     intrinsics: &VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
@@ -753,7 +761,11 @@ fn install_symbol_method(
 
 fn date_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Date")
-        .with_constructor(NativeFunctionDescriptor::constructor("Date", 7, date_constructor))
+        .with_constructor(NativeFunctionDescriptor::constructor(
+            "Date",
+            7,
+            date_constructor,
+        ))
         // ── Static methods ──
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
@@ -995,8 +1007,10 @@ fn date_constructor(
                         let n = to_number(prim, runtime)?;
                         time_clip(n)
                     }
-                } else if prim.as_number().is_some() || prim == RegisterValue::undefined()
-                    || prim == RegisterValue::null() || prim.as_bool().is_some()
+                } else if prim.as_number().is_some()
+                    || prim == RegisterValue::undefined()
+                    || prim == RegisterValue::null()
+                    || prim.as_bool().is_some()
                 {
                     let n = to_number(prim, runtime)?;
                     time_clip(n)
@@ -1096,21 +1110,58 @@ fn date_utc(
     args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let year = to_number(args.first().copied().unwrap_or(RegisterValue::undefined()), runtime)?.trunc();
-    let month = if args.len() > 1 { to_number(args[1], runtime)?.trunc() } else { 0.0 };
-    let date = if args.len() > 2 { to_number(args[2], runtime)?.trunc() } else { 1.0 };
-    let hours = if args.len() > 3 { to_number(args[3], runtime)?.trunc() } else { 0.0 };
-    let minutes = if args.len() > 4 { to_number(args[4], runtime)?.trunc() } else { 0.0 };
-    let seconds = if args.len() > 5 { to_number(args[5], runtime)?.trunc() } else { 0.0 };
-    let ms = if args.len() > 6 { to_number(args[6], runtime)?.trunc() } else { 0.0 };
+    let year = to_number(
+        args.first().copied().unwrap_or(RegisterValue::undefined()),
+        runtime,
+    )?
+    .trunc();
+    let month = if args.len() > 1 {
+        to_number(args[1], runtime)?.trunc()
+    } else {
+        0.0
+    };
+    let date = if args.len() > 2 {
+        to_number(args[2], runtime)?.trunc()
+    } else {
+        1.0
+    };
+    let hours = if args.len() > 3 {
+        to_number(args[3], runtime)?.trunc()
+    } else {
+        0.0
+    };
+    let minutes = if args.len() > 4 {
+        to_number(args[4], runtime)?.trunc()
+    } else {
+        0.0
+    };
+    let seconds = if args.len() > 5 {
+        to_number(args[5], runtime)?.trunc()
+    } else {
+        0.0
+    };
+    let ms = if args.len() > 6 {
+        to_number(args[6], runtime)?.trunc()
+    } else {
+        0.0
+    };
 
-    if year.is_nan() || month.is_nan() || date.is_nan() || hours.is_nan()
-        || minutes.is_nan() || seconds.is_nan() || ms.is_nan()
+    if year.is_nan()
+        || month.is_nan()
+        || date.is_nan()
+        || hours.is_nan()
+        || minutes.is_nan()
+        || seconds.is_nan()
+        || ms.is_nan()
     {
         return Ok(RegisterValue::from_number(f64::NAN));
     }
 
-    let full_year = if (0.0..=99.0).contains(&year) { 1900.0 + year } else { year };
+    let full_year = if (0.0..=99.0).contains(&year) {
+        1900.0 + year
+    } else {
+        year
+    };
     let t = make_time(hours, minutes, seconds, ms);
     let d = make_day(full_year, month, date);
     Ok(RegisterValue::from_number(time_clip(make_date(d, t))))
@@ -1467,7 +1518,15 @@ fn date_set_minutes(
     let (y, m, d, h, _, cur_sec, cur_ms) = local_components(ts);
     set_date_data(
         this,
-        local_to_utc_ms(y, m, d, h, min, sec.unwrap_or(cur_sec), ms.unwrap_or(cur_ms)),
+        local_to_utc_ms(
+            y,
+            m,
+            d,
+            h,
+            min,
+            sec.unwrap_or(cur_sec),
+            ms.unwrap_or(cur_ms),
+        ),
         runtime,
     )
 }
@@ -1509,7 +1568,10 @@ fn date_set_hours(
     set_date_data(
         this,
         local_to_utc_ms(
-            y, m, d, hour,
+            y,
+            m,
+            d,
+            hour,
             min.unwrap_or(cur_min),
             sec.unwrap_or(cur_sec),
             ms.unwrap_or(cur_ms),
@@ -1555,7 +1617,11 @@ fn date_set_date(
         return Ok(RegisterValue::from_number(f64::NAN));
     }
     let (y, m, _, h, min, sec, ms) = local_components(ts);
-    set_date_data(this, local_to_utc_ms(y, m, date_arg, h, min, sec, ms), runtime)
+    set_date_data(
+        this,
+        local_to_utc_ms(y, m, date_arg, h, min, sec, ms),
+        runtime,
+    )
 }
 
 /// §21.4.4.29 setUTCDate
@@ -1628,7 +1694,15 @@ fn date_set_full_year(
     let (_, cur_m, cur_d, h, min, sec, ms) = local_components(t);
     set_date_data(
         this,
-        local_to_utc_ms(y, mon.unwrap_or(cur_m), date_arg.unwrap_or(cur_d), h, min, sec, ms),
+        local_to_utc_ms(
+            y,
+            mon.unwrap_or(cur_m),
+            date_arg.unwrap_or(cur_d),
+            h,
+            min,
+            sec,
+            ms,
+        ),
         runtime,
     )
 }
@@ -1850,7 +1924,10 @@ fn date_prototype_to_primitive(
 ) -> Result<RegisterValue, VmNativeCallError> {
     // 1. If this is not an Object, throw TypeError.
     if this.as_object_handle().is_none() {
-        return Err(type_error(runtime, "Symbol.toPrimitive requires an object receiver")?);
+        return Err(type_error(
+            runtime,
+            "Symbol.toPrimitive requires an object receiver",
+        )?);
     }
 
     // 2. Get hint string.
@@ -1871,18 +1948,24 @@ fn date_prototype_to_primitive(
         let prop = runtime.intern_property_name(name);
         let handle = this.as_object_handle().map(ObjectHandle).unwrap();
         if let Ok(Some(lookup)) = runtime.objects().get_property(handle, prop) {
-            if let PropertyValue::Data { value: func_val, .. } = lookup.value() {
+            if let PropertyValue::Data {
+                value: func_val, ..
+            } = lookup.value()
+            {
                 if let Some(fn_handle) = func_val.as_object_handle().map(ObjectHandle) {
                     if runtime.objects().is_callable(fn_handle) {
-                        let result = runtime
-                            .call_callable(fn_handle, *this, &[])
-                            .map_err(|e| match e {
-                                VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
-                                other => other,
-                            })?;
+                        let result =
+                            runtime
+                                .call_callable(fn_handle, *this, &[])
+                                .map_err(|e| match e {
+                                    VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+                                    other => other,
+                                })?;
                         // If result is not an object, return it.
-                        if result.as_object_handle().is_none() || result.as_number().is_some()
-                            || result.as_bool().is_some() || result == RegisterValue::undefined()
+                        if result.as_object_handle().is_none()
+                            || result.as_number().is_some()
+                            || result.as_bool().is_some()
+                            || result == RegisterValue::undefined()
                             || result == RegisterValue::null()
                         {
                             return Ok(result);
@@ -1899,7 +1982,10 @@ fn date_prototype_to_primitive(
         }
     }
 
-    Err(type_error(runtime, "Cannot convert object to primitive value")?)
+    Err(type_error(
+        runtime,
+        "Cannot convert object to primitive value",
+    )?)
 }
 
 // ── Legacy methods (Annex B) ─────────────────────────────────────────────────
@@ -1930,7 +2016,15 @@ fn date_set_year(
         return set_date_data(this, f64::NAN, runtime);
     }
     let t = if ts.is_nan() { 0.0 } else { ts };
-    let full_year = if (0.0..=99.0).contains(&y) { 1900.0 + y } else { y };
+    let full_year = if (0.0..=99.0).contains(&y) {
+        1900.0 + y
+    } else {
+        y
+    };
     let (_, cur_m, cur_d, h, min, sec, ms) = local_components(t);
-    set_date_data(this, local_to_utc_ms(full_year, cur_m, cur_d, h, min, sec, ms), runtime)
+    set_date_data(
+        this,
+        local_to_utc_ms(full_year, cur_m, cur_d, h, min, sec, ms),
+        runtime,
+    )
 }

@@ -141,6 +141,10 @@ pub enum HeapValueKind {
     WeakSet,
     /// ES2024 §27.5 Generator object.
     Generator,
+    /// ES2024 §25.1 ArrayBuffer object.
+    ArrayBuffer,
+    /// ES2024 §25.2 SharedArrayBuffer object.
+    SharedArrayBuffer,
     /// ES2024 §22.2 RegExp object.
     RegExp,
     /// ES2024 §27.2.1.5 — Promise capability resolve/reject function.
@@ -151,6 +155,12 @@ pub enum HeapValueKind {
     PromiseFinallyFunction,
     /// Value thunk for finally (returns or throws a captured value).
     PromiseValueThunk,
+    /// ES2024 §28.2 Proxy exotic object.
+    Proxy,
+    /// ES2024 §23.2 TypedArray object (Int8Array, Uint8Array, etc.).
+    TypedArray,
+    /// ES2024 §25.3 DataView object.
+    DataView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -243,6 +253,86 @@ pub enum SetIteratorKind {
     Values,
     /// `Set.prototype.entries()` — yields `[value, value]` pairs.
     Entries,
+}
+
+/// ES2024 §23.2 — TypedArray element type discriminator.
+///
+/// Each variant corresponds to a concrete TypedArray constructor.
+/// Spec: <https://tc39.es/ecma262/#table-the-typedarray-constructors>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypedArrayKind {
+    /// Int8Array — 1 byte, signed.
+    Int8,
+    /// Uint8Array — 1 byte, unsigned.
+    Uint8,
+    /// Uint8ClampedArray — 1 byte, unsigned, clamped conversion.
+    Uint8Clamped,
+    /// Int16Array — 2 bytes, signed.
+    Int16,
+    /// Uint16Array — 2 bytes, unsigned.
+    Uint16,
+    /// Int32Array — 4 bytes, signed.
+    Int32,
+    /// Uint32Array — 4 bytes, unsigned.
+    Uint32,
+    /// Float32Array — 4 bytes, IEEE 754 single.
+    Float32,
+    /// Float64Array — 8 bytes, IEEE 754 double.
+    Float64,
+    /// BigInt64Array — 8 bytes, signed bigint.
+    BigInt64,
+    /// BigUint64Array — 8 bytes, unsigned bigint.
+    BigUint64,
+}
+
+impl TypedArrayKind {
+    /// Returns the byte size of a single element.
+    /// §23.2.6 Table 70 — TypedArray Element Sizes.
+    #[must_use]
+    pub const fn element_size(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
+        }
+    }
+
+    /// Returns the ECMAScript constructor name.
+    #[must_use]
+    pub const fn constructor_name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
+        }
+    }
+
+    /// Returns all TypedArray kinds for iteration.
+    #[must_use]
+    pub const fn all() -> &'static [TypedArrayKind] {
+        &[
+            Self::Int8,
+            Self::Uint8,
+            Self::Uint8Clamped,
+            Self::Int16,
+            Self::Uint16,
+            Self::Int32,
+            Self::Uint32,
+            Self::Float32,
+            Self::Float64,
+            Self::BigInt64,
+            Self::BigUint64,
+        ]
+    }
 }
 
 /// ES2024 §27.5.3 — Generator state.
@@ -605,6 +695,30 @@ impl PropertyDescriptor {
         self.configurable
     }
 
+    /// Converts this partial descriptor into a concrete `PropertyValue`,
+    /// filling in spec-default values for any missing fields.
+    /// §6.2.6.1 CompletePropertyDescriptor
+    #[must_use]
+    pub fn to_property_value(self) -> PropertyValue {
+        let enumerable = self.enumerable.unwrap_or(false);
+        let configurable = self.configurable.unwrap_or(false);
+        match self.kind {
+            PropertyDescriptorKind::Generic => PropertyValue::data_with_attrs(
+                RegisterValue::undefined(),
+                PropertyAttributes::from_flags(false, enumerable, configurable),
+            ),
+            PropertyDescriptorKind::Data { value, writable } => PropertyValue::data_with_attrs(
+                value.unwrap_or_else(RegisterValue::undefined),
+                PropertyAttributes::from_flags(writable.unwrap_or(false), enumerable, configurable),
+            ),
+            PropertyDescriptorKind::Accessor { getter, setter } => PropertyValue::Accessor {
+                getter: getter.unwrap_or(None),
+                setter: setter.unwrap_or(None),
+                attributes: PropertyAttributes::from_flags(false, enumerable, configurable),
+            },
+        }
+    }
+
     #[must_use]
     pub const fn from_property_value(value: PropertyValue) -> Self {
         let attributes = value.attributes();
@@ -805,6 +919,34 @@ enum HeapValue {
         value: crate::value::RegisterValue,
         kind: crate::promise::PromiseFinallyKind,
     },
+    /// ES2024 §25.1 ArrayBuffer Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-arraybuffer-objects>
+    ArrayBuffer {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        data: Vec<u8>,
+        /// §25.1.2.1 [[ArrayBufferDetachKey]] — true after detach/transfer.
+        detached: bool,
+        /// §25.1.3.1 step 9 — configured maximum for resizable buffers.
+        max_byte_length: usize,
+        /// §25.1.3.1 step 10 — true when constructed with maxByteLength option.
+        resizable: bool,
+    },
+    /// ES2024 §25.2 SharedArrayBuffer Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-sharedarraybuffer-objects>
+    SharedArrayBuffer {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        data: Vec<u8>,
+        max_byte_length: usize,
+        growable: bool,
+    },
     /// ES2024 §22.2 RegExp Objects — ordinary object with [[OriginalSource]] and [[OriginalFlags]].
     /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
     RegExp {
@@ -818,6 +960,186 @@ enum HeapValue {
         /// Canonical flags string (alphabetically sorted).
         flags: Box<str>,
     },
+    /// ES2024 §25.3 DataView Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-dataview-objects>
+    DataView {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        /// [[ViewedArrayBuffer]] — the underlying ArrayBuffer or SharedArrayBuffer.
+        viewed_buffer: ObjectHandle,
+        /// [[ByteOffset]] — start offset into the buffer.
+        byte_offset: usize,
+        /// [[ByteLength]] — None means AUTO (tracks buffer length for resizable buffers).
+        byte_length: Option<usize>,
+    },
+    /// ES2024 §23.2 TypedArray Objects (Int8Array, Uint8Array, etc.).
+    /// Spec: <https://tc39.es/ecma262/#sec-typedarray-objects>
+    TypedArray {
+        prototype: Option<ObjectHandle>,
+        extensible: bool,
+        shape_id: ObjectShapeId,
+        keys: Vec<PropertyNameId>,
+        values: Vec<PropertyValue>,
+        /// [[ViewedArrayBuffer]] — the underlying ArrayBuffer or SharedArrayBuffer.
+        viewed_buffer: ObjectHandle,
+        /// [[ByteOffset]] — byte offset into the buffer.
+        byte_offset: usize,
+        /// [[ByteLength]] — byte length of the view.
+        byte_length: usize,
+        /// [[ArrayLength]] — number of elements.
+        array_length: usize,
+        /// [[TypedArrayName]] / [[ContentType]] — element type discriminator.
+        kind: TypedArrayKind,
+    },
+    /// ES2024 §28.2 Proxy Exotic Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots>
+    Proxy {
+        /// [[ProxyTarget]] — the wrapped target object.
+        target: ObjectHandle,
+        /// [[ProxyHandler]] — the handler object whose methods define trap behavior.
+        handler: ObjectHandle,
+        /// `true` after `Proxy.revocable().revoke()` has been called.
+        revoked: bool,
+    },
+}
+
+/// §25.1.2.8 RawBytesToNumeric — read a single typed element from a byte slice.
+///
+/// Returns the element value as `f64` for numeric types.
+/// BigInt64/BigUint64 are returned as their nearest f64 approximation.
+fn read_typed_element(kind: TypedArrayKind, bytes: &[u8]) -> f64 {
+    match kind {
+        TypedArrayKind::Int8 => f64::from(i8::from_ne_bytes([bytes[0]])),
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => f64::from(bytes[0]),
+        TypedArrayKind::Int16 => f64::from(i16::from_le_bytes([bytes[0], bytes[1]])),
+        TypedArrayKind::Uint16 => f64::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+        TypedArrayKind::Int32 => {
+            f64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        TypedArrayKind::Uint32 => {
+            f64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        TypedArrayKind::Float32 => {
+            f64::from(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        TypedArrayKind::Float64 => f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        TypedArrayKind::BigInt64 => i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]) as f64,
+        TypedArrayKind::BigUint64 => u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]) as f64,
+    }
+}
+
+/// §25.1.2.11 NumericToRawBytes — write a single typed element to a byte slice.
+///
+/// Implements the spec-correct conversion from `f64` to each element type.
+fn write_typed_element(kind: TypedArrayKind, value: f64, bytes: &mut [u8]) {
+    match kind {
+        TypedArrayKind::Int8 => {
+            let n = to_int8(value);
+            bytes[0] = n as u8;
+        }
+        TypedArrayKind::Uint8 => {
+            bytes[0] = to_uint8(value);
+        }
+        TypedArrayKind::Uint8Clamped => {
+            bytes[0] = to_uint8_clamp(value);
+        }
+        TypedArrayKind::Int16 => {
+            let n = to_int16(value);
+            bytes[..2].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::Uint16 => {
+            let n = to_uint16(value);
+            bytes[..2].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::Int32 => {
+            let n = to_int32(value);
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::Uint32 => {
+            let n = to_uint32(value);
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::Float32 => {
+            let n = value as f32;
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::Float64 => {
+            bytes[..8].copy_from_slice(&value.to_le_bytes());
+        }
+        TypedArrayKind::BigInt64 => {
+            let n = value.trunc() as i64;
+            bytes[..8].copy_from_slice(&n.to_le_bytes());
+        }
+        TypedArrayKind::BigUint64 => {
+            let n = value.trunc() as u64;
+            bytes[..8].copy_from_slice(&n.to_le_bytes());
+        }
+    }
+}
+
+/// §7.1.6 ToInt32 — modular conversion.
+fn to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    (n.trunc() as i64) as i32
+}
+
+/// §7.1.7 ToUint32 — modular conversion.
+fn to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    (n.trunc() as i64) as u32
+}
+
+/// §7.1.9 ToInt16 — modular conversion.
+fn to_int16(n: f64) -> i16 {
+    to_uint32(n) as i16
+}
+
+/// §7.1.10 ToUint16 — modular conversion.
+fn to_uint16(n: f64) -> u16 {
+    to_uint32(n) as u16
+}
+
+/// §7.1.8 ToInt8 — modular conversion.
+fn to_int8(n: f64) -> i8 {
+    to_uint32(n) as i8
+}
+
+/// §7.1.11 ToUint8 — modular conversion.
+fn to_uint8(n: f64) -> u8 {
+    to_uint32(n) as u8
+}
+
+/// §7.1.12 ToUint8Clamp — clamped conversion.
+fn to_uint8_clamp(n: f64) -> u8 {
+    if n.is_nan() || n <= 0.0 {
+        return 0;
+    }
+    if n >= 255.0 {
+        return 255;
+    }
+    let f = n.floor();
+    if f + 0.5 < n {
+        return (f + 1.0) as u8;
+    }
+    if n < f + 0.5 {
+        return f as u8;
+    }
+    // Exact 0.5 case: round to even.
+    let i = f as u8;
+    if i % 2 == 0 { i } else { i + 1 }
 }
 
 /// Visit an ObjectHandle as a GcHandle for tracing.
@@ -1041,6 +1363,26 @@ impl Traceable for HeapValue {
             HeapValue::PromiseValueThunk { value, .. } => {
                 trace_register_value(*value, visitor);
             }
+            HeapValue::ArrayBuffer {
+                prototype, values, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+            }
+            HeapValue::SharedArrayBuffer {
+                prototype, values, ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+            }
             HeapValue::RegExp {
                 prototype, values, ..
             } => {
@@ -1050,6 +1392,32 @@ impl Traceable for HeapValue {
                 for v in values {
                     trace_property_value(v, visitor);
                 }
+            }
+            HeapValue::DataView {
+                prototype,
+                values,
+                viewed_buffer,
+                ..
+            }
+            | HeapValue::TypedArray {
+                prototype,
+                values,
+                viewed_buffer,
+                ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                trace_handle(*viewed_buffer, visitor);
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+            }
+            HeapValue::Proxy {
+                target, handler, ..
+            } => {
+                trace_handle(*target, visitor);
+                trace_handle(*handler, visitor);
             }
         }
     }
@@ -1162,6 +1530,759 @@ impl ObjectHeap {
         });
         ObjectHandle(h.0)
     }
+
+    /// Allocates a fixed-length ArrayBuffer object with zero-initialized storage.
+    ///
+    /// §25.1.3.1 ArrayBuffer ( length )
+    /// Spec: <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
+    pub fn alloc_array_buffer(
+        &mut self,
+        byte_length: usize,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        self.alloc_array_buffer_full(vec![0; byte_length], byte_length, false, prototype)
+    }
+
+    /// Allocates an ArrayBuffer object with explicit backing bytes (fixed-length).
+    pub fn alloc_array_buffer_with_data(
+        &mut self,
+        data: Vec<u8>,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let len = data.len();
+        self.alloc_array_buffer_full(data, len, false, prototype)
+    }
+
+    /// Allocates a resizable ArrayBuffer with maxByteLength.
+    ///
+    /// §25.1.3.1 ArrayBuffer ( length [, options] )
+    /// Spec: <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
+    pub fn alloc_array_buffer_resizable(
+        &mut self,
+        byte_length: usize,
+        max_byte_length: usize,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        self.alloc_array_buffer_full(vec![0; byte_length], max_byte_length, true, prototype)
+    }
+
+    /// Allocates an ArrayBuffer with all fields specified.
+    pub fn alloc_array_buffer_full(
+        &mut self,
+        data: Vec<u8>,
+        max_byte_length: usize,
+        resizable: bool,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
+        let h = self.heap.alloc(HeapValue::ArrayBuffer {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            data,
+            detached: false,
+            max_byte_length,
+            resizable,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a SharedArrayBuffer with explicit growth metadata.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
+    pub fn alloc_shared_array_buffer_with_data(
+        &mut self,
+        data: Vec<u8>,
+        max_byte_length: usize,
+        growable: bool,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
+        let h = self.heap.alloc(HeapValue::SharedArrayBuffer {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            max_byte_length,
+            growable,
+            data,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a SharedArrayBuffer with zero-initialized storage.
+    pub fn alloc_shared_array_buffer(
+        &mut self,
+        byte_length: usize,
+        max_byte_length: usize,
+        growable: bool,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        self.alloc_shared_array_buffer_with_data(
+            vec![0; byte_length],
+            max_byte_length,
+            growable,
+            prototype,
+        )
+    }
+
+    /// §25.1.5.1 get ArrayBuffer.prototype.byteLength
+    /// Returns 0 for detached buffers per spec.
+    /// <https://tc39.es/ecma262/#sec-get-arraybuffer.prototype.bytelength>
+    pub fn array_buffer_byte_length(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    Ok(0)
+                } else {
+                    Ok(data.len())
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.1.5.3 get ArrayBuffer.prototype.detached
+    /// <https://tc39.es/ecma262/#sec-get-arraybuffer.prototype.detached>
+    pub fn array_buffer_is_detached(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { detached, .. } => Ok(*detached),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.1.5.4 get ArrayBuffer.prototype.maxByteLength
+    /// <https://tc39.es/ecma262/#sec-get-arraybuffer.prototype.maxbytelength>
+    pub fn array_buffer_max_byte_length(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer {
+                data,
+                detached,
+                max_byte_length,
+                resizable,
+                ..
+            } => {
+                if *detached {
+                    Ok(0)
+                } else if *resizable {
+                    Ok(*max_byte_length)
+                } else {
+                    Ok(data.len())
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.1.5.5 get ArrayBuffer.prototype.resizable
+    /// <https://tc39.es/ecma262/#sec-get-arraybuffer.prototype.resizable>
+    pub fn array_buffer_is_resizable(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { resizable, .. } => Ok(*resizable),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.1.5.6 ArrayBuffer.prototype.resize ( newLength )
+    /// <https://tc39.es/ecma262/#sec-arraybuffer.prototype.resize>
+    pub fn array_buffer_resize(
+        &mut self,
+        handle: ObjectHandle,
+        new_byte_length: usize,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::ArrayBuffer {
+                data,
+                detached,
+                max_byte_length,
+                resizable,
+                ..
+            } => {
+                if *detached {
+                    return Err(ObjectError::InvalidKind);
+                }
+                if !*resizable {
+                    return Err(ObjectError::InvalidKind);
+                }
+                if new_byte_length > *max_byte_length {
+                    return Err(ObjectError::InvalidArrayLength);
+                }
+                data.resize(new_byte_length, 0);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.1.5.7 ArrayBuffer.prototype.transfer ( [ newLength ] )
+    /// <https://tc39.es/ecma262/#sec-arraybuffer.prototype.transfer>
+    ///
+    /// Detaches this buffer and returns (data, old_max_byte_length, old_resizable).
+    pub fn array_buffer_detach_for_transfer(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<(Vec<u8>, usize, bool), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::ArrayBuffer {
+                data,
+                detached,
+                max_byte_length,
+                resizable,
+                ..
+            } => {
+                if *detached {
+                    return Err(ObjectError::InvalidKind);
+                }
+                let old_data = std::mem::take(data);
+                let old_max = *max_byte_length;
+                let old_resizable = *resizable;
+                *detached = true;
+                *max_byte_length = 0;
+                Ok((old_data, old_max, old_resizable))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Raw byte access (immutable) to array buffer data.
+    /// Returns None if detached.
+    pub fn array_buffer_data(&self, handle: ObjectHandle) -> Result<Option<&[u8]>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    Ok(None)
+                } else {
+                    Ok(Some(data.as_slice()))
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Clones a byte range from one ArrayBuffer into a fresh ArrayBuffer.
+    ///
+    /// §25.1.5.4 ArrayBuffer.prototype.slice ( start, end )
+    /// <https://tc39.es/ecma262/#sec-arraybuffer.prototype.slice>
+    pub fn array_buffer_slice(
+        &mut self,
+        handle: ObjectHandle,
+        start: usize,
+        end: usize,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        let data = match self.object(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    return Err(ObjectError::InvalidKind);
+                }
+                data
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let start = start.min(data.len());
+        let end = end.min(data.len());
+        let bytes = if end < start {
+            Vec::new()
+        } else {
+            data[start..end].to_vec()
+        };
+        Ok(self.alloc_array_buffer_with_data(bytes, prototype))
+    }
+
+    /// Returns the current byte length of a SharedArrayBuffer.
+    pub fn shared_array_buffer_byte_length(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::SharedArrayBuffer { data, .. } => Ok(data.len()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the configured maximum byte length of a SharedArrayBuffer.
+    pub fn shared_array_buffer_max_byte_length(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::SharedArrayBuffer {
+                data,
+                max_byte_length,
+                growable,
+                ..
+            } => {
+                if *growable {
+                    Ok(*max_byte_length)
+                } else {
+                    Ok(data.len())
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns whether a SharedArrayBuffer is growable.
+    pub fn shared_array_buffer_is_growable(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::SharedArrayBuffer { growable, .. } => Ok(*growable),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Grows a SharedArrayBuffer in place up to its maximum length.
+    pub fn shared_array_buffer_grow(
+        &mut self,
+        handle: ObjectHandle,
+        new_byte_length: usize,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::SharedArrayBuffer {
+                data,
+                max_byte_length,
+                growable,
+                ..
+            } => {
+                if !*growable {
+                    return Err(ObjectError::InvalidKind);
+                }
+                if new_byte_length < data.len() || new_byte_length > *max_byte_length {
+                    return Err(ObjectError::InvalidArrayLength);
+                }
+                data.resize(new_byte_length, 0);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Clones a byte range from one SharedArrayBuffer into a fresh SharedArrayBuffer.
+    pub fn shared_array_buffer_slice(
+        &mut self,
+        handle: ObjectHandle,
+        start: usize,
+        end: usize,
+        max_byte_length: usize,
+        growable: bool,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        let data = match self.object(handle)? {
+            HeapValue::SharedArrayBuffer { data, .. } => data,
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let start = start.min(data.len());
+        let end = end.min(data.len());
+        let bytes = if end < start {
+            Vec::new()
+        } else {
+            data[start..end].to_vec()
+        };
+        Ok(self.alloc_shared_array_buffer_with_data(bytes, max_byte_length, growable, prototype))
+    }
+
+    // ── DataView ──────────────────────────────────────────────────────
+
+    /// §25.3.2.1 DataView ( buffer, byteOffset, byteLength )
+    /// <https://tc39.es/ecma262/#sec-dataview-constructor>
+    pub fn alloc_data_view(
+        &mut self,
+        viewed_buffer: ObjectHandle,
+        byte_offset: usize,
+        byte_length: Option<usize>,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
+        let h = self.heap.alloc(HeapValue::DataView {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            viewed_buffer,
+            byte_offset,
+            byte_length,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// §25.3.4.1 get DataView.prototype.buffer
+    /// <https://tc39.es/ecma262/#sec-get-dataview.prototype.buffer>
+    pub fn data_view_buffer(&self, handle: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::DataView { viewed_buffer, .. } => Ok(*viewed_buffer),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.3.4.2 get DataView.prototype.byteLength
+    /// <https://tc39.es/ecma262/#sec-get-dataview.prototype.bytelength>
+    ///
+    /// Returns the effective byte length, resolving AUTO for resizable buffers.
+    pub fn data_view_byte_length(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::DataView {
+                viewed_buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => {
+                match *byte_length {
+                    Some(len) => Ok(len),
+                    None => {
+                        // AUTO: track the buffer's current byte length.
+                        let buf_len = self.array_buffer_or_shared_byte_length(*viewed_buffer)?;
+                        Ok(buf_len.saturating_sub(*byte_offset))
+                    }
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §25.3.4.3 get DataView.prototype.byteOffset
+    /// <https://tc39.es/ecma262/#sec-get-dataview.prototype.byteoffset>
+    pub fn data_view_byte_offset(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::DataView { byte_offset, .. } => Ok(*byte_offset),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the viewed buffer handle for a DataView.
+    pub fn data_view_viewed_buffer(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::DataView { viewed_buffer, .. } => Ok(*viewed_buffer),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Read bytes from the underlying buffer of a DataView.
+    /// Returns a slice of `element_size` bytes at `byte_index` within the buffer.
+    pub fn data_view_get_bytes(
+        &self,
+        handle: ObjectHandle,
+        byte_index: usize,
+        element_size: usize,
+    ) -> Result<Vec<u8>, ObjectError> {
+        let (viewed_buffer, byte_offset, view_byte_length) = match self.object(handle)? {
+            HeapValue::DataView {
+                viewed_buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => {
+                let effective_len = match *byte_length {
+                    Some(len) => len,
+                    None => {
+                        let buf_len = self.array_buffer_or_shared_byte_length(*viewed_buffer)?;
+                        buf_len.saturating_sub(*byte_offset)
+                    }
+                };
+                (*viewed_buffer, *byte_offset, effective_len)
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if byte_index + element_size > view_byte_length {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        let buffer_index = byte_offset + byte_index;
+        let data = self.array_buffer_or_shared_data(viewed_buffer)?;
+        if buffer_index + element_size > data.len() {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        Ok(data[buffer_index..buffer_index + element_size].to_vec())
+    }
+
+    /// Write bytes into the underlying buffer of a DataView.
+    pub fn data_view_set_bytes(
+        &mut self,
+        handle: ObjectHandle,
+        byte_index: usize,
+        bytes: &[u8],
+    ) -> Result<(), ObjectError> {
+        let (viewed_buffer, byte_offset, view_byte_length) = match self.object(handle)? {
+            HeapValue::DataView {
+                viewed_buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => {
+                let effective_len = match *byte_length {
+                    Some(len) => len,
+                    None => {
+                        let buf_len = self.array_buffer_or_shared_byte_length(*viewed_buffer)?;
+                        buf_len.saturating_sub(*byte_offset)
+                    }
+                };
+                (*viewed_buffer, *byte_offset, effective_len)
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let element_size = bytes.len();
+        if byte_index + element_size > view_byte_length {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        let buffer_index = byte_offset + byte_index;
+        let data = self.array_buffer_or_shared_data_mut(viewed_buffer)?;
+        if buffer_index + element_size > data.len() {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        data[buffer_index..buffer_index + element_size].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Helper: get byte length of either ArrayBuffer or SharedArrayBuffer.
+    fn array_buffer_or_shared_byte_length(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    Ok(0)
+                } else {
+                    Ok(data.len())
+                }
+            }
+            HeapValue::SharedArrayBuffer { data, .. } => Ok(data.len()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Helper: get immutable data slice from ArrayBuffer or SharedArrayBuffer.
+    fn array_buffer_or_shared_data(&self, handle: ObjectHandle) -> Result<&[u8], ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    Err(ObjectError::InvalidKind)
+                } else {
+                    Ok(data.as_slice())
+                }
+            }
+            HeapValue::SharedArrayBuffer { data, .. } => Ok(data.as_slice()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Helper: get mutable data slice from ArrayBuffer or SharedArrayBuffer.
+    fn array_buffer_or_shared_data_mut(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<&mut [u8], ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::ArrayBuffer { data, detached, .. } => {
+                if *detached {
+                    Err(ObjectError::InvalidKind)
+                } else {
+                    Ok(data.as_mut_slice())
+                }
+            }
+            HeapValue::SharedArrayBuffer { data, .. } => Ok(data.as_mut_slice()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    // ── TypedArray ────────────────────────────────────────────────────
+
+    /// Allocates a TypedArray object backed by the given buffer.
+    ///
+    /// §23.2.5 Properties of TypedArray Instances.
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-typedarray-instances>
+    pub fn alloc_typed_array(
+        &mut self,
+        kind: TypedArrayKind,
+        viewed_buffer: ObjectHandle,
+        byte_offset: usize,
+        array_length: usize,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let shape_id = self.allocate_shape();
+        let byte_length = array_length * kind.element_size();
+        let h = self.heap.alloc(HeapValue::TypedArray {
+            prototype,
+            extensible: true,
+            shape_id,
+            keys: Vec::new(),
+            values: Vec::new(),
+            viewed_buffer,
+            byte_offset,
+            byte_length,
+            array_length,
+            kind,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the TypedArrayKind for the given typed array handle.
+    pub fn typed_array_kind(&self, handle: ObjectHandle) -> Result<TypedArrayKind, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray { kind, .. } => Ok(*kind),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §23.2.3.1 get %TypedArray%.prototype.buffer
+    /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.buffer>
+    pub fn typed_array_buffer(&self, handle: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray { viewed_buffer, .. } => Ok(*viewed_buffer),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §23.2.3.2 get %TypedArray%.prototype.byteLength
+    /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.bytelength>
+    pub fn typed_array_byte_length(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_length,
+                ..
+            } => {
+                // If the buffer is detached, return 0.
+                if let Ok(true) = self.array_buffer_is_detached(*viewed_buffer) {
+                    Ok(0)
+                } else {
+                    Ok(*byte_length)
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §23.2.3.3 get %TypedArray%.prototype.byteOffset
+    /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.byteoffset>
+    pub fn typed_array_byte_offset(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_offset,
+                ..
+            } => {
+                if let Ok(true) = self.array_buffer_is_detached(*viewed_buffer) {
+                    Ok(0)
+                } else {
+                    Ok(*byte_offset)
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §23.2.3.18 get %TypedArray%.prototype.length
+    /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.length>
+    pub fn typed_array_length(&self, handle: ObjectHandle) -> Result<usize, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                array_length,
+                ..
+            } => {
+                if let Ok(true) = self.array_buffer_is_detached(*viewed_buffer) {
+                    Ok(0)
+                } else {
+                    Ok(*array_length)
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the viewed_buffer handle for a TypedArray.
+    pub fn typed_array_viewed_buffer(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::TypedArray { viewed_buffer, .. } => Ok(*viewed_buffer),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Reads a single element from a TypedArray as an f64.
+    ///
+    /// §10.4.5.9 IntegerIndexedElementGet
+    /// <https://tc39.es/ecma262/#sec-integerindexedelementget>
+    pub fn typed_array_get_element(
+        &self,
+        handle: ObjectHandle,
+        index: usize,
+    ) -> Result<Option<f64>, ObjectError> {
+        let (viewed_buffer, byte_offset, array_length, kind) = match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_offset,
+                array_length,
+                kind,
+                ..
+            } => (*viewed_buffer, *byte_offset, *array_length, *kind),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if index >= array_length {
+            return Ok(None);
+        }
+        let buffer_data = self.array_buffer_or_shared_data(viewed_buffer)?;
+        let elem_size = kind.element_size();
+        let byte_index = byte_offset + index * elem_size;
+        if byte_index + elem_size > buffer_data.len() {
+            return Ok(None);
+        }
+        let bytes = &buffer_data[byte_index..byte_index + elem_size];
+        Ok(Some(read_typed_element(kind, bytes)))
+    }
+
+    /// Writes a single element to a TypedArray from an f64.
+    ///
+    /// §10.4.5.10 IntegerIndexedElementSet
+    /// <https://tc39.es/ecma262/#sec-integerindexedelementset>
+    pub fn typed_array_set_element(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+        value: f64,
+    ) -> Result<(), ObjectError> {
+        let (viewed_buffer, byte_offset, array_length, kind) = match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_offset,
+                array_length,
+                kind,
+                ..
+            } => (*viewed_buffer, *byte_offset, *array_length, *kind),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if index >= array_length {
+            return Err(ObjectError::InvalidIndex);
+        }
+        let elem_size = kind.element_size();
+        let byte_index = byte_offset + index * elem_size;
+        let buffer_data = self.array_buffer_or_shared_data_mut(viewed_buffer)?;
+        if byte_index + elem_size > buffer_data.len() {
+            return Err(ObjectError::InvalidIndex);
+        }
+        write_typed_element(
+            kind,
+            value,
+            &mut buffer_data[byte_index..byte_index + elem_size],
+        );
+        Ok(())
+    }
+
+    /// Returns whether this handle is a TypedArray.
+    pub fn is_typed_array(&self, handle: ObjectHandle) -> bool {
+        matches!(self.object(handle), Ok(HeapValue::TypedArray { .. }))
+    }
+
+    // ── RegExp ───────────────────────────────────────────────────────
 
     /// Allocates a RegExp object with the given pattern and flags.
     ///
@@ -1815,6 +2936,58 @@ impl ObjectHeap {
         ObjectHandle(h.0)
     }
 
+    /// Allocates a new Proxy exotic object.
+    /// Spec: <https://tc39.es/ecma262/#sec-proxycreate>
+    pub fn alloc_proxy(&mut self, target: ObjectHandle, handler: ObjectHandle) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::Proxy {
+            target,
+            handler,
+            revoked: false,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns `true` if the handle points to a Proxy exotic object.
+    pub fn is_proxy(&self, handle: ObjectHandle) -> bool {
+        matches!(self.object(handle), Ok(HeapValue::Proxy { .. }))
+    }
+
+    /// Returns the [[ProxyTarget]] and [[ProxyHandler]] for a proxy.
+    /// Returns `Err` if revoked or not a proxy.
+    pub fn proxy_parts(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(ObjectHandle, ObjectHandle), ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Proxy {
+                target,
+                handler,
+                revoked: false,
+            } => Ok((*target, *handler)),
+            HeapValue::Proxy { revoked: true, .. } => Err(ObjectError::InvalidKind), // caller must check
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns `true` if the proxy has been revoked.
+    pub fn is_proxy_revoked(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.object(handle),
+            Ok(HeapValue::Proxy { revoked: true, .. })
+        )
+    }
+
+    /// Revokes a proxy object, making all trap operations throw TypeError.
+    pub fn revoke_proxy(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Proxy { revoked, .. } => {
+                *revoked = true;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Returns the target promise and kind for a PromiseCapabilityFunction.
     pub fn promise_capability_function_info(
         &self,
@@ -1930,7 +3103,12 @@ impl ObjectHeap {
             HeapValue::WeakMap { .. } => Ok(HeapValueKind::WeakMap),
             HeapValue::WeakSet { .. } => Ok(HeapValueKind::WeakSet),
             HeapValue::Generator { .. } => Ok(HeapValueKind::Generator),
+            HeapValue::ArrayBuffer { .. } => Ok(HeapValueKind::ArrayBuffer),
+            HeapValue::SharedArrayBuffer { .. } => Ok(HeapValueKind::SharedArrayBuffer),
             HeapValue::RegExp { .. } => Ok(HeapValueKind::RegExp),
+            HeapValue::DataView { .. } => Ok(HeapValueKind::DataView),
+            HeapValue::TypedArray { .. } => Ok(HeapValueKind::TypedArray),
+            HeapValue::Proxy { .. } => Ok(HeapValueKind::Proxy),
         }
     }
 
@@ -1954,7 +3132,13 @@ impl ObjectHeap {
             | HeapValue::WeakSet { prototype, .. }
             | HeapValue::Generator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
+            | HeapValue::ArrayBuffer { prototype, .. }
+            | HeapValue::SharedArrayBuffer { prototype, .. }
+            | HeapValue::DataView { prototype, .. }
+            | HeapValue::TypedArray { prototype, .. }
             | HeapValue::RegExp { prototype, .. } => Ok(*prototype),
+            // Proxy: delegate to target's prototype (trap invocation is at interpreter level).
+            HeapValue::Proxy { target, .. } => self.get_prototype(*target),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
@@ -2053,11 +3237,27 @@ impl ObjectHeap {
             | HeapValue::Promise {
                 prototype: slot, ..
             }
+            | HeapValue::ArrayBuffer {
+                prototype: slot, ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                prototype: slot, ..
+            }
+            | HeapValue::DataView {
+                prototype: slot, ..
+            }
+            | HeapValue::TypedArray {
+                prototype: slot, ..
+            }
             | HeapValue::RegExp {
                 prototype: slot, ..
             } => {
                 *slot = prototype;
                 Ok(true)
+            }
+            HeapValue::Proxy { target, .. } => {
+                let target = *target;
+                self.set_prototype(target, prototype)
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
@@ -2095,7 +3295,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Ok(None),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -2186,7 +3391,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -2258,7 +3468,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -2346,6 +3561,24 @@ impl ObjectHeap {
 
     /// Allocates an internal iterator for a supported iterable.
     pub fn alloc_iterator(&mut self, iterable: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
+        // TypedArrays: first copy elements to a plain Array, then iterate that.
+        if matches!(self.object(iterable)?, HeapValue::TypedArray { .. }) {
+            let len = self.typed_array_length(iterable)?;
+            let arr = self.alloc_array();
+            for i in 0..len {
+                let val = self.typed_array_get_element(iterable, i)?.unwrap_or(0.0);
+                self.set_index(arr, i, RegisterValue::from_number(val))?;
+            }
+            let h = self.heap.alloc(HeapValue::ArrayIterator {
+                prototype: None,
+                iterable: arr,
+                next_index: 0,
+                closed: false,
+                kind: ArrayIteratorKind::Values,
+            });
+            return Ok(ObjectHandle(h.0));
+        }
+
         let iterator = match self.object(iterable)? {
             HeapValue::Array { .. } => HeapValue::ArrayIterator {
                 prototype: None,
@@ -2802,7 +4035,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Ok(None),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Ok(None),
         }
     }
 
@@ -2832,7 +4070,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Ok(None),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Ok(None),
         }
     }
 
@@ -2862,7 +4105,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Ok(None),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Ok(None),
         }
     }
 
@@ -2910,7 +4158,12 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::RegExp { .. } => Ok(None),
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
+            | HeapValue::RegExp { .. }
+            | HeapValue::Proxy { .. } => Ok(None),
         }
     }
 
@@ -2983,6 +4236,24 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::BoundFunction {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::ArrayBuffer {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
                 shape_id,
                 keys,
                 values,
@@ -3069,6 +4340,21 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id: object_shape_id,
                 values,
@@ -3122,6 +4408,12 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id,
                 keys,
@@ -3169,6 +4461,10 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::BoundFunction { .. }
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. } => self.set_named_property_storage(handle, property, value),
             _ => Err(ObjectError::InvalidKind),
         }
@@ -3213,6 +4509,10 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::BoundFunction { .. }
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. } => self.delete_ordinary_property(handle, property),
             _ => Err(ObjectError::InvalidKind),
         }
@@ -3231,6 +4531,10 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::BoundFunction { .. }
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. } => self.delete_ordinary_property(handle, property),
             HeapValue::Array { .. } => self.delete_array_property(handle, property, property_names),
             _ => Err(ObjectError::InvalidKind),
@@ -3322,6 +4626,10 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::BoundFunction { .. }
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
@@ -3343,6 +4651,10 @@ impl ObjectHeap {
             | HeapValue::Closure { .. }
             | HeapValue::HostFunction { .. }
             | HeapValue::BoundFunction { .. }
+            | HeapValue::ArrayBuffer { .. }
+            | HeapValue::SharedArrayBuffer { .. }
+            | HeapValue::DataView { .. }
+            | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. } => {
                 self.define_ordinary_own_property_from_descriptor(handle, property, desc)
             }
@@ -3582,6 +4894,21 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
+                shape_id: object_shape_id,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id: object_shape_id,
                 values,
@@ -3615,6 +4942,10 @@ impl ObjectHeap {
             HeapValue::Closure { keys, .. } => property_slot(keys, property),
             HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::ArrayBuffer { keys, .. } => property_slot(keys, property),
+            HeapValue::SharedArrayBuffer { keys, .. } => property_slot(keys, property),
+            HeapValue::DataView { keys, .. } => property_slot(keys, property),
+            HeapValue::TypedArray { keys, .. } => property_slot(keys, property),
             HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::Array { .. }
             | HeapValue::String { .. }
@@ -3633,7 +4964,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Generator { .. }
+            | HeapValue::Proxy { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -3650,6 +4982,21 @@ impl ObjectHeap {
                     shape_id, values, ..
                 }
                 | HeapValue::BoundFunction {
+                    shape_id, values, ..
+                }
+                | HeapValue::ArrayBuffer {
+                    shape_id, values, ..
+                }
+                | HeapValue::SharedArrayBuffer {
+                    shape_id, values, ..
+                }
+                | HeapValue::DataView {
+                    shape_id, values, ..
+                }
+                | HeapValue::TypedArray {
+                    shape_id, values, ..
+                }
+                | HeapValue::RegExp {
                     shape_id, values, ..
                 } => (shape_id, values),
                 _ => return Err(ObjectError::InvalidKind),
@@ -3686,6 +5033,24 @@ impl ObjectHeap {
                 ..
             }
             | HeapValue::BoundFunction {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::ArrayBuffer {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
                 shape_id: object_shape_id,
                 keys,
                 values,
@@ -3729,6 +5094,10 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::ArrayBuffer { keys, .. }
+            | HeapValue::SharedArrayBuffer { keys, .. }
+            | HeapValue::DataView { keys, .. }
+            | HeapValue::TypedArray { keys, .. }
             | HeapValue::RegExp { keys, .. } => Ok(keys.clone()),
             HeapValue::Array { keys, .. } => Ok(keys.clone()),
             _ => Ok(Vec::new()),
@@ -3747,6 +5116,10 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::ArrayBuffer { keys, .. }
+            | HeapValue::SharedArrayBuffer { keys, .. }
+            | HeapValue::DataView { keys, .. }
+            | HeapValue::TypedArray { keys, .. }
             | HeapValue::RegExp { keys, .. } => Ok(keys.clone()),
             HeapValue::Array {
                 elements,
@@ -3817,6 +5190,10 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::ArrayBuffer { keys, .. }
+            | HeapValue::SharedArrayBuffer { keys, .. }
+            | HeapValue::DataView { keys, .. }
+            | HeapValue::TypedArray { keys, .. }
             | HeapValue::RegExp { keys, .. }
             | HeapValue::Array { keys, .. } => Ok(property_slot(keys, property).is_some()),
             _ => Ok(false),
@@ -3892,6 +5269,10 @@ impl ObjectHeap {
             | HeapValue::Closure { extensible, .. }
             | HeapValue::HostFunction { extensible, .. }
             | HeapValue::BoundFunction { extensible, .. }
+            | HeapValue::ArrayBuffer { extensible, .. }
+            | HeapValue::SharedArrayBuffer { extensible, .. }
+            | HeapValue::DataView { extensible, .. }
+            | HeapValue::TypedArray { extensible, .. }
             | HeapValue::RegExp { extensible, .. } => Ok(*extensible),
             // Iterator objects are extensible (prototype must be settable during init).
             HeapValue::ArrayIterator { .. }
@@ -3917,6 +5298,10 @@ impl ObjectHeap {
             | HeapValue::Closure { extensible, .. }
             | HeapValue::HostFunction { extensible, .. }
             | HeapValue::BoundFunction { extensible, .. }
+            | HeapValue::ArrayBuffer { extensible, .. }
+            | HeapValue::SharedArrayBuffer { extensible, .. }
+            | HeapValue::DataView { extensible, .. }
+            | HeapValue::TypedArray { extensible, .. }
             | HeapValue::RegExp { extensible, .. } => {
                 *extensible = false;
                 Ok(true)
@@ -4016,7 +5401,12 @@ impl ObjectHeap {
             | HeapValue::NativeObject { values, .. }
             | HeapValue::Closure { values, .. }
             | HeapValue::HostFunction { values, .. }
-            | HeapValue::BoundFunction { values, .. } => values,
+            | HeapValue::BoundFunction { values, .. }
+            | HeapValue::ArrayBuffer { values, .. }
+            | HeapValue::SharedArrayBuffer { values, .. }
+            | HeapValue::DataView { values, .. }
+            | HeapValue::TypedArray { values, .. }
+            | HeapValue::RegExp { values, .. } => values,
             HeapValue::Array {
                 elements_configurable,
                 values,
@@ -4050,7 +5440,12 @@ impl ObjectHeap {
             | HeapValue::NativeObject { values, .. }
             | HeapValue::Closure { values, .. }
             | HeapValue::HostFunction { values, .. }
-            | HeapValue::BoundFunction { values, .. } => values,
+            | HeapValue::BoundFunction { values, .. }
+            | HeapValue::ArrayBuffer { values, .. }
+            | HeapValue::SharedArrayBuffer { values, .. }
+            | HeapValue::DataView { values, .. }
+            | HeapValue::TypedArray { values, .. }
+            | HeapValue::RegExp { values, .. } => values,
             HeapValue::Array {
                 elements_writable,
                 elements_configurable,
@@ -4097,7 +5492,12 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, values, .. }
             | HeapValue::Closure { keys, values, .. }
             | HeapValue::HostFunction { keys, values, .. }
-            | HeapValue::BoundFunction { keys, values, .. } => (keys, values),
+            | HeapValue::BoundFunction { keys, values, .. }
+            | HeapValue::ArrayBuffer { keys, values, .. }
+            | HeapValue::SharedArrayBuffer { keys, values, .. }
+            | HeapValue::DataView { keys, values, .. }
+            | HeapValue::TypedArray { keys, values, .. }
+            | HeapValue::RegExp { keys, values, .. } => (keys, values),
             _ => return Ok(()),
         };
         if let Some(slot) = property_slot(keys, property).map(usize::from) {
@@ -4124,7 +5524,12 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, values, .. }
             | HeapValue::Closure { keys, values, .. }
             | HeapValue::HostFunction { keys, values, .. }
-            | HeapValue::BoundFunction { keys, values, .. } => (keys, values),
+            | HeapValue::BoundFunction { keys, values, .. }
+            | HeapValue::ArrayBuffer { keys, values, .. }
+            | HeapValue::SharedArrayBuffer { keys, values, .. }
+            | HeapValue::DataView { keys, values, .. }
+            | HeapValue::TypedArray { keys, values, .. }
+            | HeapValue::RegExp { keys, values, .. } => (keys, values),
             _ => return Ok(()),
         };
         if let Some(slot) = property_slot(keys, property).map(usize::from) {
@@ -4350,6 +5755,10 @@ impl ObjectHeap {
             | HeapValue::HostFunction { keys, .. }
             | HeapValue::BoundFunction { keys, .. }
             | HeapValue::Array { keys, .. }
+            | HeapValue::ArrayBuffer { keys, .. }
+            | HeapValue::SharedArrayBuffer { keys, .. }
+            | HeapValue::DataView { keys, .. }
+            | HeapValue::TypedArray { keys, .. }
             | HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
@@ -4367,7 +5776,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
-            | HeapValue::Generator { .. } => {
+            | HeapValue::Generator { .. }
+            | HeapValue::Proxy { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -4389,6 +5799,15 @@ impl ObjectHeap {
                     shape_id, values, ..
                 }
                 | HeapValue::Array {
+                    shape_id, values, ..
+                }
+                | HeapValue::ArrayBuffer {
+                    shape_id, values, ..
+                }
+                | HeapValue::SharedArrayBuffer {
+                    shape_id, values, ..
+                }
+                | HeapValue::DataView {
                     shape_id, values, ..
                 }
                 | HeapValue::RegExp {
@@ -4419,6 +5838,10 @@ impl ObjectHeap {
                 | HeapValue::HostFunction { shape_id, .. }
                 | HeapValue::BoundFunction { shape_id, .. }
                 | HeapValue::Array { shape_id, .. }
+                | HeapValue::ArrayBuffer { shape_id, .. }
+                | HeapValue::SharedArrayBuffer { shape_id, .. }
+                | HeapValue::DataView { shape_id, .. }
+                | HeapValue::TypedArray { shape_id, .. }
                 | HeapValue::RegExp { shape_id, .. } => *shape_id,
                 _ => return Err(ObjectError::InvalidKind),
             };
@@ -4464,6 +5887,24 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
+                shape_id: object_shape_id,
+                keys,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id: object_shape_id,
                 keys,
@@ -4502,6 +5943,8 @@ impl ObjectHeap {
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. } => property_slot(keys, property),
             HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
+            HeapValue::ArrayBuffer { keys, .. } => property_slot(keys, property),
+            HeapValue::SharedArrayBuffer { keys, .. } => property_slot(keys, property),
             HeapValue::RegExp { keys, .. } => property_slot(keys, property),
             HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
             _ => None,
@@ -4516,6 +5959,10 @@ impl ObjectHeap {
                     | HeapValue::Closure { values, .. }
                     | HeapValue::HostFunction { values, .. }
                     | HeapValue::BoundFunction { values, .. }
+                    | HeapValue::ArrayBuffer { values, .. }
+                    | HeapValue::SharedArrayBuffer { values, .. }
+                    | HeapValue::DataView { values, .. }
+                    | HeapValue::TypedArray { values, .. }
                     | HeapValue::RegExp { values, .. } => values,
                     HeapValue::Array { values, .. } if include_array => values,
                     _ => return Err(ObjectError::InvalidKind),
@@ -4533,6 +5980,10 @@ impl ObjectHeap {
                 | HeapValue::Closure { values, .. }
                 | HeapValue::HostFunction { values, .. }
                 | HeapValue::BoundFunction { values, .. }
+                | HeapValue::ArrayBuffer { values, .. }
+                | HeapValue::SharedArrayBuffer { values, .. }
+                | HeapValue::DataView { values, .. }
+                | HeapValue::TypedArray { values, .. }
                 | HeapValue::RegExp { values, .. } => values,
                 HeapValue::Array { values, .. } if include_array => values,
                 _ => return Err(ObjectError::InvalidKind),
@@ -4580,6 +6031,24 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
+                shape_id: s,
+                keys,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id: s,
                 keys,
@@ -4611,7 +6080,9 @@ impl ObjectHeap {
             | HeapValue::NativeObject { keys, .. }
             | HeapValue::Closure { keys, .. }
             | HeapValue::HostFunction { keys, .. }
-            | HeapValue::BoundFunction { keys, .. } => property_slot(keys, property),
+            | HeapValue::BoundFunction { keys, .. }
+            | HeapValue::ArrayBuffer { keys, .. } => property_slot(keys, property),
+            HeapValue::SharedArrayBuffer { keys, .. } => property_slot(keys, property),
             HeapValue::Array { keys, .. } if include_array => property_slot(keys, property),
             HeapValue::String { .. }
             | HeapValue::UpvalueCell { .. }
@@ -4849,6 +6320,30 @@ impl ObjectHeap {
                 values,
                 ..
             }
+            | HeapValue::ArrayBuffer {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::SharedArrayBuffer {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::DataView {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
+            | HeapValue::TypedArray {
+                shape_id,
+                keys,
+                values,
+                ..
+            }
             | HeapValue::RegExp {
                 shape_id,
                 keys,
@@ -4948,7 +6443,8 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::Promise { .. } => return Ok(None),
+            | HeapValue::Promise { .. }
+            | HeapValue::Proxy { .. } => return Ok(None),
         };
         let Some(slot_index) = property_slot(keys, property) else {
             return Ok(None);
@@ -4980,7 +6476,20 @@ impl ObjectHeap {
             | HeapValue::WeakSet { prototype, .. }
             | HeapValue::Generator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
+            | HeapValue::ArrayBuffer { prototype, .. }
+            | HeapValue::SharedArrayBuffer { prototype, .. }
+            | HeapValue::DataView { prototype, .. }
+            | HeapValue::TypedArray { prototype, .. }
             | HeapValue::RegExp { prototype, .. } => Ok(*prototype),
+            HeapValue::Proxy {
+                target,
+                revoked: false,
+                ..
+            } => {
+                let target = *target;
+                self.property_traversal_prototype(target)
+            }
+            HeapValue::Proxy { revoked: true, .. } => Err(ObjectError::InvalidKind),
             HeapValue::UpvalueCell { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }

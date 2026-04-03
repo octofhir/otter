@@ -6,7 +6,9 @@
 //! enumeration for future GC integration and builder-driven bootstrap.
 
 mod array_class;
+mod arraybuffer_class;
 mod boolean_class;
+mod dataview_class;
 mod date_class;
 mod error_class;
 mod function_class;
@@ -22,10 +24,12 @@ mod promise_class;
 mod proxy_class;
 mod reflect;
 mod regexp_class;
+mod sharedarraybuffer_class;
 mod species_support;
 mod string_class;
 mod symbol_class;
 pub(crate) mod timer_globals;
+pub(crate) mod typedarray_class;
 mod weakmap_weakset_class;
 
 pub(crate) use boolean_class::box_boolean_object;
@@ -117,6 +121,8 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "Object",
     "Function",
     "Array",
+    "ArrayBuffer",
+    "SharedArrayBuffer",
     "String",
     "Number",
     "Boolean",
@@ -139,6 +145,17 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "WeakSet",
     "Promise",
     "Proxy",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
     "isNaN",
     "isFinite",
     "parseInt",
@@ -209,6 +226,38 @@ pub struct VmIntrinsics {
     function_constructor: ObjectHandle,
     array_constructor: ObjectHandle,
     array_prototype: ObjectHandle,
+    array_buffer_constructor: ObjectHandle,
+    array_buffer_prototype: ObjectHandle,
+    shared_array_buffer_constructor: ObjectHandle,
+    shared_array_buffer_prototype: ObjectHandle,
+    data_view_constructor: ObjectHandle,
+    data_view_prototype: ObjectHandle,
+    // %TypedArray% (§23.2)
+    pub(crate) typed_array_base_constructor: ObjectHandle,
+    pub(crate) typed_array_base_prototype: ObjectHandle,
+    // Concrete TypedArray constructors + prototypes (11 pairs)
+    pub(crate) int8_array_constructor: ObjectHandle,
+    pub(crate) int8_array_prototype: ObjectHandle,
+    pub(crate) uint8_array_constructor: ObjectHandle,
+    pub(crate) uint8_array_prototype: ObjectHandle,
+    pub(crate) uint8_clamped_array_constructor: ObjectHandle,
+    pub(crate) uint8_clamped_array_prototype: ObjectHandle,
+    pub(crate) int16_array_constructor: ObjectHandle,
+    pub(crate) int16_array_prototype: ObjectHandle,
+    pub(crate) uint16_array_constructor: ObjectHandle,
+    pub(crate) uint16_array_prototype: ObjectHandle,
+    pub(crate) int32_array_constructor: ObjectHandle,
+    pub(crate) int32_array_prototype: ObjectHandle,
+    pub(crate) uint32_array_constructor: ObjectHandle,
+    pub(crate) uint32_array_prototype: ObjectHandle,
+    pub(crate) float32_array_constructor: ObjectHandle,
+    pub(crate) float32_array_prototype: ObjectHandle,
+    pub(crate) float64_array_constructor: ObjectHandle,
+    pub(crate) float64_array_prototype: ObjectHandle,
+    pub(crate) bigint64_array_constructor: ObjectHandle,
+    pub(crate) bigint64_array_prototype: ObjectHandle,
+    pub(crate) biguint64_array_constructor: ObjectHandle,
+    pub(crate) biguint64_array_prototype: ObjectHandle,
     string_prototype: ObjectHandle,
     symbol_prototype: ObjectHandle,
     number_prototype: ObjectHandle,
@@ -276,6 +325,36 @@ impl VmIntrinsics {
         let function_constructor = heap.alloc_object();
         let array_constructor = heap.alloc_object();
         let array_prototype = heap.alloc_object();
+        let array_buffer_constructor = heap.alloc_object();
+        let array_buffer_prototype = heap.alloc_object();
+        let shared_array_buffer_constructor = heap.alloc_object();
+        let shared_array_buffer_prototype = heap.alloc_object();
+        let data_view_constructor = heap.alloc_object();
+        let data_view_prototype = heap.alloc_object();
+        let typed_array_base_constructor = heap.alloc_object();
+        let typed_array_base_prototype = heap.alloc_object();
+        let int8_array_constructor = heap.alloc_object();
+        let int8_array_prototype = heap.alloc_object();
+        let uint8_array_constructor = heap.alloc_object();
+        let uint8_array_prototype = heap.alloc_object();
+        let uint8_clamped_array_constructor = heap.alloc_object();
+        let uint8_clamped_array_prototype = heap.alloc_object();
+        let int16_array_constructor = heap.alloc_object();
+        let int16_array_prototype = heap.alloc_object();
+        let uint16_array_constructor = heap.alloc_object();
+        let uint16_array_prototype = heap.alloc_object();
+        let int32_array_constructor = heap.alloc_object();
+        let int32_array_prototype = heap.alloc_object();
+        let uint32_array_constructor = heap.alloc_object();
+        let uint32_array_prototype = heap.alloc_object();
+        let float32_array_constructor = heap.alloc_object();
+        let float32_array_prototype = heap.alloc_object();
+        let float64_array_constructor = heap.alloc_object();
+        let float64_array_prototype = heap.alloc_object();
+        let bigint64_array_constructor = heap.alloc_object();
+        let bigint64_array_prototype = heap.alloc_object();
+        let biguint64_array_constructor = heap.alloc_object();
+        let biguint64_array_prototype = heap.alloc_object();
         let string_prototype = heap.alloc_object();
         let symbol_prototype = heap.alloc_object();
         let number_prototype = heap.alloc_object();
@@ -331,6 +410,36 @@ impl VmIntrinsics {
             function_constructor,
             array_constructor,
             array_prototype,
+            array_buffer_constructor,
+            array_buffer_prototype,
+            shared_array_buffer_constructor,
+            shared_array_buffer_prototype,
+            data_view_constructor,
+            data_view_prototype,
+            typed_array_base_constructor,
+            typed_array_base_prototype,
+            int8_array_constructor,
+            int8_array_prototype,
+            uint8_array_constructor,
+            uint8_array_prototype,
+            uint8_clamped_array_constructor,
+            uint8_clamped_array_prototype,
+            int16_array_constructor,
+            int16_array_prototype,
+            uint16_array_constructor,
+            uint16_array_prototype,
+            int32_array_constructor,
+            int32_array_prototype,
+            uint32_array_constructor,
+            uint32_array_prototype,
+            float32_array_constructor,
+            float32_array_prototype,
+            float64_array_constructor,
+            float64_array_prototype,
+            bigint64_array_constructor,
+            bigint64_array_prototype,
+            biguint64_array_constructor,
+            biguint64_array_prototype,
             string_prototype,
             symbol_prototype,
             number_prototype,
@@ -410,6 +519,25 @@ impl VmIntrinsics {
         heap.set_prototype(self.function_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.array_buffer_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.array_buffer_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(
+            self.shared_array_buffer_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.shared_array_buffer_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(self.data_view_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.data_view_prototype, Some(self.object_prototype))?;
+        // %TypedArray% (§23.2): base constructor → Function.prototype, base prototype → Object.prototype
+        heap.set_prototype(
+            self.typed_array_base_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(self.typed_array_base_prototype, Some(self.object_prototype))?;
+        // Concrete TypedArray prototypes are wired in the installer (→ %TypedArray%.prototype).
         heap.set_prototype(self.string_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.symbol_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.number_prototype, Some(self.object_prototype))?;
@@ -657,6 +785,99 @@ impl VmIntrinsics {
         self.array_prototype
     }
 
+    /// Returns `%ArrayBuffer%`.
+    #[must_use]
+    pub const fn array_buffer_constructor(&self) -> ObjectHandle {
+        self.array_buffer_constructor
+    }
+
+    /// Returns `%ArrayBuffer.prototype%`.
+    #[must_use]
+    pub const fn array_buffer_prototype(&self) -> ObjectHandle {
+        self.array_buffer_prototype
+    }
+
+    /// Returns `%SharedArrayBuffer%`.
+    #[must_use]
+    pub const fn shared_array_buffer_constructor(&self) -> ObjectHandle {
+        self.shared_array_buffer_constructor
+    }
+
+    /// Returns `%SharedArrayBuffer.prototype%`.
+    #[must_use]
+    pub const fn shared_array_buffer_prototype(&self) -> ObjectHandle {
+        self.shared_array_buffer_prototype
+    }
+
+    /// Returns `%DataView%`.
+    #[must_use]
+    pub const fn data_view_constructor(&self) -> ObjectHandle {
+        self.data_view_constructor
+    }
+
+    /// Returns `%DataView.prototype%`.
+    #[must_use]
+    pub const fn data_view_prototype(&self) -> ObjectHandle {
+        self.data_view_prototype
+    }
+
+    /// Returns the (constructor, prototype) pair for a concrete TypedArray kind.
+    #[must_use]
+    pub fn typed_array_constructor_prototype(
+        &self,
+        kind: crate::object::TypedArrayKind,
+    ) -> (ObjectHandle, ObjectHandle) {
+        use crate::object::TypedArrayKind;
+        match kind {
+            TypedArrayKind::Int8 => (self.int8_array_constructor, self.int8_array_prototype),
+            TypedArrayKind::Uint8 => (self.uint8_array_constructor, self.uint8_array_prototype),
+            TypedArrayKind::Uint8Clamped => (
+                self.uint8_clamped_array_constructor,
+                self.uint8_clamped_array_prototype,
+            ),
+            TypedArrayKind::Int16 => (self.int16_array_constructor, self.int16_array_prototype),
+            TypedArrayKind::Uint16 => (self.uint16_array_constructor, self.uint16_array_prototype),
+            TypedArrayKind::Int32 => (self.int32_array_constructor, self.int32_array_prototype),
+            TypedArrayKind::Uint32 => (self.uint32_array_constructor, self.uint32_array_prototype),
+            TypedArrayKind::Float32 => {
+                (self.float32_array_constructor, self.float32_array_prototype)
+            }
+            TypedArrayKind::Float64 => {
+                (self.float64_array_constructor, self.float64_array_prototype)
+            }
+            TypedArrayKind::BigInt64 => (
+                self.bigint64_array_constructor,
+                self.bigint64_array_prototype,
+            ),
+            TypedArrayKind::BigUint64 => (
+                self.biguint64_array_constructor,
+                self.biguint64_array_prototype,
+            ),
+        }
+    }
+
+    /// Replaces a concrete TypedArray constructor handle (used during init).
+    pub(crate) fn set_typed_array_constructor(
+        &mut self,
+        kind: crate::object::TypedArrayKind,
+        handle: ObjectHandle,
+    ) {
+        use crate::object::TypedArrayKind;
+        match kind {
+            TypedArrayKind::Int8 => self.int8_array_constructor = handle,
+            TypedArrayKind::Uint8 => self.uint8_array_constructor = handle,
+            TypedArrayKind::Uint8Clamped => self.uint8_clamped_array_constructor = handle,
+            TypedArrayKind::Int16 => self.int16_array_constructor = handle,
+            TypedArrayKind::Uint16 => self.uint16_array_constructor = handle,
+            TypedArrayKind::Int32 => self.int32_array_constructor = handle,
+            TypedArrayKind::Uint32 => self.uint32_array_constructor = handle,
+            TypedArrayKind::Float32 => self.float32_array_constructor = handle,
+            TypedArrayKind::Float64 => self.float64_array_constructor = handle,
+            TypedArrayKind::BigInt64 => self.bigint64_array_constructor = handle,
+            TypedArrayKind::BigUint64 => self.biguint64_array_constructor = handle,
+        }
+    }
+
     /// Returns `%String.prototype%`.
     #[must_use]
     pub const fn string_prototype(&self) -> ObjectHandle {
@@ -832,6 +1053,36 @@ impl VmIntrinsics {
             self.function_constructor,
             self.array_constructor,
             self.array_prototype,
+            self.array_buffer_constructor,
+            self.array_buffer_prototype,
+            self.shared_array_buffer_constructor,
+            self.shared_array_buffer_prototype,
+            self.data_view_constructor,
+            self.data_view_prototype,
+            self.typed_array_base_constructor,
+            self.typed_array_base_prototype,
+            self.int8_array_constructor,
+            self.int8_array_prototype,
+            self.uint8_array_constructor,
+            self.uint8_array_prototype,
+            self.uint8_clamped_array_constructor,
+            self.uint8_clamped_array_prototype,
+            self.int16_array_constructor,
+            self.int16_array_prototype,
+            self.uint16_array_constructor,
+            self.uint16_array_prototype,
+            self.int32_array_constructor,
+            self.int32_array_prototype,
+            self.uint32_array_constructor,
+            self.uint32_array_prototype,
+            self.float32_array_constructor,
+            self.float32_array_prototype,
+            self.float64_array_constructor,
+            self.float64_array_prototype,
+            self.bigint64_array_constructor,
+            self.bigint64_array_prototype,
+            self.biguint64_array_constructor,
+            self.biguint64_array_prototype,
             self.string_prototype,
             self.symbol_prototype,
             self.number_prototype,
@@ -889,6 +1140,36 @@ impl VmIntrinsics {
             self.function_constructor,
             self.array_constructor,
             self.array_prototype,
+            self.array_buffer_constructor,
+            self.array_buffer_prototype,
+            self.shared_array_buffer_constructor,
+            self.shared_array_buffer_prototype,
+            self.data_view_constructor,
+            self.data_view_prototype,
+            self.typed_array_base_constructor,
+            self.typed_array_base_prototype,
+            self.int8_array_constructor,
+            self.int8_array_prototype,
+            self.uint8_array_constructor,
+            self.uint8_array_prototype,
+            self.uint8_clamped_array_constructor,
+            self.uint8_clamped_array_prototype,
+            self.int16_array_constructor,
+            self.int16_array_prototype,
+            self.uint16_array_constructor,
+            self.uint16_array_prototype,
+            self.int32_array_constructor,
+            self.int32_array_prototype,
+            self.uint32_array_constructor,
+            self.uint32_array_prototype,
+            self.float32_array_constructor,
+            self.float32_array_prototype,
+            self.float64_array_constructor,
+            self.float64_array_prototype,
+            self.bigint64_array_constructor,
+            self.bigint64_array_prototype,
+            self.biguint64_array_constructor,
+            self.biguint64_array_prototype,
             self.string_prototype,
             self.symbol_prototype,
             self.number_prototype,
@@ -911,12 +1192,14 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 20] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 24] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
+        &arraybuffer_class::ARRAY_BUFFER_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
+        &dataview_class::DATA_VIEW_INTRINSIC as &dyn IntrinsicInstaller,
         &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
         &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
@@ -930,9 +1213,11 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 20] {
         &proxy_class::PROXY_INTRINSIC as &dyn IntrinsicInstaller,
         &reflect::REFLECT_INTRINSIC as &dyn IntrinsicInstaller,
         &regexp_class::REGEXP_INTRINSIC as &dyn IntrinsicInstaller,
+        &sharedarraybuffer_class::SHARED_ARRAY_BUFFER_INTRINSIC as &dyn IntrinsicInstaller,
         &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
+        &typedarray_class::TYPED_ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &weakmap_weakset_class::WEAKMAP_WEAKSET_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
@@ -972,6 +1257,8 @@ mod tests {
             intrinsics.object_prototype(),
             intrinsics.function_prototype(),
             intrinsics.array_prototype(),
+            intrinsics.array_buffer_prototype(),
+            intrinsics.shared_array_buffer_prototype(),
             intrinsics.string_prototype(),
             intrinsics.symbol_prototype(),
             intrinsics.number_prototype(),
@@ -1012,12 +1299,20 @@ mod tests {
             Ok(HeapValueKind::HostFunction)
         );
         assert_eq!(
+            heap.kind(intrinsics.array_buffer_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
+            heap.kind(intrinsics.shared_array_buffer_constructor()),
+            Ok(HeapValueKind::HostFunction)
+        );
+        assert_eq!(
             heap.kind(intrinsics.proxy_constructor()),
             Ok(HeapValueKind::HostFunction)
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 322);
+        assert_eq!(native_functions.len(), 415);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))
@@ -1029,6 +1324,14 @@ mod tests {
         );
         assert_eq!(
             heap.get_prototype(intrinsics.array_constructor()),
+            Ok(Some(intrinsics.function_prototype()))
+        );
+        assert_eq!(
+            heap.get_prototype(intrinsics.array_buffer_constructor()),
+            Ok(Some(intrinsics.function_prototype()))
+        );
+        assert_eq!(
+            heap.get_prototype(intrinsics.shared_array_buffer_constructor()),
             Ok(Some(intrinsics.function_prototype()))
         );
         assert_eq!(

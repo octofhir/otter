@@ -5,6 +5,7 @@
 //! - RegExp.prototype.exec: <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 //! - RegExp.prototype.test: <https://tc39.es/ecma262/#sec-regexp.prototype.test>
 //! - String.prototype.match: <https://tc39.es/ecma262/#sec-string.prototype.match>
+//! - String.prototype.matchAll: <https://tc39.es/ecma262/#sec-string.prototype.matchall>
 //! - String.prototype.replace: <https://tc39.es/ecma262/#sec-string.prototype.replace>
 //! - String.prototype.search: <https://tc39.es/ecma262/#sec-string.prototype.search>
 //! - String.prototype.split: <https://tc39.es/ecma262/#sec-string.prototype.split>
@@ -149,6 +150,75 @@ fn string_match_non_global() {
             "assert.sameValue(m[1], 'orld', 'capture');\n",
         ),
         "string-match-non-global.js",
+    );
+    assert_eq!(r, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn string_match_all_global_regexp() {
+    let r = run(
+        concat!(
+            "var matches = 'test1test2'.matchAll(/t(e)(st\\d)/g);\n",
+            "assert.sameValue(matches.length, 2, 'two matches');\n",
+            "assert.sameValue(matches[0][0], 'test1', 'first full match');\n",
+            "assert.sameValue(matches[0][1], 'e', 'first capture 1');\n",
+            "assert.sameValue(matches[0][2], 'st1', 'first capture 2');\n",
+            "assert.sameValue(matches[1][0], 'test2', 'second full match');\n",
+            "assert.sameValue(matches[1][1], 'e', 'second capture 1');\n",
+            "assert.sameValue(matches[1][2], 'st2', 'second capture 2');\n",
+        ),
+        "string-matchall-global.js",
+    );
+    assert_eq!(r, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn string_match_all_custom_symbol_dispatch() {
+    let r = run(
+        concat!(
+            "var called = 0;\n",
+            "var matcher = {};\n",
+            "matcher[Symbol.matchAll] = function(value) {\n",
+            "  called += 1;\n",
+            "  assert.sameValue(value, 'otter', 'custom @@matchAll gets string');\n",
+            "  return ['ok'];\n",
+            "};\n",
+            "var result = 'otter'.matchAll(matcher);\n",
+            "assert.sameValue(called, 1, 'called once');\n",
+            "assert.sameValue(result[0], 'ok', 'custom result returned');\n",
+        ),
+        "string-matchall-custom.js",
+    );
+    assert_eq!(r, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn string_match_all_requires_global_regexp() {
+    let r = run(
+        concat!(
+            "var threw = false;\n",
+            "try {\n",
+            "  'abc'.matchAll(/a/);\n",
+            "} catch (e) {\n",
+            "  threw = e instanceof TypeError;\n",
+            "}\n",
+            "assert.sameValue(threw, true, 'non-global regexp throws');\n",
+        ),
+        "string-matchall-requires-global.js",
+    );
+    assert_eq!(r, RegisterValue::from_i32(0));
+}
+
+#[test]
+fn string_match_all_string_fallback_creates_global_regexp() {
+    let r = run(
+        concat!(
+            "var matches = 'banana'.matchAll('an');\n",
+            "assert.sameValue(matches.length, 2, 'two string matches');\n",
+            "assert.sameValue(matches[0][0], 'an', 'first string match');\n",
+            "assert.sameValue(matches[1][0], 'an', 'second string match');\n",
+        ),
+        "string-matchall-fallback.js",
     );
     assert_eq!(r, RegisterValue::from_i32(0));
 }

@@ -1147,9 +1147,7 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     /// Lazily allocates a local register for eval completion value tracking.
-    fn ensure_eval_completion_register(
-        &mut self,
-    ) -> Result<BytecodeRegister, SourceLoweringError> {
+    fn ensure_eval_completion_register(&mut self) -> Result<BytecodeRegister, SourceLoweringError> {
         if let Some(reg) = self.eval_completion_register {
             return Ok(reg);
         }

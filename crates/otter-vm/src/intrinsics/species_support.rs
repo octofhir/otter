@@ -30,6 +30,13 @@ impl IntrinsicInstaller for SpeciesSupportIntrinsic {
             intrinsics.array_constructor(),
             intrinsics.function_prototype(),
         )?;
+        // §25.1.4.3 get ArrayBuffer[@@species]
+        // <https://tc39.es/ecma262/#sec-get-arraybuffer-%symbol.species%>
+        install_species_getter(
+            cx,
+            intrinsics.array_buffer_constructor(),
+            intrinsics.function_prototype(),
+        )?;
         install_species_getter(
             cx,
             intrinsics.promise_constructor(),
@@ -39,6 +46,13 @@ impl IntrinsicInstaller for SpeciesSupportIntrinsic {
         install_species_getter(
             cx,
             intrinsics.regexp_constructor(),
+            intrinsics.function_prototype(),
+        )?;
+        // §25.2.4.3 get SharedArrayBuffer[@@species]
+        // <https://tc39.es/ecma262/#sec-get-sharedarraybuffer-%symbol.species%>
+        install_species_getter(
+            cx,
+            intrinsics.shared_array_buffer_constructor(),
             intrinsics.function_prototype(),
         )?;
         Ok(())

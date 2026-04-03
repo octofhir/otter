@@ -134,6 +134,7 @@ fn string_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("split", 2, string_split))
         .with_binding(proto("at", 1, string_at))
         .with_binding(proto("match", 1, string_match))
+        .with_binding(proto("matchAll", 1, string_match_all))
         .with_binding(proto("search", 1, string_search))
         .with_binding(proto("replace", 2, string_replace))
         .with_binding(proto("replaceAll", 2, string_replace_all))
@@ -944,6 +945,65 @@ fn string_match(
     set_regexp_last_index(re, 0.0, runtime);
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Match, re_val, this, &[], runtime)? {
+        return Ok(result);
+    }
+    Ok(RegisterValue::null())
+}
+
+// ── §22.1.3.13 String.prototype.matchAll(regexp) ─────────────────────────
+// Spec: <https://tc39.es/ecma262/#sec-string.prototype.matchall>
+// Delegates through @@matchAll when present and enforces the global-flag check
+// for built-in RegExp objects before dispatch.
+
+fn string_match_all(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let regexp_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    if let Some(handle) = regexp_arg.as_object_handle().map(ObjectHandle)
+        && matches!(runtime.objects().kind(handle), Ok(HeapValueKind::RegExp))
+    {
+        let flags_property = runtime.intern_property_name("flags");
+        let flags_value = runtime.ordinary_get(handle, flags_property, regexp_arg)?;
+        let flags = runtime
+            .js_to_string(flags_value)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        if !flags.contains('g') {
+            return Err(type_error(
+                runtime,
+                "String.prototype.matchAll requires a global RegExp argument",
+            )?);
+        }
+    }
+
+    if let Some(result) =
+        try_symbol_dispatch(WellKnownSymbol::MatchAll, regexp_arg, this, &[], runtime)?
+    {
+        return Ok(result);
+    }
+
+    let pattern = if regexp_arg == RegisterValue::undefined() {
+        String::new()
+    } else {
+        runtime
+            .js_to_string(regexp_arg)
+            .map_err(|e| map_interpreter_error(e, runtime))?
+            .to_string()
+    };
+    let prototype = runtime.intrinsics().regexp_prototype;
+    let re = runtime
+        .objects_mut()
+        .alloc_regexp(&pattern, "g", Some(prototype));
+    set_regexp_last_index(re, 0.0, runtime);
+    let re_val = RegisterValue::from_object_handle(re.0);
+    if let Some(result) =
+        try_symbol_dispatch(WellKnownSymbol::MatchAll, re_val, this, &[], runtime)?
+    {
         return Ok(result);
     }
     Ok(RegisterValue::null())

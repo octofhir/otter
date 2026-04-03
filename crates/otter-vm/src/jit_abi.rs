@@ -122,6 +122,7 @@ mod tests {
     use crate::deopt::{DeoptHandoff, DeoptId, DeoptReason, DeoptSite, DeoptTable};
     use crate::exception::ExceptionTable;
     use crate::feedback::FeedbackTableLayout;
+    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::module::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module};
@@ -142,6 +143,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),

@@ -13,8 +13,8 @@ cargo build --release -p otterjs         # Release CLI binary
 
 # Test
 cargo test --all --all-features          # All tests
-cargo test -p otter-vm-core              # VM core tests only
-cargo test -p otter-engine               # Engine tests only
+cargo test -p otter-vm                   # Target VM tests
+cargo test -p otter-runtime              # Target runtime tests
 
 # Lint and format
 cargo fmt --all
@@ -32,43 +32,52 @@ just test262-filter "Array/prototype/map"
 
 ## Key Architecture
 
+Target stack:
+- `crates/otter-gc`
+- `crates/otter-vm`
+- `crates/otter-runtime`
+
+Legacy stack being retired:
+- `crates/otter-engine`
+- `crates/otter-vm-runtime`
+- `crates/otter-vm-core`
+
+Migration rules:
+- New runtime/VM/API work must target the target stack.
+- Do not add new dependencies from target-stack crates to legacy crates.
+- Legacy crates may remain in the repo temporarily, but once no active workspace member depends on them they should be removed from `[workspace].members` so they stop participating in compilation.
+- Removing a crate from the workspace is not enough if a live crate still depends on it by path.
+
 ### Crate Layering (bottom-up)
 
 ```
 otterjs (CLI)
     ↓
-otter-engine (Module loading, permissions)
+target host/runtime integration layer
     ↓
-otter-vm-runtime (Builtins integration, event loop)
+otter-runtime
     ↓
-otter-vm-core (Interpreter, values, objects, GC)
+otter-vm
     ↓
-otter-vm-compiler (JS/TS → bytecode)
-    ↓
-otter-vm-bytecode (Instruction definitions)
-    ↓
-otter-vm-gc (Garbage collector)
+otter-gc
 ```
 
 ### Critical Implementation Details
 
-1. **Value Representation**: NaN-boxing for efficient 64-bit values. See `otter-vm-core/src/value.rs`.
+1. **Value Representation**: The target value model lives in `crates/otter-vm/src/value.rs`.
 
-2. **Object Model**: Hidden classes (shapes) for optimized property access. See `otter-vm-core/src/object.rs` and `shape.rs`.
+2. **Object Model**: The target object model lives in `crates/otter-vm/src/object.rs`.
 
 3. **GC Safety**: Use `GcRef<T>` for references. Values must be properly rooted across GC boundaries.
 
-4. **Native Functions**: Use `NativeContext` for calling JS from Rust:
-   - Old: `(this, args, mm: Arc<MemoryManager>)`
-   - New: `(this, args, ncx: &mut NativeContext<'_>)`
-   - Use `ncx.call_function()` to invoke JS callbacks from native code
+4. **Native Functions**: Port native bindings toward the target runtime/VM ABI. Do not add new JS-visible host bindings to legacy crates.
 
 5. **Module System**:
-   - ESM loader in `otter-engine`
-   - Support for `file://`, `node:`, and `https://` URLs
-   - Import maps for aliasing
+   - Must move onto the target runtime integration layer
+   - Support for `file://`, `node:`, and `https://` URLs remains required during migration
+   - Import maps and graph semantics should be preserved while removing legacy dependencies
 
-6. **Async Operations**: Require Tokio runtime handle (thread-local). Microtasks queue in `otter-vm-runtime`.
+6. **Async Operations**: Require Tokio runtime handle. New async/runtime behavior must move toward `otter-runtime` + `otter-vm`, not `otter-vm-runtime`.
 
 7. **Parsing**: Always use ASTs via `oxc` parser. **Never use regex to parse JS/TS code.**
 
@@ -142,13 +151,13 @@ cargo build --release -p otterjs
 
 ## Security Model
 
-Deny-by-default capabilities via `otter-engine`:
+Deny-by-default capabilities remain required during migration:
 - `fs_read`, `fs_write`: Path allowlists
 - `net`: Host allowlists
 - `env`: Variable allowlists with secret deny patterns (`AWS_*`, `*_SECRET*`, etc.)
 - `subprocess`, `ffi`: Boolean flags
 
-**Never bypass capability checks.** Always enforce at Rust boundary with test coverage.
+**Never bypass capability checks.** Always enforce at Rust boundary with test coverage, and port the checks to the target stack instead of extending legacy implementations.
 
 ## Rust Best Practices
 
@@ -203,6 +212,7 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 4. **Update the triangle**: Keep runtime ↔ TypeScript `.d.ts` ↔ tests in sync
 5. **AST-first parsing**: Use `oxc` for JS/TS analysis; never regex parsing
 6. **Conformance first**: Check `ES_CONFORMANCE.md` before and after feature work. Track pass rate deltas.
+7. **Protect the migration boundary**: no new target-stack dependency on legacy crates.
 
 ## Current Work
 

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::editions;
 use crate::metadata::ExecutionMode;
-use crate::runner::{TestOutcome, TestResult};
+use crate::results::{TestOutcome, TestResult};
 
 /// Test run report
 #[derive(Debug, Clone, Serialize, Deserialize)]

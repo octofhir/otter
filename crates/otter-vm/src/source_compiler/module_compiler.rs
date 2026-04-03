@@ -69,6 +69,7 @@ impl<'a> ModuleCompiler<'a> {
         index
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile_function_from_statements(
         &mut self,
         function_index: FunctionIndex,
@@ -91,6 +92,7 @@ impl<'a> ModuleCompiler<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile_function_from_statements_with_options(
         &mut self,
         function_index: FunctionIndex,
@@ -136,6 +138,7 @@ impl<'a> ModuleCompiler<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile_function_from_expression(
         &mut self,
         function_index: FunctionIndex,

@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use num_traits::Zero;
+
 use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
 use crate::closure::{CaptureDescriptor, ClosureTemplate, UpvalueId};
@@ -1928,6 +1930,22 @@ impl RuntimeState {
         handle
     }
 
+    /// Allocates one BigInt heap value (no prototype — BigInt is a primitive type).
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    pub fn alloc_bigint(&mut self, value: &str) -> ObjectHandle {
+        self.objects.alloc_bigint(value)
+    }
+
+    /// Returns the decimal string backing a BigInt handle.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    pub fn bigint_value(&self, handle: ObjectHandle) -> Option<&str> {
+        self.objects.bigint_value(handle).ok().flatten()
+    }
+
     /// Allocates one fresh symbol primitive with a VM-wide stable identifier.
     pub fn alloc_symbol(&mut self) -> RegisterValue {
         self.alloc_symbol_with_description(None)
@@ -2863,6 +2881,8 @@ impl RuntimeState {
             .and_then(|value| value.as_object_handle().map(ObjectHandle)))
     }
 
+    /// §7.2.15 IsLooselyEqual(x, y)
+    /// <https://tc39.es/ecma262/#sec-islooselyequal>
     fn js_loose_eq(
         &mut self,
         lhs: RegisterValue,
@@ -2875,6 +2895,32 @@ impl RuntimeState {
             || (lhs == RegisterValue::null() && rhs == RegisterValue::undefined())
         {
             return Ok(true);
+        }
+
+        // §7.2.15 step 10-11: BigInt == Number comparison.
+        if lhs.is_bigint() && rhs.as_number().is_some() {
+            return self.bigint_equals_number(lhs, rhs);
+        }
+        if lhs.as_number().is_some() && rhs.is_bigint() {
+            return self.bigint_equals_number(rhs, lhs);
+        }
+
+        // §7.2.15 step 12-13: BigInt == String comparison.
+        if lhs.is_bigint() && self.value_is_string(rhs)? {
+            let rhs_str = self.js_to_string(rhs)?;
+            if let Ok(rhs_val) = rhs_str.parse::<num_bigint::BigInt>() {
+                let lhs_val = self.parse_bigint_value(lhs)?;
+                return Ok(lhs_val == rhs_val);
+            }
+            return Ok(false);
+        }
+        if self.value_is_string(lhs)? && rhs.is_bigint() {
+            let lhs_str = self.js_to_string(lhs)?;
+            if let Ok(lhs_val) = lhs_str.parse::<num_bigint::BigInt>() {
+                let rhs_val = self.parse_bigint_value(rhs)?;
+                return Ok(lhs_val == rhs_val);
+            }
+            return Ok(false);
         }
 
         let coerced_lhs = self.coerce_loose_equality_primitive(lhs)?;
@@ -2962,6 +3008,11 @@ impl RuntimeState {
                     .as_object_handle()
                     .expect("boxed number should return object handle"),
             ));
+        }
+        if value.is_bigint() {
+            let wrapper = self
+                .alloc_object_with_prototype(Some(self.intrinsics.bigint_prototype()));
+            return Ok(wrapper);
         }
         if value.is_symbol() {
             let object = box_symbol_object(value, self).map_err(|error| match error {
@@ -3147,6 +3198,14 @@ impl RuntimeState {
                 "Cannot convert a Symbol value to a string".into(),
             ));
         }
+        // §6.1.6.2.14 BigInt::toString(x)
+        if let Some(handle) = value.as_bigint_handle() {
+            let str_val = self
+                .objects
+                .bigint_value(ObjectHandle(handle))?
+                .unwrap_or("0");
+            return Ok(str_val.to_string().into_boxed_str());
+        }
         if let Some(number) = value.as_number() {
             let text = if number.is_nan() {
                 "NaN".to_string()
@@ -3185,6 +3244,7 @@ impl RuntimeState {
     }
 
     /// ES spec 7.1.4 ToNumber — converts a value to its numeric representation.
+    /// <https://tc39.es/ecma262/#sec-tonumber>
     pub fn js_to_number(&mut self, value: RegisterValue) -> Result<f64, InterpreterError> {
         if value == RegisterValue::undefined() {
             return Ok(f64::NAN);
@@ -3198,6 +3258,12 @@ impl RuntimeState {
         if value.is_symbol() {
             return Err(InterpreterError::TypeError(
                 "Cannot convert a Symbol value to a number".into(),
+            ));
+        }
+        // §7.1.4 step 1.e: BigInt → throw TypeError.
+        if value.is_bigint() {
+            return Err(InterpreterError::TypeError(
+                "Cannot convert a BigInt value to a number".into(),
             ));
         }
         if let Some(number) = value.as_number() {
@@ -3238,6 +3304,7 @@ impl RuntimeState {
     }
 
     /// ES spec 7.2.13 Abstract Relational Comparison.
+    /// <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
     /// Returns `Some(true)` for less-than, `Some(false)` for not less-than,
     /// `None` for undefined (NaN involved).
     fn js_abstract_relational_comparison(
@@ -3266,6 +3333,39 @@ impl RuntimeState {
             return Ok(Some(sx.as_ref() < sy.as_ref()));
         }
 
+        // §7.2.13 step 3.a: If both are BigInt, use BigInt::lessThan.
+        if px.is_bigint() && py.is_bigint() {
+            return self.bigint_less_than(px, py);
+        }
+
+        // §7.2.13 step 3.b: Mixed BigInt/Number comparison.
+        if px.is_bigint() && py.as_number().is_some() {
+            return self.bigint_number_less_than(px, py);
+        }
+        if px.as_number().is_some() && py.is_bigint() {
+            // number < bigint ≡ !(bigint < number) && !(bigint == number)
+            // But spec says: reverse roles in step 3.c.
+            return self.number_bigint_less_than(px, py);
+        }
+
+        // §7.2.13 step 3.d: Mixed BigInt + String comparison.
+        if px.is_bigint() && py_is_string {
+            let sy = self.js_to_string(py)?;
+            if let Ok(ny) = sy.parse::<num_bigint::BigInt>() {
+                let lhs_val = self.parse_bigint_value(px)?;
+                return Ok(Some(lhs_val < ny));
+            }
+            return Ok(None);
+        }
+        if px_is_string && py.is_bigint() {
+            let sx = self.js_to_string(px)?;
+            if let Ok(nx) = sx.parse::<num_bigint::BigInt>() {
+                let rhs_val = self.parse_bigint_value(py)?;
+                return Ok(Some(nx < rhs_val));
+            }
+            return Ok(None);
+        }
+
         // 4. Otherwise, coerce both to numbers.
         let nx = self.js_to_number(px)?;
         let ny = self.js_to_number(py)?;
@@ -3276,10 +3376,124 @@ impl RuntimeState {
         Ok(Some(nx < ny))
     }
 
+    /// Parse the BigInt value from a register into a `num_bigint::BigInt`.
+    fn parse_bigint_value(
+        &self,
+        value: RegisterValue,
+    ) -> Result<num_bigint::BigInt, InterpreterError> {
+        let handle = ObjectHandle(
+            value
+                .as_bigint_handle()
+                .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
+        );
+        let str_val = self
+            .objects
+            .bigint_value(handle)?
+            .ok_or(InterpreterError::InvalidHeapValueKind)?;
+        str_val
+            .parse()
+            .map_err(|_| InterpreterError::InvalidConstant)
+    }
+
+    /// §6.1.6.2.12 BigInt::lessThan(x, y)
+    /// <https://tc39.es/ecma262/#sec-numeric-types-bigint-lessThan>
+    fn bigint_less_than(
+        &self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<Option<bool>, InterpreterError> {
+        let lhs_val = self.parse_bigint_value(lhs)?;
+        let rhs_val = self.parse_bigint_value(rhs)?;
+        Ok(Some(lhs_val < rhs_val))
+    }
+
+    /// §7.2.13 step 3.b: BigInt < Number comparison.
+    fn bigint_number_less_than(
+        &self,
+        bigint_val: RegisterValue,
+        number_val: RegisterValue,
+    ) -> Result<Option<bool>, InterpreterError> {
+        let n = number_val.as_number().unwrap();
+        if n.is_nan() || n.is_infinite() {
+            return Ok(if n.is_nan() {
+                None
+            } else if n.is_sign_positive() {
+                Some(true) // bigint < +Infinity
+            } else {
+                Some(false) // bigint < -Infinity
+            });
+        }
+        let bv = self.parse_bigint_value(bigint_val)?;
+        // Convert number to integer for comparison.
+        let n_int = num_bigint::BigInt::from(n as i64);
+        if bv < n_int {
+            Ok(Some(true))
+        } else if bv > n_int {
+            Ok(Some(false))
+        } else {
+            // bv == n_int, but n may have fractional part
+            Ok(Some((n_int.to_string().parse::<f64>().unwrap_or(0.0)) < n))
+        }
+    }
+
+    /// §7.2.13 step 3.c: Number < BigInt comparison.
+    fn number_bigint_less_than(
+        &self,
+        number_val: RegisterValue,
+        bigint_val: RegisterValue,
+    ) -> Result<Option<bool>, InterpreterError> {
+        let n = number_val.as_number().unwrap();
+        if n.is_nan() || n.is_infinite() {
+            return Ok(if n.is_nan() {
+                None
+            } else if n.is_sign_positive() {
+                Some(false) // +Infinity < bigint → false
+            } else {
+                Some(true) // -Infinity < bigint → true
+            });
+        }
+        let bv = self.parse_bigint_value(bigint_val)?;
+        let n_int = num_bigint::BigInt::from(n as i64);
+        if n_int < bv {
+            Ok(Some(true))
+        } else if n_int > bv {
+            Ok(Some(false))
+        } else {
+            // n_int == bv, but n may have fractional part
+            Ok(Some(n < n_int.to_string().parse::<f64>().unwrap_or(0.0)))
+        }
+    }
+
+    /// §7.2.15 BigInt == Number comparison.
+    /// <https://tc39.es/ecma262/#sec-islooselyequal>
+    fn bigint_equals_number(
+        &self,
+        bigint_val: RegisterValue,
+        number_val: RegisterValue,
+    ) -> Result<bool, InterpreterError> {
+        let n = number_val.as_number().unwrap();
+        if n.is_nan() || n.is_infinite() {
+            return Ok(false);
+        }
+        // If n has a fractional part, it can never equal a BigInt.
+        if n.fract() != 0.0 {
+            return Ok(false);
+        }
+        let bv = self.parse_bigint_value(bigint_val)?;
+        let n_int = num_bigint::BigInt::from(n as i64);
+        Ok(bv == n_int)
+    }
+
     /// ES spec 7.1.2 ToBoolean — runtime-aware truthiness check.
+    /// <https://tc39.es/ecma262/#sec-toboolean>
     /// Unlike `RegisterValue::is_truthy()`, this correctly handles heap strings
-    /// (empty string "" is falsy).
+    /// (empty string "" is falsy) and BigInt (0n is falsy).
     pub(crate) fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        // §7.1.2 step 7: BigInt — 0n is falsy, all others truthy.
+        if let Some(handle) = value.as_bigint_handle() {
+            let str_val = self.objects.bigint_value(ObjectHandle(handle))?.unwrap_or("0");
+            return Ok(str_val != "0");
+        }
         // Fast path: non-object values use the NaN-box check.
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(value.is_truthy());
@@ -3496,28 +3710,130 @@ impl RuntimeState {
         Ok(false)
     }
 
+    /// §6.1.6.2 BigInt arithmetic helper — performs a binary operation on two
+    /// BigInt register values and returns the result as a new BigInt.
+    /// <https://tc39.es/ecma262/#sec-numeric-types-bigint-add>
+    fn bigint_binary_op(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+        op: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let lhs_handle = ObjectHandle(
+            lhs.as_bigint_handle()
+                .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
+        );
+        let rhs_handle = ObjectHandle(
+            rhs.as_bigint_handle()
+                .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
+        );
+
+        let lhs_str = self
+            .objects
+            .bigint_value(lhs_handle)?
+            .ok_or(InterpreterError::InvalidHeapValueKind)?;
+        let rhs_str = self
+            .objects
+            .bigint_value(rhs_handle)?
+            .ok_or(InterpreterError::InvalidHeapValueKind)?;
+
+        let lhs_val: num_bigint::BigInt = lhs_str
+            .parse()
+            .map_err(|_| InterpreterError::InvalidConstant)?;
+        let rhs_val: num_bigint::BigInt = rhs_str
+            .parse()
+            .map_err(|_| InterpreterError::InvalidConstant)?;
+
+        let result = op(&lhs_val, &rhs_val);
+        let handle = self.alloc_bigint(&result.to_string());
+        Ok(RegisterValue::from_bigint_handle(handle.0))
+    }
+
+    /// §6.1.6.2.10 BigInt::divide — truncating division, RangeError on zero divisor.
+    /// <https://tc39.es/ecma262/#sec-numeric-types-bigint-divide>
+    fn bigint_checked_div(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        self.bigint_binary_op(lhs, rhs, |a, b| {
+            if b.is_zero() {
+                // Caller would need to signal error; we use a sentinel approach below.
+                num_bigint::BigInt::from(0)
+            } else {
+                a / b
+            }
+        })
+        .and_then(|result| {
+            // Re-check for division by zero via the original rhs.
+            let rhs_handle = ObjectHandle(rhs.as_bigint_handle().unwrap());
+            let rhs_str = self.objects.bigint_value(rhs_handle).ok().flatten().unwrap_or("0");
+            if rhs_str == "0" {
+                return Err(InterpreterError::TypeError("Division by zero".into()));
+            }
+            Ok(result)
+        })
+    }
+
+    /// §6.1.6.2.11 BigInt::remainder — RangeError on zero divisor.
+    /// <https://tc39.es/ecma262/#sec-numeric-types-bigint-remainder>
+    fn bigint_checked_rem(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        // Check for zero divisor first.
+        let rhs_handle = ObjectHandle(
+            rhs.as_bigint_handle()
+                .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
+        );
+        let rhs_str = self
+            .objects
+            .bigint_value(rhs_handle)?
+            .ok_or(InterpreterError::InvalidHeapValueKind)?;
+        if rhs_str == "0" {
+            return Err(InterpreterError::TypeError("Division by zero".into()));
+        }
+        self.bigint_binary_op(lhs, rhs, |a, b| a % b)
+    }
+
+    /// §12.8.3 The Addition Operator ( + )
+    /// <https://tc39.es/ecma262/#sec-addition-operator-plus>
     fn js_add(
         &mut self,
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        let lhs = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
-        let rhs = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
-        let lhs_is_string = self.value_is_string(lhs)?;
-        let rhs_is_string = self.value_is_string(rhs)?;
+        // §13.15.3 ApplyStringOrNumericBinaryOperator — step 1-4: ToPrimitive first.
+        let lprim = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
+        let rprim = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
 
+        // §13.15.3 step 5: If either is a String, do string concatenation.
+        let lhs_is_string = self.value_is_string(lprim)?;
+        let rhs_is_string = self.value_is_string(rprim)?;
         if lhs_is_string || rhs_is_string {
-            let mut text = self.js_to_string(lhs)?.into_string();
-            text.push_str(&self.js_to_string(rhs)?);
+            let mut text = self.js_to_string(lprim)?.into_string();
+            text.push_str(&self.js_to_string(rprim)?);
             let value = self.alloc_string(text);
             return Ok(RegisterValue::from_object_handle(value.0));
         }
 
-        if let (Some(lhs_number), Some(rhs_number)) = (lhs.as_number(), rhs.as_number()) {
+        // §6.1.6.2.7 BigInt::add — both operands BigInt.
+        if lprim.is_bigint() && rprim.is_bigint() {
+            return self.bigint_binary_op(lprim, rprim, |a, b| a + b);
+        }
+        // Mixed BigInt + non-BigInt → TypeError (§12.15.3 step 6).
+        if lprim.is_bigint() || rprim.is_bigint() {
+            return Err(InterpreterError::TypeError(
+                "Cannot mix BigInt and other types, use explicit conversions".into(),
+            ));
+        }
+
+        if let (Some(lhs_number), Some(rhs_number)) = (lprim.as_number(), rprim.as_number()) {
             return Ok(RegisterValue::from_number(lhs_number + rhs_number));
         }
 
-        lhs.add_i32(rhs).map_err(InterpreterError::InvalidValue)
+        lprim.add_i32(rprim).map_err(InterpreterError::InvalidValue)
     }
 
     fn js_typeof(&mut self, value: RegisterValue) -> Result<RegisterValue, InterpreterError> {
@@ -3529,6 +3845,8 @@ impl RuntimeState {
             "boolean"
         } else if value.is_symbol() {
             "symbol"
+        } else if value.is_bigint() {
+            "bigint"
         } else if value.as_number().is_some() {
             "number"
         } else if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
@@ -3559,6 +3877,7 @@ impl RuntimeState {
                 | HeapValueKind::Proxy
                 | HeapValueKind::TypedArray
                 | HeapValueKind::DataView => "object",
+                HeapValueKind::BigInt => "bigint",
             }
         } else {
             "undefined"
@@ -4450,35 +4769,34 @@ impl Interpreter {
                     &[job.argument],
                 );
 
-                if let Some(result_promise) = job.result_promise {
-                    if !callback_is_self_settling {
-                        match call_result {
-                            Ok(handler_result) => {
-                                let resolve = runtime.objects.alloc_promise_capability_function(
-                                    result_promise,
-                                    crate::promise::ReactionKind::Fulfill,
-                                );
-                                let _ = Self::call_function(
-                                    runtime,
-                                    module,
-                                    resolve,
-                                    RegisterValue::undefined(),
-                                    &[handler_result],
-                                );
-                            }
-                            Err(InterpreterError::UncaughtThrow(reason)) => {
-                                if let Some(promise) =
-                                    runtime.objects.get_promise_mut(result_promise)
-                                {
-                                    if let Some(jobs) = promise.reject(reason) {
-                                        for j in jobs {
-                                            runtime.microtasks_mut().enqueue_promise_job(j);
-                                        }
-                                    }
+                if let Some(result_promise) = job.result_promise
+                    && !callback_is_self_settling
+                {
+                    match call_result {
+                        Ok(handler_result) => {
+                            let resolve = runtime.objects.alloc_promise_capability_function(
+                                result_promise,
+                                crate::promise::ReactionKind::Fulfill,
+                            );
+                            let _ = Self::call_function(
+                                runtime,
+                                module,
+                                resolve,
+                                RegisterValue::undefined(),
+                                &[handler_result],
+                            );
+                        }
+                        Err(InterpreterError::UncaughtThrow(reason)) => {
+                            if let Some(promise) =
+                                runtime.objects.get_promise_mut(result_promise)
+                                && let Some(jobs) = promise.reject(reason)
+                            {
+                                for j in jobs {
+                                    runtime.microtasks_mut().enqueue_promise_job(j);
                                 }
                             }
-                            Err(_) => {}
                         }
+                        Err(_) => {}
                     }
                 }
                 did_work = true;
@@ -4570,6 +4888,23 @@ impl Interpreter {
                     function,
                     instruction.a(),
                     RegisterValue::from_number(value),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §6.1.6.2 Load BigInt constant from side table.
+            // <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+            Opcode::LoadBigInt => {
+                let bigint_id = crate::bigint::BigIntId(instruction.b());
+                let value_str = function
+                    .bigint_constants()
+                    .get(bigint_id)
+                    .ok_or(InterpreterError::InvalidConstant)?;
+                let handle = runtime.alloc_bigint(value_str);
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bigint_handle(handle.0),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -4982,6 +5317,18 @@ impl Interpreter {
             Opcode::Sub => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // §6.1.6.2.8 BigInt::subtract
+                if lhs.is_bigint() && rhs.is_bigint() {
+                    let result = runtime.bigint_binary_op(lhs, rhs, |a, b| a - b)?;
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                if lhs.is_bigint() || rhs.is_bigint() {
+                    return Err(InterpreterError::TypeError(
+                        "Cannot mix BigInt and other types, use explicit conversions".into(),
+                    ));
+                }
                 let lhs_num = runtime.js_to_number(lhs)?;
                 let rhs_num = runtime.js_to_number(rhs)?;
                 activation.write_bytecode_register(
@@ -4995,6 +5342,18 @@ impl Interpreter {
             Opcode::Mul => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // §6.1.6.2.9 BigInt::multiply
+                if lhs.is_bigint() && rhs.is_bigint() {
+                    let result = runtime.bigint_binary_op(lhs, rhs, |a, b| a * b)?;
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                if lhs.is_bigint() || rhs.is_bigint() {
+                    return Err(InterpreterError::TypeError(
+                        "Cannot mix BigInt and other types, use explicit conversions".into(),
+                    ));
+                }
                 let lhs_num = runtime.js_to_number(lhs)?;
                 let rhs_num = runtime.js_to_number(rhs)?;
                 activation.write_bytecode_register(
@@ -5008,6 +5367,18 @@ impl Interpreter {
             Opcode::Div => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // §6.1.6.2.10 BigInt::divide — throws RangeError for division by zero.
+                if lhs.is_bigint() && rhs.is_bigint() {
+                    let result = runtime.bigint_checked_div(lhs, rhs)?;
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                if lhs.is_bigint() || rhs.is_bigint() {
+                    return Err(InterpreterError::TypeError(
+                        "Cannot mix BigInt and other types, use explicit conversions".into(),
+                    ));
+                }
                 let lhs_num = runtime.js_to_number(lhs)?;
                 let rhs_num = runtime.js_to_number(rhs)?;
                 activation.write_bytecode_register(
@@ -5110,10 +5481,21 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
-            // Mod uses ToNumber coercion.
+            // §6.1.6.2.11 BigInt::remainder / Mod uses ToNumber coercion.
             Opcode::Mod => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                if lhs.is_bigint() && rhs.is_bigint() {
+                    let result = runtime.bigint_checked_rem(lhs, rhs)?;
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                if lhs.is_bigint() || rhs.is_bigint() {
+                    return Err(InterpreterError::TypeError(
+                        "Cannot mix BigInt and other types, use explicit conversions".into(),
+                    ));
+                }
                 let lhs_num = runtime.js_to_number(lhs)?;
                 let rhs_num = runtime.js_to_number(rhs)?;
                 activation.write_bytecode_register(
@@ -5423,22 +5805,22 @@ impl Interpreter {
                 let key = activation.read_bytecode_register(function, instruction.c())?;
 
                 // §10.4.5.4 — TypedArray [[Get]] for numeric indices.
-                if runtime.objects.is_typed_array(handle) {
-                    if let Some(index) = Self::canonical_numeric_index(key) {
-                        let value = if index >= 0.0 && index == index.floor() {
-                            runtime
-                                .objects
-                                .typed_array_get_element(handle, index as usize)
-                                .unwrap_or(None)
-                                .map(RegisterValue::from_number)
-                                .unwrap_or(RegisterValue::undefined())
-                        } else {
-                            RegisterValue::undefined()
-                        };
-                        activation.write_bytecode_register(function, instruction.a(), value)?;
-                        activation.advance();
-                        return Ok(StepOutcome::Continue);
-                    }
+                if runtime.objects.is_typed_array(handle)
+                    && let Some(index) = Self::canonical_numeric_index(key)
+                {
+                    let value = if index >= 0.0 && index == index.floor() {
+                        runtime
+                            .objects
+                            .typed_array_get_element(handle, index as usize)
+                            .unwrap_or(None)
+                            .map(RegisterValue::from_number)
+                            .unwrap_or_default()
+                    } else {
+                        RegisterValue::undefined()
+                    };
+                    activation.write_bytecode_register(function, instruction.a(), value)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
                 }
 
                 let property = runtime.computed_property_name(key)?;
@@ -5472,19 +5854,19 @@ impl Interpreter {
                 let handle = runtime.property_set_target_handle(base)?;
 
                 // §10.4.5.5 — TypedArray [[Set]] for numeric indices.
-                if runtime.objects.is_typed_array(handle) {
-                    if let Some(index) = Self::canonical_numeric_index(key) {
-                        if index >= 0.0 && index == index.floor() {
-                            let num = runtime.js_to_number(value)?;
-                            let _ = runtime.objects.typed_array_set_element(
-                                handle,
-                                index as usize,
-                                num,
-                            );
-                        }
-                        activation.advance();
-                        return Ok(StepOutcome::Continue);
+                if runtime.objects.is_typed_array(handle)
+                    && let Some(index) = Self::canonical_numeric_index(key)
+                {
+                    if index >= 0.0 && index == index.floor() {
+                        let num = runtime.js_to_number(value)?;
+                        let _ = runtime.objects.typed_array_set_element(
+                            handle,
+                            index as usize,
+                            num,
+                        );
                     }
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
                 }
 
                 let property = runtime.computed_property_name(key)?;
@@ -6425,6 +6807,7 @@ impl Interpreter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generic_set_property(
         function: &Function,
         runtime: &mut RuntimeState,
@@ -6512,10 +6895,10 @@ impl Interpreter {
         if let Some(n) = key.as_i32() {
             return Some(f64::from(n));
         }
-        if let Some(n) = key.as_number() {
-            if !n.is_nan() {
-                return Some(n);
-            }
+        if let Some(n) = key.as_number()
+            && !n.is_nan()
+        {
+            return Some(n);
         }
         None
     }
@@ -7201,6 +7584,7 @@ mod tests {
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::exception::ExceptionTable;
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::{FrameFlags, FrameLayout};
     use crate::intrinsics::WellKnownSymbol;
@@ -7673,6 +8057,7 @@ mod tests {
                     PropertyNameTable::new(vec!["count"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -7713,6 +8098,7 @@ mod tests {
                     PropertyNameTable::new(vec!["count"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -7787,6 +8173,7 @@ mod tests {
                     PropertyNameTable::new(vec!["length"]),
                     StringTable::new(vec!["otter"]),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -7839,6 +8226,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -7909,6 +8297,7 @@ mod tests {
                     PropertyNameTable::new(vec!["ignored", "shared"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -7951,6 +8340,7 @@ mod tests {
                     PropertyNameTable::new(vec!["shared"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -8009,6 +8399,7 @@ mod tests {
                     PropertyNameTable::new(vec!["Math", "abs"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -8084,6 +8475,7 @@ mod tests {
                     PropertyNameTable::new(vec!["Math", "memory"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -8163,6 +8555,7 @@ mod tests {
                     PropertyNameTable::new(vec!["Object", "create", "valueOf"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -8278,6 +8671,7 @@ mod tests {
                     ]),
                     StringTable::new(vec!["function () { [native code] }"]),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         None,
@@ -8361,6 +8755,7 @@ mod tests {
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -8445,6 +8840,7 @@ mod tests {
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::default(),
                     crate::regexp::RegExpTable::default(),
@@ -8565,6 +8961,7 @@ mod tests {
                     PropertyNameTable::new(vec!["value"]),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Closure(ClosureCall::new(
@@ -8658,6 +9055,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Closure(ClosureCall::new(
@@ -8711,6 +9109,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Direct(DirectCall::new(
@@ -8772,6 +9171,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::new(vec![
                         None,
                         Some(ClosureTemplate::new(FunctionIndex(1), [])),
@@ -8840,6 +9240,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     CallTable::new(vec![
                         Some(CallSite::Closure(ClosureCall::new_with_receiver(
@@ -8964,6 +9365,7 @@ mod tests {
                     PropertyNameTable::default(),
                     StringTable::default(),
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::new(vec![
                         None,
                         Some(ClosureTemplate::new(

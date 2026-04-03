@@ -39,6 +39,9 @@ const TAG_SYMBOL: u64 = 0x7FF8_0002_0000_0000;
 const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const SYMBOL_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
+/// NaN-box pointer tag for heap-allocated BigInt values (§21.2).
+/// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+const TAG_PTR_BIGINT: u64 = 0x7FFD_0000_0000_0000;
 
 /// Shared register value cell for the new VM.
 ///
@@ -64,6 +67,9 @@ impl RegisterValue {
     #[must_use]
     pub const fn from_raw_bits(bits: u64) -> Option<Self> {
         if (bits & OBJECT_TAG_MASK) == TAG_PTR_OBJECT {
+            return Some(Self(bits));
+        }
+        if (bits & OBJECT_TAG_MASK) == TAG_PTR_BIGINT {
             return Some(Self(bits));
         }
 
@@ -143,6 +149,15 @@ impl RegisterValue {
         Self(TAG_PTR_OBJECT | handle as u64)
     }
 
+    /// Encodes a VM-local BigInt heap handle.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    #[must_use]
+    pub const fn from_bigint_handle(handle: u32) -> Self {
+        Self(TAG_PTR_BIGINT | handle as u64)
+    }
+
     /// Returns the raw NaN-boxed bits.
     #[must_use]
     pub const fn raw_bits(self) -> u64 {
@@ -177,6 +192,25 @@ impl RegisterValue {
         } else {
             None
         }
+    }
+
+    /// Decodes the value as a BigInt heap handle.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    #[must_use]
+    pub const fn as_bigint_handle(self) -> Option<u32> {
+        if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_BIGINT {
+            Some((self.0 & OBJECT_PAYLOAD_MASK) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether the value is a BigInt primitive.
+    #[must_use]
+    pub const fn is_bigint(self) -> bool {
+        (self.0 & OBJECT_TAG_MASK) == TAG_PTR_BIGINT
     }
 
     /// Decodes the value as a symbol identifier.
@@ -218,12 +252,17 @@ impl RegisterValue {
     }
 
     /// Returns whether the value is truthy in the minimal VM subset.
+    ///
+    /// §7.1.2 ToBoolean ( argument )
+    /// <https://tc39.es/ecma262/#sec-toboolean>
     #[must_use]
     pub fn is_truthy(self) -> bool {
         match self.0 {
             TAG_UNDEFINED | TAG_NULL | TAG_FALSE | TAG_NAN | TAG_HOLE => false,
             TAG_TRUE => true,
             _ if (self.0 & INT32_TAG_MASK) == TAG_INT32 => self.as_i32().unwrap_or(0) != 0,
+            // BigInt: 0n is falsy, all others truthy (§7.1.2 step 7)
+            _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_BIGINT => true, // caller must check "0" case via heap
             _ if !self.is_nan_boxed() => {
                 let number = f64::from_bits(self.0);
                 !number.is_nan() && number != 0.0
@@ -370,6 +409,13 @@ impl fmt::Debug for RegisterValue {
             _ if (self.0 & SYMBOL_TAG_MASK) == TAG_SYMBOL => {
                 write!(f, "Symbol({})", self.as_symbol_id().unwrap_or_default())
             }
+            _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_BIGINT => {
+                write!(
+                    f,
+                    "[bigint#{}]",
+                    self.as_bigint_handle().unwrap_or_default()
+                )
+            }
             _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_OBJECT => {
                 write!(
                     f,
@@ -391,7 +437,7 @@ impl fmt::Debug for RegisterValue {
 mod tests {
     use super::{
         INT32_TAG_MASK, RegisterValue, SYMBOL_TAG_MASK, TAG_FALSE, TAG_INT32, TAG_NAN, TAG_NULL,
-        TAG_PTR_OBJECT, TAG_SYMBOL, TAG_TRUE, TAG_UNDEFINED, ValueError,
+        TAG_PTR_BIGINT, TAG_PTR_OBJECT, TAG_SYMBOL, TAG_TRUE, TAG_UNDEFINED, ValueError,
     };
 
     #[test]
@@ -487,5 +533,24 @@ mod tests {
         assert_eq!(value.raw_bits(), TAG_PTR_OBJECT | 17);
         assert_eq!(value.as_object_handle(), Some(17));
         assert_eq!(format!("{value:?}"), "[object#17]");
+    }
+
+    #[test]
+    fn bigint_handles_round_trip() {
+        let value = RegisterValue::from_bigint_handle(42);
+
+        assert_eq!(value.raw_bits(), TAG_PTR_BIGINT | 42);
+        assert_eq!(value.as_bigint_handle(), Some(42));
+        assert!(value.is_bigint());
+        assert_eq!(value.as_object_handle(), None);
+        assert_eq!(value.as_number(), None);
+        assert_eq!(format!("{value:?}"), "[bigint#42]");
+    }
+
+    #[test]
+    fn bigint_from_raw_bits_accepted() {
+        let bits = TAG_PTR_BIGINT | 0x1234;
+        let value = RegisterValue::from_raw_bits(bits).expect("bigint handle should decode");
+        assert_eq!(value.as_bigint_handle(), Some(0x1234));
     }
 }

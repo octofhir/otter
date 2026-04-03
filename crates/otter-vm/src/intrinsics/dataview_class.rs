@@ -262,17 +262,16 @@ fn require_not_detached(
         .data_view_buffer(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let kind = runtime.objects().kind(buf);
-    if let Ok(HeapValueKind::ArrayBuffer) = kind {
-        if runtime
+    if let Ok(HeapValueKind::ArrayBuffer) = kind
+        && runtime
             .objects()
             .array_buffer_is_detached(buf)
             .unwrap_or(false)
-        {
-            return Err(type_error(
-                runtime,
-                &format!("{method_name}: viewed ArrayBuffer is detached"),
-            )?);
-        }
+    {
+        return Err(type_error(
+            runtime,
+            &format!("{method_name}: viewed ArrayBuffer is detached"),
+        )?);
     }
     Ok(())
 }
@@ -326,14 +325,13 @@ fn data_view_constructor(
     )?;
 
     // 4. If IsDetachedBuffer(buffer), throw TypeError.
-    if buf_kind == HeapValueKind::ArrayBuffer {
-        if runtime
+    if buf_kind == HeapValueKind::ArrayBuffer
+        && runtime
             .objects()
             .array_buffer_is_detached(buffer)
             .unwrap_or(false)
-        {
-            return Err(type_error(runtime, "DataView: buffer is detached")?);
-        }
+    {
+        return Err(type_error(runtime, "DataView: buffer is detached")?);
     }
 
     // 5. Let bufferByteLength be buffer.[[ArrayBufferByteLength]].
@@ -678,6 +676,7 @@ fn data_view_get_float64(
 }
 
 /// §25.3.4.4 DataView.prototype.getBigInt64 ( byteOffset [ , littleEndian ] )
+/// <https://tc39.es/ecma262/#sec-dataview.prototype.getbigint64>
 fn data_view_get_big_int64(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -693,12 +692,12 @@ fn data_view_get_big_int64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    // TODO: Return BigInt when we have BigInt support.
-    // For now, return as Number (lossy for values > 2^53).
-    Ok(RegisterValue::from_number(val as f64))
+    let handle = runtime.alloc_bigint(&val.to_string());
+    Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
-/// §25.3.4.4 DataView.prototype.getBigUint64 ( byteOffset [ , littleEndian ] )
+/// §25.3.4.5 DataView.prototype.getBigUint64 ( byteOffset [ , littleEndian ] )
+/// <https://tc39.es/ecma262/#sec-dataview.prototype.getbiguint64>
 fn data_view_get_big_uint64(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -714,7 +713,8 @@ fn data_view_get_big_uint64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    Ok(RegisterValue::from_number(val as f64))
+    let handle = runtime.alloc_bigint(&val.to_string());
+    Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
 // ── Set methods ──────────────────────────────────────────────────────
@@ -886,14 +886,13 @@ fn data_view_set_float64(
 }
 
 /// §25.3.4.25 DataView.prototype.setBigInt64 ( byteOffset, value [ , littleEndian ] )
+/// <https://tc39.es/ecma262/#sec-dataview.prototype.setbigint64>
 fn data_view_set_big_int64(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // TODO: ToBigInt when BigInt support exists. For now, ToNumber → i64.
-    let num = to_number_arg(args, 1, runtime)?;
-    let val = num as i64;
+    let val = to_bigint_i64(args, 1, runtime)?;
     let bytes = if is_little_endian(args, 2) {
         val.to_le_bytes()
     } else {
@@ -910,13 +909,13 @@ fn data_view_set_big_int64(
 }
 
 /// §25.3.4.26 DataView.prototype.setBigUint64 ( byteOffset, value [ , littleEndian ] )
+/// <https://tc39.es/ecma262/#sec-dataview.prototype.setbiguint64>
 fn data_view_set_big_uint64(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let num = to_number_arg(args, 1, runtime)?;
-    let val = num as u64;
+    let val = to_bigint_u64(args, 1, runtime)?;
     let bytes = if is_little_endian(args, 2) {
         val.to_le_bytes()
     } else {
@@ -930,6 +929,56 @@ fn data_view_set_big_uint64(
         &bytes,
         "DataView.prototype.setBigUint64",
     )
+}
+
+/// Helper: extract BigInt argument at given index and convert to `i64`.
+///
+/// §7.1.13 ToBigInt — applied to the value argument for setBigInt64.
+fn to_bigint_i64(
+    args: &[RegisterValue],
+    index: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<i64, VmNativeCallError> {
+    let val = args
+        .get(index)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = val.as_bigint_handle() else {
+        return Err(type_error(
+            runtime,
+            "Cannot convert a non-BigInt value to a BigInt",
+        )?);
+    };
+    let s = runtime
+        .bigint_value(ObjectHandle(handle))
+        .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;
+    Ok(s.parse::<i64>().unwrap_or(0))
+}
+
+/// Helper: extract BigInt argument at given index and convert to `u64`.
+///
+/// §7.1.13 ToBigInt — applied to the value argument for setBigUint64.
+fn to_bigint_u64(
+    args: &[RegisterValue],
+    index: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<u64, VmNativeCallError> {
+    let val = args
+        .get(index)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let Some(handle) = val.as_bigint_handle() else {
+        return Err(type_error(
+            runtime,
+            "Cannot convert a non-BigInt value to a BigInt",
+        )?);
+    };
+    let s = runtime
+        .bigint_value(ObjectHandle(handle))
+        .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;
+    // For BigUint64, parse as i128 first to handle large positive values and wrap.
+    let parsed: i128 = s.parse().unwrap_or(0);
+    Ok(parsed as u64)
 }
 
 /// Helper: extract numeric argument at given index.

@@ -675,6 +675,7 @@ fn object_to_string_tag(
         HeapValueKind::Proxy => Ok("Object"),
         HeapValueKind::TypedArray => Ok("TypedArray"),
         HeapValueKind::DataView => Ok("DataView"),
+        HeapValueKind::BigInt => Ok("BigInt"),
     }
 }
 
@@ -1562,10 +1563,10 @@ fn proxy_enumerable_own_keys(
         let desc = runtime
             .proxy_get_own_property_descriptor(target, key)
             .map_err(interp_to_native)?;
-        if let Some(pv) = desc {
-            if pv.attributes().enumerable() {
-                result.push(key);
-            }
+        if let Some(pv) = desc
+            && pv.attributes().enumerable()
+        {
+            result.push(key);
         }
     }
     Ok(result)

@@ -10,6 +10,29 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 
 > **Note:** The VM is under active development. Some features (full Web APIs) are being added incrementally.
 
+## Migration Status
+
+The target runtime stack is:
+
+- `crates/otter-gc`
+- `crates/otter-vm`
+- `crates/otter-runtime`
+
+The legacy stack is frozen and must be retired incrementally:
+
+- `crates/otter-engine`
+- `crates/otter-vm-runtime`
+- `crates/otter-vm-core`
+- any crate that still requires them transitively
+
+Migration policy:
+
+- New runtime, VM, Web API, extension, Node.js API, FFI, KV, and SQL work must target the new stack.
+- Do not introduce new dependencies from target-stack crates to legacy crates.
+- Port in vertical slices; temporary coexistence is allowed, but dependency direction must always move toward the new stack.
+- If a legacy crate is no longer referenced by any live workspace member, remove it from `[workspace].members` so it stops participating in `cargo check`, `cargo test`, and `cargo build`.
+- Removing a crate from `[workspace].members` is not sufficient if an active crate still depends on it by path; Cargo will still compile it.
+
 ## Agent Checklist (per task)
 
 1. **Confirm intent + constraints**: Web API compatibility? sandbox/permissions? performance target? platform?
@@ -19,23 +42,32 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 5. **Respect safety boundaries**: follow the `unsafe` rules and GC invariants below.
 6. **Update the "triangle" when needed**: runtime behavior ↔ TypeScript `.d.ts` ↔ docs/examples/tests.
 7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
+8. **Protect the migration boundary**: no new imports from target-stack crates into legacy crates, and no new imports from target-stack crates back to legacy crates.
+9. **Prefer build-graph cleanup**: when a migration slice lands, check whether any legacy crate can be removed from the active workspace/build graph immediately.
 
 ## Repository Map (where to change what)
 
-### VM Core (new architecture)
-- `crates/otter-vm-bytecode`: bytecode instruction definitions and constants.
-- `crates/otter-vm-gc`: garbage collector with mark-sweep and generational collection.
-- `crates/otter-vm-core`: bytecode interpreter, value representation, objects, strings.
-- `crates/otter-vm-compiler`: JS/TS to bytecode compiler using oxc parser.
-- `crates/otter-vm-runtime`: runtime and event loop primitives.
+### Target Runtime Stack
+- `crates/otter-gc`: target garbage collector.
+- `crates/otter-vm`: target VM, interpreter, value model, intrinsics, source compiler.
+- `crates/otter-runtime`: target public runtime and embedding surface.
 
 ### Supporting crates
 - `crates/otter-macros`: `#[dive]` proc-macro for native function bindings.
-- `crates/otter-engine`: module loader/graph, capabilities (permissions), isolated env store.
+- `crates/otter-nodejs`: Node.js API compatibility layer to be ported onto the target stack.
+- `crates/otter-ffi`: FFI bridge to be ported onto the target stack.
 - `crates/otter-pm`: package management + bundled type definitions (`@types/otter`).
-- `crates/otter-sql`: SQLite + PostgreSQL database support.
-- `crates/otter-kv`: key-value store backed by redb.
+- `crates/otter-sql`: SQLite + PostgreSQL support to be exposed through the target extension/runtime layer.
+- `crates/otter-kv`: key-value store to be exposed through the target extension/runtime layer.
 - `crates/otterjs`: CLI (`otter`) and config (`otter.toml`).
+
+### Legacy Stack (frozen; port away from it)
+- `crates/otter-engine`
+- `crates/otter-vm-runtime`
+- `crates/otter-vm-core`
+- `crates/otter-vm-gc`
+- `crates/otter-jit`
+- `crates/otter-node-compat`
 
 ## File Naming Conventions
 
@@ -57,16 +89,14 @@ This separation:
 - Makes it easy to find the right implementation
 - Maintains consistency across modules
 
-### Intrinsic Registration Pattern
+### Intrinsic and Bootstrap Pattern
 
-New ECMAScript builtins, global namespaces, and Web API globals must follow the
-trait-based intrinsic registration flow used in `crates/otter-vm-core/src/builtin_builder.rs`.
+New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the target-stack descriptor/builder/bootstrap flow described in `OTTER_VM_SPEC_PLAN.md`.
 
-- Expose exactly one module entrypoint: `pub struct XIntrinsic` or `pub struct XNamespace` implementing `IntrinsicObject`.
-- In `Intrinsics::init_core()` and `Intrinsics::install_on_global()`, only dispatch `IntrinsicObject::init(&ctx)` calls. Do not add ad-hoc property definitions or object construction there.
-- Use `BuiltInBuilder` for constructor/prototype pairs and `NamespaceBuilder` for plain namespace objects.
-- If a module needs helper functions, keep them module-private and use names like `build_*`, `populate_*`, or `define_*`. Do not introduce new public `install_*` / `init_*` registration entrypoints.
-- If the builtin needs pre-allocated intrinsic objects, add them to `Intrinsics::allocate()`, wire their prototype chain in `Intrinsics::wire_prototype_chains()`, and populate them from the owning module's `IntrinsicObject::init()`.
+- Add new bootstrap work in `crates/otter-vm` / `crates/otter-runtime`, not in legacy crates.
+- Keep global installation centralized; do not scatter ad-hoc global mutation across unrelated modules.
+- Prefer descriptor/builder style APIs over one-off registration functions when exposing JS-visible constructors, prototypes, and namespaces.
+- If a feature still exists only in the legacy stack, port it; do not extend the legacy bootstrap surface further.
 
 ## Development Philosophy
 
@@ -88,15 +118,13 @@ trait-based intrinsic registration flow used in `crates/otter-vm-core/src/builti
 
 ### Async model
 
-- Timers are runtime primitives, not Node-specific APIs:
-  - `setTimeout`, `setInterval`, `setImmediate`, `queueMicrotask` must come from `otter-vm-runtime`.
-  - `node:timers` / `timers` must re-export runtime globals, not maintain a separate timer backend.
-- Promise settlement for async native APIs must go through JS job queues:
-  - Use `JsPromise::with_resolvers(...)` and enqueue through `ncx.js_job_queue()`.
-  - Do not settle promises directly from worker threads.
-- Worker tasks may execute only plain Rust async work (Tokio); VM/JS interaction must be marshalled back onto VM thread via queued jobs.
-- For stream/iterator-like async APIs (e.g. `timers/promises.setInterval()`), use explicit pending queues (for example `VecDeque`) and deterministic delivery semantics.
-- In `otter-nodejs` extension code, prefer `std::sync` primitives (`Mutex`, atomics) plus queue handoff; avoid introducing new `parking_lot` usage there unless explicitly justified.
+- Timers are target-runtime primitives, not Node-specific APIs:
+  - `setTimeout`, `setInterval`, `setImmediate`, `queueMicrotask` must belong to the target stack.
+  - `node:timers` / `timers` must re-export target runtime globals, not maintain a separate backend.
+- Promise settlement for async native APIs must go through the target VM/runtime job queue.
+- Worker tasks may execute plain Rust async work, but VM/JS interaction must hop back onto the target runtime's scheduling boundary.
+- For stream/iterator-like async APIs, use explicit pending queues and deterministic delivery semantics.
+- When porting async code from the legacy stack, move semantics first and adapter glue second; do not preserve legacy runtime abstractions just for compatibility.
 
 ## Common Pitfalls to Avoid
 
@@ -160,8 +188,9 @@ just fmt && just lint && just test
 Justfile shortcuts available: `just fmt`, `just lint`, `just test`, `just build`, `just release`
 
 Fast iteration tips:
-- Run VM tests: `cargo test -p otter-vm-core` / `cargo test -p otter-vm-compiler`
-- Run a single crate: `cargo test -p otter-engine`
+- Run target VM tests: `cargo test -p otter-vm`
+- Run target runtime tests: `cargo test -p otter-runtime`
+- Run a single support crate after porting work there: `cargo test -p otter-nodejs`, `cargo test -p otter-kv`, etc.
 
 ## Architecture
 
@@ -170,30 +199,27 @@ Fast iteration tips:
 ```
 otterjs (CLI -> `otter`)
     ↓
-otter-engine (ESM loader, module graph, capabilities)
+target host/runtime integration layer
     ↓
-otter-vm-runtime (runtime with builtins)
+otter-runtime
     ↓
-otter-vm-core (interpreter, values, objects)
+otter-vm
     ↓
-otter-vm-compiler (JS/TS -> bytecode)
-    ↓
-otter-vm-bytecode (instruction definitions)
-    ↓
-otter-vm-gc (garbage collector)
+otter-gc
 ```
 
 Supporting crates:
 - `otter-macros` - `#[dive]` proc-macro for registering native Rust functions callable from JS
+- `otter-nodejs` / `otter-ffi` / `otter-kv` / `otter-sql` - support crates to be ported onto the target runtime
 - `otter-pm` - NPM package manager integration
 
 ### Key Architectural Constraints
 
-1. **GC Safety**: Values must be properly rooted when stored across GC boundaries. Use `GcRoot<T>` for long-lived references.
+1. **GC Safety**: Values must be properly rooted when stored across GC boundaries. Use the target stack's GC/reference types and rooting patterns; do not introduce new long-lived GC ownership patterns only in legacy crates.
 
-2. **Value Representation**: NaN-boxing is used for efficient value storage. See `otter-vm-core/src/value.rs`.
+2. **Value Representation**: The target value model lives in `crates/otter-vm/src/value.rs`. Do not add new JS-visible value ABI work to legacy crates.
 
-3. **Object Model**: Objects use hidden classes for property access optimization. See `otter-vm-core/src/object.rs`.
+3. **Object Model**: The target object model lives in `crates/otter-vm/src/object.rs`. Object semantics, property behavior, and host object integration should move there over time.
 
 4. **Async ops require Tokio**: async ops are scheduled onto a Tokio runtime handle (thread-local).
 
@@ -204,14 +230,15 @@ Supporting crates:
 
 Native functions are registered via runtime/engine extensions. Example:
 ```rust
-use otter_vm_core::{Value, VmError};
+use otter_vm::descriptors::VmNativeCallError;
+use otter_vm::value::RegisterValue;
 
-pub fn console_log(args: &[Value]) -> Result<Value, VmError> {
+pub fn console_log(args: &[RegisterValue]) -> Result<RegisterValue, VmNativeCallError> {
     for arg in args {
-        print!("{}", arg.to_string());
+        print!("{arg:?}");
     }
     println!();
-    Ok(Value::undefined())
+    Ok(RegisterValue::undefined())
 }
 ```
 
@@ -266,7 +293,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 - Trace schema fields:
   - VM instruction trace JSON includes `otterTraceSchemaVersion` + `traceEvents`.
   - Async trace JSON includes `otterAsyncTraceSchemaVersion` + `traceEvents`.
-  - Async trace parent/count validation (runtime async-op burst): `cargo test -p otter-vm-runtime --features profiling test_async_trace_links_parent_child_across_async_hop`
+  - Async trace parent/count validation: run the relevant target-runtime profiling tests once that coverage lives on the target stack.
 
 ### Debug Workflows (engine improvement)
 
@@ -303,7 +330,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 
 ## Security Model
 
-Capability-based, deny-by-default (via `otter-engine`):
+Capability-based, deny-by-default. During migration this may still be implemented partly in legacy crates, but all new permission work must target the new runtime integration layer:
 - `fs_read`, `fs_write` - Path allowlists
 - `net` - Host allowlists
 - `env` - Variable allowlists with built-in deny patterns for secrets (AWS_*, *_SECRET*, etc.)
@@ -311,7 +338,7 @@ Capability-based, deny-by-default (via `otter-engine`):
 
 Practical rules when adding/altering APIs:
 - **Never bypass capabilities**; enforce checks in the Rust boundary and cover with tests.
-- **Env access must stay isolated**: use `otter-engine`'s `IsolatedEnvStore` / `EnvStoreBuilder` (default deny + deny patterns).
+- **Env access must stay isolated**: preserve default deny behavior and secret deny patterns while porting env access to the target stack.
 
 ## TypeScript / Types
 
@@ -330,8 +357,8 @@ Practical rules when adding/altering APIs:
 
 ## Benchmarks
 
-- VM tests: `cargo test -p otter-vm-core`
-- Compiler tests: `cargo test -p otter-vm-compiler`
+- VM tests: `cargo test -p otter-vm`
+- Runtime tests: `cargo test -p otter-runtime`
 - Test262 conformance: `cargo test -p otter-test262`
 - Phase-by-phase cross-runtime baseline (Otter/Node/Bun/Deno): `benchmarks/cpu/phase_baseline.sh`
   - Runs Otter in release mode (`target/release/otter`) and enforces `OTTER_TIMEOUT_SECONDS <= 45` for comparability.
@@ -369,8 +396,8 @@ After each fix, re-run and document the delta:
 ### 4. Validate No Regressions
 Run full test suite after changes to core modules:
 ```bash
-cargo test -p otter-vm-core
-cargo test -p otter-vm-runtime
+cargo test -p otter-vm
+cargo test -p otter-runtime
 ```
 
 ## Conformance Tracking

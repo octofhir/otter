@@ -17,6 +17,7 @@ pub(crate) use property_descriptor::{
 };
 
 /// ES2024 §7.2.14 IsStrictlyEqual(x, y).
+/// <https://tc39.es/ecma262/#sec-isstrictlyequal>
 pub fn is_strictly_equal(
     heap: &ObjectHeap,
     lhs: RegisterValue,
@@ -33,10 +34,16 @@ pub fn is_strictly_equal(
         return Ok(true);
     }
 
+    // §7.2.14 step 2: If Type(x) is BigInt, return BigInt::equal(x, y).
+    if let Some(result) = compare_bigint_primitives(heap, lhs, rhs)? {
+        return Ok(result);
+    }
+
     compare_string_primitives(heap, lhs, rhs).map(|result| result.unwrap_or(false))
 }
 
 /// ES2024 §7.2.9 SameValue(x, y).
+/// <https://tc39.es/ecma262/#sec-samevalue>
 pub fn same_value(
     heap: &ObjectHeap,
     lhs: RegisterValue,
@@ -44,6 +51,10 @@ pub fn same_value(
 ) -> Result<bool, ObjectError> {
     if let (Some(lhs_num), Some(rhs_num)) = (lhs.as_number(), rhs.as_number()) {
         return Ok(number_same_value(lhs_num, rhs_num));
+    }
+
+    if let Some(result) = compare_bigint_primitives(heap, lhs, rhs)? {
+        return Ok(result);
     }
 
     if let Some(result) = compare_string_primitives(heap, lhs, rhs)? {
@@ -54,6 +65,7 @@ pub fn same_value(
 }
 
 /// ES2024 §7.2.10 SameValueZero(x, y).
+/// <https://tc39.es/ecma262/#sec-samevaluezero>
 pub fn same_value_zero(
     heap: &ObjectHeap,
     lhs: RegisterValue,
@@ -61,6 +73,10 @@ pub fn same_value_zero(
 ) -> Result<bool, ObjectError> {
     if let (Some(lhs_num), Some(rhs_num)) = (lhs.as_number(), rhs.as_number()) {
         return Ok(number_same_value_zero(lhs_num, rhs_num));
+    }
+
+    if let Some(result) = compare_bigint_primitives(heap, lhs, rhs)? {
+        return Ok(result);
     }
 
     if let Some(result) = compare_string_primitives(heap, lhs, rhs)? {
@@ -98,6 +114,33 @@ fn to_property_key_string(
     runtime.js_to_string(value).map_err(|error| {
         VmNativeCallError::Internal(format!("ToPropertyKey string coercion failed: {error}").into())
     })
+}
+
+/// Compares two BigInt values by their decimal string representation.
+///
+/// Returns `Some(true/false)` when both operands are BigInt, `None` otherwise.
+/// §6.1.6.2.13 BigInt::equal(x, y)
+/// <https://tc39.es/ecma262/#sec-numeric-types-bigint-equal>
+fn compare_bigint_primitives(
+    heap: &ObjectHeap,
+    lhs: RegisterValue,
+    rhs: RegisterValue,
+) -> Result<Option<bool>, ObjectError> {
+    let Some(lhs_handle) = lhs.as_bigint_handle() else {
+        return Ok(None);
+    };
+    let Some(rhs_handle) = rhs.as_bigint_handle() else {
+        return Ok(None);
+    };
+
+    let Some(lhs_value) = heap.bigint_value(ObjectHandle(lhs_handle))? else {
+        return Ok(None);
+    };
+    let Some(rhs_value) = heap.bigint_value(ObjectHandle(rhs_handle))? else {
+        return Ok(None);
+    };
+
+    Ok(Some(lhs_value == rhs_value))
 }
 
 fn compare_string_primitives(

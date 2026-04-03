@@ -6,6 +6,7 @@ use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use crate::call::{CallSite, CallTable, ClosureCall, DirectCall};
 use crate::closure::{CaptureDescriptor, ClosureTable, ClosureTemplate, UpvalueId};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+use crate::bigint::BigIntTable;
 use crate::float::FloatTable;
 use crate::frame::{FrameFlags, FrameLayout};
 use crate::interpreter::{ExecutionResult, Interpreter, InterpreterError};
@@ -276,6 +277,7 @@ fn object_property_case() -> SmokeCase {
                 PropertyNameTable::new(vec!["count"]),
                 StringTable::default(),
                 FloatTable::default(),
+                BigIntTable::default(),
                 ClosureTable::default(),
                 CallTable::default(),
                 crate::regexp::RegExpTable::default(),
@@ -360,6 +362,7 @@ fn string_array_case() -> SmokeCase {
                 PropertyNameTable::new(vec!["length"]),
                 StringTable::new(vec!["otter"]),
                 FloatTable::default(),
+                BigIntTable::default(),
                 ClosureTable::default(),
                 CallTable::default(),
                 crate::regexp::RegExpTable::default(),
@@ -406,6 +409,7 @@ fn direct_call_case() -> SmokeCase {
                 PropertyNameTable::default(),
                 StringTable::default(),
                 FloatTable::default(),
+                BigIntTable::default(),
                 ClosureTable::default(),
                 CallTable::new(vec![
                     None,
@@ -480,6 +484,7 @@ fn closure_case() -> SmokeCase {
                 PropertyNameTable::default(),
                 StringTable::default(),
                 FloatTable::default(),
+                BigIntTable::default(),
                 ClosureTable::new(vec![
                     None,
                     Some(ClosureTemplate::new(

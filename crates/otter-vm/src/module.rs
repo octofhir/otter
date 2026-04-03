@@ -2,6 +2,7 @@
 
 use core::fmt;
 
+use crate::bigint::BigIntTable;
 use crate::bytecode::Bytecode;
 use crate::call::CallTable;
 use crate::closure::ClosureTable;
@@ -44,6 +45,7 @@ pub struct FunctionSideTables {
     property_names: PropertyNameTable,
     string_literals: StringTable,
     float_constants: FloatTable,
+    bigint_constants: BigIntTable,
     closures: ClosureTable,
     calls: CallTable,
     regexp_literals: RegExpTable,
@@ -56,6 +58,7 @@ impl FunctionSideTables {
         property_names: PropertyNameTable,
         string_literals: StringTable,
         float_constants: FloatTable,
+        bigint_constants: BigIntTable,
         closures: ClosureTable,
         calls: CallTable,
         regexp_literals: RegExpTable,
@@ -64,6 +67,7 @@ impl FunctionSideTables {
             property_names,
             string_literals,
             float_constants,
+            bigint_constants,
             closures,
             calls,
             regexp_literals,
@@ -83,6 +87,7 @@ impl Default for FunctionSideTables {
             PropertyNameTable::default(),
             StringTable::default(),
             FloatTable::default(),
+            BigIntTable::default(),
             ClosureTable::default(),
             CallTable::default(),
             RegExpTable::default(),
@@ -154,6 +159,7 @@ pub struct Function {
     property_names: PropertyNameTable,
     string_literals: StringTable,
     float_constants: FloatTable,
+    bigint_constants: BigIntTable,
     closures: ClosureTable,
     calls: CallTable,
     regexp_literals: RegExpTable,
@@ -174,7 +180,7 @@ impl Function {
     ) -> Self {
         Self::new_with_length(
             name,
-            u16::from(frame_layout.parameter_count()),
+            frame_layout.parameter_count(),
             frame_layout,
             bytecode,
             tables,
@@ -202,6 +208,7 @@ impl Function {
             property_names: tables.side_tables.property_names,
             string_literals: tables.side_tables.string_literals,
             float_constants: tables.side_tables.float_constants,
+            bigint_constants: tables.side_tables.bigint_constants,
             closures: tables.side_tables.closures,
             calls: tables.side_tables.calls,
             regexp_literals: tables.side_tables.regexp_literals,
@@ -325,6 +332,13 @@ impl Function {
         &self.float_constants
     }
 
+    /// Returns the BigInt-constant side table.
+    /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    #[must_use]
+    pub fn bigint_constants(&self) -> &BigIntTable {
+        &self.bigint_constants
+    }
+
     /// Returns the closure-creation side table.
     #[must_use]
     pub fn closures(&self) -> &ClosureTable {
@@ -440,6 +454,7 @@ mod tests {
     use crate::deopt::{DeoptId, DeoptSite, DeoptTable};
     use crate::exception::{ExceptionHandler, ExceptionTable};
     use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+    use crate::bigint::BigIntTable;
     use crate::float::FloatTable;
     use crate::frame::FrameLayout;
     use crate::property::PropertyNameTable;
@@ -481,6 +496,7 @@ mod tests {
                     property_names,
                     string_literals,
                     FloatTable::default(),
+                    BigIntTable::default(),
                     ClosureTable::default(),
                     calls,
                     crate::regexp::RegExpTable::default(),

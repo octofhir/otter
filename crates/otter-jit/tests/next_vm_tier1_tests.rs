@@ -9,6 +9,7 @@ use otter_vm::RegisterValue;
 use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use otter_vm::call::{CallSite, CallTable, DirectCall};
 use otter_vm::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
+use otter_vm::bigint::BigIntTable;
 use otter_vm::float::FloatTable;
 use otter_vm::frame::FrameFlags;
 use otter_vm::frame::FrameLayout;
@@ -93,6 +94,7 @@ fn property_loop_module() -> Module {
                 PropertyNameTable::new(vec!["count"]),
                 StringTable::default(),
                 FloatTable::default(),
+                BigIntTable::default(),
                 otter_vm::closure::ClosureTable::default(),
                 CallTable::default(),
                 RegExpTable::default(),
@@ -136,6 +138,7 @@ fn direct_call_module() -> Module {
                 PropertyNameTable::default(),
                 StringTable::default(),
                 FloatTable::default(),
+                BigIntTable::default(),
                 otter_vm::closure::ClosureTable::default(),
                 CallTable::new(vec![
                     None,

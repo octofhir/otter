@@ -51,7 +51,7 @@ fn print_human_readable(info: &RuntimeInfo) {
     println!(
         "  VM Engine:   {}",
         if info.features.vm {
-            "otter-vm-core"
+            "otter-vm + otter-runtime"
         } else {
             "disabled"
         }
@@ -103,7 +103,7 @@ impl RuntimeInfo {
                 typescript: true,
                 type_check: false, // tsgo integration pending
                 esm: true,
-                vm: true, // Using otter-vm-core
+                vm: true, // Using the target VM stack
             },
             paths: Paths {
                 cwd: std::env::current_dir()

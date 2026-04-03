@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::report::PersistedReport;
-use crate::runner::TestOutcome;
+use crate::results::TestOutcome;
 
 /// Comparison between two test runs
 #[derive(Debug)]

@@ -9,6 +9,8 @@
 
 /// Shared execution ABI.
 pub mod abi;
+/// BigInt-constant side tables.
+pub mod bigint;
 /// ECMAScript abstract operations shared across interpreter and intrinsics.
 pub mod abstract_ops;
 /// Suspended async function context for await support.

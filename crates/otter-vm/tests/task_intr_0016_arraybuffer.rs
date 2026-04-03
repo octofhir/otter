@@ -307,9 +307,7 @@ fn array_buffer_is_view_returns_false_for_non_views() {
 #[test]
 fn array_buffer_species_getter() {
     let r = run(
-        concat!(
-            "assert.sameValue(ArrayBuffer[Symbol.species], ArrayBuffer, '@@species returns constructor');\n",
-        ),
+        "assert.sameValue(ArrayBuffer[Symbol.species], ArrayBuffer, '@@species returns constructor');\n",
         "arraybuffer-species.js",
     );
     assert_eq!(r, RegisterValue::from_i32(0));

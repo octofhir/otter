@@ -221,6 +221,11 @@ pub enum Opcode {
     /// pattern and flags, and stores the handle in `dst`.
     /// Spec: <https://tc39.es/ecma262/#sec-regexp-regular-expression-literals>
     NewRegExp = 0x61,
+    /// Load a BigInt constant from the constant pool.
+    /// `LoadBigInt dst, constant_index` — allocates a BigInt heap value from the
+    /// constant pool entry at `constant_index` and stores the handle in `dst`.
+    /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    LoadBigInt = 0x62,
 }
 
 impl Opcode {
@@ -306,6 +311,7 @@ impl Opcode {
             0x5E => Some(Self::ToString),
             0x60 => Some(Self::Yield),
             0x61 => Some(Self::NewRegExp),
+            0x62 => Some(Self::LoadBigInt),
             _ => None,
         }
     }
@@ -630,6 +636,18 @@ impl Instruction {
             Opcode::NewRegExp,
             dst,
             BytecodeRegister::new(regexp_id.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a BigInt-constant load from the BigInt side table.
+    /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    #[must_use]
+    pub const fn load_bigint(dst: BytecodeRegister, bigint_id: crate::bigint::BigIntId) -> Self {
+        Self::encode_abc(
+            Opcode::LoadBigInt,
+            dst,
+            BytecodeRegister::new(bigint_id.0),
             BytecodeRegister::new(0),
         )
     }

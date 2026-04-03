@@ -55,10 +55,8 @@ pub(super) fn collect_binding_identifier_names(
             }
         }
         BindingPattern::ArrayPattern(array_pattern) => {
-            for element in &array_pattern.elements {
-                if let Some(element) = element {
-                    collect_binding_identifier_names(element, names);
-                }
+            for element in array_pattern.elements.iter().flatten() {
+                collect_binding_identifier_names(element, names);
             }
             if let Some(rest) = &array_pattern.rest {
                 collect_binding_identifier_names(&rest.argument, names);

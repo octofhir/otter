@@ -3992,9 +3992,7 @@ mod tests {
     #[test]
     fn symbol_to_primitive_method_accepts_symbol_primitive_receiver() {
         let result = execute_test262_basic(
-            concat!(
-                "assert.sameValue(Symbol.toPrimitive[Symbol.toPrimitive](), Symbol.toPrimitive);\n",
-            ),
+            "assert.sameValue(Symbol.toPrimitive[Symbol.toPrimitive](), Symbol.toPrimitive);\n",
             "symbol-to-primitive-primitive-receiver.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
@@ -4032,9 +4030,7 @@ mod tests {
     #[test]
     fn symbol_primitive_member_lookup_finds_symbol_to_primitive_method() {
         let result = execute_test262_basic(
-            concat!(
-                "assert.sameValue(typeof Symbol.toPrimitive[Symbol.toPrimitive], 'function');\n",
-            ),
+            "assert.sameValue(typeof Symbol.toPrimitive[Symbol.toPrimitive], 'function');\n",
             "symbol-primitive-member-lookup.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));

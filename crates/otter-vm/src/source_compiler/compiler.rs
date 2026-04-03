@@ -35,6 +35,8 @@ impl<'a> FunctionCompiler<'a> {
             string_literals: Vec::new(),
             string_ids: BTreeMap::new(),
             float_constants: Vec::new(),
+            bigint_constants: Vec::new(),
+            bigint_ids: BTreeMap::new(),
             regexp_literals: Vec::new(),
             regexp_ids: BTreeMap::new(),
             closure_templates: Vec::new(),
@@ -381,6 +383,7 @@ impl<'a> FunctionCompiler<'a> {
                 PropertyNameTable::new(self.property_names),
                 StringTable::new(self.string_literals),
                 FloatTable::new(self.float_constants),
+                crate::bigint::BigIntTable::new(self.bigint_constants),
                 ClosureTable::new(self.closure_templates),
                 CallTable::new(self.call_sites),
                 crate::regexp::RegExpTable::new(self.regexp_literals),
@@ -1734,6 +1737,26 @@ impl<'a> FunctionCompiler<'a> {
         self.string_literals
             .push(value.to_string().into_boxed_str());
         self.string_ids.insert(value.to_string(), id);
+        Ok(id)
+    }
+
+    /// Interns a BigInt constant value and returns its stable id.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    pub(super) fn intern_bigint(
+        &mut self,
+        value: &str,
+    ) -> Result<crate::bigint::BigIntId, SourceLoweringError> {
+        if let Some(existing) = self.bigint_ids.get(value).copied() {
+            return Ok(existing);
+        }
+        let id = crate::bigint::BigIntId(
+            u16::try_from(self.bigint_constants.len())
+                .map_err(|_| SourceLoweringError::TooManyLocals)?,
+        );
+        self.bigint_constants.push(value.to_string().into_boxed_str());
+        self.bigint_ids.insert(value.to_string(), id);
         Ok(id)
     }
 

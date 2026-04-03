@@ -161,6 +161,8 @@ pub enum HeapValueKind {
     TypedArray,
     /// ES2024 §25.3 DataView object.
     DataView,
+    /// ES2024 §6.1.6.2 BigInt primitive (heap-allocated).
+    BigInt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -314,6 +316,13 @@ impl TypedArrayKind {
             Self::BigInt64 => "BigInt64Array",
             Self::BigUint64 => "BigUint64Array",
         }
+    }
+
+    /// Returns whether this kind is a BigInt typed array (BigInt64Array or BigUint64Array).
+    /// §23.2.6 Table 70 — BigInt typed arrays have [[ContentType]] = BigInt.
+    #[must_use]
+    pub const fn is_bigint_kind(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
     }
 
     /// Returns all TypedArray kinds for iteration.
@@ -805,6 +814,11 @@ enum HeapValue {
     UpvalueCell {
         value: RegisterValue,
     },
+    /// §6.1.6.2 The BigInt Type — heap-allocated arbitrary-precision integer.
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    BigInt {
+        value: Box<str>,
+    },
     /// ES2024 §23.1.5.1 — Array Iterator Objects.
     ArrayIterator {
         prototype: Option<ObjectHandle>,
@@ -1139,7 +1153,7 @@ fn to_uint8_clamp(n: f64) -> u8 {
     }
     // Exact 0.5 case: round to even.
     let i = f as u8;
-    if i % 2 == 0 { i } else { i + 1 }
+    if i.is_multiple_of(2) { i } else { i + 1 }
 }
 
 /// Visit an ObjectHandle as a GcHandle for tracing.
@@ -1419,6 +1433,7 @@ impl Traceable for HeapValue {
                 trace_handle(*target, visitor);
                 trace_handle(*handler, visitor);
             }
+            HeapValue::BigInt { .. } => {}
         }
     }
 }
@@ -2277,6 +2292,116 @@ impl ObjectHeap {
         Ok(())
     }
 
+    /// Reads a single element from a TypedArray as a `RegisterValue`.
+    ///
+    /// For numeric kinds (Int8..Float64), returns a Number.
+    /// For BigInt kinds (BigInt64Array, BigUint64Array), allocates and returns a BigInt.
+    ///
+    /// §10.4.5.9 IntegerIndexedElementGet
+    /// <https://tc39.es/ecma262/#sec-integerindexedelementget>
+    pub fn typed_array_get_element_value(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+    ) -> Result<Option<RegisterValue>, ObjectError> {
+        let (viewed_buffer, byte_offset, array_length, kind) = match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_offset,
+                array_length,
+                kind,
+                ..
+            } => (*viewed_buffer, *byte_offset, *array_length, *kind),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if index >= array_length {
+            return Ok(None);
+        }
+        let buffer_data = self.array_buffer_or_shared_data(viewed_buffer)?;
+        let elem_size = kind.element_size();
+        let byte_index = byte_offset + index * elem_size;
+        if byte_index + elem_size > buffer_data.len() {
+            return Ok(None);
+        }
+        let bytes = &buffer_data[byte_index..byte_index + elem_size];
+        if kind.is_bigint_kind() {
+            let value_str = match kind {
+                TypedArrayKind::BigInt64 => {
+                    let raw = i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    raw.to_string()
+                }
+                TypedArrayKind::BigUint64 => {
+                    let raw = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    raw.to_string()
+                }
+                _ => unreachable!(),
+            };
+            let bigint_handle = self.alloc_bigint(value_str);
+            Ok(Some(RegisterValue::from_bigint_handle(bigint_handle.0)))
+        } else {
+            Ok(Some(RegisterValue::from_number(read_typed_element(
+                kind, bytes,
+            ))))
+        }
+    }
+
+    /// Writes a single element to a TypedArray from a `RegisterValue`.
+    ///
+    /// For numeric kinds, the value is converted to Number (f64).
+    /// For BigInt kinds, the value must be a BigInt; its decimal string is parsed.
+    ///
+    /// §10.4.5.10 IntegerIndexedElementSet
+    /// <https://tc39.es/ecma262/#sec-integerindexedelementset>
+    pub fn typed_array_set_element_bigint(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+        bigint_handle: ObjectHandle,
+    ) -> Result<(), ObjectError> {
+        let (viewed_buffer, byte_offset, array_length, kind) = match self.object(handle)? {
+            HeapValue::TypedArray {
+                viewed_buffer,
+                byte_offset,
+                array_length,
+                kind,
+                ..
+            } => (*viewed_buffer, *byte_offset, *array_length, *kind),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if index >= array_length {
+            return Err(ObjectError::InvalidIndex);
+        }
+        let bigint_str = match self.object(bigint_handle)? {
+            HeapValue::BigInt { value } => value.to_string(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let elem_size = kind.element_size();
+        let byte_index = byte_offset + index * elem_size;
+        let buffer_data = self.array_buffer_or_shared_data_mut(viewed_buffer)?;
+        if byte_index + elem_size > buffer_data.len() {
+            return Err(ObjectError::InvalidIndex);
+        }
+        let dest = &mut buffer_data[byte_index..byte_index + elem_size];
+        match kind {
+            TypedArrayKind::BigInt64 => {
+                let n: i64 = bigint_str.parse().unwrap_or(0);
+                dest.copy_from_slice(&n.to_le_bytes());
+            }
+            TypedArrayKind::BigUint64 => {
+                let n: u64 = bigint_str.parse().unwrap_or(0);
+                dest.copy_from_slice(&n.to_le_bytes());
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        }
+        Ok(())
+    }
+
     /// Returns whether this handle is a TypedArray.
     pub fn is_typed_array(&self, handle: ObjectHandle) -> bool {
         matches!(self.object(handle), Ok(HeapValue::TypedArray { .. }))
@@ -2309,7 +2434,7 @@ impl ObjectHeap {
     /// Returns the pattern string of a RegExp object.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
-    pub fn regexp_pattern<'h>(&'h self, handle: ObjectHandle) -> Result<&'h str, ObjectError> {
+    pub fn regexp_pattern(&self, handle: ObjectHandle) -> Result<&str, ObjectError> {
         match self.object(handle)? {
             HeapValue::RegExp { pattern, .. } => Ok(pattern),
             _ => Err(ObjectError::InvalidKind),
@@ -2319,7 +2444,7 @@ impl ObjectHeap {
     /// Returns the flags string of a RegExp object.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-properties-of-regexp-instances>
-    pub fn regexp_flags<'h>(&'h self, handle: ObjectHandle) -> Result<&'h str, ObjectError> {
+    pub fn regexp_flags(&self, handle: ObjectHandle) -> Result<&str, ObjectError> {
         match self.object(handle)? {
             HeapValue::RegExp { flags, .. } => Ok(flags),
             _ => Err(ObjectError::InvalidKind),
@@ -2778,6 +2903,25 @@ impl ObjectHeap {
         ObjectHandle(h.0)
     }
 
+    /// Allocates a heap-stored BigInt value.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    pub fn alloc_bigint(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::BigInt {
+            value: value.into(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the decimal string value of a BigInt heap object.
+    pub fn bigint_value(&self, handle: ObjectHandle) -> Result<Option<&str>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::BigInt { value } => Ok(Some(value)),
+            _ => Ok(None),
+        }
+    }
+
     /// Allocates a mutable upvalue cell.
     pub fn alloc_upvalue(&mut self, value: RegisterValue) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::UpvalueCell { value });
@@ -3109,6 +3253,7 @@ impl ObjectHeap {
             HeapValue::DataView { .. } => Ok(HeapValueKind::DataView),
             HeapValue::TypedArray { .. } => Ok(HeapValueKind::TypedArray),
             HeapValue::Proxy { .. } => Ok(HeapValueKind::Proxy),
+            HeapValue::BigInt { .. } => Ok(HeapValueKind::BigInt),
         }
     }
 
@@ -3140,6 +3285,7 @@ impl ObjectHeap {
             // Proxy: delegate to target's prototype (trap invocation is at interpreter level).
             HeapValue::Proxy { target, .. } => self.get_prototype(*target),
             HeapValue::UpvalueCell { .. }
+            | HeapValue::BigInt { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -3260,6 +3406,7 @@ impl ObjectHeap {
                 self.set_prototype(target, prototype)
             }
             HeapValue::UpvalueCell { .. }
+            | HeapValue::BigInt { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -3300,7 +3447,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Ok(None),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -3396,7 +3544,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -3473,7 +3622,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -4040,7 +4190,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Ok(None),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Ok(None),
         }
     }
 
@@ -4075,7 +4226,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Ok(None),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Ok(None),
         }
     }
 
@@ -4110,7 +4262,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Ok(None),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Ok(None),
         }
     }
 
@@ -4163,7 +4316,8 @@ impl ObjectHeap {
             | HeapValue::DataView { .. }
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
-            | HeapValue::Proxy { .. } => Ok(None),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => Ok(None),
         }
     }
 
@@ -4965,7 +5119,8 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::Proxy { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -5777,7 +5932,8 @@ impl ObjectHeap {
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
             | HeapValue::Generator { .. }
-            | HeapValue::Proxy { .. } => {
+            | HeapValue::Proxy { .. }
+            | HeapValue::BigInt { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -6222,12 +6378,11 @@ impl ObjectHeap {
                     }
                     if let Ok(HeapValue::WeakMap { entries, .. }) = self.object(wm) {
                         for (&key, value) in entries {
-                            if self.heap.is_marked(GcHandle(key)) {
-                                if let Some(vh) = value.as_object_handle() {
-                                    if !self.heap.is_marked(GcHandle(vh)) {
-                                        extra.push(GcHandle(vh));
-                                    }
-                                }
+                            if self.heap.is_marked(GcHandle(key))
+                                && let Some(vh) = value.as_object_handle()
+                                && !self.heap.is_marked(GcHandle(vh))
+                            {
+                                extra.push(GcHandle(vh));
                             }
                         }
                     }
@@ -6428,6 +6583,7 @@ impl ObjectHeap {
                 return Ok(None);
             }
             HeapValue::UpvalueCell { .. }
+            | HeapValue::BigInt { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -6491,6 +6647,7 @@ impl ObjectHeap {
             }
             HeapValue::Proxy { revoked: true, .. } => Err(ObjectError::InvalidKind),
             HeapValue::UpvalueCell { .. }
+            | HeapValue::BigInt { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -6536,6 +6693,86 @@ fn array_length_from_value(value: RegisterValue) -> Option<usize> {
         return None;
     }
     Some(length as usize)
+}
+
+/// SameValueZero comparison at the RegisterValue level.
+/// For string comparison, delegates to the heap; other primitives compare by bits.
+fn svz(heap: &TypedHeap, a: RegisterValue, b: RegisterValue) -> bool {
+    if let (Some(na), Some(nb)) = (a.as_number(), b.as_number()) {
+        if na.is_nan() && nb.is_nan() {
+            return true;
+        }
+        return na == nb;
+    }
+    if a == b {
+        return true;
+    }
+    // Different handles might refer to equal strings.
+    if let (Some(ah), Some(bh)) = (a.as_object_handle(), b.as_object_handle())
+        && let (Some(hva), Some(hvb)) = (
+            heap.get::<HeapValue>(GcHandle(ah)),
+            heap.get::<HeapValue>(GcHandle(bh)),
+        )
+        && let (HeapValue::String { value: sa, .. }, HeapValue::String { value: sb, .. }) =
+            (hva, hvb)
+    {
+        return sa == sb;
+    }
+    false
+}
+
+impl ObjectHeap {
+    /// Find the index of a matching Map entry by key using SameValueZero.
+    fn map_find_index(
+        &self,
+        handle: ObjectHandle,
+        key: RegisterValue,
+    ) -> Result<Option<usize>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Map { entries, .. } => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(e) = entry
+                        && svz(&self.heap, e.0, key)
+                    {
+                        return Ok(Some(i));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Find the index of a matching Set entry by value using SameValueZero.
+    fn set_find_index(
+        &self,
+        handle: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<Option<usize>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Set { entries, .. } => {
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(e) = entry
+                        && svz(&self.heap, *e, value)
+                    {
+                        return Ok(Some(i));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+}
+
+/// Normalize -0.0 to +0.0 per ES2024 §24.1.3.9 step 6.
+fn normalize_zero(v: RegisterValue) -> RegisterValue {
+    if let Some(n) = v.as_number()
+        && n == 0.0 && n.is_sign_negative()
+    {
+        return RegisterValue::from_number(0.0);
+    }
+    v
 }
 
 #[cfg(test)]
@@ -6917,86 +7154,4 @@ mod tests {
             Ok(IteratorStep::done())
         );
     }
-}
-
-/// SameValueZero comparison at the RegisterValue level.
-/// For string comparison, delegates to the heap; other primitives compare by bits.
-fn svz(heap: &TypedHeap, a: RegisterValue, b: RegisterValue) -> bool {
-    if let (Some(na), Some(nb)) = (a.as_number(), b.as_number()) {
-        if na.is_nan() && nb.is_nan() {
-            return true;
-        }
-        return na == nb;
-    }
-    if a == b {
-        return true;
-    }
-    // Different handles might refer to equal strings.
-    if let (Some(ah), Some(bh)) = (a.as_object_handle(), b.as_object_handle()) {
-        if let (Some(hva), Some(hvb)) = (
-            heap.get::<HeapValue>(GcHandle(ah)),
-            heap.get::<HeapValue>(GcHandle(bh)),
-        ) {
-            if let (HeapValue::String { value: sa, .. }, HeapValue::String { value: sb, .. }) =
-                (hva, hvb)
-            {
-                return sa == sb;
-            }
-        }
-    }
-    false
-}
-
-impl ObjectHeap {
-    /// Find the index of a matching Map entry by key using SameValueZero.
-    fn map_find_index(
-        &self,
-        handle: ObjectHandle,
-        key: RegisterValue,
-    ) -> Result<Option<usize>, ObjectError> {
-        match self.object(handle)? {
-            HeapValue::Map { entries, .. } => {
-                for (i, entry) in entries.iter().enumerate() {
-                    if let Some(e) = entry {
-                        if svz(&self.heap, e.0, key) {
-                            return Ok(Some(i));
-                        }
-                    }
-                }
-                Ok(None)
-            }
-            _ => Err(ObjectError::InvalidKind),
-        }
-    }
-
-    /// Find the index of a matching Set entry by value using SameValueZero.
-    fn set_find_index(
-        &self,
-        handle: ObjectHandle,
-        value: RegisterValue,
-    ) -> Result<Option<usize>, ObjectError> {
-        match self.object(handle)? {
-            HeapValue::Set { entries, .. } => {
-                for (i, entry) in entries.iter().enumerate() {
-                    if let Some(e) = entry {
-                        if svz(&self.heap, *e, value) {
-                            return Ok(Some(i));
-                        }
-                    }
-                }
-                Ok(None)
-            }
-            _ => Err(ObjectError::InvalidKind),
-        }
-    }
-}
-
-/// Normalize -0.0 to +0.0 per ES2024 §24.1.3.9 step 6.
-fn normalize_zero(v: RegisterValue) -> RegisterValue {
-    if let Some(n) = v.as_number() {
-        if n == 0.0 && n.is_sign_negative() {
-            return RegisterValue::from_number(0.0);
-        }
-    }
-    v
 }

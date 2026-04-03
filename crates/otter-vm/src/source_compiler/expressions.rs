@@ -93,6 +93,12 @@ impl<'a> FunctionCompiler<'a> {
             Expression::AwaitExpression(await_expr) => {
                 self.compile_await_expression(await_expr, module)
             }
+            // §12.8.6 BigInt Literals
+            // Spec: <https://tc39.es/ecma262/#sec-numeric-literals>
+            Expression::BigIntLiteral(lit) => {
+                let raw = lit.raw.as_ref().map_or("0n", |a| a.as_str());
+                self.compile_bigint_literal(raw)
+            }
             // §12.9 Regular Expression Literals
             // Spec: <https://tc39.es/ecma262/#sec-literals-regular-expression-literals>
             Expression::RegExpLiteral(regexp) => {
@@ -491,6 +497,13 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ValueLocation, SourceLoweringError> {
         match unary.operator {
             UnaryOperator::UnaryNegation => {
+                // §6.1.6.2.1 BigInt::unaryMinus — compile `-42n` as BigInt("-42").
+                if let Expression::BigIntLiteral(lit) = &unary.argument {
+                    let raw = lit.raw.as_ref().map_or("0n", |a| a.as_str());
+                    let value = raw.strip_suffix('n').unwrap_or(raw);
+                    let negated = format!("-{value}");
+                    return self.compile_bigint_literal_value(&negated);
+                }
                 let zero = self.load_i32(0)?;
                 let argument = self.compile_expression(&unary.argument, module)?;
                 // Use `zero` as the result register since it was allocated first —
@@ -524,15 +537,15 @@ impl<'a> FunctionCompiler<'a> {
             UnaryOperator::Typeof => {
                 // ES2024 §13.5.1: typeof on an unresolvable global reference
                 // must return "undefined", not throw ReferenceError.
-                if let oxc_ast::ast::Expression::Identifier(ident) = &unary.argument {
-                    if !self.env.bindings.contains_key(ident.name.as_str()) {
-                        // Global variable — use TypeOfGlobal which doesn't throw.
-                        let result = ValueLocation::temp(self.alloc_temp());
-                        let prop = self.intern_property_name(ident.name.as_str())?;
-                        self.instructions
-                            .push(Instruction::type_of_global(result.register, prop));
-                        return Ok(result);
-                    }
+                if let oxc_ast::ast::Expression::Identifier(ident) = &unary.argument
+                    && !self.env.bindings.contains_key(ident.name.as_str())
+                {
+                    // Global variable — use TypeOfGlobal which doesn't throw.
+                    let result = ValueLocation::temp(self.alloc_temp());
+                    let prop = self.intern_property_name(ident.name.as_str())?;
+                    self.instructions
+                        .push(Instruction::type_of_global(result.register, prop));
+                    return Ok(result);
                 }
                 let value = self.compile_expression(&unary.argument, module)?;
                 let result = if value.is_temp {
@@ -1961,15 +1974,15 @@ impl<'a> FunctionCompiler<'a> {
 
         // Install methods.
         for element in &class.body.body {
-            if let ClassElement::MethodDefinition(method) = element {
-                if !matches!(method.kind, MethodDefinitionKind::Constructor) {
-                    let target = if method.r#static {
-                        constructor_value
-                    } else {
-                        prototype
-                    };
-                    self.compile_class_method(method, target, module)?;
-                }
+            if let ClassElement::MethodDefinition(method) = element
+                && !matches!(method.kind, MethodDefinitionKind::Constructor)
+            {
+                let target = if method.r#static {
+                    constructor_value
+                } else {
+                    prototype
+                };
+                self.compile_class_method(method, target, module)?;
             }
         }
 
@@ -2052,6 +2065,33 @@ impl<'a> FunctionCompiler<'a> {
 
     /// §12.9 Regular Expression Literals — emits a `NewRegExp` instruction.
     ///
+    /// Compiles a BigInt literal (`42n`) by stripping the trailing `n` suffix,
+    /// interning the decimal value in the BigInt constant pool, and emitting
+    /// `LoadBigInt dst, bigint_id`.
+    ///
+    /// §6.1.6.2 The BigInt Type
+    /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    fn compile_bigint_literal(
+        &mut self,
+        raw: &str,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // The raw text includes the trailing `n` suffix — strip it.
+        let value = raw.strip_suffix('n').unwrap_or(raw);
+        self.compile_bigint_literal_value(value)
+    }
+
+    /// Compiles a BigInt value (already stripped of `n` suffix) into a LoadBigInt.
+    fn compile_bigint_literal_value(
+        &mut self,
+        value: &str,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let bigint_id = self.intern_bigint(value)?;
+        let dst = self.alloc_temp();
+        self.instructions
+            .push(Instruction::load_bigint(dst, bigint_id));
+        Ok(ValueLocation::temp(dst))
+    }
+
     /// Interns the (pattern, flags) pair into the function's regexp side table
     /// and emits `NewRegExp dst, regexp_id` which creates a fresh RegExp object
     /// at runtime.

@@ -445,10 +445,10 @@ fn parse_date_string_internal(s: &str) -> f64 {
             .timestamp_millis() as f64;
     }
     if s.len() == 4 {
-        if let Ok(y) = s.parse::<i32>() {
-            if let Some(d) = NaiveDate::from_ymd_opt(y, 1, 1) {
-                return d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64;
-            }
+        if let Ok(y) = s.parse::<i32>()
+            && let Some(d) = NaiveDate::from_ymd_opt(y, 1, 1)
+        {
+            return d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64;
         }
         return f64::NAN;
     }
@@ -466,10 +466,10 @@ fn parse_date_string_internal(s: &str) -> f64 {
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%a %b %d %Y %H:%M:%S") {
         return local_to_ms(Local.from_local_datetime(&dt));
     }
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%a %b %d %Y") {
-        if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-            return local_to_ms(Local.from_local_datetime(&dt));
-        }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%a %b %d %Y")
+        && let Some(dt) = d.and_hms_opt(0, 0, 0)
+    {
+        return local_to_ms(Local.from_local_datetime(&dt));
     }
     f64::NAN
 }
@@ -1002,7 +1002,7 @@ fn date_constructor(
                 let prim = to_primitive_default(args[0], runtime)?;
                 if let Some(handle) = prim.as_object_handle().map(ObjectHandle) {
                     if let Ok(Some(s)) = runtime.objects().string_value(handle) {
-                        time_clip(parse_date_string(&s.to_string()))
+                        time_clip(parse_date_string(s))
                     } else {
                         let n = to_number(prim, runtime)?;
                         time_clip(n)
@@ -1904,10 +1904,10 @@ fn date_to_json(
         .js_to_primitive_with_hint(*this, ToPrimitiveHint::Number)
         .map_err(|e| interp_err(e, runtime))?;
     // 3. If Type(tv) is Number and tv is not finite, return null.
-    if let Some(n) = tv.as_number() {
-        if n.is_nan() || n.is_infinite() {
-            return Ok(RegisterValue::null());
-        }
+    if let Some(n) = tv.as_number()
+        && (n.is_nan() || n.is_infinite())
+    {
+        return Ok(RegisterValue::null());
     }
     // 4. Return ? Invoke(O, "toISOString").
     date_to_iso_string(this, &[], runtime)
@@ -1947,37 +1947,34 @@ fn date_prototype_to_primitive(
     for name in method_names {
         let prop = runtime.intern_property_name(name);
         let handle = this.as_object_handle().map(ObjectHandle).unwrap();
-        if let Ok(Some(lookup)) = runtime.objects().get_property(handle, prop) {
-            if let PropertyValue::Data {
+        if let Ok(Some(lookup)) = runtime.objects().get_property(handle, prop)
+            && let PropertyValue::Data {
                 value: func_val, ..
             } = lookup.value()
+            && let Some(fn_handle) = func_val.as_object_handle().map(ObjectHandle)
+            && runtime.objects().is_callable(fn_handle)
+        {
+            let result =
+                runtime
+                    .call_callable(fn_handle, *this, &[])
+                    .map_err(|e| match e {
+                        VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+                        other => other,
+                    })?;
+            // If result is not an object, return it.
+            if result.as_object_handle().is_none()
+                || result.as_number().is_some()
+                || result.as_bool().is_some()
+                || result == RegisterValue::undefined()
+                || result == RegisterValue::null()
             {
-                if let Some(fn_handle) = func_val.as_object_handle().map(ObjectHandle) {
-                    if runtime.objects().is_callable(fn_handle) {
-                        let result =
-                            runtime
-                                .call_callable(fn_handle, *this, &[])
-                                .map_err(|e| match e {
-                                    VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
-                                    other => other,
-                                })?;
-                        // If result is not an object, return it.
-                        if result.as_object_handle().is_none()
-                            || result.as_number().is_some()
-                            || result.as_bool().is_some()
-                            || result == RegisterValue::undefined()
-                            || result == RegisterValue::null()
-                        {
-                            return Ok(result);
-                        }
-                        // Check if it's a string (string handles are object handles).
-                        if let Some(h) = result.as_object_handle().map(ObjectHandle) {
-                            if runtime.objects().string_value(h).ok().flatten().is_some() {
-                                return Ok(result);
-                            }
-                        }
-                    }
-                }
+                return Ok(result);
+            }
+            // Check if it's a string (string handles are object handles).
+            if let Some(h) = result.as_object_handle().map(ObjectHandle)
+                && runtime.objects().string_value(h).ok().flatten().is_some()
+            {
+                return Ok(result);
             }
         }
     }

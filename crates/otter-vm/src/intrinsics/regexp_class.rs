@@ -333,18 +333,18 @@ fn require_regexp_this(
 }
 
 /// Gets the pattern string from a RegExp handle.
-fn regexp_pattern<'a>(
+fn regexp_pattern(
     handle: ObjectHandle,
-    runtime: &'a crate::interpreter::RuntimeState,
-) -> &'a str {
+    runtime: &crate::interpreter::RuntimeState,
+) -> &str {
     runtime.objects().regexp_pattern(handle).unwrap_or("")
 }
 
 /// Gets the flags string from a RegExp handle.
-fn regexp_flags_str<'a>(
+fn regexp_flags_str(
     handle: ObjectHandle,
-    runtime: &'a crate::interpreter::RuntimeState,
-) -> &'a str {
+    runtime: &crate::interpreter::RuntimeState,
+) -> &str {
     runtime.objects().regexp_flags(handle).unwrap_or("")
 }
 
@@ -668,14 +668,12 @@ fn regexp_constructor(
     let is_construct = this.as_object_handle().is_some();
 
     // §22.2.3 step 2: if pattern is RegExp and flags is undefined, return pattern as-is (function call only).
-    if !is_construct {
-        if let Some(phandle) = pattern_arg.as_object_handle().map(ObjectHandle) {
-            if matches!(runtime.objects().kind(phandle), Ok(HeapValueKind::RegExp))
-                && flags_arg == RegisterValue::undefined()
-            {
-                return Ok(pattern_arg);
-            }
-        }
+    if !is_construct
+        && let Some(phandle) = pattern_arg.as_object_handle().map(ObjectHandle)
+        && matches!(runtime.objects().kind(phandle), Ok(HeapValueKind::RegExp))
+        && flags_arg == RegisterValue::undefined()
+    {
+        return Ok(pattern_arg);
     }
 
     // Determine pattern string.
@@ -1111,11 +1109,7 @@ fn regexp_symbol_replace(
         .map(|h| runtime.objects().is_callable(h))
         .unwrap_or(false);
 
-    if !global {
-        set_last_index(handle, 0.0, runtime);
-    } else {
-        set_last_index(handle, 0.0, runtime);
-    }
+    set_last_index(handle, 0.0, runtime);
 
     let input_utf16: Vec<u16> = input.encode_utf16().collect();
     let mut results: Vec<ObjectHandle> = Vec::new();
@@ -1298,26 +1292,22 @@ fn apply_replacement_template(
                         let groups_prop = runtime.intern_property_name("groups");
                         let groups_lookup =
                             runtime.property_lookup(arr, groups_prop).ok().flatten();
-                        if let Some(glookup) = groups_lookup {
-                            if let crate::object::PropertyValue::Data { value: gv, .. } =
+                        if let Some(glookup) = groups_lookup
+                            && let crate::object::PropertyValue::Data { value: gv, .. } =
                                 glookup.value()
+                            && let Some(gh) = gv.as_object_handle().map(ObjectHandle)
+                        {
+                            let name_prop = runtime.intern_property_name(&name);
+                            let nlookup =
+                                runtime.property_lookup(gh, name_prop).ok().flatten();
+                            if let Some(nl) = nlookup
+                                && let crate::object::PropertyValue::Data {
+                                    value: nv,
+                                    ..
+                                } = nl.value()
+                                && let Ok(s) = runtime.js_to_string(nv)
                             {
-                                if let Some(gh) = gv.as_object_handle().map(ObjectHandle) {
-                                    let name_prop = runtime.intern_property_name(&name);
-                                    let nlookup =
-                                        runtime.property_lookup(gh, name_prop).ok().flatten();
-                                    if let Some(nl) = nlookup {
-                                        if let crate::object::PropertyValue::Data {
-                                            value: nv,
-                                            ..
-                                        } = nl.value()
-                                        {
-                                            if let Ok(s) = runtime.js_to_string(nv) {
-                                                result.push_str(&s);
-                                            }
-                                        }
-                                    }
-                                }
+                                result.push_str(&s);
                             }
                         }
                         i += 2 + end + 1; // skip $<name>
@@ -1414,10 +1404,8 @@ fn regexp_symbol_split(
                 None
             } else if let Some(i) = v.as_i32() {
                 Some(i.max(0) as usize)
-            } else if let Some(n) = v.as_number() {
-                Some(n.max(0.0) as usize)
             } else {
-                None
+                v.as_number().map(|n| n.max(0.0) as usize)
             }
         })
         .unwrap_or(u32::MAX as usize);
@@ -1490,13 +1478,7 @@ fn regexp_symbol_split(
                     }
                     // Add captures.
                     let mut cap_idx = 1;
-                    loop {
-                        match runtime.objects_mut().get_index(arr, cap_idx) {
-                            Ok(Some(_)) => {
-                                // Include capture group (may be undefined).
-                            }
-                            _ => break,
-                        }
+                    while let Ok(Some(_)) = runtime.objects_mut().get_index(arr, cap_idx) {
                         let cap_val = runtime
                             .objects_mut()
                             .get_index(arr, cap_idx)

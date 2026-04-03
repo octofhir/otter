@@ -7,6 +7,7 @@
 
 mod array_class;
 mod arraybuffer_class;
+mod bigint_class;
 mod boolean_class;
 mod dataview_class;
 mod date_class;
@@ -122,6 +123,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "Function",
     "Array",
     "ArrayBuffer",
+    "BigInt",
     "SharedArrayBuffer",
     "String",
     "Number",
@@ -228,6 +230,8 @@ pub struct VmIntrinsics {
     array_prototype: ObjectHandle,
     array_buffer_constructor: ObjectHandle,
     array_buffer_prototype: ObjectHandle,
+    bigint_constructor: ObjectHandle,
+    bigint_prototype: ObjectHandle,
     shared_array_buffer_constructor: ObjectHandle,
     shared_array_buffer_prototype: ObjectHandle,
     data_view_constructor: ObjectHandle,
@@ -327,6 +331,8 @@ impl VmIntrinsics {
         let array_prototype = heap.alloc_object();
         let array_buffer_constructor = heap.alloc_object();
         let array_buffer_prototype = heap.alloc_object();
+        let bigint_constructor = heap.alloc_object();
+        let bigint_prototype = heap.alloc_object();
         let shared_array_buffer_constructor = heap.alloc_object();
         let shared_array_buffer_prototype = heap.alloc_object();
         let data_view_constructor = heap.alloc_object();
@@ -412,6 +418,8 @@ impl VmIntrinsics {
             array_prototype,
             array_buffer_constructor,
             array_buffer_prototype,
+            bigint_constructor,
+            bigint_prototype,
             shared_array_buffer_constructor,
             shared_array_buffer_prototype,
             data_view_constructor,
@@ -521,6 +529,8 @@ impl VmIntrinsics {
         heap.set_prototype(self.array_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.array_buffer_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.array_buffer_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(self.bigint_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.bigint_prototype, Some(self.object_prototype))?;
         heap.set_prototype(
             self.shared_array_buffer_constructor,
             Some(self.function_prototype),
@@ -797,6 +807,18 @@ impl VmIntrinsics {
         self.array_buffer_prototype
     }
 
+    /// Returns `%BigInt%` (the constructor function).
+    #[must_use]
+    pub const fn bigint_constructor(&self) -> ObjectHandle {
+        self.bigint_constructor
+    }
+
+    /// Returns `%BigInt.prototype%`.
+    #[must_use]
+    pub const fn bigint_prototype(&self) -> ObjectHandle {
+        self.bigint_prototype
+    }
+
     /// Returns `%SharedArrayBuffer%`.
     #[must_use]
     pub const fn shared_array_buffer_constructor(&self) -> ObjectHandle {
@@ -1005,9 +1027,8 @@ impl VmIntrinsics {
 
     /// Store/retrieve a named namespace (generic for JSON and future namespaces).
     pub(super) fn set_namespace(&mut self, name: &str, handle: ObjectHandle) {
-        match name {
-            "JSON" => self.json_namespace = Some(handle),
-            _ => {}
+        if name == "JSON" {
+            self.json_namespace = Some(handle);
         }
         self.register_namespace_root(handle);
     }
@@ -1192,12 +1213,13 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 24] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 25] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &arraybuffer_class::ARRAY_BUFFER_INTRINSIC as &dyn IntrinsicInstaller,
+        &bigint_class::BIGINT_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
         &dataview_class::DATA_VIEW_INTRINSIC as &dyn IntrinsicInstaller,
         &date_class::DATE_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1312,7 +1334,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 415);
+        assert_eq!(native_functions.len(), 421);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

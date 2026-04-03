@@ -142,42 +142,39 @@ fn weakmap_constructor(
     let handle = runtime.objects_mut().alloc_weakmap(prototype);
 
     // If iterable argument provided, add entries.
-    if let Some(iterable) = args.first().copied() {
-        if iterable != RegisterValue::undefined() && iterable != RegisterValue::null() {
-            if let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle) {
-                if matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array)) {
-                    let length = runtime
-                        .objects()
-                        .array_length(arr_handle)
-                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
-                        .unwrap_or(0);
-                    for i in 0..length {
-                        let entry = runtime.get_array_index_value(arr_handle, i)?;
-                        if let Some(entry_val) = entry {
-                            if let Some(eh) = entry_val.as_object_handle().map(ObjectHandle) {
-                                if matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array)) {
-                                    let key = runtime
-                                        .get_array_index_value(eh, 0)?
-                                        .unwrap_or(RegisterValue::undefined());
-                                    let value = runtime
-                                        .get_array_index_value(eh, 1)?
-                                        .unwrap_or(RegisterValue::undefined());
-                                    let key_handle = key.as_object_handle().ok_or_else(|| {
-                                        VmNativeCallError::Internal(
-                                            "Invalid value used as weak map key".into(),
-                                        )
-                                    })?;
-                                    runtime
-                                        .objects_mut()
-                                        .weakmap_set(handle, key_handle, value)
-                                        .map_err(|e| {
-                                            VmNativeCallError::Internal(format!("{e:?}").into())
-                                        })?;
-                                }
-                            }
-                        }
-                    }
-                }
+    if let Some(iterable) = args.first().copied()
+        && iterable != RegisterValue::undefined() && iterable != RegisterValue::null()
+        && let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle)
+        && matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array))
+    {
+        let length = runtime
+            .objects()
+            .array_length(arr_handle)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or(0);
+        for i in 0..length {
+            let entry = runtime.get_array_index_value(arr_handle, i)?;
+            if let Some(entry_val) = entry
+                && let Some(eh) = entry_val.as_object_handle().map(ObjectHandle)
+                && matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array))
+            {
+                let key = runtime
+                    .get_array_index_value(eh, 0)?
+                    .unwrap_or(RegisterValue::undefined());
+                let value = runtime
+                    .get_array_index_value(eh, 1)?
+                    .unwrap_or(RegisterValue::undefined());
+                let key_handle = key.as_object_handle().ok_or_else(|| {
+                    VmNativeCallError::Internal(
+                        "Invalid value used as weak map key".into(),
+                    )
+                })?;
+                runtime
+                    .objects_mut()
+                    .weakmap_set(handle, key_handle, value)
+                    .map_err(|e| {
+                        VmNativeCallError::Internal(format!("{e:?}").into())
+                    })?;
             }
         }
     }
@@ -348,29 +345,27 @@ fn weakset_constructor(
     let prototype = Some(runtime.intrinsics().weakset_prototype);
     let handle = runtime.objects_mut().alloc_weakset(prototype);
 
-    if let Some(iterable) = args.first().copied() {
-        if iterable != RegisterValue::undefined() && iterable != RegisterValue::null() {
-            if let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle) {
-                if matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array)) {
-                    let length = runtime
-                        .objects()
-                        .array_length(arr_handle)
-                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
-                        .unwrap_or(0);
-                    for i in 0..length {
-                        if let Some(value) = runtime.get_array_index_value(arr_handle, i)? {
-                            let key_handle = value.as_object_handle().ok_or_else(|| {
-                                VmNativeCallError::Internal("Invalid value used in weak set".into())
-                            })?;
-                            runtime
-                                .objects_mut()
-                                .weakset_add(handle, key_handle)
-                                .map_err(|e| {
-                                    VmNativeCallError::Internal(format!("{e:?}").into())
-                                })?;
-                        }
-                    }
-                }
+    if let Some(iterable) = args.first().copied()
+        && iterable != RegisterValue::undefined() && iterable != RegisterValue::null()
+        && let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle)
+        && matches!(runtime.objects().kind(arr_handle), Ok(HeapValueKind::Array))
+    {
+        let length = runtime
+            .objects()
+            .array_length(arr_handle)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or(0);
+        for i in 0..length {
+            if let Some(value) = runtime.get_array_index_value(arr_handle, i)? {
+                let key_handle = value.as_object_handle().ok_or_else(|| {
+                    VmNativeCallError::Internal("Invalid value used in weak set".into())
+                })?;
+                runtime
+                    .objects_mut()
+                    .weakset_add(handle, key_handle)
+                    .map_err(|e| {
+                        VmNativeCallError::Internal(format!("{e:?}").into())
+                    })?;
             }
         }
     }

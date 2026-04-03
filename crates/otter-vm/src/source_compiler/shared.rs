@@ -129,6 +129,8 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) string_literals: Vec<Box<str>>,
     pub(super) string_ids: BTreeMap<String, StringId>,
     pub(super) float_constants: Vec<f64>,
+    pub(super) bigint_constants: Vec<Box<str>>,
+    pub(super) bigint_ids: BTreeMap<String, crate::bigint::BigIntId>,
     pub(super) regexp_literals: Vec<(Box<str>, Box<str>)>,
     pub(super) regexp_ids: BTreeMap<(String, String), crate::regexp::RegExpId>,
     pub(super) closure_templates: Vec<Option<ClosureTemplate>>,

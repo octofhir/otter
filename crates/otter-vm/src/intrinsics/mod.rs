@@ -29,6 +29,7 @@ mod sharedarraybuffer_class;
 mod species_support;
 mod string_class;
 mod symbol_class;
+mod temporal;
 pub(crate) mod timer_globals;
 pub(crate) mod typedarray_class;
 mod weakmap_weakset_class;
@@ -147,6 +148,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "WeakSet",
     "Promise",
     "Proxy",
+    "Temporal",
     "Int8Array",
     "Uint8Array",
     "Uint8ClampedArray",
@@ -312,6 +314,24 @@ pub struct VmIntrinsics {
     // RegExp (§22.2)
     pub(crate) regexp_constructor: ObjectHandle,
     pub(crate) regexp_prototype: ObjectHandle,
+    // Temporal (proposal-temporal, Stage 4)
+    pub(crate) temporal_namespace: ObjectHandle,
+    pub(crate) temporal_instant_constructor: ObjectHandle,
+    pub(crate) temporal_instant_prototype: ObjectHandle,
+    pub(crate) temporal_duration_constructor: ObjectHandle,
+    pub(crate) temporal_duration_prototype: ObjectHandle,
+    pub(crate) temporal_plain_date_constructor: ObjectHandle,
+    pub(crate) temporal_plain_date_prototype: ObjectHandle,
+    pub(crate) temporal_plain_time_constructor: ObjectHandle,
+    pub(crate) temporal_plain_time_prototype: ObjectHandle,
+    pub(crate) temporal_plain_date_time_constructor: ObjectHandle,
+    pub(crate) temporal_plain_date_time_prototype: ObjectHandle,
+    pub(crate) temporal_plain_year_month_constructor: ObjectHandle,
+    pub(crate) temporal_plain_year_month_prototype: ObjectHandle,
+    pub(crate) temporal_plain_month_day_constructor: ObjectHandle,
+    pub(crate) temporal_plain_month_day_prototype: ObjectHandle,
+    pub(crate) temporal_zoned_date_time_constructor: ObjectHandle,
+    pub(crate) temporal_zoned_date_time_prototype: ObjectHandle,
 }
 
 impl VmIntrinsics {
@@ -400,6 +420,24 @@ impl VmIntrinsics {
         let generator_prototype = heap.alloc_object();
         let regexp_constructor = heap.alloc_object();
         let regexp_prototype = heap.alloc_object();
+        // Temporal (proposal-temporal)
+        let temporal_namespace = heap.alloc_object();
+        let temporal_instant_constructor = heap.alloc_object();
+        let temporal_instant_prototype = heap.alloc_object();
+        let temporal_duration_constructor = heap.alloc_object();
+        let temporal_duration_prototype = heap.alloc_object();
+        let temporal_plain_date_constructor = heap.alloc_object();
+        let temporal_plain_date_prototype = heap.alloc_object();
+        let temporal_plain_time_constructor = heap.alloc_object();
+        let temporal_plain_time_prototype = heap.alloc_object();
+        let temporal_plain_date_time_constructor = heap.alloc_object();
+        let temporal_plain_date_time_prototype = heap.alloc_object();
+        let temporal_plain_year_month_constructor = heap.alloc_object();
+        let temporal_plain_year_month_prototype = heap.alloc_object();
+        let temporal_plain_month_day_constructor = heap.alloc_object();
+        let temporal_plain_month_day_prototype = heap.alloc_object();
+        let temporal_zoned_date_time_constructor = heap.alloc_object();
+        let temporal_zoned_date_time_prototype = heap.alloc_object();
 
         Self {
             stage: IntrinsicsStage::Allocated,
@@ -507,6 +545,23 @@ impl VmIntrinsics {
             generator_prototype,
             regexp_constructor,
             regexp_prototype,
+            temporal_namespace,
+            temporal_instant_constructor,
+            temporal_instant_prototype,
+            temporal_duration_constructor,
+            temporal_duration_prototype,
+            temporal_plain_date_constructor,
+            temporal_plain_date_prototype,
+            temporal_plain_time_constructor,
+            temporal_plain_time_prototype,
+            temporal_plain_date_time_constructor,
+            temporal_plain_date_time_prototype,
+            temporal_plain_year_month_constructor,
+            temporal_plain_year_month_prototype,
+            temporal_plain_month_day_constructor,
+            temporal_plain_month_day_prototype,
+            temporal_zoned_date_time_constructor,
+            temporal_zoned_date_time_prototype,
         }
     }
 
@@ -602,6 +657,70 @@ impl VmIntrinsics {
         // RegExp (§22.2): RegExp.prototype → Object.prototype
         heap.set_prototype(self.regexp_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.regexp_prototype, Some(self.object_prototype))?;
+        // Temporal (proposal-temporal): namespace → Object.prototype,
+        // each constructor → Function.prototype, each prototype → Object.prototype.
+        heap.set_prototype(self.temporal_namespace, Some(self.object_prototype))?;
+        heap.set_prototype(
+            self.temporal_instant_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(self.temporal_instant_prototype, Some(self.object_prototype))?;
+        heap.set_prototype(
+            self.temporal_duration_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_duration_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_date_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_date_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_time_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_time_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_date_time_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_date_time_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_year_month_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_year_month_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_month_day_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_plain_month_day_prototype,
+            Some(self.object_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_zoned_date_time_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.temporal_zoned_date_time_prototype,
+            Some(self.object_prototype),
+        )?;
         self.stage = IntrinsicsStage::Wired;
         Ok(())
     }
@@ -1002,6 +1121,62 @@ impl VmIntrinsics {
         self.regexp_prototype
     }
 
+    // ── Temporal (proposal-temporal) ────────────────────────────────
+
+    /// Returns the `Temporal` namespace object.
+    #[must_use]
+    pub const fn temporal_namespace(&self) -> ObjectHandle {
+        self.temporal_namespace
+    }
+
+    /// Returns `%Temporal.Instant.prototype%`.
+    #[must_use]
+    pub const fn temporal_instant_prototype(&self) -> ObjectHandle {
+        self.temporal_instant_prototype
+    }
+
+    /// Returns `%Temporal.Duration.prototype%`.
+    #[must_use]
+    pub const fn temporal_duration_prototype(&self) -> ObjectHandle {
+        self.temporal_duration_prototype
+    }
+
+    /// Returns `%Temporal.PlainDate.prototype%`.
+    #[must_use]
+    pub const fn temporal_plain_date_prototype(&self) -> ObjectHandle {
+        self.temporal_plain_date_prototype
+    }
+
+    /// Returns `%Temporal.PlainTime.prototype%`.
+    #[must_use]
+    pub const fn temporal_plain_time_prototype(&self) -> ObjectHandle {
+        self.temporal_plain_time_prototype
+    }
+
+    /// Returns `%Temporal.PlainDateTime.prototype%`.
+    #[must_use]
+    pub const fn temporal_plain_date_time_prototype(&self) -> ObjectHandle {
+        self.temporal_plain_date_time_prototype
+    }
+
+    /// Returns `%Temporal.PlainYearMonth.prototype%`.
+    #[must_use]
+    pub const fn temporal_plain_year_month_prototype(&self) -> ObjectHandle {
+        self.temporal_plain_year_month_prototype
+    }
+
+    /// Returns `%Temporal.PlainMonthDay.prototype%`.
+    #[must_use]
+    pub const fn temporal_plain_month_day_prototype(&self) -> ObjectHandle {
+        self.temporal_plain_month_day_prototype
+    }
+
+    /// Returns `%Temporal.ZonedDateTime.prototype%`.
+    #[must_use]
+    pub const fn temporal_zoned_date_time_prototype(&self) -> ObjectHandle {
+        self.temporal_zoned_date_time_prototype
+    }
+
     /// Registers an additional namespace root owned by the intrinsic registry.
     pub fn register_namespace_root(&mut self, handle: ObjectHandle) {
         self.namespace_roots.push(handle);
@@ -1135,6 +1310,23 @@ impl VmIntrinsics {
             self.generator_prototype,
             self.regexp_constructor,
             self.regexp_prototype,
+            self.temporal_namespace,
+            self.temporal_instant_constructor,
+            self.temporal_instant_prototype,
+            self.temporal_duration_constructor,
+            self.temporal_duration_prototype,
+            self.temporal_plain_date_constructor,
+            self.temporal_plain_date_prototype,
+            self.temporal_plain_time_constructor,
+            self.temporal_plain_time_prototype,
+            self.temporal_plain_date_time_constructor,
+            self.temporal_plain_date_time_prototype,
+            self.temporal_plain_year_month_constructor,
+            self.temporal_plain_year_month_prototype,
+            self.temporal_plain_month_day_constructor,
+            self.temporal_plain_month_day_prototype,
+            self.temporal_zoned_date_time_constructor,
+            self.temporal_zoned_date_time_prototype,
         ]);
         if let Some(h) = self.math_namespace {
             roots.push(h);
@@ -1199,6 +1391,23 @@ impl VmIntrinsics {
             self.proxy_constructor,
             self.generator_function_prototype,
             self.generator_prototype,
+            self.temporal_namespace,
+            self.temporal_instant_constructor,
+            self.temporal_instant_prototype,
+            self.temporal_duration_constructor,
+            self.temporal_duration_prototype,
+            self.temporal_plain_date_constructor,
+            self.temporal_plain_date_prototype,
+            self.temporal_plain_time_constructor,
+            self.temporal_plain_time_prototype,
+            self.temporal_plain_date_time_constructor,
+            self.temporal_plain_date_time_prototype,
+            self.temporal_plain_year_month_constructor,
+            self.temporal_plain_year_month_prototype,
+            self.temporal_plain_month_day_constructor,
+            self.temporal_plain_month_day_prototype,
+            self.temporal_zoned_date_time_constructor,
+            self.temporal_zoned_date_time_prototype,
         ] {
             tracer(IntrinsicRoot::Object(handle));
         }
@@ -1213,7 +1422,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 25] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 26] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1239,6 +1448,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 25] {
         &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
+        &temporal::TEMPORAL_INTRINSIC as &dyn IntrinsicInstaller,
         &typedarray_class::TYPED_ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &weakmap_weakset_class::WEAKMAP_WEAKSET_INTRINSIC as &dyn IntrinsicInstaller,
     ]
@@ -1334,7 +1544,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 421);
+        assert_eq!(native_functions.len(), 461);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

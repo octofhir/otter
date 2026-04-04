@@ -376,12 +376,112 @@ impl Function {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  §16.2.1.4 — Import/Export Records for Source Text Module Records
+//  Spec: <https://tc39.es/ecma262/#sec-source-text-module-records>
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A single import binding within an `ImportRecord`.
+/// Spec: <https://tc39.es/ecma262/#table-importentry-record-fields>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportBinding {
+    /// `import { imported as local } from "specifier"` — named import.
+    Named {
+        /// The exported name in the source module (e.g., `foo` in `import { foo }`).
+        imported: Box<str>,
+        /// The local binding name (e.g., `bar` in `import { foo as bar }`).
+        local: Box<str>,
+    },
+    /// `import local from "specifier"` — default import.
+    Default {
+        /// The local binding name.
+        local: Box<str>,
+    },
+    /// `import * as local from "specifier"` — namespace import.
+    Namespace {
+        /// The local binding name.
+        local: Box<str>,
+    },
+}
+
+impl ImportBinding {
+    /// Returns the local binding name for this import.
+    #[must_use]
+    pub fn local_name(&self) -> &str {
+        match self {
+            Self::Named { local, .. } | Self::Default { local } | Self::Namespace { local } => {
+                local
+            }
+        }
+    }
+}
+
+/// A single import declaration record.
+/// Spec: <https://tc39.es/ecma262/#sec-imports>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRecord {
+    /// The module specifier string (e.g., `"./utils.js"`, `"lodash"`).
+    pub specifier: Box<str>,
+    /// Individual import bindings from this specifier.
+    pub bindings: Vec<ImportBinding>,
+}
+
+/// A single export record.
+/// Spec: <https://tc39.es/ecma262/#sec-exports>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportRecord {
+    /// `export { local as exported }` or `export const exported = ...`.
+    Named {
+        /// The local binding name.
+        local: Box<str>,
+        /// The externally visible export name.
+        exported: Box<str>,
+    },
+    /// `export default expr`.
+    Default {
+        /// The local binding name (often a synthetic `*default*`).
+        local: Box<str>,
+    },
+    /// `export { imported as exported } from "specifier"` — re-export named.
+    ReExportNamed {
+        /// The source module specifier.
+        specifier: Box<str>,
+        /// The name imported from the source module.
+        imported: Box<str>,
+        /// The name exported from this module.
+        exported: Box<str>,
+    },
+    /// `export * from "specifier"` — re-export all.
+    ReExportAll {
+        /// The source module specifier.
+        specifier: Box<str>,
+    },
+    /// `export * as name from "specifier"` — namespace re-export.
+    ReExportNamespace {
+        /// The source module specifier.
+        specifier: Box<str>,
+        /// The exported namespace name.
+        exported: Box<str>,
+    },
+}
+
 /// Immutable executable module for the new VM.
+///
+/// §16.2 — Modules
+/// Spec: <https://tc39.es/ecma262/#sec-modules>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
     name: Option<Box<str>>,
     functions: Box<[Function]>,
     entry: FunctionIndex,
+    /// Whether this module uses ES module semantics (import/export).
+    is_esm: bool,
+    /// §16.2.2 — Static import records.
+    /// Spec: <https://tc39.es/ecma262/#sec-imports>
+    imports: Vec<ImportRecord>,
+    /// §16.2.3 — Static export records.
+    /// Spec: <https://tc39.es/ecma262/#sec-exports>
+    exports: Vec<ExportRecord>,
 }
 
 impl Module {
@@ -404,6 +504,36 @@ impl Module {
             name: name.map(Into::into),
             functions,
             entry,
+            is_esm: false,
+            imports: Vec::new(),
+            exports: Vec::new(),
+        })
+    }
+
+    /// Creates a checked executable ES module with import/export records.
+    pub fn new_esm(
+        name: Option<impl Into<Box<str>>>,
+        functions: Vec<Function>,
+        entry: FunctionIndex,
+        imports: Vec<ImportRecord>,
+        exports: Vec<ExportRecord>,
+    ) -> Result<Self, ModuleError> {
+        let functions = functions.into_boxed_slice();
+        if usize::try_from(entry.0)
+            .ok()
+            .and_then(|index| functions.get(index))
+            .is_none()
+        {
+            return Err(ModuleError::InvalidEntryFunction);
+        }
+
+        Ok(Self {
+            name: name.map(Into::into),
+            functions,
+            entry,
+            is_esm: true,
+            imports,
+            exports,
         })
     }
 
@@ -411,6 +541,26 @@ impl Module {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Returns whether this is an ES module (has import/export semantics).
+    #[must_use]
+    pub const fn is_esm(&self) -> bool {
+        self.is_esm
+    }
+
+    /// Returns the static import records.
+    /// Spec: <https://tc39.es/ecma262/#sec-imports>
+    #[must_use]
+    pub fn imports(&self) -> &[ImportRecord] {
+        &self.imports
+    }
+
+    /// Returns the static export records.
+    /// Spec: <https://tc39.es/ecma262/#sec-exports>
+    #[must_use]
+    pub fn exports(&self) -> &[ExportRecord] {
+        &self.exports
     }
 
     /// Returns the number of functions in the module.

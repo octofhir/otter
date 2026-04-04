@@ -2,6 +2,8 @@ use super::ast::{ParamInfo, has_use_strict_directive};
 use super::shared::{CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind};
 use super::*;
 
+use crate::module::{ExportRecord, ImportRecord};
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct FunctionIdentity {
     pub(super) debug_name: Option<String>,
@@ -13,6 +15,10 @@ pub(super) struct ModuleCompiler<'a> {
     source_url: &'a str,
     mode: LoweringMode,
     functions: Vec<Option<VmFunction>>,
+    /// §16.2.2 — Import records collected during module compilation.
+    imports: Vec<ImportRecord>,
+    /// §16.2.3 — Export records collected during module compilation.
+    exports: Vec<ExportRecord>,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -21,14 +27,36 @@ impl<'a> ModuleCompiler<'a> {
             source_url,
             mode,
             functions: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
         }
     }
+
+    /// Adds an import record (used by import declaration compilation).
+    pub(super) fn add_import(&mut self, record: ImportRecord) {
+        self.imports.push(record);
+    }
+
+    /// Adds an export record (used by export declaration compilation).
+    pub(super) fn add_export(&mut self, record: ExportRecord) {
+        self.exports.push(record);
+    }
+
+    /// Returns the current lowering mode.
+    pub(super) fn mode(&self) -> LoweringMode {
+        self.mode
+    }
+
 
     pub(super) fn compile(
         mut self,
         program: &AstProgram<'_>,
     ) -> Result<Module, SourceLoweringError> {
+        let is_module = self.mode == LoweringMode::Module;
         let entry = self.reserve_function();
+        // §10.2.1 — Module code is always strict.
+        let inherited_strict =
+            is_module || has_use_strict_directive(program.directives.as_slice());
         let compiled = self.compile_function_from_statements(
             entry,
             FunctionIdentity {
@@ -40,7 +68,7 @@ impl<'a> ModuleCompiler<'a> {
             &[],
             FunctionKind::Script,
             None,
-            has_use_strict_directive(program.directives.as_slice()),
+            inherited_strict,
         )?;
         self.functions[entry.0 as usize] = Some(compiled.function);
 
@@ -58,9 +86,22 @@ impl<'a> ModuleCompiler<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Module::new(Some(self.source_url), functions, entry).map_err(|error| {
-            SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
-        })
+        if is_module {
+            Module::new_esm(
+                Some(self.source_url),
+                functions,
+                entry,
+                self.imports,
+                self.exports,
+            )
+            .map_err(|error| {
+                SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
+            })
+        } else {
+            Module::new(Some(self.source_url), functions, entry).map_err(|error| {
+                SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
+            })
+        }
     }
 
     pub(super) fn reserve_function(&mut self) -> FunctionIndex {
@@ -127,6 +168,15 @@ impl<'a> ModuleCompiler<'a> {
         compiler.predeclare_function_scope(statements, self)?;
         compiler.emit_hoisted_function_initializers()?;
         let terminated = compiler.compile_statements(statements, self)?;
+
+        // §16.2.3 — In module mode, ensure all exported local bindings are
+        // stored on the global object so the host can read them after evaluation.
+        // `var` and hoisted function declarations already use SetGlobal, but
+        // `const`/`let` and non-hoisted exports need explicit global writes.
+        if self.mode == LoweringMode::Module {
+            compiler.emit_module_export_globals(&self.exports)?;
+        }
+
         if !terminated {
             compiler.emit_implicit_return()?;
         }

@@ -88,6 +88,23 @@ fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Ve
                 }
             }
         }
+        // §16.2.3 — `export var x = 1` hoists the var declaration.
+        AstStatement::ExportNamedDeclaration(export) => {
+            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(declaration)) =
+                &export.declaration
+                && declaration.kind == VariableDeclarationKind::Var
+            {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                        && !names
+                            .iter()
+                            .any(|existing| existing == identifier.name.as_str())
+                    {
+                        names.push(identifier.name.to_string());
+                    }
+                }
+            }
+        }
         AstStatement::BlockStatement(block) => {
             for statement in &block.body {
                 collect_var_names_from_statement(statement, names);
@@ -191,6 +208,23 @@ fn collect_function_declarations_from_statement<'a>(
 ) {
     match statement {
         AstStatement::FunctionDeclaration(function) => functions.push(function),
+        // §16.2.3 — `export function f() {}` hoists the function declaration.
+        AstStatement::ExportNamedDeclaration(export) => {
+            if let Some(oxc_ast::ast::Declaration::FunctionDeclaration(function)) =
+                &export.declaration
+            {
+                functions.push(function);
+            }
+        }
+        // §16.2.3 — `export default function f() {}` hoists the named function.
+        AstStatement::ExportDefaultDeclaration(export) => {
+            if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(function) =
+                &export.declaration
+                && function.id.is_some()
+            {
+                functions.push(function);
+            }
+        }
         AstStatement::BlockStatement(block) => {
             for statement in &block.body {
                 collect_function_declarations_from_statement(statement, functions);

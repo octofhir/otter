@@ -87,7 +87,7 @@ pub fn compile_eval(source: &str, source_url: &str) -> Result<Module, SourceLowe
 pub fn compile_module(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
     let allocator = Allocator::default();
     let ast = parse_module(&allocator, source, source_url)?;
-    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Script)
+    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Module)
 }
 
 /// Parse, lower, and compile a tiny native Test262 script into an `otter-vm` module.
@@ -162,6 +162,9 @@ pub(crate) enum LoweringMode {
     /// Eval mode: returns the completion value of the last expression statement.
     /// Used by `-p` (print) and REPL-style evaluation.
     Eval,
+    /// §16.2 — ES Module mode: strict mode by default, import/export allowed.
+    /// Spec: <https://tc39.es/ecma262/#sec-modules>
+    Module,
 }
 
 struct TinyScriptLowerer<'a> {
@@ -192,7 +195,7 @@ impl<'a> TinyScriptLowerer<'a> {
         }
 
         match self.mode {
-            LoweringMode::Script | LoweringMode::Eval => {
+            LoweringMode::Script | LoweringMode::Eval | LoweringMode::Module => {
                 let return_local = self.allocate_return_local()?;
                 body.push(Statement::ret(Expr::local(return_local)));
             }

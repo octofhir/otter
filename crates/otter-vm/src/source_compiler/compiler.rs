@@ -572,6 +572,28 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(true)
             }
             AstStatement::SwitchStatement(switch) => self.compile_switch_statement(switch, module),
+
+            // ═══════════════════════════════════════════════════════════════
+            //  §16.2 — Module Declarations (import/export)
+            //  Spec: <https://tc39.es/ecma262/#sec-modules>
+            // ═══════════════════════════════════════════════════════════════
+            AstStatement::ImportDeclaration(import) => {
+                self.compile_import_declaration(import, module)?;
+                Ok(false)
+            }
+            AstStatement::ExportNamedDeclaration(export) => {
+                self.compile_export_named_declaration(export, module)?;
+                Ok(false)
+            }
+            AstStatement::ExportDefaultDeclaration(export) => {
+                self.compile_export_default_declaration(export, module)?;
+                Ok(false)
+            }
+            AstStatement::ExportAllDeclaration(export) => {
+                self.compile_export_all_declaration(export, module)?;
+                Ok(false)
+            }
+
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "statement {:?}",
                 statement
@@ -653,7 +675,7 @@ impl<'a> FunctionCompiler<'a> {
 
     /// §15.7 ClassDeclaration — `class Name { ... }`
     /// Spec: <https://tc39.es/ecma262/#sec-class-definitions>
-    fn compile_class_declaration(
+    pub(super) fn compile_class_declaration(
         &mut self,
         class: &Class<'_>,
         module: &mut ModuleCompiler<'a>,
@@ -2432,7 +2454,7 @@ impl<'a> FunctionCompiler<'a> {
     pub(super) fn emit_implicit_return(&mut self) -> Result<(), SourceLoweringError> {
         let value = match self.kind {
             FunctionKind::Script => match self.mode {
-                LoweringMode::Script => self.load_undefined()?,
+                LoweringMode::Script | LoweringMode::Module => self.load_undefined()?,
                 LoweringMode::Test262Basic => self.load_i32(0)?,
                 LoweringMode::Eval => {
                     if let Some(reg) = self.eval_completion_register {

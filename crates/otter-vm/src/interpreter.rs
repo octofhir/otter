@@ -7966,6 +7966,78 @@ impl Interpreter {
                     })
                 }
             }
+            // §13.3.10 Dynamic import() — evaluate specifier and return a Promise.
+            // Spec: <https://tc39.es/ecma262/#sec-import-calls>
+            Opcode::DynamicImport => {
+                let dst_reg = instruction.a();
+                let specifier_reg = instruction.b();
+                let specifier_value =
+                    activation.read_bytecode_register(function, specifier_reg)?;
+
+                // Coerce specifier to string.
+                let specifier_str = runtime.js_to_string(specifier_value)?;
+
+                // Look up the host-installed __importDynamic function on the global.
+                let prop = runtime.intern_property_name("__importDynamic");
+                let global = runtime.intrinsics().global_object();
+                let handler_value = runtime
+                    .own_property_value(global, prop)
+                    .unwrap_or_default();
+
+                let result = if let Some(handle_id) = handler_value.as_object_handle()
+                {
+                    // Call __importDynamic(specifier) and return its result
+                    // (should be a Promise).
+                    let specifier_handle = runtime.alloc_string(specifier_str);
+                    let specifier_rv =
+                        RegisterValue::from_object_handle(specifier_handle.0);
+                    runtime.call_callable_for_accessor(
+                        Some(ObjectHandle(handle_id)),
+                        RegisterValue::undefined(),
+                        &[specifier_rv],
+                    )?
+                } else {
+                    // No host handler — throw a TypeError.
+                    return Err(InterpreterError::TypeError(
+                        "import() requires a host-installed __importDynamic handler"
+                            .into(),
+                    ));
+                };
+
+                activation.write_bytecode_register(function, dst_reg, result)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.3.12 import.meta — return a module metadata object.
+            // Spec: <https://tc39.es/ecma262/#sec-meta-properties>
+            Opcode::ImportMeta => {
+                let dst_reg = instruction.a();
+
+                // Build { url: "<module name>" } object.
+                let module_url: Option<Box<str>> = runtime
+                    .current_module
+                    .as_ref()
+                    .and_then(|m| m.name().map(|n| n.into()));
+                let meta_object = runtime.alloc_object();
+                let url_prop = runtime.intern_property_name("url");
+                let url_value = if let Some(url) = module_url {
+                    let handle = runtime.alloc_string(url);
+                    RegisterValue::from_object_handle(handle.0)
+                } else {
+                    RegisterValue::undefined()
+                };
+                runtime
+                    .objects_mut()
+                    .set_property(meta_object, url_prop, url_value)
+                    .map_err(|_| {
+                        InterpreterError::TypeError("cannot set import.meta.url".into())
+                    })?;
+
+                let result = RegisterValue::from_object_handle(meta_object.0);
+                activation.write_bytecode_register(function, dst_reg, result)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
         }
     }
 

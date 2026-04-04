@@ -31,6 +31,7 @@ mod compiler;
 mod destructuring;
 mod expressions;
 mod module_compiler;
+mod modules;
 mod shared;
 mod statements;
 

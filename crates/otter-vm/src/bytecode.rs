@@ -364,6 +364,17 @@ pub enum Opcode {
     /// `.return()` and `.throw()` are forwarded to the inner iterator.
     /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
     YieldStar = 0x73,
+
+    /// §13.3.10 Dynamic `import()` — evaluate specifier and return a Promise
+    /// that resolves to the module namespace object.
+    /// `DynamicImport dst, specifier`
+    /// Spec: <https://tc39.es/ecma262/#sec-import-calls>
+    DynamicImport = 0x74,
+
+    /// §13.3.12 `import.meta` — returns an object with module metadata.
+    /// `ImportMeta dst`
+    /// Spec: <https://tc39.es/ecma262/#sec-meta-properties>
+    ImportMeta = 0x75,
 }
 
 impl Opcode {
@@ -472,6 +483,8 @@ impl Opcode {
             0x71 => Some(Self::PushPrivateSetter),
             0x72 => Some(Self::InPrivate),
             0x73 => Some(Self::YieldStar),
+            0x74 => Some(Self::DynamicImport),
+            0x75 => Some(Self::ImportMeta),
             _ => None,
         }
     }
@@ -1530,6 +1543,27 @@ impl Instruction {
             dst,
             object,
             BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §13.3.10 Dynamic `import()` — evaluate specifier and return a Promise.
+    /// `DynamicImport dst, specifier`
+    /// Spec: <https://tc39.es/ecma262/#sec-import-calls>
+    #[must_use]
+    pub const fn dynamic_import(dst: BytecodeRegister, specifier: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::DynamicImport, dst, specifier, BytecodeRegister::new(0))
+    }
+
+    /// §13.3.12 `import.meta` — returns a module metadata object.
+    /// `ImportMeta dst`
+    /// Spec: <https://tc39.es/ecma262/#sec-meta-properties>
+    #[must_use]
+    pub const fn import_meta(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::ImportMeta,
+            dst,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
         )
     }
 

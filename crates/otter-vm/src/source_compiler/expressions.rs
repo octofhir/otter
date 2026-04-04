@@ -121,6 +121,14 @@ impl<'a> FunctionCompiler<'a> {
             Expression::PrivateInExpression(expr) => {
                 self.compile_private_in_expression(expr, module)
             }
+            // §13.3.10 Dynamic import() — `import(specifier)`.
+            // Spec: <https://tc39.es/ecma262/#sec-import-calls>
+            Expression::ImportExpression(import_expr) => {
+                self.compile_import_expression(import_expr, module)
+            }
+            // §13.3.12 MetaProperty — `import.meta` or `new.target`.
+            // Spec: <https://tc39.es/ecma262/#sec-meta-properties>
+            Expression::MetaProperty(meta) => self.compile_meta_property(meta),
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
                 expression
@@ -1519,7 +1527,7 @@ impl<'a> FunctionCompiler<'a> {
         self.load_undefined()
     }
 
-    fn compile_function_expression(
+    pub(super) fn compile_function_expression(
         &mut self,
         function: &Function<'_>,
         inferred_name: Option<&str>,
@@ -2380,7 +2388,7 @@ impl<'a> FunctionCompiler<'a> {
 
     /// §15.7 ClassExpression — `let x = class [Name] { ... }`
     /// Spec: <https://tc39.es/ecma262/#sec-class-definitions-runtime-semantics-evaluation>
-    fn compile_class_expression(
+    pub(super) fn compile_class_expression(
         &mut self,
         class: &oxc_ast::ast::Class<'_>,
         module: &mut ModuleCompiler<'a>,
@@ -2677,5 +2685,53 @@ impl<'a> FunctionCompiler<'a> {
         self.instructions
             .push(Instruction::new_regexp(dst, regexp_id));
         Ok(ValueLocation::local(dst))
+    }
+
+    /// §13.3.10 Dynamic `import()` — compiles `import(specifier)` to a
+    /// DynamicImport instruction that returns a Promise for the module namespace.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-import-calls>
+    fn compile_import_expression(
+        &mut self,
+        import_expr: &oxc_ast::ast::ImportExpression<'_>,
+        module: &mut super::module_compiler::ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let specifier = self.compile_expression(&import_expr.source, module)?;
+        let specifier_reg = specifier.register;
+
+        // Discard options argument if present (not yet supported).
+        if let Some(options) = &import_expr.options {
+            let opt = self.compile_expression(options, module)?;
+            self.release(opt);
+        }
+
+        let dst = self.allocate_local()?;
+        self.instructions
+            .push(Instruction::dynamic_import(dst, specifier_reg));
+        self.release(specifier);
+        Ok(ValueLocation::local(dst))
+    }
+
+    /// §13.3.12 MetaProperty — `import.meta` or `new.target`.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-meta-properties>
+    fn compile_meta_property(
+        &mut self,
+        meta: &oxc_ast::ast::MetaProperty<'_>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        if meta.meta.name == "import" && meta.property.name == "meta" {
+            // import.meta — emit ImportMeta instruction.
+            let dst = self.allocate_local()?;
+            self.instructions.push(Instruction::import_meta(dst));
+            Ok(ValueLocation::local(dst))
+        } else if meta.meta.name == "new" && meta.property.name == "target" {
+            // new.target — not yet implemented, return undefined.
+            self.load_undefined()
+        } else {
+            Err(SourceLoweringError::Unsupported(format!(
+                "meta property {}.{}",
+                meta.meta.name, meta.property.name
+            )))
+        }
     }
 }

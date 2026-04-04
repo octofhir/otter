@@ -59,6 +59,8 @@ pub mod lowering;
 pub mod microtask;
 /// Executable module and function containers.
 pub mod module;
+/// §16.2.1 — Module loading, linking, and evaluation.
+pub mod module_loader;
 /// Minimal object heap for the new VM.
 pub mod object;
 /// Native payload storage and tracing contracts for JS-visible host objects.
@@ -100,7 +102,9 @@ pub use host::{HostFunctionId, NativeFunctionRegistry};
 pub use host_callbacks::HostCallbackSender;
 pub use interpreter::{Interpreter, RuntimeState};
 pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
-pub use module::{Function, FunctionIndex, Module, ModuleError};
+pub use module::{
+    ExportRecord, Function, FunctionIndex, ImportBinding, ImportRecord, Module, ModuleError,
+};
 pub use object::{ObjectShapeId, PropertyInlineCache};
 pub use payload::{
     NativePayloadError, NativePayloadId, NativePayloadRegistry, VmNativePayload, VmTrace,

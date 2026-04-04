@@ -13,6 +13,11 @@ pub mod instant;
 pub mod now;
 pub mod payload;
 pub mod plain_date;
+pub mod plain_date_time;
+pub mod plain_month_day;
+pub mod plain_time;
+pub mod plain_year_month;
+pub mod zoned_date_time;
 
 use crate::builders::ClassBuilder;
 use crate::object::{ObjectHandle, PropertyAttributes, PropertyValue};
@@ -34,7 +39,7 @@ impl IntrinsicInstaller for TemporalIntrinsic {
         // ── Temporal.Instant ────────────────────────────────────────
         install_temporal_class(
             intrinsics.temporal_instant_prototype,
-            intrinsics.temporal_instant_constructor,
+            &mut intrinsics.temporal_instant_constructor,
             &instant::instant_class_descriptor(),
             intrinsics.function_prototype,
             cx,
@@ -43,7 +48,7 @@ impl IntrinsicInstaller for TemporalIntrinsic {
         // ── Temporal.Duration ───────────────────────────────────────
         install_temporal_class(
             intrinsics.temporal_duration_prototype,
-            intrinsics.temporal_duration_constructor,
+            &mut intrinsics.temporal_duration_constructor,
             &duration::duration_class_descriptor(),
             intrinsics.function_prototype,
             cx,
@@ -52,8 +57,53 @@ impl IntrinsicInstaller for TemporalIntrinsic {
         // ── Temporal.PlainDate ──────────────────────────────────────
         install_temporal_class(
             intrinsics.temporal_plain_date_prototype,
-            intrinsics.temporal_plain_date_constructor,
+            &mut intrinsics.temporal_plain_date_constructor,
             &plain_date::plain_date_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // ── Temporal.PlainTime ─────────────────────────────────────
+        install_temporal_class(
+            intrinsics.temporal_plain_time_prototype,
+            &mut intrinsics.temporal_plain_time_constructor,
+            &plain_time::plain_time_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // ── Temporal.PlainDateTime ─────────────────────────────────
+        install_temporal_class(
+            intrinsics.temporal_plain_date_time_prototype,
+            &mut intrinsics.temporal_plain_date_time_constructor,
+            &plain_date_time::plain_date_time_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // ── Temporal.PlainYearMonth ────────────────────────────────
+        install_temporal_class(
+            intrinsics.temporal_plain_year_month_prototype,
+            &mut intrinsics.temporal_plain_year_month_constructor,
+            &plain_year_month::plain_year_month_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // ── Temporal.PlainMonthDay ─────────────────────────────────
+        install_temporal_class(
+            intrinsics.temporal_plain_month_day_prototype,
+            &mut intrinsics.temporal_plain_month_day_constructor,
+            &plain_month_day::plain_month_day_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // ── Temporal.ZonedDateTime ─────────────────────────────────
+        install_temporal_class(
+            intrinsics.temporal_zoned_date_time_prototype,
+            &mut intrinsics.temporal_zoned_date_time_constructor,
+            &zoned_date_time::zoned_date_time_class_descriptor(),
             intrinsics.function_prototype,
             cx,
         )?;
@@ -109,6 +159,36 @@ impl IntrinsicInstaller for TemporalIntrinsic {
             intrinsics.temporal_plain_date_constructor,
             cx,
         )?;
+        install_on_namespace(
+            intrinsics.temporal_namespace,
+            "PlainTime",
+            intrinsics.temporal_plain_time_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.temporal_namespace,
+            "PlainDateTime",
+            intrinsics.temporal_plain_date_time_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.temporal_namespace,
+            "PlainYearMonth",
+            intrinsics.temporal_plain_year_month_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.temporal_namespace,
+            "PlainMonthDay",
+            intrinsics.temporal_plain_month_day_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.temporal_namespace,
+            "ZonedDateTime",
+            intrinsics.temporal_zoned_date_time_constructor,
+            cx,
+        )?;
 
         Ok(())
     }
@@ -116,9 +196,15 @@ impl IntrinsicInstaller for TemporalIntrinsic {
 
 // ── Shared installation helpers ─────────────────────────────────────
 
+/// Installs a Temporal class following the same pattern as ArrayBuffer/DataView:
+/// register the constructor as a proper host function, then install members.
+///
+/// Returns the **actual** constructor handle (which may differ from the
+/// pre-allocated placeholder if the constructor was re-allocated as a host
+/// function).
 fn install_temporal_class(
     prototype: ObjectHandle,
-    constructor: ObjectHandle,
+    constructor: &mut ObjectHandle,
     descriptor: &crate::descriptors::JsClassDescriptor,
     function_prototype: ObjectHandle,
     cx: &mut IntrinsicInstallContext<'_>,
@@ -129,28 +215,10 @@ fn install_temporal_class(
 
     if let Some(ctor_desc) = plan.constructor() {
         let host_id = cx.native_functions.register(ctor_desc.clone());
-        cx.heap.define_own_property(
-            constructor,
-            cx.property_names.intern("length"),
-            PropertyValue::data_with_attrs(
-                RegisterValue::from_i32(i32::from(ctor_desc.length())),
-                PropertyAttributes::from_flags(false, false, true),
-            ),
-        )?;
-        let name_str = cx.heap.alloc_string(ctor_desc.js_name());
-        cx.heap.define_own_property(
-            constructor,
-            cx.property_names.intern("name"),
-            PropertyValue::data_with_attrs(
-                RegisterValue::from_object_handle(name_str.0),
-                PropertyAttributes::from_flags(false, false, true),
-            ),
-        )?;
-        // Store the host function id on the constructor.
-        let _ = host_id;
+        *constructor = cx.alloc_intrinsic_host_function(host_id, function_prototype)?;
     }
 
-    install_class_plan(prototype, constructor, &plan, function_prototype, cx)?;
+    install_class_plan(prototype, *constructor, &plan, function_prototype, cx)?;
     Ok(())
 }
 

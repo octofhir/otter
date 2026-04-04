@@ -21,16 +21,18 @@ use super::payload::{TemporalPayload, construct_temporal, require_temporal_paylo
 pub fn plain_time_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("PlainTime")
         .with_constructor(NativeFunctionDescriptor::constructor(
-            "PlainTime", 0, plain_time_constructor,
+            "PlainTime",
+            0,
+            plain_time_constructor,
         ))
         .with_binding(stat("from", 1, plain_time_from))
         .with_binding(stat("compare", 2, plain_time_compare))
-        .with_binding(proto("hour", 0, pt_hour))
-        .with_binding(proto("minute", 0, pt_minute))
-        .with_binding(proto("second", 0, pt_second))
-        .with_binding(proto("millisecond", 0, pt_millisecond))
-        .with_binding(proto("microsecond", 0, pt_microsecond))
-        .with_binding(proto("nanosecond", 0, pt_nanosecond))
+        .with_binding(getter("hour", pt_hour))
+        .with_binding(getter("minute", pt_minute))
+        .with_binding(getter("second", pt_second))
+        .with_binding(getter("millisecond", pt_millisecond))
+        .with_binding(getter("microsecond", pt_microsecond))
+        .with_binding(getter("nanosecond", pt_nanosecond))
         .with_binding(proto("add", 1, pt_add))
         .with_binding(proto("subtract", 1, pt_subtract))
         .with_binding(proto("equals", 1, pt_equals))
@@ -39,24 +41,27 @@ pub fn plain_time_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("valueOf", 0, helpers::temporal_value_of))
 }
 
-fn proto(
-    name: &str,
-    arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+type VmNativeFn = fn(
+    &RegisterValue,
+    &[RegisterValue],
+    &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError>;
+
+fn proto(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
         NativeFunctionDescriptor::method(name, arity, f),
     )
 }
 
-fn stat(
-    name: &str,
-    arity: u16,
-    f: fn(&RegisterValue, &[RegisterValue], &mut crate::interpreter::RuntimeState)
-        -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+fn getter(name: &str, f: VmNativeFn) -> NativeBindingDescriptor {
+    NativeBindingDescriptor::new(
+        NativeBindingTarget::Prototype,
+        NativeFunctionDescriptor::getter(name, f),
+    )
+}
+
+fn stat(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,
         NativeFunctionDescriptor::method(name, arity, f),
@@ -117,8 +122,9 @@ fn plain_time_constructor(
     let microsecond = to_integer_or_zero(args, 4, runtime)? as u16;
     let nanosecond = to_integer_or_zero(args, 5, runtime)? as u16;
 
-    let pt = temporal_rs::PlainTime::new(hour, minute, second, millisecond, microsecond, nanosecond)
-        .map_err(|e| temporal_err(e, runtime))?;
+    let pt =
+        temporal_rs::PlainTime::new(hour, minute, second, millisecond, microsecond, nanosecond)
+            .map_err(|e| temporal_err(e, runtime))?;
     Ok(wrap_plain_time(pt, runtime))
 }
 
@@ -170,23 +176,12 @@ macro_rules! pt_getter {
     };
 }
 
-/// §11.2.3.2 get Temporal.PlainTime.prototype.hour
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.hour>
+// §11.2.3.2–7 PlainTime getters: hour, minute, second, millisecond, microsecond, nanosecond
 pt_getter!(pt_hour, hour);
-/// §11.2.3.3 get Temporal.PlainTime.prototype.minute
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.minute>
 pt_getter!(pt_minute, minute);
-/// §11.2.3.4 get Temporal.PlainTime.prototype.second
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.second>
 pt_getter!(pt_second, second);
-/// §11.2.3.5 get Temporal.PlainTime.prototype.millisecond
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.millisecond>
 pt_getter!(pt_millisecond, millisecond);
-/// §11.2.3.6 get Temporal.PlainTime.prototype.microsecond
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.microsecond>
 pt_getter!(pt_microsecond, microsecond);
-/// §11.2.3.7 get Temporal.PlainTime.prototype.nanosecond
-/// <https://tc39.es/proposal-temporal/#sec-get-temporal.plaintime.prototype.nanosecond>
 pt_getter!(pt_nanosecond, nanosecond);
 
 // ── Prototype methods ───────────────────────────────────────────────

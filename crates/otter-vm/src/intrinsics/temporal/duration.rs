@@ -24,18 +24,18 @@ pub fn duration_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(stat("from", 1, duration_from))
         .with_binding(stat("compare", 2, duration_compare))
-        .with_binding(proto("years", 0, dur_years))
-        .with_binding(proto("months", 0, dur_months))
-        .with_binding(proto("weeks", 0, dur_weeks))
-        .with_binding(proto("days", 0, dur_days))
-        .with_binding(proto("hours", 0, dur_hours))
-        .with_binding(proto("minutes", 0, dur_minutes))
-        .with_binding(proto("seconds", 0, dur_seconds))
-        .with_binding(proto("milliseconds", 0, dur_milliseconds))
-        .with_binding(proto("microseconds", 0, dur_microseconds))
-        .with_binding(proto("nanoseconds", 0, dur_nanoseconds))
-        .with_binding(proto("sign", 0, dur_sign))
-        .with_binding(proto("blank", 0, dur_blank))
+        .with_binding(getter("years", dur_years))
+        .with_binding(getter("months", dur_months))
+        .with_binding(getter("weeks", dur_weeks))
+        .with_binding(getter("days", dur_days))
+        .with_binding(getter("hours", dur_hours))
+        .with_binding(getter("minutes", dur_minutes))
+        .with_binding(getter("seconds", dur_seconds))
+        .with_binding(getter("milliseconds", dur_milliseconds))
+        .with_binding(getter("microseconds", dur_microseconds))
+        .with_binding(getter("nanoseconds", dur_nanoseconds))
+        .with_binding(getter("sign", dur_sign))
+        .with_binding(getter("blank", dur_blank))
         .with_binding(proto("negated", 0, dur_negated))
         .with_binding(proto("abs", 0, dur_abs))
         .with_binding(proto("add", 1, dur_add))
@@ -45,30 +45,27 @@ pub fn duration_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("valueOf", 0, helpers::temporal_value_of))
 }
 
-fn proto(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+type VmNativeFn = fn(
+    &RegisterValue,
+    &[RegisterValue],
+    &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError>;
+
+fn proto(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
         NativeFunctionDescriptor::method(name, arity, f),
     )
 }
 
-fn stat(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+fn getter(name: &str, f: VmNativeFn) -> NativeBindingDescriptor {
+    NativeBindingDescriptor::new(
+        NativeBindingTarget::Prototype,
+        NativeFunctionDescriptor::getter(name, f),
+    )
+}
+
+fn stat(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,
         NativeFunctionDescriptor::method(name, arity, f),

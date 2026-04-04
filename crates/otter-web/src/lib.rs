@@ -5,6 +5,7 @@ mod url_api;
 
 use otter_runtime::{HostedExtension, RuntimeProfile, RuntimeState};
 use otter_vm::RegisterValue;
+use otter_vm::WellKnownSymbol;
 use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use otter_vm::object::{HeapValueKind, ObjectHandle, TypedArrayKind};
 use otter_vm::payload::{VmTrace, VmValueTracer};
@@ -395,7 +396,7 @@ pub(crate) fn bytes_from_buffer_source(
     }
 }
 
-fn alloc_uint8_array(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle {
+pub(crate) fn alloc_uint8_array(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle {
     let buffer_proto = Some(runtime.intrinsics().array_buffer_prototype());
     let buffer = runtime
         .objects_mut()
@@ -556,6 +557,34 @@ pub(crate) fn install_method(
     let id = runtime.register_native_function(descriptor);
     let function = runtime.alloc_host_function(id);
     let property = runtime.intern_property_name(name);
+    runtime
+        .objects_mut()
+        .set_property(
+            target,
+            property,
+            RegisterValue::from_object_handle(function.0),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("failed to install {context}: {error:?}"))
+}
+
+pub(crate) fn install_symbol_method(
+    runtime: &mut RuntimeState,
+    target: ObjectHandle,
+    symbol: WellKnownSymbol,
+    js_name: &str,
+    arity: u16,
+    callback: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
+    context: &str,
+) -> Result<(), String> {
+    let descriptor = NativeFunctionDescriptor::method(js_name, arity, callback);
+    let id = runtime.register_native_function(descriptor);
+    let function = runtime.alloc_host_function(id);
+    let property = runtime.intern_symbol_property_name(symbol.stable_id());
     runtime
         .objects_mut()
         .set_property(

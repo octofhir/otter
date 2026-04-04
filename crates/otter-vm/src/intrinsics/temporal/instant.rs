@@ -30,8 +30,8 @@ pub fn instant_class_descriptor() -> JsClassDescriptor {
         .with_binding(stat("compare", 2, instant_compare))
         .with_binding(stat("fromEpochMilliseconds", 1, instant_from_epoch_ms))
         .with_binding(stat("fromEpochNanoseconds", 1, instant_from_epoch_ns))
-        .with_binding(proto("epochMilliseconds", 0, instant_epoch_ms))
-        .with_binding(proto("epochNanoseconds", 0, instant_epoch_ns))
+        .with_binding(getter("epochMilliseconds", instant_epoch_ms))
+        .with_binding(getter("epochNanoseconds", instant_epoch_ns))
         .with_binding(proto("add", 1, instant_add))
         .with_binding(proto("subtract", 1, instant_subtract))
         .with_binding(proto("equals", 1, instant_equals))
@@ -40,30 +40,27 @@ pub fn instant_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("valueOf", 0, helpers::temporal_value_of))
 }
 
-fn proto(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+type VmNativeFn = fn(
+    &RegisterValue,
+    &[RegisterValue],
+    &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError>;
+
+fn proto(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
         NativeFunctionDescriptor::method(name, arity, f),
     )
 }
 
-fn stat(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+fn getter(name: &str, f: VmNativeFn) -> NativeBindingDescriptor {
+    NativeBindingDescriptor::new(
+        NativeBindingTarget::Prototype,
+        NativeFunctionDescriptor::getter(name, f),
+    )
+}
+
+fn stat(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,
         NativeFunctionDescriptor::method(name, arity, f),

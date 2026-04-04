@@ -300,7 +300,7 @@ fn response_follows_json_clone_and_body_reader_semantics() {
                var __type = __response.type; \
                var __redirected = __response.redirected; \
                var __url = __response.url; \
-               var __bodyIsNull = __response.body === null; \
+               var __hasBodyStream = __response.body instanceof ReadableStream; \
                var __jsonContentType = __response.headers.get('content-type'); \
                var __bodyUsedBefore = __response.bodyUsed; \
                var __blobContentType = __blobResponse.headers.get('content-type'); \
@@ -329,7 +329,7 @@ fn response_follows_json_clone_and_body_reader_semantics() {
     );
     assert_eq!(global_string_property(&mut runtime, "__url"), "");
     assert_eq!(
-        global_property(&mut runtime, "__bodyIsNull"),
+        global_property(&mut runtime, "__hasBodyStream"),
         RegisterValue::from_bool(true)
     );
     assert_eq!(

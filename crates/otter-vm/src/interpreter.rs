@@ -2712,6 +2712,15 @@ impl RuntimeState {
         Ok(self.alloc_rejected_vm_promise(reason)?.promise_handle())
     }
 
+    /// Allocates one iterator result object `{ value, done }`.
+    pub fn alloc_iter_result_object(
+        &mut self,
+        value: RegisterValue,
+        done: bool,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        crate::intrinsics::create_iter_result_object(value, done, self)
+    }
+
     pub fn call_callable(
         &mut self,
         callable: ObjectHandle,

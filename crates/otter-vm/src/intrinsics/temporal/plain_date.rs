@@ -27,20 +27,20 @@ pub fn plain_date_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(stat("from", 1, plain_date_from))
         .with_binding(stat("compare", 2, plain_date_compare))
-        .with_binding(proto("calendarId", 0, pd_calendar_id))
-        .with_binding(proto("year", 0, pd_year))
-        .with_binding(proto("month", 0, pd_month))
-        .with_binding(proto("monthCode", 0, pd_month_code))
-        .with_binding(proto("day", 0, pd_day))
-        .with_binding(proto("dayOfWeek", 0, pd_day_of_week))
-        .with_binding(proto("dayOfYear", 0, pd_day_of_year))
-        .with_binding(proto("weekOfYear", 0, pd_week_of_year))
-        .with_binding(proto("yearOfWeek", 0, pd_year_of_week))
-        .with_binding(proto("daysInWeek", 0, pd_days_in_week))
-        .with_binding(proto("daysInMonth", 0, pd_days_in_month))
-        .with_binding(proto("daysInYear", 0, pd_days_in_year))
-        .with_binding(proto("monthsInYear", 0, pd_months_in_year))
-        .with_binding(proto("inLeapYear", 0, pd_in_leap_year))
+        .with_binding(getter("calendarId", pd_calendar_id))
+        .with_binding(getter("year", pd_year))
+        .with_binding(getter("month", pd_month))
+        .with_binding(getter("monthCode", pd_month_code))
+        .with_binding(getter("day", pd_day))
+        .with_binding(getter("dayOfWeek", pd_day_of_week))
+        .with_binding(getter("dayOfYear", pd_day_of_year))
+        .with_binding(getter("weekOfYear", pd_week_of_year))
+        .with_binding(getter("yearOfWeek", pd_year_of_week))
+        .with_binding(getter("daysInWeek", pd_days_in_week))
+        .with_binding(getter("daysInMonth", pd_days_in_month))
+        .with_binding(getter("daysInYear", pd_days_in_year))
+        .with_binding(getter("monthsInYear", pd_months_in_year))
+        .with_binding(getter("inLeapYear", pd_in_leap_year))
         .with_binding(proto("add", 1, pd_add))
         .with_binding(proto("subtract", 1, pd_subtract))
         .with_binding(proto("equals", 1, pd_equals))
@@ -49,30 +49,27 @@ pub fn plain_date_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("valueOf", 0, helpers::temporal_value_of))
 }
 
-fn proto(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+type VmNativeFn = fn(
+    &RegisterValue,
+    &[RegisterValue],
+    &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError>;
+
+fn proto(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Prototype,
         NativeFunctionDescriptor::method(name, arity, f),
     )
 }
 
-fn stat(
-    name: &str,
-    arity: u16,
-    f: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut crate::interpreter::RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> NativeBindingDescriptor {
+fn getter(name: &str, f: VmNativeFn) -> NativeBindingDescriptor {
+    NativeBindingDescriptor::new(
+        NativeBindingTarget::Prototype,
+        NativeFunctionDescriptor::getter(name, f),
+    )
+}
+
+fn stat(name: &str, arity: u16, f: VmNativeFn) -> NativeBindingDescriptor {
     NativeBindingDescriptor::new(
         NativeBindingTarget::Constructor,
         NativeFunctionDescriptor::method(name, arity, f),

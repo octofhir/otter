@@ -14,11 +14,14 @@ use crate::blob_api::{
 use crate::headers_api::{alloc_headers_instance, header_entries, parse_headers_init};
 use crate::url_api::serialize_url_search_params_value;
 use crate::{
-    alloc_constructor, bytes_from_buffer_source, class_prototype, has_global, install_getter,
-    install_method, link_constructor_and_prototype, type_error,
+    alloc_constructor, alloc_uint8_array, bytes_from_buffer_source, class_prototype, has_global,
+    install_getter, install_method, install_symbol_method, link_constructor_and_prototype,
+    type_error,
 };
 
 pub(crate) fn install(runtime: &mut RuntimeState) -> Result<(), String> {
+    install_readable_stream(runtime)?;
+    install_readable_stream_default_reader(runtime)?;
     install_request(runtime)?;
     install_response(runtime)?;
     install_fetch(runtime)?;
@@ -28,7 +31,44 @@ pub(crate) fn install(runtime: &mut RuntimeState) -> Result<(), String> {
 #[derive(Debug, Clone)]
 struct BodyState {
     bytes: Vec<u8>,
-    used: bool,
+    present: bool,
+    disturbed: bool,
+    locked: bool,
+    chunk_delivered: bool,
+    stream: Option<RegisterValue>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamReaderState {
+    body: Arc<Mutex<BodyState>>,
+    released: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug, Clone)]
+struct ReadableStreamPayload {
+    body: Arc<Mutex<BodyState>>,
+}
+
+impl VmTrace for ReadableStreamPayload {
+    fn trace(&self, _tracer: &mut dyn VmValueTracer) {}
+}
+
+#[derive(Debug, Clone)]
+struct ReadableStreamDefaultReaderPayload {
+    state: StreamReaderState,
+}
+
+impl VmTrace for ReadableStreamDefaultReaderPayload {
+    fn trace(&self, _tracer: &mut dyn VmValueTracer) {}
+}
+
+#[derive(Debug, Clone)]
+struct ReadableStreamAsyncIteratorPayload {
+    state: StreamReaderState,
+}
+
+impl VmTrace for ReadableStreamAsyncIteratorPayload {
+    fn trace(&self, _tracer: &mut dyn VmValueTracer) {}
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +82,7 @@ struct RequestPayload {
 impl VmTrace for RequestPayload {
     fn trace(&self, tracer: &mut dyn VmValueTracer) {
         self.headers.trace(tracer);
+        trace_body_state(&self.body, tracer);
     }
 }
 
@@ -57,6 +98,7 @@ struct ResponsePayload {
 impl VmTrace for ResponsePayload {
     fn trace(&self, tracer: &mut dyn VmValueTracer) {
         self.headers.trace(tracer);
+        trace_body_state(&self.body, tracer);
     }
 }
 
@@ -80,6 +122,99 @@ struct FetchResponseState {
     status_text: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+fn install_readable_stream(runtime: &mut RuntimeState) -> Result<(), String> {
+    if has_global(runtime, "ReadableStream") {
+        return Ok(());
+    }
+
+    let prototype = runtime.alloc_object();
+    install_method(
+        runtime,
+        prototype,
+        "cancel",
+        1,
+        readable_stream_cancel,
+        "ReadableStream.prototype.cancel",
+    )?;
+    install_method(
+        runtime,
+        prototype,
+        "getReader",
+        0,
+        readable_stream_get_reader,
+        "ReadableStream.prototype.getReader",
+    )?;
+    install_getter(
+        runtime,
+        prototype,
+        "locked",
+        readable_stream_get_locked,
+        "ReadableStream.prototype.locked",
+    )?;
+    install_symbol_method(
+        runtime,
+        prototype,
+        otter_vm::WellKnownSymbol::AsyncIterator,
+        "[Symbol.asyncIterator]",
+        0,
+        readable_stream_async_iterator,
+        "ReadableStream.prototype[Symbol.asyncIterator]",
+    )?;
+
+    let constructor = alloc_constructor(runtime, "ReadableStream", 0, readable_stream_constructor);
+    link_constructor_and_prototype(runtime, constructor, prototype)?;
+    runtime.install_global_value(
+        "ReadableStream",
+        RegisterValue::from_object_handle(constructor.0),
+    );
+    Ok(())
+}
+
+fn install_readable_stream_default_reader(runtime: &mut RuntimeState) -> Result<(), String> {
+    if has_global(runtime, "ReadableStreamDefaultReader") {
+        return Ok(());
+    }
+
+    let prototype = runtime.alloc_object();
+    install_method(
+        runtime,
+        prototype,
+        "cancel",
+        1,
+        readable_stream_default_reader_cancel,
+        "ReadableStreamDefaultReader.prototype.cancel",
+    )?;
+    install_method(
+        runtime,
+        prototype,
+        "read",
+        0,
+        readable_stream_default_reader_read,
+        "ReadableStreamDefaultReader.prototype.read",
+    )?;
+    install_method(
+        runtime,
+        prototype,
+        "releaseLock",
+        0,
+        readable_stream_default_reader_release_lock,
+        "ReadableStreamDefaultReader.prototype.releaseLock",
+    )?;
+
+    let constructor = alloc_constructor(
+        runtime,
+        "ReadableStreamDefaultReader",
+        1,
+        readable_stream_default_reader_constructor,
+    );
+    link_constructor_and_prototype(runtime, constructor, prototype)?;
+    runtime.install_global_value(
+        "ReadableStreamDefaultReader",
+        RegisterValue::from_object_handle(constructor.0),
+    );
+    Ok(())
 }
 
 fn install_request(runtime: &mut RuntimeState) -> Result<(), String> {
@@ -240,6 +375,185 @@ fn install_response(runtime: &mut RuntimeState) -> Result<(), String> {
     Ok(())
 }
 
+fn readable_stream_constructor(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let source = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let strategy = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    if source != RegisterValue::undefined() && source != RegisterValue::null() {
+        return Err(type_error(
+            runtime,
+            "ReadableStream constructor underlying sources are not implemented yet",
+        ));
+    }
+    if strategy != RegisterValue::undefined() && strategy != RegisterValue::null() {
+        return Err(type_error(
+            runtime,
+            "ReadableStream constructor strategies are not implemented yet",
+        ));
+    }
+    alloc_body_stream_instance(
+        runtime,
+        Arc::new(Mutex::new(BodyState {
+            bytes: Vec::new(),
+            present: true,
+            disturbed: false,
+            locked: false,
+            chunk_delivered: false,
+            stream: None,
+        })),
+    )
+}
+
+fn readable_stream_default_reader_constructor(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let stream = args
+        .first()
+        .copied()
+        .ok_or_else(|| type_error(runtime, "ReadableStreamDefaultReader requires a stream"))?;
+    let payload = require_readable_stream_payload(runtime, &stream)?;
+    let reader = acquire_stream_reader(runtime, &payload.body)?;
+    alloc_readable_stream_default_reader(runtime, reader)
+}
+
+fn readable_stream_get_locked(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_payload(runtime, this)?;
+    let state = payload
+        .body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    Ok(RegisterValue::from_bool(state.locked))
+}
+
+fn readable_stream_get_reader(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_payload(runtime, this)?;
+    let options = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    if options != RegisterValue::undefined() && options != RegisterValue::null() {
+        return Err(type_error(
+            runtime,
+            "ReadableStream.getReader options are not implemented yet",
+        ));
+    }
+    let reader = acquire_stream_reader(runtime, &payload.body)?;
+    alloc_readable_stream_default_reader(runtime, reader)
+}
+
+fn readable_stream_cancel(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_payload(runtime, this)?;
+    let locked = {
+        let mut state = payload
+            .body
+            .lock()
+            .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+        if state.locked {
+            true
+        } else {
+            state.disturbed = true;
+            state.chunk_delivered = true;
+            false
+        }
+    };
+    if locked {
+        let reason = type_error_value(runtime, "ReadableStream is locked and cannot be cancelled")?;
+        return rejected_promise_value(runtime, reason);
+    }
+    fulfilled_promise_value(runtime, RegisterValue::undefined())
+}
+
+fn readable_stream_async_iterator(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_payload(runtime, this)?;
+    let reader = acquire_stream_reader(runtime, &payload.body)?;
+    alloc_readable_stream_async_iterator(runtime, reader)
+}
+
+fn readable_stream_default_reader_read(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_default_reader_payload(runtime, this)?;
+    read_from_reader_state(runtime, &payload.state)
+}
+
+fn readable_stream_default_reader_cancel(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_default_reader_payload(runtime, this)?;
+    cancel_reader_state(runtime, &payload.state)
+}
+
+fn readable_stream_default_reader_release_lock(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_default_reader_payload(runtime, this)?;
+    release_reader_state(&payload.state)?;
+    Ok(RegisterValue::undefined())
+}
+
+fn readable_stream_async_iterator_next(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_async_iterator_payload(runtime, this)?;
+    read_from_reader_state(runtime, &payload.state)
+}
+
+fn readable_stream_async_iterator_return(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let payload = require_readable_stream_async_iterator_payload(runtime, this)?;
+    let _ = cancel_reader_state(runtime, &payload.state)?;
+    release_reader_state(&payload.state)?;
+    let result = runtime.alloc_iter_result_object(RegisterValue::undefined(), true)?;
+    fulfilled_promise_value(runtime, result)
+}
+
+fn readable_stream_async_iterator_symbol_async_iterator(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let _ = require_readable_stream_async_iterator_payload(runtime, this)?;
+    Ok(*this)
+}
+
 fn request_constructor(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -328,7 +642,7 @@ fn request_clone(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let payload = require_request_payload(runtime, this)?;
-    if body_is_used(&payload.body)? {
+    if body_is_unusable(&payload.body)? {
         return Err(type_error(
             runtime,
             "Cannot clone a Request whose body is already used",
@@ -434,7 +748,7 @@ fn response_clone(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let payload = require_response_payload(runtime, this)?;
-    if body_is_used(&payload.body)? {
+    if body_is_unusable(&payload.body)? {
         return Err(type_error(
             runtime,
             "Cannot clone a Response whose body is already used",
@@ -477,7 +791,11 @@ fn response_json_static(
     payload.headers = replace_content_type_header(runtime, payload.headers, "application/json")?;
     payload.body = Arc::new(Mutex::new(BodyState {
         bytes: text.into_bytes(),
-        used: false,
+        present: true,
+        disturbed: false,
+        locked: false,
+        chunk_delivered: false,
+        stream: None,
     }));
     alloc_response_instance(runtime, payload)
 }
@@ -543,7 +861,11 @@ fn fetch_global(
                             headers,
                             body: Arc::new(Mutex::new(BodyState {
                                 bytes: response.body,
-                                used: false,
+                                present: response_status_allows_body(response.status),
+                                disturbed: false,
+                                locked: false,
+                                chunk_delivered: false,
+                                stream: None,
                             })),
                             url: response.url,
                         },
@@ -566,11 +888,12 @@ fn fetch_global(
 }
 
 fn request_or_response_body(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     _args: &[RegisterValue],
-    _runtime: &mut RuntimeState,
+    runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    Ok(RegisterValue::null())
+    let owner = require_body_owner(runtime, this)?;
+    body_stream_value(runtime, owner.body())
 }
 
 fn request_or_response_body_used(
@@ -579,7 +902,7 @@ fn request_or_response_body_used(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let state = require_body_owner(runtime, this)?;
-    Ok(RegisterValue::from_bool(body_is_used(state.body())?))
+    Ok(RegisterValue::from_bool(body_is_disturbed(state.body())?))
 }
 
 fn request_or_response_text(
@@ -682,7 +1005,7 @@ fn build_request_payload(
             bytes: source_body_bytes,
             content_type: None,
         };
-        if body_is_used(&source.body)? && !has_own_property(init, runtime, "body")? {
+        if body_is_unusable(&source.body)? && !has_own_property(init, runtime, "body")? {
             return Err(type_error(
                 runtime,
                 "Cannot construct a Request from one whose body is already used",
@@ -725,7 +1048,11 @@ fn build_request_payload(
         headers,
         body: Arc::new(Mutex::new(BodyState {
             bytes: body.bytes,
-            used: false,
+            present: body.present,
+            disturbed: false,
+            locked: false,
+            chunk_delivered: false,
+            stream: None,
         })),
     })
 }
@@ -788,7 +1115,11 @@ fn build_response_payload(
         headers,
         body: Arc::new(Mutex::new(BodyState {
             bytes: body.bytes,
-            used: false,
+            present: body.present,
+            disturbed: false,
+            locked: false,
+            chunk_delivered: false,
+            stream: None,
         })),
         url: String::new(),
     })
@@ -1064,6 +1395,246 @@ fn require_body_owner(
     ))
 }
 
+fn require_readable_stream_payload(
+    runtime: &mut RuntimeState,
+    value: &RegisterValue,
+) -> Result<ReadableStreamPayload, VmNativeCallError> {
+    runtime
+        .native_payload_from_value::<ReadableStreamPayload>(value)
+        .cloned()
+        .map_err(|_| {
+            type_error(
+                runtime,
+                "ReadableStream method called on incompatible receiver",
+            )
+        })
+}
+
+fn require_readable_stream_default_reader_payload(
+    runtime: &mut RuntimeState,
+    value: &RegisterValue,
+) -> Result<ReadableStreamDefaultReaderPayload, VmNativeCallError> {
+    runtime
+        .native_payload_from_value::<ReadableStreamDefaultReaderPayload>(value)
+        .cloned()
+        .map_err(|_| {
+            type_error(
+                runtime,
+                "ReadableStreamDefaultReader method called on incompatible receiver",
+            )
+        })
+}
+
+fn require_readable_stream_async_iterator_payload(
+    runtime: &mut RuntimeState,
+    value: &RegisterValue,
+) -> Result<ReadableStreamAsyncIteratorPayload, VmNativeCallError> {
+    runtime
+        .native_payload_from_value::<ReadableStreamAsyncIteratorPayload>(value)
+        .cloned()
+        .map_err(|_| {
+            type_error(
+                runtime,
+                "ReadableStream async iterator called on incompatible receiver",
+            )
+        })
+}
+
+fn alloc_body_stream_instance(
+    runtime: &mut RuntimeState,
+    body: Arc<Mutex<BodyState>>,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let prototype = class_prototype(runtime, "ReadableStream")?;
+    let instance =
+        runtime.alloc_native_object_with_prototype(Some(prototype), ReadableStreamPayload { body });
+    Ok(RegisterValue::from_object_handle(instance.0))
+}
+
+fn alloc_readable_stream_default_reader(
+    runtime: &mut RuntimeState,
+    state: StreamReaderState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let prototype = class_prototype(runtime, "ReadableStreamDefaultReader")?;
+    let instance = runtime.alloc_native_object_with_prototype(
+        Some(prototype),
+        ReadableStreamDefaultReaderPayload { state },
+    );
+    Ok(RegisterValue::from_object_handle(instance.0))
+}
+
+fn alloc_readable_stream_async_iterator(
+    runtime: &mut RuntimeState,
+    state: StreamReaderState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let prototype = runtime.alloc_object();
+    install_method(
+        runtime,
+        prototype,
+        "next",
+        0,
+        readable_stream_async_iterator_next,
+        "ReadableStreamAsyncIterator.prototype.next",
+    )
+    .map_err(|error| VmNativeCallError::Internal(error.into_boxed_str()))?;
+    install_method(
+        runtime,
+        prototype,
+        "return",
+        0,
+        readable_stream_async_iterator_return,
+        "ReadableStreamAsyncIterator.prototype.return",
+    )
+    .map_err(|error| VmNativeCallError::Internal(error.into_boxed_str()))?;
+    install_symbol_method(
+        runtime,
+        prototype,
+        otter_vm::WellKnownSymbol::AsyncIterator,
+        "[Symbol.asyncIterator]",
+        0,
+        readable_stream_async_iterator_symbol_async_iterator,
+        "ReadableStreamAsyncIterator.prototype[Symbol.asyncIterator]",
+    )
+    .map_err(|error| VmNativeCallError::Internal(error.into_boxed_str()))?;
+    let instance = runtime.alloc_native_object_with_prototype(
+        Some(prototype),
+        ReadableStreamAsyncIteratorPayload { state },
+    );
+    Ok(RegisterValue::from_object_handle(instance.0))
+}
+
+fn body_stream_value(
+    runtime: &mut RuntimeState,
+    body: &Arc<Mutex<BodyState>>,
+) -> Result<RegisterValue, VmNativeCallError> {
+    {
+        let state = body
+            .lock()
+            .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+        if !state.present {
+            return Ok(RegisterValue::null());
+        }
+        if let Some(stream) = state.stream {
+            return Ok(stream);
+        }
+    }
+
+    let stream = alloc_body_stream_instance(runtime, body.clone())?;
+    let mut state = body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    if let Some(existing) = state.stream {
+        return Ok(existing);
+    }
+    state.stream = Some(stream);
+    Ok(stream)
+}
+
+fn acquire_stream_reader(
+    runtime: &mut RuntimeState,
+    body: &Arc<Mutex<BodyState>>,
+) -> Result<StreamReaderState, VmNativeCallError> {
+    let mut state = body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    if state.locked {
+        return Err(type_error(runtime, "ReadableStream is already locked"));
+    }
+    state.locked = true;
+    Ok(StreamReaderState {
+        body: body.clone(),
+        released: Arc::new(Mutex::new(false)),
+    })
+}
+
+fn release_reader_state(state: &StreamReaderState) -> Result<(), VmNativeCallError> {
+    let mut released = state
+        .released
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("ReadableStream reader mutex poisoned".into()))?;
+    if *released {
+        return Ok(());
+    }
+    let mut body = state
+        .body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    body.locked = false;
+    *released = true;
+    Ok(())
+}
+
+fn ensure_active_reader_state(
+    runtime: &mut RuntimeState,
+    state: &StreamReaderState,
+) -> Result<(), VmNativeCallError> {
+    let released = state
+        .released
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("ReadableStream reader mutex poisoned".into()))?;
+    if *released {
+        return Err(type_error(
+            runtime,
+            "ReadableStream reader has been released",
+        ));
+    }
+    Ok(())
+}
+
+fn read_from_reader_state(
+    runtime: &mut RuntimeState,
+    state: &StreamReaderState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    ensure_active_reader_state(runtime, state)?;
+    let next_chunk = {
+        let mut body = state
+            .body
+            .lock()
+            .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+        let next = if body.chunk_delivered || body.bytes.is_empty() {
+            None
+        } else {
+            Some(body.bytes.clone())
+        };
+        body.disturbed = true;
+        body.chunk_delivered = true;
+        next
+    };
+    let result = if let Some(bytes) = next_chunk {
+        let value = RegisterValue::from_object_handle(alloc_uint8_array(runtime, bytes).0);
+        runtime.alloc_iter_result_object(value, false)?
+    } else {
+        runtime.alloc_iter_result_object(RegisterValue::undefined(), true)?
+    };
+    fulfilled_promise_value(runtime, result)
+}
+
+fn cancel_reader_state(
+    runtime: &mut RuntimeState,
+    state: &StreamReaderState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    ensure_active_reader_state(runtime, state)?;
+    let mut body = state
+        .body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    body.disturbed = true;
+    body.chunk_delivered = true;
+    drop(body);
+    fulfilled_promise_value(runtime, RegisterValue::undefined())
+}
+
+fn trace_body_state(body: &Arc<Mutex<BodyState>>, tracer: &mut dyn VmValueTracer) {
+    if let Ok(state) = body.lock() {
+        if let Some(stream) = state.stream {
+            stream.trace(tracer);
+        }
+    }
+}
+
+fn response_status_allows_body(status: u16) -> bool {
+    !matches!(status, 101 | 103 | 204 | 205 | 304)
+}
+
 enum BodyReadError {
     Rejected(RegisterValue),
     Thrown(VmNativeCallError),
@@ -1074,25 +1645,42 @@ fn consume_body_bytes(
     value: &RegisterValue,
 ) -> Result<Vec<u8>, BodyReadError> {
     let owner = require_body_owner(runtime, value).map_err(BodyReadError::Thrown)?;
-    let mut state = owner.body().lock().map_err(|_| {
-        BodyReadError::Thrown(VmNativeCallError::Internal(
-            "Body state mutex poisoned".into(),
-        ))
-    })?;
-    if state.used {
-        let reason = type_error_value(runtime, "Body has already been consumed")
-            .map_err(BodyReadError::Thrown)?;
-        return Err(BodyReadError::Rejected(reason));
+    let bytes = {
+        let mut state = owner.body().lock().map_err(|_| {
+            BodyReadError::Thrown(VmNativeCallError::Internal(
+                "Body state mutex poisoned".into(),
+            ))
+        })?;
+        if state.locked || state.disturbed {
+            None
+        } else {
+            state.disturbed = true;
+            state.chunk_delivered = true;
+            Some(state.bytes.clone())
+        }
+    };
+    match bytes {
+        Some(bytes) => Ok(bytes),
+        None => {
+            let reason =
+                type_error_value(runtime, "Body is unusable").map_err(BodyReadError::Thrown)?;
+            Err(BodyReadError::Rejected(reason))
+        }
     }
-    state.used = true;
-    Ok(state.bytes.clone())
 }
 
-fn body_is_used(body: &Arc<Mutex<BodyState>>) -> Result<bool, VmNativeCallError> {
+fn body_is_disturbed(body: &Arc<Mutex<BodyState>>) -> Result<bool, VmNativeCallError> {
     let state = body
         .lock()
         .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
-    Ok(state.used)
+    Ok(state.disturbed)
+}
+
+fn body_is_unusable(body: &Arc<Mutex<BodyState>>) -> Result<bool, VmNativeCallError> {
+    let state = body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
+    Ok(state.locked || state.disturbed)
 }
 
 fn clone_body_bytes(body: &Arc<Mutex<BodyState>>) -> Result<Vec<u8>, VmNativeCallError> {
@@ -1105,9 +1693,16 @@ fn clone_body_bytes(body: &Arc<Mutex<BodyState>>) -> Result<Vec<u8>, VmNativeCal
 fn clone_body_state(
     body: &Arc<Mutex<BodyState>>,
 ) -> Result<Arc<Mutex<BodyState>>, VmNativeCallError> {
+    let state = body
+        .lock()
+        .map_err(|_| VmNativeCallError::Internal("Body state mutex poisoned".into()))?;
     Ok(Arc::new(Mutex::new(BodyState {
-        bytes: clone_body_bytes(body)?,
-        used: false,
+        bytes: state.bytes.clone(),
+        present: state.present,
+        disturbed: false,
+        locked: false,
+        chunk_delivered: false,
+        stream: None,
     })))
 }
 

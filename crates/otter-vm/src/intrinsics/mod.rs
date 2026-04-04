@@ -36,6 +36,7 @@ mod weakmap_weakset_class;
 
 pub(crate) use boolean_class::box_boolean_object;
 pub(crate) use generator_class::GeneratorResumeKind;
+pub(crate) use iterator_class::create_iter_result_object;
 pub(crate) use number_class::box_number_object;
 pub(crate) use symbol_class::{box_symbol_object, symbol_descriptive_string};
 
@@ -1544,7 +1545,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 461);
+        assert_eq!(native_functions.len(), 594);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

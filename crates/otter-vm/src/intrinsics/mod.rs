@@ -142,6 +142,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "SyntaxError",
     "URIError",
     "EvalError",
+    "AggregateError",
     "Symbol",
     "Date",
     "RegExp",
@@ -174,6 +175,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "encodeURIComponent",
     "decodeURI",
     "decodeURIComponent",
+    "globalThis",
     "console",
     "$262",
 ];
@@ -294,6 +296,8 @@ pub struct VmIntrinsics {
     pub(crate) uri_error_constructor: ObjectHandle,
     pub(crate) eval_error_prototype: ObjectHandle,
     pub(crate) eval_error_constructor: ObjectHandle,
+    pub(crate) aggregate_error_prototype: ObjectHandle,
+    pub(crate) aggregate_error_constructor: ObjectHandle,
     // Map / Set
     pub(crate) map_constructor: ObjectHandle,
     pub(crate) map_prototype: ObjectHandle,
@@ -415,6 +419,8 @@ impl VmIntrinsics {
         let uri_error_constructor = heap.alloc_object();
         let eval_error_prototype = heap.alloc_object();
         let eval_error_constructor = heap.alloc_object();
+        let aggregate_error_prototype = heap.alloc_object();
+        let aggregate_error_constructor = heap.alloc_object();
         let map_constructor = heap.alloc_object();
         let map_prototype = heap.alloc_object();
         let set_constructor = heap.alloc_object();
@@ -547,6 +553,8 @@ impl VmIntrinsics {
             uri_error_constructor,
             eval_error_prototype,
             eval_error_constructor,
+            aggregate_error_prototype,
+            aggregate_error_constructor,
             map_constructor,
             map_prototype,
             set_constructor,
@@ -656,6 +664,9 @@ impl VmIntrinsics {
         heap.set_prototype(self.uri_error_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.eval_error_prototype, Some(self.error_prototype))?;
         heap.set_prototype(self.eval_error_constructor, Some(self.function_prototype))?;
+        // AggregateError (§20.5.7)
+        heap.set_prototype(self.aggregate_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(self.aggregate_error_constructor, Some(self.function_prototype))?;
         // Promise: constructor → Function.prototype, prototype → Object.prototype
         heap.set_prototype(self.promise_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.promise_prototype, Some(self.object_prototype))?;
@@ -847,6 +858,17 @@ impl VmIntrinsics {
                 self.global_object,
                 prop,
                 RegisterValue::from_object_handle(handle.0),
+            )?;
+        }
+
+        // §19.1 globalThis — self-reference to the global object.
+        // Spec: <https://tc39.es/ecma262/#sec-globalthis>
+        {
+            let global_this_prop = cx.property_names.intern("globalThis");
+            cx.heap.set_property(
+                self.global_object,
+                global_this_prop,
+                RegisterValue::from_object_handle(self.global_object.0),
             )?;
         }
 
@@ -1625,7 +1647,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 603);
+        assert_eq!(native_functions.len(), 604);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

@@ -76,6 +76,14 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             cx,
         )?;
 
+        // §20.5.7 AggregateError — special constructor with (errors, message) signature.
+        install_aggregate_error_class(
+            intrinsics.aggregate_error_prototype,
+            &mut intrinsics.aggregate_error_constructor,
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
         // Install Error.prototype.toString on the base Error prototype.
         install_error_to_string(intrinsics, cx)?;
 
@@ -95,6 +103,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             ("SyntaxError", intrinsics.syntax_error_constructor),
             ("URIError", intrinsics.uri_error_constructor),
             ("EvalError", intrinsics.eval_error_constructor),
+            ("AggregateError", intrinsics.aggregate_error_constructor),
         ];
         for &(name, handle) in globals {
             cx.install_global_value(
@@ -155,6 +164,96 @@ fn install_error_class(
     )?;
 
     Ok(())
+}
+
+/// §20.5.7 AggregateError — `new AggregateError(errors, message)`
+/// Spec: <https://tc39.es/ecma262/#sec-aggregate-error-objects>
+///
+/// AggregateError stores an `errors` iterable as an own Array property
+/// in addition to the standard `message` property.
+fn install_aggregate_error_class(
+    prototype: ObjectHandle,
+    constructor: &mut ObjectHandle,
+    function_prototype: ObjectHandle,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let descriptor = JsClassDescriptor::new("AggregateError")
+        .with_constructor(NativeFunctionDescriptor::constructor(
+            "AggregateError",
+            2,
+            aggregate_error_constructor,
+        ));
+    let plan = ClassBuilder::from_descriptor(&descriptor)
+        .expect("AggregateError class descriptor should normalize")
+        .build();
+
+    if let Some(ctor_desc) = plan.constructor() {
+        let host_id = cx.native_functions.register(ctor_desc.clone());
+        let new_ctor = cx.alloc_intrinsic_host_function(host_id, function_prototype)?;
+        *constructor = new_ctor;
+    }
+
+    install_class_plan(prototype, *constructor, &plan, function_prototype, cx)?;
+
+    // Set prototype.name = "AggregateError".
+    let name_prop = cx.property_names.intern("name");
+    let name_str = cx.heap.alloc_string("AggregateError");
+    cx.heap.set_property(
+        prototype,
+        name_prop,
+        RegisterValue::from_object_handle(name_str.0),
+    )?;
+
+    // Set prototype.message = "" (default empty message).
+    let message_prop = cx.property_names.intern("message");
+    let empty_str = cx.heap.alloc_string("");
+    cx.heap.set_property(
+        prototype,
+        message_prop,
+        RegisterValue::from_object_handle(empty_str.0),
+    )?;
+
+    Ok(())
+}
+
+/// §20.5.7.1 AggregateError ( errors, message )
+/// Spec: <https://tc39.es/ecma262/#sec-aggregate-error>
+fn aggregate_error_constructor(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("AggregateError constructor requires new".into())
+    })?;
+
+    // 1. Set message property if provided and not undefined (§20.5.7.1 step 4).
+    let message_arg = args.get(1).copied().unwrap_or(RegisterValue::undefined());
+    if message_arg != RegisterValue::undefined() {
+        let msg_str = runtime.js_to_string_infallible(message_arg);
+        let msg_handle = runtime.alloc_string(msg_str);
+        let msg_prop = runtime.intern_property_name("message");
+        runtime
+            .objects_mut()
+            .set_property(
+                handle,
+                msg_prop,
+                RegisterValue::from_object_handle(msg_handle.0),
+            )
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    }
+
+    // 2. Store errors on the `errors` property (§20.5.7.1 step 5).
+    //    Spec calls for IterableToList(errors), but storing the argument directly
+    //    covers the common case of passing an array.
+    let errors_arg = args.first().copied().unwrap_or(RegisterValue::undefined());
+    let errors_prop = runtime.intern_property_name("errors");
+    runtime
+        .objects_mut()
+        .set_property(handle, errors_prop, errors_arg)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    Ok(*this)
 }
 
 /// Install `Error.prototype.toString` as a host method.

@@ -131,6 +131,18 @@ impl RegisterValue {
         Self(TAG_UNDEFINED)
     }
 
+    /// Returns `true` if this value is `undefined`.
+    #[must_use]
+    pub const fn is_undefined(self) -> bool {
+        self.0 == TAG_UNDEFINED
+    }
+
+    /// Returns `true` if this value is `null`.
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        self.0 == TAG_NULL
+    }
+
     /// Encodes `null`.
     #[must_use]
     pub const fn null() -> Self {

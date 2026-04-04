@@ -74,6 +74,11 @@ impl<'a> FunctionCompiler<'a> {
             Expression::TemplateLiteral(template) => {
                 self.compile_template_literal(template, module)
             }
+            // §13.3.11 Tagged Templates — `tag`str``
+            // Spec: <https://tc39.es/ecma262/#sec-tagged-templates>
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.compile_tagged_template_expression(tagged, module)
+            }
             Expression::SequenceExpression(sequence) => {
                 self.compile_sequence_expression(sequence, module)
             }
@@ -2167,11 +2172,13 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::local(dst))
     }
 
-    /// §13.3.7 Optional Chaining — `obj?.prop`, `obj?.[key]`, `obj?.method()`
+    /// ��13.3.7 Optional Chaining — `obj?.prop`, `obj?.[key]`, `obj?.method()`
     /// Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
     ///
     /// Strategy: extract the base object, check if nullish, short-circuit to
     /// undefined if so. Otherwise perform the member access / call normally.
+    /// All nullish guards within a single chain share the same short-circuit
+    /// target (the end label) per §13.3.7.1.
     fn compile_chain_expression(
         &mut self,
         chain: &oxc_ast::ast::ChainExpression<'_>,
@@ -2183,23 +2190,15 @@ impl<'a> FunctionCompiler<'a> {
         let result = self.allocate_local()?;
         self.instructions.push(Instruction::load_undefined(result));
 
+        // All nullish guards jump to the same end label.
+        let mut jump_patches: Vec<usize> = Vec::new();
+
         match &chain.expression {
             ChainElement::StaticMemberExpression(member) => {
                 let base = self.compile_expression(&member.object, module)?;
                 let base = self.stabilize_binding_value(base)?;
 
-                // if (base == null) jump to end
-                let null_val = self.load_null()?;
-                let is_nullish = ValueLocation::temp(self.alloc_temp());
-                self.instructions.push(Instruction::loose_eq(
-                    is_nullish.register,
-                    base.register,
-                    null_val.register,
-                ));
-                self.release(null_val);
-                let jump_end =
-                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, is_nullish.register);
-                self.release(is_nullish);
+                self.emit_nullish_guard(base.register, &mut jump_patches)?;
 
                 let prop = self.intern_property_name(member.property.name.as_str())?;
                 let val = ValueLocation::temp(self.alloc_temp());
@@ -2211,24 +2210,12 @@ impl<'a> FunctionCompiler<'a> {
                 self.instructions
                     .push(Instruction::move_(result, val.register));
                 self.release(val);
-                let end = self.instructions.len();
-                self.patch_jump(jump_end, end)?;
             }
             ChainElement::ComputedMemberExpression(member) => {
                 let base = self.compile_expression(&member.object, module)?;
                 let base = self.stabilize_binding_value(base)?;
 
-                let null_val = self.load_null()?;
-                let is_nullish = ValueLocation::temp(self.alloc_temp());
-                self.instructions.push(Instruction::loose_eq(
-                    is_nullish.register,
-                    base.register,
-                    null_val.register,
-                ));
-                self.release(null_val);
-                let jump_end =
-                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, is_nullish.register);
-                self.release(is_nullish);
+                self.emit_nullish_guard(base.register, &mut jump_patches)?;
 
                 let key = self.compile_expression(&member.expression, module)?;
                 let val = ValueLocation::temp(self.alloc_temp());
@@ -2241,14 +2228,62 @@ impl<'a> FunctionCompiler<'a> {
                 self.instructions
                     .push(Instruction::move_(result, val.register));
                 self.release(val);
-                let end = self.instructions.len();
-                self.patch_jump(jump_end, end)?;
             }
-            ChainElement::CallExpression(_call) => {
-                // TODO: optional call `obj?.method()` — fall back for now.
-                return Err(SourceLoweringError::Unsupported(
-                    "optional call expressions (?.) are not yet implemented".to_string(),
-                ));
+            // §13.3.8.1 Optional call: `a?.()`, `a?.b()`, `a.b?.()`, `a?.b?.()`
+            // Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
+            ChainElement::CallExpression(call) => {
+                // Compile callee with chain-aware optional handling.
+                let (callee, receiver) = self.compile_chain_call_target(
+                    &call.callee,
+                    &mut jump_patches,
+                    module,
+                )?;
+
+                // Stabilize for safe register reuse across argument compilation.
+                let receiver = match receiver {
+                    Some(r) if r.is_temp => Some(self.stabilize_binding_value(r)?),
+                    other => other,
+                };
+                let callee = if callee.is_temp {
+                    self.stabilize_binding_value(callee)?
+                } else {
+                    callee
+                };
+
+                // If the call itself uses `?.()` syntax, check callee for nullish.
+                if call.optional {
+                    self.emit_nullish_guard(callee.register, &mut jump_patches)?;
+                }
+
+                // Compile call arguments and emit call instruction.
+                let has_spread = call
+                    .arguments
+                    .iter()
+                    .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+                let call_result = if has_spread {
+                    self.compile_call_with_spread(
+                        &call.arguments,
+                        callee,
+                        receiver,
+                        false,
+                        module,
+                    )?
+                } else {
+                    self.compile_call_static_args(
+                        &call.arguments,
+                        callee,
+                        receiver,
+                        false,
+                        module,
+                    )?
+                };
+
+                self.instructions
+                    .push(Instruction::move_(result, call_result.register));
+                if call_result.register != result {
+                    self.release(call_result);
+                }
             }
             _ => {
                 return Err(SourceLoweringError::Unsupported(
@@ -2256,7 +2291,91 @@ impl<'a> FunctionCompiler<'a> {
                 ));
             }
         }
+
+        let end = self.instructions.len();
+        for patch in jump_patches {
+            self.patch_jump(patch, end)?;
+        }
         Ok(ValueLocation::local(result))
+    }
+
+    /// Compile the callee of an optional chain call expression.
+    ///
+    /// When the callee is a member expression with `optional: true` (e.g. the
+    /// `a?.b` in `a?.b()`), a nullish guard is inserted for the base object.
+    /// Returns `(callee, receiver)` just like `compile_call_target`.
+    ///
+    /// §13.3.7.1 Runtime Semantics: ChainEvaluation
+    /// Spec: <https://tc39.es/ecma262/#sec-optional-chaining-chain-evaluation>
+    fn compile_chain_call_target(
+        &mut self,
+        callee: &Expression<'_>,
+        jump_patches: &mut Vec<usize>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(ValueLocation, Option<ValueLocation>), SourceLoweringError> {
+        match callee {
+            // `a?.b()` — callee is StaticMember with optional flag
+            Expression::StaticMemberExpression(member) if member.optional => {
+                let receiver = self.compile_expression(&member.object, module)?;
+                let receiver = self.stabilize_binding_value(receiver)?;
+
+                self.emit_nullish_guard(receiver.register, jump_patches)?;
+
+                let callee_reg = self.alloc_temp();
+                let prop = self.intern_property_name(member.property.name.as_str())?;
+                self.instructions.push(Instruction::get_property(
+                    callee_reg,
+                    receiver.register,
+                    prop,
+                ));
+                Ok((ValueLocation::temp(callee_reg), Some(receiver)))
+            }
+            // `a?.[key]()` — callee is ComputedMember with optional flag
+            Expression::ComputedMemberExpression(member) if member.optional => {
+                let receiver = self.compile_expression(&member.object, module)?;
+                let receiver = self.stabilize_binding_value(receiver)?;
+
+                self.emit_nullish_guard(receiver.register, jump_patches)?;
+
+                let key = self.compile_expression(&member.expression, module)?;
+                let callee_reg = self.alloc_temp();
+                self.instructions.push(Instruction::get_index(
+                    callee_reg,
+                    receiver.register,
+                    key.register,
+                ));
+                self.release(key);
+                Ok((ValueLocation::temp(callee_reg), Some(receiver)))
+            }
+            // Non-optional callee — compile normally via standard call target.
+            _ => self.compile_call_target(callee, module),
+        }
+    }
+
+    /// Emit a nullish guard: `if (value == null) jump to end`.
+    ///
+    /// Uses abstract equality (`==`) so that both `null` and `undefined` match.
+    /// The jump placeholder index is pushed to `jump_patches` for later patching.
+    ///
+    /// §13.3.7.1 Runtime Semantics: ChainEvaluation
+    /// Spec: <https://tc39.es/ecma262/#sec-optional-chaining-chain-evaluation>
+    fn emit_nullish_guard(
+        &mut self,
+        value: BytecodeRegister,
+        jump_patches: &mut Vec<usize>,
+    ) -> Result<(), SourceLoweringError> {
+        let null_val = self.load_null()?;
+        let is_nullish = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::loose_eq(
+            is_nullish.register,
+            value,
+            null_val.register,
+        ));
+        self.release(null_val);
+        let patch = self.emit_conditional_placeholder(Opcode::JumpIfTrue, is_nullish.register);
+        self.release(is_nullish);
+        jump_patches.push(patch);
+        Ok(())
     }
 
     /// §15.7 ClassExpression — `let x = class [Name] { ... }`
@@ -2345,6 +2464,176 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         Ok(result)
+    }
+
+    /// §13.3.11 Tagged Templates — `` tag`hello ${expr} world` ``
+    /// Spec: <https://tc39.es/ecma262/#sec-tagged-templates>
+    ///
+    /// Compiles a tagged template expression by:
+    /// 1. Building the template object (frozen array of cooked strings with `.raw`)
+    /// 2. Evaluating each substitution expression
+    /// 3. Calling the tag function: `tag(templateObj, sub0, sub1, ...)`
+    ///
+    /// §13.2.8.3 GetTemplateObject
+    /// Spec: <https://tc39.es/ecma262/#sec-gettemplateobject>
+    fn compile_tagged_template_expression(
+        &mut self,
+        tagged: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let template = &tagged.quasi;
+
+        // 1. Compile the tag expression (callee + optional receiver for method calls).
+        let (callee, receiver) = self.compile_call_target(&tagged.tag, module)?;
+        let receiver = match receiver {
+            Some(r) if r.is_temp => Some(self.stabilize_binding_value(r)?),
+            other => other,
+        };
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
+
+        // 2. Build the template strings array (cooked values).
+        //    §13.2.8.3 GetTemplateObject — `template` is an Array of cooked strings.
+        let quasis_count = template.quasis.len() as u16;
+        let strings_arr = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(strings_arr.register, quasis_count));
+        let strings_arr = self.stabilize_binding_value(strings_arr)?;
+
+        for (i, quasi) in template.quasis.iter().enumerate() {
+            let cooked = quasi.value.cooked.as_ref().map(|s| s.as_str());
+            let val = match cooked {
+                Some(s) => self.compile_string_literal(s)?,
+                None => {
+                    // Invalid escape sequence → cooked is undefined.
+                    let v = ValueLocation::temp(self.alloc_temp());
+                    self.instructions
+                        .push(Instruction::load_undefined(v.register));
+                    v
+                }
+            };
+            let idx = self.compile_numeric_literal(i as f64)?;
+            self.instructions.push(Instruction::set_index(
+                strings_arr.register,
+                idx.register,
+                val.register,
+            ));
+            self.release(idx);
+            self.release(val);
+        }
+
+        // 3. Build the raw strings array.
+        //    §13.2.8.3 GetTemplateObject — `template.raw` is an Array of raw strings.
+        let raw_arr = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(raw_arr.register, quasis_count));
+        let raw_arr = self.stabilize_binding_value(raw_arr)?;
+
+        for (i, quasi) in template.quasis.iter().enumerate() {
+            let raw_str = quasi.value.raw.as_str();
+            let val = self.compile_string_literal(raw_str)?;
+            let idx = self.compile_numeric_literal(i as f64)?;
+            self.instructions.push(Instruction::set_index(
+                raw_arr.register,
+                idx.register,
+                val.register,
+            ));
+            self.release(idx);
+            self.release(val);
+        }
+
+        // 4. Set `strings.raw = rawArray`.
+        let raw_prop = self.intern_property_name("raw")?;
+        self.instructions.push(Instruction::set_property(
+            strings_arr.register,
+            raw_arr.register,
+            raw_prop,
+        ));
+        self.release(raw_arr);
+
+        // 5. Evaluate substitution expressions.
+        let mut sub_values = Vec::with_capacity(template.expressions.len());
+        for expr in &template.expressions {
+            let val = self.compile_expression(expr, module)?;
+            sub_values.push(if val.is_temp {
+                self.stabilize_binding_value(val)?
+            } else {
+                val
+            });
+        }
+
+        // 6. Call: tag(strings, sub0, sub1, ...)
+        //    Total argument count = 1 (template object) + substitution count.
+        let total_args = 1 + sub_values.len();
+        let argument_count = RegisterIndex::try_from(total_args)
+            .map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let arg_start = self.reserve_temp_window(argument_count)?;
+
+        // First arg: template strings array
+        self.instructions
+            .push(Instruction::move_(arg_start, strings_arr.register));
+        self.release(strings_arr);
+
+        // Remaining args: substitution values
+        for (i, val) in sub_values.into_iter().enumerate() {
+            let dst = BytecodeRegister::new(arg_start.index() + 1 + i as u16);
+            if val.register != dst {
+                self.instructions
+                    .push(Instruction::move_(dst, val.register));
+                self.release(val);
+            }
+        }
+
+        let mut call_result = if receiver.is_some_and(|r| r.is_temp) {
+            receiver.expect("receiver must exist")
+        } else if callee.is_temp {
+            callee
+        } else {
+            ValueLocation::temp(self.alloc_temp())
+        };
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            call_result.register,
+            callee.register,
+            arg_start,
+        ));
+        let call_site = match receiver {
+            Some(recv) => CallSite::Closure(ClosureCall::new_with_receiver(
+                argument_count,
+                FrameFlags::new(false, true, false),
+                recv.register,
+            )),
+            None => CallSite::Closure(ClosureCall::new(
+                argument_count,
+                FrameFlags::new(false, true, false),
+            )),
+        };
+        self.record_call_site(pc, call_site);
+
+        // Move result to highest temp (same pattern as compile_call_static_args).
+        if argument_count != 0 {
+            let stable_register =
+                BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
+            if call_result.register != stable_register {
+                self.instructions
+                    .push(Instruction::move_(stable_register, call_result.register));
+                call_result = ValueLocation::temp(stable_register);
+            }
+            self.release_temp_window(argument_count.saturating_sub(1));
+        }
+        if callee.register != call_result.register {
+            self.release(callee);
+        }
+        if let Some(recv) = receiver
+            && recv.register != call_result.register
+        {
+            self.release(recv);
+        }
+
+        Ok(call_result)
     }
 
     /// §12.9 Regular Expression Literals — emits a `NewRegExp` instruction.

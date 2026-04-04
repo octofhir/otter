@@ -370,6 +370,16 @@ impl<'a> FunctionCompiler<'a> {
         Ok(false)
     }
 
+    /// §13.7.5.12 ForIn/OfBodyEvaluation — assign the iteration value to
+    /// the for-of / for-in / for-await-of left-hand side binding.
+    ///
+    /// Handles:
+    /// - Simple identifiers: `for (const x of arr)`
+    /// - Destructuring bindings: `for (const {a, b} of arr)`, `for (const [a, b] of arr)`
+    /// - Assignment targets: `for ({a, b} of arr)`, `for ([a, b] of arr)`
+    /// - Member expressions: `for (obj.prop of arr)`, `for (obj[key] of arr)`
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-forinofbodyevaluation>
     pub(super) fn assign_for_of_left(
         &mut self,
         left: &ForStatementLeft<'_>,
@@ -393,18 +403,30 @@ impl<'a> FunctionCompiler<'a> {
                         "for..of declaration initializers".to_string(),
                     ));
                 }
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    return Err(SourceLoweringError::Unsupported(
-                        "for..of destructuring bindings".to_string(),
-                    ));
-                };
 
-                let register = self.declare_variable_binding(identifier.name.as_str(), true)?;
-                self.assign_binding(
-                    identifier.name.as_str(),
-                    register,
-                    ValueLocation::local(value_register),
-                )?;
+                // §13.15.5 Destructuring binding patterns in for-of/for-in.
+                // Spec: <https://tc39.es/ecma262/#sec-destructuring-assignment>
+                match &declarator.id {
+                    BindingPattern::BindingIdentifier(identifier) => {
+                        let register =
+                            self.declare_variable_binding(identifier.name.as_str(), true)?;
+                        self.assign_binding(
+                            identifier.name.as_str(),
+                            register,
+                            ValueLocation::local(value_register),
+                        )?;
+                    }
+                    pattern @ (BindingPattern::ObjectPattern(_)
+                    | BindingPattern::ArrayPattern(_)
+                    | BindingPattern::AssignmentPattern(_)) => {
+                        self.compile_binding_pattern_target(
+                            pattern,
+                            ValueLocation::local(value_register),
+                            false,
+                            module,
+                        )?;
+                    }
+                }
                 Ok(())
             }
             ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
@@ -432,6 +454,20 @@ impl<'a> FunctionCompiler<'a> {
                     property,
                 ));
                 self.release(object);
+                Ok(())
+            }
+            // §13.15.5 Destructuring assignment targets in for-of/for-in.
+            // `for ({a, b} of arr)` or `for ([a, b] of arr)`
+            ForStatementLeft::ObjectAssignmentTarget(target) => {
+                let value = self.stabilize_binding_value(ValueLocation::local(value_register))?;
+                self.compile_object_assignment_destructuring(target, value.register, module)?;
+                self.release(value);
+                Ok(())
+            }
+            ForStatementLeft::ArrayAssignmentTarget(target) => {
+                let value = self.stabilize_binding_value(ValueLocation::local(value_register))?;
+                self.compile_array_assignment_destructuring(target, value.register, module)?;
+                self.release(value);
                 Ok(())
             }
             _ => Err(SourceLoweringError::Unsupported(
@@ -677,18 +713,33 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<bool, SourceLoweringError> {
         let saved_env = self.env.clone();
 
+        // §14.15.2 CatchClauseEvaluation — bind the caught exception to
+        // the catch parameter (simple identifier or destructuring pattern).
+        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-catchclauseevaluation>
         if let Some(param) = &handler.param {
-            let BindingPattern::BindingIdentifier(identifier) = &param.pattern else {
-                return Err(SourceLoweringError::Unsupported(
-                    "destructuring catch parameters".to_string(),
-                ));
-            };
-            let register = self.allocate_local()?;
-            self.env
-                .bindings
-                .insert(identifier.name.to_string(), Binding::Register(register));
-            self.instructions
-                .push(Instruction::load_exception(register));
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(identifier) => {
+                    let register = self.allocate_local()?;
+                    self.env
+                        .bindings
+                        .insert(identifier.name.to_string(), Binding::Register(register));
+                    self.instructions
+                        .push(Instruction::load_exception(register));
+                }
+                pattern @ (BindingPattern::ObjectPattern(_)
+                | BindingPattern::ArrayPattern(_)
+                | BindingPattern::AssignmentPattern(_)) => {
+                    let exc_reg = self.allocate_local()?;
+                    self.instructions
+                        .push(Instruction::load_exception(exc_reg));
+                    self.compile_binding_pattern_target(
+                        pattern,
+                        ValueLocation::local(exc_reg),
+                        false,
+                        module,
+                    )?;
+                }
+            }
         }
 
         let terminated = self.compile_statements(&handler.body.body, module)?;

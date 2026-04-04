@@ -7,7 +7,7 @@ use crate::object::{HeapValueKind, ObjectHandle};
 use crate::value::RegisterValue;
 
 use super::{
-    IntrinsicsError, VmIntrinsics,
+    IntrinsicsError, VmIntrinsics, WellKnownSymbol,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
 };
 
@@ -60,6 +60,43 @@ impl IntrinsicInstaller for ArrayIntrinsic {
             .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
         cx.heap
             .set_property(intrinsics.array_prototype(), sym_iterator, values_fn)?;
+
+        // §23.1.3.38 Array.prototype[@@unscopables]
+        // Spec: <https://tc39.es/ecma262/#sec-array.prototype-%symbol.unscopables%>
+        let unscopables_obj = cx.heap.alloc_object(); // null prototype per spec
+        let true_val = RegisterValue::from_bool(true);
+        for name in [
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            let prop = cx.property_names.intern(name);
+            cx.heap.set_property(unscopables_obj, prop, true_val)?;
+        }
+        let sym_unscopables = cx
+            .property_names
+            .intern_symbol(WellKnownSymbol::Unscopables.stable_id());
+        cx.heap.define_own_property(
+            intrinsics.array_prototype(),
+            sym_unscopables,
+            crate::object::PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(unscopables_obj.0),
+                crate::object::PropertyAttributes::from_flags(false, false, true),
+            ),
+        )?;
 
         Ok(())
     }
@@ -423,36 +460,41 @@ fn array_index_of(
 }
 
 /// ES2024 §23.1.3.1 Array.prototype.concat(...items)
+/// ES2024 §22.1.3.1 Array.prototype.concat(...items)
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.concat>
 fn array_concat(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.concat requires array receiver".into())
-    })?;
-    let base_len = array_length(receiver, runtime, "Array.prototype.concat")?;
+    // 1. Let O be ? ToObject(this value).
     let result = runtime.alloc_array();
-    runtime
-        .objects_mut()
-        .set_array_length(result, base_len)
-        .ok();
-    for index in 0..base_len {
-        if let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.concat")? {
-            runtime.objects_mut().set_index(result, index, elem).ok();
-        }
-    }
-    let mut next_index = base_len;
-    for arg in args {
-        if let Some(handle) = arg.as_object_handle().map(ObjectHandle)
-            && matches!(runtime.objects().kind(handle), Ok(HeapValueKind::Array))
-        {
-            let arg_len = array_length(handle, runtime, "Array.prototype.concat")?;
+    let mut next_index: usize = 0;
+
+    // 3. Let items be a List whose first element is O and whose subsequent
+    //    elements are the elements of args.
+    // We iterate over `this` first, then `args`.
+    let this_val = *this;
+    let items = std::iter::once(&this_val).chain(args.iter());
+
+    for item in items {
+        // 4.a. Let spreadable be ? IsConcatSpreadable(E).
+        if is_concat_spreadable(*item, runtime)? {
+            // 4.a.i. Spreadable: treat as array-like
+            // ES2024 §22.1.3.1 step 5.c.ii: Let len be ? LengthOfArrayLike(E).
+            let handle = item.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+                VmNativeCallError::Internal(
+                    "concat: spreadable value must be an object".into(),
+                )
+            })?;
+            let len = length_of_array_like(handle, runtime)?;
             runtime
                 .objects_mut()
-                .set_array_length(result, next_index.saturating_add(arg_len))
+                .set_array_length(result, next_index.saturating_add(len))
                 .ok();
-            for offset in 0..arg_len {
+            for offset in 0..len {
+                // 5.c.iv.2: Let exists be ? HasProperty(E, P).
+                // 5.c.iv.3: If exists is true, let subElement be ? Get(E, P).
                 if let Some(elem) =
                     array_index_value(handle, offset, runtime, "Array.prototype.concat")?
                 {
@@ -462,13 +504,45 @@ fn array_concat(
                         .ok();
                 }
             }
-            next_index = next_index.saturating_add(arg_len);
-            continue;
+            next_index = next_index.saturating_add(len);
+        } else {
+            // 4.a.ii. Not spreadable: append as single element.
+            runtime.objects_mut().set_index(result, next_index, *item).ok();
+            next_index = next_index.saturating_add(1);
         }
-        runtime.objects_mut().push_element(result, *arg).ok();
-        next_index = next_index.saturating_add(1);
     }
+    runtime
+        .objects_mut()
+        .set_array_length(result, next_index)
+        .ok();
     Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// ES2024 §22.1.3.1.1 IsConcatSpreadable(O)
+/// Spec: <https://tc39.es/ecma262/#sec-isconcatspreadable>
+///
+/// 1. If O is not an Object, return false.
+/// 2. Let spreadable be ? Get(O, @@isConcatSpreadable).
+/// 3. If spreadable is not undefined, return ToBoolean(spreadable).
+/// 4. Return ? IsArray(O).
+fn is_concat_spreadable(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<bool, VmNativeCallError> {
+    let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+        return Ok(false);
+    };
+    let sym_prop = runtime
+        .intern_symbol_property_name(WellKnownSymbol::IsConcatSpreadable.stable_id());
+    let spreadable = runtime.ordinary_get(handle, sym_prop, value)?;
+    if spreadable != RegisterValue::undefined() {
+        return Ok(spreadable.is_truthy());
+    }
+    // Fallback: IsArray(O).
+    Ok(matches!(
+        runtime.objects().kind(handle),
+        Ok(HeapValueKind::Array)
+    ))
 }
 
 /// ES2024 §23.1.3.26 Array.prototype.slice(start, end)
@@ -526,6 +600,38 @@ fn array_length(
         .array_length(receiver)
         .map_err(|error| VmNativeCallError::Internal(format!("{op}: {error:?}").into()))?
         .ok_or_else(|| VmNativeCallError::Internal(format!("{op} requires array receiver").into()))
+}
+
+/// ES2024 §7.3.2 LengthOfArrayLike(obj)
+/// Spec: <https://tc39.es/ecma262/#sec-lengthofarraylike>
+///
+/// Works for any object with a "length" property (arrays, array-like objects,
+/// arguments objects, etc.).
+fn length_of_array_like(
+    obj: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<usize, VmNativeCallError> {
+    // 1. Return ℝ(? ToLength(? Get(obj, "length"))).
+    let length_prop = runtime.intern_property_name("length");
+    let length_val = runtime.ordinary_get(
+        obj,
+        length_prop,
+        RegisterValue::from_object_handle(obj.0),
+    )?;
+    // ToLength: undefined/NaN → 0, number → clamp to [0, 2^53 - 1]
+    if length_val == RegisterValue::undefined() || length_val == RegisterValue::null() {
+        return Ok(0);
+    }
+    if let Some(n) = length_val.as_i32() {
+        return Ok(n.max(0) as usize);
+    }
+    if let Some(n) = length_val.as_number() {
+        if n.is_nan() || n < 0.0 {
+            return Ok(0);
+        }
+        return Ok(n.min(((1u64 << 53) - 1) as f64) as usize);
+    }
+    Ok(0)
 }
 
 fn array_index_value(

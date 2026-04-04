@@ -735,7 +735,8 @@ impl<'a> FunctionCompiler<'a> {
         let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
         let prototype = self.stabilize_binding_value(prototype)?;
         let prototype_parent = if let Some(super_class) = super_class {
-            self.emit_named_property_load(super_class, "prototype")?
+            let parent = self.emit_named_property_load(super_class, "prototype")?;
+            self.stabilize_binding_value(parent)?
         } else {
             let object_ctor = self.compile_identifier("Object")?;
             let object_ctor = if object_ctor.is_temp {
@@ -743,9 +744,11 @@ impl<'a> FunctionCompiler<'a> {
             } else {
                 object_ctor
             };
-            self.emit_named_property_load(object_ctor, "prototype")?
+            let parent = self.emit_named_property_load(object_ctor, "prototype")?;
+            self.stabilize_binding_value(parent)?
         };
         self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
+        self.release(prototype_parent);
 
         // Second pass: install methods on prototype (instance) or constructor (static).
         // §15.7.14 ClassDefinitionEvaluation step 26–28.

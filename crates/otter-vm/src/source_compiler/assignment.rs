@@ -21,12 +21,22 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 AssignmentTarget::ComputedMemberExpression(member) => {
                     let object = self.compile_expression(&member.object, module)?;
+                    let object = if object.is_temp {
+                        self.stabilize_binding_value(object)?
+                    } else {
+                        object
+                    };
                     let value = self.compile_expression(&assignment.right, module)?;
                     self.store_computed_member(object, module, member, value)?;
                     Ok(value)
                 }
                 AssignmentTarget::StaticMemberExpression(member) => {
                     let object = self.compile_expression(&member.object, module)?;
+                    let object = if object.is_temp {
+                        self.stabilize_binding_value(object)?
+                    } else {
+                        object
+                    };
                     let value = self.compile_expression(&assignment.right, module)?;
                     let property = self.intern_property_name(member.property.name.as_str())?;
                     self.instructions.push(Instruction::set_property(

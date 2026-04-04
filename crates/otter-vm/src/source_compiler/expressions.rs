@@ -232,7 +232,7 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let lhs = self.compile_expression(&binary.left, module)?;
-        let lhs = self.materialize_value(lhs);
+        let lhs = self.stabilize_binding_value(lhs)?;
         let rhs = self.compile_expression(&binary.right, module)?;
 
         let result = if lhs.is_temp {
@@ -771,24 +771,39 @@ impl<'a> FunctionCompiler<'a> {
             callee
         };
 
-        let argument_count = RegisterIndex::try_from(call.arguments.len())
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
+        if has_spread {
+            self.compile_call_with_spread(&call.arguments, callee, receiver, false, module)
+        } else {
+            self.compile_call_static_args(&call.arguments, callee, receiver, false, module)
+        }
+    }
+
+    /// §13.3.8.1 ArgumentListEvaluation — no spread, register-window path.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-argumentlistevaluation>
+    fn compile_call_static_args(
+        &mut self,
+        arguments: &[Argument<'_>],
+        callee: ValueLocation,
+        receiver: Option<ValueLocation>,
+        is_construct: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let argument_count = RegisterIndex::try_from(arguments.len())
             .map_err(|_| SourceLoweringError::TooManyLocals)?;
         let mut argument_values = Vec::with_capacity(usize::from(argument_count));
 
-        for argument in &call.arguments {
-            let value = match argument {
-                Argument::SpreadElement(_) => {
-                    return Err(SourceLoweringError::Unsupported(
-                        "spread arguments".to_string(),
-                    ));
-                }
-                _ => self.compile_expression(
-                    argument.as_expression().ok_or_else(|| {
-                        SourceLoweringError::Unsupported("unsupported call argument".to_string())
-                    })?,
-                    module,
-                )?,
-            };
+        for argument in arguments {
+            let value = self.compile_expression(
+                argument.as_expression().ok_or_else(|| {
+                    SourceLoweringError::Unsupported("unsupported call argument".to_string())
+                })?,
+                module,
+            )?;
             argument_values.push(if value.is_temp {
                 self.stabilize_binding_value(value)?
             } else {
@@ -827,10 +842,12 @@ impl<'a> FunctionCompiler<'a> {
         let call_site = match receiver {
             Some(receiver) => CallSite::Closure(ClosureCall::new_with_receiver(
                 argument_count,
-                FrameFlags::new(false, true, false),
+                FrameFlags::new(is_construct, true, false),
                 receiver.register,
             )),
-            None => CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::empty())),
+            None => {
+                CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::new(is_construct, !is_construct, false)))
+            }
         };
         self.record_call_site(pc, call_site);
 
@@ -855,6 +872,99 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
+    /// §13.3.8.1 ArgumentListEvaluation — spread present, array-based path.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-argumentlistevaluation>
+    ///
+    /// Builds all arguments (spread and non-spread) into a temporary array,
+    /// then emits CallSpread which extracts the elements at runtime.
+    fn compile_call_with_spread(
+        &mut self,
+        arguments: &[Argument<'_>],
+        callee: ValueLocation,
+        receiver: Option<ValueLocation>,
+        is_construct: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // Build argument array: NewArray(0) + ArrayPush/SpreadIntoArray.
+        let args_array = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(args_array.register, 0));
+        let args_array = self.stabilize_binding_value(args_array)?;
+
+        for argument in arguments {
+            match argument {
+                Argument::SpreadElement(spread) => {
+                    let iterable = self.compile_expression(&spread.argument, module)?;
+                    let iterable = if iterable.is_temp {
+                        self.stabilize_binding_value(iterable)?
+                    } else {
+                        iterable
+                    };
+                    self.instructions.push(Instruction::spread_into_array(
+                        args_array.register,
+                        iterable.register,
+                    ));
+                    self.release(iterable);
+                }
+                _ => {
+                    let value = self.compile_expression(
+                        argument.as_expression().ok_or_else(|| {
+                            SourceLoweringError::Unsupported(
+                                "unsupported call argument".to_string(),
+                            )
+                        })?,
+                        module,
+                    )?;
+                    let value = if value.is_temp {
+                        self.stabilize_binding_value(value)?
+                    } else {
+                        value
+                    };
+                    self.instructions
+                        .push(Instruction::array_push(args_array.register, value.register));
+                    self.release(value);
+                }
+            }
+        }
+
+        // Emit CallSpread dst, callee, args_array.
+        let result = if callee.is_temp {
+            callee
+        } else {
+            ValueLocation::temp(self.alloc_temp())
+        };
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_spread(
+            result.register,
+            callee.register,
+            args_array.register,
+        ));
+        let call_site = match receiver {
+            Some(receiver) => CallSite::Closure(ClosureCall::new_with_receiver(
+                0, // argument_count unused for CallSpread — args come from the array
+                FrameFlags::new(is_construct, true, false),
+                receiver.register,
+            )),
+            None => {
+                CallSite::Closure(ClosureCall::new(0, FrameFlags::new(is_construct, !is_construct, false)))
+            }
+        };
+        self.record_call_site(pc, call_site);
+
+        self.release(args_array);
+        if callee.register != result.register {
+            self.release(callee);
+        }
+        if let Some(receiver) = receiver
+            && receiver.register != result.register
+        {
+            self.release(receiver);
+        }
+        Ok(result)
+    }
+
+    /// §12.3.7.1 SuperCall: `super(Arguments)`
+    /// Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
     fn compile_super_call_expression(
         &mut self,
         call: &oxc_ast::ast::CallExpression<'_>,
@@ -866,14 +976,24 @@ impl<'a> FunctionCompiler<'a> {
             ));
         }
 
-        for argument in &call.arguments {
-            if matches!(argument, Argument::SpreadElement(_)) {
-                return Err(SourceLoweringError::Unsupported(
-                    "super(...spread) is not implemented yet on the new VM path".to_string(),
-                ));
-            }
-        }
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
+        if has_spread {
+            self.compile_super_call_with_spread(call, module)
+        } else {
+            self.compile_super_call_static(call, module)
+        }
+    }
+
+    /// super() with no spread — uses CallSuper opcode with contiguous register window.
+    fn compile_super_call_static(
+        &mut self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
         let argument_count = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::TooManyLocals)?;
         let mut argument_values = Vec::with_capacity(usize::from(argument_count));
@@ -932,6 +1052,73 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
+    /// super(...spread) — uses CallSuperSpread opcode with args from array.
+    fn compile_super_call_with_spread(
+        &mut self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // Build arguments array: NewArray(0) + ArrayPush/SpreadIntoArray.
+        let args_array = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(args_array.register, 0));
+        let args_array = self.stabilize_binding_value(args_array)?;
+
+        for argument in &call.arguments {
+            match argument {
+                Argument::SpreadElement(spread) => {
+                    let iterable = self.compile_expression(&spread.argument, module)?;
+                    let iterable = if iterable.is_temp {
+                        self.stabilize_binding_value(iterable)?
+                    } else {
+                        iterable
+                    };
+                    self.instructions.push(Instruction::spread_into_array(
+                        args_array.register,
+                        iterable.register,
+                    ));
+                    self.release(iterable);
+                }
+                _ => {
+                    let value = self.compile_expression(
+                        argument.as_expression().ok_or_else(|| {
+                            SourceLoweringError::Unsupported(
+                                "unsupported super() argument".to_string(),
+                            )
+                        })?,
+                        module,
+                    )?;
+                    let value = if value.is_temp {
+                        self.stabilize_binding_value(value)?
+                    } else {
+                        value
+                    };
+                    self.instructions
+                        .push(Instruction::array_push(args_array.register, value.register));
+                    self.release(value);
+                }
+            }
+        }
+
+        let result = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::call_super_spread(
+            result.register,
+            args_array.register,
+        ));
+        self.release(args_array);
+
+        if let Some(Binding::ThisRegister(this_register)) = self.env.bindings.get("this").copied()
+            && this_register != result.register
+        {
+            self.instructions
+                .push(Instruction::move_(this_register, result.register));
+        }
+
+        Ok(result)
+    }
+
+    /// §13.3.5 The `new` Operator — `new MemberExpression Arguments`
+    /// Spec: <https://tc39.es/ecma262/#sec-new-operator>
     fn compile_new_expression(
         &mut self,
         new_expression: &oxc_ast::ast::NewExpression<'_>,
@@ -948,79 +1135,18 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             callee
         };
+
         let arguments = &new_expression.arguments;
-        let argument_count = RegisterIndex::try_from(arguments.len())
-            .map_err(|_| SourceLoweringError::TooManyLocals)?;
-        let mut argument_values = Vec::with_capacity(usize::from(argument_count));
+        let has_spread = arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
-        for argument in arguments {
-            let value = match argument {
-                Argument::SpreadElement(_) => {
-                    return Err(SourceLoweringError::Unsupported(
-                        "spread arguments".to_string(),
-                    ));
-                }
-                _ => self.compile_expression(
-                    argument.as_expression().ok_or_else(|| {
-                        SourceLoweringError::Unsupported("unsupported call argument".to_string())
-                    })?,
-                    module,
-                )?,
-            };
-            argument_values.push(if value.is_temp {
-                self.stabilize_binding_value(value)?
-            } else {
-                value
-            });
-        }
-
-        let arg_start = if argument_count == 0 {
-            BytecodeRegister::new(self.next_local + self.next_temp)
+        let result = if has_spread {
+            self.compile_call_with_spread(arguments, callee, None, true, module)?
         } else {
-            self.reserve_temp_window(argument_count)?
+            self.compile_call_static_args(arguments, callee, None, true, module)?
         };
 
-        for (offset, value) in argument_values.into_iter().enumerate() {
-            let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
-            if value.register != destination {
-                self.instructions
-                    .push(Instruction::move_(destination, value.register));
-                self.release(value);
-            }
-        }
-
-        let mut result = if callee.is_temp {
-            callee
-        } else {
-            ValueLocation::temp(self.alloc_temp())
-        };
-        let pc = self.instructions.len();
-        self.instructions.push(Instruction::call_closure(
-            result.register,
-            callee.register,
-            arg_start,
-        ));
-        self.record_call_site(
-            pc,
-            CallSite::Closure(ClosureCall::new(
-                argument_count,
-                FrameFlags::new(true, true, false),
-            )),
-        );
-
-        if argument_count != 0 {
-            let stable_register =
-                BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
-            if result.register != stable_register {
-                self.instructions
-                    .push(Instruction::move_(stable_register, result.register));
-                result = ValueLocation::temp(stable_register);
-            }
-            self.release_temp_window(argument_count.saturating_sub(1));
-        }
-        if callee.register != result.register {
-            self.release(callee);
-        }
         if let Some(value) = cleanup
             && value.register != result.register
         {
@@ -1456,7 +1582,29 @@ impl<'a> FunctionCompiler<'a> {
         Ok(destination)
     }
 
+    /// §13.2.4.1 Runtime Semantics: ArrayAccumulation
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
     fn compile_array_expression(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let has_spread = array.elements.iter().any(|el| {
+            matches!(
+                el,
+                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)
+            )
+        });
+
+        if has_spread {
+            self.compile_array_expression_with_spread(array, module)
+        } else {
+            self.compile_array_expression_static(array, module)
+        }
+    }
+
+    /// Fast path: no spread elements, all indices known at compile time.
+    fn compile_array_expression_static(
         &mut self,
         array: &oxc_ast::ast::ArrayExpression<'_>,
         module: &mut ModuleCompiler<'a>,
@@ -1471,9 +1619,7 @@ impl<'a> FunctionCompiler<'a> {
         for (index, element) in array.elements.iter().enumerate() {
             let expr = match element {
                 oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
-                    return Err(SourceLoweringError::Unsupported(
-                        "array spread elements".to_string(),
-                    ));
+                    unreachable!("spread elements handled by compile_array_expression_with_spread");
                 }
                 oxc_ast::ast::ArrayExpressionElement::Elision(_) => continue,
                 expr => expr.to_expression(),
@@ -1494,6 +1640,69 @@ impl<'a> FunctionCompiler<'a> {
             ));
             self.release(index_value);
             self.release(value);
+        }
+
+        Ok(destination)
+    }
+
+    /// Spread path: uses ArrayPush + SpreadIntoArray since indices are not
+    /// statically known when spread elements are present.
+    /// §13.2.4.1 ArrayAccumulation
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
+    fn compile_array_expression_with_spread(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // Allocate an empty array — final length unknown due to spread.
+        let destination = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(destination.register, 0));
+        let destination = self.stabilize_binding_value(destination)?;
+
+        for element in &array.elements {
+            match element {
+                oxc_ast::ast::ArrayExpressionElement::SpreadElement(spread) => {
+                    // §13.2.4.1 SpreadElement : ...AssignmentExpression
+                    // 1. Let spreadRef = ? Evaluation of AssignmentExpression.
+                    // 2. Let spreadObj = ? GetValue(spreadRef).
+                    // 3. Let iteratorRecord = ? GetIterator(spreadObj, sync).
+                    // 4. Repeat: IteratorStep → array.push each value.
+                    let iterable = self.compile_expression(&spread.argument, module)?;
+                    let iterable = if iterable.is_temp {
+                        self.stabilize_binding_value(iterable)?
+                    } else {
+                        iterable
+                    };
+                    self.instructions.push(Instruction::spread_into_array(
+                        destination.register,
+                        iterable.register,
+                    ));
+                    self.release(iterable);
+                }
+                oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                    // §13.2.4.1 Elision — push undefined to preserve hole semantics
+                    // in spread context. (Holes in spread arrays become explicit undefined.)
+                    let undef = ValueLocation::temp(self.alloc_temp());
+                    self.instructions
+                        .push(Instruction::load_undefined(undef.register));
+                    self.instructions
+                        .push(Instruction::array_push(destination.register, undef.register));
+                    self.release(undef);
+                }
+                expr => {
+                    // §13.2.4.1 AssignmentExpression — single element.
+                    let value = self.compile_expression(expr.to_expression(), module)?;
+                    let value = if value.is_temp {
+                        self.stabilize_binding_value(value)?
+                    } else {
+                        value
+                    };
+                    self.instructions
+                        .push(Instruction::array_push(destination.register, value.register));
+                    self.release(value);
+                }
+            }
         }
 
         Ok(destination)
@@ -1969,7 +2178,8 @@ impl<'a> FunctionCompiler<'a> {
         let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
         let prototype = self.stabilize_binding_value(prototype)?;
         let prototype_parent = if let Some(super_class) = super_class {
-            self.emit_named_property_load(super_class, "prototype")?
+            let parent = self.emit_named_property_load(super_class, "prototype")?;
+            self.stabilize_binding_value(parent)?
         } else {
             let object_ctor = self.compile_identifier("Object")?;
             let object_ctor = if object_ctor.is_temp {
@@ -1977,9 +2187,11 @@ impl<'a> FunctionCompiler<'a> {
             } else {
                 object_ctor
             };
-            self.emit_named_property_load(object_ctor, "prototype")?
+            let parent = self.emit_named_property_load(object_ctor, "prototype")?;
+            self.stabilize_binding_value(parent)?
         };
         self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
+        self.release(prototype_parent);
 
         // Install methods.
         for element in &class.body.body {

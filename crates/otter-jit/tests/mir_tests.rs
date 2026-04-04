@@ -6,12 +6,13 @@ use otter_vm::source;
 
 fn compile_and_build_mir(source: &str) -> otter_jit::mir::graph::MirGraph {
     let module = source::compile_script(source, "test.js").expect("compilation failed");
-    // The compiler puts user functions first, module body ("main") last.
-    // Pick the first non-"main" function, or index 0 if only one.
+    // The module body is at index 0 (named after the source URL).
+    // Pick the first named user function (skip the module body).
     let func = module
         .functions()
         .iter()
-        .find(|f| f.name() != Some("main"))
+        .skip(1)
+        .next()
         .unwrap_or_else(|| &module.functions()[0]);
     build_mir(func, None).expect("MIR should build")
 }

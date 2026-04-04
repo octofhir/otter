@@ -41,6 +41,18 @@ impl IntrinsicInstaller for IteratorIntrinsic {
         )?;
         // @@toStringTag = "Iterator" (not in ES2024, but matches V8/SpiderMonkey)
 
+        // ─── §27.1.4 %AsyncIteratorPrototype% ──────────────────────────
+        // %AsyncIteratorPrototype%[@@asyncIterator]() — returns `this`.
+        install_symbol_method(
+            intrinsics.async_iterator_prototype(),
+            WellKnownSymbol::AsyncIterator,
+            "[Symbol.asyncIterator]",
+            0,
+            async_iterator_prototype_symbol_async_iterator,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+
         // ─── §23.1.5.1 %ArrayIteratorPrototype% ────────────────────────
         install_next_method(
             intrinsics.array_iterator_prototype(),
@@ -208,6 +220,17 @@ pub(crate) fn create_iter_result_object(
 /// Spec: <https://tc39.es/ecma262/#sec-%iteratorprototype%-@@iterator>
 /// Returns `this`.
 fn iterator_prototype_symbol_iterator(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    Ok(*this)
+}
+
+/// %AsyncIteratorPrototype% \[ @@asyncIterator \] ()
+/// Spec: <https://tc39.es/ecma262/#sec-asynciteratorprototype-asynciterator>
+/// Returns `this`.
+fn async_iterator_prototype_symbol_async_iterator(
     this: &RegisterValue,
     _args: &[RegisterValue],
     _runtime: &mut crate::interpreter::RuntimeState,

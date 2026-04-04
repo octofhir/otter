@@ -153,9 +153,7 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<bool, SourceLoweringError> {
         if for_of_statement.r#await {
-            return Err(SourceLoweringError::Unsupported(
-                "for await..of".to_string(),
-            ));
+            return self.compile_for_await_of_statement(for_of_statement, module);
         }
 
         let iterator_register = self.allocate_local()?;
@@ -196,6 +194,119 @@ impl<'a> FunctionCompiler<'a> {
         self.patch_jump(jump_to_exit, normal_exit_pc)?;
         self.patch_loop_scope(loop_scope, normal_exit_pc, loop_start)?;
 
+        let jump_over_exception_handler = self.emit_jump_placeholder();
+        let exception_handler_pc = self.instructions.len();
+        self.instructions
+            .push(Instruction::load_exception(exception_register));
+        self.instructions
+            .push(Instruction::iterator_close(iterator_register));
+        self.instructions
+            .push(Instruction::throw(exception_register));
+        self.patch_jump(jump_over_exception_handler, self.instructions.len())?;
+
+        self.exception_handlers.push(ExceptionHandler::new(
+            try_start as ProgramCounter,
+            normal_exit_pc as ProgramCounter,
+            exception_handler_pc as ProgramCounter,
+        ));
+
+        Ok(false)
+    }
+
+    /// ES2024 §14.7.5.6 ForIn/OfHeadEvaluation — `for await (... of ...)` variant.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-forinofheadevaluation>
+    ///
+    /// Compiles to: GetAsyncIterator → loop { call .next(), Await, extract
+    /// done/value } with exception-handler close.
+    fn compile_for_await_of_statement(
+        &mut self,
+        for_of: &oxc_ast::ast::ForOfStatement<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        let iterator_register = self.allocate_local()?;
+        let next_fn_register = self.allocate_local()?;
+        let promise_register = self.allocate_local()?;
+        let result_register = self.allocate_local()?;
+        let done_register = self.allocate_local()?;
+        let value_register = self.allocate_local()?;
+        let exception_register = self.allocate_local()?;
+
+        // 1. Evaluate the iterable expression.
+        let iterable = self.compile_expression(&for_of.right, module)?;
+        // 2. GetIterator(iterable, async).
+        self.instructions.push(Instruction::get_async_iterator(
+            iterator_register,
+            iterable.register,
+        ));
+        self.release(iterable);
+
+        // 3. Cache the .next() method on the iterator.
+        let next_prop = self.intern_property_name("next")?;
+        self.instructions.push(Instruction::get_property(
+            next_fn_register,
+            iterator_register,
+            next_prop,
+        ));
+
+        let try_start = self.instructions.len();
+        let loop_start = self.instructions.len();
+        self.loop_stack.push(LoopScope {
+            continue_target: Some(loop_start),
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            iterator_register: Some(iterator_register),
+            label: self.pending_loop_label.take(),
+        });
+
+        // 4. Call iterator.next() — 0 args, receiver = iterator.
+        let arg_start = BytecodeRegister::new(self.next_local + self.next_temp);
+        let call_pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            promise_register,
+            next_fn_register,
+            arg_start,
+        ));
+        self.record_call_site(
+            call_pc,
+            CallSite::Closure(ClosureCall::new_with_receiver(
+                0,
+                FrameFlags::new(false, true, false),
+                iterator_register,
+            )),
+        );
+
+        // 5. Await the result promise → {done, value}.
+        self.instructions
+            .push(Instruction::r#await(result_register, promise_register));
+
+        // 6. Extract done: let done = result.done.
+        let done_prop = self.intern_property_name("done")?;
+        self.instructions.push(Instruction::get_property(
+            done_register,
+            result_register,
+            done_prop,
+        ));
+        let jump_to_exit = self.emit_conditional_placeholder(Opcode::JumpIfTrue, done_register);
+
+        // 7. Extract value: let value = result.value.
+        let value_prop = self.intern_property_name("value")?;
+        self.instructions.push(Instruction::get_property(
+            value_register,
+            result_register,
+            value_prop,
+        ));
+
+        // 8. Assign to the loop variable and compile body.
+        self.assign_for_of_left(&for_of.left, value_register, module)?;
+        let _ = self.compile_statement(&for_of.body, module)?;
+        self.emit_relative_jump(loop_start)?;
+
+        let loop_scope = self.loop_stack.pop().expect("loop scope must exist");
+        let normal_exit_pc = self.instructions.len();
+        self.patch_jump(jump_to_exit, normal_exit_pc)?;
+        self.patch_loop_scope(loop_scope, normal_exit_pc, loop_start)?;
+
+        // 9. Exception handler: close iterator and rethrow.
         let jump_over_exception_handler = self.emit_jump_placeholder();
         let exception_handler_pc = self.instructions.len();
         self.instructions

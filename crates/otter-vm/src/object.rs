@@ -139,6 +139,10 @@ pub enum HeapValueKind {
     WeakMap,
     /// ES2024 §24.4 WeakSet object.
     WeakSet,
+    /// ES2024 §26.1 WeakRef object.
+    WeakRef,
+    /// ES2024 §26.2 FinalizationRegistry object.
+    FinalizationRegistry,
     /// ES2024 §27.5 Generator object.
     Generator,
     /// ES2024 §25.1 ArrayBuffer object.
@@ -255,6 +259,18 @@ pub enum SetIteratorKind {
     Values,
     /// `Set.prototype.entries()` — yields `[value, value]` pairs.
     Entries,
+}
+
+/// ES2024 §26.2.1.2 — FinalizationRegistry cell record.
+/// Spec: <https://tc39.es/ecma262/#sec-weak-ref-processing-model>
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizationCell {
+    /// The weakly-held target (handle index). `None` = already collected.
+    pub target: Option<u32>,
+    /// The value held for the cleanup callback.
+    pub held_value: RegisterValue,
+    /// Optional unregister token (handle index). `None` = no token.
+    pub unregister_token: Option<u32>,
 }
 
 /// ES2024 §23.2 — TypedArray element type discriminator.
@@ -882,6 +898,23 @@ enum HeapValue {
         /// Stores ObjectHandle indices. Keys must be objects.
         entries: std::collections::HashSet<u32>,
     },
+    /// ES2024 §26.1 WeakRef Objects — weak reference to a target object.
+    /// Spec: <https://tc39.es/ecma262/#sec-weak-ref-objects>
+    WeakRef {
+        prototype: Option<ObjectHandle>,
+        /// The weakly-held target. Set to `None` when the target is collected.
+        target: Option<u32>,
+    },
+    /// ES2024 §26.2 FinalizationRegistry Objects — invoke cleanup after target collection.
+    /// Spec: <https://tc39.es/ecma262/#sec-finalization-registry-objects>
+    FinalizationRegistry {
+        prototype: Option<ObjectHandle>,
+        /// The cleanup callback function.
+        cleanup_callback: ObjectHandle,
+        /// Registered cells: (target_handle, held_value, unregister_token).
+        /// Target is `None` when already collected and pending cleanup.
+        cells: Vec<FinalizationCell>,
+    },
     /// ES2024 §27.5 — Generator Objects.
     /// Spec: <https://tc39.es/ecma262/#sec-properties-of-generator-instances>
     Generator {
@@ -1325,12 +1358,28 @@ impl Traceable for HeapValue {
                     trace_register_value(*entry, visitor);
                 }
             }
-            HeapValue::WeakMap { prototype, .. } | HeapValue::WeakSet { prototype, .. } => {
+            HeapValue::WeakMap { prototype, .. }
+            | HeapValue::WeakSet { prototype, .. }
+            | HeapValue::WeakRef { prototype, .. } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
                 }
-                // Entries are intentionally NOT traced — they are weak references.
-                // Ephemeron fixpoint in collect_with_ephemerons handles value liveness.
+                // Entries/target are intentionally NOT traced — they are weak references.
+                // Ephemeron fixpoint in collect_garbage handles value liveness.
+            }
+            HeapValue::FinalizationRegistry {
+                prototype,
+                cleanup_callback,
+                cells,
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                trace_handle(*cleanup_callback, visitor);
+                // Trace held_values (strongly held), but NOT targets/tokens (weak).
+                for cell in cells {
+                    trace_register_value(cell.held_value, visitor);
+                }
             }
             HeapValue::Generator {
                 prototype,
@@ -2774,6 +2823,144 @@ impl ObjectHeap {
         }
     }
 
+    // ─── WeakRef Objects (§26.1) ──────────────────────────────────────
+
+    /// Allocates a WeakRef object holding a weak reference to `target`.
+    /// Spec: <https://tc39.es/ecma262/#sec-weak-ref-target>
+    pub fn alloc_weakref(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+        target: ObjectHandle,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::WeakRef {
+            prototype,
+            target: Some(target.0),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// WeakRef.prototype.deref() — returns the target or undefined.
+    /// Spec: <https://tc39.es/ecma262/#sec-weak-ref.prototype.deref>
+    pub fn weakref_deref(&self, handle: ObjectHandle) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::WeakRef { target, .. } => {
+                Ok(target.map(ObjectHandle))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Clears dead WeakRef targets during GC.
+    pub fn weakref_clear_dead(
+        &mut self,
+        handle: ObjectHandle,
+        is_live: &dyn Fn(u32) -> bool,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::WeakRef { target, .. } => {
+                if let Some(t) = *target && !is_live(t) {
+                    *target = None;
+                }
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    // ─── FinalizationRegistry Objects (§26.2) ──────────────────────────
+
+    /// Allocates a FinalizationRegistry object.
+    /// Spec: <https://tc39.es/ecma262/#sec-finalization-registry-cleanup-callback>
+    pub fn alloc_finalization_registry(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+        cleanup_callback: ObjectHandle,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::FinalizationRegistry {
+            prototype,
+            cleanup_callback,
+            cells: Vec::new(),
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// FinalizationRegistry.prototype.register(target, heldValue, unregisterToken)
+    /// Spec: <https://tc39.es/ecma262/#sec-finalization-registry.prototype.register>
+    pub fn finalization_registry_register(
+        &mut self,
+        handle: ObjectHandle,
+        target: ObjectHandle,
+        held_value: RegisterValue,
+        unregister_token: Option<ObjectHandle>,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::FinalizationRegistry { cells, .. } => {
+                cells.push(FinalizationCell {
+                    target: Some(target.0),
+                    held_value,
+                    unregister_token: unregister_token.map(|t| t.0),
+                });
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// FinalizationRegistry.prototype.unregister(unregisterToken)
+    /// Spec: <https://tc39.es/ecma262/#sec-finalization-registry.prototype.unregister>
+    ///
+    /// Returns `true` if any cells were removed.
+    pub fn finalization_registry_unregister(
+        &mut self,
+        handle: ObjectHandle,
+        token: ObjectHandle,
+    ) -> Result<bool, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::FinalizationRegistry { cells, .. } => {
+                let before = cells.len();
+                cells.retain(|cell| cell.unregister_token != Some(token.0));
+                Ok(cells.len() != before)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the cleanup callback for a FinalizationRegistry.
+    pub fn finalization_registry_callback(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::FinalizationRegistry {
+                cleanup_callback, ..
+            } => Ok(*cleanup_callback),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// During GC: marks cells whose targets are dead and returns their held values
+    /// for cleanup callback invocation. Removes those cells from the registry.
+    pub fn finalization_registry_clear_dead(
+        &mut self,
+        handle: ObjectHandle,
+        is_live: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<RegisterValue>, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::FinalizationRegistry { cells, .. } => {
+                let mut cleanup_values = Vec::new();
+                cells.retain(|cell| {
+                    if let Some(t) = cell.target && !is_live(t) {
+                        cleanup_values.push(cell.held_value);
+                        return false;
+                    }
+                    true
+                });
+                Ok(cleanup_values)
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     // ─── Generator Objects (§27.5) ──────────────────────────────────────
 
     /// Allocates a generator object in `SuspendedStart` state.
@@ -3246,6 +3433,8 @@ impl ObjectHeap {
             HeapValue::SetIterator { .. } => Ok(HeapValueKind::SetIterator),
             HeapValue::WeakMap { .. } => Ok(HeapValueKind::WeakMap),
             HeapValue::WeakSet { .. } => Ok(HeapValueKind::WeakSet),
+            HeapValue::WeakRef { .. } => Ok(HeapValueKind::WeakRef),
+            HeapValue::FinalizationRegistry { .. } => Ok(HeapValueKind::FinalizationRegistry),
             HeapValue::Generator { .. } => Ok(HeapValueKind::Generator),
             HeapValue::ArrayBuffer { .. } => Ok(HeapValueKind::ArrayBuffer),
             HeapValue::SharedArrayBuffer { .. } => Ok(HeapValueKind::SharedArrayBuffer),
@@ -3275,6 +3464,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { prototype, .. }
             | HeapValue::WeakMap { prototype, .. }
             | HeapValue::WeakSet { prototype, .. }
+            | HeapValue::WeakRef { prototype, .. }
+            | HeapValue::FinalizationRegistry { prototype, .. }
             | HeapValue::Generator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
             | HeapValue::ArrayBuffer { prototype, .. }
@@ -3377,6 +3568,12 @@ impl ObjectHeap {
             | HeapValue::WeakSet {
                 prototype: slot, ..
             }
+            | HeapValue::WeakRef {
+                prototype: slot, ..
+            }
+            | HeapValue::FinalizationRegistry {
+                prototype: slot, ..
+            }
             | HeapValue::Generator {
                 prototype: slot, ..
             }
@@ -3441,6 +3638,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -3538,6 +3737,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -3616,6 +3817,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -4184,6 +4387,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -4220,6 +4425,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -4256,6 +4463,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -4310,6 +4519,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
@@ -5118,6 +5329,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::Proxy { .. }
             | HeapValue::BigInt { .. } => return Err(ObjectError::InvalidKind),
@@ -5434,9 +5647,11 @@ impl ObjectHeap {
             | HeapValue::StringIterator { .. }
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
-            // WeakMap/WeakSet are extensible (prototype must be settable during init).
+            // WeakMap/WeakSet/WeakRef/FinalizationRegistry are extensible.
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             // Generators are extensible (can have own properties).
             | HeapValue::Generator { .. } => Ok(true),
             // Strings, promises, upvalue cells are not extensible objects.
@@ -5931,6 +6146,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::Proxy { .. }
             | HeapValue::BigInt { .. } => {
@@ -6255,7 +6472,9 @@ impl ObjectHeap {
             | HeapValue::MapIterator { .. }
             | HeapValue::SetIterator { .. }
             | HeapValue::WeakMap { .. }
-            | HeapValue::WeakSet { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. } => return Err(ObjectError::InvalidKind),
             _ => None,
         };
 
@@ -6407,6 +6626,27 @@ impl ObjectHeap {
         for &ws in &weakset_handles {
             if self.heap.is_marked(GcHandle(ws.0)) {
                 let _ = self.weakset_clear_dead(ws, &is_marked);
+            }
+        }
+
+        // Phase 3b: Clear dead WeakRef targets.
+        let weakref_handles: Vec<ObjectHandle> = self.find_weak_handles(HeapValueKind::WeakRef);
+        for &wr in &weakref_handles {
+            if self.heap.is_marked(GcHandle(wr.0)) {
+                let _ = self.weakref_clear_dead(wr, &is_marked);
+            }
+        }
+
+        // Phase 3c: Clear dead FinalizationRegistry cells.
+        // Held values from dead cells are collected for later cleanup callback invocation.
+        let fr_handles: Vec<ObjectHandle> =
+            self.find_weak_handles(HeapValueKind::FinalizationRegistry);
+        for &fr in &fr_handles {
+            if self.heap.is_marked(GcHandle(fr.0)) {
+                // Note: cleanup callbacks are deferred to the microtask queue.
+                // For now we just clear dead cells — the held values are discarded.
+                // Full spec compliance requires queueing HostCleanupFinalizationRegistry jobs.
+                let _ = self.finalization_registry_clear_dead(fr, &is_marked);
             }
         }
 
@@ -6598,6 +6838,8 @@ impl ObjectHeap {
             | HeapValue::Set { .. }
             | HeapValue::WeakMap { .. }
             | HeapValue::WeakSet { .. }
+            | HeapValue::WeakRef { .. }
+            | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Proxy { .. } => return Ok(None),
@@ -6630,6 +6872,8 @@ impl ObjectHeap {
             | HeapValue::SetIterator { prototype, .. }
             | HeapValue::WeakMap { prototype, .. }
             | HeapValue::WeakSet { prototype, .. }
+            | HeapValue::WeakRef { prototype, .. }
+            | HeapValue::FinalizationRegistry { prototype, .. }
             | HeapValue::Generator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
             | HeapValue::ArrayBuffer { prototype, .. }

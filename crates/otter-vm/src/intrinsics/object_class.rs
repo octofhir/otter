@@ -668,6 +668,8 @@ fn object_to_string_tag(
         HeapValueKind::SetIterator => Ok("Set Iterator"),
         HeapValueKind::WeakMap => Ok("WeakMap"),
         HeapValueKind::WeakSet => Ok("WeakSet"),
+        HeapValueKind::WeakRef => Ok("WeakRef"),
+        HeapValueKind::FinalizationRegistry => Ok("FinalizationRegistry"),
         HeapValueKind::Generator => Ok("Generator"),
         HeapValueKind::ArrayBuffer => Ok("ArrayBuffer"),
         HeapValueKind::SharedArrayBuffer => Ok("SharedArrayBuffer"),

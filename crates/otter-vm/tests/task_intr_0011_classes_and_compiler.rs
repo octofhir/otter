@@ -90,8 +90,7 @@ fn class_inheritance_with_methods() {
             "}\n",
             "var d = new Dog('Rex');\n",
             "assert.sameValue(d.speak(), 'Rex barks', 'overridden method');\n",
-            // TODO: instanceof with multi-level inheritance needs setPrototypeOf fix.
-            // "assert.sameValue(d instanceof Animal, true, 'instanceof');\n",
+            "assert.sameValue(d instanceof Animal, true, 'instanceof grandparent');\n",
         ),
         "class-inheritance-methods.js",
     );

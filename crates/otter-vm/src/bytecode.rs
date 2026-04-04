@@ -207,6 +207,31 @@ pub enum Opcode {
     CallSuper = 0x51,
     /// Invoke the default derived constructor forwarding all original arguments.
     CallSuperForward = 0x52,
+    /// Create an async iterator: look up `Symbol.asyncIterator`, call it; if absent,
+    /// fall back to `Symbol.iterator` (sync-to-async wrapping).
+    /// `GetAsyncIterator dst, src`
+    /// Spec: <https://tc39.es/ecma262/#sec-getiterator> (kind = async)
+    GetAsyncIterator = 0x53,
+    /// Append a single value to an array (push semantics).
+    /// `ArrayPush target_array, value`
+    /// Used for array literals with spread elements and spread argument building
+    /// where the index is not known at compile time.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
+    ArrayPush = 0x54,
+    /// Iterate an iterable and append all elements to an existing array.
+    /// `SpreadIntoArray target_array, iterable`
+    /// Used for `[...iterable]` and for building spread argument lists.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
+    SpreadIntoArray = 0x56,
+    /// Call a function with arguments taken from an array register.
+    /// `CallSpread dst, callee, args_array`
+    /// Used for `fn(...args)`, `new Fn(...args)`, `super(...args)`.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-argumentlistevaluation>
+    CallSpread = 0x55,
+    /// Invoke `super(...)` with arguments from an array register (spread).
+    /// `CallSuperSpread dst, args_array`
+    /// Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+    CallSuperSpread = 0x57,
     /// ToNumber conversion.
     ToNumber = 0x5D,
     /// ToString conversion.
@@ -307,6 +332,11 @@ impl Opcode {
             0x50 => Some(Self::CopyDataPropertiesExcept),
             0x51 => Some(Self::CallSuper),
             0x52 => Some(Self::CallSuperForward),
+            0x53 => Some(Self::GetAsyncIterator),
+            0x54 => Some(Self::ArrayPush),
+            0x55 => Some(Self::CallSpread),
+            0x56 => Some(Self::SpreadIntoArray),
+            0x57 => Some(Self::CallSuperSpread),
             0x5D => Some(Self::ToNumber),
             0x5E => Some(Self::ToString),
             0x60 => Some(Self::Yield),
@@ -910,6 +940,54 @@ impl Instruction {
     #[must_use]
     pub const fn get_iterator(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::GetIterator, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Encodes an async iterator allocation.
+    /// Spec: <https://tc39.es/ecma262/#sec-getiterator> (kind = async)
+    #[must_use]
+    pub const fn get_async_iterator(dst: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::GetAsyncIterator, dst, src, BytecodeRegister::new(0))
+    }
+
+    /// Append `value` to `target_array`.
+    /// `ArrayPush target_array, value`
+    #[must_use]
+    pub const fn array_push(
+        target_array: BytecodeRegister,
+        value: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::ArrayPush, target_array, value, BytecodeRegister::new(0))
+    }
+
+    /// Iterate `src` and append all elements to `target_array`.
+    /// `SpreadIntoArray target_array, src`
+    #[must_use]
+    pub const fn spread_into_array(
+        target_array: BytecodeRegister,
+        src: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::SpreadIntoArray, target_array, src, BytecodeRegister::new(0))
+    }
+
+    /// Call `callee` with arguments from `args_array`.
+    /// `CallSpread dst, callee, args_array`
+    #[must_use]
+    pub const fn call_spread(
+        dst: BytecodeRegister,
+        callee: BytecodeRegister,
+        args_array: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::CallSpread, dst, callee, args_array)
+    }
+
+    /// Invoke `super(...)` with arguments from an array register.
+    /// `CallSuperSpread dst, args_array`
+    #[must_use]
+    pub const fn call_super_spread(
+        dst: BytecodeRegister,
+        args_array: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::CallSuperSpread, dst, args_array, BytecodeRegister::new(0))
     }
 
     /// Encodes one iterator step.

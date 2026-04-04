@@ -4012,6 +4012,8 @@ impl RuntimeState {
                 | HeapValueKind::SetIterator
                 | HeapValueKind::WeakMap
                 | HeapValueKind::WeakSet
+                | HeapValueKind::WeakRef
+                | HeapValueKind::FinalizationRegistry
                 | HeapValueKind::Generator
                 | HeapValueKind::ArrayBuffer
                 | HeapValueKind::SharedArrayBuffer
@@ -6202,6 +6204,351 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §7.4.3 GetIterator(obj, async)
+            // Spec: <https://tc39.es/ecma262/#sec-getiterator>
+            //
+            // 1. Let method = ? GetMethod(obj, @@asyncIterator).
+            // 2. If method is undefined:
+            //    a. Let syncMethod = ? GetMethod(obj, @@iterator).
+            //    b. Return sync iterator (async wrapping deferred).
+            // 3. Return ? GetIteratorDirect(obj, method).
+            Opcode::GetAsyncIterator => {
+                let base = activation.read_bytecode_register(function, instruction.b())?;
+                let handle = base
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::TypeError("Value is not iterable".into()))?;
+
+                // Step 1: Try Symbol.asyncIterator first.
+                let sym_async = runtime.intern_symbol_property_name(
+                    super::WellKnownSymbol::AsyncIterator.stable_id(),
+                );
+                let async_method = runtime.ordinary_get(handle, sym_async, base).map_err(
+                    |e| match e {
+                        VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                        VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                    },
+                )?;
+
+                let iterator = if async_method != RegisterValue::undefined()
+                    && async_method != RegisterValue::null()
+                {
+                    // Has @@asyncIterator — call it.
+                    let callable = async_method
+                        .as_object_handle()
+                        .map(ObjectHandle)
+                        .filter(|h| runtime.objects.is_callable(*h))
+                        .ok_or_else(|| {
+                            InterpreterError::TypeError(
+                                "Symbol.asyncIterator value is not callable".into(),
+                            )
+                        })?;
+                    let iter_obj =
+                        runtime
+                            .call_callable(callable, base, &[])
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                VmNativeCallError::Internal(m) => {
+                                    InterpreterError::NativeCall(m)
+                                }
+                            })?;
+                    iter_obj.as_object_handle().map(ObjectHandle).ok_or(
+                        InterpreterError::TypeError(
+                            "Symbol.asyncIterator must return an object".into(),
+                        ),
+                    )?
+                } else {
+                    // Step 2: Fall back to Symbol.iterator (sync iterator).
+                    // Always use the protocol path (Symbol.iterator method call)
+                    // because the compiled for-await-of loop accesses .next() via
+                    // property lookup. Internal iterators from alloc_iterator have
+                    // prototype: None and no protocol-accessible .next() method.
+                    let sym_iterator = runtime.intern_symbol_property_name(
+                        super::WellKnownSymbol::Iterator.stable_id(),
+                    );
+                    let method = runtime
+                        .ordinary_get(handle, sym_iterator, base)
+                        .map_err(|e| match e {
+                            VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            VmNativeCallError::Internal(m) => {
+                                InterpreterError::NativeCall(m)
+                            }
+                        })?;
+                    let callable = method
+                        .as_object_handle()
+                        .map(ObjectHandle)
+                        .filter(|h| runtime.objects.is_callable(*h))
+                        .ok_or_else(|| {
+                            InterpreterError::TypeError(
+                                "Value is not async iterable".into(),
+                            )
+                        })?;
+                    let iter_obj = runtime
+                        .call_callable(callable, base, &[])
+                        .map_err(|e| match e {
+                            VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            VmNativeCallError::Internal(m) => {
+                                InterpreterError::NativeCall(m)
+                            }
+                        })?;
+                    iter_obj.as_object_handle().map(ObjectHandle).ok_or(
+                        InterpreterError::TypeError(
+                            "Symbol.iterator must return an object".into(),
+                        ),
+                    )?
+                };
+
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_object_handle(iterator.0),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.2.4.1 Runtime Semantics: ArrayAccumulation — single element.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
+            //
+            // Append value (register B) to the target array (register A).
+            // Used when compiling array literals / argument lists with spread
+            // elements, where the index is not statically known.
+            Opcode::ArrayPush => {
+                let target_array = Self::read_object_handle(activation, function, instruction.a())?;
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                runtime.objects.push_element(target_array, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.2.4.1 Runtime Semantics: ArrayAccumulation — spread.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-arrayaccumulation>
+            //
+            // Iterate `src` (register B) via the iteration protocol and append
+            // every yielded value to the target array (register A).
+            Opcode::SpreadIntoArray => {
+                let target_array = Self::read_object_handle(activation, function, instruction.a())?;
+                let src = activation.read_bytecode_register(function, instruction.b())?;
+                let src_handle = src
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::TypeError("Value is not iterable".into()))?;
+
+                // Fast path: internal iterators for arrays and strings.
+                match runtime.objects.alloc_iterator(src_handle) {
+                    Ok(iterator) => {
+                        loop {
+                            let step = runtime.iterator_next(iterator)?;
+                            if step.is_done() {
+                                break;
+                            }
+                            runtime.objects.push_element(target_array, step.value())?;
+                        }
+                    }
+                    Err(ObjectError::InvalidKind) => {
+                        // Slow path: protocol-based iterator (Symbol.iterator).
+                        let sym_iterator = runtime.intern_symbol_property_name(
+                            super::WellKnownSymbol::Iterator.stable_id(),
+                        );
+                        let method = runtime.ordinary_get(src_handle, sym_iterator, src).map_err(
+                            |e| match e {
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                            },
+                        )?;
+                        let callable = method
+                            .as_object_handle()
+                            .map(ObjectHandle)
+                            .filter(|h| runtime.objects.is_callable(*h))
+                            .ok_or_else(|| {
+                                InterpreterError::TypeError("Value is not iterable".into())
+                            })?;
+                        let iter_obj =
+                            runtime
+                                .call_callable(callable, src, &[])
+                                .map_err(|e| match e {
+                                    VmNativeCallError::Thrown(v) => {
+                                        InterpreterError::UncaughtThrow(v)
+                                    }
+                                    VmNativeCallError::Internal(m) => {
+                                        InterpreterError::NativeCall(m)
+                                    }
+                                })?;
+                        let iter_handle = iter_obj.as_object_handle().map(ObjectHandle).ok_or(
+                            InterpreterError::TypeError(
+                                "Symbol.iterator must return an object".into(),
+                            ),
+                        )?;
+                        let next_prop = runtime.intern_property_name("next");
+                        let done_prop = runtime.intern_property_name("done");
+                        let value_prop = runtime.intern_property_name("value");
+                        loop {
+                            let iter_val = RegisterValue::from_object_handle(iter_handle.0);
+                            let next_fn = runtime
+                                .ordinary_get(iter_handle, next_prop, iter_val)
+                                .map_err(|e| match e {
+                                    VmNativeCallError::Thrown(v) => {
+                                        InterpreterError::UncaughtThrow(v)
+                                    }
+                                    VmNativeCallError::Internal(m) => {
+                                        InterpreterError::NativeCall(m)
+                                    }
+                                })?;
+                            let next_callable = next_fn
+                                .as_object_handle()
+                                .map(ObjectHandle)
+                                .filter(|h| runtime.objects.is_callable(*h))
+                                .ok_or_else(|| {
+                                    InterpreterError::TypeError(
+                                        "Iterator .next is not a function".into(),
+                                    )
+                                })?;
+                            let result_obj = runtime
+                                .call_callable(next_callable, iter_val, &[])
+                                .map_err(|e| match e {
+                                    VmNativeCallError::Thrown(v) => {
+                                        InterpreterError::UncaughtThrow(v)
+                                    }
+                                    VmNativeCallError::Internal(m) => {
+                                        InterpreterError::NativeCall(m)
+                                    }
+                                })?;
+                            let result_handle =
+                                result_obj.as_object_handle().map(ObjectHandle).ok_or(
+                                    InterpreterError::TypeError(
+                                        "Iterator .next() must return an object".into(),
+                                    ),
+                                )?;
+                            let done_val = runtime
+                                .ordinary_get(result_handle, done_prop, result_obj)
+                                .unwrap_or_else(|_| RegisterValue::from_bool(false));
+                            if runtime.js_to_boolean(done_val).unwrap_or(false) {
+                                break;
+                            }
+                            let value = runtime
+                                .ordinary_get(result_handle, value_prop, result_obj)
+                                .unwrap_or_else(|_| RegisterValue::undefined());
+                            runtime.objects.push_element(target_array, value)?;
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.3.8.1 Runtime Semantics: ArgumentListEvaluation (spread)
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-argumentlistevaluation>
+            //
+            // Call `callee` (register B) with arguments extracted from `args_array`
+            // (register C). Call metadata (construct flag, receiver) comes from the
+            // call-site side table, same as CallClosure.
+            //
+            // Unlike CallClosure which reads args from contiguous registers, this
+            // opcode reads the already-evaluated argument list from a heap array.
+            // It delegates to `call_function` / `construct_callable` which handle
+            // the full dispatch chain: Proxy, BoundFunction, Generator, Async,
+            // Promise internal functions, HostFunction, and ordinary Closures
+            // (§10.2.1, §10.3.1, §10.4.1, §10.5.12/13, §27.2, §27.3, §27.7).
+            Opcode::CallSpread => {
+                let call = Self::resolve_closure_call(function, activation.pc())?;
+                let caller_function = module
+                    .function(activation.function_index())
+                    .expect("activation function index must be valid");
+                let callee_value =
+                    activation.read_bytecode_register(caller_function, instruction.b())?;
+                let Some(callee) = callee_value.as_object_handle().map(ObjectHandle) else {
+                    let error = runtime.alloc_type_error("Value is not callable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
+
+                // Extract arguments from the array built by the compiler.
+                let args_array_handle =
+                    Self::read_object_handle(activation, function, instruction.c())?;
+                let arguments = runtime.objects.array_elements(args_array_handle).map_err(
+                    |_| InterpreterError::TypeError("Spread arguments must be an array".into()),
+                )?;
+
+                let result = if call.flags().is_construct() {
+                    // §13.3.5.1.1 EvaluateNew — construct with spread args.
+                    // Spec: <https://tc39.es/ecma262/#sec-evaluatenew>
+                    //
+                    // §10.5.13 [[Construct]] for Proxy, §10.2.2 for ordinary,
+                    // host construct for HostFunction.
+                    if runtime.is_proxy(callee) {
+                        runtime.proxy_construct(callee, &arguments, callee).map_err(
+                            |e| match e {
+                                InterpreterError::UncaughtThrow(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                other => other,
+                            },
+                        )
+                    } else if !runtime.is_constructible(callee) {
+                        let error = runtime.alloc_type_error("Value is not a constructor")?;
+                        Err(InterpreterError::UncaughtThrow(
+                            RegisterValue::from_object_handle(error.0),
+                        ))
+                    } else {
+                        runtime
+                            .construct_callable(callee, &arguments, callee)
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                VmNativeCallError::Internal(m) => {
+                                    InterpreterError::NativeCall(m)
+                                }
+                            })
+                    }
+                } else {
+                    // §13.3.8.1 — Ordinary call with spread args.
+                    // Resolve receiver from call-site metadata.
+                    let receiver = Self::resolve_call_receiver(
+                        caller_function,
+                        activation,
+                        call.flags(),
+                        call.receiver(),
+                        None,
+                    )?;
+
+                    // §10.5.12 [[Call]] for Proxy.
+                    if runtime.is_proxy(callee) {
+                        runtime.proxy_apply(callee, receiver, &arguments).map_err(
+                            |e| match e {
+                                InterpreterError::UncaughtThrow(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                other => other,
+                            },
+                        )
+                    } else {
+                        // call_function handles: Closure (ordinary, async, generator,
+                        // class constructor guard), BoundFunction, HostFunction,
+                        // PromiseCapabilityFunction, PromiseCombinatorElement,
+                        // PromiseFinallyFunction, PromiseValueThunk.
+                        Self::call_function(runtime, module, callee, receiver, &arguments)
+                    }
+                };
+
+                match result {
+                    Ok(value) => {
+                        activation.refresh_open_upvalues_from_cells(runtime)?;
+                        activation.write_bytecode_register(function, instruction.a(), value)?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Err(InterpreterError::UncaughtThrow(value)) => {
+                        Ok(StepOutcome::Throw(value))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             // V8-style LdaGlobal: load a global variable by name from the
             // global object (receiver r0).  Throws if not found.
             Opcode::GetGlobal => {
@@ -6663,6 +7010,57 @@ impl Interpreter {
                         .read_bytecode_register(function, instruction.b().saturating_add(offset))?;
                     arguments.push(value);
                 }
+
+                match runtime.construct_callable(super_ctor, &arguments, new_target) {
+                    Ok(this_value) => {
+                        if function.frame_layout().receiver_slot().is_some() {
+                            activation.set_receiver(function, this_value)?;
+                        }
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            this_value,
+                        )?;
+                        activation.advance();
+                        Ok(StepOutcome::Continue)
+                    }
+                    Err(VmNativeCallError::Thrown(value)) => Ok(StepOutcome::Throw(value)),
+                    Err(VmNativeCallError::Internal(message)) => {
+                        Err(InterpreterError::NativeCall(message))
+                    }
+                }
+            }
+            // §12.3.7.1 SuperCall — spread variant.
+            // Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+            //
+            // Same semantics as CallSuper but reads arguments from an array
+            // register (B) instead of a contiguous register window.
+            Opcode::CallSuperSpread => {
+                if !function.is_derived_constructor()
+                    || !activation.metadata().flags().is_construct()
+                {
+                    let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                    let error = runtime.alloc_type_error("Super constructor is not available")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
+                let new_target = activation.construct_new_target().unwrap_or(closure);
+
+                let args_array_handle =
+                    Self::read_object_handle(activation, function, instruction.b())?;
+                let arguments = runtime.objects.array_elements(args_array_handle).map_err(
+                    |_| InterpreterError::TypeError("Spread arguments must be an array".into()),
+                )?;
 
                 match runtime.construct_callable(super_ctor, &arguments, new_target) {
                     Ok(this_value) => {

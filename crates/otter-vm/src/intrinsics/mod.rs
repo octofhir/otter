@@ -33,6 +33,7 @@ mod temporal;
 pub(crate) mod timer_globals;
 pub(crate) mod typedarray_class;
 mod weakmap_weakset_class;
+mod weakref_class;
 
 pub(crate) use boolean_class::box_boolean_object;
 pub(crate) use generator_class::GeneratorResumeKind;
@@ -147,6 +148,8 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "Set",
     "WeakMap",
     "WeakSet",
+    "WeakRef",
+    "FinalizationRegistry",
     "Promise",
     "Proxy",
     "Temporal",
@@ -303,8 +306,14 @@ pub struct VmIntrinsics {
     pub(crate) weakmap_prototype: ObjectHandle,
     pub(crate) weakset_constructor: ObjectHandle,
     pub(crate) weakset_prototype: ObjectHandle,
+    // WeakRef / FinalizationRegistry (§26.1, §26.2)
+    pub(crate) weakref_constructor: ObjectHandle,
+    pub(crate) weakref_prototype: ObjectHandle,
+    pub(crate) finalization_registry_constructor: ObjectHandle,
+    pub(crate) finalization_registry_prototype: ObjectHandle,
     // Iterator prototypes (§27.1.2, §23.1.5, §22.1.5, §24.1.5, §24.2.5)
     pub(crate) iterator_prototype: ObjectHandle,
+    pub(crate) async_iterator_prototype: ObjectHandle,
     pub(crate) array_iterator_prototype: ObjectHandle,
     pub(crate) string_iterator_prototype: ObjectHandle,
     pub(crate) map_iterator_prototype: ObjectHandle,
@@ -412,7 +421,12 @@ impl VmIntrinsics {
         let weakmap_prototype = heap.alloc_object();
         let weakset_constructor = heap.alloc_object();
         let weakset_prototype = heap.alloc_object();
+        let weakref_constructor = heap.alloc_object();
+        let weakref_prototype = heap.alloc_object();
+        let finalization_registry_constructor = heap.alloc_object();
+        let finalization_registry_prototype = heap.alloc_object();
         let iterator_prototype = heap.alloc_object();
+        let async_iterator_prototype = heap.alloc_object();
         let array_iterator_prototype = heap.alloc_object();
         let string_iterator_prototype = heap.alloc_object();
         let map_iterator_prototype = heap.alloc_object();
@@ -537,7 +551,12 @@ impl VmIntrinsics {
             weakmap_prototype,
             weakset_constructor,
             weakset_prototype,
+            weakref_constructor,
+            weakref_prototype,
+            finalization_registry_constructor,
+            finalization_registry_prototype,
             iterator_prototype,
+            async_iterator_prototype,
             array_iterator_prototype,
             string_iterator_prototype,
             map_iterator_prototype,
@@ -637,9 +656,23 @@ impl VmIntrinsics {
         heap.set_prototype(self.weakmap_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.weakset_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.weakset_prototype, Some(self.object_prototype))?;
+        // WeakRef (§26.1): WeakRef → Function.prototype, WeakRef.prototype → Object.prototype
+        heap.set_prototype(self.weakref_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(self.weakref_prototype, Some(self.object_prototype))?;
+        // FinalizationRegistry (§26.2)
+        heap.set_prototype(
+            self.finalization_registry_constructor,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.finalization_registry_prototype,
+            Some(self.object_prototype),
+        )?;
         // Iterator prototypes (§27.1.2): %IteratorPrototype% → %Object.prototype%
         // Concrete iterator prototypes → %IteratorPrototype%
         heap.set_prototype(self.iterator_prototype, Some(self.object_prototype))?;
+        // §27.1.4 %AsyncIteratorPrototype% → %Object.prototype%
+        heap.set_prototype(self.async_iterator_prototype, Some(self.object_prototype))?;
         heap.set_prototype(self.array_iterator_prototype, Some(self.iterator_prototype))?;
         heap.set_prototype(
             self.string_iterator_prototype,
@@ -1074,6 +1107,12 @@ impl VmIntrinsics {
         self.iterator_prototype
     }
 
+    /// Returns `%AsyncIteratorPrototype%` (§27.1.4).
+    #[must_use]
+    pub const fn async_iterator_prototype(&self) -> ObjectHandle {
+        self.async_iterator_prototype
+    }
+
     /// Returns `%ArrayIteratorPrototype%` (§23.1.5).
     #[must_use]
     pub const fn array_iterator_prototype(&self) -> ObjectHandle {
@@ -1302,7 +1341,12 @@ impl VmIntrinsics {
             self.weakmap_prototype,
             self.weakset_constructor,
             self.weakset_prototype,
+            self.weakref_constructor,
+            self.weakref_prototype,
+            self.finalization_registry_constructor,
+            self.finalization_registry_prototype,
             self.iterator_prototype,
+            self.async_iterator_prototype,
             self.array_iterator_prototype,
             self.string_iterator_prototype,
             self.map_iterator_prototype,
@@ -1423,7 +1467,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 26] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 27] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1452,6 +1496,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 26] {
         &temporal::TEMPORAL_INTRINSIC as &dyn IntrinsicInstaller,
         &typedarray_class::TYPED_ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &weakmap_weakset_class::WEAKMAP_WEAKSET_INTRINSIC as &dyn IntrinsicInstaller,
+        &weakref_class::WEAKREF_INTRINSIC as &dyn IntrinsicInstaller,
     ]
 }
 
@@ -1545,7 +1590,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 594);
+        assert_eq!(native_functions.len(), 600);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

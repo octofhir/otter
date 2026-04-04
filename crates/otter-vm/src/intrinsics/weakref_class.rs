@@ -153,26 +153,21 @@ fn weakref_constructor(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     if !runtime.is_current_native_construct_call() {
-        return Err(type_error(
-            runtime,
-            "WeakRef constructor requires 'new'",
-        )?);
+        return Err(type_error(runtime, "WeakRef constructor requires 'new'")?);
     }
     let target = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let target_handle = target
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(runtime, "WeakRef target must be an object")
-                .unwrap_or(VmNativeCallError::Internal(
-                    "WeakRef target must be an object".into(),
-                ))
-        })?;
+    let target_handle = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(runtime, "WeakRef target must be an object").unwrap_or(
+            VmNativeCallError::Internal("WeakRef target must be an object".into()),
+        )
+    })?;
     let prototype = Some(runtime.intrinsics().weakref_prototype);
-    let handle = runtime.objects_mut().alloc_weakref(prototype, target_handle);
+    let handle = runtime
+        .objects_mut()
+        .alloc_weakref(prototype, target_handle);
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -187,15 +182,11 @@ fn weakref_deref(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(runtime, "WeakRef.prototype.deref requires a WeakRef")
-                .unwrap_or(VmNativeCallError::Internal(
-                    "WeakRef.prototype.deref requires a WeakRef".into(),
-                ))
-        })?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(runtime, "WeakRef.prototype.deref requires a WeakRef").unwrap_or(
+            VmNativeCallError::Internal("WeakRef.prototype.deref requires a WeakRef".into()),
+        )
+    })?;
     match runtime.objects().weakref_deref(handle) {
         Ok(Some(target)) => Ok(RegisterValue::from_object_handle(target.0)),
         Ok(None) => Ok(RegisterValue::undefined()),
@@ -326,32 +317,25 @@ fn finalization_registry_register(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(
-                runtime,
-                "FinalizationRegistry.prototype.register requires a FinalizationRegistry",
-            )
-            .unwrap_or(VmNativeCallError::Internal(
-                "register requires FinalizationRegistry".into(),
-            ))
-        })?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(
+            runtime,
+            "FinalizationRegistry.prototype.register requires a FinalizationRegistry",
+        )
+        .unwrap_or(VmNativeCallError::Internal(
+            "register requires FinalizationRegistry".into(),
+        ))
+    })?;
 
     let target = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let target_handle = target
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(runtime, "FinalizationRegistry target must be an object")
-                .unwrap_or(VmNativeCallError::Internal(
-                    "target must be an object".into(),
-                ))
-        })?;
+    let target_handle = target.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(runtime, "FinalizationRegistry target must be an object").unwrap_or(
+            VmNativeCallError::Internal("target must be an object".into()),
+        )
+    })?;
 
     let held_value = args
         .get(1)
@@ -403,35 +387,29 @@ fn finalization_registry_unregister(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(
-                runtime,
-                "FinalizationRegistry.prototype.unregister requires a FinalizationRegistry",
-            )
-            .unwrap_or(VmNativeCallError::Internal(
-                "unregister requires FinalizationRegistry".into(),
-            ))
-        })?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(
+            runtime,
+            "FinalizationRegistry.prototype.unregister requires a FinalizationRegistry",
+        )
+        .unwrap_or(VmNativeCallError::Internal(
+            "unregister requires FinalizationRegistry".into(),
+        ))
+    })?;
 
     let token = args
         .first()
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
-    let token_handle = token
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            type_error(
-                runtime,
-                "FinalizationRegistry unregister token must be an object",
-            )
-            .unwrap_or(VmNativeCallError::Internal(
-                "unregister token must be an object".into(),
-            ))
-        })?;
+    let token_handle = token.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(
+            runtime,
+            "FinalizationRegistry unregister token must be an object",
+        )
+        .unwrap_or(VmNativeCallError::Internal(
+            "unregister token must be an object".into(),
+        ))
+    })?;
 
     let removed = runtime
         .objects_mut()

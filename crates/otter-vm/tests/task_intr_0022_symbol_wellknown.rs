@@ -127,7 +127,9 @@ fn concat_this_not_spreadable() {
 
 #[test]
 fn unscopables_object_exists() {
-    assert!(run_bool("Array.prototype[Symbol.unscopables] !== undefined"));
+    assert!(run_bool(
+        "Array.prototype[Symbol.unscopables] !== undefined"
+    ));
 }
 
 #[test]
@@ -234,7 +236,9 @@ fn well_known_symbol_properties_exist() {
 
 #[test]
 fn symbol_description_reflects_well_known_names() {
-    assert!(run_bool("Symbol.iterator.description === 'Symbol.iterator'"));
+    assert!(run_bool(
+        "Symbol.iterator.description === 'Symbol.iterator'"
+    ));
     assert!(run_bool(
         "Symbol.toStringTag.description === 'Symbol.toStringTag'"
     ));
@@ -272,12 +276,6 @@ fn typeof_symbol_is_symbol() {
 
 #[test]
 fn symbol_to_string_produces_descriptive_string() {
-    assert_eq!(
-        run_string("Symbol('otter').toString()"),
-        "Symbol(otter)"
-    );
-    assert_eq!(
-        run_string("Symbol().toString()"),
-        "Symbol()"
-    );
+    assert_eq!(run_string("Symbol('otter').toString()"), "Symbol(otter)");
+    assert_eq!(run_string("Symbol().toString()"), "Symbol()");
 }

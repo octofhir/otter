@@ -47,6 +47,23 @@ impl<'a> FunctionCompiler<'a> {
                     self.release(object);
                     Ok(value)
                 }
+                AssignmentTarget::PrivateFieldExpression(member) => {
+                    let object = self.compile_expression(&member.object, module)?;
+                    let object = if object.is_temp {
+                        self.stabilize_binding_value(object)?
+                    } else {
+                        object
+                    };
+                    let value = self.compile_expression(&assignment.right, module)?;
+                    let prop_id = self.intern_property_name(member.field.name.as_str())?;
+                    self.instructions.push(Instruction::set_private_field(
+                        object.register,
+                        value.register,
+                        prop_id,
+                    ));
+                    self.release(object);
+                    Ok(value)
+                }
                 AssignmentTarget::ArrayAssignmentTarget(_)
                 | AssignmentTarget::ObjectAssignmentTarget(_) => {
                     let value = self.compile_expression_with_inferred_name(
@@ -188,6 +205,32 @@ impl<'a> FunctionCompiler<'a> {
                     current.register,
                 ));
                 self.release(index);
+                self.release(object);
+                Ok(current)
+            }
+            AssignmentTarget::PrivateFieldExpression(member) => {
+                let object = self.compile_expression(&member.object, module)?;
+                let object = self.materialize_value(object);
+                let prop_id = self.intern_property_name(member.field.name.as_str())?;
+                let current = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::get_private_field(
+                    current.register,
+                    object.register,
+                    prop_id,
+                ));
+                let rhs = self.compile_expression(&assignment.right, module)?;
+                self.emit_compound_op(
+                    assignment.operator,
+                    current.register,
+                    current.register,
+                    rhs.register,
+                );
+                self.release(rhs);
+                self.instructions.push(Instruction::set_private_field(
+                    object.register,
+                    current.register,
+                    prop_id,
+                ));
                 self.release(object);
                 Ok(current)
             }

@@ -115,6 +115,9 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) mode: LoweringMode,
     pub(super) strict_mode: bool,
     pub(super) is_derived_constructor: bool,
+    /// When true, this constructor has associated class instance fields.
+    /// Causes `RunClassFieldInitializer` to be emitted at the right point.
+    pub(super) has_instance_fields: bool,
     pub(super) function_name: Option<String>,
     pub(super) kind: FunctionKind,
     pub(super) parent_env: Option<CompileEnv>,

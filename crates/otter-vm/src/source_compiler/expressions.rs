@@ -106,6 +106,16 @@ impl<'a> FunctionCompiler<'a> {
                 let flags = regexp.regex.flags.to_string();
                 self.compile_regexp_literal(pattern, &flags)
             }
+            // §13.10 Private Field Access — `obj.#field`
+            // Spec: <https://tc39.es/ecma262/#sec-private-field-access>
+            Expression::PrivateFieldExpression(member) => {
+                self.compile_private_field_get(member, module)
+            }
+            // §13.10.1 PrivateInExpression — `#field in obj`
+            // Spec: <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+            Expression::PrivateInExpression(expr) => {
+                self.compile_private_in_expression(expr, module)
+            }
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "expression {:?}",
                 expression
@@ -615,6 +625,9 @@ impl<'a> FunctionCompiler<'a> {
             SimpleAssignmentTarget::ComputedMemberExpression(member) => {
                 self.compile_member_update_computed(member, update, module)
             }
+            SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+                self.compile_member_update_private(member, update, module)
+            }
             _ => Err(SourceLoweringError::Unsupported(
                 "unsupported update target".to_string(),
             )),
@@ -745,6 +758,89 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
+    /// `obj.#field++` / `--obj.#field`
+    fn compile_member_update_private(
+        &mut self,
+        member: &oxc_ast::ast::PrivateFieldExpression<'_>,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let object = self.compile_expression(&member.object, module)?;
+        let object = self.stabilize_binding_value(object)?;
+        let prop_id = self.intern_property_name(member.field.name.as_str())?;
+
+        let old_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::get_private_field(
+            old_val.register,
+            object.register,
+            prop_id,
+        ));
+
+        let delta = match update.operator {
+            UpdateOperator::Increment => self.load_i32(1)?,
+            UpdateOperator::Decrement => self.load_i32(-1)?,
+        };
+        let new_val = ValueLocation::temp(self.alloc_temp());
+        self.instructions.push(Instruction::add(
+            new_val.register,
+            old_val.register,
+            delta.register,
+        ));
+        self.release(delta);
+
+        self.instructions.push(Instruction::set_private_field(
+            object.register,
+            new_val.register,
+            prop_id,
+        ));
+
+        if update.prefix {
+            self.release(old_val);
+            Ok(new_val)
+        } else {
+            self.release(new_val);
+            Ok(old_val)
+        }
+    }
+
+    /// §7.3.32 PrivateGet — `obj.#field`
+    /// Spec: <https://tc39.es/ecma262/#sec-privatemethods-specification-type>
+    fn compile_private_field_get(
+        &mut self,
+        member: &oxc_ast::ast::PrivateFieldExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let object = self.compile_expression(&member.object, module)?;
+        let prop_id = self.intern_property_name(member.field.name.as_str())?;
+        let dst = self.alloc_temp();
+        self.instructions.push(Instruction::get_private_field(
+            dst,
+            object.register,
+            prop_id,
+        ));
+        self.release(object);
+        Ok(ValueLocation::temp(dst))
+    }
+
+    /// §13.10.1 `#field in obj` brand check.
+    /// Spec: <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+    fn compile_private_in_expression(
+        &mut self,
+        expr: &oxc_ast::ast::PrivateInExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let object = self.compile_expression(&expr.right, module)?;
+        let prop_id = self.intern_property_name(expr.left.name.as_str())?;
+        let dst = self.alloc_temp();
+        self.instructions.push(Instruction::in_private(
+            dst,
+            object.register,
+            prop_id,
+        ));
+        self.release(object);
+        Ok(ValueLocation::temp(dst))
+    }
+
     fn compile_call_expression(
         &mut self,
         call: &oxc_ast::ast::CallExpression<'_>,
@@ -845,9 +941,10 @@ impl<'a> FunctionCompiler<'a> {
                 FrameFlags::new(is_construct, true, false),
                 receiver.register,
             )),
-            None => {
-                CallSite::Closure(ClosureCall::new(argument_count, FrameFlags::new(is_construct, !is_construct, false)))
-            }
+            None => CallSite::Closure(ClosureCall::new(
+                argument_count,
+                FrameFlags::new(is_construct, !is_construct, false),
+            )),
         };
         self.record_call_site(pc, call_site);
 
@@ -945,9 +1042,10 @@ impl<'a> FunctionCompiler<'a> {
                 FrameFlags::new(is_construct, true, false),
                 receiver.register,
             )),
-            None => {
-                CallSite::Closure(ClosureCall::new(0, FrameFlags::new(is_construct, !is_construct, false)))
-            }
+            None => CallSite::Closure(ClosureCall::new(
+                0,
+                FrameFlags::new(is_construct, !is_construct, false),
+            )),
         };
         self.record_call_site(pc, call_site);
 
@@ -1038,6 +1136,12 @@ impl<'a> FunctionCompiler<'a> {
                 .push(Instruction::move_(this_register, result.register));
         }
 
+        // §15.7.14 — Run instance field initializers after super() binds `this`.
+        if self.has_instance_fields {
+            self.instructions
+                .push(Instruction::run_class_field_initializer());
+        }
+
         if argument_count != 0 {
             let stable_register =
                 BytecodeRegister::new(arg_start.index() + argument_count.saturating_sub(1));
@@ -1112,6 +1216,12 @@ impl<'a> FunctionCompiler<'a> {
         {
             self.instructions
                 .push(Instruction::move_(this_register, result.register));
+        }
+
+        // §15.7.14 — Run instance field initializers after super() binds `this`.
+        if self.has_instance_fields {
+            self.instructions
+                .push(Instruction::run_class_field_initializer());
         }
 
         Ok(result)
@@ -1213,6 +1323,22 @@ impl<'a> FunctionCompiler<'a> {
                     }
                 }
 
+                Ok((ValueLocation::temp(callee_register), Some(receiver)))
+            }
+            Expression::PrivateFieldExpression(member) => {
+                let receiver = self.compile_expression(&member.object, module)?;
+                let receiver = if receiver.is_temp {
+                    self.stabilize_binding_value(receiver)?
+                } else {
+                    receiver
+                };
+                let callee_register = self.alloc_temp();
+                let prop_id = self.intern_property_name(member.field.name.as_str())?;
+                self.instructions.push(Instruction::get_private_field(
+                    callee_register,
+                    receiver.register,
+                    prop_id,
+                ));
                 Ok((ValueLocation::temp(callee_register), Some(receiver)))
             }
             _ => {
@@ -1589,12 +1715,10 @@ impl<'a> FunctionCompiler<'a> {
         array: &oxc_ast::ast::ArrayExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let has_spread = array.elements.iter().any(|el| {
-            matches!(
-                el,
-                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)
-            )
-        });
+        let has_spread = array
+            .elements
+            .iter()
+            .any(|el| matches!(el, oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)));
 
         if has_spread {
             self.compile_array_expression_with_spread(array, module)
@@ -1686,8 +1810,10 @@ impl<'a> FunctionCompiler<'a> {
                     let undef = ValueLocation::temp(self.alloc_temp());
                     self.instructions
                         .push(Instruction::load_undefined(undef.register));
-                    self.instructions
-                        .push(Instruction::array_push(destination.register, undef.register));
+                    self.instructions.push(Instruction::array_push(
+                        destination.register,
+                        undef.register,
+                    ));
                     self.release(undef);
                 }
                 expr => {
@@ -1698,8 +1824,10 @@ impl<'a> FunctionCompiler<'a> {
                     } else {
                         value
                     };
-                    self.instructions
-                        .push(Instruction::array_push(destination.register, value.register));
+                    self.instructions.push(Instruction::array_push(
+                        destination.register,
+                        value.register,
+                    ));
                     self.release(value);
                 }
             }
@@ -2121,94 +2249,12 @@ impl<'a> FunctionCompiler<'a> {
         class: &oxc_ast::ast::Class<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
         let class_name = class
             .id
             .as_ref()
             .map(|id| id.name.as_str())
             .unwrap_or("anonymous");
-
-        // First pass: extract constructor.
-        let mut constructor = None;
-        for element in &class.body.body {
-            match element {
-                ClassElement::MethodDefinition(method)
-                    if matches!(method.kind, MethodDefinitionKind::Constructor) =>
-                {
-                    constructor = Some(&method.value);
-                }
-                ClassElement::MethodDefinition(_) => {}
-                _ => {
-                    return Err(SourceLoweringError::Unsupported(
-                        "unsupported class expression element".to_string(),
-                    ));
-                }
-            }
-        }
-
-        let super_class = if let Some(super_class) = class.super_class.as_ref() {
-            let super_value = self.compile_expression(super_class, module)?;
-            Some(self.stabilize_binding_value(super_value)?)
-        } else {
-            None
-        };
-
-        let constructor_value = if let Some(ctor) = constructor {
-            self.compile_class_constructor(class_name, ctor, super_class.is_some(), module)?
-        } else if super_class.is_some() {
-            self.compile_default_derived_class_constructor(class_name, module)?
-        } else {
-            self.compile_default_base_class_constructor(class_name, module)?
-        };
-        let constructor_value = if constructor_value.is_temp {
-            self.stabilize_binding_value(constructor_value)?
-        } else {
-            constructor_value
-        };
-
-        if let Some(super_class) = super_class {
-            self.emit_object_method_call(
-                "setPrototypeOf",
-                constructor_value,
-                &[super_class],
-                module,
-            )?;
-        }
-
-        let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
-        let prototype = self.stabilize_binding_value(prototype)?;
-        let prototype_parent = if let Some(super_class) = super_class {
-            let parent = self.emit_named_property_load(super_class, "prototype")?;
-            self.stabilize_binding_value(parent)?
-        } else {
-            let object_ctor = self.compile_identifier("Object")?;
-            let object_ctor = if object_ctor.is_temp {
-                self.stabilize_binding_value(object_ctor)?
-            } else {
-                object_ctor
-            };
-            let parent = self.emit_named_property_load(object_ctor, "prototype")?;
-            self.stabilize_binding_value(parent)?
-        };
-        self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
-        self.release(prototype_parent);
-
-        // Install methods.
-        for element in &class.body.body {
-            if let ClassElement::MethodDefinition(method) = element
-                && !matches!(method.kind, MethodDefinitionKind::Constructor)
-            {
-                let target = if method.r#static {
-                    constructor_value
-                } else {
-                    prototype
-                };
-                self.compile_class_method(method, target, module)?;
-            }
-        }
-
-        self.emit_make_class_prototype_non_writable(constructor_value, module)?;
-        Ok(constructor_value)
+        self.compile_class_body(class, class_name, module)
     }
 
     /// Template literal: `` `prefix${expr}mid${expr}suffix` ``

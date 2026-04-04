@@ -521,4 +521,3 @@ fn class_ctor_super_with_expression() {
     );
     assert_eq!(result, RegisterValue::from_i32(0));
 }
-

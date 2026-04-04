@@ -21,6 +21,7 @@ impl<'a> FunctionCompiler<'a> {
             mode,
             strict_mode: false,
             is_derived_constructor: false,
+            has_instance_fields: false,
             function_name,
             kind,
             parent_env,
@@ -642,6 +643,8 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    /// §15.7 ClassDeclaration — `class Name { ... }`
+    /// Spec: <https://tc39.es/ecma262/#sec-class-definitions>
     fn compile_class_declaration(
         &mut self,
         class: &Class<'_>,
@@ -652,8 +655,31 @@ impl<'a> FunctionCompiler<'a> {
         })?;
         let binding = self.declare_variable_binding(name.name.as_str(), false)?;
 
-        // First pass: extract constructor, validate elements.
+        let constructor_value = self.compile_class_body(class, name.name.as_str(), module)?;
+
+        if constructor_value.register != binding {
+            self.instructions
+                .push(Instruction::move_(binding, constructor_value.register));
+        }
+
+        Ok(())
+    }
+
+    /// §15.7.14 ClassDefinitionEvaluation — shared implementation for class
+    /// declarations and class expressions.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    pub(super) fn compile_class_body(
+        &mut self,
+        class: &Class<'_>,
+        class_name: &str,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyDefinitionType};
+
+        // ── First pass: extract constructor, count instance fields, detect private members ──
         let mut constructor = None;
+        let mut has_instance_fields = false;
+        let mut has_private_members = false;
         for element in &class.body.body {
             match element {
                 ClassElement::MethodDefinition(method)
@@ -671,16 +697,39 @@ impl<'a> FunctionCompiler<'a> {
                     }
                     constructor = Some(&method.value);
                 }
-                // Non-constructor methods are handled in the second pass below.
-                ClassElement::MethodDefinition(_) => {}
-                ClassElement::PropertyDefinition(_) => {
-                    return Err(SourceLoweringError::Unsupported(
-                        "class field declarations are not implemented yet".to_string(),
-                    ));
+                ClassElement::MethodDefinition(method) => {
+                    if matches!(
+                        &method.key,
+                        oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
+                    ) {
+                        has_private_members = true;
+                    }
                 }
-                ClassElement::StaticBlock(_) => {
+                ClassElement::PropertyDefinition(prop) => {
+                    if prop.declare {
+                        continue;
+                    }
+                    if matches!(
+                        prop.r#type,
+                        PropertyDefinitionType::TSAbstractPropertyDefinition
+                    ) {
+                        continue;
+                    }
+                    if !prop.r#static {
+                        has_instance_fields = true;
+                    }
+                    if matches!(
+                        &prop.key,
+                        oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
+                    ) {
+                        has_private_members = true;
+                    }
+                }
+                ClassElement::StaticBlock(_) => {}
+                ClassElement::AccessorProperty(_) => {
                     return Err(SourceLoweringError::Unsupported(
-                        "static blocks are not implemented yet".to_string(),
+                        "accessor class properties (auto-accessor) are not yet implemented"
+                            .to_string(),
                     ));
                 }
                 _ => {
@@ -691,29 +740,50 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
+        // ── Compile super class ─────────────────────────────────────────────
+        // §15.7.14 step 5: Detect `class extends null` — protoParent = null,
+        // constructorParent = %Function.prototype%, constructor kind = base.
+        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        let extends_null = matches!(
+            class.super_class.as_ref(),
+            Some(Expression::NullLiteral(_))
+        );
         let super_class = if let Some(super_class) = class.super_class.as_ref() {
-            if matches!(super_class, Expression::NullLiteral(_)) {
-                return Err(SourceLoweringError::Unsupported(
-                    "class extends null is not implemented yet on the new VM path".to_string(),
-                ));
+            if extends_null {
+                None // Don't compile null as a super class value
+            } else {
+                let super_value = self.compile_expression(super_class, module)?;
+                Some(self.stabilize_binding_value(super_value)?)
             }
-            let super_value = self.compile_expression(super_class, module)?;
-            Some(self.stabilize_binding_value(super_value)?)
         } else {
             None
         };
+        let is_derived = super_class.is_some() && !extends_null;
 
-        let constructor_value = if let Some(constructor) = constructor {
-            self.compile_class_constructor(
-                name.name.as_str(),
-                constructor,
-                super_class.is_some(),
+        // ── Compile constructor ─────────────────────────────────────────────
+        // RunClassFieldInitializer is needed both for instance fields AND for
+        // copying private methods/accessors to instances.
+        let needs_field_initializer = has_instance_fields || has_private_members;
+        let constructor_value = if let Some(ctor) = constructor {
+            self.compile_class_constructor_with_fields(
+                class_name,
+                ctor,
+                is_derived,
+                needs_field_initializer,
                 module,
             )?
-        } else if super_class.is_some() {
-            self.compile_default_derived_class_constructor(name.name.as_str(), module)?
+        } else if is_derived {
+            self.compile_default_derived_class_constructor_with_fields(
+                class_name,
+                needs_field_initializer,
+                module,
+            )?
         } else {
-            self.compile_default_base_class_constructor(name.name.as_str(), module)?
+            self.compile_default_base_class_constructor_with_fields(
+                class_name,
+                needs_field_initializer,
+                module,
+            )?
         };
         let constructor_value = if constructor_value.is_temp {
             self.stabilize_binding_value(constructor_value)?
@@ -721,7 +791,9 @@ impl<'a> FunctionCompiler<'a> {
             constructor_value
         };
 
+        // ── Set up prototype chain ──────────────────────────────────────────
         if let Some(super_class) = super_class {
+            // Normal extends: constructor.__proto__ = superClass
             self.emit_object_method_call(
                 "setPrototypeOf",
                 constructor_value,
@@ -729,12 +801,17 @@ impl<'a> FunctionCompiler<'a> {
                 module,
             )?;
         }
+        // For extends null: constructor.__proto__ stays as Function.prototype (default).
 
-        // Load and stabilize prototype early — it's needed for both setPrototypeOf
-        // and method installation.
         let prototype = self.emit_named_property_load(constructor_value, "prototype")?;
         let prototype = self.stabilize_binding_value(prototype)?;
-        let prototype_parent = if let Some(super_class) = super_class {
+        let prototype_parent = if extends_null {
+            // §15.7.14 step 5.b.i: protoParent = null
+            // Stabilize to prevent clobbering by internal allocations in
+            // emit_object_method_call.
+            let null_val = self.load_null()?;
+            self.stabilize_binding_value(null_val)?
+        } else if let Some(super_class) = super_class {
             let parent = self.emit_named_property_load(super_class, "prototype")?;
             self.stabilize_binding_value(parent)?
         } else {
@@ -750,44 +827,560 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_object_method_call("setPrototypeOf", prototype, &[prototype_parent], module)?;
         self.release(prototype_parent);
 
-        // Second pass: install methods on prototype (instance) or constructor (static).
+        // ── AllocClassId if the class has private members ──────────────────
+        // §6.2.12 — Allocate a unique class identifier for private name resolution.
+        if has_private_members {
+            self.instructions
+                .push(Instruction::alloc_class_id(constructor_value.register));
+        }
+
+        // ── Second pass: install methods ────────────────────────────────────
         // §15.7.14 ClassDefinitionEvaluation step 26–28.
-        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
         for element in &class.body.body {
-            match element {
-                ClassElement::MethodDefinition(method)
-                    if !matches!(method.kind, MethodDefinitionKind::Constructor) =>
-                {
+            if let ClassElement::MethodDefinition(method) = element
+                && !matches!(method.kind, MethodDefinitionKind::Constructor)
+            {
+                let is_private = matches!(
+                    &method.key,
+                    oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
+                );
+                let class_id_src = if has_private_members {
+                    Some(constructor_value.register)
+                } else {
+                    None
+                };
+                if is_private {
+                    self.compile_private_class_method(
+                        method,
+                        constructor_value,
+                        prototype,
+                        module,
+                    )?;
+                } else {
                     let target = if method.r#static {
                         constructor_value
                     } else {
                         prototype
                     };
-                    self.compile_class_method(method, target, module)?;
+                    self.compile_class_method(method, target, class_id_src, module)?;
                 }
-                _ => {} // Constructor and other elements already handled.
             }
         }
 
         self.emit_make_class_prototype_non_writable(constructor_value, module)?;
 
-        if constructor_value.register != binding {
-            self.instructions
-                .push(Instruction::move_(binding, constructor_value.register));
+        // ── Compile instance field initializer ──────────────────────────────
+        // §15.7.14 step 29: Create an initializer function for instance fields.
+        if needs_field_initializer {
+            self.compile_class_field_initializer(
+                class,
+                constructor_value,
+                has_private_members,
+                module,
+            )?;
         }
 
+        // ── Third pass: static fields and static blocks ─────────────────────
+        // §15.7.14 step 34: Evaluate static field initializers in order.
+        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        for element in &class.body.body {
+            match element {
+                ClassElement::PropertyDefinition(prop) if prop.r#static && !prop.declare => {
+                    if let oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) = &prop.key {
+                        // Static private field: compile value and emit DefinePrivateField
+                        // on the constructor.
+                        self.compile_static_private_field(
+                            ident.name.as_str(),
+                            prop,
+                            constructor_value,
+                            module,
+                        )?;
+                    } else {
+                        self.compile_static_field(prop, constructor_value, module)?;
+                    }
+                }
+                ClassElement::StaticBlock(block) => {
+                    self.compile_static_block(block, constructor_value, module)?;
+                }
+                _ => {} // methods & instance fields handled above
+            }
+        }
+
+        Ok(constructor_value)
+    }
+
+    /// §15.7.14 step 29 — Compile a synthetic function that initializes instance
+    /// fields and store it on the constructor via SetClassFieldInitializer.
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    fn compile_class_field_initializer(
+        &mut self,
+        class: &Class<'_>,
+        constructor_value: ValueLocation,
+        has_private_members: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        use super::ast::non_computed_property_key_name;
+        use oxc_ast::ast::{ClassElement, PropertyDefinitionType};
+
+        // Compile the synthetic initializer function.
+        // It receives `this` as receiver and defines each instance field.
+        let class_name = class
+            .id
+            .as_ref()
+            .map(|id| id.name.as_str())
+            .unwrap_or("anonymous");
+        let reserved = module.reserve_function();
+        let mut init_compiler = FunctionCompiler::new(
+            self.mode,
+            Some(format!("{class_name}.__field_init__")),
+            super::shared::FunctionKind::Ordinary,
+            Some(self.env.clone()),
+        );
+        init_compiler.strict_mode = true;
+        init_compiler.declare_parameters(&[])?;
+        init_compiler.declare_this_binding()?;
+        init_compiler.reserve_arguments_binding_slot()?;
+        init_compiler.compile_parameter_initialization(&[], module)?;
+
+        // Load `this` for field definitions.
+        let this_reg = init_compiler.alloc_temp();
+        init_compiler
+            .instructions
+            .push(Instruction::load_this(this_reg));
+        let this_reg = init_compiler
+            .stabilize_binding_value(ValueLocation::temp(this_reg))?
+            .register;
+
+        // Emit field definitions in source order.
+        for element in &class.body.body {
+            if let ClassElement::PropertyDefinition(prop) = element
+                && !prop.r#static
+                && !prop.declare
+                && !matches!(
+                    prop.r#type,
+                    PropertyDefinitionType::TSAbstractPropertyDefinition
+                )
+            {
+                if let oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) = &prop.key {
+                    // §7.3.31 PrivateFieldAdd — private instance field.
+                    let value = if let Some(init_expr) = &prop.value {
+                        init_compiler.compile_expression(init_expr, module)?
+                    } else {
+                        init_compiler.load_undefined()?
+                    };
+                    let prop_id =
+                        init_compiler.intern_property_name(ident.name.as_str())?;
+                    init_compiler
+                        .instructions
+                        .push(Instruction::define_private_field(
+                            this_reg,
+                            value.register,
+                            prop_id,
+                        ));
+                    init_compiler.release(value);
+                } else {
+                    // Public instance field.
+                    let value = if let Some(init_expr) = &prop.value {
+                        init_compiler.compile_expression(init_expr, module)?
+                    } else {
+                        init_compiler.load_undefined()?
+                    };
+
+                    if prop.computed {
+                        let key =
+                            init_compiler.compile_expression(prop.key.to_expression(), module)?;
+                        init_compiler
+                            .instructions
+                            .push(Instruction::define_computed_field(
+                                this_reg,
+                                key.register,
+                                value.register,
+                            ));
+                        init_compiler.release(key);
+                    } else {
+                        let key_name =
+                            non_computed_property_key_name(&prop.key).ok_or_else(|| {
+                                SourceLoweringError::Unsupported("unnamed class field".to_string())
+                            })?;
+                        let prop_id = init_compiler.intern_property_name(&key_name)?;
+                        init_compiler.instructions.push(Instruction::define_field(
+                            this_reg,
+                            value.register,
+                            prop_id,
+                        ));
+                    }
+                    init_compiler.release(value);
+                }
+            }
+        }
+
+        init_compiler.emit_implicit_return()?;
+        let compiled = init_compiler.finish(reserved, 0, Some("__field_init__"))?;
+        module.set_function(reserved, compiled.function);
+
+        // Create the closure and attach it to the constructor.
+        let init_closure = ValueLocation::temp(self.alloc_temp());
+        self.emit_new_closure(init_closure.register, reserved, &compiled.captures)?;
+
+        // Propagate class_id so DefinePrivateField can resolve private names.
+        if has_private_members {
+            self.instructions.push(Instruction::copy_class_id(
+                init_closure.register,
+                constructor_value.register,
+            ));
+        }
+
+        self.instructions
+            .push(Instruction::set_class_field_initializer(
+                constructor_value.register,
+                init_closure.register,
+            ));
+        self.release(init_closure);
+
+        Ok(())
+    }
+
+    /// §15.7.14 step 34 — Compile a single static field definition.
+    /// Evaluates the initializer in a synthetic function with `this` = constructor,
+    /// then defines the property on the constructor via DefineField.
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    fn compile_static_field(
+        &mut self,
+        prop: &oxc_ast::ast::PropertyDefinition<'_>,
+        constructor_value: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        use super::ast::non_computed_property_key_name;
+
+        if prop.computed {
+            // Computed key: evaluate key in outer scope, value in a synthetic function.
+            let key = self.compile_expression(prop.key.to_expression(), module)?;
+            let key = self.stabilize_binding_value(key)?;
+
+            let value = self.compile_static_field_value(prop, constructor_value, module)?;
+
+            self.instructions.push(Instruction::define_computed_field(
+                constructor_value.register,
+                key.register,
+                value.register,
+            ));
+            self.release(key);
+            self.release(value);
+        } else {
+            let key_name = non_computed_property_key_name(&prop.key).ok_or_else(|| {
+                SourceLoweringError::Unsupported("unnamed static field".to_string())
+            })?;
+            let prop_id = self.intern_property_name(&key_name)?;
+
+            let value = self.compile_static_field_value(prop, constructor_value, module)?;
+
+            self.instructions.push(Instruction::define_field(
+                constructor_value.register,
+                value.register,
+                prop_id,
+            ));
+            self.release(value);
+        }
+        Ok(())
+    }
+
+    /// §15.7.14 — Compile a static private field definition.
+    /// Evaluates the initializer via a synthetic function with `this` = constructor,
+    /// then emits DefinePrivateField on the constructor.
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    fn compile_static_private_field(
+        &mut self,
+        name: &str,
+        prop: &oxc_ast::ast::PropertyDefinition<'_>,
+        constructor_value: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        let value = self.compile_static_field_value(prop, constructor_value, module)?;
+        let prop_id = self.intern_property_name(name)?;
+        self.instructions.push(Instruction::define_private_field(
+            constructor_value.register,
+            value.register,
+            prop_id,
+        ));
+        self.release(value);
+        Ok(())
+    }
+
+    /// §15.7.14 — Compile a private class method/getter/setter.
+    ///
+    /// For **instance** methods: emits PushPrivateMethod/Getter/Setter on the
+    /// constructor — these get copied to instances during RunClassFieldInitializer.
+    /// For **static** methods: emits DefinePrivateMethod/Getter/Setter on the
+    /// constructor directly (adds to constructor's [[PrivateElements]]).
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    fn compile_private_class_method(
+        &mut self,
+        method: &oxc_ast::ast::MethodDefinition<'_>,
+        constructor_value: ValueLocation,
+        prototype: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        use super::ast::extract_function_params;
+
+        let private_name = match &method.key {
+            oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) => ident.name.as_str(),
+            _ => unreachable!("compile_private_class_method called with non-private key"),
+        };
+
+        let display_name = match method.kind {
+            MethodDefinitionKind::Get => format!("get #{private_name}"),
+            MethodDefinitionKind::Set => format!("set #{private_name}"),
+            _ => format!("#{private_name}"),
+        };
+
+        // Compile the method body as a closure.
+        let function = &method.value;
+        let reserved = module.reserve_function();
+        let params = extract_function_params(function)?;
+        let kind = if method.value.r#async {
+            super::shared::FunctionKind::Async
+        } else if method.value.generator {
+            return Err(SourceLoweringError::Unsupported(
+                "generator private class methods".to_string(),
+            ));
+        } else {
+            super::shared::FunctionKind::Ordinary
+        };
+        let compiled = module.compile_function_from_statements(
+            reserved,
+            super::module_compiler::FunctionIdentity {
+                debug_name: Some(display_name),
+                self_binding_name: None,
+                length: super::ast::expected_function_length(&params),
+            },
+            function
+                .body
+                .as_ref()
+                .map(|body| body.statements.as_slice())
+                .unwrap_or(&[]),
+            &params,
+            kind,
+            Some(self.env.clone()),
+            true, // class bodies are always strict
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let method_closure = ValueLocation::temp(self.alloc_temp());
+        if kind.is_async() {
+            self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
+        } else {
+            self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+        }
+
+        // Propagate class_id so the method can resolve private names.
+        self.instructions.push(Instruction::copy_class_id(
+            method_closure.register,
+            constructor_value.register,
+        ));
+
+        let prop_id = self.intern_property_name(private_name)?;
+
+        if method.r#static {
+            // Static private: add directly to constructor's [[PrivateElements]].
+            match method.kind {
+                MethodDefinitionKind::Method => {
+                    self.instructions.push(Instruction::define_private_method(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Get => {
+                    self.instructions.push(Instruction::define_private_getter(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Set => {
+                    self.instructions.push(Instruction::define_private_setter(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Constructor => {
+                    unreachable!("constructor handled in first pass")
+                }
+            }
+        } else {
+            // Instance private: push to constructor's [[PrivateMethods]].
+            // Copied to instances during RunClassFieldInitializer.
+            match method.kind {
+                MethodDefinitionKind::Method => {
+                    self.instructions.push(Instruction::push_private_method(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Get => {
+                    self.instructions.push(Instruction::push_private_getter(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Set => {
+                    self.instructions.push(Instruction::push_private_setter(
+                        constructor_value.register,
+                        method_closure.register,
+                        prop_id,
+                    ));
+                }
+                MethodDefinitionKind::Constructor => {
+                    unreachable!("constructor handled in first pass")
+                }
+            }
+        }
+
+        self.release(method_closure);
+        let _ = prototype; // prototype is not used for private methods
+        Ok(())
+    }
+
+    /// Compile a static field initializer value. If the field has an initializer,
+    /// it's compiled as a synthetic function called with `this` = constructor
+    /// (per spec, static field initializers evaluate with `this` bound to the class).
+    /// Returns the result value location.
+    fn compile_static_field_value(
+        &mut self,
+        prop: &oxc_ast::ast::PropertyDefinition<'_>,
+        constructor_value: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let Some(init_expr) = &prop.value else {
+            return self.load_undefined();
+        };
+
+        // Compile the initializer as a synthetic function that returns the value.
+        // This ensures `this` inside the initializer refers to the constructor.
+        let reserved = module.reserve_function();
+        let compiled = module.compile_function_from_expression(
+            reserved,
+            super::module_compiler::FunctionIdentity {
+                debug_name: Some("static_field_init".to_string()),
+                self_binding_name: None,
+                length: 0,
+            },
+            init_expr,
+            &[],
+            super::shared::FunctionKind::Ordinary,
+            Some(self.env.clone()),
+            true,
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let init_closure = ValueLocation::temp(self.alloc_temp());
+        self.emit_new_closure(init_closure.register, reserved, &compiled.captures)?;
+
+        // Call with constructor as receiver.
+        let argument_count = 1u16;
+        let arg_start = self.reserve_temp_window(argument_count)?;
+        if constructor_value.register != arg_start {
+            self.instructions
+                .push(Instruction::move_(arg_start, constructor_value.register));
+        }
+
+        let result = self.alloc_temp();
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            result,
+            init_closure.register,
+            arg_start,
+        ));
+        self.record_call_site(
+            pc,
+            crate::call::CallSite::Closure(crate::call::ClosureCall::new_with_receiver(
+                argument_count,
+                crate::frame::FrameFlags::new(false, true, false),
+                arg_start,
+            )),
+        );
+        self.release_temp_window(argument_count);
+        self.release(init_closure);
+
+        Ok(ValueLocation::temp(result))
+    }
+
+    /// §15.7.12 StaticBlock — `static { ... }`
+    /// Compiled as an IIFE with `this` bound to the constructor.
+    /// Spec: <https://tc39.es/ecma262/#sec-static-blocks>
+    fn compile_static_block(
+        &mut self,
+        block: &oxc_ast::ast::StaticBlock<'_>,
+        constructor_value: ValueLocation,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<(), SourceLoweringError> {
+        // Compile the static block body as a synthetic function.
+        let reserved = module.reserve_function();
+        let compiled = module.compile_function_from_statements(
+            reserved,
+            super::module_compiler::FunctionIdentity {
+                debug_name: Some("static".to_string()),
+                self_binding_name: None,
+                length: 0,
+            },
+            &block.body,
+            &[],
+            super::shared::FunctionKind::Ordinary,
+            Some(self.env.clone()),
+            true, // class bodies are always strict
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        // Create closure and immediately invoke with constructor as `this`.
+        let block_closure = ValueLocation::temp(self.alloc_temp());
+        self.emit_new_closure(block_closure.register, reserved, &compiled.captures)?;
+
+        // Call: block_closure() with `this` = constructor.
+        // argument_count = 1 because the receiver occupies one slot in the window.
+        let argument_count = 1u16;
+        let arg_start = self.reserve_temp_window(argument_count)?;
+        if constructor_value.register != arg_start {
+            self.instructions
+                .push(Instruction::move_(arg_start, constructor_value.register));
+        }
+
+        let result = self.alloc_temp();
+        let pc = self.instructions.len();
+        self.instructions.push(Instruction::call_closure(
+            result,
+            block_closure.register,
+            arg_start,
+        ));
+        self.record_call_site(
+            pc,
+            crate::call::CallSite::Closure(crate::call::ClosureCall::new_with_receiver(
+                argument_count,
+                crate::frame::FrameFlags::new(false, true, false),
+                arg_start,
+            )),
+        );
+        self.release(ValueLocation::temp(result));
+        self.release_temp_window(argument_count);
+        self.release(block_closure);
         Ok(())
     }
 
     /// Compiles a class method and installs it on the target (prototype or constructor).
     ///
     /// Handles regular methods, getters, setters — named and computed keys.
+    /// If `class_id_source` is provided, emits CopyClassId on the closure before
+    /// installing (so methods can resolve private names at runtime).
     /// §15.4.5 MethodDefinitionEvaluation
     /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
     pub(super) fn compile_class_method(
         &mut self,
         method: &oxc_ast::ast::MethodDefinition<'_>,
         target: ValueLocation,
+        class_id_source: Option<BytecodeRegister>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
         use super::ast::{
@@ -915,46 +1508,16 @@ impl<'a> FunctionCompiler<'a> {
             MethodDefinitionKind::Constructor => unreachable!("constructor handled in first pass"),
         }
 
+        // Propagate class_id so the method can resolve private names at runtime.
+        if let Some(source) = class_id_source {
+            self.instructions.push(Instruction::copy_class_id(
+                method_closure.register,
+                source,
+            ));
+        }
+
         self.release(method_closure);
         Ok(())
-    }
-
-    pub(super) fn compile_class_constructor(
-        &mut self,
-        class_name: &str,
-        constructor: &Function<'_>,
-        derived: bool,
-        module: &mut ModuleCompiler<'a>,
-    ) -> Result<ValueLocation, SourceLoweringError> {
-        let reserved = module.reserve_function();
-        let params = extract_function_params(constructor)?;
-        let compiled = module.compile_function_from_statements_with_options(
-            reserved,
-            FunctionIdentity {
-                debug_name: Some(class_name.to_string()),
-                self_binding_name: Some(class_name.to_string()),
-                length: expected_function_length(&params),
-            },
-            constructor
-                .body
-                .as_ref()
-                .map(|body| body.statements.as_slice())
-                .ok_or_else(|| {
-                    SourceLoweringError::Unsupported(
-                        "class constructors without bodies".to_string(),
-                    )
-                })?,
-            &params,
-            FunctionKind::Ordinary,
-            Some(self.env.clone()),
-            true,
-            derived,
-        )?;
-        module.set_function(reserved, compiled.function);
-
-        let destination = self.alloc_temp();
-        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
-        Ok(ValueLocation::temp(destination))
     }
 
     pub(super) fn compile_default_base_class_constructor(
@@ -983,9 +1546,134 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(destination))
     }
 
-    pub(super) fn compile_default_derived_class_constructor(
+    /// §15.7.14 — Compile an explicit class constructor with field support.
+    /// For base class: emits RunClassFieldInitializer at the start.
+    /// For derived class: relies on compile_super_call_* to emit RunClassFieldInitializer.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    fn compile_class_constructor_with_fields(
         &mut self,
         class_name: &str,
+        constructor: &Function<'_>,
+        derived: bool,
+        has_instance_fields: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let reserved = module.reserve_function();
+        let params = extract_function_params(constructor)?;
+
+        // For base class constructors with fields, we need to inject
+        // RunClassFieldInitializer at the start of the body. We do this by
+        // adding has_instance_fields to the function compiler state.
+        let mut compiler = FunctionCompiler::new(
+            self.mode,
+            Some(class_name.to_string()),
+            FunctionKind::Ordinary,
+            Some(self.env.clone()),
+        );
+        compiler.strict_mode = true;
+        compiler.is_derived_constructor = derived;
+        compiler.has_instance_fields = has_instance_fields;
+
+        compiler.declare_parameters(&params)?;
+        compiler.declare_this_binding()?;
+        compiler.reserve_arguments_binding_slot()?;
+        compiler.compile_parameter_initialization(&params, module)?;
+        if let Some(self_binding_name) = Some(class_name) {
+            let closure_register = compiler.declare_function_binding(self_binding_name)?;
+            compiler
+                .instructions
+                .push(Instruction::load_current_closure(closure_register));
+        }
+
+        // For base class: emit RunClassFieldInitializer before user code.
+        if !derived && has_instance_fields {
+            compiler
+                .instructions
+                .push(Instruction::run_class_field_initializer());
+        }
+
+        compiler.predeclare_function_scope(
+            constructor
+                .body
+                .as_ref()
+                .map(|body| body.statements.as_slice())
+                .unwrap_or(&[]),
+            module,
+        )?;
+        compiler.emit_hoisted_function_initializers()?;
+        let terminated = compiler.compile_statements(
+            constructor
+                .body
+                .as_ref()
+                .map(|body| body.statements.as_slice())
+                .unwrap_or(&[]),
+            module,
+        )?;
+        if !terminated {
+            compiler.emit_implicit_return()?;
+        }
+
+        let compiled = compiler.finish(
+            reserved,
+            expected_function_length(&params),
+            Some(class_name),
+        )?;
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    /// §15.7.14 — Default base class constructor with field initializer support.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    fn compile_default_base_class_constructor_with_fields(
+        &mut self,
+        class_name: &str,
+        has_instance_fields: bool,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        if !has_instance_fields {
+            return self.compile_default_base_class_constructor(class_name, module);
+        }
+        let reserved = module.reserve_function();
+        let mut compiler = FunctionCompiler::new(
+            self.mode,
+            Some(class_name.to_string()),
+            FunctionKind::Ordinary,
+            Some(self.env.clone()),
+        );
+        compiler.strict_mode = true;
+        compiler.has_instance_fields = true;
+        compiler.declare_parameters(&[])?;
+        compiler.declare_this_binding()?;
+        compiler.reserve_arguments_binding_slot()?;
+        compiler.compile_parameter_initialization(&[], module)?;
+        let closure_register = compiler.declare_function_binding(class_name)?;
+        compiler
+            .instructions
+            .push(Instruction::load_current_closure(closure_register));
+
+        // Emit RunClassFieldInitializer for instance fields.
+        compiler
+            .instructions
+            .push(Instruction::run_class_field_initializer());
+
+        compiler.emit_implicit_return()?;
+        let compiled = compiler.finish(reserved, 0, Some(class_name))?;
+        module.set_function(reserved, compiled.function);
+
+        let destination = self.alloc_temp();
+        self.emit_new_closure_class_constructor(destination, reserved, &compiled.captures)?;
+        Ok(ValueLocation::temp(destination))
+    }
+
+    /// §15.7.14 — Default derived class constructor with field initializer support.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    fn compile_default_derived_class_constructor_with_fields(
+        &mut self,
+        class_name: &str,
+        has_instance_fields: bool,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let reserved = module.reserve_function();
@@ -997,6 +1685,7 @@ impl<'a> FunctionCompiler<'a> {
         );
         compiler.strict_mode = true;
         compiler.is_derived_constructor = true;
+        compiler.has_instance_fields = has_instance_fields;
         compiler.declare_parameters(&[])?;
         compiler.declare_this_binding()?;
         compiler.reserve_arguments_binding_slot()?;
@@ -1017,6 +1706,14 @@ impl<'a> FunctionCompiler<'a> {
                 .instructions
                 .push(Instruction::move_(this_register, forwarded.register));
         }
+
+        // For derived class with fields: emit RunClassFieldInitializer after super().
+        if has_instance_fields {
+            compiler
+                .instructions
+                .push(Instruction::run_class_field_initializer());
+        }
+
         compiler.release(forwarded);
         compiler.emit_implicit_return()?;
         let compiled = compiler.finish(reserved, 0, Some(class_name))?;

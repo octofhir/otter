@@ -142,6 +142,7 @@ impl From<ObjectError> for InterpreterError {
             ObjectError::InvalidIndex => Self::InvalidHeapSlot,
             ObjectError::InvalidKind => Self::InvalidHeapValueKind,
             ObjectError::InvalidArrayLength => Self::NativeCall("invalid array length".into()),
+            ObjectError::TypeError(msg) => Self::TypeError(msg),
         }
     }
 }
@@ -528,6 +529,9 @@ pub struct RuntimeState {
     symbol_descriptions: BTreeMap<u32, Option<Box<str>>>,
     global_symbol_registry: BTreeMap<Box<str>, u32>,
     global_symbol_registry_reverse: BTreeMap<u32, Box<str>>,
+    /// §6.2.12 Monotonic counter for unique private class identifiers.
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    next_class_id: u64,
 }
 
 impl RuntimeState {
@@ -569,6 +573,7 @@ impl RuntimeState {
             symbol_descriptions,
             global_symbol_registry: BTreeMap::new(),
             global_symbol_registry_reverse: BTreeMap::new(),
+            next_class_id: 1,
         }
     }
 
@@ -592,6 +597,14 @@ impl RuntimeState {
     /// Returns the mutable object heap.
     pub fn objects_mut(&mut self) -> &mut ObjectHeap {
         &mut self.objects
+    }
+
+    /// §6.2.12 — Allocates a new unique class identifier for private name resolution.
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    pub fn alloc_class_id(&mut self) -> u64 {
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        id
     }
 
     /// Returns the runtime-wide property-name registry.
@@ -5328,6 +5341,451 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §15.7.14 DefineField — define own data property with named key.
+            // Spec: <https://tc39.es/ecma262/#sec-definefield>
+            Opcode::DefineField => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(object)?;
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let property = Self::resolve_property_name(function, runtime, instruction.c())?;
+                let desc = crate::object::PropertyDescriptor::data(
+                    Some(value),
+                    Some(true), // writable
+                    Some(true), // enumerable
+                    Some(true), // configurable
+                );
+                let defined = runtime
+                    .objects
+                    .define_own_property_from_descriptor(handle, property, desc)?;
+                if !defined {
+                    return Err(InterpreterError::TypeError(
+                        "class field define failed".into(),
+                    ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 DefineField — computed key variant.
+            // Spec: <https://tc39.es/ecma262/#sec-definefield>
+            Opcode::DefineComputedField => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(object)?;
+                let key = activation.read_bytecode_register(function, instruction.b())?;
+                let value = activation.read_bytecode_register(function, instruction.c())?;
+                let property = runtime.computed_property_name(key)?;
+                let desc = crate::object::PropertyDescriptor::data(
+                    Some(value),
+                    Some(true), // writable
+                    Some(true), // enumerable
+                    Some(true), // configurable
+                );
+                let defined = runtime
+                    .objects
+                    .define_own_property_from_descriptor(handle, property, desc)?;
+                if !defined {
+                    return Err(InterpreterError::TypeError(
+                        "class computed field define failed".into(),
+                    ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 RunClassFieldInitializer — InitializeInstanceElements.
+            // Step 1: copy [[PrivateMethods]] from constructor to instance.
+            // Step 2: invoke the field initializer with `this` as receiver.
+            // Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+            Opcode::RunClassFieldInitializer => {
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+
+                // Step 1: Copy private methods from constructor to instance.
+                let private_methods = runtime.objects.closure_private_methods(closure)?;
+                if !private_methods.is_empty() {
+                    let this_value = activation.receiver(function)?;
+                    let this_handle = this_value
+                        .as_object_handle()
+                        .map(ObjectHandle)
+                        .ok_or(InterpreterError::InvalidObjectValue)?;
+                    for (key, element) in private_methods {
+                        runtime
+                            .objects
+                            .private_method_or_accessor_add(this_handle, key, element)?;
+                    }
+                }
+
+                // Step 2: Run field initializer (handles both public and private fields).
+                let initializer = runtime.objects.closure_field_initializer(closure)?;
+                if let Some(init_handle) = initializer {
+                    let this_value = activation.receiver(function)?;
+                    match Self::call_function(runtime, module, init_handle, this_value, &[]) {
+                        Ok(_) => {
+                            activation.advance();
+                            Ok(StepOutcome::Continue)
+                        }
+                        Err(InterpreterError::UncaughtThrow(value)) => {
+                            Ok(StepOutcome::Throw(value))
+                        }
+                        Err(other) => Err(other),
+                    }
+                } else {
+                    activation.advance();
+                    Ok(StepOutcome::Continue)
+                }
+            }
+            // §15.7.14 SetClassFieldInitializer — store initializer on constructor.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+            Opcode::SetClassFieldInitializer => {
+                let constructor = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let initializer = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                runtime
+                    .objects
+                    .set_closure_field_initializer(constructor, initializer)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // ── Private Class Elements ─────────────────────────────────────
+
+            // §6.2.12 AllocClassId — allocate unique class_id on a closure.
+            // Spec: <https://tc39.es/ecma262/#sec-private-names>
+            Opcode::AllocClassId => {
+                let closure = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let id = runtime.alloc_class_id();
+                runtime.objects.set_closure_class_id(closure, id)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §6.2.12 CopyClassId — copy class_id between closures.
+            // Spec: <https://tc39.es/ecma262/#sec-private-names>
+            Opcode::CopyClassId => {
+                let target = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let source = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let id = runtime.objects.closure_class_id(source)?;
+                runtime.objects.set_closure_class_id(target, id)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §7.3.31 DefinePrivateField — PrivateFieldAdd.
+            // Spec: <https://tc39.es/ecma262/#sec-privatefieldadd>
+            Opcode::DefinePrivateField => {
+                let obj_handle = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let class_id =
+                    Self::resolve_class_id(activation, runtime, Some(obj_handle))?;
+                let key = Self::resolve_private_name_key(
+                    function,
+                    runtime,
+                    instruction.c(),
+                    class_id,
+                )?;
+                runtime.objects.private_field_add(obj_handle, key, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §7.3.32 GetPrivateField — PrivateGet.
+            // Spec: <https://tc39.es/ecma262/#sec-privateget>
+            Opcode::GetPrivateField => {
+                let object = activation.read_bytecode_register(function, instruction.b())?;
+                let obj_handle = object
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let class_id = runtime.objects.closure_class_id(closure)?;
+                let key = Self::resolve_private_name_key(
+                    function,
+                    runtime,
+                    instruction.c(),
+                    class_id,
+                )?;
+                // Check element kind to handle accessor getters.
+                let element = runtime.objects.private_elements_ref(obj_handle, &key);
+                match element {
+                    Some(crate::object::PrivateElement::Accessor {
+                        getter: Some(getter_handle),
+                        ..
+                    }) => {
+                        let getter_handle = *getter_handle;
+                        match Self::call_function(
+                            runtime,
+                            module,
+                            getter_handle,
+                            object,
+                            &[],
+                        ) {
+                            Ok(result) => {
+                                activation.write_bytecode_register(
+                                    function,
+                                    instruction.a(),
+                                    result,
+                                )?;
+                            }
+                            Err(InterpreterError::UncaughtThrow(value)) => {
+                                return Ok(StepOutcome::Throw(value));
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    Some(crate::object::PrivateElement::Accessor {
+                        getter: None, ..
+                    }) => {
+                        return Err(InterpreterError::TypeError(
+                            "private accessor has no getter".into(),
+                        ));
+                    }
+                    _ => {
+                        let result = runtime.objects.private_get(obj_handle, &key)?;
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            result,
+                        )?;
+                    }
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §7.3.33 SetPrivateField — PrivateSet.
+            // Spec: <https://tc39.es/ecma262/#sec-privateset>
+            Opcode::SetPrivateField => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let obj_handle = object
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let value = activation.read_bytecode_register(function, instruction.b())?;
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let class_id = runtime.objects.closure_class_id(closure)?;
+                let key = Self::resolve_private_name_key(
+                    function,
+                    runtime,
+                    instruction.c(),
+                    class_id,
+                )?;
+                match runtime.objects.private_set(obj_handle, &key, value)? {
+                    None => {} // Field set succeeded directly.
+                    Some(setter_handle) => {
+                        match Self::call_function(
+                            runtime,
+                            module,
+                            setter_handle,
+                            object,
+                            &[value],
+                        ) {
+                            Ok(_) => {}
+                            Err(InterpreterError::UncaughtThrow(v)) => {
+                                return Ok(StepOutcome::Throw(v));
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 DefinePrivateMethod — static private method on object.
+            // Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
+            Opcode::DefinePrivateMethod => {
+                let object = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let method = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id =
+                    Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.private_method_or_accessor_add(
+                    object, key, crate::object::PrivateElement::Method(method),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 DefinePrivateGetter — static private getter on object.
+            Opcode::DefinePrivateGetter => {
+                let object = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let getter = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id =
+                    Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.private_method_or_accessor_add(
+                    object, key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: Some(getter), setter: None,
+                    },
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 DefinePrivateSetter — static private setter on object.
+            Opcode::DefinePrivateSetter => {
+                let object = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let setter = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id =
+                    Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.private_method_or_accessor_add(
+                    object, key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: None, setter: Some(setter),
+                    },
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 PushPrivateMethod — instance private method on constructor.
+            Opcode::PushPrivateMethod => {
+                let constructor = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let method = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id = runtime.objects.closure_class_id(constructor)?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.push_private_method(
+                    constructor, key, crate::object::PrivateElement::Method(method),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 PushPrivateGetter — instance private getter on constructor.
+            Opcode::PushPrivateGetter => {
+                let constructor = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let getter = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id = runtime.objects.closure_class_id(constructor)?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.push_private_method(
+                    constructor, key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: Some(getter), setter: None,
+                    },
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 PushPrivateSetter — instance private setter on constructor.
+            Opcode::PushPrivateSetter => {
+                let constructor = activation
+                    .read_bytecode_register(function, instruction.a())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let setter = activation
+                    .read_bytecode_register(function, instruction.b())?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let class_id = runtime.objects.closure_class_id(constructor)?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                runtime.objects.push_private_method(
+                    constructor, key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: None, setter: Some(setter),
+                    },
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.10.1 InPrivate — `#field in obj` brand check.
+            Opcode::InPrivate => {
+                let object = activation.read_bytecode_register(function, instruction.b())?;
+                let obj_handle = object
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or_else(|| {
+                        InterpreterError::TypeError(
+                            "right-hand side of 'in' should be an object".into(),
+                        )
+                    })?;
+                let closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let class_id = runtime.objects.closure_class_id(closure)?;
+                let key = Self::resolve_private_name_key(
+                    function, runtime, instruction.c(), class_id,
+                )?;
+                let found = runtime.objects.private_element_find(obj_handle, &key)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_bool(found),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::CopyDataProperties | Opcode::CopyDataPropertiesExcept => {
                 let target = activation.read_bytecode_register(function, instruction.a())?;
                 let target_handle = runtime.property_base_object_handle(target)?;
@@ -6220,15 +6678,15 @@ impl Interpreter {
                     .ok_or(InterpreterError::TypeError("Value is not iterable".into()))?;
 
                 // Step 1: Try Symbol.asyncIterator first.
-                let sym_async = runtime.intern_symbol_property_name(
-                    super::WellKnownSymbol::AsyncIterator.stable_id(),
-                );
-                let async_method = runtime.ordinary_get(handle, sym_async, base).map_err(
-                    |e| match e {
-                        VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
-                        VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-                    },
-                )?;
+                let sym_async = runtime
+                    .intern_symbol_property_name(super::WellKnownSymbol::AsyncIterator.stable_id());
+                let async_method =
+                    runtime
+                        .ordinary_get(handle, sym_async, base)
+                        .map_err(|e| match e {
+                            VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                            VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                        })?;
 
                 let iterator = if async_method != RegisterValue::undefined()
                     && async_method != RegisterValue::null()
@@ -6247,12 +6705,8 @@ impl Interpreter {
                         runtime
                             .call_callable(callable, base, &[])
                             .map_err(|e| match e {
-                                VmNativeCallError::Thrown(v) => {
-                                    InterpreterError::UncaughtThrow(v)
-                                }
-                                VmNativeCallError::Internal(m) => {
-                                    InterpreterError::NativeCall(m)
-                                }
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
                             })?;
                     iter_obj.as_object_handle().map(ObjectHandle).ok_or(
                         InterpreterError::TypeError(
@@ -6265,42 +6719,30 @@ impl Interpreter {
                     // because the compiled for-await-of loop accesses .next() via
                     // property lookup. Internal iterators from alloc_iterator have
                     // prototype: None and no protocol-accessible .next() method.
-                    let sym_iterator = runtime.intern_symbol_property_name(
-                        super::WellKnownSymbol::Iterator.stable_id(),
-                    );
+                    let sym_iterator = runtime
+                        .intern_symbol_property_name(super::WellKnownSymbol::Iterator.stable_id());
                     let method = runtime
                         .ordinary_get(handle, sym_iterator, base)
                         .map_err(|e| match e {
-                            VmNativeCallError::Thrown(v) => {
-                                InterpreterError::UncaughtThrow(v)
-                            }
-                            VmNativeCallError::Internal(m) => {
-                                InterpreterError::NativeCall(m)
-                            }
+                            VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                            VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
                         })?;
                     let callable = method
                         .as_object_handle()
                         .map(ObjectHandle)
                         .filter(|h| runtime.objects.is_callable(*h))
                         .ok_or_else(|| {
-                            InterpreterError::TypeError(
-                                "Value is not async iterable".into(),
-                            )
+                            InterpreterError::TypeError("Value is not async iterable".into())
                         })?;
-                    let iter_obj = runtime
-                        .call_callable(callable, base, &[])
-                        .map_err(|e| match e {
-                            VmNativeCallError::Thrown(v) => {
-                                InterpreterError::UncaughtThrow(v)
-                            }
-                            VmNativeCallError::Internal(m) => {
-                                InterpreterError::NativeCall(m)
-                            }
-                        })?;
+                    let iter_obj =
+                        runtime
+                            .call_callable(callable, base, &[])
+                            .map_err(|e| match e {
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                            })?;
                     iter_obj.as_object_handle().map(ObjectHandle).ok_or(
-                        InterpreterError::TypeError(
-                            "Symbol.iterator must return an object".into(),
-                        ),
+                        InterpreterError::TypeError("Symbol.iterator must return an object".into()),
                     )?
                 };
 
@@ -6340,26 +6782,24 @@ impl Interpreter {
 
                 // Fast path: internal iterators for arrays and strings.
                 match runtime.objects.alloc_iterator(src_handle) {
-                    Ok(iterator) => {
-                        loop {
-                            let step = runtime.iterator_next(iterator)?;
-                            if step.is_done() {
-                                break;
-                            }
-                            runtime.objects.push_element(target_array, step.value())?;
+                    Ok(iterator) => loop {
+                        let step = runtime.iterator_next(iterator)?;
+                        if step.is_done() {
+                            break;
                         }
-                    }
+                        runtime.objects.push_element(target_array, step.value())?;
+                    },
                     Err(ObjectError::InvalidKind) => {
                         // Slow path: protocol-based iterator (Symbol.iterator).
                         let sym_iterator = runtime.intern_symbol_property_name(
                             super::WellKnownSymbol::Iterator.stable_id(),
                         );
-                        let method = runtime.ordinary_get(src_handle, sym_iterator, src).map_err(
-                            |e| match e {
+                        let method = runtime
+                            .ordinary_get(src_handle, sym_iterator, src)
+                            .map_err(|e| match e {
                                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-                            },
-                        )?;
+                            })?;
                         let callable = method
                             .as_object_handle()
                             .map(ObjectHandle)
@@ -6417,12 +6857,12 @@ impl Interpreter {
                                         InterpreterError::NativeCall(m)
                                     }
                                 })?;
-                            let result_handle =
-                                result_obj.as_object_handle().map(ObjectHandle).ok_or(
-                                    InterpreterError::TypeError(
-                                        "Iterator .next() must return an object".into(),
-                                    ),
-                                )?;
+                            let result_handle = result_obj
+                                .as_object_handle()
+                                .map(ObjectHandle)
+                                .ok_or(InterpreterError::TypeError(
+                                    "Iterator .next() must return an object".into(),
+                                ))?;
                             let done_val = runtime
                                 .ordinary_get(result_handle, done_prop, result_obj)
                                 .unwrap_or_else(|_| RegisterValue::from_bool(false));
@@ -6470,9 +6910,13 @@ impl Interpreter {
                 // Extract arguments from the array built by the compiler.
                 let args_array_handle =
                     Self::read_object_handle(activation, function, instruction.c())?;
-                let arguments = runtime.objects.array_elements(args_array_handle).map_err(
-                    |_| InterpreterError::TypeError("Spread arguments must be an array".into()),
-                )?;
+                let arguments =
+                    runtime
+                        .objects
+                        .array_elements(args_array_handle)
+                        .map_err(|_| {
+                            InterpreterError::TypeError("Spread arguments must be an array".into())
+                        })?;
 
                 let result = if call.flags().is_construct() {
                     // §13.3.5.1.1 EvaluateNew — construct with spread args.
@@ -6481,14 +6925,14 @@ impl Interpreter {
                     // §10.5.13 [[Construct]] for Proxy, §10.2.2 for ordinary,
                     // host construct for HostFunction.
                     if runtime.is_proxy(callee) {
-                        runtime.proxy_construct(callee, &arguments, callee).map_err(
-                            |e| match e {
+                        runtime
+                            .proxy_construct(callee, &arguments, callee)
+                            .map_err(|e| match e {
                                 InterpreterError::UncaughtThrow(v) => {
                                     InterpreterError::UncaughtThrow(v)
                                 }
                                 other => other,
-                            },
-                        )
+                            })
                     } else if !runtime.is_constructible(callee) {
                         let error = runtime.alloc_type_error("Value is not a constructor")?;
                         Err(InterpreterError::UncaughtThrow(
@@ -6498,12 +6942,8 @@ impl Interpreter {
                         runtime
                             .construct_callable(callee, &arguments, callee)
                             .map_err(|e| match e {
-                                VmNativeCallError::Thrown(v) => {
-                                    InterpreterError::UncaughtThrow(v)
-                                }
-                                VmNativeCallError::Internal(m) => {
-                                    InterpreterError::NativeCall(m)
-                                }
+                                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
                             })
                     }
                 } else {
@@ -6519,14 +6959,14 @@ impl Interpreter {
 
                     // §10.5.12 [[Call]] for Proxy.
                     if runtime.is_proxy(callee) {
-                        runtime.proxy_apply(callee, receiver, &arguments).map_err(
-                            |e| match e {
+                        runtime
+                            .proxy_apply(callee, receiver, &arguments)
+                            .map_err(|e| match e {
                                 InterpreterError::UncaughtThrow(v) => {
                                     InterpreterError::UncaughtThrow(v)
                                 }
                                 other => other,
-                            },
-                        )
+                            })
                     } else {
                         // call_function handles: Closure (ordinary, async, generator,
                         // class constructor guard), BoundFunction, HostFunction,
@@ -6543,9 +6983,7 @@ impl Interpreter {
                         activation.advance();
                         Ok(StepOutcome::Continue)
                     }
-                    Err(InterpreterError::UncaughtThrow(value)) => {
-                        Ok(StepOutcome::Throw(value))
-                    }
+                    Err(InterpreterError::UncaughtThrow(value)) => Ok(StepOutcome::Throw(value)),
                     Err(error) => Err(error),
                 }
             }
@@ -7058,9 +7496,13 @@ impl Interpreter {
 
                 let args_array_handle =
                     Self::read_object_handle(activation, function, instruction.b())?;
-                let arguments = runtime.objects.array_elements(args_array_handle).map_err(
-                    |_| InterpreterError::TypeError("Spread arguments must be an array".into()),
-                )?;
+                let arguments =
+                    runtime
+                        .objects
+                        .array_elements(args_array_handle)
+                        .map_err(|_| {
+                            InterpreterError::TypeError("Spread arguments must be an array".into())
+                        })?;
 
                 match runtime.construct_callable(super_ctor, &arguments, new_target) {
                     Ok(this_value) => {
@@ -7253,6 +7695,51 @@ impl Interpreter {
             .get(PropertyNameId(raw_id))
             .ok_or(InterpreterError::UnknownPropertyName)?;
         Ok(runtime.intern_property_name(property_name))
+    }
+
+    /// §6.2.12 — Resolve a property-name operand into a PrivateNameKey by combining it
+    /// with the current closure's class_id.
+    /// Resolves the class_id for a private member operation.
+    ///
+    /// Tries the current closure first; if unavailable or class_id is 0, falls
+    /// back to reading class_id from a fallback object (typically the constructor).
+    /// This is needed because static private element definitions run in the outer
+    /// function context, not inside the constructor closure.
+    fn resolve_class_id(
+        activation: &Activation,
+        runtime: &RuntimeState,
+        fallback_object: Option<ObjectHandle>,
+    ) -> Result<u64, InterpreterError> {
+        if let Some(closure) = activation.closure_handle() {
+            let id = runtime.objects.closure_class_id(closure).unwrap_or(0);
+            if id != 0 {
+                return Ok(id);
+            }
+        }
+        // Fallback: read class_id from the target object (constructor).
+        if let Some(obj) = fallback_object {
+            let id = runtime.objects.closure_class_id(obj).unwrap_or(0);
+            if id != 0 {
+                return Ok(id);
+            }
+        }
+        Err(InterpreterError::MissingClosureContext)
+    }
+
+    fn resolve_private_name_key(
+        function: &Function,
+        _runtime: &mut RuntimeState,
+        raw_id: RegisterIndex,
+        class_id: u64,
+    ) -> Result<crate::object::PrivateNameKey, InterpreterError> {
+        let property_name_str = function
+            .property_names()
+            .get(PropertyNameId(raw_id))
+            .ok_or(InterpreterError::UnknownPropertyName)?;
+        Ok(crate::object::PrivateNameKey {
+            class_id,
+            description: property_name_str.into(),
+        })
     }
 
     fn resolve_string_literal(

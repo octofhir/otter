@@ -251,6 +251,111 @@ pub enum Opcode {
     /// constant pool entry at `constant_index` and stores the handle in `dst`.
     /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
     LoadBigInt = 0x62,
+
+    /// §15.7.14 DefineField — define an own data property on an object.
+    /// `DefineField obj, value, property_name_id`
+    /// Used for class field initialization with static (non-computed) keys.
+    /// Creates a property with attributes { writable: true, enumerable: true, configurable: true }.
+    /// Unlike SetProperty, this uses [[DefineOwnProperty]] and does NOT trigger inherited setters.
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    DefineField = 0x63,
+
+    /// §15.7.14 DefineField — computed key variant.
+    /// `DefineComputedField obj, key, value`
+    /// Same semantics as DefineField but the property key is read from a register.
+    /// The key is coerced to a property name at runtime (ToString/ToPropertyKey).
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    DefineComputedField = 0x64,
+
+    /// §15.7.14 RunClassFieldInitializer — invoke the class's instance
+    /// field initializer function with `this` as receiver.
+    /// `RunClassFieldInitializer` (no operands)
+    /// Reads the current closure's field_initializer internal slot. If present,
+    /// calls it as a function with the current `this` value as receiver.
+    /// Emitted at the start of base class constructors and after super() in derived constructors.
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    RunClassFieldInitializer = 0x65,
+
+    /// §15.7.14 SetClassFieldInitializer — store a field initializer closure
+    /// on a class constructor.
+    /// `SetClassFieldInitializer constructor, initializer`
+    /// Stores the initializer closure on the constructor's internal [[Fields]] slot.
+    /// Emitted during class definition after compiling both constructor and initializer.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    SetClassFieldInitializer = 0x66,
+
+    // ── Private Class Elements (§15.7.14, §6.2.12, §7.3.31-33) ────────
+
+    /// §6.2.12 AllocClassId — allocate a unique class_id and store it on a closure.
+    /// `AllocClassId closure`
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    AllocClassId = 0x67,
+
+    /// §6.2.12 CopyClassId — copy class_id from one closure to another.
+    /// `CopyClassId target_closure, source_closure`
+    /// Used to propagate class identity to method and initializer closures.
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    CopyClassId = 0x68,
+
+    /// §7.3.31 DefinePrivateField — add a private field to an object's `[[PrivateElements]]`.
+    /// `DefinePrivateField obj, value, property_name_id`
+    /// The class_id is read from the current closure's stored class identity.
+    /// Spec: <https://tc39.es/ecma262/#sec-privatefieldadd>
+    DefinePrivateField = 0x69,
+
+    /// §7.3.32 GetPrivateField — read a private field, method, or accessor getter.
+    /// `GetPrivateField dst, obj, property_name_id`
+    /// For accessor getters, the returned value is the getter function handle
+    /// (the interpreter must call it with `obj` as receiver).
+    /// Spec: <https://tc39.es/ecma262/#sec-privateget>
+    GetPrivateField = 0x6A,
+
+    /// §7.3.33 SetPrivateField — write a private field or invoke accessor setter.
+    /// `SetPrivateField obj, value, property_name_id`
+    /// For accessor setters, the interpreter calls the setter with `obj` as receiver.
+    /// Methods throw TypeError (read-only).
+    /// Spec: <https://tc39.es/ecma262/#sec-privateset>
+    SetPrivateField = 0x6B,
+
+    /// §15.7.14 DefinePrivateMethod — add a private method to object's `[[PrivateElements]]`.
+    /// `DefinePrivateMethod obj, method, property_name_id`
+    /// Used for static private methods (stored directly on the constructor).
+    /// Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
+    DefinePrivateMethod = 0x6C,
+
+    /// §15.7.14 DefinePrivateGetter — add a private getter to object's `[[PrivateElements]]`.
+    /// `DefinePrivateGetter obj, getter, property_name_id`
+    /// Used for static private accessors.
+    /// Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
+    DefinePrivateGetter = 0x6D,
+
+    /// §15.7.14 DefinePrivateSetter — add a private setter to object's `[[PrivateElements]]`.
+    /// `DefinePrivateSetter obj, setter, property_name_id`
+    /// Used for static private accessors.
+    /// Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
+    DefinePrivateSetter = 0x6E,
+
+    /// §15.7.14 PushPrivateMethod — push a private method to constructor's `[[PrivateMethods]]`.
+    /// `PushPrivateMethod constructor, method, property_name_id`
+    /// Stored for later copying to instances during InitializeInstanceElements.
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    PushPrivateMethod = 0x6F,
+
+    /// §15.7.14 PushPrivateGetter — push a private getter to constructor's `[[PrivateMethods]]`.
+    /// `PushPrivateGetter constructor, getter, property_name_id`
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    PushPrivateGetter = 0x70,
+
+    /// §15.7.14 PushPrivateSetter — push a private setter to constructor's `[[PrivateMethods]]`.
+    /// `PushPrivateSetter constructor, setter, property_name_id`
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    PushPrivateSetter = 0x71,
+
+    /// §13.10.1 `in` operator for private names — `#field in obj`.
+    /// `InPrivate dst, obj, property_name_id`
+    /// Sets `dst` to `true` if the object has the private element, `false` otherwise.
+    /// Spec: <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+    InPrivate = 0x72,
 }
 
 impl Opcode {
@@ -342,6 +447,22 @@ impl Opcode {
             0x60 => Some(Self::Yield),
             0x61 => Some(Self::NewRegExp),
             0x62 => Some(Self::LoadBigInt),
+            0x63 => Some(Self::DefineField),
+            0x64 => Some(Self::DefineComputedField),
+            0x65 => Some(Self::RunClassFieldInitializer),
+            0x66 => Some(Self::SetClassFieldInitializer),
+            0x67 => Some(Self::AllocClassId),
+            0x68 => Some(Self::CopyClassId),
+            0x69 => Some(Self::DefinePrivateField),
+            0x6A => Some(Self::GetPrivateField),
+            0x6B => Some(Self::SetPrivateField),
+            0x6C => Some(Self::DefinePrivateMethod),
+            0x6D => Some(Self::DefinePrivateGetter),
+            0x6E => Some(Self::DefinePrivateSetter),
+            0x6F => Some(Self::PushPrivateMethod),
+            0x70 => Some(Self::PushPrivateGetter),
+            0x71 => Some(Self::PushPrivateSetter),
+            0x72 => Some(Self::InPrivate),
             _ => None,
         }
     }
@@ -952,21 +1073,25 @@ impl Instruction {
     /// Append `value` to `target_array`.
     /// `ArrayPush target_array, value`
     #[must_use]
-    pub const fn array_push(
-        target_array: BytecodeRegister,
-        value: BytecodeRegister,
-    ) -> Self {
-        Self::encode_abc(Opcode::ArrayPush, target_array, value, BytecodeRegister::new(0))
+    pub const fn array_push(target_array: BytecodeRegister, value: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::ArrayPush,
+            target_array,
+            value,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Iterate `src` and append all elements to `target_array`.
     /// `SpreadIntoArray target_array, src`
     #[must_use]
-    pub const fn spread_into_array(
-        target_array: BytecodeRegister,
-        src: BytecodeRegister,
-    ) -> Self {
-        Self::encode_abc(Opcode::SpreadIntoArray, target_array, src, BytecodeRegister::new(0))
+    pub const fn spread_into_array(target_array: BytecodeRegister, src: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::SpreadIntoArray,
+            target_array,
+            src,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Call `callee` with arguments from `args_array`.
@@ -983,11 +1108,13 @@ impl Instruction {
     /// Invoke `super(...)` with arguments from an array register.
     /// `CallSuperSpread dst, args_array`
     #[must_use]
-    pub const fn call_super_spread(
-        dst: BytecodeRegister,
-        args_array: BytecodeRegister,
-    ) -> Self {
-        Self::encode_abc(Opcode::CallSuperSpread, dst, args_array, BytecodeRegister::new(0))
+    pub const fn call_super_spread(dst: BytecodeRegister, args_array: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::CallSuperSpread,
+            dst,
+            args_array,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Encodes one iterator step.
@@ -1164,6 +1291,228 @@ impl Instruction {
     #[must_use]
     pub const fn yield_(dst: BytecodeRegister, value: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Yield, dst, value, BytecodeRegister::new(0))
+    }
+
+    /// §15.7.14 DefineField — define an own data property with a named key.
+    /// `DefineField obj, value, property_name_id`
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    #[must_use]
+    pub const fn define_field(
+        object: BytecodeRegister,
+        value: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineField,
+            object,
+            value,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 DefineField — define an own data property with a computed key.
+    /// `DefineComputedField obj, key, value`
+    /// Spec: <https://tc39.es/ecma262/#sec-definefield>
+    #[must_use]
+    pub const fn define_computed_field(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        value: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineComputedField, object, key, value)
+    }
+
+    /// §15.7.14 RunClassFieldInitializer — invoke the class field initializer.
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    #[must_use]
+    pub const fn run_class_field_initializer() -> Self {
+        Self::encode_abc(
+            Opcode::RunClassFieldInitializer,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §15.7.14 SetClassFieldInitializer — store initializer closure on constructor.
+    /// `SetClassFieldInitializer constructor, initializer`
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    #[must_use]
+    pub const fn set_class_field_initializer(
+        constructor: BytecodeRegister,
+        initializer: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetClassFieldInitializer,
+            constructor,
+            initializer,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    // ── Private Class Elements ─────────────────────────────────────────
+
+    /// §6.2.12 AllocClassId — allocate unique class_id and store on closure.
+    pub const fn alloc_class_id(closure: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::AllocClassId,
+            closure,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §6.2.12 CopyClassId — copy class_id from source closure to target closure.
+    pub const fn copy_class_id(
+        target: BytecodeRegister,
+        source: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::CopyClassId,
+            target,
+            source,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §7.3.31 DefinePrivateField — add private field to object.
+    pub const fn define_private_field(
+        object: BytecodeRegister,
+        value: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefinePrivateField,
+            object,
+            value,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §7.3.32 GetPrivateField — read private element from object.
+    pub const fn get_private_field(
+        dst: BytecodeRegister,
+        object: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::GetPrivateField,
+            dst,
+            object,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §7.3.33 SetPrivateField — write private field on object.
+    pub const fn set_private_field(
+        object: BytecodeRegister,
+        value: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetPrivateField,
+            object,
+            value,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 DefinePrivateMethod — add method to object's `[[PrivateElements]]`.
+    pub const fn define_private_method(
+        object: BytecodeRegister,
+        method: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefinePrivateMethod,
+            object,
+            method,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 DefinePrivateGetter — add getter to object's `[[PrivateElements]]`.
+    pub const fn define_private_getter(
+        object: BytecodeRegister,
+        getter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefinePrivateGetter,
+            object,
+            getter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 DefinePrivateSetter — add setter to object's `[[PrivateElements]]`.
+    pub const fn define_private_setter(
+        object: BytecodeRegister,
+        setter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefinePrivateSetter,
+            object,
+            setter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 PushPrivateMethod — push method to constructor's `[[PrivateMethods]]`.
+    pub const fn push_private_method(
+        constructor: BytecodeRegister,
+        method: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::PushPrivateMethod,
+            constructor,
+            method,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 PushPrivateGetter — push getter to constructor's `[[PrivateMethods]]`.
+    pub const fn push_private_getter(
+        constructor: BytecodeRegister,
+        getter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::PushPrivateGetter,
+            constructor,
+            getter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §15.7.14 PushPrivateSetter — push setter to constructor's `[[PrivateMethods]]`.
+    pub const fn push_private_setter(
+        constructor: BytecodeRegister,
+        setter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::PushPrivateSetter,
+            constructor,
+            setter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// §13.10.1 InPrivate — `#field in obj` brand check.
+    pub const fn in_private(
+        dst: BytecodeRegister,
+        object: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::InPrivate,
+            dst,
+            object,
+            BytecodeRegister::new(property.0),
+        )
     }
 
     /// Returns the decoded opcode.

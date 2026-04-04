@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use oxc_ast::ast::{
     Argument, AssignmentOperator, AssignmentTarget, AssignmentTargetMaybeDefault,
-    AssignmentTargetProperty, BinaryOperator, BindingPattern, Class, ClassElement,
-    ComputedMemberExpression, Expression, ForStatementLeft, Function, LogicalOperator,
-    MethodDefinitionKind, ObjectPropertyKind, Program as AstProgram, PropertyKey, PropertyKind,
-    SimpleAssignmentTarget, Statement as AstStatement, StaticMemberExpression, UnaryOperator,
-    UpdateOperator, VariableDeclarationKind,
+    AssignmentTargetProperty, BinaryOperator, BindingPattern, Class, ComputedMemberExpression,
+    Expression, ForStatementLeft, Function, LogicalOperator, MethodDefinitionKind,
+    ObjectPropertyKind, Program as AstProgram, PropertyKey, PropertyKind, SimpleAssignmentTarget,
+    Statement as AstStatement, StaticMemberExpression, UnaryOperator, UpdateOperator,
+    VariableDeclarationKind,
 };
 
 use crate::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset, Opcode};

@@ -12,6 +12,34 @@ use crate::payload::NativePayloadId;
 use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::value::RegisterValue;
 
+/// §6.2.12 Private Name — uniquely identifies a private class element.
+/// Each class evaluation produces a unique `class_id`; combined with the
+/// element description it forms a globally unique key for `[[PrivateElements]]`.
+/// Spec: <https://tc39.es/ecma262/#sec-private-names>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateNameKey {
+    /// Unique identifier per class evaluation (monotonic counter).
+    pub class_id: u64,
+    /// The description string without the `#` prefix (e.g. `"x"` for `#x`).
+    pub description: Box<str>,
+}
+
+/// §6.2.10 PrivateElement — a private field, method, or accessor stored
+/// in an object's `[[PrivateElements]]` internal slot.
+/// Spec: <https://tc39.es/ecma262/#sec-privateelement-specification-type>
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrivateElement {
+    /// A private instance or static field value.
+    Field(RegisterValue),
+    /// A private method (not writable via PrivateSet).
+    Method(ObjectHandle),
+    /// A private accessor pair.
+    Accessor {
+        getter: Option<ObjectHandle>,
+        setter: Option<ObjectHandle>,
+    },
+}
+
 /// Maximum prototype chain depth before aborting a lookup (defense in depth).
 const MAX_PROTOTYPE_DEPTH: usize = 45;
 
@@ -95,7 +123,7 @@ impl PropertyLookup {
 }
 
 /// Error produced by the minimal object heap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectError {
     /// The object handle does not exist in the current heap.
     InvalidHandle,
@@ -105,6 +133,8 @@ pub enum ObjectError {
     InvalidIndex,
     /// The requested array length is not a valid ECMAScript array length.
     InvalidArrayLength,
+    /// A TypeError-level semantic violation (e.g. private name access).
+    TypeError(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -772,6 +802,9 @@ enum HeapValue {
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
+        /// §9.1 `[[PrivateElements]]` internal slot.
+        /// Spec: <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
+        private_elements: Vec<(PrivateNameKey, PrivateElement)>,
     },
     NativeObject {
         prototype: Option<ObjectHandle>,
@@ -807,6 +840,23 @@ enum HeapValue {
         module: Module,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
+        /// §15.7.14 — class field initializer closure, if this is a class constructor.
+        /// Stored during ClassDefinitionEvaluation, invoked by RunClassFieldInitializer.
+        /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        field_initializer: Option<ObjectHandle>,
+        /// §6.2.12 — unique class identity for private name resolution.
+        /// Non-zero when this closure is a class constructor or a method
+        /// that accesses private names.
+        /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+        class_id: u64,
+        /// §15.7.14 `[[PrivateMethods]]` — private methods/accessors to copy
+        /// to instances during InitializeInstanceElements.
+        /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+        private_methods: Vec<(PrivateNameKey, PrivateElement)>,
+        /// §9.1 `[[PrivateElements]]` — private elements on the closure itself
+        /// (used for static private fields/methods/accessors on constructors).
+        /// Spec: <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
+        private_elements: Vec<(PrivateNameKey, PrivateElement)>,
     },
     HostFunction {
         function: HostFunctionId,
@@ -1216,13 +1266,45 @@ fn trace_property_value(pv: &PropertyValue, visitor: &mut dyn FnMut(GcHandle)) {
     }
 }
 
+/// Visit all GC pointers in a `[[PrivateElements]]` or `[[PrivateMethods]]` list.
+fn trace_private_elements(
+    elements: &[(PrivateNameKey, PrivateElement)],
+    visitor: &mut dyn FnMut(GcHandle),
+) {
+    for (_, element) in elements {
+        match element {
+            PrivateElement::Field(value) => trace_register_value(*value, visitor),
+            PrivateElement::Method(handle) => trace_handle(*handle, visitor),
+            PrivateElement::Accessor { getter, setter } => {
+                if let Some(g) = getter {
+                    trace_handle(*g, visitor);
+                }
+                if let Some(s) = setter {
+                    trace_handle(*s, visitor);
+                }
+            }
+        }
+    }
+}
+
 impl Traceable for HeapValue {
     fn trace_handles(&self, visitor: &mut dyn FnMut(GcHandle)) {
         match self {
             HeapValue::Object {
-                prototype, values, ..
+                prototype,
+                values,
+                private_elements,
+                ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                for v in values {
+                    trace_property_value(v, visitor);
+                }
+                trace_private_elements(private_elements, visitor);
             }
-            | HeapValue::NativeObject {
+            HeapValue::NativeObject {
                 prototype, values, ..
             }
             | HeapValue::HostFunction {
@@ -1239,6 +1321,9 @@ impl Traceable for HeapValue {
                 prototype,
                 values,
                 upvalues,
+                field_initializer,
+                private_methods,
+                private_elements,
                 ..
             } => {
                 if let Some(p) = prototype {
@@ -1250,6 +1335,11 @@ impl Traceable for HeapValue {
                 for uv in upvalues {
                     trace_handle(*uv, visitor);
                 }
+                if let Some(fi) = field_initializer {
+                    trace_handle(*fi, visitor);
+                }
+                trace_private_elements(private_methods, visitor);
+                trace_private_elements(private_elements, visitor);
             }
             HeapValue::Array {
                 prototype,
@@ -1541,6 +1631,7 @@ impl ObjectHeap {
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
+            private_elements: Vec::new(),
         });
         ObjectHandle(h.0)
     }
@@ -2843,9 +2934,7 @@ impl ObjectHeap {
     /// Spec: <https://tc39.es/ecma262/#sec-weak-ref.prototype.deref>
     pub fn weakref_deref(&self, handle: ObjectHandle) -> Result<Option<ObjectHandle>, ObjectError> {
         match self.object(handle)? {
-            HeapValue::WeakRef { target, .. } => {
-                Ok(target.map(ObjectHandle))
-            }
+            HeapValue::WeakRef { target, .. } => Ok(target.map(ObjectHandle)),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -2858,7 +2947,9 @@ impl ObjectHeap {
     ) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
             HeapValue::WeakRef { target, .. } => {
-                if let Some(t) = *target && !is_live(t) {
+                if let Some(t) = *target
+                    && !is_live(t)
+                {
                     *target = None;
                 }
                 Ok(())
@@ -2949,7 +3040,9 @@ impl ObjectHeap {
             HeapValue::FinalizationRegistry { cells, .. } => {
                 let mut cleanup_values = Vec::new();
                 cells.retain(|cell| {
-                    if let Some(t) = cell.target && !is_live(t) {
+                    if let Some(t) = cell.target
+                        && !is_live(t)
+                    {
                         cleanup_values.push(cell.held_value);
                         return false;
                     }
@@ -3134,6 +3227,10 @@ impl ObjectHeap {
             module,
             callee,
             upvalues,
+            field_initializer: None,
+            class_id: 0,
+            private_methods: Vec::new(),
+            private_elements: Vec::new(),
         });
         ObjectHandle(h.0)
     }
@@ -4357,6 +4454,304 @@ impl ObjectHeap {
             HeapValue::Closure { module, .. } => Ok(module.clone()),
             _ => Err(ObjectError::InvalidKind),
         }
+    }
+
+    /// §15.7.14 — Returns the field initializer closure stored on a class constructor, if any.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    pub fn closure_field_initializer(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure {
+                field_initializer, ..
+            } => Ok(*field_initializer),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §15.7.14 — Stores a field initializer closure on a class constructor.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    pub fn set_closure_field_initializer(
+        &mut self,
+        handle: ObjectHandle,
+        initializer: ObjectHandle,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Closure {
+                field_initializer, ..
+            } => {
+                *field_initializer = Some(initializer);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  §6.2.12 Private Names — class_id, private_methods, private_elements
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// §6.2.12 — Returns the class_id stored on a closure (0 if none).
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    pub fn closure_class_id(&self, handle: ObjectHandle) -> Result<u64, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure { class_id, .. } => Ok(*class_id),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §6.2.12 — Sets the class_id on a closure.
+    /// Spec: <https://tc39.es/ecma262/#sec-private-names>
+    pub fn set_closure_class_id(
+        &mut self,
+        handle: ObjectHandle,
+        id: u64,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Closure { class_id, .. } => {
+                *class_id = id;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §15.7.14 — Pushes a private method/accessor to constructor's `[[PrivateMethods]]`.
+    /// These are copied to each instance during InitializeInstanceElements.
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    pub fn push_private_method(
+        &mut self,
+        handle: ObjectHandle,
+        key: PrivateNameKey,
+        element: PrivateElement,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Closure {
+                private_methods, ..
+            } => {
+                // Merge accessor pairs: if an accessor with the same key exists,
+                // merge the getter/setter instead of pushing a duplicate.
+                if let PrivateElement::Accessor { getter, setter } = &element {
+                    for (k, existing) in private_methods.iter_mut() {
+                        if *k == key
+                            && let PrivateElement::Accessor {
+                                getter: g,
+                                setter: s,
+                            } = existing
+                        {
+                            if getter.is_some() {
+                                *g = *getter;
+                            }
+                            if setter.is_some() {
+                                *s = *setter;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                private_methods.push((key, element));
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §15.7.14 — Returns a clone of the constructor's `[[PrivateMethods]]` list.
+    /// Spec: <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+    pub fn closure_private_methods(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Vec<(PrivateNameKey, PrivateElement)>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure {
+                private_methods, ..
+            } => Ok(private_methods.clone()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// §7.3.31 PrivateFieldAdd — append a private field to `[[PrivateElements]]`.
+    /// Throws TypeError if a field with the same key already exists.
+    /// Spec: <https://tc39.es/ecma262/#sec-privatefieldadd>
+    pub fn private_field_add(
+        &mut self,
+        handle: ObjectHandle,
+        key: PrivateNameKey,
+        value: RegisterValue,
+    ) -> Result<(), ObjectError> {
+        let elements = self.private_elements_mut(handle)?;
+        if elements.iter().any(|(k, _)| *k == key) {
+            return Err(ObjectError::TypeError(
+                "private field already defined on object".into(),
+            ));
+        }
+        elements.push((key, PrivateElement::Field(value)));
+        Ok(())
+    }
+
+    /// §7.3.31 PrivateMethodOrAccessorAdd — append a method/accessor to `[[PrivateElements]]`.
+    /// Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
+    pub fn private_method_or_accessor_add(
+        &mut self,
+        handle: ObjectHandle,
+        key: PrivateNameKey,
+        element: PrivateElement,
+    ) -> Result<(), ObjectError> {
+        let elements = self.private_elements_mut(handle)?;
+        // Merge accessor pairs.
+        if let PrivateElement::Accessor { getter, setter } = &element {
+            for (k, existing) in elements.iter_mut() {
+                if *k == key
+                    && let PrivateElement::Accessor {
+                        getter: g,
+                        setter: s,
+                    } = existing
+                {
+                    if getter.is_some() {
+                        *g = *getter;
+                    }
+                    if setter.is_some() {
+                        *s = *setter;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if elements.iter().any(|(k, _)| *k == key) {
+            return Err(ObjectError::TypeError(
+                "private method/accessor already defined on object".into(),
+            ));
+        }
+        elements.push((key, element));
+        Ok(())
+    }
+
+    /// §7.3.32 PrivateGet — read a private field, method, or accessor.
+    /// Spec: <https://tc39.es/ecma262/#sec-privateget>
+    pub fn private_get(
+        &self,
+        handle: ObjectHandle,
+        key: &PrivateNameKey,
+    ) -> Result<RegisterValue, ObjectError> {
+        let elements = self.private_elements(handle)?;
+        for (k, element) in elements {
+            if k == key {
+                return match element {
+                    PrivateElement::Field(value) => Ok(*value),
+                    PrivateElement::Method(method) => {
+                        Ok(RegisterValue::from_object_handle(method.0))
+                    }
+                    PrivateElement::Accessor { getter, .. } => {
+                        if let Some(g) = getter {
+                            // Accessor getter must be called by the interpreter,
+                            // so we return the getter function handle.
+                            Ok(RegisterValue::from_object_handle(g.0))
+                        } else {
+                            Err(ObjectError::TypeError(
+                                "private accessor has no getter".into(),
+                            ))
+                        }
+                    }
+                };
+            }
+        }
+        Err(ObjectError::TypeError(
+            "cannot access private field or method: object does not have the private member".into(),
+        ))
+    }
+
+    /// §7.3.33 PrivateSet — write a private field value.
+    /// Methods throw TypeError (read-only). Accessors invoke the setter.
+    /// Spec: <https://tc39.es/ecma262/#sec-privateset>
+    pub fn private_set(
+        &mut self,
+        handle: ObjectHandle,
+        key: &PrivateNameKey,
+        value: RegisterValue,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        let elements = self.private_elements_mut(handle)?;
+        for (k, element) in elements.iter_mut() {
+            if k == key {
+                return match element {
+                    PrivateElement::Field(field_value) => {
+                        *field_value = value;
+                        Ok(None)
+                    }
+                    PrivateElement::Method(_) => Err(ObjectError::TypeError(
+                        "cannot assign to a private method".into(),
+                    )),
+                    PrivateElement::Accessor { setter, .. } => {
+                        if let Some(s) = setter {
+                            // Accessor setter must be called by the interpreter.
+                            Ok(Some(*s))
+                        } else {
+                            Err(ObjectError::TypeError(
+                                "private accessor has no setter".into(),
+                            ))
+                        }
+                    }
+                };
+            }
+        }
+        Err(ObjectError::TypeError(
+            "cannot set private field: object does not have the private member".into(),
+        ))
+    }
+
+    /// §7.3.31 PrivateElementFind — check if a private element exists.
+    /// Spec: <https://tc39.es/ecma262/#sec-privateelementfind>
+    pub fn private_element_find(
+        &self,
+        handle: ObjectHandle,
+        key: &PrivateNameKey,
+    ) -> Result<bool, ObjectError> {
+        let elements = self.private_elements(handle)?;
+        Ok(elements.iter().any(|(k, _)| k == key))
+    }
+
+    /// Returns a reference to the `[[PrivateElements]]` list of an object.
+    fn private_elements(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<&[(PrivateNameKey, PrivateElement)], ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Object {
+                private_elements, ..
+            }
+            | HeapValue::Closure {
+                private_elements, ..
+            } => Ok(private_elements),
+            _ => Ok(&[]),
+        }
+    }
+
+    /// Returns a mutable reference to the `[[PrivateElements]]` list.
+    fn private_elements_mut(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<&mut Vec<(PrivateNameKey, PrivateElement)>, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Object {
+                private_elements, ..
+            }
+            | HeapValue::Closure {
+                private_elements, ..
+            } => Ok(private_elements),
+            _ => Err(ObjectError::TypeError(
+                "object does not support private elements".into(),
+            )),
+        }
+    }
+
+    /// Returns a reference to a specific private element by key, if found.
+    pub fn private_elements_ref(
+        &self,
+        handle: ObjectHandle,
+        key: &PrivateNameKey,
+    ) -> Option<&PrivateElement> {
+        let elements = self.private_elements(handle).ok()?;
+        elements.iter().find(|(k, _)| k == key).map(|(_, e)| e)
     }
 
     /// Returns the host-function id stored in a host-function object, if any.

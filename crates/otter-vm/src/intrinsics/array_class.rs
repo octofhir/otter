@@ -483,9 +483,7 @@ fn array_concat(
             // 4.a.i. Spreadable: treat as array-like
             // ES2024 §22.1.3.1 step 5.c.ii: Let len be ? LengthOfArrayLike(E).
             let handle = item.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-                VmNativeCallError::Internal(
-                    "concat: spreadable value must be an object".into(),
-                )
+                VmNativeCallError::Internal("concat: spreadable value must be an object".into())
             })?;
             let len = length_of_array_like(handle, runtime)?;
             runtime
@@ -507,7 +505,10 @@ fn array_concat(
             next_index = next_index.saturating_add(len);
         } else {
             // 4.a.ii. Not spreadable: append as single element.
-            runtime.objects_mut().set_index(result, next_index, *item).ok();
+            runtime
+                .objects_mut()
+                .set_index(result, next_index, *item)
+                .ok();
             next_index = next_index.saturating_add(1);
         }
     }
@@ -532,8 +533,8 @@ fn is_concat_spreadable(
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
         return Ok(false);
     };
-    let sym_prop = runtime
-        .intern_symbol_property_name(WellKnownSymbol::IsConcatSpreadable.stable_id());
+    let sym_prop =
+        runtime.intern_symbol_property_name(WellKnownSymbol::IsConcatSpreadable.stable_id());
     let spreadable = runtime.ordinary_get(handle, sym_prop, value)?;
     if spreadable != RegisterValue::undefined() {
         return Ok(spreadable.is_truthy());
@@ -613,11 +614,8 @@ fn length_of_array_like(
 ) -> Result<usize, VmNativeCallError> {
     // 1. Return ℝ(? ToLength(? Get(obj, "length"))).
     let length_prop = runtime.intern_property_name("length");
-    let length_val = runtime.ordinary_get(
-        obj,
-        length_prop,
-        RegisterValue::from_object_handle(obj.0),
-    )?;
+    let length_val =
+        runtime.ordinary_get(obj, length_prop, RegisterValue::from_object_handle(obj.0))?;
     // ToLength: undefined/NaN → 0, number → clamp to [0, 2^53 - 1]
     if length_val == RegisterValue::undefined() || length_val == RegisterValue::null() {
         return Ok(0);

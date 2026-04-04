@@ -505,6 +505,16 @@ enum Completion {
     Throw(RegisterValue),
 }
 
+/// §14.4.4 yield* delegation result — used internally by resume_generator_impl.
+enum YieldStarResult {
+    /// Inner iterator yielded a value — yield it to the outer caller.
+    Yield(RegisterValue),
+    /// Inner iterator completed — the `yield*` expression evaluates to this value.
+    Done(RegisterValue),
+    /// Inner iterator completed via `.return()` forwarding — complete the outer generator.
+    Return(RegisterValue),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToPrimitiveHint {
     String,
@@ -532,6 +542,9 @@ pub struct RuntimeState {
     /// §6.2.12 Monotonic counter for unique private class identifiers.
     /// Spec: <https://tc39.es/ecma262/#sec-private-names>
     next_class_id: u64,
+    /// §14.4.4 Transient: set by `YieldStar` opcode, consumed by
+    /// the generator resume loop when handling `GeneratorYield`.
+    pending_delegation_iterator: Option<ObjectHandle>,
 }
 
 impl RuntimeState {
@@ -574,6 +587,7 @@ impl RuntimeState {
             global_symbol_registry: BTreeMap::new(),
             global_symbol_registry_reverse: BTreeMap::new(),
             next_class_id: 1,
+            pending_delegation_iterator: None,
         }
     }
 
@@ -4028,6 +4042,7 @@ impl RuntimeState {
                 | HeapValueKind::WeakRef
                 | HeapValueKind::FinalizationRegistry
                 | HeapValueKind::Generator
+                | HeapValueKind::AsyncGenerator
                 | HeapValueKind::ArrayBuffer
                 | HeapValueKind::SharedArrayBuffer
                 | HeapValueKind::RegExp
@@ -4095,6 +4110,205 @@ impl RuntimeState {
         resume_kind: crate::intrinsics::GeneratorResumeKind,
     ) -> Result<RegisterValue, VmNativeCallError> {
         Interpreter::resume_generator_impl(self, generator, sent_value, resume_kind)
+    }
+
+    // ─── Async Generator Support (§27.6) ────────────────────────────────
+
+    /// Allocates an async generator object in SuspendedStart state.
+    ///
+    /// Called when an `async function*` is invoked — instead of executing the
+    /// body, we create an async generator object that lazily executes on `.next()`.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorstart>
+    pub fn alloc_async_generator(
+        &mut self,
+        module: Module,
+        function_index: FunctionIndex,
+        closure_handle: Option<ObjectHandle>,
+        arguments: Vec<RegisterValue>,
+    ) -> ObjectHandle {
+        let prototype = self.intrinsics.async_generator_prototype();
+        self.objects.alloc_async_generator(
+            Some(prototype),
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+        )
+    }
+
+    /// Resumes a suspended async generator. Dequeues the front request
+    /// and runs the body until next yield/await/return/throw.
+    ///
+    /// §27.6.3.3 AsyncGeneratorResume
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorresume>
+    pub(crate) fn resume_async_generator(
+        &mut self,
+        generator: ObjectHandle,
+    ) -> Result<(), VmNativeCallError> {
+        Interpreter::resume_async_generator_impl(self, generator)
+    }
+
+    // ─── yield* delegation helpers (§14.4.4) ────────────────────────────
+
+    /// Calls `iterator.next(value)` — tries the internal fast path first
+    /// (ArrayIterator/StringIterator), then falls back to protocol-based `.next()`.
+    /// Returns (done, value).
+    /// Spec: <https://tc39.es/ecma262/#sec-iteratornext>
+    pub(crate) fn call_iterator_next_with_value(
+        &mut self,
+        iterator: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<(bool, RegisterValue), InterpreterError> {
+        // Fast path: internal array/string iterators (ignores sent value,
+        // which is correct per spec — arrays/strings don't use it).
+        match self.iterator_next(iterator) {
+            Ok(step) => {
+                return Ok((step.is_done(), step.value()));
+            }
+            Err(InterpreterError::InvalidHeapValueKind) => {
+                // Not an internal fast-path iterator — fall through to protocol.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: protocol-based iterator — look up .next() and call it.
+        let next_prop = self.intern_property_name("next");
+        let iter_val = RegisterValue::from_object_handle(iterator.0);
+        let next_fn = self.ordinary_get(iterator, next_prop, iter_val).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        let callable = next_fn
+            .as_object_handle()
+            .map(ObjectHandle)
+            .filter(|h| self.objects.is_callable(*h))
+            .ok_or_else(|| {
+                InterpreterError::TypeError("Iterator .next is not a function".into())
+            })?;
+        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        self.read_iter_result(result_obj)
+    }
+
+    /// Calls `iterator.throw(value)` if the method exists.
+    /// Returns `Some((done, value))` if `.throw` exists, `None` if it doesn't.
+    /// Internal array/string iterators don't have `.throw()` — returns `None`.
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation> step 7.b
+    pub(crate) fn call_iterator_throw(
+        &mut self,
+        iterator: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<Option<(bool, RegisterValue)>, InterpreterError> {
+        // Internal array/string iterators have no .throw() method.
+        if self.is_internal_fast_path_iterator(iterator) {
+            return Ok(None);
+        }
+
+        let throw_prop = self.intern_property_name("throw");
+        let iter_val = RegisterValue::from_object_handle(iterator.0);
+        let throw_fn = self.ordinary_get(iterator, throw_prop, iter_val).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        if throw_fn == RegisterValue::undefined() || throw_fn == RegisterValue::null() {
+            return Ok(None);
+        }
+        let callable = throw_fn
+            .as_object_handle()
+            .map(ObjectHandle)
+            .filter(|h| self.objects.is_callable(*h))
+            .ok_or_else(|| {
+                InterpreterError::TypeError("Iterator .throw is not a function".into())
+            })?;
+        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        self.read_iter_result(result_obj).map(Some)
+    }
+
+    /// Calls `iterator.return(value)` if the method exists.
+    /// Returns `Some((done, value))` if `.return` exists, `None` if it doesn't.
+    /// Internal array/string iterators have no `.return()` — returns `None`.
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation> step 7.c
+    pub(crate) fn call_iterator_return(
+        &mut self,
+        iterator: ObjectHandle,
+        value: RegisterValue,
+    ) -> Result<Option<(bool, RegisterValue)>, InterpreterError> {
+        // Internal array/string iterators have no .return() method.
+        if self.is_internal_fast_path_iterator(iterator) {
+            return Ok(None);
+        }
+
+        let return_prop = self.intern_property_name("return");
+        let iter_val = RegisterValue::from_object_handle(iterator.0);
+        let return_fn = self.ordinary_get(iterator, return_prop, iter_val).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        if return_fn == RegisterValue::undefined() || return_fn == RegisterValue::null() {
+            return Ok(None);
+        }
+        let callable = return_fn
+            .as_object_handle()
+            .map(ObjectHandle)
+            .filter(|h| self.objects.is_callable(*h))
+            .ok_or_else(|| {
+                InterpreterError::TypeError("Iterator .return is not a function".into())
+            })?;
+        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
+            |e| match e {
+                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+            },
+        )?;
+        self.read_iter_result(result_obj).map(Some)
+    }
+
+    /// Returns `true` if the handle is an internal array (values-kind) or string iterator
+    /// that uses the `iterator_next` fast path and has no protocol-level `.next()`/`.throw()`/`.return()`.
+    fn is_internal_fast_path_iterator(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.objects.kind(handle),
+            Ok(HeapValueKind::Iterator)
+        )
+    }
+
+    /// Reads `done` and `value` from an iterator result object.
+    fn read_iter_result(
+        &mut self,
+        result_obj: RegisterValue,
+    ) -> Result<(bool, RegisterValue), InterpreterError> {
+        let result_handle = result_obj
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| {
+                InterpreterError::TypeError("Iterator result must be an object".into())
+            })?;
+        let done_prop = self.intern_property_name("done");
+        let done_val = self
+            .ordinary_get(result_handle, done_prop, result_obj)
+            .unwrap_or_else(|_| RegisterValue::from_bool(false));
+        let done = self.js_to_boolean(done_val).unwrap_or(false);
+        let value_prop = self.intern_property_name("value");
+        let value = self
+            .ordinary_get(result_handle, value_prop, result_obj)
+            .unwrap_or_else(|_| RegisterValue::undefined());
+        Ok((done, value))
     }
 }
 
@@ -4873,7 +5087,13 @@ impl Interpreter {
                             }
                             crate::promise::PromiseState::Rejected(reason) => {
                                 let reason = *reason;
-                                // Feed rejection through exception handling.
+                                // The PC was advanced past the Await instruction
+                                // in the Suspend path. Back it up so that
+                                // transfer_exception finds the enclosing try/catch.
+                                let current_pc = activation.pc();
+                                if current_pc > 0 {
+                                    activation.set_pc(current_pc - 1);
+                                }
                                 if self.transfer_exception(function, activation, reason) {
                                     continue;
                                 }
@@ -7270,6 +7490,32 @@ impl Interpreter {
                     )));
                 }
 
+                // §27.6.3.1 — Async generator function call: create an async
+                // generator object instead of executing the body.
+                // Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorstart>
+                if matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
+                    && runtime
+                        .objects
+                        .closure_flags(callee)
+                        .is_ok_and(|flags| flags.is_generator() && flags.is_async())
+                {
+                    let callee_module = runtime.objects.closure_module(callee)?;
+                    let callee_fn_index = runtime.objects.closure_callee(callee)?;
+                    let gen_handle = runtime.alloc_async_generator(
+                        callee_module,
+                        callee_fn_index,
+                        Some(callee),
+                        arguments.clone(),
+                    );
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_object_handle(gen_handle.0),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+
                 // §27.3.3.1 — Generator function call: create a generator object
                 // instead of executing the body.
                 // Spec: <https://tc39.es/ecma262/#sec-generatorfunction-objects-call>
@@ -7645,8 +7891,10 @@ impl Interpreter {
                             }
                             crate::promise::PromiseState::Rejected(reason) => {
                                 // Already rejected — throw the reason.
+                                // Do NOT advance the PC: transfer_exception needs
+                                // the PC at the Await instruction to find the
+                                // enclosing try/catch handler.
                                 let reason = *reason;
-                                activation.advance();
                                 return Ok(StepOutcome::Throw(reason));
                             }
                             crate::promise::PromiseState::Pending => {
@@ -7681,6 +7929,42 @@ impl Interpreter {
                     yielded_value: value,
                     resume_register: resume_reg,
                 })
+            }
+            // §14.4.4 yield* — delegate to a sub-iterator.
+            // Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+            Opcode::YieldStar => {
+                let dst_reg = instruction.a();
+                let iterator_reg = instruction.b();
+                let iterator_value =
+                    activation.read_bytecode_register(function, iterator_reg)?;
+
+                let iterator_handle = iterator_value
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or_else(|| {
+                        InterpreterError::TypeError("yield* operand is not an object".into())
+                    })?;
+
+                // Call inner.next(undefined) to get the first result.
+                let (done, value) = runtime.call_iterator_next_with_value(
+                    iterator_handle,
+                    RegisterValue::undefined(),
+                )?;
+
+                if done {
+                    // Inner iterator immediately done — write return value to dst.
+                    activation.write_bytecode_register(function, dst_reg, value)?;
+                    activation.advance();
+                    Ok(StepOutcome::Continue)
+                } else {
+                    // Store pending delegation for the resume loop to pick up.
+                    runtime.pending_delegation_iterator = Some(iterator_handle);
+                    activation.advance();
+                    Ok(StepOutcome::GeneratorYield {
+                        yielded_value: value,
+                        resume_register: dst_reg,
+                    })
+                }
             }
         }
     }
@@ -8317,6 +8601,83 @@ impl Interpreter {
         }
     }
 
+    /// §14.4.4 yield* delegation forwarding result.
+    fn handle_yield_star_delegation(
+        runtime: &mut RuntimeState,
+        _generator: ObjectHandle,
+        inner_iter: ObjectHandle,
+        sent_value: RegisterValue,
+        resume_kind: crate::intrinsics::GeneratorResumeKind,
+        _resume_reg: u16,
+    ) -> Result<YieldStarResult, VmNativeCallError> {
+        use crate::intrinsics::GeneratorResumeKind;
+
+        fn interp_to_native(e: InterpreterError) -> VmNativeCallError {
+            match e {
+                InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                InterpreterError::TypeError(m) | InterpreterError::NativeCall(m) => {
+                    VmNativeCallError::Internal(m)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            }
+        }
+
+        match resume_kind {
+            GeneratorResumeKind::Next => {
+                let (done, value) = runtime
+                    .call_iterator_next_with_value(inner_iter, sent_value)
+                    .map_err(interp_to_native)?;
+                if done {
+                    Ok(YieldStarResult::Done(value))
+                } else {
+                    Ok(YieldStarResult::Yield(value))
+                }
+            }
+            GeneratorResumeKind::Throw => {
+                // §14.4.4 step 7.b — forward .throw() to inner iterator.
+                match runtime.call_iterator_throw(inner_iter, sent_value).map_err(interp_to_native)? {
+                    Some((done, value)) => {
+                        if done {
+                            Ok(YieldStarResult::Done(value))
+                        } else {
+                            Ok(YieldStarResult::Yield(value))
+                        }
+                    }
+                    None => {
+                        // Inner iterator has no .throw() — close it and throw TypeError.
+                        let _ = runtime.objects.iterator_close(inner_iter);
+                        let err = runtime
+                            .alloc_type_error(
+                                "The iterator does not provide a 'throw' method",
+                            )
+                            .map_err(|e| {
+                                VmNativeCallError::Internal(format!("{e:?}").into())
+                            })?;
+                        Err(VmNativeCallError::Thrown(RegisterValue::from_object_handle(
+                            err.0,
+                        )))
+                    }
+                }
+            }
+            GeneratorResumeKind::Return => {
+                // §14.4.4 step 7.c — forward .return() to inner iterator.
+                match runtime.call_iterator_return(inner_iter, sent_value).map_err(interp_to_native)? {
+                    Some((done, value)) => {
+                        if done {
+                            Ok(YieldStarResult::Return(value))
+                        } else {
+                            Ok(YieldStarResult::Yield(value))
+                        }
+                    }
+                    None => {
+                        // Inner iterator has no .return() — just return the value.
+                        Ok(YieldStarResult::Return(sent_value))
+                    }
+                }
+            }
+        }
+    }
+
     /// Core generator resume implementation.
     ///
     /// Called from `RuntimeState::resume_generator` to execute generator body
@@ -8440,6 +8801,88 @@ impl Interpreter {
 
         let interp = Interpreter::new();
         let previous_module = runtime.enter_module(&module);
+
+        // §14.4.4 — Check for active yield* delegation before entering the execution loop.
+        // If a delegation iterator is active, forward the resume to it.
+        // NOTE: enter_module must be called BEFORE this block so that
+        // call_callable_for_accessor can dispatch through Interpreter::call_function
+        // (otherwise current_module is None and it falls back to call_host_function).
+        if had_saved_registers {
+            let delegation = runtime
+                .objects
+                .generator_delegation_iterator(generator)
+                .unwrap_or(None);
+            if let Some(inner_iter) = delegation {
+                match Self::handle_yield_star_delegation(
+                    runtime,
+                    generator,
+                    inner_iter,
+                    sent_value,
+                    resume_kind,
+                    resume_reg,
+                ) {
+                    Ok(YieldStarResult::Yield(yielded_value)) => {
+                        // Inner iterator not done — save state and yield the inner value.
+                        let saved_regs = activation.save_registers();
+                        let pc = activation.pc();
+                        runtime
+                            .objects
+                            .generator_save_state(generator, saved_regs, pc, resume_reg)
+                            .map_err(|e| {
+                                VmNativeCallError::Internal(
+                                    format!("generator save state: {e:?}").into(),
+                                )
+                            })?;
+                        runtime.restore_module(previous_module);
+                        let result = runtime.create_iter_result(yielded_value, false)?;
+                        return Ok(RegisterValue::from_object_handle(result.0));
+                    }
+                    Ok(YieldStarResult::Done(return_value)) => {
+                        // Inner iterator done — clear delegation, write return value
+                        // to the resume register, and continue generator execution.
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        activation
+                            .write_bytecode_register(function, resume_reg, return_value)
+                            .map_err(|e| {
+                                VmNativeCallError::Internal(
+                                    format!("generator delegation write: {e:?}").into(),
+                                )
+                            })?;
+                        // Fall through to the normal execution loop below.
+                    }
+                    Ok(YieldStarResult::Return(return_value)) => {
+                        // .return() propagated from inner — complete the generator.
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        runtime
+                            .objects
+                            .set_generator_state(generator, GeneratorState::Completed)
+                            .ok();
+                        runtime.restore_module(previous_module);
+                        let result = runtime.create_iter_result(return_value, true)?;
+                        return Ok(RegisterValue::from_object_handle(result.0));
+                    }
+                    Err(VmNativeCallError::Thrown(thrown)) => {
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        runtime
+                            .objects
+                            .set_generator_state(generator, GeneratorState::Completed)
+                            .ok();
+                        runtime.restore_module(previous_module);
+                        return Err(VmNativeCallError::Thrown(thrown));
+                    }
+                    Err(e) => {
+                        runtime.restore_module(previous_module);
+                        return Err(e);
+                    }
+                }
+            }
+        }
         let mut frame_runtime = FrameRuntimeState::new(function);
 
         // For Throw resume kind on a yielded generator, inject exception.
@@ -8451,6 +8894,14 @@ impl Interpreter {
 
             if inject_throw {
                 inject_throw = false;
+                // The saved resume PC is past the Yield instruction (Yield
+                // advances before saving state). Back up by 1 so that
+                // transfer_exception sees the PC at the Yield, which is
+                // inside any enclosing try/catch handler range.
+                let current_pc = activation.pc();
+                if current_pc > 0 {
+                    activation.set_pc(current_pc - 1);
+                }
                 if interp.transfer_exception(function, &mut activation, sent_value) {
                     continue;
                 }
@@ -8542,9 +8993,572 @@ impl Interpreter {
                                 format!("generator save state: {e:?}").into(),
                             )
                         })?;
+                    // §14.4.4 — if YieldStar set a pending delegation, store it.
+                    if let Some(inner_iter) = runtime.pending_delegation_iterator.take() {
+                        let _ = runtime.objects.set_generator_delegation_iterator(
+                            generator,
+                            Some(inner_iter),
+                        );
+                    }
                     runtime.restore_module(previous_module);
                     let result = runtime.create_iter_result(yielded_value, false)?;
                     return Ok(RegisterValue::from_object_handle(result.0));
+                }
+            }
+        }
+    }
+
+    /// Core async generator resume implementation.
+    ///
+    /// §27.6.3.3 AsyncGeneratorResume
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorresume>
+    ///
+    /// Peeks at the front request, resumes the body. On yield, saves state
+    /// and settles the front request's promise with `{value, done: false}`.
+    /// On return/throw, marks completed and drains the queue.
+    fn resume_async_generator_impl(
+        runtime: &mut RuntimeState,
+        generator: ObjectHandle,
+    ) -> Result<(), VmNativeCallError> {
+        use crate::intrinsics::async_generator_class::{
+            async_generator_complete_step, async_generator_drain_completed,
+        };
+        use crate::object::{AsyncGeneratorRequestKind, GeneratorState};
+
+        // Peek the front request to determine resume kind + value.
+        let request = runtime
+            .objects
+            .async_generator_peek_request(generator)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("async generator peek request: {e:?}").into(),
+                )
+            })?;
+        let Some(request) = request else {
+            // No pending requests — nothing to do.
+            return Ok(());
+        };
+
+        let resume_kind = request.kind;
+        let sent_value = request.value;
+
+        // Take state from the async generator (transitions to Executing).
+        let (module, function_index, closure_handle, arguments, saved_registers, resume_pc, resume_reg) =
+            runtime
+                .objects
+                .async_generator_take_state(generator)
+                .map_err(|e| {
+                    VmNativeCallError::Internal(
+                        format!("async generator take state: {e:?}").into(),
+                    )
+                })?;
+
+        let function = module.function(function_index).ok_or_else(|| {
+            VmNativeCallError::Internal("async generator function index invalid".into())
+        })?;
+
+        let register_count = function.frame_layout().register_count();
+        let had_saved_registers = saved_registers.is_some();
+
+        let mut activation = if let Some(saved_regs) = saved_registers {
+            let mut act = Activation::with_context(
+                function_index,
+                register_count,
+                FrameMetadata::default(),
+                closure_handle,
+            );
+            act.restore_registers(&saved_regs);
+            act.set_pc(resume_pc);
+
+            match resume_kind {
+                AsyncGeneratorRequestKind::Next => {
+                    act.write_bytecode_register(function, resume_reg, sent_value)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("async gen resume write: {e:?}").into(),
+                            )
+                        })?;
+                }
+                AsyncGeneratorRequestKind::Return => {
+                    // §27.6.3.5 AsyncGeneratorAwaitReturn — complete the request,
+                    // mark completed, and drain.
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    async_generator_complete_step(runtime, request.promise, sent_value, true)?;
+                    async_generator_drain_completed(generator, runtime)?;
+                    return Ok(());
+                }
+                AsyncGeneratorRequestKind::Throw => {
+                    // Will inject throw at first step.
+                }
+            }
+            act
+        } else {
+            // SuspendedStart — first call to .next().
+            match resume_kind {
+                AsyncGeneratorRequestKind::Next => {
+                    let mut act = Activation::with_context(
+                        function_index,
+                        register_count,
+                        FrameMetadata::new(arguments.len() as u16, FrameFlags::empty()),
+                        closure_handle,
+                    );
+                    let param_count = function.frame_layout().parameter_count();
+                    for (i, &arg) in arguments.iter().enumerate() {
+                        if i >= param_count as usize {
+                            break;
+                        }
+                        let _ = act.write_bytecode_register(function, i as u16, arg);
+                    }
+                    act
+                }
+                AsyncGeneratorRequestKind::Return => {
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    async_generator_complete_step(runtime, request.promise, sent_value, true)?;
+                    async_generator_drain_completed(generator, runtime)?;
+                    return Ok(());
+                }
+                AsyncGeneratorRequestKind::Throw => {
+                    // §27.6.1.4 step 10: If state is suspendedStart, reject.
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    // Reject the promise with the thrown value.
+                    if let Some(p) = runtime.objects.get_promise_mut(request.promise)
+                        && p.is_pending()
+                        && let Some(jobs) = p.reject(sent_value)
+                    {
+                        for job in jobs {
+                            runtime.microtasks_mut().enqueue_promise_job(job);
+                        }
+                    }
+                    async_generator_drain_completed(generator, runtime)?;
+                    return Ok(());
+                }
+            }
+        };
+
+        let interp = Interpreter::new();
+        let previous_module = runtime.enter_module(&module);
+
+        // §14.4.4 — Check for active yield* delegation before entering the execution loop.
+        if had_saved_registers {
+            let delegation = runtime
+                .objects
+                .generator_delegation_iterator(generator)
+                .unwrap_or(None);
+            if let Some(inner_iter) = delegation {
+                // Convert async generator request kind to sync GeneratorResumeKind
+                // for the delegation handler.
+                let gen_resume_kind = match resume_kind {
+                    AsyncGeneratorRequestKind::Next => {
+                        crate::intrinsics::GeneratorResumeKind::Next
+                    }
+                    AsyncGeneratorRequestKind::Return => {
+                        crate::intrinsics::GeneratorResumeKind::Return
+                    }
+                    AsyncGeneratorRequestKind::Throw => {
+                        crate::intrinsics::GeneratorResumeKind::Throw
+                    }
+                };
+                match Self::handle_yield_star_delegation(
+                    runtime,
+                    generator,
+                    inner_iter,
+                    sent_value,
+                    gen_resume_kind,
+                    resume_reg,
+                ) {
+                    Ok(YieldStarResult::Yield(yielded_value)) => {
+                        // Inner iterator not done — save state and yield the inner value.
+                        let saved_regs = activation.save_registers();
+                        let pc = activation.pc();
+                        runtime
+                            .objects
+                            .async_generator_save_state(
+                                generator,
+                                saved_regs,
+                                pc,
+                                resume_reg,
+                            )
+                            .map_err(|e| {
+                                VmNativeCallError::Internal(
+                                    format!("async gen save state: {e:?}").into(),
+                                )
+                            })?;
+                        runtime.restore_module(previous_module);
+                        // Dequeue front request and resolve with {value, done: false}.
+                        let _ = runtime
+                            .objects
+                            .async_generator_dequeue(generator);
+                        async_generator_complete_step(
+                            runtime,
+                            request.promise,
+                            yielded_value,
+                            false,
+                        )?;
+                        // If more queued requests, resume immediately.
+                        let queue_empty = runtime
+                            .objects
+                            .async_generator_queue_is_empty(generator)
+                            .unwrap_or(true);
+                        if !queue_empty {
+                            return Self::resume_async_generator_impl(runtime, generator);
+                        }
+                        return Ok(());
+                    }
+                    Ok(YieldStarResult::Done(return_value)) => {
+                        // Inner iterator done — clear delegation, write return value
+                        // to the resume register, and continue execution.
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        activation
+                            .write_bytecode_register(function, resume_reg, return_value)
+                            .map_err(|e| {
+                                VmNativeCallError::Internal(
+                                    format!("async gen delegation write: {e:?}").into(),
+                                )
+                            })?;
+                        // Fall through to the normal execution loop below.
+                    }
+                    Ok(YieldStarResult::Return(return_value)) => {
+                        // .return() propagated from inner — complete the async generator.
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        let _ = runtime
+                            .objects
+                            .set_async_generator_state(generator, GeneratorState::Completed);
+                        runtime.restore_module(previous_module);
+                        let _ = runtime
+                            .objects
+                            .async_generator_dequeue(generator);
+                        async_generator_complete_step(
+                            runtime,
+                            request.promise,
+                            return_value,
+                            true,
+                        )?;
+                        async_generator_drain_completed(generator, runtime)?;
+                        return Ok(());
+                    }
+                    Err(VmNativeCallError::Thrown(thrown)) => {
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, None);
+                        let _ = runtime
+                            .objects
+                            .set_async_generator_state(generator, GeneratorState::Completed);
+                        runtime.restore_module(previous_module);
+                        let _ = runtime
+                            .objects
+                            .async_generator_dequeue(generator);
+                        if let Some(p) = runtime.objects.get_promise_mut(request.promise)
+                            && p.is_pending()
+                            && let Some(jobs) = p.reject(thrown)
+                        {
+                            for job in jobs {
+                                runtime.microtasks_mut().enqueue_promise_job(job);
+                            }
+                        }
+                        async_generator_drain_completed(generator, runtime)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        runtime.restore_module(previous_module);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        let mut frame_runtime = FrameRuntimeState::new(function);
+
+        let mut inject_throw = matches!(resume_kind, AsyncGeneratorRequestKind::Throw)
+            && had_saved_registers;
+
+        loop {
+            activation.begin_step();
+
+            if inject_throw {
+                inject_throw = false;
+                // The saved resume PC is past the Yield instruction (Yield
+                // advances before saving state). Back up by 1 so that
+                // transfer_exception sees the PC at the Yield, which is
+                // inside any enclosing try/catch handler range.
+                let current_pc = activation.pc();
+                if current_pc > 0 {
+                    activation.set_pc(current_pc - 1);
+                }
+                if interp.transfer_exception(function, &mut activation, sent_value) {
+                    continue;
+                }
+                // Exception not caught — complete with rejection.
+                runtime.restore_module(previous_module);
+                let _ = runtime
+                    .objects
+                    .set_async_generator_state(generator, GeneratorState::Completed);
+                let _ = runtime
+                    .objects
+                    .async_generator_dequeue(generator);
+                if let Some(p) = runtime.objects.get_promise_mut(request.promise)
+                    && p.is_pending()
+                    && let Some(jobs) = p.reject(sent_value)
+                {
+                    for job in jobs {
+                        runtime.microtasks_mut().enqueue_promise_job(job);
+                    }
+                }
+                async_generator_drain_completed(generator, runtime)?;
+                return Ok(());
+            }
+
+            let outcome = match interp.step(
+                function,
+                &module,
+                &mut activation,
+                runtime,
+                &mut frame_runtime,
+            ) {
+                Ok(outcome) => outcome,
+                Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
+                Err(InterpreterError::TypeError(message)) => {
+                    let error = runtime
+                        .alloc_type_error(&message)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                    StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
+                }
+                Err(error) => {
+                    runtime.restore_module(previous_module);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    if let Some(p) = runtime.objects.get_promise_mut(request.promise)
+                        && p.is_pending()
+                        && let Some(jobs) = p.reject(RegisterValue::undefined())
+                    {
+                        for job in jobs {
+                            runtime.microtasks_mut().enqueue_promise_job(job);
+                        }
+                    }
+                    return Err(VmNativeCallError::Internal(
+                        format!("async generator execution error: {error:?}").into(),
+                    ));
+                }
+            };
+
+            match outcome {
+                StepOutcome::Continue => {
+                    activation
+                        .sync_written_open_upvalues(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                    activation
+                        .refresh_open_upvalues_from_cells(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                }
+                StepOutcome::Return(return_value) => {
+                    // §27.6.3.7 AsyncGeneratorCompleteStep — resolve with {value, done:true}.
+                    runtime.restore_module(previous_module);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    async_generator_complete_step(
+                        runtime,
+                        request.promise,
+                        return_value,
+                        true,
+                    )?;
+                    // Drain remaining requests since generator is now completed.
+                    async_generator_drain_completed(generator, runtime)?;
+                    return Ok(());
+                }
+                StepOutcome::Throw(value) => {
+                    if interp.transfer_exception(function, &mut activation, value) {
+                        continue;
+                    }
+                    // Uncaught — reject the front request's promise.
+                    runtime.restore_module(previous_module);
+                    let _ = runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed);
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    if let Some(p) = runtime.objects.get_promise_mut(request.promise)
+                        && p.is_pending()
+                        && let Some(jobs) = p.reject(value)
+                    {
+                        for job in jobs {
+                            runtime.microtasks_mut().enqueue_promise_job(job);
+                        }
+                    }
+                    async_generator_drain_completed(generator, runtime)?;
+                    return Ok(());
+                }
+                StepOutcome::Suspend {
+                    awaited_promise,
+                    resume_register: await_resume_reg,
+                } => {
+                    // Await inside async generator — synchronously poll the
+                    // awaited promise (same approach as async functions in our
+                    // single-threaded event loop model).
+                    if let Some(promise) = runtime.objects.get_promise(awaited_promise) {
+                        match &promise.state {
+                            crate::promise::PromiseState::Fulfilled(result) => {
+                                let result = *result;
+                                activation
+                                    .set_register(await_resume_reg, result)
+                                    .map_err(|e| {
+                                        VmNativeCallError::Internal(
+                                            format!("{e:?}").into(),
+                                        )
+                                    })?;
+                                continue;
+                            }
+                            crate::promise::PromiseState::Rejected(reason) => {
+                                let reason = *reason;
+                                // Back up PC past the Await advance so
+                                // transfer_exception finds the try/catch.
+                                let current_pc = activation.pc();
+                                if current_pc > 0 {
+                                    activation.set_pc(current_pc - 1);
+                                }
+                                if interp.transfer_exception(
+                                    function,
+                                    &mut activation,
+                                    reason,
+                                ) {
+                                    continue;
+                                }
+                                // Uncaught — reject the front request.
+                                runtime.restore_module(previous_module);
+                                let _ = runtime.objects.set_async_generator_state(
+                                    generator,
+                                    GeneratorState::Completed,
+                                );
+                                let _ = runtime
+                                    .objects
+                                    .async_generator_dequeue(generator);
+                                if let Some(p) =
+                                    runtime.objects.get_promise_mut(request.promise)
+                                    && p.is_pending()
+                                    && let Some(jobs) = p.reject(reason)
+                                {
+                                    for job in jobs {
+                                        runtime
+                                            .microtasks_mut()
+                                            .enqueue_promise_job(job);
+                                    }
+                                }
+                                async_generator_drain_completed(
+                                    generator, runtime,
+                                )?;
+                                return Ok(());
+                            }
+                            crate::promise::PromiseState::Pending => {
+                                // Save state, suspend. The promise handler
+                                // will need to resume later.
+                                let saved_regs = activation.save_registers();
+                                let pc = activation.pc();
+                                runtime
+                                    .objects
+                                    .async_generator_save_state(
+                                        generator,
+                                        saved_regs,
+                                        pc,
+                                        await_resume_reg,
+                                    )
+                                    .map_err(|e| {
+                                        VmNativeCallError::Internal(
+                                            format!("{e:?}").into(),
+                                        )
+                                    })?;
+                                runtime.restore_module(previous_module);
+                                // TODO: Register promise reaction to resume.
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Not a promise — treat as immediately resolved.
+                    let await_val =
+                        RegisterValue::from_object_handle(awaited_promise.0);
+                    activation
+                        .set_register(await_resume_reg, await_val)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(format!("{e:?}").into())
+                        })?;
+                    continue;
+                }
+                StepOutcome::GeneratorYield {
+                    yielded_value,
+                    resume_register: yield_resume_reg,
+                } => {
+                    // §27.6.3.8 AsyncGeneratorYield — save state, settle front
+                    // request with {value, done: false}, leave queued requests.
+                    let saved_regs = activation.save_registers();
+                    let pc = activation.pc();
+                    runtime
+                        .objects
+                        .async_generator_save_state(
+                            generator,
+                            saved_regs,
+                            pc,
+                            yield_resume_reg,
+                        )
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("async gen save state: {e:?}").into(),
+                            )
+                        })?;
+                    // §14.4.4 — if YieldStar set a pending delegation, store it.
+                    if let Some(inner_iter) = runtime.pending_delegation_iterator.take() {
+                        let _ = runtime.objects.set_generator_delegation_iterator(
+                            generator,
+                            Some(inner_iter),
+                        );
+                    }
+                    runtime.restore_module(previous_module);
+
+                    // Dequeue the front request and resolve its promise.
+                    let _ = runtime
+                        .objects
+                        .async_generator_dequeue(generator);
+                    async_generator_complete_step(
+                        runtime,
+                        request.promise,
+                        yielded_value,
+                        false,
+                    )?;
+
+                    // If there are more queued requests, resume immediately.
+                    let queue_empty = runtime
+                        .objects
+                        .async_generator_queue_is_empty(generator)
+                        .unwrap_or(true);
+                    if !queue_empty {
+                        return Self::resume_async_generator_impl(runtime, generator);
+                    }
+
+                    return Ok(());
                 }
             }
         }

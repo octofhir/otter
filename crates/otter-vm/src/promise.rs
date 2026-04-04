@@ -282,7 +282,7 @@ impl JsPromise {
         match &self.state {
             PromiseState::Pending => {
                 self.fulfill_reactions.push(PromiseReaction {
-                    capability: capability.clone(),
+                    capability,
                     handler: on_fulfill,
                     kind: ReactionKind::Fulfill,
                 });

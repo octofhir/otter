@@ -130,7 +130,7 @@ fn generator_prototype_next(
         .map_err(to_internal_error)?;
 
     match state {
-        GeneratorState::Executing => {
+        GeneratorState::Executing | GeneratorState::AwaitingReturn => {
             let error = runtime
                 .alloc_type_error("Generator is already running")
                 .map_err(to_internal_error)?;
@@ -168,7 +168,7 @@ fn generator_prototype_return(
         .map_err(to_internal_error)?;
 
     match state {
-        GeneratorState::Executing => {
+        GeneratorState::Executing | GeneratorState::AwaitingReturn => {
             let error = runtime
                 .alloc_type_error("Generator is already running")
                 .map_err(to_internal_error)?;
@@ -210,7 +210,7 @@ fn generator_prototype_throw(
         .map_err(to_internal_error)?;
 
     match state {
-        GeneratorState::Executing => {
+        GeneratorState::Executing | GeneratorState::AwaitingReturn => {
             let error = runtime
                 .alloc_type_error("Generator is already running")
                 .map_err(to_internal_error)?;

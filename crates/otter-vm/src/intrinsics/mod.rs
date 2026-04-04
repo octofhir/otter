@@ -7,6 +7,7 @@
 
 mod array_class;
 mod arraybuffer_class;
+pub(crate) mod async_generator_class;
 mod bigint_class;
 mod boolean_class;
 mod dataview_class;
@@ -321,6 +322,9 @@ pub struct VmIntrinsics {
     // Generator (§27.3, §27.5)
     pub(crate) generator_function_prototype: ObjectHandle,
     pub(crate) generator_prototype: ObjectHandle,
+    // Async Generator (§27.4, §27.6)
+    pub(crate) async_generator_function_prototype: ObjectHandle,
+    pub(crate) async_generator_prototype: ObjectHandle,
     // RegExp (§22.2)
     pub(crate) regexp_constructor: ObjectHandle,
     pub(crate) regexp_prototype: ObjectHandle,
@@ -433,6 +437,8 @@ impl VmIntrinsics {
         let set_iterator_prototype = heap.alloc_object();
         let generator_function_prototype = heap.alloc_object();
         let generator_prototype = heap.alloc_object();
+        let async_generator_function_prototype = heap.alloc_object();
+        let async_generator_prototype = heap.alloc_object();
         let regexp_constructor = heap.alloc_object();
         let regexp_prototype = heap.alloc_object();
         // Temporal (proposal-temporal)
@@ -563,6 +569,8 @@ impl VmIntrinsics {
             set_iterator_prototype,
             generator_function_prototype,
             generator_prototype,
+            async_generator_function_prototype,
+            async_generator_prototype,
             regexp_constructor,
             regexp_prototype,
             temporal_namespace,
@@ -688,6 +696,18 @@ impl VmIntrinsics {
             Some(self.function_prototype),
         )?;
         heap.set_prototype(self.generator_prototype, Some(self.iterator_prototype))?;
+        // Async Generator (§27.4, §27.6):
+        // %AsyncGeneratorFunction.prototype% → %Function.prototype%
+        // %AsyncGeneratorPrototype% → %AsyncIteratorPrototype%
+        // Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorfunction-objects>
+        heap.set_prototype(
+            self.async_generator_function_prototype,
+            Some(self.function_prototype),
+        )?;
+        heap.set_prototype(
+            self.async_generator_prototype,
+            Some(self.async_iterator_prototype),
+        )?;
         // RegExp (§22.2): RegExp.prototype → Object.prototype
         heap.set_prototype(self.regexp_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.regexp_prototype, Some(self.object_prototype))?;
@@ -1149,6 +1169,20 @@ impl VmIntrinsics {
         self.generator_prototype
     }
 
+    /// Returns `%AsyncGeneratorFunction.prototype%` (§27.4).
+    /// Spec: <https://tc39.es/ecma262/#sec-properties-of-the-asyncgeneratorfunction-prototype-object>
+    #[must_use]
+    pub const fn async_generator_function_prototype(&self) -> ObjectHandle {
+        self.async_generator_function_prototype
+    }
+
+    /// Returns `%AsyncGenerator.prototype%` (§27.6).
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgenerator-objects>
+    #[must_use]
+    pub const fn async_generator_prototype(&self) -> ObjectHandle {
+        self.async_generator_prototype
+    }
+
     /// Returns `%RegExp%` (§22.2).
     #[must_use]
     pub const fn regexp_constructor(&self) -> ObjectHandle {
@@ -1467,7 +1501,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 27] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 28] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1480,6 +1514,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 27] {
         &error_class::ERROR_INTRINSIC as &dyn IntrinsicInstaller,
         &function_class::FUNCTION_INTRINSIC as &dyn IntrinsicInstaller,
         &generator_class::GENERATOR_INTRINSIC as &dyn IntrinsicInstaller,
+        &async_generator_class::ASYNC_GENERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &json::JSON_INTRINSIC as &dyn IntrinsicInstaller,
         &map_set_class::MAP_SET_INTRINSIC as &dyn IntrinsicInstaller,
         &math::MATH_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1590,7 +1625,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 600);
+        assert_eq!(native_functions.len(), 603);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

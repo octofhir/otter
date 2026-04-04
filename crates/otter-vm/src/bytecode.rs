@@ -356,6 +356,14 @@ pub enum Opcode {
     /// Sets `dst` to `true` if the object has the private element, `false` otherwise.
     /// Spec: <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
     InPrivate = 0x72,
+
+    /// §14.4.4 `yield*` — delegates to a sub-iterator.
+    /// `YieldStar dst, iterator` — enters a delegation loop over `iterator`.
+    /// Each inner value is yielded to the outer caller. When the inner
+    /// iterator completes, `dst` receives the final return value.
+    /// `.return()` and `.throw()` are forwarded to the inner iterator.
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+    YieldStar = 0x73,
 }
 
 impl Opcode {
@@ -463,6 +471,7 @@ impl Opcode {
             0x70 => Some(Self::PushPrivateGetter),
             0x71 => Some(Self::PushPrivateSetter),
             0x72 => Some(Self::InPrivate),
+            0x73 => Some(Self::YieldStar),
             _ => None,
         }
     }
@@ -1291,6 +1300,15 @@ impl Instruction {
     #[must_use]
     pub const fn yield_(dst: BytecodeRegister, value: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Yield, dst, value, BytecodeRegister::new(0))
+    }
+
+    /// §14.4.4 `yield*` — delegate to a sub-iterator.
+    /// `YieldStar dst, iterator` — `dst` receives the final return value
+    /// when the inner iterator is done. `iterator` is the inner iterator object.
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+    #[must_use]
+    pub const fn yield_star(dst: BytecodeRegister, iterator: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::YieldStar, dst, iterator, BytecodeRegister::new(0))
     }
 
     /// §15.7.14 DefineField — define an own data property with a named key.

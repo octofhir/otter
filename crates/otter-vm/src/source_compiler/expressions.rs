@@ -1548,7 +1548,9 @@ impl<'a> FunctionCompiler<'a> {
                     )
                 })?,
             &params,
-            if function.generator {
+            if function.generator && function.r#async {
+                FunctionKind::AsyncGenerator
+            } else if function.generator {
                 FunctionKind::Generator
             } else if function.r#async {
                 FunctionKind::Async
@@ -1568,7 +1570,9 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
-        if function.generator {
+        if function.generator && function.r#async {
+            self.emit_new_closure_async_generator(destination, reserved, &compiled.captures)?;
+        } else if function.generator {
             self.emit_new_closure_generator(destination, reserved, &compiled.captures)?;
         } else if function.r#async {
             self.emit_new_closure_async(destination, reserved, &compiled.captures)?;
@@ -2111,10 +2115,23 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         if yield_expr.delegate {
-            // yield* — delegate to sub-iterator. Not yet implemented.
-            return Err(SourceLoweringError::Unsupported(
-                "yield* (delegating yield) is not implemented yet".to_string(),
-            ));
+            // §14.4.4 yield* — delegate to sub-iterator.
+            // Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+            let argument = yield_expr
+                .argument
+                .as_ref()
+                .ok_or_else(|| {
+                    SourceLoweringError::Unsupported("yield* requires an argument".to_string())
+                })?;
+            let iterable = self.compile_expression(argument, module)?;
+            let iterator = self.allocate_local()?;
+            self.instructions
+                .push(Instruction::get_iterator(iterator, iterable.register));
+            self.release(iterable);
+            let dst = self.allocate_local()?;
+            self.instructions
+                .push(Instruction::yield_star(dst, iterator));
+            return Ok(ValueLocation::local(dst));
         }
 
         let value = if let Some(argument) = &yield_expr.argument {

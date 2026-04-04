@@ -242,7 +242,7 @@ fn promise_then(
         .get_promise_mut(promise_handle)
         .expect("validated above");
 
-    if let Some(immediate_job) = promise.then(on_fulfill, on_reject, capability.clone()) {
+    if let Some(immediate_job) = promise.then(on_fulfill, on_reject, capability) {
         runtime.microtasks_mut().enqueue_promise_job(immediate_job);
     }
 
@@ -448,7 +448,7 @@ fn promise_static_all(
             index as u32,
             result_array,
             counter,
-            result_cap.clone(),
+            result_cap,
         );
 
         // Capability for this element's .then() chain.
@@ -557,7 +557,7 @@ fn promise_static_all_settled(
             index as u32,
             result_array,
             counter,
-            result_cap.clone(),
+            result_cap,
         );
         // §27.2.4.2.2: Per-element reject function creates { status: "rejected", reason }.
         let reject_element = runtime.objects_mut().alloc_promise_combinator_element(
@@ -565,7 +565,7 @@ fn promise_static_all_settled(
             index as u32,
             result_array,
             counter,
-            result_cap.clone(),
+            result_cap,
         );
 
         let cap = PromiseCapability {
@@ -642,7 +642,7 @@ fn promise_static_any(
             index as u32,
             errors_array,
             counter,
-            result_cap.clone(),
+            result_cap,
         );
 
         let cap = PromiseCapability {

@@ -67,17 +67,25 @@ pub(super) enum FunctionKind {
     Ordinary,
     Arrow,
     /// §27.3 Generator functions — `function*`.
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions>
     Generator,
     /// §27.7 Async functions — `async function`.
     /// Spec: <https://tc39.es/ecma262/#sec-async-function-definitions>
     Async,
     /// §27.7 Async arrow functions — `async () => {}`.
     AsyncArrow,
+    /// §27.6 Async generator functions — `async function*`.
+    /// Spec: <https://tc39.es/ecma262/#sec-async-generator-function-definitions>
+    AsyncGenerator,
 }
 
 impl FunctionKind {
     pub(super) fn is_async(self) -> bool {
-        matches!(self, Self::Async | Self::AsyncArrow)
+        matches!(self, Self::Async | Self::AsyncArrow | Self::AsyncGenerator)
+    }
+
+    pub(super) fn is_generator(self) -> bool {
+        matches!(self, Self::Generator | Self::AsyncGenerator)
     }
 }
 

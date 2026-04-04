@@ -175,6 +175,8 @@ pub enum HeapValueKind {
     FinalizationRegistry,
     /// ES2024 §27.5 Generator object.
     Generator,
+    /// ES2024 §27.6 AsyncGenerator object.
+    AsyncGenerator,
     /// ES2024 §25.1 ArrayBuffer object.
     ArrayBuffer,
     /// ES2024 §25.2 SharedArrayBuffer object.
@@ -401,6 +403,34 @@ pub enum GeneratorState {
     Executing,
     /// Completed (returned or threw).
     Completed,
+    /// §27.6 — Awaiting return (async generator only, waiting for AwaitReturn promise).
+    AwaitingReturn,
+}
+
+/// ES2024 §27.6.3.1 — AsyncGeneratorRequest record.
+/// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorrequest-records>
+///
+/// Each `.next(v)` / `.return(v)` / `.throw(v)` call on an async generator
+/// pushes one request into the queue. The generator processes them in FIFO order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AsyncGeneratorRequest {
+    /// The completion kind that initiated this request.
+    pub kind: AsyncGeneratorRequestKind,
+    /// The value passed to `.next(v)` / `.return(v)` / `.throw(v)`.
+    pub value: RegisterValue,
+    /// The promise to be resolved/rejected when this request completes.
+    pub promise: ObjectHandle,
+}
+
+/// The kind of operation that created an async generator request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGeneratorRequestKind {
+    /// `.next(value)`
+    Next,
+    /// `.return(value)`
+    Return,
+    /// `.throw(value)`
+    Throw,
 }
 
 /// ES2024 §10.2 — Closure function kind flags.
@@ -446,6 +476,14 @@ impl ClosureFlags {
     #[must_use]
     pub const fn async_fn() -> Self {
         Self(FLAG_ASYNC)
+    }
+
+    /// Async generator function — `async function*`.
+    /// §27.6 — no `[[Construct]]`, generator + async.
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgenerator-objects>
+    #[must_use]
+    pub const fn async_generator() -> Self {
+        Self(FLAG_GENERATOR | FLAG_ASYNC)
     }
 
     /// Async arrow function — no `[[Construct]]`, no own `this`, async body.
@@ -986,6 +1024,40 @@ enum HeapValue {
         resume_pc: ProgramCounter,
         /// Register index where the sent value should be written on resume.
         resume_register: u16,
+        /// §14.4.4 `yield*` — active delegation iterator, if any.
+        /// When set, `.next()/.return()/.throw()` are forwarded to this inner
+        /// iterator instead of resuming the generator body directly.
+        /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+        delegation_iterator: Option<ObjectHandle>,
+    },
+    /// ES2024 §27.6 — AsyncGenerator Objects.
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgenerator-objects>
+    ///
+    /// Like Generator but `.next()/.return()/.throw()` return Promises.
+    /// The request queue holds pending `{completion, capability}` pairs.
+    AsyncGenerator {
+        prototype: Option<ObjectHandle>,
+        /// The async generator's execution state.
+        state: GeneratorState,
+        /// Module containing the generator function's bytecode.
+        module: Module,
+        /// Function index within the module.
+        function_index: FunctionIndex,
+        /// Closure handle (if the async generator function was a closure).
+        closure_handle: Option<ObjectHandle>,
+        /// Arguments passed when the async generator function was called.
+        arguments: Vec<RegisterValue>,
+        /// Saved register window (captured at yield/await, restored on resume).
+        registers: Option<Box<[RegisterValue]>>,
+        /// Program counter to resume from.
+        resume_pc: ProgramCounter,
+        /// Register index where the sent value should be written on resume.
+        resume_register: u16,
+        /// §27.6.3.2 AsyncGeneratorRequest queue — pending `.next()/.return()/.throw()`.
+        /// Each entry holds `(kind, value, promise_handle)`.
+        queue: Vec<AsyncGeneratorRequest>,
+        /// §14.4.4 `yield*` — active delegation iterator, if any.
+        delegation_iterator: Option<ObjectHandle>,
     },
     /// ES2024 §27.2.1.5 — Internal resolve/reject function for a PromiseCapability.
     /// Spec: <https://tc39.es/ecma262/#sec-promise-resolve-functions>
@@ -1475,6 +1547,7 @@ impl Traceable for HeapValue {
                 prototype,
                 closure_handle,
                 registers,
+                delegation_iterator,
                 ..
             } => {
                 if let Some(p) = prototype {
@@ -1488,6 +1561,36 @@ impl Traceable for HeapValue {
                     for reg in regs.iter() {
                         trace_register_value(*reg, visitor);
                     }
+                }
+                if let Some(d) = delegation_iterator {
+                    trace_handle(*d, visitor);
+                }
+            }
+            HeapValue::AsyncGenerator {
+                prototype,
+                closure_handle,
+                registers,
+                queue,
+                delegation_iterator,
+                ..
+            } => {
+                if let Some(p) = prototype {
+                    trace_handle(*p, visitor);
+                }
+                if let Some(c) = closure_handle {
+                    trace_handle(*c, visitor);
+                }
+                if let Some(regs) = registers {
+                    for reg in regs.iter() {
+                        trace_register_value(*reg, visitor);
+                    }
+                }
+                for req in queue {
+                    trace_register_value(req.value, visitor);
+                    trace_handle(req.promise, visitor);
+                }
+                if let Some(d) = delegation_iterator {
+                    trace_handle(*d, visitor);
                 }
             }
             HeapValue::PromiseCapabilityFunction { promise, .. } => {
@@ -3076,6 +3179,7 @@ impl ObjectHeap {
             registers: None,
             resume_pc: 0,
             resume_register: 0,
+            delegation_iterator: None,
         });
         ObjectHandle(h.0)
     }
@@ -3149,6 +3253,228 @@ impl ObjectHeap {
     > {
         match self.object_mut(handle)? {
             HeapValue::Generator {
+                module,
+                function_index,
+                closure_handle,
+                arguments,
+                registers,
+                resume_pc,
+                resume_register,
+                state,
+                ..
+            } => {
+                *state = GeneratorState::Executing;
+                Ok((
+                    module.clone(),
+                    *function_index,
+                    *closure_handle,
+                    std::mem::take(arguments),
+                    registers.take(),
+                    *resume_pc,
+                    *resume_register,
+                ))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    // ─── yield* Delegation (§14.4.4) ─────────────────────────────────────
+
+    /// Returns the active delegation iterator for a generator (sync or async).
+    /// Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+    pub fn generator_delegation_iterator(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Generator {
+                delegation_iterator,
+                ..
+            }
+            | HeapValue::AsyncGenerator {
+                delegation_iterator,
+                ..
+            } => Ok(*delegation_iterator),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Sets the active delegation iterator for a generator.
+    pub fn set_generator_delegation_iterator(
+        &mut self,
+        handle: ObjectHandle,
+        iterator: Option<ObjectHandle>,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Generator {
+                delegation_iterator,
+                ..
+            }
+            | HeapValue::AsyncGenerator {
+                delegation_iterator,
+                ..
+            } => {
+                *delegation_iterator = iterator;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    // ─── Async Generator Objects (§27.6) ─────────────────────────────────
+
+    /// Allocates an async generator object in `SuspendedStart` state.
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorstart>
+    pub fn alloc_async_generator(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+        module: Module,
+        function_index: FunctionIndex,
+        closure_handle: Option<ObjectHandle>,
+        arguments: Vec<RegisterValue>,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::AsyncGenerator {
+            prototype,
+            state: GeneratorState::SuspendedStart,
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+            registers: None,
+            resume_pc: 0,
+            resume_register: 0,
+            queue: Vec::new(),
+            delegation_iterator: None,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the current async generator state.
+    pub fn async_generator_state(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<GeneratorState, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::AsyncGenerator { state, .. } => Ok(*state),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Sets the async generator state.
+    pub fn set_async_generator_state(
+        &mut self,
+        handle: ObjectHandle,
+        new_state: GeneratorState,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::AsyncGenerator { state, .. } => {
+                *state = new_state;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Pushes a request into the async generator's queue.
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgeneratorenqueue>
+    pub fn async_generator_enqueue(
+        &mut self,
+        handle: ObjectHandle,
+        request: AsyncGeneratorRequest,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::AsyncGenerator { queue, .. } => {
+                queue.push(request);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Peeks at the front request in the queue (without removing it).
+    pub fn async_generator_peek_request(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<AsyncGeneratorRequest>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::AsyncGenerator { queue, .. } => Ok(queue.first().copied()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Removes the front request from the queue.
+    pub fn async_generator_dequeue(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Option<AsyncGeneratorRequest>, ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::AsyncGenerator { queue, .. } => {
+                if queue.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(queue.remove(0)))
+                }
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns whether the async generator's request queue is empty.
+    pub fn async_generator_queue_is_empty(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::AsyncGenerator { queue, .. } => Ok(queue.is_empty()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Saves the register window and PC into the async generator for suspension.
+    pub fn async_generator_save_state(
+        &mut self,
+        handle: ObjectHandle,
+        saved_registers: Box<[RegisterValue]>,
+        pc: ProgramCounter,
+        resume_reg: u16,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::AsyncGenerator {
+                registers,
+                resume_pc,
+                resume_register,
+                state,
+                ..
+            } => {
+                *registers = Some(saved_registers);
+                *resume_pc = pc;
+                *resume_register = resume_reg;
+                *state = GeneratorState::SuspendedYield;
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Takes the saved state from an async generator, transitioning it to `Executing`.
+    #[allow(clippy::type_complexity)]
+    pub fn async_generator_take_state(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<
+        (
+            Module,
+            FunctionIndex,
+            Option<ObjectHandle>,
+            Vec<RegisterValue>,
+            Option<Box<[RegisterValue]>>,
+            ProgramCounter,
+            u16,
+        ),
+        ObjectError,
+    > {
+        match self.object_mut(handle)? {
+            HeapValue::AsyncGenerator {
                 module,
                 function_index,
                 closure_handle,
@@ -3452,7 +3778,7 @@ impl ObjectHeap {
                 *index,
                 *result_array,
                 *remaining_counter,
-                result_capability.clone(),
+                *result_capability,
                 *already_called,
             )),
             _ => None,
@@ -3533,6 +3859,7 @@ impl ObjectHeap {
             HeapValue::WeakRef { .. } => Ok(HeapValueKind::WeakRef),
             HeapValue::FinalizationRegistry { .. } => Ok(HeapValueKind::FinalizationRegistry),
             HeapValue::Generator { .. } => Ok(HeapValueKind::Generator),
+            HeapValue::AsyncGenerator { .. } => Ok(HeapValueKind::AsyncGenerator),
             HeapValue::ArrayBuffer { .. } => Ok(HeapValueKind::ArrayBuffer),
             HeapValue::SharedArrayBuffer { .. } => Ok(HeapValueKind::SharedArrayBuffer),
             HeapValue::RegExp { .. } => Ok(HeapValueKind::RegExp),
@@ -3564,6 +3891,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { prototype, .. }
             | HeapValue::FinalizationRegistry { prototype, .. }
             | HeapValue::Generator { prototype, .. }
+            | HeapValue::AsyncGenerator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
             | HeapValue::ArrayBuffer { prototype, .. }
             | HeapValue::SharedArrayBuffer { prototype, .. }
@@ -3674,6 +4002,9 @@ impl ObjectHeap {
             | HeapValue::Generator {
                 prototype: slot, ..
             }
+            | HeapValue::AsyncGenerator {
+                prototype: slot, ..
+            }
             | HeapValue::Promise {
                 prototype: slot, ..
             }
@@ -3738,6 +4069,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -3837,6 +4169,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -3917,6 +4250,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -4785,6 +5119,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -4823,6 +5158,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -4861,6 +5197,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -4917,6 +5254,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::ArrayBuffer { .. }
             | HeapValue::SharedArrayBuffer { .. }
             | HeapValue::DataView { .. }
@@ -5727,6 +6065,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::Proxy { .. }
             | HeapValue::BigInt { .. } => return Err(ObjectError::InvalidKind),
         } {
@@ -6544,6 +6883,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::Proxy { .. }
             | HeapValue::BigInt { .. } => {
                 return Err(ObjectError::InvalidKind);
@@ -7236,6 +7576,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { .. }
             | HeapValue::FinalizationRegistry { .. }
             | HeapValue::Generator { .. }
+            | HeapValue::AsyncGenerator { .. }
             | HeapValue::Promise { .. }
             | HeapValue::Proxy { .. } => return Ok(None),
         };
@@ -7270,6 +7611,7 @@ impl ObjectHeap {
             | HeapValue::WeakRef { prototype, .. }
             | HeapValue::FinalizationRegistry { prototype, .. }
             | HeapValue::Generator { prototype, .. }
+            | HeapValue::AsyncGenerator { prototype, .. }
             | HeapValue::Promise { prototype, .. }
             | HeapValue::ArrayBuffer { prototype, .. }
             | HeapValue::SharedArrayBuffer { prototype, .. }

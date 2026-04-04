@@ -38,10 +38,10 @@ fn eval(source: &str) -> String {
     if v.raw_bits() == otter_vm::value::RegisterValue::null().raw_bits() {
         return "null".to_string();
     }
-    if let Some(handle) = v.as_object_handle() {
-        if let Ok(Some(s)) = runtime.objects().string_value(ObjectHandle(handle)) {
-            return s.to_string();
-        }
+    if let Some(handle) = v.as_object_handle()
+        && let Ok(Some(s)) = runtime.objects().string_value(ObjectHandle(handle))
+    {
+        return s.to_string();
     }
     format!("{v:?}")
 }

@@ -671,6 +671,7 @@ fn object_to_string_tag(
         HeapValueKind::WeakRef => Ok("WeakRef"),
         HeapValueKind::FinalizationRegistry => Ok("FinalizationRegistry"),
         HeapValueKind::Generator => Ok("Generator"),
+        HeapValueKind::AsyncGenerator => Ok("AsyncGenerator"),
         HeapValueKind::ArrayBuffer => Ok("ArrayBuffer"),
         HeapValueKind::SharedArrayBuffer => Ok("SharedArrayBuffer"),
         HeapValueKind::RegExp => Ok("RegExp"),

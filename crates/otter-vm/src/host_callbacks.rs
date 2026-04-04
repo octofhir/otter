@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use crate::interpreter::RuntimeState;
@@ -95,10 +95,7 @@ impl HostCallbackQueue {
 
     pub fn wait_and_drain(&mut self, timeout: Option<Duration>) -> Vec<HostCallback> {
         let first = match timeout {
-            Some(timeout) => match self.receiver.recv_timeout(timeout) {
-                Ok(callback) => Some(callback),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-            },
+            Some(timeout) => self.receiver.recv_timeout(timeout).ok(),
             None => self.receiver.recv().ok(),
         };
 

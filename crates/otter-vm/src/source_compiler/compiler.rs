@@ -309,7 +309,9 @@ impl<'a> FunctionCompiler<'a> {
                         )
                     })?,
                 &extract_function_params(function)?,
-                if function.generator {
+                if function.generator && function.r#async {
+                    FunctionKind::AsyncGenerator
+                } else if function.generator {
                     FunctionKind::Generator
                 } else if function.r#async {
                     FunctionKind::Async
@@ -341,7 +343,13 @@ impl<'a> FunctionCompiler<'a> {
 
     pub(super) fn emit_hoisted_function_initializers(&mut self) -> Result<(), SourceLoweringError> {
         for pending in self.hoisted_functions.clone() {
-            if pending.is_generator {
+            if pending.is_generator && pending.is_async {
+                self.emit_new_closure_async_generator(
+                    pending.closure_register,
+                    pending.reserved,
+                    &pending.captures,
+                )?;
+            } else if pending.is_generator {
                 self.emit_new_closure_generator(
                     pending.closure_register,
                     pending.reserved,
@@ -405,7 +413,7 @@ impl<'a> FunctionCompiler<'a> {
             )
             .with_strict(self.strict_mode)
             .with_derived_constructor(self.is_derived_constructor)
-            .with_generator(self.kind == FunctionKind::Generator)
+            .with_generator(self.kind.is_generator())
             .with_async(self.kind.is_async()),
             captures: self.captures,
         })
@@ -1138,12 +1146,12 @@ impl<'a> FunctionCompiler<'a> {
         let function = &method.value;
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
-        let kind = if method.value.r#async {
-            super::shared::FunctionKind::Async
+        let kind = if method.value.generator && method.value.r#async {
+            super::shared::FunctionKind::AsyncGenerator
         } else if method.value.generator {
-            return Err(SourceLoweringError::Unsupported(
-                "generator private class methods".to_string(),
-            ));
+            super::shared::FunctionKind::Generator
+        } else if method.value.r#async {
+            super::shared::FunctionKind::Async
         } else {
             super::shared::FunctionKind::Ordinary
         };
@@ -1167,7 +1175,19 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let method_closure = ValueLocation::temp(self.alloc_temp());
-        if kind.is_async() {
+        if kind.is_generator() && kind.is_async() {
+            self.emit_new_closure_async_generator(
+                method_closure.register,
+                reserved,
+                &compiled.captures,
+            )?;
+        } else if kind.is_generator() {
+            self.emit_new_closure_generator(
+                method_closure.register,
+                reserved,
+                &compiled.captures,
+            )?;
+        } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
             self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
@@ -1405,12 +1425,12 @@ impl<'a> FunctionCompiler<'a> {
         let function = &method.value;
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
-        let kind = if method.value.r#async {
-            super::shared::FunctionKind::Async
+        let kind = if method.value.generator && method.value.r#async {
+            super::shared::FunctionKind::AsyncGenerator
         } else if method.value.generator {
-            return Err(SourceLoweringError::Unsupported(
-                "generator class methods".to_string(),
-            ));
+            super::shared::FunctionKind::Generator
+        } else if method.value.r#async {
+            super::shared::FunctionKind::Async
         } else {
             super::shared::FunctionKind::Ordinary
         };
@@ -1434,7 +1454,19 @@ impl<'a> FunctionCompiler<'a> {
         module.set_function(reserved, compiled.function);
 
         let method_closure = ValueLocation::temp(self.alloc_temp());
-        if kind.is_async() {
+        if kind.is_generator() && kind.is_async() {
+            self.emit_new_closure_async_generator(
+                method_closure.register,
+                reserved,
+                &compiled.captures,
+            )?;
+        } else if kind.is_generator() {
+            self.emit_new_closure_generator(
+                method_closure.register,
+                reserved,
+                &compiled.captures,
+            )?;
+        } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
             self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
@@ -2006,6 +2038,22 @@ impl<'a> FunctionCompiler<'a> {
         )
     }
 
+    /// §27.6 Async generator closure — `async function*`.
+    /// Spec: <https://tc39.es/ecma262/#sec-asyncgenerator-objects>
+    pub(super) fn emit_new_closure_async_generator(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::async_generator(),
+        )
+    }
+
     pub(super) fn emit_new_closure_async_arrow(
         &mut self,
         destination: BytecodeRegister,
@@ -2400,7 +2448,8 @@ impl<'a> FunctionCompiler<'a> {
             | FunctionKind::Arrow
             | FunctionKind::Generator
             | FunctionKind::Async
-            | FunctionKind::AsyncArrow => self.load_undefined()?,
+            | FunctionKind::AsyncArrow
+            | FunctionKind::AsyncGenerator => self.load_undefined()?,
         };
         self.instructions.push(Instruction::ret(value.register));
         self.release(value);

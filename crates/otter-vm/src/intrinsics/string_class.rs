@@ -159,6 +159,8 @@ fn string_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("replace", 2, string_replace))
         .with_binding(proto("replaceAll", 2, string_replace_all))
         .with_binding(proto("normalize", 0, string_normalize))
+        .with_binding(proto("isWellFormed", 0, string_is_well_formed))
+        .with_binding(proto("toWellFormed", 0, string_to_well_formed))
         .with_binding(proto("localeCompare", 1, string_locale_compare))
         .with_binding(proto("toLocaleLowerCase", 0, string_to_locale_lower_case))
         .with_binding(proto("toLocaleUpperCase", 0, string_to_locale_upper_case))
@@ -1314,6 +1316,56 @@ fn string_normalize(
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
+/// Get the raw `JsString` from `this` — preserves lone surrogates.
+fn this_js_string_value(
+    this: &RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<crate::js_string::JsString, VmNativeCallError> {
+    if let Some(handle) = this.as_object_handle().map(crate::object::ObjectHandle) {
+        if let Ok(Some(js)) = runtime.objects().string_value(handle) {
+            return Ok(js.clone());
+        }
+        // Check for String wrapper object (__otter_string_data__ slot).
+        let str_prop = runtime.intern_property_name("__otter_string_data__");
+        if let Ok(Some(lookup)) = runtime.property_lookup(handle, str_prop)
+            && let crate::object::PropertyValue::Data { value: v, .. } = lookup.value()
+            && let Some(inner_h) = v.as_object_handle().map(crate::object::ObjectHandle)
+            && let Ok(Some(js)) = runtime.objects().string_value(inner_h)
+        {
+            return Ok(js.clone());
+        }
+    }
+    // Fallback: coerce via js_to_string (lossy for lone surrogates)
+    let s = this_string_value(this, runtime)?;
+    Ok(crate::js_string::JsString::from_str(&s))
+}
+
+// ── §22.1.3.9 String.prototype.isWellFormed() ───────────────────────────────
+// Spec: <https://tc39.es/ecma262/#sec-string.prototype.iswellformed>
+
+fn string_is_well_formed(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let js = this_js_string_value(this, runtime)?;
+    Ok(RegisterValue::from_bool(js.is_well_formed()))
+}
+
+// ── §22.1.3.33 String.prototype.toWellFormed() ─────────────────────────────
+// Spec: <https://tc39.es/ecma262/#sec-string.prototype.towellformed>
+
+fn string_to_well_formed(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let js = this_js_string_value(this, runtime)?;
+    let result = js.to_well_formed();
+    let handle = runtime.alloc_js_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
 // ── §22.1.3.11 String.prototype.localeCompare(that [, locales [, options]]) ──
 //
 // ECMA-402 §18.1.1: <https://tc39.es/ecma402/#sup-string.prototype.localecompare>
@@ -1584,13 +1636,13 @@ fn string_raw(
         result.push_str(&segment);
 
         // Step 7.b: If i + 1 < literalSegments, append ToString(substitutions[i]).
-        if i + 1 < literal_segments {
-            if let Some(&sub) = substitutions.get(i) {
-                let sub_str = runtime
-                    .js_to_string(sub)
-                    .map_err(|e| map_interpreter_error(e, runtime))?;
-                result.push_str(&sub_str);
-            }
+        if i + 1 < literal_segments
+            && let Some(&sub) = substitutions.get(i)
+        {
+            let sub_str = runtime
+                .js_to_string(sub)
+                .map_err(|e| map_interpreter_error(e, runtime))?;
+            result.push_str(&sub_str);
         }
     }
 

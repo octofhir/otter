@@ -1002,7 +1002,7 @@ fn date_constructor(
                 let prim = to_primitive_default(args[0], runtime)?;
                 if let Some(handle) = prim.as_object_handle().map(ObjectHandle) {
                     if let Ok(Some(s)) = runtime.objects().string_value(handle) {
-                        time_clip(parse_date_string(s))
+                        time_clip(parse_date_string(&s.to_rust_string()))
                     } else {
                         let n = to_number(prim, runtime)?;
                         time_clip(n)

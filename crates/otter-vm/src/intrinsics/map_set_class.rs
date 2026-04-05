@@ -991,19 +991,20 @@ fn same_value_zero_with_runtime(
         return true;
     }
     // Both NaN → true.
-    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
-        if a.is_nan() && b.is_nan() {
-            return true;
-        }
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number())
+        && a.is_nan()
+        && b.is_nan()
+    {
+        return true;
     }
     // String content comparison (different handles, same content).
-    if let (Some(xh), Some(yh)) = (x.as_object_handle(), y.as_object_handle()) {
-        if let (Ok(Some(xs)), Ok(Some(ys))) = (
+    if let (Some(xh), Some(yh)) = (x.as_object_handle(), y.as_object_handle())
+        && let (Ok(Some(xs)), Ok(Some(ys))) = (
             runtime.objects().string_value(ObjectHandle(xh)),
             runtime.objects().string_value(ObjectHandle(yh)),
-        ) {
-            return xs == ys;
-        }
+        )
+    {
+        return xs == ys;
     }
     false
 }

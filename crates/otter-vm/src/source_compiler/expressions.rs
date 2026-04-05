@@ -34,7 +34,13 @@ impl<'a> FunctionCompiler<'a> {
             Expression::BooleanLiteral(literal) => self.compile_bool(literal.value),
             Expression::NullLiteral(_) => self.load_null(),
             Expression::StringLiteral(literal) => {
-                self.compile_string_literal(literal.value.as_str())
+                if literal.lone_surrogates {
+                    self.compile_js_string_literal(
+                        crate::js_string::JsString::from_oxc_encoded(literal.value.as_str()),
+                    )
+                } else {
+                    self.compile_string_literal(literal.value.as_str())
+                }
             }
             Expression::ThisExpression(_) => self.compile_this_expression(),
             Expression::ArrayExpression(array) => self.compile_array_expression(array, module),
@@ -181,6 +187,18 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ValueLocation, SourceLoweringError> {
         let register = self.alloc_temp();
         let string_id = self.intern_string(value)?;
+        self.instructions
+            .push(Instruction::load_string(register, string_id));
+        Ok(ValueLocation::temp(register))
+    }
+
+    /// Compiles a string literal with lone surrogates (WTF-16) from oxc.
+    pub(super) fn compile_js_string_literal(
+        &mut self,
+        value: crate::js_string::JsString,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let register = self.alloc_temp();
+        let string_id = self.intern_js_string(value)?;
         self.instructions
             .push(Instruction::load_string(register, string_id));
         Ok(ValueLocation::temp(register))

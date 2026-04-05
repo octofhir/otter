@@ -692,7 +692,7 @@ impl RuntimeState {
         let Some(string) = self.objects.string_value(string_handle)? else {
             return Ok(keys);
         };
-        let length = string.chars().count();
+        let length = string.len();
         let mut result = Vec::with_capacity(length.saturating_add(1).saturating_add(keys.len()));
         for index in 0..length {
             result.push(self.property_names.intern(&index.to_string()));
@@ -890,12 +890,42 @@ impl RuntimeState {
                 _ => crate::object::IteratorStep::done(),
             }
         } else {
-            match self
-                .objects
-                .get_index(cursor.iterable(), cursor.next_index())?
-            {
-                Some(value) => crate::object::IteratorStep::yield_value(value),
-                None => crate::object::IteratorStep::done(),
+            // §22.1.5.2.1 %StringIteratorPrototype%.next() — yield code points.
+            // Surrogate pairs yield a single 2-unit string.
+            let iterable = cursor.iterable();
+            let idx = cursor.next_index();
+            if let Ok(Some(js_str)) = self.objects.string_value(iterable).map(|o| o.cloned()) {
+                let utf16 = js_str.as_utf16();
+                if idx >= utf16.len() {
+                    crate::object::IteratorStep::done()
+                } else {
+                    let (_, advance) = js_str
+                        .code_point_at(idx)
+                        .unwrap_or((utf16[idx] as u32, 1));
+                    let ch_units = utf16[idx..idx + advance].to_vec();
+                    let ch_str = crate::js_string::JsString::from_utf16(ch_units);
+                    let str_handle = self.objects.alloc_js_string(ch_str);
+                    // Set prototype for the new string.
+                    let proto = self.intrinsics.string_prototype();
+                    self.objects
+                        .set_prototype(str_handle, Some(proto))
+                        .ok();
+                    let step = crate::object::IteratorStep::yield_value(
+                        RegisterValue::from_object_handle(str_handle.0),
+                    );
+                    // Advance extra for surrogate pairs (advance-1 beyond the +1 below).
+                    if advance > 1 {
+                        for _ in 1..advance {
+                            self.objects.advance_iterator_cursor(handle, false)?;
+                        }
+                    }
+                    step
+                }
+            } else {
+                match self.objects.get_index(iterable, idx)? {
+                    Some(value) => crate::object::IteratorStep::yield_value(value),
+                    None => crate::object::IteratorStep::done(),
+                }
             }
         };
 
@@ -960,7 +990,7 @@ impl RuntimeState {
 
         if property_name == "length" {
             return Ok(Some(PropertyValue::data_with_attrs(
-                RegisterValue::from_i32(i32::try_from(string.chars().count()).unwrap_or(i32::MAX)),
+                RegisterValue::from_i32(i32::try_from(string.len()).unwrap_or(i32::MAX)),
                 PropertyAttributes::from_flags(false, false, false),
             )));
         }
@@ -968,11 +998,11 @@ impl RuntimeState {
         let Some(index) = canonical_string_exotic_index(property_name) else {
             return Ok(None);
         };
-        let Some(character) = string.chars().nth(index) else {
+        let Some(unit) = string.code_unit_at(index) else {
             return Ok(None);
         };
 
-        let character = self.alloc_string(character.to_string());
+        let character = self.alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]));
         Ok(Some(PropertyValue::data_with_attrs(
             RegisterValue::from_object_handle(character.0),
             PropertyAttributes::from_flags(false, true, false),
@@ -1989,6 +2019,18 @@ impl RuntimeState {
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
         let prototype = self.intrinsics.string_prototype();
         let handle = self.objects.alloc_string(value);
+        self.objects
+            .set_prototype(handle, Some(prototype))
+            .expect("string prototype should exist");
+        handle
+    }
+
+    /// Allocates a string from a WTF-16 `JsString` with the runtime default prototype.
+    ///
+    /// Preserves lone surrogates as-is.
+    pub fn alloc_js_string(&mut self, value: crate::js_string::JsString) -> ObjectHandle {
+        let prototype = self.intrinsics.string_prototype();
+        let handle = self.objects.alloc_js_string(value);
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("string prototype should exist");
@@ -3432,7 +3474,7 @@ impl RuntimeState {
         }
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             if let Some(string) = self.objects.string_value(handle)? {
-                return Ok(parse_string_to_number(string));
+                return Ok(parse_string_to_number(&string.to_rust_string()));
             }
             let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)?;
             if primitive != value {
@@ -5389,7 +5431,7 @@ impl Interpreter {
             }
             Opcode::LoadString => {
                 let string = Self::resolve_string_literal(function, instruction.b())?;
-                let handle = runtime.alloc_string(string);
+                let handle = runtime.alloc_js_string(string);
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -8206,10 +8248,11 @@ impl Interpreter {
     fn resolve_string_literal(
         function: &Function,
         raw_id: RegisterIndex,
-    ) -> Result<&str, InterpreterError> {
+    ) -> Result<crate::js_string::JsString, InterpreterError> {
         function
             .string_literals()
-            .get(StringId(raw_id))
+            .get_js(StringId(raw_id))
+            .cloned()
             .ok_or(InterpreterError::UnknownStringLiteral)
     }
 

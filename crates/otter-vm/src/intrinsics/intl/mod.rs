@@ -537,7 +537,7 @@ pub(crate) fn canonicalize_locale_list_from_value(
     if let Some(handle) = value.as_object_handle() {
         let h = crate::object::ObjectHandle(handle);
         if let Ok(Some(s)) = runtime.objects().string_value(h) {
-            let tag = locale_utils::canonicalize_locale_tag(s)
+            let tag = locale_utils::canonicalize_locale_tag(&s.to_rust_string())
                 .map_err(|_| alloc_range_error_thrown(runtime, "Invalid language tag"))?;
             return Ok(vec![tag]);
         }

@@ -390,7 +390,7 @@ impl<'a> FunctionCompiler<'a> {
         let tables = FunctionTables::new(
             FunctionSideTables::new(
                 PropertyNameTable::new(self.property_names),
-                StringTable::new(self.string_literals),
+                StringTable::new_js(self.string_literals),
                 FloatTable::new(self.float_constants),
                 crate::bigint::BigIntTable::new(self.bigint_constants),
                 ClosureTable::new(self.closure_templates),
@@ -2495,8 +2495,36 @@ impl<'a> FunctionCompiler<'a> {
                 .map_err(|_| SourceLoweringError::TooManyLocals)?,
         );
         self.string_literals
-            .push(value.to_string().into_boxed_str());
+            .push(crate::js_string::JsString::from_str(value));
         self.string_ids.insert(value.to_string(), id);
+        Ok(id)
+    }
+
+    /// Interns a `JsString` (WTF-16) literal, preserving lone surrogates.
+    pub(super) fn intern_js_string(
+        &mut self,
+        value: crate::js_string::JsString,
+    ) -> Result<StringId, SourceLoweringError> {
+        // For dedup, use a lossless key: format UTF-16 code units as hex.
+        // This avoids collisions like 0xD800 vs 0xFFFD which both produce
+        // the same lossy UTF-8 string (U+FFFD).
+        let key = value
+            .as_utf16()
+            .iter()
+            .map(|u| format!("{u:04x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let key = format!("wtf16:{key}");
+        if let Some(existing) = self.string_ids.get(&key).copied() {
+            return Ok(existing);
+        }
+
+        let id = StringId(
+            u16::try_from(self.string_literals.len())
+                .map_err(|_| SourceLoweringError::TooManyLocals)?,
+        );
+        self.string_literals.push(value);
+        self.string_ids.insert(key, id);
         Ok(id)
     }
 

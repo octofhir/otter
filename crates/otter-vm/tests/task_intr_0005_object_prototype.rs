@@ -45,8 +45,8 @@ fn execute_test262_basic_without_throw(source: &str, source_url: &str) -> Result
                 .objects()
                 .string_value(handle)
                 .expect("thrown string lookup should succeed")
-                .unwrap_or("<non-string>")
-                .to_string();
+                .map(|s| s.to_rust_string())
+                .unwrap_or_else(|| "<non-string>".to_string());
             Err(message)
         }
         Err(error) => Err(error.to_string()),

@@ -369,5 +369,21 @@ fn error_constructor(
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     }
 
+    // §20.5.1.1 step 5: InstallErrorCause(O, options)
+    // Spec: <https://tc39.es/ecma262/#sec-installerrorcause>
+    if let Some(options) = args.get(1)
+        && let Some(opts_handle) = options.as_object_handle().map(ObjectHandle)
+    {
+        let cause_prop = runtime.intern_property_name("cause");
+        if let Ok(Some(lookup)) = runtime.property_lookup(opts_handle, cause_prop)
+            && let crate::object::PropertyValue::Data { value, .. } = lookup.value()
+        {
+            runtime
+                .objects_mut()
+                .set_property(handle, cause_prop, value)
+                .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        }
+    }
+
     Ok(*this)
 }

@@ -6,6 +6,7 @@ use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
 
 use crate::bytecode::ProgramCounter;
 use crate::host::HostFunctionId;
+use crate::js_string::JsString;
 use crate::module::FunctionIndex;
 use crate::module::Module;
 use crate::payload::NativePayloadId;
@@ -866,7 +867,7 @@ enum HeapValue {
     },
     String {
         prototype: Option<ObjectHandle>,
-        value: Box<str>,
+        value: JsString,
     },
     Closure {
         prototype: Option<ObjectHandle>,
@@ -3500,11 +3501,27 @@ impl ObjectHeap {
         }
     }
 
-    /// Allocates a string value.
+    /// Allocates a string value from UTF-8 input.
+    ///
+    /// The UTF-8 input is converted to WTF-16 (UTF-16 code units) for storage.
+    /// For strings that may contain lone surrogates, use [`alloc_js_string`].
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
+        let s: Box<str> = value.into();
+        let js = JsString::from_str(&s);
         let h = self.heap.alloc(HeapValue::String {
             prototype: None,
-            value: value.into(),
+            value: js,
+        });
+        ObjectHandle(h.0)
+    }
+
+    /// Allocates a string value from a `JsString` (WTF-16).
+    ///
+    /// Preserves lone surrogates as-is — no validation or replacement.
+    pub fn alloc_js_string(&mut self, value: JsString) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::String {
+            prototype: None,
+            value,
         });
         ObjectHandle(h.0)
     }
@@ -4082,7 +4099,7 @@ impl ObjectHeap {
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
             )),
             HeapValue::String { value, .. } if property_name == "length" => Ok(Some(
-                RegisterValue::from_i32(i32::try_from(value.chars().count()).unwrap_or(i32::MAX)),
+                RegisterValue::from_i32(i32::try_from(value.len()).unwrap_or(i32::MAX)),
             )),
             HeapValue::Array { .. } | HeapValue::String { .. } => Ok(None),
         }
@@ -4134,13 +4151,12 @@ impl ObjectHeap {
                 Ok(Some(value))
             }
             HeapValue::String { value, .. } => {
-                let character = value
-                    .chars()
-                    .nth(index)
-                    .map(|ch| ch.to_string().into_boxed_str());
-                match character {
-                    Some(character) => {
-                        let handle = self.alloc_string(character);
+                // §22.1.3.2 — String indexing returns single UTF-16 code unit
+                let code_unit = value.code_unit_at(index);
+                match code_unit {
+                    Some(unit) => {
+                        let ch_str = JsString::from_utf16(vec![unit]);
+                        let handle = self.alloc_js_string(ch_str);
                         Ok(Some(RegisterValue::from_object_handle(handle.0)))
                     }
                     None => Ok(None),
@@ -4480,6 +4496,7 @@ impl ObjectHeap {
             return Ok(IteratorStep::done());
         }
 
+        let mut string_extra_advance: usize = 0;
         let step = match kind {
             IteratorKind::Array => match self.array_length(iterable)? {
                 Some(length) if next_index < length => {
@@ -4490,10 +4507,28 @@ impl ObjectHeap {
                 }
                 _ => IteratorStep::done(),
             },
-            IteratorKind::String => match self.get_index(iterable, next_index)? {
-                Some(value) => IteratorStep::yield_value(value),
-                None => IteratorStep::done(),
-            },
+            IteratorKind::String => {
+                // §22.1.5.2.1 %StringIteratorPrototype%.next() — yield code points,
+                // not individual code units. Surrogate pairs yield a single 2-unit string.
+                // Spec: <https://tc39.es/ecma262/#sec-%stringiteratorprototype%.next>
+                let Some(js_str) = self.string_value(iterable)?.cloned() else {
+                    return Ok(IteratorStep::done());
+                };
+                let utf16 = js_str.as_utf16();
+                if next_index >= utf16.len() {
+                    IteratorStep::done()
+                } else {
+                    let (_, advance) = js_str
+                        .code_point_at(next_index)
+                        .unwrap_or((utf16[next_index] as u32, 1));
+                    let ch_units = utf16[next_index..next_index + advance].to_vec();
+                    let ch_str = JsString::from_utf16(ch_units);
+                    let str_handle = self.alloc_js_string(ch_str);
+                    // Store extra advance for the post-step block (advance-1 extra beyond +1)
+                    string_extra_advance = advance.saturating_sub(1);
+                    IteratorStep::yield_value(RegisterValue::from_object_handle(str_handle.0))
+                }
+            }
         };
 
         match self.object_mut(handle)? {
@@ -4506,7 +4541,7 @@ impl ObjectHeap {
                 if step.is_done() {
                     *closed = true;
                 } else {
-                    *next_index = next_index.wrapping_add(1);
+                    *next_index = next_index.wrapping_add(1 + string_extra_advance);
                 }
             }
             _ => return Err(ObjectError::InvalidKind),
@@ -5169,8 +5204,11 @@ impl ObjectHeap {
         }
     }
 
-    /// Returns the borrowed string contents for string heap values.
-    pub fn string_value(&self, handle: ObjectHandle) -> Result<Option<&str>, ObjectError> {
+    /// Returns the WTF-16 string contents for string heap values.
+    ///
+    /// Returns a reference to the internal `JsString` which stores UTF-16
+    /// code units (including lone surrogates).
+    pub fn string_value(&self, handle: ObjectHandle) -> Result<Option<&JsString>, ObjectError> {
         match self.object(handle)? {
             HeapValue::String { value, .. } => Ok(Some(value)),
             HeapValue::Object { .. }
@@ -6254,7 +6292,7 @@ impl ObjectHeap {
                 Ok(result)
             }
             HeapValue::String { value, .. } => {
-                let length = value.chars().count();
+                let length = value.len();
                 let mut keys = Vec::with_capacity(length.saturating_add(1));
                 for index in 0..length {
                     let name = index.to_string();
@@ -7548,7 +7586,7 @@ impl ObjectHeap {
                     return Ok(Some((
                         PropertyValue::data_with_attrs(
                             RegisterValue::from_i32(
-                                i32::try_from(value.chars().count()).unwrap_or(i32::MAX),
+                                i32::try_from(value.len()).unwrap_or(i32::MAX),
                             ),
                             PropertyAttributes::from_flags(false, false, false),
                         ),

@@ -523,7 +523,7 @@ fn stringify_value(
 
     // String values.
     if let Ok(Some(s)) = runtime.objects().string_value(handle) {
-        escape_json_string(s, out);
+        escape_json_string(&s.to_rust_string(), out);
         return Ok(true);
     }
 

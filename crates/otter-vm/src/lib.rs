@@ -51,6 +51,8 @@ pub mod host_callbacks;
 pub mod interpreter;
 /// Runtime-owned intrinsic registry and root model.
 pub mod intrinsics;
+/// §6.1.4 — WTF-16 JavaScript string type.
+pub mod js_string;
 /// JIT-facing ABI surface.
 pub mod jit_abi;
 /// Tiny lowering bridge from structured subset to bytecode/module form.

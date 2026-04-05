@@ -137,7 +137,7 @@ pub(super) struct FunctionCompiler<'a> {
     pub(super) instructions: Vec<Instruction>,
     pub(super) property_names: Vec<Box<str>>,
     pub(super) property_name_ids: BTreeMap<String, PropertyNameId>,
-    pub(super) string_literals: Vec<Box<str>>,
+    pub(super) string_literals: Vec<crate::js_string::JsString>,
     pub(super) string_ids: BTreeMap<String, StringId>,
     pub(super) float_constants: Vec<f64>,
     pub(super) bigint_constants: Vec<Box<str>>,

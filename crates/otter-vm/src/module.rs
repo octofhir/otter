@@ -668,7 +668,7 @@ mod tests {
         );
         assert_eq!(
             function.string_literals().get(crate::string::StringId(0)),
-            Some("otter")
+            Some("otter".to_string())
         );
         assert_eq!(
             function.calls().get_direct(0),

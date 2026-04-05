@@ -30,6 +30,16 @@ num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 temporal_rs = { version = "0.2.3", features = ["sys-local"] }
+unicode-normalization = "0.1"
+fixed_decimal = { version = "0.7.1", features = ["ryu"] }
+icu_decimal = "2.1.1"
+icu_locale = "2.1.1"
+writeable = "0.6.2"
+icu_collator = "2.1"
+icu_plurals = "2.1"
+icu_datetime = "2.1"
+icu_calendar = "2.1"
+icu_time = "2.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }

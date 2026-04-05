@@ -3837,6 +3837,20 @@ impl RuntimeState {
         Ok(handle)
     }
 
+    /// Allocates one RangeError instance with the given message.
+    pub fn alloc_range_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
+        let prototype = self.intrinsics.range_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let msg_handle = self.objects.alloc_string(message);
+        let msg_prop = self.intern_property_name("message");
+        self.objects.set_property(
+            handle,
+            msg_prop,
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
+        Ok(handle)
+    }
+
     /// Creates a { status: "...", [value_key]: value } object for Promise.allSettled.
     /// ES2024 §27.2.4.2.1–2
     pub fn alloc_settled_result_object(

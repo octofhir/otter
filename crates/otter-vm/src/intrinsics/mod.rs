@@ -31,6 +31,7 @@ mod sharedarraybuffer_class;
 mod species_support;
 mod string_class;
 mod symbol_class;
+mod intl;
 mod temporal;
 pub(crate) mod timer_globals;
 pub(crate) mod typedarray_class;
@@ -333,6 +334,18 @@ pub struct VmIntrinsics {
     // RegExp (§22.2)
     pub(crate) regexp_constructor: ObjectHandle,
     pub(crate) regexp_prototype: ObjectHandle,
+    // Intl (ECMA-402)
+    pub(crate) intl_namespace: ObjectHandle,
+    pub(crate) intl_collator_constructor: ObjectHandle,
+    pub(crate) intl_collator_prototype: ObjectHandle,
+    pub(crate) intl_number_format_constructor: ObjectHandle,
+    pub(crate) intl_number_format_prototype: ObjectHandle,
+    pub(crate) intl_plural_rules_constructor: ObjectHandle,
+    pub(crate) intl_plural_rules_prototype: ObjectHandle,
+    pub(crate) intl_locale_constructor: ObjectHandle,
+    pub(crate) intl_locale_prototype: ObjectHandle,
+    pub(crate) intl_date_time_format_constructor: ObjectHandle,
+    pub(crate) intl_date_time_format_prototype: ObjectHandle,
     // Temporal (proposal-temporal, Stage 4)
     pub(crate) temporal_namespace: ObjectHandle,
     pub(crate) temporal_instant_constructor: ObjectHandle,
@@ -448,6 +461,18 @@ impl VmIntrinsics {
         let async_generator_prototype = heap.alloc_object();
         let regexp_constructor = heap.alloc_object();
         let regexp_prototype = heap.alloc_object();
+        // Intl (ECMA-402)
+        let intl_namespace = heap.alloc_object();
+        let intl_collator_constructor = heap.alloc_object();
+        let intl_collator_prototype = heap.alloc_object();
+        let intl_number_format_constructor = heap.alloc_object();
+        let intl_number_format_prototype = heap.alloc_object();
+        let intl_plural_rules_constructor = heap.alloc_object();
+        let intl_plural_rules_prototype = heap.alloc_object();
+        let intl_locale_constructor = heap.alloc_object();
+        let intl_locale_prototype = heap.alloc_object();
+        let intl_date_time_format_constructor = heap.alloc_object();
+        let intl_date_time_format_prototype = heap.alloc_object();
         // Temporal (proposal-temporal)
         let temporal_namespace = heap.alloc_object();
         let temporal_instant_constructor = heap.alloc_object();
@@ -582,6 +607,17 @@ impl VmIntrinsics {
             async_generator_prototype,
             regexp_constructor,
             regexp_prototype,
+            intl_namespace,
+            intl_collator_constructor,
+            intl_collator_prototype,
+            intl_number_format_constructor,
+            intl_number_format_prototype,
+            intl_plural_rules_constructor,
+            intl_plural_rules_prototype,
+            intl_locale_constructor,
+            intl_locale_prototype,
+            intl_date_time_format_constructor,
+            intl_date_time_format_prototype,
             temporal_namespace,
             temporal_instant_constructor,
             temporal_instant_prototype,
@@ -726,6 +762,26 @@ impl VmIntrinsics {
         // RegExp (§22.2): RegExp.prototype → Object.prototype
         heap.set_prototype(self.regexp_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.regexp_prototype, Some(self.object_prototype))?;
+        // Intl (ECMA-402): namespace → Object.prototype, constructors → Function.prototype, prototypes → Object.prototype.
+        heap.set_prototype(self.intl_namespace, Some(self.object_prototype))?;
+        for ctor in [
+            self.intl_collator_constructor,
+            self.intl_number_format_constructor,
+            self.intl_plural_rules_constructor,
+            self.intl_locale_constructor,
+            self.intl_date_time_format_constructor,
+        ] {
+            heap.set_prototype(ctor, Some(self.function_prototype))?;
+        }
+        for proto in [
+            self.intl_collator_prototype,
+            self.intl_number_format_prototype,
+            self.intl_plural_rules_prototype,
+            self.intl_locale_prototype,
+            self.intl_date_time_format_prototype,
+        ] {
+            heap.set_prototype(proto, Some(self.object_prototype))?;
+        }
         // Temporal (proposal-temporal): namespace → Object.prototype,
         // each constructor → Function.prototype, each prototype → Object.prototype.
         heap.set_prototype(self.temporal_namespace, Some(self.object_prototype))?;
@@ -1243,6 +1299,31 @@ impl VmIntrinsics {
         self.temporal_namespace
     }
 
+    #[must_use]
+    pub const fn intl_collator_prototype(&self) -> ObjectHandle {
+        self.intl_collator_prototype
+    }
+
+    #[must_use]
+    pub const fn intl_number_format_prototype(&self) -> ObjectHandle {
+        self.intl_number_format_prototype
+    }
+
+    #[must_use]
+    pub const fn intl_plural_rules_prototype(&self) -> ObjectHandle {
+        self.intl_plural_rules_prototype
+    }
+
+    #[must_use]
+    pub const fn intl_locale_prototype(&self) -> ObjectHandle {
+        self.intl_locale_prototype
+    }
+
+    #[must_use]
+    pub const fn intl_date_time_format_prototype(&self) -> ObjectHandle {
+        self.intl_date_time_format_prototype
+    }
+
     /// Returns `%Temporal.Instant.prototype%`.
     #[must_use]
     pub const fn temporal_instant_prototype(&self) -> ObjectHandle {
@@ -1510,6 +1591,17 @@ impl VmIntrinsics {
             self.proxy_constructor,
             self.generator_function_prototype,
             self.generator_prototype,
+            self.intl_namespace,
+            self.intl_collator_constructor,
+            self.intl_collator_prototype,
+            self.intl_number_format_constructor,
+            self.intl_number_format_prototype,
+            self.intl_plural_rules_constructor,
+            self.intl_plural_rules_prototype,
+            self.intl_locale_constructor,
+            self.intl_locale_prototype,
+            self.intl_date_time_format_constructor,
+            self.intl_date_time_format_prototype,
             self.temporal_namespace,
             self.temporal_instant_constructor,
             self.temporal_instant_prototype,
@@ -1541,7 +1633,7 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 28] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 29] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1568,6 +1660,7 @@ fn core_installers() -> [&'static dyn IntrinsicInstaller; 28] {
         &species_support::SPECIES_SUPPORT_INTRINSIC as &dyn IntrinsicInstaller,
         &symbol_class::SYMBOL_INTRINSIC as &dyn IntrinsicInstaller,
         &string_class::STRING_INTRINSIC as &dyn IntrinsicInstaller,
+        &intl::INTL_INTRINSIC as &dyn IntrinsicInstaller,
         &temporal::TEMPORAL_INTRINSIC as &dyn IntrinsicInstaller,
         &typedarray_class::TYPED_ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &weakmap_weakset_class::WEAKMAP_WEAKSET_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1665,7 +1758,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 609);
+        assert_eq!(native_functions.len(), 615);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

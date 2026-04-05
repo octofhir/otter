@@ -137,7 +137,8 @@ impl IntrinsicInstaller for IntlIntrinsic {
                 segmenter::segments_symbol_iterator,
             );
             let host_id = cx.native_functions.register(desc);
-            let handle = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+            let handle =
+                cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
             cx.heap.define_own_property(
                 intrinsics.intl_segments_prototype,
                 iter_sym,
@@ -168,7 +169,8 @@ impl IntrinsicInstaller for IntlIntrinsic {
                 segment_iterator_return_self,
             );
             let host_id = cx.native_functions.register(desc);
-            let handle = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+            let handle =
+                cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
             cx.heap.define_own_property(
                 intrinsics.intl_segment_iterator_prototype,
                 iter_sym,
@@ -205,14 +207,34 @@ impl IntrinsicInstaller for IntlIntrinsic {
 
         // @@toStringTag on each Intl type prototype.
         install_to_string_tag(intrinsics.intl_collator_prototype, "Intl.Collator", cx)?;
-        install_to_string_tag(intrinsics.intl_number_format_prototype, "Intl.NumberFormat", cx)?;
-        install_to_string_tag(intrinsics.intl_plural_rules_prototype, "Intl.PluralRules", cx)?;
+        install_to_string_tag(
+            intrinsics.intl_number_format_prototype,
+            "Intl.NumberFormat",
+            cx,
+        )?;
+        install_to_string_tag(
+            intrinsics.intl_plural_rules_prototype,
+            "Intl.PluralRules",
+            cx,
+        )?;
         install_to_string_tag(intrinsics.intl_locale_prototype, "Intl.Locale", cx)?;
-        install_to_string_tag(intrinsics.intl_date_time_format_prototype, "Intl.DateTimeFormat", cx)?;
+        install_to_string_tag(
+            intrinsics.intl_date_time_format_prototype,
+            "Intl.DateTimeFormat",
+            cx,
+        )?;
         install_to_string_tag(intrinsics.intl_list_format_prototype, "Intl.ListFormat", cx)?;
         install_to_string_tag(intrinsics.intl_segmenter_prototype, "Intl.Segmenter", cx)?;
-        install_to_string_tag(intrinsics.intl_display_names_prototype, "Intl.DisplayNames", cx)?;
-        install_to_string_tag(intrinsics.intl_relative_time_format_prototype, "Intl.RelativeTimeFormat", cx)?;
+        install_to_string_tag(
+            intrinsics.intl_display_names_prototype,
+            "Intl.DisplayNames",
+            cx,
+        )?;
+        install_to_string_tag(
+            intrinsics.intl_relative_time_format_prototype,
+            "Intl.RelativeTimeFormat",
+            cx,
+        )?;
 
         // Intl.getCanonicalLocales (&sect;8.3.1)
         install_namespace_method(
@@ -244,15 +266,60 @@ impl IntrinsicInstaller for IntlIntrinsic {
             RegisterValue::from_object_handle(intrinsics.intl_namespace.0),
         )?;
 
-        install_on_namespace(intrinsics.intl_namespace, "Collator", intrinsics.intl_collator_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "NumberFormat", intrinsics.intl_number_format_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "PluralRules", intrinsics.intl_plural_rules_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "Locale", intrinsics.intl_locale_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "DateTimeFormat", intrinsics.intl_date_time_format_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "ListFormat", intrinsics.intl_list_format_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "Segmenter", intrinsics.intl_segmenter_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "DisplayNames", intrinsics.intl_display_names_constructor, cx)?;
-        install_on_namespace(intrinsics.intl_namespace, "RelativeTimeFormat", intrinsics.intl_relative_time_format_constructor, cx)?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "Collator",
+            intrinsics.intl_collator_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "NumberFormat",
+            intrinsics.intl_number_format_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "PluralRules",
+            intrinsics.intl_plural_rules_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "Locale",
+            intrinsics.intl_locale_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "DateTimeFormat",
+            intrinsics.intl_date_time_format_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "ListFormat",
+            intrinsics.intl_list_format_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "Segmenter",
+            intrinsics.intl_segmenter_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "DisplayNames",
+            intrinsics.intl_display_names_constructor,
+            cx,
+        )?;
+        install_on_namespace(
+            intrinsics.intl_namespace,
+            "RelativeTimeFormat",
+            intrinsics.intl_relative_time_format_constructor,
+            cx,
+        )?;
 
         Ok(())
     }
@@ -369,7 +436,10 @@ fn intl_get_canonical_locales(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_strings = canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_strings {
@@ -396,7 +466,10 @@ fn intl_supported_values_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let key_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let key_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let key = runtime
         .js_to_string(key_arg)
         .map_err(|e| VmNativeCallError::Internal(format!("supportedValuesOf: {e}").into()))?;
@@ -428,9 +501,7 @@ fn intl_supported_values_of(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
-            .map_err(|e| {
-                VmNativeCallError::Internal(format!("supportedValuesOf: {e:?}").into())
-            })?;
+            .map_err(|e| VmNativeCallError::Internal(format!("supportedValuesOf: {e:?}").into()))?;
     }
     Ok(RegisterValue::from_object_handle(arr.0))
 }
@@ -445,7 +516,10 @@ pub(crate) fn resolve_locale(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<String, VmNativeCallError> {
     let list = canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    Ok(list.into_iter().next().unwrap_or_else(|| locale_utils::DEFAULT_LOCALE.to_string()))
+    Ok(list
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| locale_utils::DEFAULT_LOCALE.to_string()))
 }
 
 /// Simplified CanonicalizeLocaleList that handles string and array-of-strings.
@@ -463,9 +537,8 @@ pub(crate) fn canonicalize_locale_list_from_value(
     if let Some(handle) = value.as_object_handle() {
         let h = crate::object::ObjectHandle(handle);
         if let Ok(Some(s)) = runtime.objects().string_value(h) {
-            let tag = locale_utils::canonicalize_locale_tag(s).map_err(|_| {
-                alloc_range_error_thrown(runtime, "Invalid language tag")
-            })?;
+            let tag = locale_utils::canonicalize_locale_tag(s)
+                .map_err(|_| alloc_range_error_thrown(runtime, "Invalid language tag"))?;
             return Ok(vec![tag]);
         }
     }

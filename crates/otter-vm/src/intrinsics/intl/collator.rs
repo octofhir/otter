@@ -2,8 +2,8 @@
 //!
 //! Spec: <https://tc39.es/ecma402/#sec-intl-collator-constructor>
 
-use icu_collator::options::{CaseLevel, Strength};
 use icu_collator::options::CollatorOptions;
+use icu_collator::options::{CaseLevel, Strength};
 use icu_collator::{CollatorBorrowed, CollatorPreferences};
 use icu_locale::Locale;
 use std::cmp::Ordering;
@@ -61,8 +61,14 @@ fn collator_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
     let data = resolve_collator_options(&locale, options_arg, runtime)?;
@@ -88,16 +94,15 @@ fn collator_compare_getter(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Collator.compare getter: expected object".into())
-        })?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Collator.compare getter: expected object".into())
+    })?;
 
     // Check cache.
     let cache_prop = runtime.intern_property_name("__boundCompare");
-    let cached = runtime.own_property_value(handle, cache_prop).map_err(interp_err)?;
+    let cached = runtime
+        .own_property_value(handle, cache_prop)
+        .map_err(interp_err)?;
     if cached != RegisterValue::undefined() && cached.as_object_handle().is_some() {
         return Ok(cached);
     }
@@ -107,26 +112,37 @@ fn collator_compare_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
-    let _ = runtime.objects_mut().set_prototype(bound_fn, Some(fn_proto));
+    let _ = runtime
+        .objects_mut()
+        .set_prototype(bound_fn, Some(fn_proto));
 
     // Store the collator handle on the bound function as __collator__.
     let collator_prop = runtime.intern_property_name("__collator__");
-    runtime.objects_mut().define_own_property(
-        bound_fn,
-        collator_prop,
-        PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(handle.0),
-            PropertyAttributes::from_flags(false, false, false),
-        ),
-    ).map_err(interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            bound_fn,
+            collator_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(handle.0),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(interp_err)?;
 
     // Cache on the instance.
     let bound_val = RegisterValue::from_object_handle(bound_fn.0);
-    runtime.objects_mut().define_own_property(
-        handle,
-        cache_prop,
-        PropertyValue::data_with_attrs(bound_val, PropertyAttributes::from_flags(false, false, false)),
-    ).map_err(interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            handle,
+            cache_prop,
+            PropertyValue::data_with_attrs(
+                bound_val,
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(interp_err)?;
 
     Ok(bound_val)
 }
@@ -138,21 +154,28 @@ fn bound_collator_compare(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let fn_handle = runtime.current_native_callee().ok_or_else(|| {
-        VmNativeCallError::Internal("bound compare: no callee".into())
-    })?;
+    let fn_handle = runtime
+        .current_native_callee()
+        .ok_or_else(|| VmNativeCallError::Internal("bound compare: no callee".into()))?;
     let collator_prop = runtime.intern_property_name("__collator__");
-    let collator_val = runtime.own_property_value(fn_handle, collator_prop).map_err(interp_err)?;
-    let collator_rv = RegisterValue::from_object_handle(
-        collator_val.as_object_handle().ok_or_else(|| {
+    let collator_val = runtime
+        .own_property_value(fn_handle, collator_prop)
+        .map_err(interp_err)?;
+    let collator_rv =
+        RegisterValue::from_object_handle(collator_val.as_object_handle().ok_or_else(|| {
             VmNativeCallError::Internal("bound compare: missing __collator__".into())
-        })?,
-    );
+        })?);
 
     let data = require_collator_data(&collator_rv, runtime)?.clone();
 
-    let x_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let y_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let x_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let y_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let x_str = runtime
         .js_to_string(x_val)
@@ -161,7 +184,9 @@ fn bound_collator_compare(
         .js_to_string(y_val)
         .map_err(|e| VmNativeCallError::Internal(format!("Collator.compare: {e}").into()))?;
 
-    Ok(RegisterValue::from_i32(perform_compare(&x_str, &y_str, &data)))
+    Ok(RegisterValue::from_i32(perform_compare(
+        &x_str, &y_str, &data,
+    )))
 }
 
 fn interp_err(e: impl std::fmt::Debug) -> VmNativeCallError {
@@ -244,7 +269,10 @@ fn collator_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -284,14 +312,13 @@ fn resolve_collator_options(
         runtime,
     )?;
 
-    let ignore_punctuation = get_option_bool(options, "ignorePunctuation", runtime)?
-        .unwrap_or(false);
+    let ignore_punctuation =
+        get_option_bool(options, "ignorePunctuation", runtime)?.unwrap_or(false);
 
-    let collation = get_option_string(options, "collation", runtime)?
-        .unwrap_or_else(|| "default".to_string());
+    let collation =
+        get_option_string(options, "collation", runtime)?.unwrap_or_else(|| "default".to_string());
 
-    let numeric = get_option_bool(options, "numeric", runtime)?
-        .unwrap_or(false);
+    let numeric = get_option_bool(options, "numeric", runtime)?.unwrap_or(false);
 
     let case_first = parse_enum(
         get_option_string(options, "caseFirst", runtime)?,
@@ -378,13 +405,10 @@ fn require_collator_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a CollatorData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("Collator: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("Collator: {e}").into()))?;
     payload.as_collator().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not Collator)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not Collator)".into())
     })
 }
 
@@ -396,11 +420,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn set_bool_prop(
@@ -410,11 +432,9 @@ fn set_bool_prop(
     value: bool,
 ) {
     let prop = runtime.intern_property_name(name);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_bool(value),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_bool(value));
 }
 
 fn parse_enum<T>(
@@ -426,14 +446,13 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),

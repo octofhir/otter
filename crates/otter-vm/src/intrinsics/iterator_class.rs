@@ -93,15 +93,151 @@ impl IntrinsicInstaller for IteratorIntrinsic {
         )?;
         install_to_string_tag(intrinsics.set_iterator_prototype(), "Set Iterator", cx)?;
 
+        // ─── §27.1.4 Iterator Helper methods on %IteratorPrototype% ────
+        // ES2025 Iterator Helpers: consuming methods
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "toArray",
+            0,
+            iterator_to_array,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "forEach",
+            1,
+            iterator_for_each,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "some",
+            1,
+            iterator_some,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "every",
+            1,
+            iterator_every,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "find",
+            1,
+            iterator_find,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "reduce",
+            1,
+            iterator_reduce,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "map",
+            1,
+            iterator_map,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "filter",
+            1,
+            iterator_filter,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "take",
+            1,
+            iterator_take,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "drop",
+            1,
+            iterator_drop,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+        install_proto_method(
+            intrinsics.iterator_prototype(),
+            "flatMap",
+            1,
+            iterator_flat_map,
+            intrinsics.function_prototype(),
+            cx,
+        )?;
+
+        // ─── Iterator.from(o) — §27.1.2.1 ─────────────────────────────
+        // Installed on global `Iterator` constructor.
+        // We need an Iterator constructor for this. Create a minimal one.
+        let iter_ctor_desc =
+            NativeFunctionDescriptor::constructor("Iterator", 0, iterator_constructor);
+        let iter_ctor_id = cx.native_functions.register(iter_ctor_desc);
+        let iter_ctor =
+            cx.alloc_intrinsic_host_function(iter_ctor_id, intrinsics.function_prototype())?;
+
+        // Set Iterator.prototype = %IteratorPrototype%
+        let prototype_prop = cx.property_names.intern("prototype");
+        cx.heap.define_own_property(
+            iter_ctor,
+            prototype_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(intrinsics.iterator_prototype().0),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )?;
+
+        // Install Iterator.from
+        let from_desc = NativeFunctionDescriptor::method("from", 1, iterator_from);
+        let from_id = cx.native_functions.register(from_desc);
+        let from_handle =
+            cx.alloc_intrinsic_host_function(from_id, intrinsics.function_prototype())?;
+        let from_prop = cx.property_names.intern("from");
+        cx.heap.define_own_property(
+            iter_ctor,
+            from_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(from_handle.0),
+                PropertyAttributes::builtin_method(),
+            ),
+        )?;
+
+        // Store Iterator constructor for install_on_global
+        intrinsics.iterator_constructor = Some(iter_ctor);
+
         Ok(())
     }
 
     fn install_on_global(
         &self,
-        _intrinsics: &VmIntrinsics,
-        _cx: &mut IntrinsicInstallContext<'_>,
+        intrinsics: &VmIntrinsics,
+        cx: &mut IntrinsicInstallContext<'_>,
     ) -> Result<(), IntrinsicsError> {
-        // Iterator prototypes are not directly exposed as globals.
+        // Expose `Iterator` as a global (ES2025 §27.1.2).
+        if let Some(ctor) = intrinsics.iterator_constructor {
+            cx.install_global_value(
+                intrinsics,
+                "Iterator",
+                RegisterValue::from_object_handle(ctor.0),
+            )?;
+        }
         Ok(())
     }
 }
@@ -115,6 +251,31 @@ type NativeFn = fn(
     &[RegisterValue],
     &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError>;
+
+/// Installs a named method on a prototype object.
+fn install_proto_method(
+    prototype: ObjectHandle,
+    name: &str,
+    arity: u16,
+    f: NativeFn,
+    function_prototype: ObjectHandle,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let desc = NativeFunctionDescriptor::method(name, arity, f);
+    let host_fn = cx.native_functions.register(desc);
+    let handle = cx.alloc_intrinsic_host_function(host_fn, function_prototype)?;
+    install_function_length_name(handle, arity, name, cx)?;
+    let prop = cx.property_names.intern(name);
+    cx.heap.define_own_property(
+        prototype,
+        prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(handle.0),
+            PropertyAttributes::builtin_method(),
+        ),
+    )?;
+    Ok(())
+}
 
 /// Installs a `.next()` method on a prototype object.
 fn install_next_method(
@@ -495,4 +656,686 @@ fn set_iterator_next(
         .set_set_iterator_index(handle, idx)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     create_iter_result_object(RegisterValue::undefined(), true, runtime)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Iterator Helper Utilities
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Calls `.next()` on an iterator and returns `(value, done)`.
+/// Spec: <https://tc39.es/ecma262/#sec-iteratornext>
+fn iter_step(
+    iterator: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<(RegisterValue, bool), VmNativeCallError> {
+    let next_prop = runtime.intern_property_name("next");
+    let next_fn = runtime
+        .property_lookup(iterator, next_prop)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+        .and_then(|l| {
+            if let PropertyValue::Data { value, .. } = l.value() {
+                value.as_object_handle().map(ObjectHandle)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| VmNativeCallError::Internal("iterator.next is not a function".into()))?;
+
+    let result =
+        runtime.call_callable(next_fn, RegisterValue::from_object_handle(iterator.0), &[])?;
+
+    let result_handle = result
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("iterator result is not an object".into()))?;
+
+    let done_prop = runtime.intern_property_name("done");
+    let done = runtime
+        .property_lookup(result_handle, done_prop)
+        .ok()
+        .flatten()
+        .and_then(|l| {
+            if let PropertyValue::Data { value, .. } = l.value() {
+                value.as_bool()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+
+    let value_prop = runtime.intern_property_name("value");
+    let value = runtime
+        .property_lookup(result_handle, value_prop)
+        .ok()
+        .flatten()
+        .map(|l| {
+            if let PropertyValue::Data { value, .. } = l.value() {
+                value
+            } else {
+                RegisterValue::undefined()
+            }
+        })
+        .unwrap_or_else(RegisterValue::undefined);
+
+    Ok((value, done))
+}
+
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
+    match runtime.alloc_type_error(message) {
+        Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+        Err(error) => VmNativeCallError::Internal(format!("{error}").into()),
+    }
+}
+
+fn require_callable(
+    val: RegisterValue,
+    runtime: &crate::interpreter::RuntimeState,
+    method_name: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    val.as_object_handle()
+        .map(ObjectHandle)
+        .filter(|h| runtime.objects().is_callable(*h))
+        .ok_or_else(|| {
+            VmNativeCallError::Internal(format!("{method_name}: callback is not a function").into())
+        })
+}
+
+/// Tries to get a `[Symbol.iterator]()` result from a value.
+/// Returns `Ok(Some(iterator))` if iterable, `Ok(None)` otherwise.
+fn try_get_iterator(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<Option<RegisterValue>, VmNativeCallError> {
+    let obj_handle = match value.as_object_handle().map(ObjectHandle) {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    let sym_iterator = runtime.intern_symbol_property_name(WellKnownSymbol::Iterator.stable_id());
+    let iter_fn = match runtime.property_lookup(obj_handle, sym_iterator) {
+        Ok(Some(lookup)) => {
+            if let PropertyValue::Data { value: v, .. } = lookup.value() {
+                v.as_object_handle().map(ObjectHandle)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match iter_fn {
+        Some(fn_handle) => {
+            let iterator = runtime.call_callable(fn_handle, value, &[])?;
+            Ok(Some(iterator))
+        }
+        None => Ok(None),
+    }
+}
+
+fn require_this_iterator(
+    this: &RegisterValue,
+    method_name: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal(format!("{method_name}: this is not an object").into())
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.1 Iterator.prototype.map(mapper)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.map>
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SLOT_SOURCE_ITER: &str = "__otter_iter_source__";
+const SLOT_CALLBACK: &str = "__otter_iter_callback__";
+const SLOT_REMAINING: &str = "__otter_iter_remaining__";
+const SLOT_KIND: &str = "__otter_iter_kind__";
+const SLOT_INNER_ITER: &str = "__otter_iter_inner__";
+
+const KIND_MAP: i32 = 1;
+const KIND_FILTER: i32 = 2;
+const KIND_TAKE: i32 = 3;
+const KIND_DROP: i32 = 4;
+const KIND_FLAT_MAP: i32 = 5;
+
+/// Creates a wrapper iterator with internal slots stored as properties.
+fn create_wrapper_iterator(
+    source: ObjectHandle,
+    callback: RegisterValue,
+    kind: i32,
+    remaining: i32,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let proto = runtime.intrinsics().iterator_prototype();
+    let wrapper = runtime.alloc_object_with_prototype(Some(proto));
+
+    // Store internal state as properties.
+    let src_prop = runtime.intern_property_name(SLOT_SOURCE_ITER);
+    runtime
+        .objects_mut()
+        .set_property(
+            wrapper,
+            src_prop,
+            RegisterValue::from_object_handle(source.0),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let cb_prop = runtime.intern_property_name(SLOT_CALLBACK);
+    runtime
+        .objects_mut()
+        .set_property(wrapper, cb_prop, callback)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let kind_prop = runtime.intern_property_name(SLOT_KIND);
+    runtime
+        .objects_mut()
+        .set_property(wrapper, kind_prop, RegisterValue::from_i32(kind))
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let rem_prop = runtime.intern_property_name(SLOT_REMAINING);
+    runtime
+        .objects_mut()
+        .set_property(wrapper, rem_prop, RegisterValue::from_i32(remaining))
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    // Install .next() method
+    let next_desc = NativeFunctionDescriptor::method("next", 0, wrapper_iterator_next);
+    let next_id = runtime.register_native_function(next_desc);
+    let next_handle = runtime.alloc_host_function(next_id);
+    let next_prop = runtime.intern_property_name("next");
+    runtime
+        .objects_mut()
+        .set_property(
+            wrapper,
+            next_prop,
+            RegisterValue::from_object_handle(next_handle.0),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    Ok(RegisterValue::from_object_handle(wrapper.0))
+}
+
+/// Helper: read an internal slot property from a wrapper iterator.
+fn read_slot(
+    handle: ObjectHandle,
+    slot: &str,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> RegisterValue {
+    let prop = runtime.intern_property_name(slot);
+    runtime
+        .property_lookup(handle, prop)
+        .ok()
+        .flatten()
+        .map(|l| {
+            if let PropertyValue::Data { value, .. } = l.value() {
+                value
+            } else {
+                RegisterValue::undefined()
+            }
+        })
+        .unwrap_or_else(RegisterValue::undefined)
+}
+
+/// The `.next()` method for wrapper iterators (map, filter, take, drop, flatMap).
+fn wrapper_iterator_next(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "IteratorHelper.next")?;
+
+    let kind_val = read_slot(handle, SLOT_KIND, runtime);
+    let kind = kind_val.as_i32().unwrap_or(0);
+
+    let source_val = read_slot(handle, SLOT_SOURCE_ITER, runtime);
+    let source = source_val
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("wrapper iterator: missing source".into()))?;
+
+    let callback_val = read_slot(handle, SLOT_CALLBACK, runtime);
+
+    match kind {
+        KIND_MAP => {
+            let (value, done) = iter_step(source, runtime)?;
+            if done {
+                return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+            }
+            let cb = require_callable(callback_val, runtime, "Iterator.prototype.map")?;
+            let mapped = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+            create_iter_result_object(mapped, false, runtime)
+        }
+        KIND_FILTER => loop {
+            let (value, done) = iter_step(source, runtime)?;
+            if done {
+                return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+            }
+            let cb = require_callable(callback_val, runtime, "Iterator.prototype.filter")?;
+            let result = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+            if to_boolean(result) {
+                return create_iter_result_object(value, false, runtime);
+            }
+        },
+        KIND_TAKE => {
+            let remaining = read_slot(handle, SLOT_REMAINING, runtime)
+                .as_i32()
+                .unwrap_or(0);
+            if remaining <= 0 {
+                return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+            }
+            let (value, done) = iter_step(source, runtime)?;
+            if done {
+                return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+            }
+            // Decrement remaining.
+            let rem_prop = runtime.intern_property_name(SLOT_REMAINING);
+            runtime
+                .objects_mut()
+                .set_property(handle, rem_prop, RegisterValue::from_i32(remaining - 1))
+                .ok();
+            create_iter_result_object(value, false, runtime)
+        }
+        KIND_DROP => {
+            let mut remaining = read_slot(handle, SLOT_REMAINING, runtime)
+                .as_i32()
+                .unwrap_or(0);
+            // Skip `remaining` elements.
+            while remaining > 0 {
+                let (_, done) = iter_step(source, runtime)?;
+                if done {
+                    return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+                }
+                remaining -= 1;
+            }
+            // Store 0 so subsequent calls don't re-skip.
+            let rem_prop = runtime.intern_property_name(SLOT_REMAINING);
+            runtime
+                .objects_mut()
+                .set_property(handle, rem_prop, RegisterValue::from_i32(0))
+                .ok();
+            let (value, done) = iter_step(source, runtime)?;
+            if done {
+                return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+            }
+            create_iter_result_object(value, false, runtime)
+        }
+        KIND_FLAT_MAP => {
+            // Check for active inner iterator first.
+            let inner_val = read_slot(handle, SLOT_INNER_ITER, runtime);
+            if let Some(inner_handle) = inner_val.as_object_handle().map(ObjectHandle) {
+                let (value, done) = iter_step(inner_handle, runtime)?;
+                if !done {
+                    return create_iter_result_object(value, false, runtime);
+                }
+                // Inner exhausted — clear it.
+                let inner_prop = runtime.intern_property_name(SLOT_INNER_ITER);
+                runtime
+                    .objects_mut()
+                    .set_property(handle, inner_prop, RegisterValue::undefined())
+                    .ok();
+            }
+            // Pull from source and create new inner iterator.
+            loop {
+                let (value, done) = iter_step(source, runtime)?;
+                if done {
+                    return create_iter_result_object(RegisterValue::undefined(), true, runtime);
+                }
+                let cb = require_callable(callback_val, runtime, "Iterator.prototype.flatMap")?;
+                let mapped = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+                // Try to get an iterator from the mapped value.
+                if let Some(inner_iter) = try_get_iterator(mapped, runtime)?
+                    && let Some(inner_handle) = inner_iter.as_object_handle().map(ObjectHandle)
+                {
+                    let (v, d) = iter_step(inner_handle, runtime)?;
+                    if !d {
+                        // Store inner for subsequent calls.
+                        let inner_prop = runtime.intern_property_name(SLOT_INNER_ITER);
+                        runtime
+                            .objects_mut()
+                            .set_property(handle, inner_prop, inner_iter)
+                            .ok();
+                        return create_iter_result_object(v, false, runtime);
+                    }
+                    // Inner was empty — continue to next source element.
+                    continue;
+                }
+                // If not iterable, yield the value directly.
+                return create_iter_result_object(mapped, false, runtime);
+            }
+        }
+        _ => create_iter_result_object(RegisterValue::undefined(), true, runtime),
+    }
+}
+
+fn iterator_map(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.map")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let _ = require_callable(callback, runtime, "Iterator.prototype.map")?;
+    create_wrapper_iterator(handle, callback, KIND_MAP, 0, runtime)
+}
+
+fn iterator_filter(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.filter")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let _ = require_callable(callback, runtime, "Iterator.prototype.filter")?;
+    create_wrapper_iterator(handle, callback, KIND_FILTER, 0, runtime)
+}
+
+fn iterator_take(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.take")?;
+    let limit = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let n = limit
+        .as_i32()
+        .or_else(|| limit.as_number().map(|f| f as i32))
+        .unwrap_or(0);
+    if n < 0 {
+        return Err(type_error(
+            runtime,
+            "Iterator.prototype.take: limit must be non-negative",
+        ));
+    }
+    create_wrapper_iterator(handle, RegisterValue::undefined(), KIND_TAKE, n, runtime)
+}
+
+fn iterator_drop(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.drop")?;
+    let limit = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let n = limit
+        .as_i32()
+        .or_else(|| limit.as_number().map(|f| f as i32))
+        .unwrap_or(0);
+    if n < 0 {
+        return Err(type_error(
+            runtime,
+            "Iterator.prototype.drop: limit must be non-negative",
+        ));
+    }
+    create_wrapper_iterator(handle, RegisterValue::undefined(), KIND_DROP, n, runtime)
+}
+
+fn iterator_flat_map(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.flatMap")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let _ = require_callable(callback, runtime, "Iterator.prototype.flatMap")?;
+    create_wrapper_iterator(handle, callback, KIND_FLAT_MAP, 0, runtime)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.7 Iterator.prototype.toArray()
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.toarray>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_to_array(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.toArray")?;
+    let array = runtime.alloc_array();
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            break;
+        }
+        runtime.objects_mut().push_element(array, value).ok();
+    }
+    Ok(RegisterValue::from_object_handle(array.0))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.8 Iterator.prototype.forEach(fn)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.foreach>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_for_each(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.forEach")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let cb = require_callable(callback, runtime, "Iterator.prototype.forEach")?;
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            break;
+        }
+        runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+    }
+    Ok(RegisterValue::undefined())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.9 Iterator.prototype.some(fn)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.some>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_some(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.some")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let cb = require_callable(callback, runtime, "Iterator.prototype.some")?;
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            return Ok(RegisterValue::from_bool(false));
+        }
+        let result = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+        if to_boolean(result) {
+            return Ok(RegisterValue::from_bool(true));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.10 Iterator.prototype.every(fn)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.every>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_every(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.every")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let cb = require_callable(callback, runtime, "Iterator.prototype.every")?;
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            return Ok(RegisterValue::from_bool(true));
+        }
+        let result = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+        if !to_boolean(result) {
+            return Ok(RegisterValue::from_bool(false));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.11 Iterator.prototype.find(fn)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.find>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_find(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.find")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let cb = require_callable(callback, runtime, "Iterator.prototype.find")?;
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            return Ok(RegisterValue::undefined());
+        }
+        let result = runtime.call_callable(cb, RegisterValue::undefined(), &[value])?;
+        if to_boolean(result) {
+            return Ok(value);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.4.6 Iterator.prototype.reduce(reducer, initialValue)
+//  Spec: <https://tc39.es/ecma262/#sec-iteratorprototype.reduce>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_reduce(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_this_iterator(this, "Iterator.prototype.reduce")?;
+    let callback = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let cb = require_callable(callback, runtime, "Iterator.prototype.reduce")?;
+
+    let mut accumulator = if args.len() >= 2 {
+        args[1]
+    } else {
+        // No initial value — use first element.
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            return Err(type_error(
+                runtime,
+                "Iterator.prototype.reduce: empty iterator with no initial value",
+            ));
+        }
+        value
+    };
+
+    loop {
+        let (value, done) = iter_step(handle, runtime)?;
+        if done {
+            return Ok(accumulator);
+        }
+        accumulator =
+            runtime.call_callable(cb, RegisterValue::undefined(), &[accumulator, value])?;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §27.1.2.1 Iterator.from(o)
+//  Spec: <https://tc39.es/ecma262/#sec-iterator.from>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn iterator_constructor(
+    _this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    // Iterator is not directly constructible.
+    Err(type_error(runtime, "Iterator is not a constructor"))
+}
+
+fn iterator_from(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let obj = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // If obj has [Symbol.iterator], call it to get an iterator.
+    if let Some(iterator) = try_get_iterator(obj, runtime)? {
+        return Ok(iterator);
+    }
+
+    // If obj itself has a `.next()` method, treat it as an iterator already.
+    if let Some(obj_handle) = obj.as_object_handle().map(ObjectHandle) {
+        let next_prop = runtime.intern_property_name("next");
+        if let Ok(Some(lookup)) = runtime.property_lookup(obj_handle, next_prop)
+            && let PropertyValue::Data { value, .. } = lookup.value()
+            && value.as_object_handle().is_some()
+        {
+            return Ok(obj);
+        }
+    }
+
+    Err(type_error(
+        runtime,
+        "Iterator.from: argument is not iterable",
+    ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ToBoolean (§7.1.2) — inline helper
+//  Spec: <https://tc39.es/ecma262/#sec-toboolean>
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn to_boolean(value: RegisterValue) -> bool {
+    if let Some(b) = value.as_bool() {
+        return b;
+    }
+    if value == RegisterValue::undefined() || value == RegisterValue::null() {
+        return false;
+    }
+    if let Some(n) = value.as_i32() {
+        return n != 0;
+    }
+    if let Some(n) = value.as_number() {
+        return n != 0.0 && !n.is_nan();
+    }
+    // Objects, strings (non-empty) are truthy.
+    if value.as_object_handle().is_some() {
+        return true;
+    }
+    if value.is_symbol() {
+        return true;
+    }
+    false
 }

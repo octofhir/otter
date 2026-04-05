@@ -257,6 +257,26 @@ fn array_class_descriptor() -> JsClassDescriptor {
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("at", 1, array_at),
         ))
+        // §23.1.3.30 toReversed() — <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toReversed", 0, array_to_reversed),
+        ))
+        // §23.1.3.31 toSorted() — <https://tc39.es/ecma262/#sec-array.prototype.tosorted>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toSorted", 1, array_to_sorted),
+        ))
+        // §23.1.3.32 toSpliced() — <https://tc39.es/ecma262/#sec-array.prototype.tospliced>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toSpliced", 2, array_to_spliced),
+        ))
+        // §23.1.3.37 with() — <https://tc39.es/ecma262/#sec-array.prototype.with>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("with", 2, array_with),
+        ))
         // §23.1.3.16 keys() — <https://tc39.es/ecma262/#sec-array.prototype.keys>
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -1872,9 +1892,9 @@ fn call_to_locale_string(
         }
     }
     // Fallback: coerce to string.
-    let s = runtime.js_to_string(value).map_err(|e| {
-        VmNativeCallError::Internal(format!("toLocaleString coerce: {e}").into())
-    })?;
+    let s = runtime
+        .js_to_string(value)
+        .map_err(|e| VmNativeCallError::Internal(format!("toLocaleString coerce: {e}").into()))?;
     Ok(s.to_string())
 }
 
@@ -1935,6 +1955,203 @@ fn array_copy_within(
         }
     }
     Ok(*this)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ES2023 Change-by-Copy methods
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `Array.prototype.toReversed()` — §23.1.3.30
+/// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
+///
+/// Returns a new array with elements in reverse order. Does not mutate the
+/// original array.
+fn array_to_reversed(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Array.prototype.toReversed requires array receiver".into())
+    })?;
+    let length = array_length(receiver, runtime, "Array.prototype.toReversed")?;
+
+    let mut elements = Vec::with_capacity(length);
+    for i in (0..length).rev() {
+        let val = array_index_value(receiver, i, runtime, "Array.prototype.toReversed")?
+            .unwrap_or_else(RegisterValue::undefined);
+        elements.push(val);
+    }
+    let result = runtime.alloc_array_with_elements(&elements);
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Array.prototype.toSorted(compareFn?)` — §23.1.3.31
+/// <https://tc39.es/ecma262/#sec-array.prototype.tosorted>
+///
+/// Returns a new array with elements sorted. Does not mutate the original.
+fn array_to_sorted(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Array.prototype.toSorted requires array receiver".into())
+    })?;
+    let length = array_length(receiver, runtime, "Array.prototype.toSorted")?;
+
+    let comparefn = args
+        .first()
+        .copied()
+        .filter(|v| *v != RegisterValue::undefined())
+        .and_then(|v| v.as_object_handle().map(ObjectHandle))
+        .filter(|h| runtime.objects().is_callable(*h));
+
+    // Collect all elements (holes become undefined per spec).
+    let mut items = Vec::with_capacity(length);
+    for i in 0..length {
+        let val = array_index_value(receiver, i, runtime, "Array.prototype.toSorted")?
+            .unwrap_or_else(RegisterValue::undefined);
+        items.push(val);
+    }
+
+    // Stable insertion sort (same as Array.prototype.sort).
+    for i in 1..items.len() {
+        let key = items[i];
+        let mut j = i;
+        while j > 0 {
+            let cmp = sort_compare(items[j - 1], key, comparefn, runtime)?;
+            if cmp <= 0.0 {
+                break;
+            }
+            items[j] = items[j - 1];
+            j -= 1;
+        }
+        items[j] = key;
+    }
+
+    let result = runtime.alloc_array_with_elements(&items);
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Array.prototype.toSpliced(start, deleteCount, ...items)` — §23.1.3.32
+/// <https://tc39.es/ecma262/#sec-array.prototype.tospliced>
+///
+/// Returns a new array with elements removed/replaced/inserted. Does not
+/// mutate the original.
+fn array_to_spliced(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Array.prototype.toSpliced requires array receiver".into())
+    })?;
+    let len = array_length(receiver, runtime, "Array.prototype.toSpliced")?;
+    let len_i = len as i64;
+
+    // Step 3-5: RelativeStart.
+    let raw_start = args
+        .first()
+        .map(|v| runtime.js_to_number(*v).map(|n| n as i64).unwrap_or(0))
+        .unwrap_or(0);
+    let actual_start = if raw_start < 0 {
+        (len_i + raw_start).max(0) as usize
+    } else {
+        (raw_start as usize).min(len)
+    };
+
+    // Step 6-8: ActualDeleteCount.
+    let insert_items = if args.len() > 2 { &args[2..] } else { &[] };
+    let actual_delete_count = if args.is_empty() {
+        0
+    } else if args.len() == 1 {
+        // No deleteCount → remove everything from start.
+        len - actual_start
+    } else {
+        let raw_dc = runtime.js_to_number(args[1]).unwrap_or(0.0);
+        let dc = raw_dc.max(0.0) as usize;
+        dc.min(len - actual_start)
+    };
+
+    // Build new array: [0..actual_start] + insert_items + [actual_start+actual_delete_count..len].
+    let new_len = len - actual_delete_count + insert_items.len();
+    let mut elements = Vec::with_capacity(new_len);
+
+    // Copy before splice point.
+    for i in 0..actual_start {
+        let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
+            .unwrap_or_else(RegisterValue::undefined);
+        elements.push(val);
+    }
+
+    // Insert new items.
+    elements.extend_from_slice(insert_items);
+
+    // Copy after splice point.
+    for i in (actual_start + actual_delete_count)..len {
+        let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
+            .unwrap_or_else(RegisterValue::undefined);
+        elements.push(val);
+    }
+
+    let result = runtime.alloc_array_with_elements(&elements);
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Array.prototype.with(index, value)` — §23.1.3.37
+/// <https://tc39.es/ecma262/#sec-array.prototype.with>
+///
+/// Returns a new array identical to the original except the element at `index`
+/// is replaced with `value`. Throws **RangeError** if the index is out of
+/// bounds.
+fn array_with(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Array.prototype.with requires array receiver".into())
+    })?;
+    let length = array_length(receiver, runtime, "Array.prototype.with")?;
+    let len_i = length as i64;
+
+    // Step 3: Let relativeIndex = ToIntegerOrInfinity(index).
+    let raw_index = args
+        .first()
+        .map(|v| runtime.js_to_number(*v).map(|n| n as i64).unwrap_or(0))
+        .unwrap_or(0);
+    let actual_index = if raw_index < 0 {
+        len_i + raw_index
+    } else {
+        raw_index
+    };
+
+    // Step 5: If actualIndex >= len or actualIndex < 0, throw a RangeError.
+    if actual_index < 0 || actual_index >= len_i {
+        return Err(invalid_array_length_error(runtime));
+    }
+    let actual_index = actual_index as usize;
+
+    let new_value = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // Build new array with the replacement.
+    let mut elements = Vec::with_capacity(length);
+    for i in 0..length {
+        if i == actual_index {
+            elements.push(new_value);
+        } else {
+            let val = array_index_value(receiver, i, runtime, "Array.prototype.with")?
+                .unwrap_or_else(RegisterValue::undefined);
+            elements.push(val);
+        }
+    }
+
+    let result = runtime.alloc_array_with_elements(&elements);
+    Ok(RegisterValue::from_object_handle(result.0))
 }
 
 /// ES2024 §23.1.3.1 Array.prototype.at(index)

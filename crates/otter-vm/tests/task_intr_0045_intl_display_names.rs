@@ -64,7 +64,9 @@ fn display_names_is_function() {
 
 #[test]
 fn display_names_constructor_with_type() {
-    assert!(run_bool("typeof new Intl.DisplayNames('en', { type: 'language' }) === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.DisplayNames('en', { type: 'language' }) === 'object'"
+    ));
 }
 
 // ── of() — language ──────────────────────────────────────────────
@@ -133,21 +135,29 @@ fn of_script_latn() {
 
 #[test]
 fn of_unknown_code_fallback_code() {
-    let s = run_string("new Intl.DisplayNames('en', { type: 'language', fallback: 'code' }).of('zzzz')");
+    let s = run_string(
+        "new Intl.DisplayNames('en', { type: 'language', fallback: 'code' }).of('zzzz')",
+    );
     assert_eq!(s, "zzzz");
 }
 
 #[test]
 fn of_unknown_code_fallback_none() {
-    assert!(run_bool("new Intl.DisplayNames('en', { type: 'language', fallback: 'none' }).of('zzzz') === undefined"));
+    assert!(run_bool(
+        "new Intl.DisplayNames('en', { type: 'language', fallback: 'none' }).of('zzzz') === undefined"
+    ));
 }
 
 // ── resolvedOptions() ────────────────────────────────────────────
 
 #[test]
 fn resolved_options_locale() {
-    let s = run_string("new Intl.DisplayNames('en', { type: 'language' }).resolvedOptions().locale");
-    assert!(s.starts_with("en"), "expected locale starting with 'en', got: {s}");
+    let s =
+        run_string("new Intl.DisplayNames('en', { type: 'language' }).resolvedOptions().locale");
+    assert!(
+        s.starts_with("en"),
+        "expected locale starting with 'en', got: {s}"
+    );
 }
 
 #[test]
@@ -164,7 +174,8 @@ fn resolved_options_style_default() {
 
 #[test]
 fn resolved_options_fallback_default() {
-    let s = run_string("new Intl.DisplayNames('en', { type: 'language' }).resolvedOptions().fallback");
+    let s =
+        run_string("new Intl.DisplayNames('en', { type: 'language' }).resolvedOptions().fallback");
     assert_eq!(s, "code");
 }
 
@@ -172,5 +183,7 @@ fn resolved_options_fallback_default() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.DisplayNames.supportedLocalesOf('en'))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.DisplayNames.supportedLocalesOf('en'))"
+    ));
 }

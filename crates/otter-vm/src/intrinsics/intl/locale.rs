@@ -93,7 +93,11 @@ pub fn locale_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("getNumberingSystems", 0, locale_get_numbering_systems),
+            NativeFunctionDescriptor::method(
+                "getNumberingSystems",
+                0,
+                locale_get_numbering_systems,
+            ),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -118,11 +122,20 @@ fn locale_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let tag_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let tag_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if tag_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "First argument to Intl.Locale must be a string or Locale object"));
+        return Err(type_error(
+            runtime,
+            "First argument to Intl.Locale must be a string or Locale object",
+        ));
     }
 
     // Coerce tag to string.
@@ -507,16 +520,18 @@ fn locale_get_text_info(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_locale_data(this, runtime)?.clone();
     let lang = data.locale.split('-').next().unwrap_or("en").to_string();
-    let direction = if locale_utils::is_rtl_language(&lang) { "rtl" } else { "ltr" };
+    let direction = if locale_utils::is_rtl_language(&lang) {
+        "rtl"
+    } else {
+        "ltr"
+    };
 
     let obj = runtime.alloc_object();
     let prop = runtime.intern_property_name("direction");
     let s = runtime.alloc_string(direction);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
     Ok(RegisterValue::from_object_handle(obj.0))
 }
 
@@ -561,9 +576,11 @@ fn locale_get_week_info(
 
     // minimalDays: 1-7
     let prop_minimal = runtime.intern_property_name("minimalDays");
-    let _ = runtime
-        .objects_mut()
-        .set_property(obj, prop_minimal, RegisterValue::from_i32(minimal_days));
+    let _ = runtime.objects_mut().set_property(
+        obj,
+        prop_minimal,
+        RegisterValue::from_i32(minimal_days),
+    );
 
     Ok(RegisterValue::from_object_handle(obj.0))
 }
@@ -641,7 +658,10 @@ fn strip_unicode_extension(tag: &str) -> &str {
         // Find next singleton extension.
         for (i, _) in rest.match_indices('-') {
             let after = &rest[i + 1..];
-            if after.len() >= 2 && after.as_bytes()[1] == b'-' && locale_utils::is_singleton(&after[..1]) {
+            if after.len() >= 2
+                && after.as_bytes()[1] == b'-'
+                && locale_utils::is_singleton(&after[..1])
+            {
                 // Found next extension, return base + that.
                 return &tag[..pos + 3 + i];
             }
@@ -665,7 +685,10 @@ fn extract_subtag_script(tag: &str) -> Option<&str> {
 /// Extract the region subtag from a BCP 47 tag (2-letter uppercase or 3 digits).
 fn extract_subtag_region(tag: &str) -> Option<&str> {
     let parts: Vec<&str> = tag.split('-').collect();
-    parts[1..].iter().find(|p| locale_utils::is_region(p)).copied()
+    parts[1..]
+        .iter()
+        .find(|p| locale_utils::is_region(p))
+        .copied()
 }
 
 /// Extract the base name (language[-script][-region][-variant]*) without extensions.
@@ -698,30 +721,21 @@ fn require_locale_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a LocaleData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("Locale: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("Locale: {e}").into()))?;
     payload.as_locale().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not Locale)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not Locale)".into())
     })
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),
     }
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("TypeError alloc: {e}").into()),

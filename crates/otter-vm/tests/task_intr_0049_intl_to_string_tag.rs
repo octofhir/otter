@@ -78,7 +78,9 @@ fn segmenter_to_string_tag() {
 
 #[test]
 fn display_names_to_string_tag() {
-    let s = run_string("Object.prototype.toString.call(new Intl.DisplayNames('en', { type: 'language' }))");
+    let s = run_string(
+        "Object.prototype.toString.call(new Intl.DisplayNames('en', { type: 'language' }))",
+    );
     assert_eq!(s, "[object Intl.DisplayNames]");
 }
 

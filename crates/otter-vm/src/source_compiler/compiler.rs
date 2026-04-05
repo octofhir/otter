@@ -594,6 +594,17 @@ impl<'a> FunctionCompiler<'a> {
                 Ok(false)
             }
 
+            // §14.15 — debugger statement: no-op in production
+            AstStatement::DebuggerStatement(_) => Ok(false),
+
+            // §14.11 — with statement: forbidden in strict mode
+            AstStatement::WithStatement(_with) => {
+                // oxc parser already rejects `with` in strict mode. In sloppy mode
+                // we compile the body ignoring the with-object (partial semantics —
+                // full scope chain injection not yet implemented).
+                self.compile_statement(&_with.body, module)
+            }
+
             _ => Err(SourceLoweringError::Unsupported(format!(
                 "statement {:?}",
                 statement

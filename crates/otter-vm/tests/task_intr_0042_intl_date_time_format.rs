@@ -62,12 +62,16 @@ fn date_time_format_is_function() {
 
 #[test]
 fn date_time_format_constructor_no_args() {
-    assert!(run_bool("new Intl.DateTimeFormat() instanceof Intl.DateTimeFormat"));
+    assert!(run_bool(
+        "new Intl.DateTimeFormat() instanceof Intl.DateTimeFormat"
+    ));
 }
 
 #[test]
 fn date_time_format_constructor_with_locale() {
-    assert!(run_bool("new Intl.DateTimeFormat('en-US') instanceof Intl.DateTimeFormat"));
+    assert!(run_bool(
+        "new Intl.DateTimeFormat('en-US') instanceof Intl.DateTimeFormat"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -77,9 +81,8 @@ fn date_time_format_constructor_with_locale() {
 #[test]
 fn format_known_date() {
     // 2024-01-15T00:00:00Z = 1705276800000 ms.
-    let result = run_string(
-        "new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(1705276800000)"
-    );
+    let result =
+        run_string("new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(1705276800000)");
     // Should contain "1" and "15" and "2024" in some form.
     assert!(
         result.contains("1") && result.contains("15") && result.contains("2024"),
@@ -97,9 +100,7 @@ fn format_returns_string() {
 #[test]
 fn format_epoch_zero() {
     // 1970-01-01 UTC.
-    let result = run_string(
-        "new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(0)"
-    );
+    let result = run_string("new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(0)");
     assert!(
         result.contains("1970") || result.contains("1"),
         "format(0) = epoch should include 1970 or 1: {result}"
@@ -113,17 +114,23 @@ fn format_epoch_zero() {
 #[test]
 fn format_date_style_short() {
     let result = run_string(
-        "new Intl.DateTimeFormat('en-US', { dateStyle: 'short', timeZone: 'UTC' }).format(1705276800000)"
+        "new Intl.DateTimeFormat('en-US', { dateStyle: 'short', timeZone: 'UTC' }).format(1705276800000)",
     );
-    assert!(!result.is_empty(), "dateStyle short should produce non-empty: {result}");
+    assert!(
+        !result.is_empty(),
+        "dateStyle short should produce non-empty: {result}"
+    );
 }
 
 #[test]
 fn format_time_style_short() {
     let result = run_string(
-        "new Intl.DateTimeFormat('en-US', { timeStyle: 'short', timeZone: 'UTC' }).format(1705276800000)"
+        "new Intl.DateTimeFormat('en-US', { timeStyle: 'short', timeZone: 'UTC' }).format(1705276800000)",
     );
-    assert!(!result.is_empty(), "timeStyle short should produce non-empty: {result}");
+    assert!(
+        !result.is_empty(),
+        "timeStyle short should produce non-empty: {result}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -152,7 +159,10 @@ fn format_to_parts_has_type_and_value() {
 #[test]
 fn resolved_options_locale() {
     let locale = run_string("new Intl.DateTimeFormat('en').resolvedOptions().locale");
-    assert!(locale.starts_with("en"), "locale should start with 'en', got: {locale}");
+    assert!(
+        locale.starts_with("en"),
+        "locale should start with 'en', got: {locale}"
+    );
 }
 
 #[test]
@@ -163,7 +173,8 @@ fn resolved_options_calendar() {
 
 #[test]
 fn resolved_options_time_zone() {
-    let tz = run_string("new Intl.DateTimeFormat('en', { timeZone: 'UTC' }).resolvedOptions().timeZone");
+    let tz =
+        run_string("new Intl.DateTimeFormat('en', { timeZone: 'UTC' }).resolvedOptions().timeZone");
     assert_eq!(tz, "UTC");
 }
 
@@ -173,7 +184,9 @@ fn resolved_options_time_zone() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.DateTimeFormat.supportedLocalesOf(['en']))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.DateTimeFormat.supportedLocalesOf(['en']))"
+    ));
 }
 
 #[test]

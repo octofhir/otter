@@ -60,7 +60,8 @@ fn run_string(source: &str) -> String {
 
 fn run_f64(source: &str) -> f64 {
     let v = run(source);
-    v.as_number().unwrap_or_else(|| panic!("expected number, got {v:?}"))
+    v.as_number()
+        .unwrap_or_else(|| panic!("expected number, got {v:?}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -183,27 +184,37 @@ fn date_to_locale_string_returns_string() {
 
 #[test]
 fn date_to_locale_date_string_returns_string() {
-    assert!(run_bool("typeof new Date(0).toLocaleDateString() === 'string'"));
+    assert!(run_bool(
+        "typeof new Date(0).toLocaleDateString() === 'string'"
+    ));
 }
 
 #[test]
 fn date_to_locale_time_string_returns_string() {
-    assert!(run_bool("typeof new Date(0).toLocaleTimeString() === 'string'"));
+    assert!(run_bool(
+        "typeof new Date(0).toLocaleTimeString() === 'string'"
+    ));
 }
 
 #[test]
 fn date_to_locale_string_is_function() {
-    assert!(run_bool("typeof Date.prototype.toLocaleString === 'function'"));
+    assert!(run_bool(
+        "typeof Date.prototype.toLocaleString === 'function'"
+    ));
 }
 
 #[test]
 fn date_to_locale_date_string_is_function() {
-    assert!(run_bool("typeof Date.prototype.toLocaleDateString === 'function'"));
+    assert!(run_bool(
+        "typeof Date.prototype.toLocaleDateString === 'function'"
+    ));
 }
 
 #[test]
 fn date_to_locale_time_string_is_function() {
-    assert!(run_bool("typeof Date.prototype.toLocaleTimeString === 'function'"));
+    assert!(run_bool(
+        "typeof Date.prototype.toLocaleTimeString === 'function'"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -212,7 +223,9 @@ fn date_to_locale_time_string_is_function() {
 
 #[test]
 fn array_to_locale_string_is_function() {
-    assert!(run_bool("typeof Array.prototype.toLocaleString === 'function'"));
+    assert!(run_bool(
+        "typeof Array.prototype.toLocaleString === 'function'"
+    ));
 }
 
 #[test]
@@ -265,7 +278,9 @@ fn array_to_locale_string_returns_string() {
 
 #[test]
 fn bigint_to_locale_string_is_function() {
-    assert!(run_bool("typeof BigInt.prototype.toLocaleString === 'function'"));
+    assert!(run_bool(
+        "typeof BigInt.prototype.toLocaleString === 'function'"
+    ));
 }
 
 #[test]

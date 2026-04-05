@@ -81,6 +81,12 @@ fn map_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("keys", 0, map_keys))
         .with_binding(proto("values", 0, map_values))
         .with_binding(proto("entries", 0, map_entries))
+        // §24.1.2.2 Map.groupBy(items, callbackfn)
+        // <https://tc39.es/ecma262/#sec-map.groupby>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("groupBy", 2, map_group_by),
+        ))
 }
 
 fn install_map(
@@ -392,6 +398,14 @@ fn set_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("values", 0, set_values))
         .with_binding(proto("keys", 0, set_values)) // keys === values for Set
         .with_binding(proto("entries", 0, set_entries))
+        // ES2025 Set methods — §24.2.3
+        .with_binding(proto("intersection", 1, set_intersection))
+        .with_binding(proto("union", 1, set_union))
+        .with_binding(proto("difference", 1, set_difference))
+        .with_binding(proto("symmetricDifference", 1, set_symmetric_difference))
+        .with_binding(proto("isSubsetOf", 1, set_is_subset_of))
+        .with_binding(proto("isSupersetOf", 1, set_is_superset_of))
+        .with_binding(proto("isDisjointFrom", 1, set_is_disjoint_from))
 }
 
 fn install_set(
@@ -633,6 +647,236 @@ fn create_set_iterator(
     Ok(RegisterValue::from_object_handle(iterator.0))
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// ES2025 Set methods — §24.2.3
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `Set.prototype.intersection(other)` — §24.2.3.5
+/// <https://tc39.es/ecma262/#sec-set.prototype.intersection>
+fn set_intersection(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    let set_proto = runtime.intrinsics().set_prototype;
+    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+
+    for entry in this_entries.into_iter().flatten() {
+        if runtime.objects().set_has(other_set, entry).unwrap_or(false) {
+            runtime
+                .objects_mut()
+                .set_add(result, entry)
+                .map_err(map_obj_err)?;
+        }
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Set.prototype.union(other)` — §24.2.3.12
+/// <https://tc39.es/ecma262/#sec-set.prototype.union>
+fn set_union(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let set_proto = runtime.intrinsics().set_prototype;
+    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+
+    // Add all from this.
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    for entry in this_entries.into_iter().flatten() {
+        runtime
+            .objects_mut()
+            .set_add(result, entry)
+            .map_err(map_obj_err)?;
+    }
+
+    // Add all from other (set_add deduplicates).
+    let other_entries = runtime
+        .objects()
+        .set_entries(other_set)
+        .map_err(map_obj_err)?;
+    for entry in other_entries.into_iter().flatten() {
+        runtime
+            .objects_mut()
+            .set_add(result, entry)
+            .map_err(map_obj_err)?;
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Set.prototype.difference(other)` — §24.2.3.1
+/// <https://tc39.es/ecma262/#sec-set.prototype.difference>
+fn set_difference(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    let set_proto = runtime.intrinsics().set_prototype;
+    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+
+    for entry in this_entries.into_iter().flatten() {
+        if !runtime.objects().set_has(other_set, entry).unwrap_or(false) {
+            runtime
+                .objects_mut()
+                .set_add(result, entry)
+                .map_err(map_obj_err)?;
+        }
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Set.prototype.symmetricDifference(other)` — §24.2.3.10
+/// <https://tc39.es/ecma262/#sec-set.prototype.symmetricdifference>
+fn set_symmetric_difference(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let set_proto = runtime.intrinsics().set_prototype;
+    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+
+    // Elements in this but not in other.
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    for entry in this_entries.into_iter().flatten() {
+        if !runtime.objects().set_has(other_set, entry).unwrap_or(false) {
+            runtime
+                .objects_mut()
+                .set_add(result, entry)
+                .map_err(map_obj_err)?;
+        }
+    }
+
+    // Elements in other but not in this.
+    let other_entries = runtime
+        .objects()
+        .set_entries(other_set)
+        .map_err(map_obj_err)?;
+    for entry in other_entries.into_iter().flatten() {
+        if !runtime.objects().set_has(this_set, entry).unwrap_or(false) {
+            runtime
+                .objects_mut()
+                .set_add(result, entry)
+                .map_err(map_obj_err)?;
+        }
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// `Set.prototype.isSubsetOf(other)` — §24.2.3.7
+/// <https://tc39.es/ecma262/#sec-set.prototype.issubsetof>
+fn set_is_subset_of(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    for entry in this_entries.into_iter().flatten() {
+        if !runtime.objects().set_has(other_set, entry).unwrap_or(false) {
+            return Ok(RegisterValue::from_bool(false));
+        }
+    }
+
+    Ok(RegisterValue::from_bool(true))
+}
+
+/// `Set.prototype.isSupersetOf(other)` — §24.2.3.8
+/// <https://tc39.es/ecma262/#sec-set.prototype.issupersetof>
+fn set_is_superset_of(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let other_entries = runtime
+        .objects()
+        .set_entries(other_set)
+        .map_err(map_obj_err)?;
+    for entry in other_entries.into_iter().flatten() {
+        if !runtime.objects().set_has(this_set, entry).unwrap_or(false) {
+            return Ok(RegisterValue::from_bool(false));
+        }
+    }
+
+    Ok(RegisterValue::from_bool(true))
+}
+
+/// `Set.prototype.isDisjointFrom(other)` — §24.2.3.6
+/// <https://tc39.es/ecma262/#sec-set.prototype.isdisjointfrom>
+fn set_is_disjoint_from(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let this_set = require_set(*this, runtime)?;
+    let other_set = require_set_arg(args, runtime)?;
+
+    let this_entries = runtime
+        .objects()
+        .set_entries(this_set)
+        .map_err(map_obj_err)?;
+    for entry in this_entries.into_iter().flatten() {
+        if runtime.objects().set_has(other_set, entry).unwrap_or(false) {
+            return Ok(RegisterValue::from_bool(false));
+        }
+    }
+
+    Ok(RegisterValue::from_bool(true))
+}
+
+/// Extract the first argument as a Set.
+fn require_set_arg(
+    args: &[RegisterValue],
+    runtime: &crate::interpreter::RuntimeState,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    args.first()
+        .and_then(|v| v.as_object_handle().map(ObjectHandle))
+        .filter(|h| matches!(runtime.objects().kind(*h), Ok(HeapValueKind::Set)))
+        .ok_or_else(|| VmNativeCallError::Internal("Argument is not a Set".into()))
+}
+
+fn map_obj_err(e: crate::object::ObjectError) -> VmNativeCallError {
+    VmNativeCallError::Internal(format!("{e:?}").into())
+}
+
 fn require_set(
     this: RegisterValue,
     runtime: &crate::interpreter::RuntimeState,
@@ -641,4 +885,125 @@ fn require_set(
         .map(ObjectHandle)
         .filter(|h| matches!(runtime.objects().kind(*h), Ok(HeapValueKind::Set)))
         .ok_or_else(|| VmNativeCallError::Internal("Method requires a Set receiver".into()))
+}
+
+// ---------------------------------------------------------------------------
+// §24.1.2.2 Map.groupBy(items, callbackfn)
+// ---------------------------------------------------------------------------
+
+/// `Map.groupBy(items, callbackfn)` — §24.1.2.2
+/// <https://tc39.es/ecma262/#sec-map.groupby>
+///
+/// Groups elements of an iterable into a Map whose keys are the results of
+/// `callbackfn(element, index)` (not string-coerced — keys preserve identity).
+fn map_group_by(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let items = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let callback = args
+        .get(1)
+        .and_then(|v| v.as_object_handle().map(ObjectHandle))
+        .filter(|h| runtime.objects().is_callable(*h))
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("Map.groupBy: callbackfn is not a function".into())
+        })?;
+
+    let source = items
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("Map.groupBy: items is not an object".into()))?;
+
+    let length = runtime
+        .objects()
+        .array_length(source)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+
+    // Result is a new Map.
+    let map_proto = runtime.intrinsics().map_prototype;
+    let result = runtime.objects_mut().alloc_map(Some(map_proto));
+
+    // We track group keys in order. For each callback result, we check if we
+    // already have a Map entry for that key (using SameValueZero). If yes,
+    // push to the existing array. If not, create a new array.
+    //
+    // We maintain a local Vec of (key, array_handle) pairs since we can't
+    // easily iterate Map entries during construction.
+    let mut groups: Vec<(RegisterValue, ObjectHandle)> = Vec::new();
+
+    for i in 0..length {
+        let value = runtime
+            .get_array_index_value(source, i)?
+            .unwrap_or_else(RegisterValue::undefined);
+
+        let key = runtime.call_callable(
+            callback,
+            RegisterValue::undefined(),
+            &[value, RegisterValue::from_i32(i as i32)],
+        )?;
+
+        // Find existing group by SameValueZero.
+        let existing = groups
+            .iter()
+            .find(|(k, _)| same_value_zero_with_runtime(*k, key, runtime));
+        let group = if let Some((_, arr)) = existing {
+            *arr
+        } else {
+            let arr = runtime.alloc_array();
+            groups.push((key, arr));
+            arr
+        };
+
+        runtime
+            .objects_mut()
+            .push_element(group, value)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    }
+
+    // Now populate the Map with the groups.
+    for (key, arr) in groups {
+        runtime
+            .objects_mut()
+            .map_set(result, key, RegisterValue::from_object_handle(arr.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// §7.2.10 SameValueZero(x, y) — simplified for groupBy keys.
+/// <https://tc39.es/ecma262/#sec-samevaluezero>
+///
+/// For Map.groupBy, keys are typically strings returned by the callback. Since
+/// each call may allocate a new string handle, we compare string content.
+fn same_value_zero_with_runtime(
+    x: RegisterValue,
+    y: RegisterValue,
+    runtime: &crate::interpreter::RuntimeState,
+) -> bool {
+    if x == y {
+        return true;
+    }
+    // Both NaN → true.
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        if a.is_nan() && b.is_nan() {
+            return true;
+        }
+    }
+    // String content comparison (different handles, same content).
+    if let (Some(xh), Some(yh)) = (x.as_object_handle(), y.as_object_handle()) {
+        if let (Ok(Some(xs)), Ok(Some(ys))) = (
+            runtime.objects().string_value(ObjectHandle(xh)),
+            runtime.objects().string_value(ObjectHandle(yh)),
+        ) {
+            return xs == ys;
+        }
+    }
+    false
 }

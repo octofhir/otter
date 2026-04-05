@@ -59,8 +59,14 @@ fn plural_rules_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
     let data = resolve_plural_rules_options(&locale, options_arg, runtime)?;
@@ -85,7 +91,10 @@ fn plural_rules_select(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_plural_rules_data(this, runtime)?.clone();
 
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let number = runtime
         .js_to_number(value)
         .map_err(|e| VmNativeCallError::Internal(format!("PluralRules.select: {e}").into()))?;
@@ -109,11 +118,20 @@ fn plural_rules_select_range(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_plural_rules_data(this, runtime)?.clone();
 
-    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let start_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let end_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "start and end are required for selectRange"));
+        return Err(type_error(
+            runtime,
+            "start and end are required for selectRange",
+        ));
     }
 
     let start = runtime
@@ -147,7 +165,12 @@ fn plural_rules_resolved_options(
     let obj = runtime.alloc_object();
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "type", data.plural_type.as_str());
-    set_i32_prop(runtime, obj, "minimumIntegerDigits", data.minimum_integer_digits as i32);
+    set_i32_prop(
+        runtime,
+        obj,
+        "minimumIntegerDigits",
+        data.minimum_integer_digits as i32,
+    );
     if let Some(v) = data.minimum_fraction_digits {
         set_i32_prop(runtime, obj, "minimumFractionDigits", v as i32);
     }
@@ -173,10 +196,9 @@ fn plural_rules_resolved_options(
         let cats_arr = runtime.alloc_array();
         for cat in rules.categories() {
             let s = runtime.alloc_string(plural_category_str(cat));
-            let _ = runtime.objects_mut().push_element(
-                cats_arr,
-                RegisterValue::from_object_handle(s.0),
-            );
+            let _ = runtime
+                .objects_mut()
+                .push_element(cats_arr, RegisterValue::from_object_handle(s.0));
         }
         let prop = runtime.intern_property_name("pluralCategories");
         let _ = runtime.objects_mut().set_property(
@@ -198,7 +220,10 @@ fn plural_rules_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -342,13 +367,10 @@ fn require_plural_rules_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a PluralRulesData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("PluralRules: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("PluralRules: {e}").into()))?;
     payload.as_plural_rules().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not PluralRules)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not PluralRules)".into())
     })
 }
 
@@ -360,11 +382,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn set_i32_prop(
@@ -374,11 +394,9 @@ fn set_i32_prop(
     value: i32,
 ) {
     let prop = runtime.intern_property_name(name);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_i32(value),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_i32(value));
 }
 
 fn parse_enum<T>(
@@ -390,7 +408,9 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 
@@ -421,20 +441,14 @@ fn validate_int_range(
     Ok(v as u32)
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),
     }
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("TypeError alloc: {e}").into()),

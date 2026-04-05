@@ -84,7 +84,8 @@ fn format_conjunction_two_items() {
 
 #[test]
 fn format_conjunction_three_items() {
-    let s = run_string("new Intl.ListFormat('en', { type: 'conjunction' }).format(['a', 'b', 'c'])");
+    let s =
+        run_string("new Intl.ListFormat('en', { type: 'conjunction' }).format(['a', 'b', 'c'])");
     assert!(s.contains("a"), "expected 'a' in: {s}");
     assert!(s.contains("c"), "expected 'c' in: {s}");
 }
@@ -113,7 +114,9 @@ fn format_empty_array() {
 
 #[test]
 fn format_to_parts_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.ListFormat('en').formatToParts(['a', 'b']))"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.ListFormat('en').formatToParts(['a', 'b']))"
+    ));
 }
 
 #[test]
@@ -129,7 +132,10 @@ fn format_to_parts_has_type_and_value() {
 #[test]
 fn resolved_options_locale() {
     let s = run_string("new Intl.ListFormat('en').resolvedOptions().locale");
-    assert!(s.starts_with("en"), "expected locale starting with 'en', got: {s}");
+    assert!(
+        s.starts_with("en"),
+        "expected locale starting with 'en', got: {s}"
+    );
 }
 
 #[test]
@@ -154,10 +160,14 @@ fn resolved_options_style_short() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.ListFormat.supportedLocalesOf('en'))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.ListFormat.supportedLocalesOf('en'))"
+    ));
 }
 
 #[test]
 fn supported_locales_of_en() {
-    assert!(run_bool("Intl.ListFormat.supportedLocalesOf('en').length >= 1"));
+    assert!(run_bool(
+        "Intl.ListFormat.supportedLocalesOf('en').length >= 1"
+    ));
 }

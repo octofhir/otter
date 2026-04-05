@@ -64,12 +64,16 @@ fn rtf_is_function() {
 
 #[test]
 fn rtf_constructor_no_args() {
-    assert!(run_bool("typeof new Intl.RelativeTimeFormat() === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.RelativeTimeFormat() === 'object'"
+    ));
 }
 
 #[test]
 fn rtf_constructor_with_locale() {
-    assert!(run_bool("typeof new Intl.RelativeTimeFormat('en') === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.RelativeTimeFormat('en') === 'object'"
+    ));
 }
 
 // ── format() ─────────────────────────────────────────────────────
@@ -78,14 +82,20 @@ fn rtf_constructor_with_locale() {
 fn format_past_day() {
     let s = run_string("new Intl.RelativeTimeFormat('en').format(-1, 'day')");
     // ICU4X produces "1 day ago"
-    assert!(s.contains("1") && s.contains("day"), "expected '1 day ago'-like, got: {s}");
+    assert!(
+        s.contains("1") && s.contains("day"),
+        "expected '1 day ago'-like, got: {s}"
+    );
     assert!(s.contains("ago"), "expected 'ago' in: {s}");
 }
 
 #[test]
 fn format_future_day() {
     let s = run_string("new Intl.RelativeTimeFormat('en').format(1, 'day')");
-    assert!(s.contains("1") && s.contains("day"), "expected 'in 1 day'-like, got: {s}");
+    assert!(
+        s.contains("1") && s.contains("day"),
+        "expected 'in 1 day'-like, got: {s}"
+    );
     assert!(s.contains("in"), "expected 'in' in: {s}");
 }
 
@@ -107,14 +117,19 @@ fn format_future_hours() {
 #[test]
 fn format_zero_seconds() {
     let s = run_string("new Intl.RelativeTimeFormat('en').format(0, 'second')");
-    assert!(s.contains("0") || s.contains("second"), "expected something with seconds, got: {s}");
+    assert!(
+        s.contains("0") || s.contains("second"),
+        "expected something with seconds, got: {s}"
+    );
 }
 
 // ── formatToParts() ──────────────────────────────────────────────
 
 #[test]
 fn format_to_parts_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.RelativeTimeFormat('en').formatToParts(-1, 'day'))"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.RelativeTimeFormat('en').formatToParts(-1, 'day'))"
+    ));
 }
 
 #[test]
@@ -130,7 +145,10 @@ fn format_to_parts_has_type_and_value() {
 #[test]
 fn resolved_options_locale() {
     let s = run_string("new Intl.RelativeTimeFormat('en').resolvedOptions().locale");
-    assert!(s.starts_with("en"), "expected locale starting with 'en', got: {s}");
+    assert!(
+        s.starts_with("en"),
+        "expected locale starting with 'en', got: {s}"
+    );
 }
 
 #[test]
@@ -147,13 +165,16 @@ fn resolved_options_numeric_default() {
 
 #[test]
 fn resolved_options_style_short() {
-    let s = run_string("new Intl.RelativeTimeFormat('en', { style: 'short' }).resolvedOptions().style");
+    let s =
+        run_string("new Intl.RelativeTimeFormat('en', { style: 'short' }).resolvedOptions().style");
     assert_eq!(s, "short");
 }
 
 #[test]
 fn resolved_options_numeric_auto() {
-    let s = run_string("new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).resolvedOptions().numeric");
+    let s = run_string(
+        "new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).resolvedOptions().numeric",
+    );
     assert_eq!(s, "auto");
 }
 
@@ -167,10 +188,14 @@ fn resolved_options_numbering_system() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.RelativeTimeFormat.supportedLocalesOf('en'))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.RelativeTimeFormat.supportedLocalesOf('en'))"
+    ));
 }
 
 #[test]
 fn supported_locales_of_en() {
-    assert!(run_bool("Intl.RelativeTimeFormat.supportedLocalesOf('en').length >= 1"));
+    assert!(run_bool(
+        "Intl.RelativeTimeFormat.supportedLocalesOf('en').length >= 1"
+    ));
 }

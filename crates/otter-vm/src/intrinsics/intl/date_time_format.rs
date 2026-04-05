@@ -10,8 +10,8 @@ use icu_datetime::fieldsets::enums::CompositeFieldSet;
 use icu_datetime::options::{Length, SubsecondDigits, TimePrecision};
 use icu_datetime::{DateTimeFormatter, DateTimeFormatterPreferences};
 use icu_locale::Locale;
-use icu_time::{DateTime, TimeZone, ZonedDateTime};
 use icu_time::zone::UtcOffset;
+use icu_time::{DateTime, TimeZone, ZonedDateTime};
 use std::str::FromStr;
 
 use crate::descriptors::{
@@ -43,11 +43,7 @@ pub fn date_time_format_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method(
-                "formatToParts",
-                1,
-                date_time_format_format_to_parts,
-            ),
+            NativeFunctionDescriptor::method("formatToParts", 1, date_time_format_format_to_parts),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -88,8 +84,14 @@ fn date_time_format_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
     let data = resolve_date_time_format_options(&locale, options_arg, runtime)?;
@@ -119,7 +121,9 @@ fn date_time_format_format_getter(
     })?;
 
     let cache_prop = runtime.intern_property_name("__boundFormat");
-    let cached = runtime.own_property_value(handle, cache_prop).map_err(dtf_interp_err)?;
+    let cached = runtime
+        .own_property_value(handle, cache_prop)
+        .map_err(dtf_interp_err)?;
     if cached != RegisterValue::undefined() && cached.as_object_handle().is_some() {
         return Ok(cached);
     }
@@ -128,24 +132,35 @@ fn date_time_format_format_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
-    let _ = runtime.objects_mut().set_prototype(bound_fn, Some(fn_proto));
+    let _ = runtime
+        .objects_mut()
+        .set_prototype(bound_fn, Some(fn_proto));
 
     let dtf_prop = runtime.intern_property_name("__dateTimeFormat__");
-    runtime.objects_mut().define_own_property(
-        bound_fn,
-        dtf_prop,
-        PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(handle.0),
-            PropertyAttributes::from_flags(false, false, false),
-        ),
-    ).map_err(dtf_interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            bound_fn,
+            dtf_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(handle.0),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(dtf_interp_err)?;
 
     let bound_val = RegisterValue::from_object_handle(bound_fn.0);
-    runtime.objects_mut().define_own_property(
-        handle,
-        cache_prop,
-        PropertyValue::data_with_attrs(bound_val, PropertyAttributes::from_flags(false, false, false)),
-    ).map_err(dtf_interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            handle,
+            cache_prop,
+            PropertyValue::data_with_attrs(
+                bound_val,
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(dtf_interp_err)?;
 
     Ok(bound_val)
 }
@@ -156,19 +171,23 @@ fn bound_dtf_format(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let fn_handle = runtime.current_native_callee().ok_or_else(|| {
-        VmNativeCallError::Internal("bound format: no callee".into())
-    })?;
+    let fn_handle = runtime
+        .current_native_callee()
+        .ok_or_else(|| VmNativeCallError::Internal("bound format: no callee".into()))?;
     let dtf_prop = runtime.intern_property_name("__dateTimeFormat__");
-    let dtf_val = runtime.own_property_value(fn_handle, dtf_prop).map_err(dtf_interp_err)?;
-    let dtf_rv = RegisterValue::from_object_handle(
-        dtf_val.as_object_handle().ok_or_else(|| {
+    let dtf_val = runtime
+        .own_property_value(fn_handle, dtf_prop)
+        .map_err(dtf_interp_err)?;
+    let dtf_rv =
+        RegisterValue::from_object_handle(dtf_val.as_object_handle().ok_or_else(|| {
             VmNativeCallError::Internal("bound format: missing __dateTimeFormat__".into())
-        })?,
-    );
+        })?);
 
     let data = require_dtf_data(&dtf_rv, runtime)?.clone();
-    let date_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let date_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let timestamp_ms = resolve_date_value(date_val, runtime)?;
 
     let formatted = format_date_time(timestamp_ms, &data)?;
@@ -194,7 +213,10 @@ fn date_time_format_format_to_parts(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_dtf_data(this, runtime)?.clone();
 
-    let date_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let date_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let timestamp_ms = resolve_date_value(date_val, runtime)?;
 
     let formatted = format_date_time(timestamp_ms, &data)?;
@@ -212,9 +234,7 @@ fn date_time_format_format_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| {
-                VmNativeCallError::Internal(format!("formatToParts: {e:?}").into())
-            })?;
+            .map_err(|e| VmNativeCallError::Internal(format!("formatToParts: {e:?}").into()))?;
     }
 
     Ok(RegisterValue::from_object_handle(arr.0))
@@ -234,11 +254,20 @@ fn date_time_format_format_range(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_dtf_data(this, runtime)?.clone();
 
-    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let start_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let end_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "startDate and endDate must be provided to formatRange"));
+        return Err(type_error(
+            runtime,
+            "startDate and endDate must be provided to formatRange",
+        ));
     }
 
     let start_ms = resolve_date_value(start_val, runtime)?;
@@ -271,11 +300,20 @@ fn date_time_format_format_range_to_parts(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_dtf_data(this, runtime)?.clone();
 
-    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let start_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let end_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "startDate and endDate must be provided to formatRangeToParts"));
+        return Err(type_error(
+            runtime,
+            "startDate and endDate must be provided to formatRangeToParts",
+        ));
     }
 
     let start_ms = resolve_date_value(start_val, runtime)?;
@@ -296,7 +334,9 @@ fn date_time_format_format_range_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into())
+            })?;
     }
 
     // Literal range separator.
@@ -319,7 +359,9 @@ fn date_time_format_format_range_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into())
+            })?;
     }
 
     Ok(RegisterValue::from_object_handle(arr.0))
@@ -333,7 +375,9 @@ fn set_dtf_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(obj, prop, RegisterValue::from_object_handle(s.0));
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 /// Simplified decomposition of a formatted date/time string into parts.
@@ -391,19 +435,39 @@ fn date_time_format_resolved_options(
         set_string_prop(runtime, obj, "timeStyle", ts.as_str());
     }
 
-    if let Some(ref v) = data.weekday { set_string_prop(runtime, obj, "weekday", v); }
-    if let Some(ref v) = data.era { set_string_prop(runtime, obj, "era", v); }
-    if let Some(ref v) = data.year { set_string_prop(runtime, obj, "year", v); }
-    if let Some(ref v) = data.month { set_string_prop(runtime, obj, "month", v); }
-    if let Some(ref v) = data.day { set_string_prop(runtime, obj, "day", v); }
-    if let Some(ref v) = data.day_period { set_string_prop(runtime, obj, "dayPeriod", v); }
-    if let Some(ref v) = data.hour { set_string_prop(runtime, obj, "hour", v); }
-    if let Some(ref v) = data.minute { set_string_prop(runtime, obj, "minute", v); }
-    if let Some(ref v) = data.second { set_string_prop(runtime, obj, "second", v); }
+    if let Some(ref v) = data.weekday {
+        set_string_prop(runtime, obj, "weekday", v);
+    }
+    if let Some(ref v) = data.era {
+        set_string_prop(runtime, obj, "era", v);
+    }
+    if let Some(ref v) = data.year {
+        set_string_prop(runtime, obj, "year", v);
+    }
+    if let Some(ref v) = data.month {
+        set_string_prop(runtime, obj, "month", v);
+    }
+    if let Some(ref v) = data.day {
+        set_string_prop(runtime, obj, "day", v);
+    }
+    if let Some(ref v) = data.day_period {
+        set_string_prop(runtime, obj, "dayPeriod", v);
+    }
+    if let Some(ref v) = data.hour {
+        set_string_prop(runtime, obj, "hour", v);
+    }
+    if let Some(ref v) = data.minute {
+        set_string_prop(runtime, obj, "minute", v);
+    }
+    if let Some(ref v) = data.second {
+        set_string_prop(runtime, obj, "second", v);
+    }
     if let Some(ref v) = data.fractional_second_digits {
         set_i32_prop(runtime, obj, "fractionalSecondDigits", *v as i32);
     }
-    if let Some(ref v) = data.time_zone_name { set_string_prop(runtime, obj, "timeZoneName", v); }
+    if let Some(ref v) = data.time_zone_name {
+        set_string_prop(runtime, obj, "timeZoneName", v);
+    }
 
     Ok(RegisterValue::from_object_handle(obj.0))
 }
@@ -417,7 +481,10 @@ fn date_time_format_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -441,12 +508,12 @@ fn resolve_date_time_format_options(
     options: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<DateTimeFormatData, VmNativeCallError> {
-    let calendar = get_option_string(options, "calendar", runtime)?
-        .unwrap_or_else(|| "gregory".to_string());
+    let calendar =
+        get_option_string(options, "calendar", runtime)?.unwrap_or_else(|| "gregory".to_string());
     let numbering_system = get_option_string(options, "numberingSystem", runtime)?
         .unwrap_or_else(|| "latn".to_string());
-    let time_zone = get_option_string(options, "timeZone", runtime)?
-        .unwrap_or_else(|| "UTC".to_string());
+    let time_zone =
+        get_option_string(options, "timeZone", runtime)?.unwrap_or_else(|| "UTC".to_string());
 
     let date_style = parse_optional_enum(
         get_option_string(options, "dateStyle", runtime)?,
@@ -563,19 +630,19 @@ fn format_date_time(
     let prefs = DateTimeFormatterPreferences::from(&locale);
 
     // Create formatter.
-    let formatter = DateTimeFormatter::try_new(prefs, fieldset).map_err(|e| {
-        VmNativeCallError::Internal(format!("DateTimeFormatter: {e}").into())
-    })?;
+    let formatter = DateTimeFormatter::try_new(prefs, fieldset)
+        .map_err(|e| VmNativeCallError::Internal(format!("DateTimeFormatter: {e}").into()))?;
 
     // Convert timestamp to ICU4X ZonedDateTime with timezone info.
     // Following Boa's pattern: create TimeZoneInfo<AtTime> for CompositeFieldSet compatibility.
     let epoch_ms = timestamp_ms as i64;
-    let zdt_utc = ZonedDateTime::from_epoch_milliseconds_and_utc_offset(
-        epoch_ms,
-        UtcOffset::zero(),
-    );
+    let zdt_utc =
+        ZonedDateTime::from_epoch_milliseconds_and_utc_offset(epoch_ms, UtcOffset::zero());
     let tz_info = TimeZone::UNKNOWN.with_offset(Some(UtcOffset::zero()));
-    let dt = DateTime { date: zdt_utc.date, time: zdt_utc.time };
+    let dt = DateTime {
+        date: zdt_utc.date,
+        time: zdt_utc.time,
+    };
     let tz_at_time = tz_info.at_date_time(dt);
     let zdt = ZonedDateTime {
         date: dt.date,
@@ -626,17 +693,21 @@ fn build_field_set(data: &DateTimeFormatData) -> Result<CompositeFieldSet, Strin
         builder.time_precision = resolve_time_precision(data);
     }
 
-    builder
-        .build_composite()
-        .map_err(|e| format!("{e}"))
+    builder.build_composite().map_err(|e| format!("{e}"))
 }
 
 /// Determine Length from component option values.
 fn resolve_component_length(data: &DateTimeFormatData) -> Length {
     // Check if any component uses "long"/"narrow" → Long, "short" → Short, else Medium.
     let all_opts: Vec<&Option<String>> = vec![
-        &data.weekday, &data.era, &data.year, &data.month, &data.day,
-        &data.hour, &data.minute, &data.second,
+        &data.weekday,
+        &data.era,
+        &data.year,
+        &data.month,
+        &data.day,
+        &data.hour,
+        &data.minute,
+        &data.second,
     ];
     for v in all_opts.iter().copied().flatten() {
         match v.as_str() {
@@ -700,7 +771,6 @@ fn resolve_time_precision(data: &DateTimeFormatData) -> Option<TimePrecision> {
     // Hour only — minute precision still needed for display.
     Some(TimePrecision::Minute)
 }
-
 
 // ═══════════════════════════════════════════════════════════════════
 //  formatToParts decomposition
@@ -795,9 +865,8 @@ fn require_dtf_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a DateTimeFormatData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("DateTimeFormat: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("DateTimeFormat: {e}").into()))?;
     payload.as_date_time_format().ok_or_else(|| {
         VmNativeCallError::Internal(
             "called on incompatible Intl receiver (not DateTimeFormat)".into(),
@@ -813,11 +882,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn set_i32_prop(
@@ -827,11 +894,9 @@ fn set_i32_prop(
     value: i32,
 ) {
     let prop = runtime.intern_property_name(name);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_i32(value),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_i32(value));
 }
 
 fn parse_optional_enum<T>(
@@ -848,20 +913,14 @@ fn parse_optional_enum<T>(
     }
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),
     }
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("TypeError alloc: {e}").into()),

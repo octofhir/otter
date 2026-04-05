@@ -118,6 +118,12 @@ fn promise_class_descriptor() -> JsClassDescriptor {
             NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("any", 1, promise_static_any),
         ))
+        // §27.2.4.8 Promise.withResolvers()
+        // <https://tc39.es/ecma262/#sec-promise.withresolvers>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("withResolvers", 0, promise_with_resolvers),
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -665,4 +671,57 @@ fn promise_static_any(
     }
 
     Ok(RegisterValue::from_object_handle(result_cap.promise.0))
+}
+
+// ---------------------------------------------------------------------------
+// §27.2.4.8 Promise.withResolvers()
+// ---------------------------------------------------------------------------
+
+/// `Promise.withResolvers()` — §27.2.4.8
+/// <https://tc39.es/ecma262/#sec-promise.withresolvers>
+///
+/// Returns a plain object `{ promise, resolve, reject }` where `promise` is a
+/// new pending Promise and `resolve`/`reject` are the functions that settle it.
+fn promise_with_resolvers(
+    _this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let cap = alloc_promise_capability(runtime);
+
+    // Build the result object: { promise, resolve, reject }.
+    let obj_proto = runtime.intrinsics().object_prototype();
+    let obj = runtime.alloc_object_with_prototype(Some(obj_proto));
+
+    let promise_prop = runtime.intern_property_name("promise");
+    runtime
+        .objects_mut()
+        .set_property(
+            obj,
+            promise_prop,
+            RegisterValue::from_object_handle(cap.promise.0),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let resolve_prop = runtime.intern_property_name("resolve");
+    runtime
+        .objects_mut()
+        .set_property(
+            obj,
+            resolve_prop,
+            RegisterValue::from_object_handle(cap.resolve.0),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let reject_prop = runtime.intern_property_name("reject");
+    runtime
+        .objects_mut()
+        .set_property(
+            obj,
+            reject_prop,
+            RegisterValue::from_object_handle(cap.reject.0),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    Ok(RegisterValue::from_object_handle(obj.0))
 }

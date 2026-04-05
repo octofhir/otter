@@ -14,7 +14,9 @@ use crate::descriptors::{
 use crate::value::RegisterValue;
 
 use super::options_utils::get_option_string;
-use super::payload::{self, DisplayNamesData, DisplayNamesFallback, DisplayNamesStyle, DisplayNamesType, IntlPayload};
+use super::payload::{
+    self, DisplayNamesData, DisplayNamesFallback, DisplayNamesStyle, DisplayNamesType, IntlPayload,
+};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Class descriptor
@@ -54,17 +56,22 @@ fn display_names_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
 
     // "type" is required per spec.
     let type_opt = get_option_string(options_arg, "type", runtime)?;
     let display_type = match type_opt {
-        Some(s) => DisplayNamesType::from_str_opt(&s).ok_or_else(|| {
-            range_error(runtime, &format!("Invalid DisplayNames type: {s}"))
-        })?,
+        Some(s) => DisplayNamesType::from_str_opt(&s)
+            .ok_or_else(|| range_error(runtime, &format!("Invalid DisplayNames type: {s}")))?,
         None => return Err(type_error(runtime, "DisplayNames requires a 'type' option")),
     };
 
@@ -106,7 +113,10 @@ fn display_names_of(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_display_names_data(this, runtime)?.clone();
-    let code_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let code_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let code = runtime
         .js_to_string(code_arg)
         .map_err(|e| VmNativeCallError::Internal(format!("DisplayNames.of: {e}").into()))?;
@@ -155,7 +165,10 @@ fn display_names_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -163,7 +176,9 @@ fn display_names_supported_locales_of(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into())
+            })?;
     }
     Ok(RegisterValue::from_object_handle(arr.0))
 }
@@ -186,20 +201,59 @@ fn lookup_display_name(code: &str, data: &DisplayNamesData) -> Option<String> {
 fn lookup_language(code: &str) -> Option<String> {
     // Common language codes → English names.
     let name = match code {
-        "ar" => "Arabic", "bg" => "Bulgarian", "bn" => "Bangla", "ca" => "Catalan",
-        "cs" => "Czech", "da" => "Danish", "de" => "German", "el" => "Greek",
-        "en" => "English", "en-US" => "American English", "en-GB" => "British English",
-        "es" => "Spanish", "et" => "Estonian", "fa" => "Persian", "fi" => "Finnish",
-        "fr" => "French", "gu" => "Gujarati", "he" => "Hebrew", "hi" => "Hindi",
-        "hr" => "Croatian", "hu" => "Hungarian", "id" => "Indonesian", "it" => "Italian",
-        "ja" => "Japanese", "kn" => "Kannada", "ko" => "Korean", "lt" => "Lithuanian",
-        "lv" => "Latvian", "ml" => "Malayalam", "mr" => "Marathi", "ms" => "Malay",
-        "nb" => "Norwegian Bokmål", "nl" => "Dutch", "pa" => "Punjabi", "pl" => "Polish",
-        "pt" => "Portuguese", "ro" => "Romanian", "ru" => "Russian", "sk" => "Slovak",
-        "sl" => "Slovenian", "sr" => "Serbian", "sv" => "Swedish", "sw" => "Swahili",
-        "ta" => "Tamil", "te" => "Telugu", "th" => "Thai", "tr" => "Turkish",
-        "uk" => "Ukrainian", "ur" => "Urdu", "vi" => "Vietnamese", "zh" => "Chinese",
-        "zh-Hans" => "Simplified Chinese", "zh-Hant" => "Traditional Chinese",
+        "ar" => "Arabic",
+        "bg" => "Bulgarian",
+        "bn" => "Bangla",
+        "ca" => "Catalan",
+        "cs" => "Czech",
+        "da" => "Danish",
+        "de" => "German",
+        "el" => "Greek",
+        "en" => "English",
+        "en-US" => "American English",
+        "en-GB" => "British English",
+        "es" => "Spanish",
+        "et" => "Estonian",
+        "fa" => "Persian",
+        "fi" => "Finnish",
+        "fr" => "French",
+        "gu" => "Gujarati",
+        "he" => "Hebrew",
+        "hi" => "Hindi",
+        "hr" => "Croatian",
+        "hu" => "Hungarian",
+        "id" => "Indonesian",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "kn" => "Kannada",
+        "ko" => "Korean",
+        "lt" => "Lithuanian",
+        "lv" => "Latvian",
+        "ml" => "Malayalam",
+        "mr" => "Marathi",
+        "ms" => "Malay",
+        "nb" => "Norwegian Bokmål",
+        "nl" => "Dutch",
+        "pa" => "Punjabi",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ro" => "Romanian",
+        "ru" => "Russian",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "sr" => "Serbian",
+        "sv" => "Swedish",
+        "sw" => "Swahili",
+        "ta" => "Tamil",
+        "te" => "Telugu",
+        "th" => "Thai",
+        "tr" => "Turkish",
+        "uk" => "Ukrainian",
+        "ur" => "Urdu",
+        "vi" => "Vietnamese",
+        "zh" => "Chinese",
+        "zh-Hans" => "Simplified Chinese",
+        "zh-Hant" => "Traditional Chinese",
         _ => return None,
     };
     Some(name.to_string())
@@ -207,21 +261,63 @@ fn lookup_language(code: &str) -> Option<String> {
 
 fn lookup_region(code: &str) -> Option<String> {
     let name = match code {
-        "AD" => "Andorra", "AE" => "United Arab Emirates", "AF" => "Afghanistan",
-        "AR" => "Argentina", "AT" => "Austria", "AU" => "Australia", "BE" => "Belgium",
-        "BG" => "Bulgaria", "BR" => "Brazil", "CA" => "Canada", "CH" => "Switzerland",
-        "CL" => "Chile", "CN" => "China", "CO" => "Colombia", "CZ" => "Czechia",
-        "DE" => "Germany", "DK" => "Denmark", "EG" => "Egypt", "ES" => "Spain",
-        "FI" => "Finland", "FR" => "France", "GB" => "United Kingdom", "GR" => "Greece",
-        "HK" => "Hong Kong SAR China", "HR" => "Croatia", "HU" => "Hungary",
-        "ID" => "Indonesia", "IE" => "Ireland", "IL" => "Israel", "IN" => "India",
-        "IQ" => "Iraq", "IR" => "Iran", "IT" => "Italy", "JP" => "Japan",
-        "KR" => "South Korea", "MX" => "Mexico", "MY" => "Malaysia", "NG" => "Nigeria",
-        "NL" => "Netherlands", "NO" => "Norway", "NZ" => "New Zealand", "PH" => "Philippines",
-        "PK" => "Pakistan", "PL" => "Poland", "PT" => "Portugal", "RO" => "Romania",
-        "RU" => "Russia", "SA" => "Saudi Arabia", "SE" => "Sweden", "SG" => "Singapore",
-        "TH" => "Thailand", "TR" => "Türkiye", "TW" => "Taiwan", "UA" => "Ukraine",
-        "US" => "United States", "VN" => "Vietnam", "ZA" => "South Africa",
+        "AD" => "Andorra",
+        "AE" => "United Arab Emirates",
+        "AF" => "Afghanistan",
+        "AR" => "Argentina",
+        "AT" => "Austria",
+        "AU" => "Australia",
+        "BE" => "Belgium",
+        "BG" => "Bulgaria",
+        "BR" => "Brazil",
+        "CA" => "Canada",
+        "CH" => "Switzerland",
+        "CL" => "Chile",
+        "CN" => "China",
+        "CO" => "Colombia",
+        "CZ" => "Czechia",
+        "DE" => "Germany",
+        "DK" => "Denmark",
+        "EG" => "Egypt",
+        "ES" => "Spain",
+        "FI" => "Finland",
+        "FR" => "France",
+        "GB" => "United Kingdom",
+        "GR" => "Greece",
+        "HK" => "Hong Kong SAR China",
+        "HR" => "Croatia",
+        "HU" => "Hungary",
+        "ID" => "Indonesia",
+        "IE" => "Ireland",
+        "IL" => "Israel",
+        "IN" => "India",
+        "IQ" => "Iraq",
+        "IR" => "Iran",
+        "IT" => "Italy",
+        "JP" => "Japan",
+        "KR" => "South Korea",
+        "MX" => "Mexico",
+        "MY" => "Malaysia",
+        "NG" => "Nigeria",
+        "NL" => "Netherlands",
+        "NO" => "Norway",
+        "NZ" => "New Zealand",
+        "PH" => "Philippines",
+        "PK" => "Pakistan",
+        "PL" => "Poland",
+        "PT" => "Portugal",
+        "RO" => "Romania",
+        "RU" => "Russia",
+        "SA" => "Saudi Arabia",
+        "SE" => "Sweden",
+        "SG" => "Singapore",
+        "TH" => "Thailand",
+        "TR" => "Türkiye",
+        "TW" => "Taiwan",
+        "UA" => "Ukraine",
+        "US" => "United States",
+        "VN" => "Vietnam",
+        "ZA" => "South Africa",
         _ => return None,
     };
     Some(name.to_string())
@@ -229,13 +325,33 @@ fn lookup_region(code: &str) -> Option<String> {
 
 fn lookup_script(code: &str) -> Option<String> {
     let name = match code {
-        "Arab" => "Arabic", "Armn" => "Armenian", "Beng" => "Bangla", "Cyrl" => "Cyrillic",
-        "Deva" => "Devanagari", "Geor" => "Georgian", "Grek" => "Greek", "Gujr" => "Gujarati",
-        "Guru" => "Gurmukhi", "Hang" => "Hangul", "Hani" => "Han", "Hans" => "Simplified",
-        "Hant" => "Traditional", "Hebr" => "Hebrew", "Jpan" => "Japanese", "Kana" => "Katakana",
-        "Knda" => "Kannada", "Kore" => "Korean", "Latn" => "Latin", "Mlym" => "Malayalam",
-        "Mymr" => "Myanmar", "Orya" => "Odia", "Sinh" => "Sinhala", "Taml" => "Tamil",
-        "Telu" => "Telugu", "Thai" => "Thai", "Tibt" => "Tibetan",
+        "Arab" => "Arabic",
+        "Armn" => "Armenian",
+        "Beng" => "Bangla",
+        "Cyrl" => "Cyrillic",
+        "Deva" => "Devanagari",
+        "Geor" => "Georgian",
+        "Grek" => "Greek",
+        "Gujr" => "Gujarati",
+        "Guru" => "Gurmukhi",
+        "Hang" => "Hangul",
+        "Hani" => "Han",
+        "Hans" => "Simplified",
+        "Hant" => "Traditional",
+        "Hebr" => "Hebrew",
+        "Jpan" => "Japanese",
+        "Kana" => "Katakana",
+        "Knda" => "Kannada",
+        "Kore" => "Korean",
+        "Latn" => "Latin",
+        "Mlym" => "Malayalam",
+        "Mymr" => "Myanmar",
+        "Orya" => "Odia",
+        "Sinh" => "Sinhala",
+        "Taml" => "Tamil",
+        "Telu" => "Telugu",
+        "Thai" => "Thai",
+        "Tibt" => "Tibetan",
         _ => return None,
     };
     Some(name.to_string())
@@ -243,13 +359,27 @@ fn lookup_script(code: &str) -> Option<String> {
 
 fn lookup_currency(code: &str) -> Option<String> {
     let name = match code {
-        "AUD" => "Australian Dollar", "BRL" => "Brazilian Real", "CAD" => "Canadian Dollar",
-        "CHF" => "Swiss Franc", "CNY" => "Chinese Yuan", "EUR" => "Euro",
-        "GBP" => "British Pound", "HKD" => "Hong Kong Dollar", "INR" => "Indian Rupee",
-        "JPY" => "Japanese Yen", "KRW" => "South Korean Won", "MXN" => "Mexican Peso",
-        "NOK" => "Norwegian Krone", "NZD" => "New Zealand Dollar", "RUB" => "Russian Ruble",
-        "SEK" => "Swedish Krona", "SGD" => "Singapore Dollar", "THB" => "Thai Baht",
-        "TRY" => "Turkish Lira", "TWD" => "New Taiwan Dollar", "USD" => "US Dollar",
+        "AUD" => "Australian Dollar",
+        "BRL" => "Brazilian Real",
+        "CAD" => "Canadian Dollar",
+        "CHF" => "Swiss Franc",
+        "CNY" => "Chinese Yuan",
+        "EUR" => "Euro",
+        "GBP" => "British Pound",
+        "HKD" => "Hong Kong Dollar",
+        "INR" => "Indian Rupee",
+        "JPY" => "Japanese Yen",
+        "KRW" => "South Korean Won",
+        "MXN" => "Mexican Peso",
+        "NOK" => "Norwegian Krone",
+        "NZD" => "New Zealand Dollar",
+        "RUB" => "Russian Ruble",
+        "SEK" => "Swedish Krona",
+        "SGD" => "Singapore Dollar",
+        "THB" => "Thai Baht",
+        "TRY" => "Turkish Lira",
+        "TWD" => "New Taiwan Dollar",
+        "USD" => "US Dollar",
         "ZAR" => "South African Rand",
         _ => return None,
     };
@@ -258,15 +388,22 @@ fn lookup_currency(code: &str) -> Option<String> {
 
 fn lookup_calendar(code: &str) -> Option<String> {
     let name = match code {
-        "buddhist" => "Buddhist Calendar", "chinese" => "Chinese Calendar",
-        "coptic" => "Coptic Calendar", "dangi" => "Dangi Calendar",
-        "ethioaa" => "Ethiopic Amete Alem Calendar", "ethiopic" => "Ethiopic Calendar",
-        "gregory" => "Gregorian Calendar", "hebrew" => "Hebrew Calendar",
-        "indian" => "Indian National Calendar", "islamic" => "Islamic Calendar",
+        "buddhist" => "Buddhist Calendar",
+        "chinese" => "Chinese Calendar",
+        "coptic" => "Coptic Calendar",
+        "dangi" => "Dangi Calendar",
+        "ethioaa" => "Ethiopic Amete Alem Calendar",
+        "ethiopic" => "Ethiopic Calendar",
+        "gregory" => "Gregorian Calendar",
+        "hebrew" => "Hebrew Calendar",
+        "indian" => "Indian National Calendar",
+        "islamic" => "Islamic Calendar",
         "islamic-civil" => "Islamic Calendar (tabular, civil epoch)",
         "islamic-umalqura" => "Islamic Calendar (Umm al-Qura)",
-        "iso8601" => "ISO-8601 Calendar", "japanese" => "Japanese Calendar",
-        "persian" => "Persian Calendar", "roc" => "Minguo Calendar",
+        "iso8601" => "ISO-8601 Calendar",
+        "japanese" => "Japanese Calendar",
+        "persian" => "Persian Calendar",
+        "roc" => "Minguo Calendar",
         _ => return None,
     };
     Some(name.to_string())
@@ -274,10 +411,18 @@ fn lookup_calendar(code: &str) -> Option<String> {
 
 fn lookup_datetime_field(code: &str) -> Option<String> {
     let name = match code {
-        "era" => "era", "year" => "year", "quarter" => "quarter", "month" => "month",
-        "weekOfYear" => "week", "weekday" => "day of the week", "day" => "day",
-        "dayPeriod" => "AM/PM", "hour" => "hour", "minute" => "minute",
-        "second" => "second", "timeZoneName" => "time zone",
+        "era" => "era",
+        "year" => "year",
+        "quarter" => "quarter",
+        "month" => "month",
+        "weekOfYear" => "week",
+        "weekday" => "day of the week",
+        "day" => "day",
+        "dayPeriod" => "AM/PM",
+        "hour" => "hour",
+        "minute" => "minute",
+        "second" => "second",
+        "timeZoneName" => "time zone",
         _ => return None,
     };
     Some(name.to_string())
@@ -313,19 +458,35 @@ impl DisplayNamesType {
 
 impl DisplayNamesStyle {
     pub fn as_str(&self) -> &'static str {
-        match self { Self::Long => "long", Self::Short => "short", Self::Narrow => "narrow" }
+        match self {
+            Self::Long => "long",
+            Self::Short => "short",
+            Self::Narrow => "narrow",
+        }
     }
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s { "long" => Some(Self::Long), "short" => Some(Self::Short), "narrow" => Some(Self::Narrow), _ => None }
+        match s {
+            "long" => Some(Self::Long),
+            "short" => Some(Self::Short),
+            "narrow" => Some(Self::Narrow),
+            _ => None,
+        }
     }
 }
 
 impl DisplayNamesFallback {
     pub fn as_str(&self) -> &'static str {
-        match self { Self::Code => "code", Self::None => "none" }
+        match self {
+            Self::Code => "code",
+            Self::None => "none",
+        }
     }
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s { "code" => Some(Self::Code), "none" => Some(Self::None), _ => None }
+        match s {
+            "code" => Some(Self::Code),
+            "none" => Some(Self::None),
+            _ => None,
+        }
     }
 }
 
@@ -337,11 +498,12 @@ fn require_display_names_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a DisplayNamesData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("DisplayNames: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("DisplayNames: {e}").into()))?;
     payload.as_display_names().ok_or_else(|| {
-        VmNativeCallError::Internal("called on incompatible Intl receiver (not DisplayNames)".into())
+        VmNativeCallError::Internal(
+            "called on incompatible Intl receiver (not DisplayNames)".into(),
+        )
     })
 }
 
@@ -353,7 +515,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(obj, prop, RegisterValue::from_object_handle(s.0));
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn parse_enum<T>(
@@ -365,7 +529,9 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 

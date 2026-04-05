@@ -17,6 +17,7 @@ mod eval;
 mod function_class;
 mod generator_class;
 mod install;
+mod intl;
 mod iterator_class;
 mod json;
 mod map_set_class;
@@ -31,7 +32,6 @@ mod sharedarraybuffer_class;
 mod species_support;
 mod string_class;
 mod symbol_class;
-mod intl;
 mod temporal;
 pub(crate) mod timer_globals;
 pub(crate) mod typedarray_class;
@@ -319,6 +319,7 @@ pub struct VmIntrinsics {
     pub(crate) finalization_registry_constructor: ObjectHandle,
     pub(crate) finalization_registry_prototype: ObjectHandle,
     // Iterator prototypes (§27.1.2, §23.1.5, §22.1.5, §24.1.5, §24.2.5)
+    pub(crate) iterator_constructor: Option<ObjectHandle>,
     pub(crate) iterator_prototype: ObjectHandle,
     pub(crate) async_iterator_prototype: ObjectHandle,
     pub(crate) array_iterator_prototype: ObjectHandle,
@@ -615,6 +616,7 @@ impl VmIntrinsics {
             weakref_prototype,
             finalization_registry_constructor,
             finalization_registry_prototype,
+            iterator_constructor: None,
             iterator_prototype,
             async_iterator_prototype,
             array_iterator_prototype,
@@ -1592,6 +1594,9 @@ impl VmIntrinsics {
             self.temporal_zoned_date_time_constructor,
             self.temporal_zoned_date_time_prototype,
         ]);
+        if let Some(h) = self.iterator_constructor {
+            roots.push(h);
+        }
         if let Some(h) = self.math_namespace {
             roots.push(h);
         }
@@ -1694,6 +1699,10 @@ impl VmIntrinsics {
             self.temporal_zoned_date_time_constructor,
             self.temporal_zoned_date_time_prototype,
         ] {
+            tracer(IntrinsicRoot::Object(handle));
+        }
+
+        if let Some(handle) = self.iterator_constructor {
             tracer(IntrinsicRoot::Object(handle));
         }
 
@@ -1832,7 +1841,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 680);
+        assert_eq!(native_functions.len(), 711);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

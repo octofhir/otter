@@ -59,7 +59,8 @@ fn run_string(source: &str) -> String {
 
 fn run_f64(source: &str) -> f64 {
     let v = run(source);
-    v.as_number().unwrap_or_else(|| panic!("expected number, got {v:?}"))
+    v.as_number()
+        .unwrap_or_else(|| panic!("expected number, got {v:?}"))
 }
 
 // ── Constructor ──────────────────────────────────────────────────
@@ -83,7 +84,9 @@ fn segmenter_constructor_with_locale() {
 
 #[test]
 fn segment_returns_object() {
-    assert!(run_bool("typeof new Intl.Segmenter('en').segment('abc') === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.Segmenter('en').segment('abc') === 'object'"
+    ));
 }
 
 #[test]
@@ -100,7 +103,7 @@ fn segment_spread_grapheme_count() {
     // Spreading into array should give one segment per grapheme cluster.
     let n = run_f64(
         "var arr = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc')]; \
-         arr.length"
+         arr.length",
     );
     assert_eq!(n, 3.0);
 }
@@ -109,7 +112,7 @@ fn segment_spread_grapheme_count() {
 fn segment_spread_has_segment_property() {
     let s = run_string(
         "var arr = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc')]; \
-         arr[0].segment"
+         arr[0].segment",
     );
     assert_eq!(s, "a");
 }
@@ -118,7 +121,7 @@ fn segment_spread_has_segment_property() {
 fn segment_spread_has_index_property() {
     let n = run_f64(
         "var arr = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc')]; \
-         arr[1].index"
+         arr[1].index",
     );
     assert_eq!(n, 1.0);
 }
@@ -127,7 +130,7 @@ fn segment_spread_has_index_property() {
 fn segment_spread_has_input_property() {
     let s = run_string(
         "var arr = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc')]; \
-         arr[0].input"
+         arr[0].input",
     );
     assert_eq!(s, "abc");
 }
@@ -145,7 +148,7 @@ fn segment_word_spread_count() {
     // "hello world" should produce at least 3 segments: "hello", " ", "world"
     let n = run_f64(
         "var arr = [...new Intl.Segmenter('en', { granularity: 'word' }).segment('hello world')]; \
-         arr.length"
+         arr.length",
     );
     assert!(n >= 3.0, "expected >= 3 word segments, got: {n}");
 }
@@ -156,7 +159,7 @@ fn segment_word_spread_count() {
 fn containing_returns_segment_at_index() {
     let s = run_string(
         "var segs = new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc'); \
-         segs.containing(0).segment"
+         segs.containing(0).segment",
     );
     assert_eq!(s, "a");
 }
@@ -165,7 +168,7 @@ fn containing_returns_segment_at_index() {
 fn containing_second_char() {
     let s = run_string(
         "var segs = new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('abc'); \
-         segs.containing(1).segment"
+         segs.containing(1).segment",
     );
     assert_eq!(s, "b");
 }
@@ -195,7 +198,7 @@ fn for_of_collects_segments() {
          for (var seg of new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('hi')) { \
              result.push(seg.segment); \
          } \
-         result.length"
+         result.length",
     );
     assert_eq!(n, 2.0);
 }
@@ -207,7 +210,7 @@ fn for_of_first_segment_value() {
          for (var seg of new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('hi')) { \
              result.push(seg.segment); \
          } \
-         result[0]"
+         result[0]",
     );
     assert_eq!(s, "h");
 }
@@ -219,7 +222,7 @@ fn segment_iterator_to_string_tag() {
     let s = run_string(
         "var segs = new Intl.Segmenter('en').segment('x'); \
          var iter = segs[Symbol.iterator](); \
-         Object.prototype.toString.call(iter)"
+         Object.prototype.toString.call(iter)",
     );
     assert_eq!(s, "[object Segmenter String Iterator]");
 }
@@ -229,7 +232,10 @@ fn segment_iterator_to_string_tag() {
 #[test]
 fn resolved_options_locale() {
     let s = run_string("new Intl.Segmenter('en').resolvedOptions().locale");
-    assert!(s.starts_with("en"), "expected locale starting with 'en', got: {s}");
+    assert!(
+        s.starts_with("en"),
+        "expected locale starting with 'en', got: {s}"
+    );
 }
 
 #[test]
@@ -240,13 +246,17 @@ fn resolved_options_granularity_default() {
 
 #[test]
 fn resolved_options_granularity_word() {
-    let s = run_string("new Intl.Segmenter('en', { granularity: 'word' }).resolvedOptions().granularity");
+    let s = run_string(
+        "new Intl.Segmenter('en', { granularity: 'word' }).resolvedOptions().granularity",
+    );
     assert_eq!(s, "word");
 }
 
 #[test]
 fn resolved_options_granularity_sentence() {
-    let s = run_string("new Intl.Segmenter('en', { granularity: 'sentence' }).resolvedOptions().granularity");
+    let s = run_string(
+        "new Intl.Segmenter('en', { granularity: 'sentence' }).resolvedOptions().granularity",
+    );
     assert_eq!(s, "sentence");
 }
 
@@ -254,5 +264,7 @@ fn resolved_options_granularity_sentence() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.Segmenter.supportedLocalesOf('en'))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.Segmenter.supportedLocalesOf('en'))"
+    ));
 }

@@ -62,7 +62,9 @@ fn plural_rules_is_function() {
 
 #[test]
 fn plural_rules_constructor_no_args() {
-    assert!(run_bool("new Intl.PluralRules() instanceof Intl.PluralRules"));
+    assert!(run_bool(
+        "new Intl.PluralRules() instanceof Intl.PluralRules"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -71,35 +73,23 @@ fn plural_rules_constructor_no_args() {
 
 #[test]
 fn select_one_english() {
-    assert_eq!(
-        run_string("new Intl.PluralRules('en').select(1)"),
-        "one"
-    );
+    assert_eq!(run_string("new Intl.PluralRules('en').select(1)"), "one");
 }
 
 #[test]
 fn select_other_english() {
-    assert_eq!(
-        run_string("new Intl.PluralRules('en').select(0)"),
-        "other"
-    );
+    assert_eq!(run_string("new Intl.PluralRules('en').select(0)"), "other");
 }
 
 #[test]
 fn select_two_english() {
-    assert_eq!(
-        run_string("new Intl.PluralRules('en').select(2)"),
-        "other"
-    );
+    assert_eq!(run_string("new Intl.PluralRules('en').select(2)"), "other");
 }
 
 #[test]
 fn select_negative_one() {
     // In English, -1 is "one" per CLDR.
-    assert_eq!(
-        run_string("new Intl.PluralRules('en').select(-1)"),
-        "one"
-    );
+    assert_eq!(run_string("new Intl.PluralRules('en').select(-1)"), "one");
 }
 
 #[test]
@@ -200,7 +190,9 @@ fn resolved_options_plural_categories() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.PluralRules.supportedLocalesOf(['en']))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.PluralRules.supportedLocalesOf(['en']))"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════

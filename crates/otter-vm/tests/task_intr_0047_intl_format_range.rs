@@ -60,7 +60,8 @@ fn run_string(source: &str) -> String {
 
 fn run_f64(source: &str) -> f64 {
     let v = run(source);
-    v.as_number().unwrap_or_else(|| panic!("expected number, got {v:?}"))
+    v.as_number()
+        .unwrap_or_else(|| panic!("expected number, got {v:?}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -69,7 +70,9 @@ fn run_f64(source: &str) -> f64 {
 
 #[test]
 fn nf_format_range_is_function() {
-    assert!(run_bool("typeof new Intl.NumberFormat('en').formatRange === 'function'"));
+    assert!(run_bool(
+        "typeof new Intl.NumberFormat('en').formatRange === 'function'"
+    ));
 }
 
 #[test]
@@ -88,7 +91,9 @@ fn nf_format_range_same_value() {
 
 #[test]
 fn nf_format_range_returns_string() {
-    assert!(run_bool("typeof new Intl.NumberFormat('en').formatRange(1, 10) === 'string'"));
+    assert!(run_bool(
+        "typeof new Intl.NumberFormat('en').formatRange(1, 10) === 'string'"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -97,12 +102,16 @@ fn nf_format_range_returns_string() {
 
 #[test]
 fn nf_format_range_to_parts_is_function() {
-    assert!(run_bool("typeof new Intl.NumberFormat('en').formatRangeToParts === 'function'"));
+    assert!(run_bool(
+        "typeof new Intl.NumberFormat('en').formatRangeToParts === 'function'"
+    ));
 }
 
 #[test]
 fn nf_format_range_to_parts_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.NumberFormat('en').formatRangeToParts(3, 5))"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.NumberFormat('en').formatRangeToParts(3, 5))"
+    ));
 }
 
 #[test]
@@ -132,7 +141,9 @@ fn nf_format_range_to_parts_has_start_and_end() {
 
 #[test]
 fn dtf_format_range_is_function() {
-    assert!(run_bool("typeof new Intl.DateTimeFormat('en').formatRange === 'function'"));
+    assert!(run_bool(
+        "typeof new Intl.DateTimeFormat('en').formatRange === 'function'"
+    ));
 }
 
 #[test]
@@ -145,7 +156,7 @@ fn dtf_format_range_returns_string() {
 #[test]
 fn dtf_format_range_contains_both_dates() {
     let s = run_string(
-        "new Intl.DateTimeFormat('en', { dateStyle: 'short' }).formatRange(new Date(2020, 0, 1), new Date(2020, 5, 15))"
+        "new Intl.DateTimeFormat('en', { dateStyle: 'short' }).formatRange(new Date(2020, 0, 1), new Date(2020, 5, 15))",
     );
     // Should contain parts from both dates.
     assert!(s.len() > 5, "expected non-trivial range string, got: {s}");
@@ -157,7 +168,9 @@ fn dtf_format_range_contains_both_dates() {
 
 #[test]
 fn dtf_format_range_to_parts_is_function() {
-    assert!(run_bool("typeof new Intl.DateTimeFormat('en').formatRangeToParts === 'function'"));
+    assert!(run_bool(
+        "typeof new Intl.DateTimeFormat('en').formatRangeToParts === 'function'"
+    ));
 }
 
 #[test]
@@ -170,7 +183,10 @@ fn dtf_format_range_to_parts_returns_array() {
 #[test]
 fn dtf_format_range_to_parts_has_source() {
     let n = run_f64(
-        "new Intl.DateTimeFormat('en', { dateStyle: 'short' }).formatRangeToParts(new Date(2020, 0, 1), new Date(2020, 11, 31)).length"
+        "new Intl.DateTimeFormat('en', { dateStyle: 'short' }).formatRangeToParts(new Date(2020, 0, 1), new Date(2020, 11, 31)).length",
     );
-    assert!(n >= 3.0, "expected at least 3 parts (start + sep + end), got: {n}");
+    assert!(
+        n >= 3.0,
+        "expected at least 3 parts (start + sep + end), got: {n}"
+    );
 }

@@ -73,7 +73,9 @@ fn collator_constructor_no_args() {
 
 #[test]
 fn collator_constructor_with_locale() {
-    assert!(run_bool("new Intl.Collator('en-US') instanceof Intl.Collator"));
+    assert!(run_bool(
+        "new Intl.Collator('en-US') instanceof Intl.Collator"
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -125,7 +127,10 @@ fn compare_accent_sensitive() {
 #[test]
 fn resolved_options_locale() {
     let locale = run_string("new Intl.Collator('en').resolvedOptions().locale");
-    assert!(locale.starts_with("en"), "locale should start with 'en', got: {locale}");
+    assert!(
+        locale.starts_with("en"),
+        "locale should start with 'en', got: {locale}"
+    );
 }
 
 #[test]
@@ -147,7 +152,9 @@ fn resolved_options_sensitivity() {
 #[test]
 fn resolved_options_custom_sensitivity() {
     assert_eq!(
-        run_string("new Intl.Collator('en', { sensitivity: 'base' }).resolvedOptions().sensitivity"),
+        run_string(
+            "new Intl.Collator('en', { sensitivity: 'base' }).resolvedOptions().sensitivity"
+        ),
         "base"
     );
 }
@@ -174,7 +181,9 @@ fn resolved_options_case_first() {
 
 #[test]
 fn supported_locales_of_returns_array() {
-    assert!(run_bool("Array.isArray(Intl.Collator.supportedLocalesOf(['en']))"));
+    assert!(run_bool(
+        "Array.isArray(Intl.Collator.supportedLocalesOf(['en']))"
+    ));
 }
 
 #[test]

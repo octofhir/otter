@@ -59,8 +59,14 @@ fn rtf_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
 
@@ -101,8 +107,14 @@ fn rtf_format(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_rtf_data(this, runtime)?.clone();
-    let value_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let unit_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let value_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let unit_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let value = runtime
         .js_to_number(value_arg)
@@ -129,8 +141,14 @@ fn rtf_format_to_parts(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_rtf_data(this, runtime)?.clone();
-    let value_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let unit_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let value_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let unit_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let value = runtime
         .js_to_number(value_arg)
@@ -189,7 +207,10 @@ fn rtf_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -197,7 +218,9 @@ fn rtf_supported_locales_of(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into())
+            })?;
     }
     Ok(RegisterValue::from_object_handle(arr.0))
 }
@@ -208,7 +231,14 @@ fn rtf_supported_locales_of(
 
 #[derive(Debug, Clone, Copy)]
 enum RelativeTimeUnit {
-    Second, Minute, Hour, Day, Week, Month, Quarter, Year,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
 }
 
 fn parse_relative_time_unit(s: &str) -> Option<RelativeTimeUnit> {
@@ -263,14 +293,38 @@ fn perform_relative_time_format(
     }
 
     match unit {
-        RelativeTimeUnit::Second => try_format!(try_new_long_second, try_new_short_second, try_new_narrow_second),
-        RelativeTimeUnit::Minute => try_format!(try_new_long_minute, try_new_short_minute, try_new_narrow_minute),
-        RelativeTimeUnit::Hour => try_format!(try_new_long_hour, try_new_short_hour, try_new_narrow_hour),
-        RelativeTimeUnit::Day => try_format!(try_new_long_day, try_new_short_day, try_new_narrow_day),
-        RelativeTimeUnit::Week => try_format!(try_new_long_week, try_new_short_week, try_new_narrow_week),
-        RelativeTimeUnit::Month => try_format!(try_new_long_month, try_new_short_month, try_new_narrow_month),
-        RelativeTimeUnit::Quarter => try_format!(try_new_long_quarter, try_new_short_quarter, try_new_narrow_quarter),
-        RelativeTimeUnit::Year => try_format!(try_new_long_year, try_new_short_year, try_new_narrow_year),
+        RelativeTimeUnit::Second => try_format!(
+            try_new_long_second,
+            try_new_short_second,
+            try_new_narrow_second
+        ),
+        RelativeTimeUnit::Minute => try_format!(
+            try_new_long_minute,
+            try_new_short_minute,
+            try_new_narrow_minute
+        ),
+        RelativeTimeUnit::Hour => {
+            try_format!(try_new_long_hour, try_new_short_hour, try_new_narrow_hour)
+        }
+        RelativeTimeUnit::Day => {
+            try_format!(try_new_long_day, try_new_short_day, try_new_narrow_day)
+        }
+        RelativeTimeUnit::Week => {
+            try_format!(try_new_long_week, try_new_short_week, try_new_narrow_week)
+        }
+        RelativeTimeUnit::Month => try_format!(
+            try_new_long_month,
+            try_new_short_month,
+            try_new_narrow_month
+        ),
+        RelativeTimeUnit::Quarter => try_format!(
+            try_new_long_quarter,
+            try_new_short_quarter,
+            try_new_narrow_quarter
+        ),
+        RelativeTimeUnit::Year => {
+            try_format!(try_new_long_year, try_new_short_year, try_new_narrow_year)
+        }
     }
 
     // Fallback if ICU4X fails.
@@ -325,19 +379,35 @@ fn decompose_relative_time(
 
 impl RelativeTimeStyle {
     pub fn as_str(&self) -> &'static str {
-        match self { Self::Long => "long", Self::Short => "short", Self::Narrow => "narrow" }
+        match self {
+            Self::Long => "long",
+            Self::Short => "short",
+            Self::Narrow => "narrow",
+        }
     }
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s { "long" => Some(Self::Long), "short" => Some(Self::Short), "narrow" => Some(Self::Narrow), _ => None }
+        match s {
+            "long" => Some(Self::Long),
+            "short" => Some(Self::Short),
+            "narrow" => Some(Self::Narrow),
+            _ => None,
+        }
     }
 }
 
 impl RelativeTimeNumeric {
     pub fn as_str(&self) -> &'static str {
-        match self { Self::Always => "always", Self::Auto => "auto" }
+        match self {
+            Self::Always => "always",
+            Self::Auto => "auto",
+        }
     }
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s { "always" => Some(Self::Always), "auto" => Some(Self::Auto), _ => None }
+        match s {
+            "always" => Some(Self::Always),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
     }
 }
 
@@ -349,9 +419,8 @@ fn require_rtf_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a RelativeTimeFormatData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("RelativeTimeFormat: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("RelativeTimeFormat: {e}").into()))?;
     payload.as_relative_time_format().ok_or_else(|| {
         VmNativeCallError::Internal(
             "called on incompatible Intl receiver (not RelativeTimeFormat)".into(),
@@ -367,7 +436,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(obj, prop, RegisterValue::from_object_handle(s.0));
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn parse_enum<T>(
@@ -379,7 +450,9 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 

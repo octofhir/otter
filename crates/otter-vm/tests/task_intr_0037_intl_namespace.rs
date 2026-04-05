@@ -112,28 +112,19 @@ fn get_canonical_locales_no_args() {
 /// getCanonicalLocales with a string returns array of one.
 #[test]
 fn get_canonical_locales_single_string() {
-    assert_eq!(
-        run_i32("Intl.getCanonicalLocales('en-US').length"),
-        1
-    );
+    assert_eq!(run_i32("Intl.getCanonicalLocales('en-US').length"), 1);
 }
 
 /// getCanonicalLocales canonicalizes case.
 #[test]
 fn get_canonical_locales_case_canonicalization() {
-    assert_eq!(
-        run_string("Intl.getCanonicalLocales('EN-us')[0]"),
-        "en-US"
-    );
+    assert_eq!(run_string("Intl.getCanonicalLocales('EN-us')[0]"), "en-US");
 }
 
 /// getCanonicalLocales canonicalizes language alias.
 #[test]
 fn get_canonical_locales_language_alias() {
-    assert_eq!(
-        run_string("Intl.getCanonicalLocales('iw')[0]"),
-        "he"
-    );
+    assert_eq!(run_string("Intl.getCanonicalLocales('iw')[0]"), "he");
 }
 
 /// getCanonicalLocales with array of locales.
@@ -174,10 +165,7 @@ fn get_canonical_locales_grandfathered() {
 /// getCanonicalLocales canonicalizes sh → sr-Latn.
 #[test]
 fn get_canonical_locales_sh_to_sr_latn() {
-    assert_eq!(
-        run_string("Intl.getCanonicalLocales('sh')[0]"),
-        "sr-Latn"
-    );
+    assert_eq!(run_string("Intl.getCanonicalLocales('sh')[0]"), "sr-Latn");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -239,9 +227,7 @@ fn supported_values_of_timezone() {
 /// supportedValuesOf('unit') returns array including 'meter'.
 #[test]
 fn supported_values_of_unit_includes_meter() {
-    assert!(run_bool(
-        "Intl.supportedValuesOf('unit').includes('meter')"
-    ));
+    assert!(run_bool("Intl.supportedValuesOf('unit').includes('meter')"));
 }
 
 /// supportedValuesOf returns sorted array.

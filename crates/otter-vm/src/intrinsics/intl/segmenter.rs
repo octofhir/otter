@@ -49,9 +49,11 @@ pub fn segmenter_class_descriptor() -> JsClassDescriptor {
 /// Native function descriptors for Segments prototype methods.
 /// Installed in `intl/mod.rs` during intrinsic initialization.
 pub fn segments_prototype_methods() -> Vec<NativeFunctionDescriptor> {
-    vec![
-        NativeFunctionDescriptor::method("containing", 1, segments_containing),
-    ]
+    vec![NativeFunctionDescriptor::method(
+        "containing",
+        1,
+        segments_containing,
+    )]
 }
 
 /// Native function descriptors for SegmentIterator prototype methods.
@@ -72,8 +74,14 @@ fn segmenter_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
 
@@ -106,7 +114,10 @@ fn segmenter_segment(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_segmenter_data(this, runtime)?.clone();
-    let str_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let str_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let input = runtime
         .js_to_string(str_arg)
         .map_err(|e| VmNativeCallError::Internal(format!("Segmenter.segment: {e}").into()))?;
@@ -118,8 +129,7 @@ fn segmenter_segment(
     };
 
     let prototype = runtime.intrinsics().intl_segments_prototype();
-    let handle =
-        payload::construct_intl(IntlPayload::Segments(segments_data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Segments(segments_data), prototype, runtime);
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -136,7 +146,10 @@ fn segments_containing(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_segments_data(this, runtime)?.clone();
 
-    let index_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let index_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let index = index_arg
         .as_number()
         .or_else(|| index_arg.as_i32().map(f64::from))
@@ -207,7 +220,8 @@ fn segment_iterator_next(
 
     // Read current state and advance position atomically.
     let (position, input, breakpoints_len) = {
-        let data: &mut IntlPayload = runtime.native_payload_mut::<IntlPayload>(handle)
+        let data: &mut IntlPayload = runtime
+            .native_payload_mut::<IntlPayload>(handle)
             .map_err(|e| VmNativeCallError::Internal(format!("SegmentIterator: {e}").into()))?;
         let iter = data.as_segment_iterator_mut().ok_or_else(|| {
             VmNativeCallError::Internal(
@@ -227,35 +241,32 @@ fn segment_iterator_next(
         // Done — return { value: undefined, done: true }
         let result = runtime.alloc_object();
         let prop_value = runtime.intern_property_name("value");
-        let _ = runtime.objects_mut().set_property(
-            result,
-            prop_value,
-            RegisterValue::undefined(),
-        );
+        let _ = runtime
+            .objects_mut()
+            .set_property(result, prop_value, RegisterValue::undefined());
         let prop_done = runtime.intern_property_name("done");
-        let _ = runtime.objects_mut().set_property(
-            result,
-            prop_done,
-            RegisterValue::from_bool(true),
-        );
+        let _ =
+            runtime
+                .objects_mut()
+                .set_property(result, prop_done, RegisterValue::from_bool(true));
         return Ok(RegisterValue::from_object_handle(result.0));
     }
 
     // Re-read the breakpoint (position was already advanced).
     let (start, end, is_word_like) = {
-        let data: &IntlPayload = runtime.native_payload::<IntlPayload>(handle)
+        let data: &IntlPayload = runtime
+            .native_payload::<IntlPayload>(handle)
             .map_err(|e| VmNativeCallError::Internal(format!("SegmentIterator: {e}").into()))?;
-        let iter = data.as_segment_iterator().ok_or_else(|| {
-            VmNativeCallError::Internal("not SegmentIterator".into())
-        })?;
+        let iter = data
+            .as_segment_iterator()
+            .ok_or_else(|| VmNativeCallError::Internal("not SegmentIterator".into()))?;
         iter.breakpoints[position]
     };
 
     let segment = input[start..end].to_string();
 
     // Build the segment data object.
-    let seg_obj =
-        build_segment_data_object(&segment, start, &input, is_word_like, runtime)?;
+    let seg_obj = build_segment_data_object(&segment, start, &input, is_word_like, runtime)?;
 
     // Return { value: segObj, done: false }
     let result = runtime.alloc_object();
@@ -264,11 +275,9 @@ fn segment_iterator_next(
         .objects_mut()
         .set_property(result, prop_value, seg_obj);
     let prop_done = runtime.intern_property_name("done");
-    let _ = runtime.objects_mut().set_property(
-        result,
-        prop_done,
-        RegisterValue::from_bool(false),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(result, prop_done, RegisterValue::from_bool(false));
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -286,11 +295,18 @@ fn segmenter_resolved_options(
 
     let prop_locale = runtime.intern_property_name("locale");
     let s = runtime.alloc_string(data.locale.as_str());
-    let _ = runtime.objects_mut().set_property(obj, prop_locale, RegisterValue::from_object_handle(s.0));
+    let _ = runtime.objects_mut().set_property(
+        obj,
+        prop_locale,
+        RegisterValue::from_object_handle(s.0),
+    );
 
     let prop_gran = runtime.intern_property_name("granularity");
     let s = runtime.alloc_string(data.granularity.as_str());
-    let _ = runtime.objects_mut().set_property(obj, prop_gran, RegisterValue::from_object_handle(s.0));
+    let _ =
+        runtime
+            .objects_mut()
+            .set_property(obj, prop_gran, RegisterValue::from_object_handle(s.0));
 
     Ok(RegisterValue::from_object_handle(obj.0))
 }
@@ -304,7 +320,10 @@ fn segmenter_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -312,7 +331,9 @@ fn segmenter_supported_locales_of(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into())
+            })?;
     }
     Ok(RegisterValue::from_object_handle(arr.0))
 }
@@ -396,11 +417,10 @@ fn build_segment_data_object(
     );
 
     let prop_index = runtime.intern_property_name("index");
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop_index,
-        RegisterValue::from_i32(index as i32),
-    );
+    let _ =
+        runtime
+            .objects_mut()
+            .set_property(obj, prop_index, RegisterValue::from_i32(index as i32));
 
     let prop_input = runtime.intern_property_name("input");
     let s_input = runtime.alloc_string(input);
@@ -450,13 +470,10 @@ fn require_segmenter_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a SegmenterData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("Segmenter: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("Segmenter: {e}").into()))?;
     payload.as_segmenter().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not Segmenter)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not Segmenter)".into())
     })
 }
 
@@ -464,13 +481,10 @@ fn require_segments_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a SegmentsData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("Segments: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("Segments: {e}").into()))?;
     payload.as_segments().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not Segments)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not Segments)".into())
     })
 }
 
@@ -483,14 +497,13 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),

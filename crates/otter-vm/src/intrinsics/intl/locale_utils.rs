@@ -100,13 +100,13 @@ pub const SANCTIONED_SIMPLE_UNITS: &[&str] = &[
 
 pub const SUPPORTED_NUMBERING_SYSTEMS: &[&str] = &[
     "adlm", "ahom", "arab", "arabext", "bali", "beng", "bhks", "brah", "cakm", "cham", "deva",
-    "diak", "fullwide", "gara", "gong", "gonm", "gujr", "gukh", "guru", "hanidec", "hmng",
-    "hmnp", "java", "kali", "kawi", "khmr", "knda", "krai", "lana", "lanatham", "laoo", "latn",
-    "lepc", "limb", "mathbold", "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym", "modi",
-    "mong", "mroo", "mtei", "mymr", "mymrepka", "mymrpao", "mymrshan", "mymrtlng", "nagm",
-    "newa", "nkoo", "olck", "onao", "orya", "osma", "outlined", "rohg", "saur", "segment",
-    "shrd", "sind", "sinh", "sora", "sund", "sunu", "takr", "talu", "tamldec", "telu", "thai",
-    "tibt", "tirh", "tnsa", "tols", "vaii", "wara", "wcho",
+    "diak", "fullwide", "gara", "gong", "gonm", "gujr", "gukh", "guru", "hanidec", "hmng", "hmnp",
+    "java", "kali", "kawi", "khmr", "knda", "krai", "lana", "lanatham", "laoo", "latn", "lepc",
+    "limb", "mathbold", "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym", "modi", "mong",
+    "mroo", "mtei", "mymr", "mymrepka", "mymrpao", "mymrshan", "mymrtlng", "nagm", "newa", "nkoo",
+    "olck", "onao", "orya", "osma", "outlined", "rohg", "saur", "segment", "shrd", "sind", "sinh",
+    "sora", "sund", "sunu", "takr", "talu", "tamldec", "telu", "thai", "tibt", "tirh", "tnsa",
+    "tols", "vaii", "wara", "wcho",
 ];
 
 pub const SUPPORTED_TIME_ZONES: &[&str] = &[
@@ -157,8 +157,7 @@ fn is_digit(s: &str) -> bool {
 
 /// BCP 47 language subtag: 2-3 or 5-8 alpha characters.
 fn is_language(s: &str) -> bool {
-    (s.len() >= 2 && s.len() <= 3 && is_alpha(s))
-        || (s.len() >= 5 && s.len() <= 8 && is_alpha(s))
+    (s.len() >= 2 && s.len() <= 3 && is_alpha(s)) || (s.len() >= 5 && s.len() <= 8 && is_alpha(s))
 }
 
 /// BCP 47 script subtag: exactly 4 alpha characters.
@@ -174,11 +173,7 @@ pub(crate) fn is_region(s: &str) -> bool {
 /// BCP 47 variant subtag: 5-8 alnum, or 4 alnum starting with a digit.
 fn is_variant(s: &str) -> bool {
     (s.len() >= 5 && s.len() <= 8 && is_alnum(s))
-        || (s.len() == 4
-            && s.as_bytes()
-                .first()
-                .is_some_and(|b| b.is_ascii_digit())
-            && is_alnum(s))
+        || (s.len() == 4 && s.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) && is_alnum(s))
 }
 
 /// BCP 47 singleton: single alphanumeric character, not 'x' or 'X'.
@@ -215,7 +210,10 @@ fn canonicalize_u_extension(subtags: &[String]) -> Result<String, LocaleError> {
     // Collect leading attributes (3-8 alnum, before first key).
     let mut i = 0;
     let mut attributes = Vec::new();
-    while i < subtags.len() && subtags[i].len() >= 3 && subtags[i].len() <= 8 && is_alnum(&subtags[i])
+    while i < subtags.len()
+        && subtags[i].len() >= 3
+        && subtags[i].len() <= 8
+        && is_alnum(&subtags[i])
     {
         attributes.push(subtags[i].clone());
         i += 1;
@@ -308,9 +306,7 @@ fn canonicalize_t_extension(subtags: &[String]) -> Result<String, LocaleError> {
     let mut tlang_end = 0;
     while i < subtags.len() {
         let s = &subtags[i];
-        if s.len() == 2
-            && s.as_bytes()[0].is_ascii_alphabetic()
-            && s.as_bytes()[1].is_ascii_digit()
+        if s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1].is_ascii_digit()
         {
             break;
         }
@@ -630,9 +626,14 @@ pub fn is_well_formed_unit_identifier(unit: &str) -> bool {
 pub fn time_zones_for_region(region: &str) -> Vec<&'static str> {
     match region {
         "US" => vec![
-            "America/Adak", "America/Anchorage", "America/Chicago",
-            "America/Denver", "America/Los_Angeles", "America/New_York",
-            "America/Phoenix", "Pacific/Honolulu",
+            "America/Adak",
+            "America/Anchorage",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/New_York",
+            "America/Phoenix",
+            "Pacific/Honolulu",
         ],
         "GB" => vec!["Europe/London"],
         "DE" => vec!["Europe/Berlin"],
@@ -641,26 +642,43 @@ pub fn time_zones_for_region(region: &str) -> Vec<&'static str> {
         "CN" => vec!["Asia/Shanghai"],
         "IN" => vec!["Asia/Kolkata"],
         "AU" => vec![
-            "Australia/Adelaide", "Australia/Brisbane", "Australia/Darwin",
-            "Australia/Hobart", "Australia/Lord_Howe", "Australia/Perth",
+            "Australia/Adelaide",
+            "Australia/Brisbane",
+            "Australia/Darwin",
+            "Australia/Hobart",
+            "Australia/Lord_Howe",
+            "Australia/Perth",
             "Australia/Sydney",
         ],
         "BR" => vec![
-            "America/Belem", "America/Fortaleza", "America/Manaus",
-            "America/Noronha", "America/Sao_Paulo",
+            "America/Belem",
+            "America/Fortaleza",
+            "America/Manaus",
+            "America/Noronha",
+            "America/Sao_Paulo",
         ],
         "CA" => vec![
-            "America/Edmonton", "America/Halifax", "America/Regina",
-            "America/St_Johns", "America/Toronto", "America/Vancouver",
+            "America/Edmonton",
+            "America/Halifax",
+            "America/Regina",
+            "America/St_Johns",
+            "America/Toronto",
+            "America/Vancouver",
             "America/Winnipeg",
         ],
         "RU" => vec![
-            "Asia/Kamchatka", "Asia/Magadan", "Asia/Vladivostok",
-            "Asia/Yekaterinburg", "Europe/Moscow",
+            "Asia/Kamchatka",
+            "Asia/Magadan",
+            "Asia/Vladivostok",
+            "Asia/Yekaterinburg",
+            "Europe/Moscow",
         ],
         "MX" => vec![
-            "America/Cancun", "America/Chihuahua", "America/Hermosillo",
-            "America/Mexico_City", "America/Tijuana",
+            "America/Cancun",
+            "America/Chihuahua",
+            "America/Hermosillo",
+            "America/Mexico_City",
+            "America/Tijuana",
         ],
         "KR" => vec!["Asia/Seoul"],
         "IT" => vec!["Europe/Rome"],
@@ -708,8 +726,24 @@ pub fn time_zones_for_region(region: &str) -> Vec<&'static str> {
 pub fn is_rtl_language(lang: &str) -> bool {
     matches!(
         lang,
-        "ar" | "arc" | "arz" | "bcc" | "bqi" | "ckb" | "dv" | "fa" | "glk"
-            | "he" | "ku" | "mzn" | "nqo" | "pnb" | "ps" | "sd" | "ug" | "ur" | "yi"
+        "ar" | "arc"
+            | "arz"
+            | "bcc"
+            | "bqi"
+            | "ckb"
+            | "dv"
+            | "fa"
+            | "glk"
+            | "he"
+            | "ku"
+            | "mzn"
+            | "nqo"
+            | "pnb"
+            | "ps"
+            | "sd"
+            | "ug"
+            | "ur"
+            | "yi"
     )
 }
 
@@ -729,12 +763,12 @@ pub fn week_info_for_region(region: &str) -> (i32, Vec<i32>, i32) {
     let first_day = match region {
         // Sunday=7 regions (most of the Americas, East Asia, etc.)
         "US" | "CA" | "MX" | "BR" | "JP" | "KR" | "TW" | "CN" | "AU" | "NZ" | "PH" | "TH"
-        | "CO" | "DO" | "GT" | "HN" | "NI" | "PA" | "PE" | "PR" | "SV" | "VE" | "ZA"
-        | "IL" | "SA" | "AE" | "BH" | "KW" | "OM" | "QA" | "JO" | "SY" | "IQ" | "IN"
-        | "BD" | "PK" | "HK" | "SG" | "ID" | "MY" | "LA" | "KH" | "MM" | "NP" | "BT"
-        | "LK" | "ET" | "KE" | "NG" | "GH" | "ZW" | "MZ" | "UG" | "AG" | "BS" | "BZ"
-        | "DM" | "GD" | "GY" | "HT" | "JM" | "KN" | "LC" | "TT" | "VC" | "VI" | "WS"
-        | "AS" | "GU" | "MH" | "MP" | "UM" | "YE" => 7,
+        | "CO" | "DO" | "GT" | "HN" | "NI" | "PA" | "PE" | "PR" | "SV" | "VE" | "ZA" | "IL"
+        | "SA" | "AE" | "BH" | "KW" | "OM" | "QA" | "JO" | "SY" | "IQ" | "IN" | "BD" | "PK"
+        | "HK" | "SG" | "ID" | "MY" | "LA" | "KH" | "MM" | "NP" | "BT" | "LK" | "ET" | "KE"
+        | "NG" | "GH" | "ZW" | "MZ" | "UG" | "AG" | "BS" | "BZ" | "DM" | "GD" | "GY" | "HT"
+        | "JM" | "KN" | "LC" | "TT" | "VC" | "VI" | "WS" | "AS" | "GU" | "MH" | "MP" | "UM"
+        | "YE" => 7,
         // Saturday=6 regions
         "AF" | "DZ" | "BN" | "DJ" | "EG" | "IR" | "LY" | "SD" => 6,
         // Friday=5 regions
@@ -745,8 +779,8 @@ pub fn week_info_for_region(region: &str) -> (i32, Vec<i32>, i32) {
 
     let weekend = match region {
         // Friday-Saturday weekend
-        "AF" | "DZ" | "BH" | "DJ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "MV"
-        | "OM" | "QA" | "SA" | "SD" | "SY" | "AE" | "YE" | "BN" => vec![5, 6],
+        "AF" | "DZ" | "BH" | "DJ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "MV" | "OM"
+        | "QA" | "SA" | "SD" | "SY" | "AE" | "YE" | "BN" => vec![5, 6],
         // Most regions: Saturday-Sunday
         _ => vec![6, 7],
     };
@@ -754,9 +788,9 @@ pub fn week_info_for_region(region: &str) -> (i32, Vec<i32>, i32) {
     let minimal_days = match region {
         // ISO 8601 regions: 4 minimal days
         "AT" | "BE" | "BG" | "CH" | "CZ" | "DE" | "DK" | "EE" | "ES" | "FI" | "FR" | "GB"
-        | "GR" | "HR" | "HU" | "IE" | "IS" | "IT" | "LI" | "LT" | "LU" | "LV" | "MC"
-        | "ME" | "MK" | "NL" | "NO" | "PL" | "PT" | "RO" | "RS" | "RU" | "SE" | "SI"
-        | "SK" | "SM" | "UA" | "VA" => 4,
+        | "GR" | "HR" | "HU" | "IE" | "IS" | "IT" | "LI" | "LT" | "LU" | "LV" | "MC" | "ME"
+        | "MK" | "NL" | "NO" | "PL" | "PT" | "RO" | "RS" | "RU" | "SE" | "SI" | "SK" | "SM"
+        | "UA" | "VA" => 4,
         // Most other regions: 1
         _ => 1,
     };

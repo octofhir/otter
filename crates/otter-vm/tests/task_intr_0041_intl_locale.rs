@@ -248,12 +248,16 @@ fn case_first_undefined_when_absent() {
 
 #[test]
 fn numeric_option_true() {
-    assert!(run_bool("new Intl.Locale('en', { numeric: true }).numeric === true"));
+    assert!(run_bool(
+        "new Intl.Locale('en', { numeric: true }).numeric === true"
+    ));
 }
 
 #[test]
 fn numeric_option_false() {
-    assert!(run_bool("new Intl.Locale('en', { numeric: false }).numeric === false"));
+    assert!(run_bool(
+        "new Intl.Locale('en', { numeric: false }).numeric === false"
+    ));
 }
 
 #[test]
@@ -267,7 +271,9 @@ fn numeric_default_false() {
 
 #[test]
 fn get_calendars_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.Locale('en').getCalendars())"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.Locale('en').getCalendars())"
+    ));
 }
 
 #[test]
@@ -283,12 +289,16 @@ fn get_calendars_with_option() {
 
 #[test]
 fn get_collations_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.Locale('en').getCollations())"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.Locale('en').getCollations())"
+    ));
 }
 
 #[test]
 fn get_hour_cycles_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.Locale('en').getHourCycles())"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.Locale('en').getHourCycles())"
+    ));
 }
 
 #[test]
@@ -299,7 +309,9 @@ fn get_hour_cycles_en_default() {
 
 #[test]
 fn get_numbering_systems_returns_array() {
-    assert!(run_bool("Array.isArray(new Intl.Locale('en').getNumberingSystems())"));
+    assert!(run_bool(
+        "Array.isArray(new Intl.Locale('en').getNumberingSystems())"
+    ));
 }
 
 #[test]
@@ -310,7 +322,9 @@ fn get_numbering_systems_default_latn() {
 
 #[test]
 fn get_time_zones_us() {
-    assert!(run_bool("new Intl.Locale('en-US').getTimeZones().length >= 1"));
+    assert!(run_bool(
+        "new Intl.Locale('en-US').getTimeZones().length >= 1"
+    ));
 }
 
 #[test]
@@ -326,12 +340,16 @@ fn get_time_zones_us_contains_new_york() {
 
 #[test]
 fn get_time_zones_no_region_undefined() {
-    assert!(run_bool("new Intl.Locale('en').getTimeZones() === undefined"));
+    assert!(run_bool(
+        "new Intl.Locale('en').getTimeZones() === undefined"
+    ));
 }
 
 #[test]
 fn get_text_info_returns_object() {
-    assert!(run_bool("typeof new Intl.Locale('en').getTextInfo() === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.Locale('en').getTextInfo() === 'object'"
+    ));
 }
 
 #[test]
@@ -356,12 +374,16 @@ fn get_text_info_he_rtl() {
 
 #[test]
 fn get_week_info_is_function() {
-    assert!(run_bool("typeof new Intl.Locale('en').getWeekInfo === 'function'"));
+    assert!(run_bool(
+        "typeof new Intl.Locale('en').getWeekInfo === 'function'"
+    ));
 }
 
 #[test]
 fn get_week_info_returns_object() {
-    assert!(run_bool("typeof new Intl.Locale('en-US').getWeekInfo() === 'object'"));
+    assert!(run_bool(
+        "typeof new Intl.Locale('en-US').getWeekInfo() === 'object'"
+    ));
 }
 
 #[test]

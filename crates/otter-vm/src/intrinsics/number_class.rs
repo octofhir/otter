@@ -285,13 +285,18 @@ fn number_to_locale_string(
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     if number.is_infinite() {
-        let s = if number.is_sign_negative() { "-Infinity" } else { "Infinity" };
+        let s = if number.is_sign_negative() {
+            "-Infinity"
+        } else {
+            "Infinity"
+        };
         let handle = runtime.alloc_string(s);
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
 
     // Use ICU4X DecimalFormatter for locale-aware number formatting.
-    let result = if let Ok(decimal) = FixedDecimal::try_from_f64(number, FloatPrecision::RoundTrip) {
+    let result = if let Ok(decimal) = FixedDecimal::try_from_f64(number, FloatPrecision::RoundTrip)
+    {
         match DecimalFormatter::try_new(Default::default(), Default::default()) {
             Ok(fmt) => fmt.format(&decimal).to_string(),
             Err(_) => ryu::Buffer::new().format(number).to_string(),

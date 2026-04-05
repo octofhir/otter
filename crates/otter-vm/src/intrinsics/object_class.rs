@@ -134,6 +134,14 @@ fn object_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method(
+                "getOwnPropertySymbols",
+                1,
+                object_get_own_property_symbols,
+            ),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("keys", 1, object_keys),
         ))
         .with_binding(NativeBindingDescriptor::new(
@@ -183,6 +191,12 @@ fn object_class_descriptor() -> JsClassDescriptor {
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("fromEntries", 1, object_from_entries),
+        ))
+        // §22.1.2.11 Object.groupBy(items, callbackfn)
+        // <https://tc39.es/ecma262/#sec-object.groupby>
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Constructor,
+            NativeFunctionDescriptor::method("groupBy", 2, object_group_by),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -1399,6 +1413,48 @@ fn object_get_own_property_names(
 }
 
 // ---------------------------------------------------------------------------
+// §20.1.2.11  Object.getOwnPropertySymbols(O)
+// Spec: <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
+// ---------------------------------------------------------------------------
+fn object_get_own_property_symbols(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let target = to_object_for_introspection(
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+        runtime,
+    )?;
+
+    // §10.5.11 — Proxy [[OwnPropertyKeys]] trap
+    let keys = if runtime.is_proxy(target) {
+        runtime.proxy_own_keys(target).map_err(interp_to_native)?
+    } else {
+        runtime.own_property_keys(target).map_err(|e| {
+            VmNativeCallError::Internal(format!("Object.getOwnPropertySymbols: {e:?}").into())
+        })?
+    };
+
+    // Collect only symbol-keyed own properties.
+    let symbol_ids: Vec<u32> = keys
+        .iter()
+        .filter_map(|key| runtime.property_names().symbol_id(*key))
+        .collect();
+
+    let array = runtime.alloc_array();
+    for sid in &symbol_ids {
+        runtime
+            .objects_mut()
+            .push_element(array, RegisterValue::from_symbol_id(*sid))
+            .ok();
+    }
+
+    Ok(RegisterValue::from_object_handle(array.0))
+}
+
+// ---------------------------------------------------------------------------
 // ES2024 §20.1.3.4  Object.prototype.propertyIsEnumerable(V)
 // ---------------------------------------------------------------------------
 fn object_property_is_enumerable(
@@ -1583,4 +1639,94 @@ fn interp_to_native(e: crate::interpreter::InterpreterError) -> VmNativeCallErro
         crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
         other => VmNativeCallError::Internal(format!("{other}").into()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// §22.1.2.11 Object.groupBy(items, callbackfn)
+// ---------------------------------------------------------------------------
+
+/// `Object.groupBy(items, callbackfn)` — §22.1.2.11
+/// <https://tc39.es/ecma262/#sec-object.groupby>
+///
+/// Groups elements of an iterable into a null-prototype object whose keys are
+/// the string-coerced results of `callbackfn(element, index)`.
+fn object_group_by(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let items = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let callback = args
+        .get(1)
+        .and_then(|v| v.as_object_handle().map(ObjectHandle))
+        .filter(|h| runtime.objects().is_callable(*h))
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("Object.groupBy: callbackfn is not a function".into())
+        })?;
+
+    let source = items.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Object.groupBy: items is not an object".into())
+    })?;
+
+    // Collect elements via array fast-path.
+    let length = runtime
+        .objects()
+        .array_length(source)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+
+    // Result is a null-prototype object.
+    let result = runtime.objects_mut().alloc_object();
+    // null prototype (no inherited properties)
+
+    for i in 0..length {
+        let value = runtime
+            .get_array_index_value(source, i)?
+            .unwrap_or_else(RegisterValue::undefined);
+
+        let key = runtime.call_callable(
+            callback,
+            RegisterValue::undefined(),
+            &[value, RegisterValue::from_i32(i as i32)],
+        )?;
+
+        // ToPropertyKey → ToString for the group key.
+        let key_str = runtime.js_to_string(key).map_err(interp_to_native)?;
+        let key_prop = runtime.intern_property_name(&key_str);
+
+        // Get or create the group array.
+        let group = match runtime.objects().get_property_with_registry(
+            result,
+            key_prop,
+            runtime.property_names(),
+        ) {
+            Ok(Some(lookup)) => match lookup.value() {
+                PropertyValue::Data { value: v, .. } => v.as_object_handle().map(ObjectHandle),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let group = if let Some(g) = group {
+            g
+        } else {
+            let g = runtime.alloc_array();
+            runtime
+                .objects_mut()
+                .set_property(result, key_prop, RegisterValue::from_object_handle(g.0))
+                .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+            g
+        };
+
+        runtime
+            .objects_mut()
+            .push_element(group, value)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    }
+
+    Ok(RegisterValue::from_object_handle(result.0))
 }

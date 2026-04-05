@@ -59,8 +59,14 @@ fn list_format_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let locale = super::resolve_locale(locales_arg, runtime)?;
 
@@ -101,7 +107,10 @@ fn list_format_format(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_list_format_data(this, runtime)?.clone();
-    let list_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let list_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let strings = extract_string_list(list_arg, runtime)?;
     let formatted = perform_list_format(&strings, &data);
@@ -120,7 +129,10 @@ fn list_format_format_to_parts(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_list_format_data(this, runtime)?.clone();
-    let list_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let list_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     let strings = extract_string_list(list_arg, runtime)?;
     let formatted = perform_list_format(&strings, &data);
@@ -167,7 +179,10 @@ fn list_format_supported_locales_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -175,7 +190,9 @@ fn list_format_supported_locales_of(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("supportedLocalesOf: {e:?}").into())
+            })?;
     }
     Ok(RegisterValue::from_object_handle(arr.0))
 }
@@ -200,18 +217,21 @@ fn perform_list_format(strings: &[String], data: &ListFormatData) -> String {
 
     match data.list_type {
         ListFormatType::Conjunction => {
-            let fmt = ListFormatter::try_new_and(prefs, options)
-                .unwrap_or_else(|_| ListFormatter::try_new_and(Default::default(), options).unwrap());
+            let fmt = ListFormatter::try_new_and(prefs, options).unwrap_or_else(|_| {
+                ListFormatter::try_new_and(Default::default(), options).unwrap()
+            });
             fmt.format(strings.iter().map(|s| s.as_str())).to_string()
         }
         ListFormatType::Disjunction => {
-            let fmt = ListFormatter::try_new_or(prefs, options)
-                .unwrap_or_else(|_| ListFormatter::try_new_or(Default::default(), options).unwrap());
+            let fmt = ListFormatter::try_new_or(prefs, options).unwrap_or_else(|_| {
+                ListFormatter::try_new_or(Default::default(), options).unwrap()
+            });
             fmt.format(strings.iter().map(|s| s.as_str())).to_string()
         }
         ListFormatType::Unit => {
-            let fmt = ListFormatter::try_new_unit(prefs, options)
-                .unwrap_or_else(|_| ListFormatter::try_new_unit(Default::default(), options).unwrap());
+            let fmt = ListFormatter::try_new_unit(prefs, options).unwrap_or_else(|_| {
+                ListFormatter::try_new_unit(Default::default(), options).unwrap()
+            });
             fmt.format(strings.iter().map(|s| s.as_str())).to_string()
         }
     }
@@ -297,16 +317,14 @@ fn extract_string_list(
     let handle = list_arg
         .as_object_handle()
         .map(crate::object::ObjectHandle)
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("ListFormat: expected iterable".into())
-        })?;
+        .ok_or_else(|| VmNativeCallError::Internal("ListFormat: expected iterable".into()))?;
 
     let elements = runtime.list_from_array_like(handle)?;
     let mut strings = Vec::new();
     for elem in elements {
-        let s = runtime.js_to_string(elem).map_err(|e| {
-            VmNativeCallError::Internal(format!("ListFormat: {e}").into())
-        })?;
+        let s = runtime
+            .js_to_string(elem)
+            .map_err(|e| VmNativeCallError::Internal(format!("ListFormat: {e}").into()))?;
         strings.push(s.to_string());
     }
     Ok(strings)
@@ -316,13 +334,10 @@ fn require_list_format_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a ListFormatData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("ListFormat: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("ListFormat: {e}").into()))?;
     payload.as_list_format().ok_or_else(|| {
-        VmNativeCallError::Internal(
-            "called on incompatible Intl receiver (not ListFormat)".into(),
-        )
+        VmNativeCallError::Internal("called on incompatible Intl receiver (not ListFormat)".into())
     })
 }
 
@@ -334,11 +349,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn parse_enum<T>(
@@ -350,14 +363,13 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),

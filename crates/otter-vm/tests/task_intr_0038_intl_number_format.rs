@@ -68,10 +68,13 @@ fn expect_throws(source: &str) {
         &registers,
         &mut runtime,
     );
-    assert!(result.is_err() || {
-        let v = result.unwrap().return_value();
-        v == RegisterValue::undefined()
-    }, "expected throw for: {source}");
+    assert!(
+        result.is_err() || {
+            let v = result.unwrap().return_value();
+            v == RegisterValue::undefined()
+        },
+        "expected throw for: {source}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -158,9 +161,7 @@ fn format_decimal_fraction() {
 /// Percent style multiplies by 100.
 #[test]
 fn format_percent() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US', { style: 'percent' }).format(0.42)",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US', { style: 'percent' }).format(0.42)");
     assert!(s.contains("42"), "expected 42 in percent output: {s}");
 }
 
@@ -213,9 +214,7 @@ fn resolved_options_style_default() {
 /// resolvedOptions has numberingSystem.
 #[test]
 fn resolved_options_numbering_system() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US').resolvedOptions().numberingSystem",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US').resolvedOptions().numberingSystem");
     assert_eq!(s, "latn");
 }
 
@@ -238,27 +237,21 @@ fn resolved_options_notation() {
 /// resolvedOptions has useGrouping.
 #[test]
 fn resolved_options_use_grouping() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US').resolvedOptions().useGrouping",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US').resolvedOptions().useGrouping");
     assert_eq!(s, "auto");
 }
 
 /// resolvedOptions has signDisplay.
 #[test]
 fn resolved_options_sign_display() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US').resolvedOptions().signDisplay",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US').resolvedOptions().signDisplay");
     assert_eq!(s, "auto");
 }
 
 /// resolvedOptions has roundingMode.
 #[test]
 fn resolved_options_rounding_mode() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US').resolvedOptions().roundingMode",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US').resolvedOptions().roundingMode");
     assert_eq!(s, "halfExpand");
 }
 
@@ -298,18 +291,15 @@ fn supported_locales_of_valid_locale() {
 /// minimumFractionDigits pads output.
 #[test]
 fn min_fraction_digits_pads() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(5)",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(5)");
     assert!(s.contains("5.00") || s.contains("5,00"), "got: {s}");
 }
 
 /// maximumFractionDigits truncates.
 #[test]
 fn max_fraction_digits_truncates() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(3.14159)",
-    );
+    let s =
+        run_string("new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(3.14159)");
     // Should be "3.1" (rounded)
     assert!(s.contains("3.1"), "got: {s}");
 }
@@ -317,9 +307,7 @@ fn max_fraction_digits_truncates() {
 /// useGrouping: false disables grouping.
 #[test]
 fn use_grouping_false() {
-    let s = run_string(
-        "new Intl.NumberFormat('en-US', { useGrouping: false }).format(1234567)",
-    );
+    let s = run_string("new Intl.NumberFormat('en-US', { useGrouping: false }).format(1234567)");
     assert_eq!(s, "1234567");
 }
 
@@ -336,9 +324,7 @@ fn invalid_style_throws() {
 /// Invalid unit throws RangeError.
 #[test]
 fn invalid_unit_throws() {
-    expect_throws(
-        "new Intl.NumberFormat('en-US', { style: 'unit', unit: 'not-a-unit' })",
-    );
+    expect_throws("new Intl.NumberFormat('en-US', { style: 'unit', unit: 'not-a-unit' })");
 }
 
 /// minimumFractionDigits > maximumFractionDigits throws.

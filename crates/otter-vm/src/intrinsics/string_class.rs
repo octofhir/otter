@@ -103,6 +103,21 @@ fn proto(
     )
 }
 
+fn static_method(
+    name: &str,
+    arity: u16,
+    f: fn(
+        &RegisterValue,
+        &[RegisterValue],
+        &mut crate::interpreter::RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError>,
+) -> NativeBindingDescriptor {
+    NativeBindingDescriptor::new(
+        NativeBindingTarget::Constructor,
+        NativeFunctionDescriptor::method(name, arity, f),
+    )
+}
+
 fn string_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("String")
         .with_constructor(NativeFunctionDescriptor::constructor(
@@ -110,6 +125,11 @@ fn string_class_descriptor() -> JsClassDescriptor {
             1,
             string_constructor,
         ))
+        // ── Static methods ──
+        .with_binding(static_method("fromCharCode", 1, string_from_char_code))
+        .with_binding(static_method("fromCodePoint", 1, string_from_code_point))
+        .with_binding(static_method("raw", 1, string_raw))
+        // ── Prototype methods ──
         .with_binding(proto("toString", 0, string_value_of))
         .with_binding(proto("valueOf", 0, string_value_of))
         .with_binding(proto("concat", 1, string_concat))
@@ -1431,6 +1451,185 @@ fn string_to_locale_upper_case(
 
     let handle = runtime.alloc_string(result);
     Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Static methods
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `String.fromCharCode(...codeUnits)` — §22.1.2.1
+/// <https://tc39.es/ecma262/#sec-string.fromcharcode>
+///
+/// Each argument is converted to Uint16 and interpreted as a single UTF-16
+/// code unit. The resulting string is the concatenation of those code units.
+fn string_from_char_code(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let mut buf: Vec<u16> = Vec::with_capacity(args.len());
+    for &arg in args {
+        // §7.1.8 ToUint16 — ToNumber then modulo 2^16.
+        let n = runtime
+            .js_to_number(arg)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        let code_unit = f64_to_uint16(n);
+        buf.push(code_unit);
+    }
+    let result = String::from_utf16_lossy(&buf);
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// `String.fromCodePoint(...codePoints)` — §22.1.2.2
+/// <https://tc39.es/ecma262/#sec-string.fromcodepoint>
+///
+/// Each argument is converted to a Number, validated as a valid Unicode code
+/// point (0..=0x10FFFF, integer), and then encoded into the result string.
+/// Throws **RangeError** for any invalid code point.
+fn string_from_code_point(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let mut result = String::with_capacity(args.len());
+    for &arg in args {
+        let n = runtime
+            .js_to_number(arg)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        // Step 5.b: If nextCP is not an integral Number, throw a RangeError.
+        // Step 5.c: If nextCP < 0 or nextCP > 0x10FFFF, throw a RangeError.
+        if n.fract() != 0.0 || n < 0.0 || n > 0x10_FFFF as f64 || n.is_nan() || n.is_infinite() {
+            return Err(range_error(runtime, &format!("Invalid code point {n}")));
+        }
+        let cp = n as u32;
+        if let Some(ch) = char::from_u32(cp) {
+            result.push(ch);
+        } else {
+            return Err(range_error(runtime, &format!("Invalid code point {cp}")));
+        }
+    }
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// `String.raw(template, ...substitutions)` — §22.1.2.4
+/// <https://tc39.es/ecma262/#sec-string.raw>
+///
+/// Reads the `.raw` property of the first argument (the template object),
+/// iterates its elements, and interleaves them with the remaining arguments
+/// (substitutions) after string coercion.
+fn string_raw(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    // Step 1-2: Let cooked = ToObject(template).
+    let template = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    if template.is_undefined() || template.is_null() {
+        return Err(type_error(
+            runtime,
+            "Cannot convert undefined or null to object",
+        )?);
+    }
+
+    // Step 3: Let raw = ToObject(Get(cooked, "raw")).
+    let raw_prop = runtime.intern_property_name("raw");
+    let raw_val = if let Some(obj) = template.as_object_handle().map(ObjectHandle) {
+        lookup_data_property(runtime, obj, raw_prop)
+    } else {
+        RegisterValue::undefined()
+    };
+    if raw_val.is_undefined() || raw_val.is_null() {
+        return Err(type_error(
+            runtime,
+            "Cannot convert undefined or null to object",
+        )?);
+    }
+
+    let raw_obj = raw_val
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| VmNativeCallError::Internal("String.raw: raw is not an object".into()))?;
+
+    // Step 4: Let literalSegments = LengthOfArrayLike(raw).
+    let length_prop = runtime.intern_property_name("length");
+    let length_val = lookup_data_property(runtime, raw_obj, length_prop);
+    let literal_segments = runtime
+        .js_to_number(length_val)
+        .map_err(|e| map_interpreter_error(e, runtime))? as usize;
+
+    // Step 5: If literalSegments == 0, return "".
+    if literal_segments == 0 {
+        let handle = runtime.alloc_string("");
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+
+    let substitutions = if args.len() > 1 { &args[1..] } else { &[] };
+    let mut result = String::new();
+
+    for i in 0..literal_segments {
+        // Step 7.a: Get raw[i] and ToString it.
+        let segment_val = runtime
+            .objects_mut()
+            .get_index(raw_obj, i)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or_else(RegisterValue::undefined);
+        let segment = runtime
+            .js_to_string(segment_val)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        result.push_str(&segment);
+
+        // Step 7.b: If i + 1 < literalSegments, append ToString(substitutions[i]).
+        if i + 1 < literal_segments {
+            if let Some(&sub) = substitutions.get(i) {
+                let sub_str = runtime
+                    .js_to_string(sub)
+                    .map_err(|e| map_interpreter_error(e, runtime))?;
+                result.push_str(&sub_str);
+            }
+        }
+    }
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// Read a named data property from an object, returning `undefined` if absent.
+fn lookup_data_property(
+    runtime: &crate::interpreter::RuntimeState,
+    obj: ObjectHandle,
+    prop: crate::property::PropertyNameId,
+) -> RegisterValue {
+    match runtime
+        .objects()
+        .get_property_with_registry(obj, prop, runtime.property_names())
+    {
+        Ok(Some(lookup)) => match lookup.value() {
+            PropertyValue::Data { value, .. } => value,
+            _ => RegisterValue::undefined(),
+        },
+        _ => RegisterValue::undefined(),
+    }
+}
+
+/// §7.1.8 ToUint16(argument)
+/// <https://tc39.es/ecma262/#sec-touint16>
+fn f64_to_uint16(n: f64) -> u16 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let int_val = n.trunc();
+    let modulo = int_val % 65536.0;
+    let positive = if modulo < 0.0 {
+        modulo + 65536.0
+    } else {
+        modulo
+    };
+    positive as u16
 }
 
 fn number_to_string(number: f64) -> String {

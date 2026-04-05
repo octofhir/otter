@@ -2,7 +2,9 @@
 //!
 //! Spec: <https://tc39.es/ecma402/#sec-intl-numberformat-constructor>
 
-use fixed_decimal::{Decimal as FixedDecimal, FloatPrecision, SignedRoundingMode, UnsignedRoundingMode};
+use fixed_decimal::{
+    Decimal as FixedDecimal, FloatPrecision, SignedRoundingMode, UnsignedRoundingMode,
+};
 use fixed_decimal::{RoundingIncrement, SignDisplay as FixedSignDisplay};
 use icu_decimal::DecimalFormatter;
 use icu_decimal::options::{DecimalFormatterOptions, GroupingStrategy};
@@ -20,8 +22,8 @@ use super::locale_utils;
 use super::options_utils::{get_option_number, get_option_string};
 use super::payload::{
     self, CompactDisplay, CurrencyDisplay, CurrencySign, IntlPayload, Notation, NumberFormatData,
-    NumberFormatStyle, RoundingMode, RoundingPriority, SignDisplay, TrailingZeroDisplay, UnitDisplay,
-    UseGrouping,
+    NumberFormatStyle, RoundingMode, RoundingPriority, SignDisplay, TrailingZeroDisplay,
+    UnitDisplay, UseGrouping,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -83,8 +85,14 @@ fn number_format_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let options_arg = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let options_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     // Resolve locale.
     let locale = resolve_locale(locales_arg, runtime)?;
@@ -118,7 +126,9 @@ fn number_format_format_getter(
     })?;
 
     let cache_prop = runtime.intern_property_name("__boundFormat");
-    let cached = runtime.own_property_value(handle, cache_prop).map_err(interp_err)?;
+    let cached = runtime
+        .own_property_value(handle, cache_prop)
+        .map_err(interp_err)?;
     if cached != RegisterValue::undefined() && cached.as_object_handle().is_some() {
         return Ok(cached);
     }
@@ -127,24 +137,35 @@ fn number_format_format_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
-    let _ = runtime.objects_mut().set_prototype(bound_fn, Some(fn_proto));
+    let _ = runtime
+        .objects_mut()
+        .set_prototype(bound_fn, Some(fn_proto));
 
     let nf_prop = runtime.intern_property_name("__numberFormat__");
-    runtime.objects_mut().define_own_property(
-        bound_fn,
-        nf_prop,
-        PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(handle.0),
-            PropertyAttributes::from_flags(false, false, false),
-        ),
-    ).map_err(interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            bound_fn,
+            nf_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(handle.0),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(interp_err)?;
 
     let bound_val = RegisterValue::from_object_handle(bound_fn.0);
-    runtime.objects_mut().define_own_property(
-        handle,
-        cache_prop,
-        PropertyValue::data_with_attrs(bound_val, PropertyAttributes::from_flags(false, false, false)),
-    ).map_err(interp_err)?;
+    runtime
+        .objects_mut()
+        .define_own_property(
+            handle,
+            cache_prop,
+            PropertyValue::data_with_attrs(
+                bound_val,
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(interp_err)?;
 
     Ok(bound_val)
 }
@@ -155,19 +176,22 @@ fn bound_number_format_format(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let fn_handle = runtime.current_native_callee().ok_or_else(|| {
-        VmNativeCallError::Internal("bound format: no callee".into())
-    })?;
+    let fn_handle = runtime
+        .current_native_callee()
+        .ok_or_else(|| VmNativeCallError::Internal("bound format: no callee".into()))?;
     let nf_prop = runtime.intern_property_name("__numberFormat__");
-    let nf_val = runtime.own_property_value(fn_handle, nf_prop).map_err(interp_err)?;
-    let nf_rv = RegisterValue::from_object_handle(
-        nf_val.as_object_handle().ok_or_else(|| {
-            VmNativeCallError::Internal("bound format: missing __numberFormat__".into())
-        })?,
-    );
+    let nf_val = runtime
+        .own_property_value(fn_handle, nf_prop)
+        .map_err(interp_err)?;
+    let nf_rv = RegisterValue::from_object_handle(nf_val.as_object_handle().ok_or_else(|| {
+        VmNativeCallError::Internal("bound format: missing __numberFormat__".into())
+    })?);
 
     let data = require_number_format_data(&nf_rv, runtime)?.clone();
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let number = runtime
         .js_to_number(value)
         .map_err(|e| VmNativeCallError::Internal(format!("NumberFormat.format: {e}").into()))?;
@@ -194,7 +218,10 @@ fn number_format_format_to_parts(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_number_format_data(this, runtime)?.clone();
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let number = runtime
         .js_to_number(value)
         .map_err(|e| VmNativeCallError::Internal(format!("formatToParts: {e}").into()))?;
@@ -210,9 +237,7 @@ fn number_format_format_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| {
-                VmNativeCallError::Internal(format!("formatToParts: {e:?}").into())
-            })?;
+            .map_err(|e| VmNativeCallError::Internal(format!("formatToParts: {e:?}").into()))?;
     }
 
     Ok(RegisterValue::from_object_handle(arr.0))
@@ -238,7 +263,10 @@ fn decompose_formatted_number(
     if number.is_infinite() {
         if number.is_sign_negative() {
             parts.push(("minusSign", "-".to_string()));
-        } else if matches!(data.sign_display, SignDisplay::Always | SignDisplay::ExceptZero) {
+        } else if matches!(
+            data.sign_display,
+            SignDisplay::Always | SignDisplay::ExceptZero
+        ) {
             parts.push(("plusSign", "+".to_string()));
         }
         parts.push(("infinity", "∞".to_string()));
@@ -329,7 +357,13 @@ fn decompose_formatted_number(
                 literal.push(ch);
                 chars.next();
                 while let Some(&nc) = chars.peek() {
-                    if nc.is_ascii_digit() || nc == '.' || nc == ',' || nc == '-' || nc == '+' || nc == '%' {
+                    if nc.is_ascii_digit()
+                        || nc == '.'
+                        || nc == ','
+                        || nc == '-'
+                        || nc == '+'
+                        || nc == '%'
+                    {
                         break;
                     }
                     literal.push(nc);
@@ -367,11 +401,20 @@ fn number_format_format_range(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_number_format_data(this, runtime)?.clone();
 
-    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let start_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let end_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "start and end must be provided to formatRange"));
+        return Err(type_error(
+            runtime,
+            "start and end must be provided to formatRange",
+        ));
     }
 
     let start = runtime
@@ -412,11 +455,20 @@ fn number_format_format_range_to_parts(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_number_format_data(this, runtime)?.clone();
 
-    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
-    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+    let start_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let end_val = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
 
     if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
-        return Err(type_error(runtime, "start and end must be provided to formatRangeToParts"));
+        return Err(type_error(
+            runtime,
+            "start and end must be provided to formatRangeToParts",
+        ));
     }
 
     let start = runtime
@@ -445,7 +497,9 @@ fn number_format_format_range_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into())
+            })?;
     }
 
     // Literal separator.
@@ -468,7 +522,9 @@ fn number_format_format_range_to_parts(
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(obj.0))
-            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into())
+            })?;
     }
 
     Ok(RegisterValue::from_object_handle(arr.0))
@@ -496,7 +552,12 @@ fn number_format_resolved_options(
         if let Some(ref cur) = data.currency {
             set_string_prop(runtime, obj, "currency", cur);
         }
-        set_string_prop(runtime, obj, "currencyDisplay", data.currency_display.as_str());
+        set_string_prop(
+            runtime,
+            obj,
+            "currencyDisplay",
+            data.currency_display.as_str(),
+        );
         set_string_prop(runtime, obj, "currencySign", data.currency_sign.as_str());
     }
     if data.style == NumberFormatStyle::Unit {
@@ -505,7 +566,12 @@ fn number_format_resolved_options(
         }
         set_string_prop(runtime, obj, "unitDisplay", data.unit_display.as_str());
     }
-    set_i32_prop(runtime, obj, "minimumIntegerDigits", data.minimum_integer_digits as i32);
+    set_i32_prop(
+        runtime,
+        obj,
+        "minimumIntegerDigits",
+        data.minimum_integer_digits as i32,
+    );
     if let Some(v) = data.minimum_fraction_digits {
         set_i32_prop(runtime, obj, "minimumFractionDigits", v as i32);
     }
@@ -521,13 +587,33 @@ fn number_format_resolved_options(
     set_string_prop(runtime, obj, "useGrouping", data.use_grouping.as_str());
     set_string_prop(runtime, obj, "notation", data.notation.as_str());
     if data.notation == Notation::Compact {
-        set_string_prop(runtime, obj, "compactDisplay", data.compact_display.as_str());
+        set_string_prop(
+            runtime,
+            obj,
+            "compactDisplay",
+            data.compact_display.as_str(),
+        );
     }
     set_string_prop(runtime, obj, "signDisplay", data.sign_display.as_str());
     set_string_prop(runtime, obj, "roundingMode", data.rounding_mode.as_str());
-    set_i32_prop(runtime, obj, "roundingIncrement", data.rounding_increment as i32);
-    set_string_prop(runtime, obj, "roundingPriority", data.rounding_priority.as_str());
-    set_string_prop(runtime, obj, "trailingZeroDisplay", data.trailing_zero_display.as_str());
+    set_i32_prop(
+        runtime,
+        obj,
+        "roundingIncrement",
+        data.rounding_increment as i32,
+    );
+    set_string_prop(
+        runtime,
+        obj,
+        "roundingPriority",
+        data.rounding_priority.as_str(),
+    );
+    set_string_prop(
+        runtime,
+        obj,
+        "trailingZeroDisplay",
+        data.trailing_zero_display.as_str(),
+    );
 
     Ok(RegisterValue::from_object_handle(obj.0))
 }
@@ -542,7 +628,10 @@ fn number_format_supported_locales_of(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     // Simplified — return the canonical form of the requested locales.
-    let locales_arg = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let locales_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
     let arr = runtime.alloc_array();
     for locale in &locale_list {
@@ -566,7 +655,10 @@ fn resolve_locale(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<String, VmNativeCallError> {
     let list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    Ok(list.into_iter().next().unwrap_or_else(|| locale_utils::DEFAULT_LOCALE.to_string()))
+    Ok(list
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| locale_utils::DEFAULT_LOCALE.to_string()))
 }
 
 fn resolve_number_format_options(
@@ -574,8 +666,8 @@ fn resolve_number_format_options(
     options: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<NumberFormatData, VmNativeCallError> {
-    let style_str = get_option_string(options, "style", runtime)?
-        .unwrap_or_else(|| "decimal".to_string());
+    let style_str =
+        get_option_string(options, "style", runtime)?.unwrap_or_else(|| "decimal".to_string());
     let style = match style_str.as_str() {
         "decimal" => NumberFormatStyle::Decimal,
         "percent" => NumberFormatStyle::Percent,
@@ -586,7 +678,10 @@ fn resolve_number_format_options(
 
     let currency = get_option_string(options, "currency", runtime)?;
     if style == NumberFormatStyle::Currency && currency.is_none() {
-        return Err(type_error(runtime, "currency option is required with currency style"));
+        return Err(type_error(
+            runtime,
+            "currency option is required with currency style",
+        ));
     }
     let currency = currency.map(|c| c.to_ascii_uppercase());
 
@@ -608,7 +703,10 @@ fn resolve_number_format_options(
 
     let unit = get_option_string(options, "unit", runtime)?;
     if style == NumberFormatStyle::Unit && unit.is_none() {
-        return Err(type_error(runtime, "unit option is required with unit style"));
+        return Err(type_error(
+            runtime,
+            "unit option is required with unit style",
+        ));
     }
     if let Some(ref u) = unit
         && !locale_utils::is_well_formed_unit_identifier(u)
@@ -682,11 +780,22 @@ fn resolve_number_format_options(
     if let (Some(minf), Some(maxf)) = (min_frac, max_frac)
         && minf > maxf
     {
-        return Err(range_error(runtime, "minimumFractionDigits > maximumFractionDigits"));
+        return Err(range_error(
+            runtime,
+            "minimumFractionDigits > maximumFractionDigits",
+        ));
     }
     // Defaults for fraction digits.
-    let min_frac = min_frac.or(Some(if style == NumberFormatStyle::Currency { 2 } else { 0 }));
-    let max_frac = max_frac.or(Some(if style == NumberFormatStyle::Currency { 2 } else { 3 }));
+    let min_frac = min_frac.or(Some(if style == NumberFormatStyle::Currency {
+        2
+    } else {
+        0
+    }));
+    let max_frac = max_frac.or(Some(if style == NumberFormatStyle::Currency {
+        2
+    } else {
+        3
+    }));
 
     let min_sig = get_option_number(options, "minimumSignificantDigits", runtime)?
         .map(|v| validate_int_range(v, 1, 21, "minimumSignificantDigits", runtime))
@@ -694,18 +803,25 @@ fn resolve_number_format_options(
     let max_sig = get_option_number(options, "maximumSignificantDigits", runtime)?
         .map(|v| validate_int_range(v, 1, 21, "maximumSignificantDigits", runtime))
         .transpose()?;
-    let min_sig = if min_sig.is_none() && max_sig.is_some() { Some(1) } else { min_sig };
+    let min_sig = if min_sig.is_none() && max_sig.is_some() {
+        Some(1)
+    } else {
+        min_sig
+    };
     if let (Some(mins), Some(maxs)) = (min_sig, max_sig)
         && mins > maxs
     {
-        return Err(range_error(runtime, "minimumSignificantDigits > maximumSignificantDigits"));
+        return Err(range_error(
+            runtime,
+            "minimumSignificantDigits > maximumSignificantDigits",
+        ));
     }
 
     let rounding_increment = get_option_number(options, "roundingIncrement", runtime)?
         .map(|v| {
             let allowed = [
-                1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0,
-                2000.0, 2500.0, 5000.0,
+                1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0,
+                2500.0, 5000.0,
             ];
             if !v.is_finite() || v.fract() != 0.0 || !allowed.contains(&v) {
                 return Err(range_error(runtime, "Invalid roundingIncrement option"));
@@ -776,7 +892,9 @@ fn format_number(number: f64, data: &NumberFormatData) -> String {
         return "NaN".to_string();
     }
     if number.is_infinite() {
-        let sign = if number.is_sign_negative() { "-" } else {
+        let sign = if number.is_sign_negative() {
+            "-"
+        } else {
             match data.sign_display {
                 SignDisplay::Always | SignDisplay::ExceptZero => "+",
                 _ => "",
@@ -816,7 +934,8 @@ fn apply_digit_options(data: &NumberFormatData, decimal: &mut FixedDecimal) {
     let sign_display = to_fixed_sign_display(data.sign_display);
 
     // Significant digits path.
-    let has_sig = data.minimum_significant_digits.is_some() || data.maximum_significant_digits.is_some();
+    let has_sig =
+        data.minimum_significant_digits.is_some() || data.maximum_significant_digits.is_some();
     if has_sig && data.rounding_priority != RoundingPriority::Auto {
         // morePrecision / lessPrecision with both sig and frac — simplified.
         let mut sig_decimal = decimal.clone();
@@ -1166,9 +1285,8 @@ fn require_number_format_data<'a>(
     this: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
 ) -> Result<&'a NumberFormatData, VmNativeCallError> {
-    let payload = payload::require_intl_payload(this, runtime).map_err(|e| {
-        VmNativeCallError::Internal(format!("NumberFormat: {e}").into())
-    })?;
+    let payload = payload::require_intl_payload(this, runtime)
+        .map_err(|e| VmNativeCallError::Internal(format!("NumberFormat: {e}").into()))?;
     payload.as_number_format().ok_or_else(|| {
         VmNativeCallError::Internal(
             "called on incompatible Intl receiver (not NumberFormat)".into(),
@@ -1184,11 +1302,9 @@ fn set_string_prop(
 ) {
     let prop = runtime.intern_property_name(name);
     let s = runtime.alloc_string(value);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_object_handle(s.0),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
 }
 
 fn set_i32_prop(
@@ -1198,11 +1314,9 @@ fn set_i32_prop(
     value: i32,
 ) {
     let prop = runtime.intern_property_name(name);
-    let _ = runtime.objects_mut().set_property(
-        obj,
-        prop,
-        RegisterValue::from_i32(value),
-    );
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop, RegisterValue::from_i32(value));
 }
 
 fn parse_enum<T>(
@@ -1214,7 +1328,9 @@ fn parse_enum<T>(
 ) -> Result<T, VmNativeCallError> {
     match value {
         None => Ok(default),
-        Some(s) => from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option"))),
+        Some(s) => {
+            from_str(&s).ok_or_else(|| range_error(runtime, &format!("Invalid {name} option")))
+        }
     }
 }
 
@@ -1245,20 +1361,14 @@ fn validate_int_range(
     Ok(v as u32)
 }
 
-fn range_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),
     }
 }
 
-fn type_error(
-    runtime: &mut crate::interpreter::RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
     match runtime.alloc_type_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("TypeError alloc: {e}").into()),

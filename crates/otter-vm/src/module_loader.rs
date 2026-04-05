@@ -202,9 +202,9 @@ fn visit_module(
 
     // Compile the module if not already in the registry.
     if !registry.contains(url) {
-        let source = host.load(url).map_err(|e| {
-            InterpreterError::NativeCall(format!("module load error: {e}").into())
-        })?;
+        let source = host
+            .load(url)
+            .map_err(|e| InterpreterError::NativeCall(format!("module load error: {e}").into()))?;
         let compiled = crate::source::compile_module(&source, url).map_err(|e| {
             InterpreterError::NativeCall(format!("module compile error: {e}").into())
         })?;
@@ -306,12 +306,7 @@ fn evaluate_module(
     let global = runtime.intrinsics().global_object();
     let registers = [RegisterValue::from_object_handle(global.0)];
 
-    interpreter.execute_with_runtime(
-        module,
-        module.entry(),
-        &registers,
-        runtime,
-    )?;
+    interpreter.execute_with_runtime(module, module.entry(), &registers, runtime)?;
 
     // Capture exports from the global object into the module namespace.
     // Module compilation emits SetGlobal for all exports.
@@ -425,9 +420,7 @@ fn capture_exports(
                 imported,
                 exported,
             } => {
-                let value = registry
-                    .get_export(specifier, imported)
-                    .unwrap_or_default();
+                let value = registry.get_export(specifier, imported).unwrap_or_default();
                 registry
                     .get_mut(url)
                     .unwrap()
@@ -447,11 +440,7 @@ fn capture_exports(
                     })
                     .unwrap_or_default();
                 for (name, value) in source_exports {
-                    registry
-                        .get_mut(url)
-                        .unwrap()
-                        .namespace
-                        .insert(name, value);
+                    registry.get_mut(url).unwrap().namespace.insert(name, value);
                 }
             }
             ExportRecord::ReExportNamespace {
@@ -476,7 +465,5 @@ fn capture_exports(
 fn lookup_module_local(name: &str, runtime: &mut RuntimeState) -> RegisterValue {
     let global = runtime.intrinsics().global_object();
     let prop = runtime.intern_property_name(name);
-    runtime
-        .own_property_value(global, prop)
-        .unwrap_or_default()
+    runtime.own_property_value(global, prop).unwrap_or_default()
 }

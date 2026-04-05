@@ -285,7 +285,6 @@ pub enum Opcode {
     SetClassFieldInitializer = 0x66,
 
     // ── Private Class Elements (§15.7.14, §6.2.12, §7.3.31-33) ────────
-
     /// §6.2.12 AllocClassId — allocate a unique class_id and store it on a closure.
     /// `AllocClassId closure`
     /// Spec: <https://tc39.es/ecma262/#sec-private-names>
@@ -380,6 +379,13 @@ pub enum Opcode {
     /// `Exp dst, lhs, rhs` — computes `lhs ** rhs`.
     /// Spec: <https://tc39.es/ecma262/#sec-exp-operator>
     Exp = 0x76,
+
+    /// §19.2.1.1 Direct eval — `CallEval dst, code`.
+    /// The compiler emits this when it detects `eval(...)` as a direct call.
+    /// The interpreter compiles and executes the source code in the caller's
+    /// context, inheriting strict mode.
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    CallEval = 0x77,
 }
 
 impl Opcode {
@@ -491,6 +497,7 @@ impl Opcode {
             0x74 => Some(Self::DynamicImport),
             0x75 => Some(Self::ImportMeta),
             0x76 => Some(Self::Exp),
+            0x77 => Some(Self::CallEval),
             _ => None,
         }
     }
@@ -1400,10 +1407,7 @@ impl Instruction {
     }
 
     /// §6.2.12 CopyClassId — copy class_id from source closure to target closure.
-    pub const fn copy_class_id(
-        target: BytecodeRegister,
-        source: BytecodeRegister,
-    ) -> Self {
+    pub const fn copy_class_id(target: BytecodeRegister, source: BytecodeRegister) -> Self {
         Self::encode_abc(
             Opcode::CopyClassId,
             target,
@@ -1555,11 +1559,7 @@ impl Instruction {
     /// Encodes an exponentiation: `dst = lhs ** rhs`.
     /// Spec: <https://tc39.es/ecma262/#sec-exp-operator>
     #[must_use]
-    pub const fn exp(
-        dst: BytecodeRegister,
-        lhs: BytecodeRegister,
-        rhs: BytecodeRegister,
-    ) -> Self {
+    pub const fn exp(dst: BytecodeRegister, lhs: BytecodeRegister, rhs: BytecodeRegister) -> Self {
         Self::encode_abc(Opcode::Exp, dst, lhs, rhs)
     }
 
@@ -1568,7 +1568,12 @@ impl Instruction {
     /// Spec: <https://tc39.es/ecma262/#sec-import-calls>
     #[must_use]
     pub const fn dynamic_import(dst: BytecodeRegister, specifier: BytecodeRegister) -> Self {
-        Self::encode_abc(Opcode::DynamicImport, dst, specifier, BytecodeRegister::new(0))
+        Self::encode_abc(
+            Opcode::DynamicImport,
+            dst,
+            specifier,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// §13.3.12 `import.meta` — returns a module metadata object.
@@ -1582,6 +1587,13 @@ impl Instruction {
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
+    }
+
+    /// §19.2.1.1 Direct eval — `CallEval dst, code`.
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    #[must_use]
+    pub const fn call_eval(dst: BytecodeRegister, code: BytecodeRegister) -> Self {
+        Self::encode_abc(Opcode::CallEval, dst, code, BytecodeRegister::new(0))
     }
 
     /// Returns the decoded opcode.

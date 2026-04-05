@@ -8,7 +8,10 @@ use crate::value::RegisterValue;
 
 use super::{
     IntrinsicsError, VmIntrinsics,
-    install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+    install::{
+        IntrinsicInstallContext, IntrinsicInstaller, install_class_plan,
+        install_function_length_name,
+    },
 };
 
 pub(super) static FUNCTION_INTRINSIC: FunctionIntrinsic = FunctionIntrinsic;
@@ -131,6 +134,10 @@ impl IntrinsicInstaller for FunctionIntrinsic {
         };
 
         intrinsics.function_constructor = constructor;
+
+        // §10.2.8 SetFunctionLength + §10.2.9 SetFunctionName for Function constructor.
+        install_function_length_name(constructor, 1, "Function", cx)?;
+
         install_class_plan(
             intrinsics.function_prototype(),
             intrinsics.function_constructor(),
@@ -184,14 +191,45 @@ fn function_class_descriptor() -> JsClassDescriptor {
         ))
 }
 
+/// §20.2.1.1 Function(p1, p2, ..., pn, body)
+///
+/// Creates a new function from string arguments. All arguments except the last
+/// are joined as the parameter list; the last argument is the function body.
+/// The function is compiled and evaluated in the global scope.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
 fn function_constructor(
     _this: &RegisterValue,
-    _args: &[RegisterValue],
-    _runtime: &mut crate::interpreter::RuntimeState,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    Err(VmNativeCallError::Internal(
-        "Function constructor is not implemented in otter-vm bootstrap".into(),
-    ))
+    // §20.2.1.1 Step 1-4: Collect parameter and body strings.
+    let (params, body) = if args.is_empty() {
+        (String::new(), String::new())
+    } else if args.len() == 1 {
+        let body_str = runtime
+            .js_to_string(args[0])
+            .map_err(|e| VmNativeCallError::Internal(format!("Function: {e}").into()))?;
+        (String::new(), body_str.to_string())
+    } else {
+        let mut param_parts = Vec::with_capacity(args.len() - 1);
+        for arg in &args[..args.len() - 1] {
+            let s = runtime
+                .js_to_string(*arg)
+                .map_err(|e| VmNativeCallError::Internal(format!("Function: {e}").into()))?;
+            param_parts.push(s.to_string());
+        }
+        let body_str = runtime
+            .js_to_string(args[args.len() - 1])
+            .map_err(|e| VmNativeCallError::Internal(format!("Function: {e}").into()))?;
+        (param_parts.join(","), body_str.to_string())
+    };
+
+    // §20.2.1.1 Step 5-8: Build the source text and compile.
+    let source = format!("(function anonymous({params}) {{\n{body}\n}})");
+    let result = runtime.eval_source(&source, false, false)?;
+
+    Ok(result)
 }
 
 fn function_is_callable(

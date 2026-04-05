@@ -224,8 +224,10 @@ impl<'a> FunctionCompiler<'a> {
                 if func.id.is_none() {
                     let binding_reg = self.declare_import_binding("*default*")?;
                     let value = self.compile_function_expression(func, Some("default"), module)?;
-                    self.instructions
-                        .push(crate::bytecode::Instruction::move_(binding_reg, value.register));
+                    self.instructions.push(crate::bytecode::Instruction::move_(
+                        binding_reg,
+                        value.register,
+                    ));
                     self.release(value);
                 }
 
@@ -247,8 +249,10 @@ impl<'a> FunctionCompiler<'a> {
                     // Anonymous class — compile as expression and store in binding.
                     let binding_reg = self.declare_import_binding("*default*")?;
                     let value = self.compile_class_expression(class, module)?;
-                    self.instructions
-                        .push(crate::bytecode::Instruction::move_(binding_reg, value.register));
+                    self.instructions.push(crate::bytecode::Instruction::move_(
+                        binding_reg,
+                        value.register,
+                    ));
                     self.release(value);
                 }
 
@@ -261,8 +265,10 @@ impl<'a> FunctionCompiler<'a> {
                 if let Some(expr) = export.declaration.as_expression() {
                     let binding_reg = self.declare_import_binding("*default*")?;
                     let value = self.compile_expression(expr, module)?;
-                    self.instructions
-                        .push(crate::bytecode::Instruction::move_(binding_reg, value.register));
+                    self.instructions.push(crate::bytecode::Instruction::move_(
+                        binding_reg,
+                        value.register,
+                    ));
                     self.release(value);
 
                     module.add_export(ExportRecord::Default {

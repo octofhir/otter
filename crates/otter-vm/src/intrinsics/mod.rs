@@ -13,6 +13,7 @@ mod boolean_class;
 mod dataview_class;
 mod date_class;
 mod error_class;
+mod eval;
 mod function_class;
 mod generator_class;
 mod install;
@@ -666,7 +667,10 @@ impl VmIntrinsics {
         heap.set_prototype(self.eval_error_constructor, Some(self.function_prototype))?;
         // AggregateError (§20.5.7)
         heap.set_prototype(self.aggregate_error_prototype, Some(self.error_prototype))?;
-        heap.set_prototype(self.aggregate_error_constructor, Some(self.function_prototype))?;
+        heap.set_prototype(
+            self.aggregate_error_constructor,
+            Some(self.function_prototype),
+        )?;
         // Promise: constructor → Function.prototype, prototype → Object.prototype
         heap.set_prototype(self.promise_constructor, Some(self.function_prototype))?;
         heap.set_prototype(self.promise_prototype, Some(self.object_prototype))?;
@@ -893,14 +897,28 @@ impl VmIntrinsics {
 
         // Install global functions (§19.2): isNaN, isFinite, parseFloat, parseInt.
         for binding in number_class::global_number_function_bindings() {
+            let length = binding.length();
+            let name = binding.js_name().to_string();
             let host_fn = cx.native_functions.register(binding);
             let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
-            let prop = cx.property_names.intern(
-                cx.native_functions
-                    .get(host_fn)
-                    .expect("just registered")
-                    .js_name(),
-            );
+            install::install_function_length_name(handle, length, &name, &mut cx)?;
+            let prop = cx.property_names.intern(&name);
+            cx.heap.set_property(
+                self.global_object,
+                prop,
+                RegisterValue::from_object_handle(handle.0),
+            )?;
+        }
+
+        // Install global functions (§19.2): eval, encodeURI, encodeURIComponent,
+        // decodeURI, decodeURIComponent.
+        for binding in eval::global_eval_and_uri_bindings() {
+            let length = binding.length();
+            let name = binding.js_name().to_string();
+            let host_fn = cx.native_functions.register(binding);
+            let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
+            install::install_function_length_name(handle, length, &name, &mut cx)?;
+            let prop = cx.property_names.intern(&name);
             cx.heap.set_property(
                 self.global_object,
                 prop,
@@ -1647,7 +1665,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 604);
+        assert_eq!(native_functions.len(), 609);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

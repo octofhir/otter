@@ -35,9 +35,8 @@ fn import_side_effect() {
 /// Named import creates the correct binding record.
 #[test]
 fn import_named() {
-    let module =
-        compile_module(r#"import { foo, bar as baz } from "./m.js";"#, "test.mjs")
-            .expect("should compile");
+    let module = compile_module(r#"import { foo, bar as baz } from "./m.js";"#, "test.mjs")
+        .expect("should compile");
     assert_eq!(module.imports().len(), 1);
     let record = &module.imports()[0];
     assert_eq!(&*record.specifier, "./m.js");
@@ -90,9 +89,8 @@ fn import_namespace() {
 /// Mixed import (default + named) from the same specifier.
 #[test]
 fn import_mixed() {
-    let module =
-        compile_module(r#"import def, { a, b } from "./m.js";"#, "test.mjs")
-            .expect("should compile");
+    let module = compile_module(r#"import def, { a, b } from "./m.js";"#, "test.mjs")
+        .expect("should compile");
     assert_eq!(module.imports().len(), 1);
     let record = &module.imports()[0];
     assert_eq!(record.bindings.len(), 3);
@@ -138,19 +136,21 @@ fn export_named_const() {
 /// Named export with multiple declarators: `export const a = 1, b = 2`.
 #[test]
 fn export_named_multiple_declarators() {
-    let module =
-        compile_module("export const a = 1, b = 2;", "test.mjs").expect("should compile");
+    let module = compile_module("export const a = 1, b = 2;", "test.mjs").expect("should compile");
     assert_eq!(module.exports().len(), 2);
-    assert!(matches!(&module.exports()[0], ExportRecord::Named { exported, .. } if &**exported == "a"));
-    assert!(matches!(&module.exports()[1], ExportRecord::Named { exported, .. } if &**exported == "b"));
+    assert!(
+        matches!(&module.exports()[0], ExportRecord::Named { exported, .. } if &**exported == "a")
+    );
+    assert!(
+        matches!(&module.exports()[1], ExportRecord::Named { exported, .. } if &**exported == "b")
+    );
 }
 
 /// Named export with function declaration: `export function foo() {}`.
 #[test]
 fn export_named_function() {
     let module =
-        compile_module("export function foo() { return 1; }", "test.mjs")
-            .expect("should compile");
+        compile_module("export function foo() { return 1; }", "test.mjs").expect("should compile");
     assert_eq!(module.exports().len(), 1);
     match &module.exports()[0] {
         ExportRecord::Named { local, exported } => {
@@ -164,11 +164,8 @@ fn export_named_function() {
 /// Local export specifiers: `export { x, y as z }`.
 #[test]
 fn export_local_specifiers() {
-    let module = compile_module(
-        "const x = 1, y = 2;\nexport { x, y as z };",
-        "test.mjs",
-    )
-    .expect("should compile");
+    let module = compile_module("const x = 1, y = 2;\nexport { x, y as z };", "test.mjs")
+        .expect("should compile");
     assert_eq!(module.exports().len(), 2);
     match &module.exports()[0] {
         ExportRecord::Named { local, exported } => {
@@ -200,11 +197,8 @@ fn export_default_expression() {
 /// Default export of a named function: `export default function foo() {}`.
 #[test]
 fn export_default_named_function() {
-    let module = compile_module(
-        "export default function foo() { return 1; }",
-        "test.mjs",
-    )
-    .expect("should compile");
+    let module = compile_module("export default function foo() { return 1; }", "test.mjs")
+        .expect("should compile");
     assert_eq!(module.exports().len(), 1);
     match &module.exports()[0] {
         ExportRecord::Default { local } => assert_eq!(&**local, "foo"),
@@ -215,9 +209,8 @@ fn export_default_named_function() {
 /// Default export of an anonymous function: `export default function() {}`.
 #[test]
 fn export_default_anonymous_function() {
-    let module =
-        compile_module("export default function() { return 1; }", "test.mjs")
-            .expect("should compile");
+    let module = compile_module("export default function() { return 1; }", "test.mjs")
+        .expect("should compile");
     assert_eq!(module.exports().len(), 1);
     match &module.exports()[0] {
         ExportRecord::Default { local } => assert_eq!(&**local, "*default*"),
@@ -228,9 +221,8 @@ fn export_default_anonymous_function() {
 /// Re-export named: `export { foo } from "./m.js"`.
 #[test]
 fn export_reexport_named() {
-    let module =
-        compile_module(r#"export { foo, bar as baz } from "./m.js";"#, "test.mjs")
-            .expect("should compile");
+    let module = compile_module(r#"export { foo, bar as baz } from "./m.js";"#, "test.mjs")
+        .expect("should compile");
     assert_eq!(module.exports().len(), 2);
     match &module.exports()[0] {
         ExportRecord::ReExportNamed {
@@ -261,8 +253,7 @@ fn export_reexport_named() {
 /// Re-export all: `export * from "./m.js"`.
 #[test]
 fn export_reexport_all() {
-    let module =
-        compile_module(r#"export * from "./m.js";"#, "test.mjs").expect("should compile");
+    let module = compile_module(r#"export * from "./m.js";"#, "test.mjs").expect("should compile");
     assert_eq!(module.exports().len(), 1);
     match &module.exports()[0] {
         ExportRecord::ReExportAll { specifier } => assert_eq!(&**specifier, "./m.js"),
@@ -329,22 +320,23 @@ fn module_is_strict() {
 /// Export let with destructuring: `export let { a, b } = obj`.
 #[test]
 fn export_destructured_let() {
-    let module = compile_module(
-        "export let { a, b } = { a: 1, b: 2 };",
-        "test.mjs",
-    )
-    .expect("should compile");
+    let module = compile_module("export let { a, b } = { a: 1, b: 2 };", "test.mjs")
+        .expect("should compile");
     assert_eq!(module.exports().len(), 2);
-    assert!(matches!(&module.exports()[0], ExportRecord::Named { exported, .. } if &**exported == "a"));
-    assert!(matches!(&module.exports()[1], ExportRecord::Named { exported, .. } if &**exported == "b"));
+    assert!(
+        matches!(&module.exports()[0], ExportRecord::Named { exported, .. } if &**exported == "a")
+    );
+    assert!(
+        matches!(&module.exports()[1], ExportRecord::Named { exported, .. } if &**exported == "b")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  §16.2.1 — Module linking & evaluation
 // ═══════════════════════════════════════════════════════════════════════════
 
-use otter_vm::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph};
 use otter_vm::RuntimeState;
+use otter_vm::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph};
 
 fn run_module_graph(entry: &str, host: &InMemoryModuleHost) -> (RuntimeState, ModuleRegistry) {
     let mut runtime = RuntimeState::new();
@@ -361,7 +353,9 @@ fn single_module_export_value() {
     host.add_module("entry.mjs", "export var x = 42;");
 
     let (_, registry) = run_module_graph("entry.mjs", &host);
-    let value = registry.get_export("entry.mjs", "x").expect("export x should exist");
+    let value = registry
+        .get_export("entry.mjs", "x")
+        .expect("export x should exist");
     assert_eq!(value.as_i32(), Some(42));
 }
 
@@ -372,7 +366,9 @@ fn single_module_export_const() {
     host.add_module("entry.mjs", "export const greeting = 'hello';");
 
     let (_, registry) = run_module_graph("entry.mjs", &host);
-    let value = registry.get_export("entry.mjs", "greeting").expect("export should exist");
+    let value = registry
+        .get_export("entry.mjs", "greeting")
+        .expect("export should exist");
     assert!(value.as_object_handle().is_some()); // string is a heap object
 }
 
@@ -395,19 +391,26 @@ fn single_module_export_function() {
 fn two_module_import_named() {
     let mut host = InMemoryModuleHost::new();
     host.add_module("a.mjs", "export var value = 10;");
-    host.add_module("b.mjs", r#"import { value } from "a.mjs"; export var result = value + 5;"#);
+    host.add_module(
+        "b.mjs",
+        r#"import { value } from "a.mjs"; export var result = value + 5;"#,
+    );
 
     let (_, registry) = run_module_graph("b.mjs", &host);
 
     // A should be evaluated (dependency).
     assert_eq!(
-        registry.get_export("a.mjs", "value").and_then(|v| v.as_i32()),
+        registry
+            .get_export("a.mjs", "value")
+            .and_then(|v| v.as_i32()),
         Some(10)
     );
 
     // B should have imported A's value and computed result.
     assert_eq!(
-        registry.get_export("b.mjs", "result").and_then(|v| v.as_i32()),
+        registry
+            .get_export("b.mjs", "result")
+            .and_then(|v| v.as_i32()),
         Some(15)
     );
 }
@@ -417,15 +420,22 @@ fn two_module_import_named() {
 fn default_export_and_import() {
     let mut host = InMemoryModuleHost::new();
     host.add_module("a.mjs", "export default 99;");
-    host.add_module("b.mjs", r#"import val from "a.mjs"; export var result = val;"#);
+    host.add_module(
+        "b.mjs",
+        r#"import val from "a.mjs"; export var result = val;"#,
+    );
 
     let (_, registry) = run_module_graph("b.mjs", &host);
     assert_eq!(
-        registry.get_export("a.mjs", "default").and_then(|v| v.as_i32()),
+        registry
+            .get_export("a.mjs", "default")
+            .and_then(|v| v.as_i32()),
         Some(99)
     );
     assert_eq!(
-        registry.get_export("b.mjs", "result").and_then(|v| v.as_i32()),
+        registry
+            .get_export("b.mjs", "result")
+            .and_then(|v| v.as_i32()),
         Some(99)
     );
 }
@@ -436,7 +446,10 @@ fn reexport_named() {
     let mut host = InMemoryModuleHost::new();
     host.add_module("a.mjs", "export var x = 7;");
     host.add_module("b.mjs", r#"export { x } from "a.mjs";"#);
-    host.add_module("c.mjs", r#"import { x } from "b.mjs"; export var result = x;"#);
+    host.add_module(
+        "c.mjs",
+        r#"import { x } from "b.mjs"; export var result = x;"#,
+    );
 
     let (_, registry) = run_module_graph("c.mjs", &host);
     assert_eq!(
@@ -444,7 +457,9 @@ fn reexport_named() {
         Some(7)
     );
     assert_eq!(
-        registry.get_export("c.mjs", "result").and_then(|v| v.as_i32()),
+        registry
+            .get_export("c.mjs", "result")
+            .and_then(|v| v.as_i32()),
         Some(7)
     );
 }
@@ -477,7 +492,10 @@ fn side_effect_import() {
     let (_, registry) = run_module_graph("entry.mjs", &host);
     // init.mjs should be evaluated (state = Evaluated).
     let loaded = registry.get("init.mjs").expect("init.mjs should be loaded");
-    assert_eq!(loaded.state, otter_vm::module_loader::ModuleState::Evaluated);
+    assert_eq!(
+        loaded.state,
+        otter_vm::module_loader::ModuleState::Evaluated
+    );
 }
 
 /// Three-level dependency chain: C → B → A.
@@ -485,8 +503,14 @@ fn side_effect_import() {
 fn three_level_dependency_chain() {
     let mut host = InMemoryModuleHost::new();
     host.add_module("a.mjs", "export var base = 1;");
-    host.add_module("b.mjs", r#"import { base } from "a.mjs"; export var mid = base + 10;"#);
-    host.add_module("c.mjs", r#"import { mid } from "b.mjs"; export var top = mid + 100;"#);
+    host.add_module(
+        "b.mjs",
+        r#"import { base } from "a.mjs"; export var mid = base + 10;"#,
+    );
+    host.add_module(
+        "c.mjs",
+        r#"import { mid } from "b.mjs"; export var top = mid + 100;"#,
+    );
 
     let (_, registry) = run_module_graph("c.mjs", &host);
     assert_eq!(
@@ -499,12 +523,24 @@ fn three_level_dependency_chain() {
 #[test]
 fn multiple_exports() {
     let mut host = InMemoryModuleHost::new();
-    host.add_module("a.mjs", "export var x = 1; export var y = 2; export var z = 3;");
+    host.add_module(
+        "a.mjs",
+        "export var x = 1; export var y = 2; export var z = 3;",
+    );
 
     let (_, registry) = run_module_graph("a.mjs", &host);
-    assert_eq!(registry.get_export("a.mjs", "x").and_then(|v| v.as_i32()), Some(1));
-    assert_eq!(registry.get_export("a.mjs", "y").and_then(|v| v.as_i32()), Some(2));
-    assert_eq!(registry.get_export("a.mjs", "z").and_then(|v| v.as_i32()), Some(3));
+    assert_eq!(
+        registry.get_export("a.mjs", "x").and_then(|v| v.as_i32()),
+        Some(1)
+    );
+    assert_eq!(
+        registry.get_export("a.mjs", "y").and_then(|v| v.as_i32()),
+        Some(2)
+    );
+    assert_eq!(
+        registry.get_export("a.mjs", "z").and_then(|v| v.as_i32()),
+        Some(3)
+    );
 }
 
 /// Export with rename: `export { x as renamed }`.
@@ -515,7 +551,9 @@ fn export_with_rename() {
 
     let (_, registry) = run_module_graph("a.mjs", &host);
     assert_eq!(
-        registry.get_export("a.mjs", "renamed").and_then(|v| v.as_i32()),
+        registry
+            .get_export("a.mjs", "renamed")
+            .and_then(|v| v.as_i32()),
         Some(42)
     );
     // Original name should NOT be in the namespace.
@@ -529,11 +567,8 @@ fn export_with_rename() {
 /// `import("specifier")` compiles to a DynamicImport opcode.
 #[test]
 fn dynamic_import_compiles() {
-    let module = compile_module(
-        r#"var p = import("./other.mjs");"#,
-        "test.mjs",
-    )
-    .expect("should compile");
+    let module =
+        compile_module(r#"var p = import("./other.mjs");"#, "test.mjs").expect("should compile");
     // Should have DynamicImport instruction in the entry function bytecode.
     let entry = module.entry_function();
     let has_dynamic_import = entry
@@ -541,7 +576,10 @@ fn dynamic_import_compiles() {
         .instructions()
         .iter()
         .any(|i| i.opcode() == otter_vm::bytecode::Opcode::DynamicImport);
-    assert!(has_dynamic_import, "expected DynamicImport opcode in bytecode");
+    assert!(
+        has_dynamic_import,
+        "expected DynamicImport opcode in bytecode"
+    );
 }
 
 /// `import()` without a host handler throws TypeError.
@@ -555,16 +593,17 @@ fn dynamic_import_without_handler_throws() {
     let mut registry = ModuleRegistry::new();
     let result = execute_module_graph("entry.mjs", &host, &mut runtime, &mut registry);
     // Should fail — no __importDynamic handler installed.
-    assert!(result.is_err(), "expected error without __importDynamic handler");
+    assert!(
+        result.is_err(),
+        "expected error without __importDynamic handler"
+    );
 }
 
 /// `import()` with a host handler calls __importDynamic(specifier).
 #[test]
 fn dynamic_import_calls_host_handler() {
-    use otter_vm::descriptors::{
-        NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
-    };
     use otter_vm::RegisterValue;
+    use otter_vm::descriptors::{NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind};
 
     let mut host = InMemoryModuleHost::new();
     // Module that uses dynamic import and stores the specifier it was called with.
@@ -618,9 +657,7 @@ fn dynamic_import_calls_host_handler() {
     // Verify __importDynamic was called with the correct specifier.
     let global = runtime.intrinsics().global_object();
     let prop = runtime.intern_property_name("__importSpecifier");
-    let specifier_value = runtime
-        .own_property_value(global, prop)
-        .unwrap_or_default();
+    let specifier_value = runtime.own_property_value(global, prop).unwrap_or_default();
     // Should be a string object handle (the specifier "./dep.mjs").
     assert!(
         specifier_value.as_object_handle().is_some(),
@@ -635,11 +672,7 @@ fn dynamic_import_calls_host_handler() {
 /// `import.meta` compiles to an ImportMeta opcode.
 #[test]
 fn import_meta_compiles() {
-    let module = compile_module(
-        "var url = import.meta.url;",
-        "test.mjs",
-    )
-    .expect("should compile");
+    let module = compile_module("var url = import.meta.url;", "test.mjs").expect("should compile");
     let entry = module.entry_function();
     let has_import_meta = entry
         .bytecode()
@@ -653,10 +686,7 @@ fn import_meta_compiles() {
 #[test]
 fn import_meta_url_returns_module_url() {
     let mut host = InMemoryModuleHost::new();
-    host.add_module(
-        "entry.mjs",
-        "export var meta_url = import.meta.url;",
-    );
+    host.add_module("entry.mjs", "export var meta_url = import.meta.url;");
 
     let (runtime, registry) = run_module_graph("entry.mjs", &host);
     let value = registry

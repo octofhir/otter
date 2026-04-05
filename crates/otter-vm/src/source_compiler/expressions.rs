@@ -853,11 +853,8 @@ impl<'a> FunctionCompiler<'a> {
         let object = self.compile_expression(&expr.right, module)?;
         let prop_id = self.intern_property_name(expr.left.name.as_str())?;
         let dst = self.alloc_temp();
-        self.instructions.push(Instruction::in_private(
-            dst,
-            object.register,
-            prop_id,
-        ));
+        self.instructions
+            .push(Instruction::in_private(dst, object.register, prop_id));
         self.release(object);
         Ok(ValueLocation::temp(dst))
     }
@@ -872,6 +869,16 @@ impl<'a> FunctionCompiler<'a> {
         }
         if matches!(&call.callee, Expression::Super(_)) {
             return self.compile_super_call_expression(call, module);
+        }
+
+        // §19.2.1.1 Detect direct eval: `eval(code)`.
+        // A call where the callee is the bare identifier `eval` (not a member
+        // expression or aliased reference) is a "direct eval" per spec.
+        // Spec: <https://tc39.es/ecma262/#sec-function-calls-runtime-semantics-evaluation>
+        if let Expression::Identifier(ident) = &call.callee
+            && ident.name == "eval"
+        {
+            return self.compile_direct_eval_call(call, module);
         }
 
         let (callee, receiver) = self.compile_call_target(&call.callee, module)?;
@@ -898,6 +905,44 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             self.compile_call_static_args(&call.arguments, callee, receiver, false, module)
         }
+    }
+
+    /// §19.2.1.1 Compile a direct eval call: `eval(code)`.
+    ///
+    /// Emits a `CallEval dst, code` instruction instead of a normal function call.
+    /// The interpreter will compile and execute the source code in the caller's
+    /// context, inheriting strict mode.
+    ///
+    /// If no arguments are provided, loads undefined as the code argument
+    /// (which eval will return unchanged per §19.2.1 step 1).
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    fn compile_direct_eval_call(
+        &mut self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let code = if let Some(arg) = call.arguments.first() {
+            let expr = arg.as_expression().ok_or_else(|| {
+                SourceLoweringError::Unsupported("spread in eval() not supported".to_string())
+            })?;
+            let val = self.compile_expression(expr, module)?;
+            if val.is_temp {
+                self.stabilize_binding_value(val)?
+            } else {
+                val
+            }
+        } else {
+            let reg = self.alloc_temp();
+            self.instructions.push(Instruction::load_undefined(reg));
+            ValueLocation::temp(reg)
+        };
+
+        let dst = self.alloc_temp();
+        self.instructions
+            .push(Instruction::call_eval(dst, code.register));
+        self.release(code);
+        Ok(ValueLocation::temp(dst))
     }
 
     /// §13.3.8.1 ArgumentListEvaluation — no spread, register-window path.
@@ -2148,12 +2193,9 @@ impl<'a> FunctionCompiler<'a> {
         if yield_expr.delegate {
             // §14.4.4 yield* — delegate to sub-iterator.
             // Spec: <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
-            let argument = yield_expr
-                .argument
-                .as_ref()
-                .ok_or_else(|| {
-                    SourceLoweringError::Unsupported("yield* requires an argument".to_string())
-                })?;
+            let argument = yield_expr.argument.as_ref().ok_or_else(|| {
+                SourceLoweringError::Unsupported("yield* requires an argument".to_string())
+            })?;
             let iterable = self.compile_expression(argument, module)?;
             let iterator = self.allocate_local()?;
             self.instructions
@@ -2259,11 +2301,8 @@ impl<'a> FunctionCompiler<'a> {
             // Spec: <https://tc39.es/ecma262/#sec-optional-chaining>
             ChainElement::CallExpression(call) => {
                 // Compile callee with chain-aware optional handling.
-                let (callee, receiver) = self.compile_chain_call_target(
-                    &call.callee,
-                    &mut jump_patches,
-                    module,
-                )?;
+                let (callee, receiver) =
+                    self.compile_chain_call_target(&call.callee, &mut jump_patches, module)?;
 
                 // Stabilize for safe register reuse across argument compilation.
                 let receiver = match receiver {
@@ -2288,21 +2327,9 @@ impl<'a> FunctionCompiler<'a> {
                     .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
                 let call_result = if has_spread {
-                    self.compile_call_with_spread(
-                        &call.arguments,
-                        callee,
-                        receiver,
-                        false,
-                        module,
-                    )?
+                    self.compile_call_with_spread(&call.arguments, callee, receiver, false, module)?
                 } else {
-                    self.compile_call_static_args(
-                        &call.arguments,
-                        callee,
-                        receiver,
-                        false,
-                        module,
-                    )?
+                    self.compile_call_static_args(&call.arguments, callee, receiver, false, module)?
                 };
 
                 self.instructions
@@ -2594,8 +2621,8 @@ impl<'a> FunctionCompiler<'a> {
         // 6. Call: tag(strings, sub0, sub1, ...)
         //    Total argument count = 1 (template object) + substitution count.
         let total_args = 1 + sub_values.len();
-        let argument_count = RegisterIndex::try_from(total_args)
-            .map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let argument_count =
+            RegisterIndex::try_from(total_args).map_err(|_| SourceLoweringError::TooManyLocals)?;
         let arg_start = self.reserve_temp_window(argument_count)?;
 
         // First arg: template strings array

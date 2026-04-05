@@ -730,8 +730,7 @@ impl<'a> FunctionCompiler<'a> {
                 | BindingPattern::ArrayPattern(_)
                 | BindingPattern::AssignmentPattern(_)) => {
                     let exc_reg = self.allocate_local()?;
-                    self.instructions
-                        .push(Instruction::load_exception(exc_reg));
+                    self.instructions.push(Instruction::load_exception(exc_reg));
                     self.compile_binding_pattern_target(
                         pattern,
                         ValueLocation::local(exc_reg),

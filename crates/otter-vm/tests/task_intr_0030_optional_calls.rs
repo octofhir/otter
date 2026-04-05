@@ -54,21 +54,21 @@ fn optional_call_on_function() {
 /// `fn?.()` — when fn is null, returns undefined.
 #[test]
 fn optional_call_on_null() {
-    assert!(run(
-        "var fn = null;\n\
-         fn?.()"
-    )
-    .is_undefined());
+    assert!(
+        run("var fn = null;\n\
+         fn?.()")
+        .is_undefined()
+    );
 }
 
 /// `fn?.()` — when fn is undefined, returns undefined.
 #[test]
 fn optional_call_on_undefined() {
-    assert!(run(
-        "var fn = undefined;\n\
-         fn?.()"
-    )
-    .is_undefined());
+    assert!(
+        run("var fn = undefined;\n\
+         fn?.()")
+        .is_undefined()
+    );
 }
 
 /// `fn?.()` — passes arguments correctly.
@@ -102,21 +102,21 @@ fn optional_method_call_on_object() {
 /// `obj?.method()` — when obj is null, short-circuits to undefined.
 #[test]
 fn optional_method_call_on_null() {
-    assert!(run(
-        "var obj = null;\n\
-         obj?.getX()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = null;\n\
+         obj?.getX()")
+        .is_undefined()
+    );
 }
 
 /// `obj?.method()` — when obj is undefined, short-circuits to undefined.
 #[test]
 fn optional_method_call_on_undefined() {
-    assert!(run(
-        "var obj = undefined;\n\
-         obj?.method()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = undefined;\n\
+         obj?.method()")
+        .is_undefined()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -138,11 +138,11 @@ fn call_optional_on_existing_method() {
 /// `obj.method?.()` — when method is undefined, returns undefined.
 #[test]
 fn call_optional_on_undefined_method() {
-    assert!(run(
-        "var obj = {};\n\
-         obj.missing?.()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = {};\n\
+         obj.missing?.()")
+        .is_undefined()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -165,11 +165,11 @@ fn optional_computed_call_on_object() {
 /// `obj?.[key]()` — when obj is null, short-circuits to undefined.
 #[test]
 fn optional_computed_call_on_null() {
-    assert!(run(
-        "var obj = null;\n\
-         obj?.['method']()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = null;\n\
+         obj?.['method']()")
+        .is_undefined()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -191,21 +191,21 @@ fn double_optional_both_exist() {
 /// `obj?.method?.()` — obj is null, short-circuits.
 #[test]
 fn double_optional_null_obj() {
-    assert!(run(
-        "var obj = null;\n\
-         obj?.fn?.()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = null;\n\
+         obj?.fn?.()")
+        .is_undefined()
+    );
 }
 
 /// `obj?.method?.()` — obj exists but method is undefined, short-circuits.
 #[test]
 fn double_optional_undefined_method() {
-    assert!(run(
-        "var obj = {};\n\
-         obj?.fn?.()"
-    )
-    .is_undefined());
+    assert!(
+        run("var obj = {};\n\
+         obj?.fn?.()")
+        .is_undefined()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -228,11 +228,11 @@ fn optional_call_with_spread() {
 /// `fn?.(...args)` — null callee with spread still returns undefined.
 #[test]
 fn optional_call_with_spread_null() {
-    assert!(run(
-        "var fn = null;\n\
-         fn?.(...[1, 2, 3])"
-    )
-    .is_undefined());
+    assert!(
+        run("var fn = null;\n\
+         fn?.(...[1, 2, 3])")
+        .is_undefined()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

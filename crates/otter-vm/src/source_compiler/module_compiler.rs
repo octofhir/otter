@@ -47,7 +47,6 @@ impl<'a> ModuleCompiler<'a> {
         self.mode
     }
 
-
     pub(super) fn compile(
         mut self,
         program: &AstProgram<'_>,
@@ -55,8 +54,7 @@ impl<'a> ModuleCompiler<'a> {
         let is_module = self.mode == LoweringMode::Module;
         let entry = self.reserve_function();
         // §10.2.1 — Module code is always strict.
-        let inherited_strict =
-            is_module || has_use_strict_directive(program.directives.as_slice());
+        let inherited_strict = is_module || has_use_strict_directive(program.directives.as_slice());
         let compiled = self.compile_function_from_statements(
             entry,
             FunctionIdentity {

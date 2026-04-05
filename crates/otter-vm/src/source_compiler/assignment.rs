@@ -261,10 +261,8 @@ impl<'a> FunctionCompiler<'a> {
                 let current = self.compile_identifier(identifier.name.as_str())?;
                 let current = self.materialize_value(current);
 
-                let skip_assign = self.emit_logical_short_circuit(
-                    assignment.operator,
-                    current.register,
-                )?;
+                let skip_assign =
+                    self.emit_logical_short_circuit(assignment.operator, current.register)?;
 
                 let rhs = self.compile_expression(&assignment.right, module)?;
                 self.instructions
@@ -286,10 +284,8 @@ impl<'a> FunctionCompiler<'a> {
                     property,
                 ));
 
-                let skip_assign = self.emit_logical_short_circuit(
-                    assignment.operator,
-                    current.register,
-                )?;
+                let skip_assign =
+                    self.emit_logical_short_circuit(assignment.operator, current.register)?;
 
                 let rhs = self.compile_expression(&assignment.right, module)?;
                 self.instructions
@@ -317,10 +313,8 @@ impl<'a> FunctionCompiler<'a> {
                     index.register,
                 ));
 
-                let skip_assign = self.emit_logical_short_circuit(
-                    assignment.operator,
-                    current.register,
-                )?;
+                let skip_assign =
+                    self.emit_logical_short_circuit(assignment.operator, current.register)?;
 
                 let rhs = self.compile_expression(&assignment.right, module)?;
                 self.instructions
@@ -348,10 +342,8 @@ impl<'a> FunctionCompiler<'a> {
                     prop_id,
                 ));
 
-                let skip_assign = self.emit_logical_short_circuit(
-                    assignment.operator,
-                    current.register,
-                )?;
+                let skip_assign =
+                    self.emit_logical_short_circuit(assignment.operator, current.register)?;
 
                 let rhs = self.compile_expression(&assignment.right, module)?;
                 self.instructions
@@ -397,11 +389,8 @@ impl<'a> FunctionCompiler<'a> {
                 // ??= : only assign if LHS is null or undefined. Skip if not nullish.
                 let null_val = self.load_null()?;
                 let cmp = ValueLocation::temp(self.alloc_temp());
-                self.instructions.push(Instruction::eq(
-                    cmp.register,
-                    value_reg,
-                    null_val.register,
-                ));
+                self.instructions
+                    .push(Instruction::eq(cmp.register, value_reg, null_val.register));
                 self.release(null_val);
                 let jump_if_null =
                     self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp.register);

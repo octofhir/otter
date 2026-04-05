@@ -728,10 +728,7 @@ impl<'a> FunctionCompiler<'a> {
                     constructor = Some(&method.value);
                 }
                 ClassElement::MethodDefinition(method) => {
-                    if matches!(
-                        &method.key,
-                        oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
-                    ) {
+                    if matches!(&method.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_)) {
                         has_private_members = true;
                     }
                 }
@@ -748,10 +745,7 @@ impl<'a> FunctionCompiler<'a> {
                     if !prop.r#static {
                         has_instance_fields = true;
                     }
-                    if matches!(
-                        &prop.key,
-                        oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
-                    ) {
+                    if matches!(&prop.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_)) {
                         has_private_members = true;
                     }
                 }
@@ -774,10 +768,7 @@ impl<'a> FunctionCompiler<'a> {
         // §15.7.14 step 5: Detect `class extends null` — protoParent = null,
         // constructorParent = %Function.prototype%, constructor kind = base.
         // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-        let extends_null = matches!(
-            class.super_class.as_ref(),
-            Some(Expression::NullLiteral(_))
-        );
+        let extends_null = matches!(class.super_class.as_ref(), Some(Expression::NullLiteral(_)));
         let super_class = if let Some(super_class) = class.super_class.as_ref() {
             if extends_null {
                 None // Don't compile null as a super class value
@@ -870,10 +861,8 @@ impl<'a> FunctionCompiler<'a> {
             if let ClassElement::MethodDefinition(method) = element
                 && !matches!(method.kind, MethodDefinitionKind::Constructor)
             {
-                let is_private = matches!(
-                    &method.key,
-                    oxc_ast::ast::PropertyKey::PrivateIdentifier(_)
-                );
+                let is_private =
+                    matches!(&method.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_));
                 let class_id_src = if has_private_members {
                     Some(constructor_value.register)
                 } else {
@@ -998,8 +987,7 @@ impl<'a> FunctionCompiler<'a> {
                     } else {
                         init_compiler.load_undefined()?
                     };
-                    let prop_id =
-                        init_compiler.intern_property_name(ident.name.as_str())?;
+                    let prop_id = init_compiler.intern_property_name(ident.name.as_str())?;
                     init_compiler
                         .instructions
                         .push(Instruction::define_private_field(
@@ -1204,11 +1192,7 @@ impl<'a> FunctionCompiler<'a> {
                 &compiled.captures,
             )?;
         } else if kind.is_generator() {
-            self.emit_new_closure_generator(
-                method_closure.register,
-                reserved,
-                &compiled.captures,
-            )?;
+            self.emit_new_closure_generator(method_closure.register, reserved, &compiled.captures)?;
         } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
@@ -1483,11 +1467,7 @@ impl<'a> FunctionCompiler<'a> {
                 &compiled.captures,
             )?;
         } else if kind.is_generator() {
-            self.emit_new_closure_generator(
-                method_closure.register,
-                reserved,
-                &compiled.captures,
-            )?;
+            self.emit_new_closure_generator(method_closure.register, reserved, &compiled.captures)?;
         } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
@@ -1564,10 +1544,8 @@ impl<'a> FunctionCompiler<'a> {
 
         // Propagate class_id so the method can resolve private names at runtime.
         if let Some(source) = class_id_source {
-            self.instructions.push(Instruction::copy_class_id(
-                method_closure.register,
-                source,
-            ));
+            self.instructions
+                .push(Instruction::copy_class_id(method_closure.register, source));
         }
 
         self.release(method_closure);

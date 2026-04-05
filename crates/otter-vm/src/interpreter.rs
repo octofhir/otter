@@ -3858,6 +3858,20 @@ impl RuntimeState {
         obj
     }
 
+    /// §19.2.1 Step 1: If x is not a String, return None.
+    /// Extracts the string content if `value` is a string primitive.
+    /// Does NOT coerce — returns None for non-string values.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-eval-x>
+    pub fn value_as_string(&self, value: RegisterValue) -> Option<String> {
+        let handle = value.as_object_handle().map(ObjectHandle)?;
+        self.objects
+            .string_value(handle)
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
+    }
+
     /// Checks whether a value is a string type (heap string or string wrapper).
     fn value_is_string(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
@@ -4175,12 +4189,12 @@ impl RuntimeState {
         // Slow path: protocol-based iterator — look up .next() and call it.
         let next_prop = self.intern_property_name("next");
         let iter_val = RegisterValue::from_object_handle(iterator.0);
-        let next_fn = self.ordinary_get(iterator, next_prop, iter_val).map_err(
-            |e| match e {
+        let next_fn = self
+            .ordinary_get(iterator, next_prop, iter_val)
+            .map_err(|e| match e {
                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+            })?;
         let callable = next_fn
             .as_object_handle()
             .map(ObjectHandle)
@@ -4188,12 +4202,12 @@ impl RuntimeState {
             .ok_or_else(|| {
                 InterpreterError::TypeError("Iterator .next is not a function".into())
             })?;
-        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
-            |e| match e {
+        let result_obj = self
+            .call_callable(callable, iter_val, &[value])
+            .map_err(|e| match e {
                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+            })?;
         self.read_iter_result(result_obj)
     }
 
@@ -4213,12 +4227,12 @@ impl RuntimeState {
 
         let throw_prop = self.intern_property_name("throw");
         let iter_val = RegisterValue::from_object_handle(iterator.0);
-        let throw_fn = self.ordinary_get(iterator, throw_prop, iter_val).map_err(
-            |e| match e {
+        let throw_fn = self
+            .ordinary_get(iterator, throw_prop, iter_val)
+            .map_err(|e| match e {
                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+            })?;
         if throw_fn == RegisterValue::undefined() || throw_fn == RegisterValue::null() {
             return Ok(None);
         }
@@ -4229,12 +4243,12 @@ impl RuntimeState {
             .ok_or_else(|| {
                 InterpreterError::TypeError("Iterator .throw is not a function".into())
             })?;
-        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
-            |e| match e {
+        let result_obj = self
+            .call_callable(callable, iter_val, &[value])
+            .map_err(|e| match e {
                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+            })?;
         self.read_iter_result(result_obj).map(Some)
     }
 
@@ -4254,12 +4268,12 @@ impl RuntimeState {
 
         let return_prop = self.intern_property_name("return");
         let iter_val = RegisterValue::from_object_handle(iterator.0);
-        let return_fn = self.ordinary_get(iterator, return_prop, iter_val).map_err(
-            |e| match e {
-                VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
-                VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+        let return_fn =
+            self.ordinary_get(iterator, return_prop, iter_val)
+                .map_err(|e| match e {
+                    VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                    VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
+                })?;
         if return_fn == RegisterValue::undefined() || return_fn == RegisterValue::null() {
             return Ok(None);
         }
@@ -4270,22 +4284,19 @@ impl RuntimeState {
             .ok_or_else(|| {
                 InterpreterError::TypeError("Iterator .return is not a function".into())
             })?;
-        let result_obj = self.call_callable(callable, iter_val, &[value]).map_err(
-            |e| match e {
+        let result_obj = self
+            .call_callable(callable, iter_val, &[value])
+            .map_err(|e| match e {
                 VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                 VmNativeCallError::Internal(m) => InterpreterError::NativeCall(m),
-            },
-        )?;
+            })?;
         self.read_iter_result(result_obj).map(Some)
     }
 
     /// Returns `true` if the handle is an internal array (values-kind) or string iterator
     /// that uses the `iterator_next` fast path and has no protocol-level `.next()`/`.throw()`/`.return()`.
     fn is_internal_fast_path_iterator(&self, handle: ObjectHandle) -> bool {
-        matches!(
-            self.objects.kind(handle),
-            Ok(HeapValueKind::Iterator)
-        )
+        matches!(self.objects.kind(handle), Ok(HeapValueKind::Iterator))
     }
 
     /// Reads `done` and `value` from an iterator result object.
@@ -4309,6 +4320,73 @@ impl RuntimeState {
             .ordinary_get(result_handle, value_prop, result_obj)
             .unwrap_or_else(|_| RegisterValue::undefined());
         Ok((done, value))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  §19.2.1 eval(x) — PerformEval
+    //  Spec: <https://tc39.es/ecma262/#sec-eval-x>
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// §19.2.1.1 PerformEval ( x, strictCaller, direct )
+    ///
+    /// Compiles and executes `source` as a Script in the current runtime.
+    /// Returns the completion value of the last expression statement.
+    ///
+    /// When `direct` is false (indirect eval), the code runs in the global
+    /// scope and is never strict unless the eval code itself contains a
+    /// "use strict" directive.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    pub fn eval_source(
+        &mut self,
+        source: &str,
+        direct: bool,
+        _strict_caller: bool,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        // §19.2.1.1 Step 2: If x is not a String, return x.
+        // (Handled by the caller before reaching this method.)
+
+        // §19.2.1.1 Step 4-10: Parse the source as a Script.
+        let source_url = if direct {
+            "<direct-eval>"
+        } else {
+            "<indirect-eval>"
+        };
+
+        let module = crate::source::compile_eval(source, source_url).map_err(|e| {
+            // §19.2.1.1 Step 5: If parsing fails, throw a SyntaxError.
+            self.alloc_syntax_error(&format!("eval: {e}"))
+        })?;
+
+        // §19.2.1.1 Step 16-25: Evaluate the parsed script.
+        let interpreter = Interpreter::new();
+        let result = interpreter
+            .execute_module(&module, self)
+            .map_err(|e| match e {
+                InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                other => VmNativeCallError::Internal(format!("eval: {other}").into()),
+            })?;
+
+        Ok(result.return_value())
+    }
+
+    /// Allocates a SyntaxError object with the given message.
+    /// §20.5.5.4 NativeError
+    /// Spec: <https://tc39.es/ecma262/#sec-nativeerror-message>
+    pub fn alloc_syntax_error(&mut self, message: &str) -> VmNativeCallError {
+        let prototype = self.intrinsics.syntax_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let msg = self.alloc_string(message);
+        let msg_prop = self.intern_property_name("message");
+        self.objects
+            .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
+            .ok();
+        let name = self.alloc_string("SyntaxError");
+        let name_prop = self.intern_property_name("name");
+        self.objects
+            .set_property(handle, name_prop, RegisterValue::from_object_handle(name.0))
+            .ok();
+        VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
     }
 }
 
@@ -5628,9 +5706,11 @@ impl Interpreter {
                         .map(ObjectHandle)
                         .ok_or(InterpreterError::InvalidObjectValue)?;
                     for (key, element) in private_methods {
-                        runtime
-                            .objects
-                            .private_method_or_accessor_add(this_handle, key, element)?;
+                        runtime.objects.private_method_or_accessor_add(
+                            this_handle,
+                            key,
+                            element,
+                        )?;
                     }
                 }
 
@@ -5714,14 +5794,9 @@ impl Interpreter {
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
                 let value = activation.read_bytecode_register(function, instruction.b())?;
-                let class_id =
-                    Self::resolve_class_id(activation, runtime, Some(obj_handle))?;
-                let key = Self::resolve_private_name_key(
-                    function,
-                    runtime,
-                    instruction.c(),
-                    class_id,
-                )?;
+                let class_id = Self::resolve_class_id(activation, runtime, Some(obj_handle))?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.private_field_add(obj_handle, key, value)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -5738,12 +5813,8 @@ impl Interpreter {
                     .closure_handle()
                     .ok_or(InterpreterError::MissingClosureContext)?;
                 let class_id = runtime.objects.closure_class_id(closure)?;
-                let key = Self::resolve_private_name_key(
-                    function,
-                    runtime,
-                    instruction.c(),
-                    class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 // Check element kind to handle accessor getters.
                 let element = runtime.objects.private_elements_ref(obj_handle, &key);
                 match element {
@@ -5752,13 +5823,7 @@ impl Interpreter {
                         ..
                     }) => {
                         let getter_handle = *getter_handle;
-                        match Self::call_function(
-                            runtime,
-                            module,
-                            getter_handle,
-                            object,
-                            &[],
-                        ) {
+                        match Self::call_function(runtime, module, getter_handle, object, &[]) {
                             Ok(result) => {
                                 activation.write_bytecode_register(
                                     function,
@@ -5772,20 +5837,14 @@ impl Interpreter {
                             Err(other) => return Err(other),
                         }
                     }
-                    Some(crate::object::PrivateElement::Accessor {
-                        getter: None, ..
-                    }) => {
+                    Some(crate::object::PrivateElement::Accessor { getter: None, .. }) => {
                         return Err(InterpreterError::TypeError(
                             "private accessor has no getter".into(),
                         ));
                     }
                     _ => {
                         let result = runtime.objects.private_get(obj_handle, &key)?;
-                        activation.write_bytecode_register(
-                            function,
-                            instruction.a(),
-                            result,
-                        )?;
+                        activation.write_bytecode_register(function, instruction.a(), result)?;
                     }
                 }
                 activation.advance();
@@ -5804,22 +5863,13 @@ impl Interpreter {
                     .closure_handle()
                     .ok_or(InterpreterError::MissingClosureContext)?;
                 let class_id = runtime.objects.closure_class_id(closure)?;
-                let key = Self::resolve_private_name_key(
-                    function,
-                    runtime,
-                    instruction.c(),
-                    class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 match runtime.objects.private_set(obj_handle, &key, value)? {
                     None => {} // Field set succeeded directly.
                     Some(setter_handle) => {
-                        match Self::call_function(
-                            runtime,
-                            module,
-                            setter_handle,
-                            object,
-                            &[value],
-                        ) {
+                        match Self::call_function(runtime, module, setter_handle, object, &[value])
+                        {
                             Ok(_) => {}
                             Err(InterpreterError::UncaughtThrow(v)) => {
                                 return Ok(StepOutcome::Throw(v));
@@ -5844,13 +5894,13 @@ impl Interpreter {
                     .as_object_handle()
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
-                let class_id =
-                    Self::resolve_class_id(activation, runtime, Some(object))?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let class_id = Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.private_method_or_accessor_add(
-                    object, key, crate::object::PrivateElement::Method(method),
+                    object,
+                    key,
+                    crate::object::PrivateElement::Method(method),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -5867,15 +5917,15 @@ impl Interpreter {
                     .as_object_handle()
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
-                let class_id =
-                    Self::resolve_class_id(activation, runtime, Some(object))?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let class_id = Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.private_method_or_accessor_add(
-                    object, key,
+                    object,
+                    key,
                     crate::object::PrivateElement::Accessor {
-                        getter: Some(getter), setter: None,
+                        getter: Some(getter),
+                        setter: None,
                     },
                 )?;
                 activation.advance();
@@ -5893,15 +5943,15 @@ impl Interpreter {
                     .as_object_handle()
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
-                let class_id =
-                    Self::resolve_class_id(activation, runtime, Some(object))?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let class_id = Self::resolve_class_id(activation, runtime, Some(object))?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.private_method_or_accessor_add(
-                    object, key,
+                    object,
+                    key,
                     crate::object::PrivateElement::Accessor {
-                        getter: None, setter: Some(setter),
+                        getter: None,
+                        setter: Some(setter),
                     },
                 )?;
                 activation.advance();
@@ -5920,11 +5970,12 @@ impl Interpreter {
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
                 let class_id = runtime.objects.closure_class_id(constructor)?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.push_private_method(
-                    constructor, key, crate::object::PrivateElement::Method(method),
+                    constructor,
+                    key,
+                    crate::object::PrivateElement::Method(method),
                 )?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -5942,13 +5993,14 @@ impl Interpreter {
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
                 let class_id = runtime.objects.closure_class_id(constructor)?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.push_private_method(
-                    constructor, key,
+                    constructor,
+                    key,
                     crate::object::PrivateElement::Accessor {
-                        getter: Some(getter), setter: None,
+                        getter: Some(getter),
+                        setter: None,
                     },
                 )?;
                 activation.advance();
@@ -5967,13 +6019,14 @@ impl Interpreter {
                     .map(ObjectHandle)
                     .ok_or(InterpreterError::InvalidObjectValue)?;
                 let class_id = runtime.objects.closure_class_id(constructor)?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 runtime.objects.push_private_method(
-                    constructor, key,
+                    constructor,
+                    key,
                     crate::object::PrivateElement::Accessor {
-                        getter: None, setter: Some(setter),
+                        getter: None,
+                        setter: Some(setter),
                     },
                 )?;
                 activation.advance();
@@ -5982,21 +6035,17 @@ impl Interpreter {
             // §13.10.1 InPrivate — `#field in obj` brand check.
             Opcode::InPrivate => {
                 let object = activation.read_bytecode_register(function, instruction.b())?;
-                let obj_handle = object
-                    .as_object_handle()
-                    .map(ObjectHandle)
-                    .ok_or_else(|| {
-                        InterpreterError::TypeError(
-                            "right-hand side of 'in' should be an object".into(),
-                        )
-                    })?;
+                let obj_handle = object.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+                    InterpreterError::TypeError(
+                        "right-hand side of 'in' should be an object".into(),
+                    )
+                })?;
                 let closure = activation
                     .closure_handle()
                     .ok_or(InterpreterError::MissingClosureContext)?;
                 let class_id = runtime.objects.closure_class_id(closure)?;
-                let key = Self::resolve_private_name_key(
-                    function, runtime, instruction.c(), class_id,
-                )?;
+                let key =
+                    Self::resolve_private_name_key(function, runtime, instruction.c(), class_id)?;
                 let found = runtime.objects.private_element_find(obj_handle, &key)?;
                 activation.write_bytecode_register(
                     function,
@@ -7955,8 +8004,7 @@ impl Interpreter {
             Opcode::YieldStar => {
                 let dst_reg = instruction.a();
                 let iterator_reg = instruction.b();
-                let iterator_value =
-                    activation.read_bytecode_register(function, iterator_reg)?;
+                let iterator_value = activation.read_bytecode_register(function, iterator_reg)?;
 
                 let iterator_handle = iterator_value
                     .as_object_handle()
@@ -7966,10 +8014,8 @@ impl Interpreter {
                     })?;
 
                 // Call inner.next(undefined) to get the first result.
-                let (done, value) = runtime.call_iterator_next_with_value(
-                    iterator_handle,
-                    RegisterValue::undefined(),
-                )?;
+                let (done, value) = runtime
+                    .call_iterator_next_with_value(iterator_handle, RegisterValue::undefined())?;
 
                 if done {
                     // Inner iterator immediately done — write return value to dst.
@@ -7991,8 +8037,7 @@ impl Interpreter {
             Opcode::DynamicImport => {
                 let dst_reg = instruction.a();
                 let specifier_reg = instruction.b();
-                let specifier_value =
-                    activation.read_bytecode_register(function, specifier_reg)?;
+                let specifier_value = activation.read_bytecode_register(function, specifier_reg)?;
 
                 // Coerce specifier to string.
                 let specifier_str = runtime.js_to_string(specifier_value)?;
@@ -8000,17 +8045,13 @@ impl Interpreter {
                 // Look up the host-installed __importDynamic function on the global.
                 let prop = runtime.intern_property_name("__importDynamic");
                 let global = runtime.intrinsics().global_object();
-                let handler_value = runtime
-                    .own_property_value(global, prop)
-                    .unwrap_or_default();
+                let handler_value = runtime.own_property_value(global, prop).unwrap_or_default();
 
-                let result = if let Some(handle_id) = handler_value.as_object_handle()
-                {
+                let result = if let Some(handle_id) = handler_value.as_object_handle() {
                     // Call __importDynamic(specifier) and return its result
                     // (should be a Promise).
                     let specifier_handle = runtime.alloc_string(specifier_str);
-                    let specifier_rv =
-                        RegisterValue::from_object_handle(specifier_handle.0);
+                    let specifier_rv = RegisterValue::from_object_handle(specifier_handle.0);
                     runtime.call_callable_for_accessor(
                         Some(ObjectHandle(handle_id)),
                         RegisterValue::undefined(),
@@ -8019,8 +8060,7 @@ impl Interpreter {
                 } else {
                     // No host handler — throw a TypeError.
                     return Err(InterpreterError::TypeError(
-                        "import() requires a host-installed __importDynamic handler"
-                            .into(),
+                        "import() requires a host-installed __importDynamic handler".into(),
                     ));
                 };
 
@@ -8054,6 +8094,37 @@ impl Interpreter {
                     })?;
 
                 let result = RegisterValue::from_object_handle(meta_object.0);
+                activation.write_bytecode_register(function, dst_reg, result)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+
+            // §19.2.1.1 PerformEval — direct eval.
+            // `CallEval dst, code`
+            // If code is not a string, returns it unchanged.
+            // Otherwise compiles and executes the source in the current runtime,
+            // returning the completion value.
+            // Spec: <https://tc39.es/ecma262/#sec-performeval>
+            Opcode::CallEval => {
+                let dst_reg = instruction.a();
+                let code_reg = instruction.b();
+                let code_value = activation.read_bytecode_register(function, code_reg)?;
+
+                // §19.2.1 Step 1: If x is not a String, return x.
+                let result = if let Some(source) = runtime.value_as_string(code_value) {
+                    // §19.2.1.1 PerformEval(x, strictCaller=from_frame, direct=true)
+                    runtime
+                        .eval_source(&source, true, false)
+                        .map_err(|e| match e {
+                            VmNativeCallError::Thrown(value) => {
+                                InterpreterError::UncaughtThrow(value)
+                            }
+                            VmNativeCallError::Internal(msg) => InterpreterError::TypeError(msg),
+                        })?
+                } else {
+                    code_value
+                };
+
                 activation.write_bytecode_register(function, dst_reg, result)?;
                 activation.advance();
                 Ok(StepOutcome::Continue)
@@ -8727,7 +8798,10 @@ impl Interpreter {
             }
             GeneratorResumeKind::Throw => {
                 // §14.4.4 step 7.b — forward .throw() to inner iterator.
-                match runtime.call_iterator_throw(inner_iter, sent_value).map_err(interp_to_native)? {
+                match runtime
+                    .call_iterator_throw(inner_iter, sent_value)
+                    .map_err(interp_to_native)?
+                {
                     Some((done, value)) => {
                         if done {
                             Ok(YieldStarResult::Done(value))
@@ -8739,21 +8813,20 @@ impl Interpreter {
                         // Inner iterator has no .throw() — close it and throw TypeError.
                         let _ = runtime.objects.iterator_close(inner_iter);
                         let err = runtime
-                            .alloc_type_error(
-                                "The iterator does not provide a 'throw' method",
-                            )
-                            .map_err(|e| {
-                                VmNativeCallError::Internal(format!("{e:?}").into())
-                            })?;
-                        Err(VmNativeCallError::Thrown(RegisterValue::from_object_handle(
-                            err.0,
-                        )))
+                            .alloc_type_error("The iterator does not provide a 'throw' method")
+                            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                        Err(VmNativeCallError::Thrown(
+                            RegisterValue::from_object_handle(err.0),
+                        ))
                     }
                 }
             }
             GeneratorResumeKind::Return => {
                 // §14.4.4 step 7.c — forward .return() to inner iterator.
-                match runtime.call_iterator_return(inner_iter, sent_value).map_err(interp_to_native)? {
+                match runtime
+                    .call_iterator_return(inner_iter, sent_value)
+                    .map_err(interp_to_native)?
+                {
                     Some((done, value)) => {
                         if done {
                             Ok(YieldStarResult::Return(value))
@@ -9087,10 +9160,9 @@ impl Interpreter {
                         })?;
                     // §14.4.4 — if YieldStar set a pending delegation, store it.
                     if let Some(inner_iter) = runtime.pending_delegation_iterator.take() {
-                        let _ = runtime.objects.set_generator_delegation_iterator(
-                            generator,
-                            Some(inner_iter),
-                        );
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, Some(inner_iter));
                     }
                     runtime.restore_module(previous_module);
                     let result = runtime.create_iter_result(yielded_value, false)?;
@@ -9122,9 +9194,7 @@ impl Interpreter {
             .objects
             .async_generator_peek_request(generator)
             .map_err(|e| {
-                VmNativeCallError::Internal(
-                    format!("async generator peek request: {e:?}").into(),
-                )
+                VmNativeCallError::Internal(format!("async generator peek request: {e:?}").into())
             })?;
         let Some(request) = request else {
             // No pending requests — nothing to do.
@@ -9135,15 +9205,20 @@ impl Interpreter {
         let sent_value = request.value;
 
         // Take state from the async generator (transitions to Executing).
-        let (module, function_index, closure_handle, arguments, saved_registers, resume_pc, resume_reg) =
-            runtime
-                .objects
-                .async_generator_take_state(generator)
-                .map_err(|e| {
-                    VmNativeCallError::Internal(
-                        format!("async generator take state: {e:?}").into(),
-                    )
-                })?;
+        let (
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+            saved_registers,
+            resume_pc,
+            resume_reg,
+        ) = runtime
+            .objects
+            .async_generator_take_state(generator)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("async generator take state: {e:?}").into())
+            })?;
 
         let function = module.function(function_index).ok_or_else(|| {
             VmNativeCallError::Internal("async generator function index invalid".into())
@@ -9174,9 +9249,7 @@ impl Interpreter {
                 AsyncGeneratorRequestKind::Return => {
                     // §27.6.3.5 AsyncGeneratorAwaitReturn — complete the request,
                     // mark completed, and drain.
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
+                    let _ = runtime.objects.async_generator_dequeue(generator);
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
@@ -9209,9 +9282,7 @@ impl Interpreter {
                     act
                 }
                 AsyncGeneratorRequestKind::Return => {
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
+                    let _ = runtime.objects.async_generator_dequeue(generator);
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
@@ -9221,9 +9292,7 @@ impl Interpreter {
                 }
                 AsyncGeneratorRequestKind::Throw => {
                     // §27.6.1.4 step 10: If state is suspendedStart, reject.
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
+                    let _ = runtime.objects.async_generator_dequeue(generator);
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
@@ -9255,9 +9324,7 @@ impl Interpreter {
                 // Convert async generator request kind to sync GeneratorResumeKind
                 // for the delegation handler.
                 let gen_resume_kind = match resume_kind {
-                    AsyncGeneratorRequestKind::Next => {
-                        crate::intrinsics::GeneratorResumeKind::Next
-                    }
+                    AsyncGeneratorRequestKind::Next => crate::intrinsics::GeneratorResumeKind::Next,
                     AsyncGeneratorRequestKind::Return => {
                         crate::intrinsics::GeneratorResumeKind::Return
                     }
@@ -9279,12 +9346,7 @@ impl Interpreter {
                         let pc = activation.pc();
                         runtime
                             .objects
-                            .async_generator_save_state(
-                                generator,
-                                saved_regs,
-                                pc,
-                                resume_reg,
-                            )
+                            .async_generator_save_state(generator, saved_regs, pc, resume_reg)
                             .map_err(|e| {
                                 VmNativeCallError::Internal(
                                     format!("async gen save state: {e:?}").into(),
@@ -9292,9 +9354,7 @@ impl Interpreter {
                             })?;
                         runtime.restore_module(previous_module);
                         // Dequeue front request and resolve with {value, done: false}.
-                        let _ = runtime
-                            .objects
-                            .async_generator_dequeue(generator);
+                        let _ = runtime.objects.async_generator_dequeue(generator);
                         async_generator_complete_step(
                             runtime,
                             request.promise,
@@ -9335,9 +9395,7 @@ impl Interpreter {
                             .objects
                             .set_async_generator_state(generator, GeneratorState::Completed);
                         runtime.restore_module(previous_module);
-                        let _ = runtime
-                            .objects
-                            .async_generator_dequeue(generator);
+                        let _ = runtime.objects.async_generator_dequeue(generator);
                         async_generator_complete_step(
                             runtime,
                             request.promise,
@@ -9355,9 +9413,7 @@ impl Interpreter {
                             .objects
                             .set_async_generator_state(generator, GeneratorState::Completed);
                         runtime.restore_module(previous_module);
-                        let _ = runtime
-                            .objects
-                            .async_generator_dequeue(generator);
+                        let _ = runtime.objects.async_generator_dequeue(generator);
                         if let Some(p) = runtime.objects.get_promise_mut(request.promise)
                             && p.is_pending()
                             && let Some(jobs) = p.reject(thrown)
@@ -9379,8 +9435,8 @@ impl Interpreter {
 
         let mut frame_runtime = FrameRuntimeState::new(function);
 
-        let mut inject_throw = matches!(resume_kind, AsyncGeneratorRequestKind::Throw)
-            && had_saved_registers;
+        let mut inject_throw =
+            matches!(resume_kind, AsyncGeneratorRequestKind::Throw) && had_saved_registers;
 
         loop {
             activation.begin_step();
@@ -9403,9 +9459,7 @@ impl Interpreter {
                 let _ = runtime
                     .objects
                     .set_async_generator_state(generator, GeneratorState::Completed);
-                let _ = runtime
-                    .objects
-                    .async_generator_dequeue(generator);
+                let _ = runtime.objects.async_generator_dequeue(generator);
                 if let Some(p) = runtime.objects.get_promise_mut(request.promise)
                     && p.is_pending()
                     && let Some(jobs) = p.reject(sent_value)
@@ -9438,9 +9492,7 @@ impl Interpreter {
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
+                    let _ = runtime.objects.async_generator_dequeue(generator);
                     if let Some(p) = runtime.objects.get_promise_mut(request.promise)
                         && p.is_pending()
                         && let Some(jobs) = p.reject(RegisterValue::undefined())
@@ -9470,15 +9522,8 @@ impl Interpreter {
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
-                    async_generator_complete_step(
-                        runtime,
-                        request.promise,
-                        return_value,
-                        true,
-                    )?;
+                    let _ = runtime.objects.async_generator_dequeue(generator);
+                    async_generator_complete_step(runtime, request.promise, return_value, true)?;
                     // Drain remaining requests since generator is now completed.
                     async_generator_drain_completed(generator, runtime)?;
                     return Ok(());
@@ -9492,9 +9537,7 @@ impl Interpreter {
                     let _ = runtime
                         .objects
                         .set_async_generator_state(generator, GeneratorState::Completed);
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
+                    let _ = runtime.objects.async_generator_dequeue(generator);
                     if let Some(p) = runtime.objects.get_promise_mut(request.promise)
                         && p.is_pending()
                         && let Some(jobs) = p.reject(value)
@@ -9520,9 +9563,7 @@ impl Interpreter {
                                 activation
                                     .set_register(await_resume_reg, result)
                                     .map_err(|e| {
-                                        VmNativeCallError::Internal(
-                                            format!("{e:?}").into(),
-                                        )
+                                        VmNativeCallError::Internal(format!("{e:?}").into())
                                     })?;
                                 continue;
                             }
@@ -9534,11 +9575,7 @@ impl Interpreter {
                                 if current_pc > 0 {
                                     activation.set_pc(current_pc - 1);
                                 }
-                                if interp.transfer_exception(
-                                    function,
-                                    &mut activation,
-                                    reason,
-                                ) {
+                                if interp.transfer_exception(function, &mut activation, reason) {
                                     continue;
                                 }
                                 // Uncaught — reject the front request.
@@ -9547,23 +9584,16 @@ impl Interpreter {
                                     generator,
                                     GeneratorState::Completed,
                                 );
-                                let _ = runtime
-                                    .objects
-                                    .async_generator_dequeue(generator);
-                                if let Some(p) =
-                                    runtime.objects.get_promise_mut(request.promise)
+                                let _ = runtime.objects.async_generator_dequeue(generator);
+                                if let Some(p) = runtime.objects.get_promise_mut(request.promise)
                                     && p.is_pending()
                                     && let Some(jobs) = p.reject(reason)
                                 {
                                     for job in jobs {
-                                        runtime
-                                            .microtasks_mut()
-                                            .enqueue_promise_job(job);
+                                        runtime.microtasks_mut().enqueue_promise_job(job);
                                     }
                                 }
-                                async_generator_drain_completed(
-                                    generator, runtime,
-                                )?;
+                                async_generator_drain_completed(generator, runtime)?;
                                 return Ok(());
                             }
                             crate::promise::PromiseState::Pending => {
@@ -9580,9 +9610,7 @@ impl Interpreter {
                                         await_resume_reg,
                                     )
                                     .map_err(|e| {
-                                        VmNativeCallError::Internal(
-                                            format!("{e:?}").into(),
-                                        )
+                                        VmNativeCallError::Internal(format!("{e:?}").into())
                                     })?;
                                 runtime.restore_module(previous_module);
                                 // TODO: Register promise reaction to resume.
@@ -9591,13 +9619,10 @@ impl Interpreter {
                         }
                     }
                     // Not a promise — treat as immediately resolved.
-                    let await_val =
-                        RegisterValue::from_object_handle(awaited_promise.0);
+                    let await_val = RegisterValue::from_object_handle(awaited_promise.0);
                     activation
                         .set_register(await_resume_reg, await_val)
-                        .map_err(|e| {
-                            VmNativeCallError::Internal(format!("{e:?}").into())
-                        })?;
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
                     continue;
                 }
                 StepOutcome::GeneratorYield {
@@ -9610,12 +9635,7 @@ impl Interpreter {
                     let pc = activation.pc();
                     runtime
                         .objects
-                        .async_generator_save_state(
-                            generator,
-                            saved_regs,
-                            pc,
-                            yield_resume_reg,
-                        )
+                        .async_generator_save_state(generator, saved_regs, pc, yield_resume_reg)
                         .map_err(|e| {
                             VmNativeCallError::Internal(
                                 format!("async gen save state: {e:?}").into(),
@@ -9623,23 +9643,15 @@ impl Interpreter {
                         })?;
                     // §14.4.4 — if YieldStar set a pending delegation, store it.
                     if let Some(inner_iter) = runtime.pending_delegation_iterator.take() {
-                        let _ = runtime.objects.set_generator_delegation_iterator(
-                            generator,
-                            Some(inner_iter),
-                        );
+                        let _ = runtime
+                            .objects
+                            .set_generator_delegation_iterator(generator, Some(inner_iter));
                     }
                     runtime.restore_module(previous_module);
 
                     // Dequeue the front request and resolve its promise.
-                    let _ = runtime
-                        .objects
-                        .async_generator_dequeue(generator);
-                    async_generator_complete_step(
-                        runtime,
-                        request.promise,
-                        yielded_value,
-                        false,
-                    )?;
+                    let _ = runtime.objects.async_generator_dequeue(generator);
+                    async_generator_complete_step(runtime, request.promise, yielded_value, false)?;
 
                     // If there are more queued requests, resume immediately.
                     let queue_empty = runtime

@@ -30,10 +30,7 @@ fn execute_test262_basic(source: &str, source_url: &str) -> RegisterValue {
 
 #[test]
 fn exponentiation_basic() {
-    execute_test262_basic(
-        "assert.sameValue(2 ** 10, 1024, '2 ** 10');",
-        "exp.js",
-    );
+    execute_test262_basic("assert.sameValue(2 ** 10, 1024, '2 ** 10');", "exp.js");
 }
 
 #[test]
@@ -282,10 +279,7 @@ fn delete_non_reference_returns_true() {
 #[test]
 fn delete_identifier_returns_true() {
     // In sloppy mode, `delete x` on a declared var — just verifies it doesn't crash.
-    execute_test262_basic(
-        "var x = 1; var result = delete x;",
-        "delete.js",
-    );
+    execute_test262_basic("var x = 1; var result = delete x;", "delete.js");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

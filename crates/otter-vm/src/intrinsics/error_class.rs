@@ -177,12 +177,9 @@ fn install_aggregate_error_class(
     function_prototype: ObjectHandle,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let descriptor = JsClassDescriptor::new("AggregateError")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "AggregateError",
-            2,
-            aggregate_error_constructor,
-        ));
+    let descriptor = JsClassDescriptor::new("AggregateError").with_constructor(
+        NativeFunctionDescriptor::constructor("AggregateError", 2, aggregate_error_constructor),
+    );
     let plan = ClassBuilder::from_descriptor(&descriptor)
         .expect("AggregateError class descriptor should normalize")
         .build();

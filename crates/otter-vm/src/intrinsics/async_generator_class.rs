@@ -142,12 +142,7 @@ fn async_generator_prototype_next(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
 
-    async_generator_enqueue_and_resume(
-        generator,
-        AsyncGeneratorRequestKind::Next,
-        value,
-        runtime,
-    )
+    async_generator_enqueue_and_resume(generator, AsyncGeneratorRequestKind::Next, value, runtime)
 }
 
 /// ES2024 §27.6.1.3 %AsyncGenerator.prototype%.return(value)
@@ -163,12 +158,7 @@ fn async_generator_prototype_return(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
 
-    async_generator_enqueue_and_resume(
-        generator,
-        AsyncGeneratorRequestKind::Return,
-        value,
-        runtime,
-    )
+    async_generator_enqueue_and_resume(generator, AsyncGeneratorRequestKind::Return, value, runtime)
 }
 
 /// ES2024 §27.6.1.4 %AsyncGenerator.prototype%.throw(exception)
@@ -268,8 +258,7 @@ pub(crate) fn async_generator_drain_completed(
         match request.kind {
             AsyncGeneratorRequestKind::Next => {
                 // {value: undefined, done: true}
-                let iter_result =
-                    runtime.create_iter_result(RegisterValue::undefined(), true)?;
+                let iter_result = runtime.create_iter_result(RegisterValue::undefined(), true)?;
                 resolve_promise(
                     runtime,
                     request.promise,
@@ -357,7 +346,9 @@ fn resolve_promise(
         .objects_mut()
         .get_promise_mut(promise)
         .ok_or_else(|| VmNativeCallError::Internal("not a promise".into()))?;
-    if p.is_pending() && let Some(jobs) = p.fulfill(value) {
+    if p.is_pending()
+        && let Some(jobs) = p.fulfill(value)
+    {
         for job in jobs {
             runtime.microtasks_mut().enqueue_promise_job(job);
         }
@@ -375,7 +366,9 @@ fn reject_promise(
         .objects_mut()
         .get_promise_mut(promise)
         .ok_or_else(|| VmNativeCallError::Internal("not a promise".into()))?;
-    if p.is_pending() && let Some(jobs) = p.reject(reason) {
+    if p.is_pending()
+        && let Some(jobs) = p.reject(reason)
+    {
         for job in jobs {
             runtime.microtasks_mut().enqueue_promise_job(job);
         }

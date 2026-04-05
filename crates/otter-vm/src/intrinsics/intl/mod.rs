@@ -8,6 +8,8 @@
 
 pub mod collator;
 pub mod date_time_format;
+pub mod display_names;
+pub mod list_format;
 pub mod locale;
 pub mod locale_utils;
 pub mod number_format;
@@ -15,6 +17,8 @@ pub mod options_utils;
 #[allow(dead_code)]
 pub mod payload;
 pub mod plural_rules;
+pub mod relative_time_format;
+pub mod segmenter;
 
 use crate::builders::ClassBuilder;
 use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
@@ -95,6 +99,121 @@ impl IntrinsicInstaller for IntlIntrinsic {
             cx,
         )?;
 
+        // Intl.ListFormat (ECMA-402 &sect;13)
+        install_intl_class(
+            intrinsics.intl_list_format_prototype,
+            &mut intrinsics.intl_list_format_constructor,
+            &list_format::list_format_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // Intl.Segmenter (ECMA-402 &sect;18)
+        install_intl_class(
+            intrinsics.intl_segmenter_prototype,
+            &mut intrinsics.intl_segmenter_constructor,
+            &segmenter::segmenter_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // %Segments%.prototype (§18.5.2) — containing() + [Symbol.iterator]()
+        for desc in segmenter::segments_prototype_methods() {
+            install_namespace_method(
+                intrinsics.intl_segments_prototype,
+                desc,
+                intrinsics.function_prototype,
+                cx,
+            )?;
+        }
+        // [Symbol.iterator]() on Segments prototype
+        {
+            let iter_sym = cx
+                .property_names
+                .intern_symbol(WellKnownSymbol::Iterator.stable_id());
+            let desc = NativeFunctionDescriptor::method(
+                "[Symbol.iterator]",
+                0,
+                segmenter::segments_symbol_iterator,
+            );
+            let host_id = cx.native_functions.register(desc);
+            let handle = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+            cx.heap.define_own_property(
+                intrinsics.intl_segments_prototype,
+                iter_sym,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_object_handle(handle.0),
+                    PropertyAttributes::from_flags(true, false, true),
+                ),
+            )?;
+        }
+
+        // %SegmentIterator%.prototype (§18.6.2) — next()
+        for desc in segmenter::segment_iterator_prototype_methods() {
+            install_namespace_method(
+                intrinsics.intl_segment_iterator_prototype,
+                desc,
+                intrinsics.function_prototype,
+                cx,
+            )?;
+        }
+        // [Symbol.iterator]() on SegmentIterator prototype — returns `this`
+        {
+            let iter_sym = cx
+                .property_names
+                .intern_symbol(WellKnownSymbol::Iterator.stable_id());
+            let desc = NativeFunctionDescriptor::method(
+                "[Symbol.iterator]",
+                0,
+                segment_iterator_return_self,
+            );
+            let host_id = cx.native_functions.register(desc);
+            let handle = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+            cx.heap.define_own_property(
+                intrinsics.intl_segment_iterator_prototype,
+                iter_sym,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_object_handle(handle.0),
+                    PropertyAttributes::from_flags(true, false, true),
+                ),
+            )?;
+        }
+        // @@toStringTag on SegmentIterator prototype
+        install_to_string_tag(
+            intrinsics.intl_segment_iterator_prototype,
+            "Segmenter String Iterator",
+            cx,
+        )?;
+
+        // Intl.DisplayNames (ECMA-402 &sect;12)
+        install_intl_class(
+            intrinsics.intl_display_names_prototype,
+            &mut intrinsics.intl_display_names_constructor,
+            &display_names::display_names_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // Intl.RelativeTimeFormat (ECMA-402 &sect;17)
+        install_intl_class(
+            intrinsics.intl_relative_time_format_prototype,
+            &mut intrinsics.intl_relative_time_format_constructor,
+            &relative_time_format::relative_time_format_class_descriptor(),
+            intrinsics.function_prototype,
+            cx,
+        )?;
+
+        // @@toStringTag on each Intl type prototype.
+        install_to_string_tag(intrinsics.intl_collator_prototype, "Intl.Collator", cx)?;
+        install_to_string_tag(intrinsics.intl_number_format_prototype, "Intl.NumberFormat", cx)?;
+        install_to_string_tag(intrinsics.intl_plural_rules_prototype, "Intl.PluralRules", cx)?;
+        install_to_string_tag(intrinsics.intl_locale_prototype, "Intl.Locale", cx)?;
+        install_to_string_tag(intrinsics.intl_date_time_format_prototype, "Intl.DateTimeFormat", cx)?;
+        install_to_string_tag(intrinsics.intl_list_format_prototype, "Intl.ListFormat", cx)?;
+        install_to_string_tag(intrinsics.intl_segmenter_prototype, "Intl.Segmenter", cx)?;
+        install_to_string_tag(intrinsics.intl_display_names_prototype, "Intl.DisplayNames", cx)?;
+        install_to_string_tag(intrinsics.intl_relative_time_format_prototype, "Intl.RelativeTimeFormat", cx)?;
+
         // Intl.getCanonicalLocales (&sect;8.3.1)
         install_namespace_method(
             intrinsics.intl_namespace,
@@ -130,9 +249,35 @@ impl IntrinsicInstaller for IntlIntrinsic {
         install_on_namespace(intrinsics.intl_namespace, "PluralRules", intrinsics.intl_plural_rules_constructor, cx)?;
         install_on_namespace(intrinsics.intl_namespace, "Locale", intrinsics.intl_locale_constructor, cx)?;
         install_on_namespace(intrinsics.intl_namespace, "DateTimeFormat", intrinsics.intl_date_time_format_constructor, cx)?;
+        install_on_namespace(intrinsics.intl_namespace, "ListFormat", intrinsics.intl_list_format_constructor, cx)?;
+        install_on_namespace(intrinsics.intl_namespace, "Segmenter", intrinsics.intl_segmenter_constructor, cx)?;
+        install_on_namespace(intrinsics.intl_namespace, "DisplayNames", intrinsics.intl_display_names_constructor, cx)?;
+        install_on_namespace(intrinsics.intl_namespace, "RelativeTimeFormat", intrinsics.intl_relative_time_format_constructor, cx)?;
 
         Ok(())
     }
+}
+
+// ── @@toStringTag installation helper ──────────────────────────────
+
+fn install_to_string_tag(
+    prototype: ObjectHandle,
+    tag: &str,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let tag_symbol = cx
+        .property_names
+        .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
+    let tag_str = cx.heap.alloc_string(tag);
+    cx.heap.define_own_property(
+        prototype,
+        tag_symbol,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(tag_str.0),
+            PropertyAttributes::from_flags(false, false, true),
+        ),
+    )?;
+    Ok(())
 }
 
 // ── Namespace method installation helper ───────────────────────────
@@ -200,6 +345,16 @@ fn install_on_namespace(
         ),
     )?;
     Ok(())
+}
+
+// ── SegmentIterator [Symbol.iterator]() → returns `this` ─────────
+
+fn segment_iterator_return_self(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    Ok(*this)
 }
 
 // ═══════════════════════════════════════════════════════════════════

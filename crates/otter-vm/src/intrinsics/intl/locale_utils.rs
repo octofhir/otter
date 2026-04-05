@@ -622,6 +622,149 @@ pub fn is_well_formed_unit_identifier(unit: &str) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Locale query helpers for Intl.Locale.prototype.getTimeZones / getTextInfo
+// ═══════════════════════════════════════════════════════════════════
+
+/// Returns representative IANA time zones for a given ISO 3166-1 alpha-2 region code.
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.gettimezones>
+pub fn time_zones_for_region(region: &str) -> Vec<&'static str> {
+    match region {
+        "US" => vec![
+            "America/Adak", "America/Anchorage", "America/Chicago",
+            "America/Denver", "America/Los_Angeles", "America/New_York",
+            "America/Phoenix", "Pacific/Honolulu",
+        ],
+        "GB" => vec!["Europe/London"],
+        "DE" => vec!["Europe/Berlin"],
+        "FR" => vec!["Europe/Paris"],
+        "JP" => vec!["Asia/Tokyo"],
+        "CN" => vec!["Asia/Shanghai"],
+        "IN" => vec!["Asia/Kolkata"],
+        "AU" => vec![
+            "Australia/Adelaide", "Australia/Brisbane", "Australia/Darwin",
+            "Australia/Hobart", "Australia/Lord_Howe", "Australia/Perth",
+            "Australia/Sydney",
+        ],
+        "BR" => vec![
+            "America/Belem", "America/Fortaleza", "America/Manaus",
+            "America/Noronha", "America/Sao_Paulo",
+        ],
+        "CA" => vec![
+            "America/Edmonton", "America/Halifax", "America/Regina",
+            "America/St_Johns", "America/Toronto", "America/Vancouver",
+            "America/Winnipeg",
+        ],
+        "RU" => vec![
+            "Asia/Kamchatka", "Asia/Magadan", "Asia/Vladivostok",
+            "Asia/Yekaterinburg", "Europe/Moscow",
+        ],
+        "MX" => vec![
+            "America/Cancun", "America/Chihuahua", "America/Hermosillo",
+            "America/Mexico_City", "America/Tijuana",
+        ],
+        "KR" => vec!["Asia/Seoul"],
+        "IT" => vec!["Europe/Rome"],
+        "ES" => vec!["Atlantic/Canary", "Europe/Madrid"],
+        "NZ" => vec!["Pacific/Auckland", "Pacific/Chatham"],
+        "SG" => vec!["Asia/Singapore"],
+        "HK" => vec!["Asia/Hong_Kong"],
+        "TW" => vec!["Asia/Taipei"],
+        "TH" => vec!["Asia/Bangkok"],
+        "PH" => vec!["Asia/Manila"],
+        "ID" => vec!["Asia/Jakarta", "Asia/Jayapura", "Asia/Makassar"],
+        "IL" => vec!["Asia/Jerusalem"],
+        "EG" => vec!["Africa/Cairo"],
+        "ZA" => vec!["Africa/Johannesburg"],
+        "NG" => vec!["Africa/Lagos"],
+        "KE" => vec!["Africa/Nairobi"],
+        "AE" => vec!["Asia/Dubai"],
+        "SA" => vec!["Asia/Riyadh"],
+        "TR" => vec!["Europe/Istanbul"],
+        "PL" => vec!["Europe/Warsaw"],
+        "SE" => vec!["Europe/Stockholm"],
+        "NO" => vec!["Europe/Oslo"],
+        "FI" => vec!["Europe/Helsinki"],
+        "DK" => vec!["Europe/Copenhagen"],
+        "NL" => vec!["Europe/Amsterdam"],
+        "BE" => vec!["Europe/Brussels"],
+        "AT" => vec!["Europe/Vienna"],
+        "CH" => vec!["Europe/Zurich"],
+        "PT" => vec!["Atlantic/Azores", "Europe/Lisbon"],
+        "GR" => vec!["Europe/Athens"],
+        "IE" => vec!["Europe/Dublin"],
+        "CZ" => vec!["Europe/Prague"],
+        "RO" => vec!["Europe/Bucharest"],
+        "UA" => vec!["Europe/Kyiv"],
+        "AR" => vec!["America/Argentina/Buenos_Aires"],
+        "CL" => vec!["America/Santiago", "Pacific/Easter"],
+        "CO" => vec!["America/Bogota"],
+        "PE" => vec!["America/Lima"],
+        _ => vec![],
+    }
+}
+
+/// Returns whether the given language subtag writes right-to-left.
+/// Used for `Intl.Locale.prototype.getTextInfo()`.
+pub fn is_rtl_language(lang: &str) -> bool {
+    matches!(
+        lang,
+        "ar" | "arc" | "arz" | "bcc" | "bqi" | "ckb" | "dv" | "fa" | "glk"
+            | "he" | "ku" | "mzn" | "nqo" | "pnb" | "ps" | "sd" | "ug" | "ur" | "yi"
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §14.3.17 Week info data
+//  CLDR: <https://unicode.org/reports/tr35/tr35-dates.html#Week_Data>
+// ═══════════════════════════════════════════════════════════════════
+
+/// Returns `(firstDay, weekend, minimalDays)` for a given ISO 3166-1 region.
+///
+/// - `firstDay`: 1=Monday … 7=Sunday (ISO 8601 numbering).
+/// - `weekend`: array of weekend day numbers.
+/// - `minimalDays`: minimum days in first week of year.
+///
+/// Data from CLDR supplemental/weekData.
+pub fn week_info_for_region(region: &str) -> (i32, Vec<i32>, i32) {
+    let first_day = match region {
+        // Sunday=7 regions (most of the Americas, East Asia, etc.)
+        "US" | "CA" | "MX" | "BR" | "JP" | "KR" | "TW" | "CN" | "AU" | "NZ" | "PH" | "TH"
+        | "CO" | "DO" | "GT" | "HN" | "NI" | "PA" | "PE" | "PR" | "SV" | "VE" | "ZA"
+        | "IL" | "SA" | "AE" | "BH" | "KW" | "OM" | "QA" | "JO" | "SY" | "IQ" | "IN"
+        | "BD" | "PK" | "HK" | "SG" | "ID" | "MY" | "LA" | "KH" | "MM" | "NP" | "BT"
+        | "LK" | "ET" | "KE" | "NG" | "GH" | "ZW" | "MZ" | "UG" | "AG" | "BS" | "BZ"
+        | "DM" | "GD" | "GY" | "HT" | "JM" | "KN" | "LC" | "TT" | "VC" | "VI" | "WS"
+        | "AS" | "GU" | "MH" | "MP" | "UM" | "YE" => 7,
+        // Saturday=6 regions
+        "AF" | "DZ" | "BN" | "DJ" | "EG" | "IR" | "LY" | "SD" => 6,
+        // Friday=5 regions
+        "MV" => 5,
+        // Monday=1: most of Europe, Russia, most of Africa, etc.
+        _ => 1,
+    };
+
+    let weekend = match region {
+        // Friday-Saturday weekend
+        "AF" | "DZ" | "BH" | "DJ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "MV"
+        | "OM" | "QA" | "SA" | "SD" | "SY" | "AE" | "YE" | "BN" => vec![5, 6],
+        // Most regions: Saturday-Sunday
+        _ => vec![6, 7],
+    };
+
+    let minimal_days = match region {
+        // ISO 8601 regions: 4 minimal days
+        "AT" | "BE" | "BG" | "CH" | "CZ" | "DE" | "DK" | "EE" | "ES" | "FI" | "FR" | "GB"
+        | "GR" | "HR" | "HU" | "IE" | "IS" | "IT" | "LI" | "LT" | "LU" | "LV" | "MC"
+        | "ME" | "MK" | "NL" | "NO" | "PL" | "PT" | "RO" | "RS" | "RU" | "SE" | "SI"
+        | "SK" | "SM" | "UA" | "VA" => 4,
+        // Most other regions: 1
+        _ => 1,
+    };
+
+    (first_day, weekend, minimal_days)
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Unit tests
 // ═══════════════════════════════════════════════════════════════════
 

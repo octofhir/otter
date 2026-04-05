@@ -12,7 +12,7 @@ use crate::descriptors::{
 use crate::value::RegisterValue;
 
 use super::locale_utils;
-use super::options_utils::get_option_string;
+use super::options_utils::{get_option_bool, get_option_string};
 use super::payload::{self, IntlPayload, LocaleData};
 
 // ═══════════════════════════════════════════════════════════════════
@@ -38,34 +38,74 @@ pub fn locale_class_descriptor() -> JsClassDescriptor {
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("minimize", 0, locale_minimize),
         ))
-        // Accessors implemented as getter methods.
+        // §14.3.3-14.3.12 Accessor getter properties (spec: get Intl.Locale.prototype.X)
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("language", 0, locale_language_getter),
+            NativeFunctionDescriptor::getter("language", locale_language_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("script", 0, locale_script_getter),
+            NativeFunctionDescriptor::getter("script", locale_script_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("region", 0, locale_region_getter),
+            NativeFunctionDescriptor::getter("region", locale_region_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("baseName", 0, locale_base_name_getter),
+            NativeFunctionDescriptor::getter("baseName", locale_base_name_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("calendar", 0, locale_calendar_getter),
+            NativeFunctionDescriptor::getter("calendar", locale_calendar_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("collation", 0, locale_collation_getter),
+            NativeFunctionDescriptor::getter("collation", locale_collation_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("numberingSystem", 0, locale_numbering_system_getter),
+            NativeFunctionDescriptor::getter("numberingSystem", locale_numbering_system_getter),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::getter("hourCycle", locale_hour_cycle_getter),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::getter("caseFirst", locale_case_first_getter),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::getter("numeric", locale_numeric_getter),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getCalendars", 0, locale_get_calendars),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getCollations", 0, locale_get_collations),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getHourCycles", 0, locale_get_hour_cycles),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getNumberingSystems", 0, locale_get_numbering_systems),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getTimeZones", 0, locale_get_time_zones),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getTextInfo", 0, locale_get_text_info),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("getWeekInfo", 0, locale_get_week_info),
         ))
 }
 
@@ -98,6 +138,9 @@ fn locale_constructor(
     let calendar = get_option_string(options_arg, "calendar", runtime)?;
     let collation = get_option_string(options_arg, "collation", runtime)?;
     let numbering_system = get_option_string(options_arg, "numberingSystem", runtime)?;
+    let hour_cycle = get_option_string(options_arg, "hourCycle", runtime)?;
+    let case_first = get_option_string(options_arg, "caseFirst", runtime)?;
+    let numeric = get_option_bool(options_arg, "numeric", runtime)?;
 
     // Build locale tag with options applied as -u- extension keywords.
     let locale_str = apply_unicode_extensions(&canonical, &calendar, &collation, &numbering_system);
@@ -107,6 +150,9 @@ fn locale_constructor(
         calendar,
         collation,
         numbering_system,
+        hour_cycle,
+        case_first,
+        numeric,
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
@@ -156,6 +202,9 @@ fn locale_maximize(
         calendar: data.calendar.clone(),
         collation: data.collation.clone(),
         numbering_system: data.numbering_system.clone(),
+        hour_cycle: data.hour_cycle.clone(),
+        case_first: data.case_first.clone(),
+        numeric: data.numeric,
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
@@ -188,6 +237,9 @@ fn locale_minimize(
         calendar: data.calendar.clone(),
         collation: data.collation.clone(),
         numbering_system: data.numbering_system.clone(),
+        hour_cycle: data.hour_cycle.clone(),
+        case_first: data.case_first.clone(),
+        numeric: data.numeric,
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
@@ -301,6 +353,251 @@ fn locale_numbering_system_getter(
         }
         None => Ok(RegisterValue::undefined()),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §14.3.8-10 Additional accessor getters
+// ═══════════════════════════════════════════════════════════════════
+
+fn locale_hour_cycle_getter(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?;
+    let hc = data.hour_cycle.clone();
+    match hc {
+        Some(h) => {
+            let handle = runtime.alloc_string(h);
+            Ok(RegisterValue::from_object_handle(handle.0))
+        }
+        None => Ok(RegisterValue::undefined()),
+    }
+}
+
+fn locale_case_first_getter(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?;
+    let cf = data.case_first.clone();
+    match cf {
+        Some(c) => {
+            let handle = runtime.alloc_string(c);
+            Ok(RegisterValue::from_object_handle(handle.0))
+        }
+        None => Ok(RegisterValue::undefined()),
+    }
+}
+
+fn locale_numeric_getter(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?;
+    match data.numeric {
+        Some(b) => Ok(RegisterValue::from_bool(b)),
+        None => Ok(RegisterValue::from_bool(false)),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §14.3.11-16 Query methods (getCalendars, getCollations, etc.)
+// ═══════════════════════════════════════════════════════════════════
+
+/// §14.3.11 Intl.Locale.prototype.getCalendars()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.getcalendars>
+fn locale_get_calendars(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let items: Vec<String> = if let Some(ca) = &data.calendar {
+        vec![ca.clone()]
+    } else {
+        vec!["gregory".to_string()]
+    };
+    alloc_owned_string_array(runtime, &items)
+}
+
+/// §14.3.12 Intl.Locale.prototype.getCollations()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.getcollations>
+fn locale_get_collations(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let items: Vec<String> = if let Some(co) = &data.collation {
+        vec![co.clone()]
+    } else {
+        vec!["default".to_string()]
+    };
+    alloc_owned_string_array(runtime, &items)
+}
+
+/// §14.3.13 Intl.Locale.prototype.getHourCycles()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.gethourcycles>
+fn locale_get_hour_cycles(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let items: Vec<String> = if let Some(hc) = &data.hour_cycle {
+        vec![hc.clone()]
+    } else {
+        let lang = data.locale.split('-').next().unwrap_or("en");
+        match lang {
+            "en" | "ko" | "hi" | "bn" => vec!["h12".to_string()],
+            _ => vec!["h23".to_string()],
+        }
+    };
+    alloc_owned_string_array(runtime, &items)
+}
+
+/// §14.3.14 Intl.Locale.prototype.getNumberingSystems()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.getnumberingsystems>
+fn locale_get_numbering_systems(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let items: Vec<String> = if let Some(ns) = &data.numbering_system {
+        vec![ns.clone()]
+    } else {
+        vec!["latn".to_string()]
+    };
+    alloc_owned_string_array(runtime, &items)
+}
+
+/// §14.3.15 Intl.Locale.prototype.getTimeZones()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.gettimezones>
+///
+/// Returns an array of representative time zones for the locale's region.
+/// If no region, returns undefined.
+fn locale_get_time_zones(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let region = extract_subtag_region(&data.locale).map(str::to_string);
+    match region {
+        None => Ok(RegisterValue::undefined()),
+        Some(r) => {
+            let tzs = locale_utils::time_zones_for_region(&r);
+            alloc_string_array(runtime, &tzs)
+        }
+    }
+}
+
+/// §14.3.16 Intl.Locale.prototype.getTextInfo()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.gettextinfo>
+///
+/// Returns `{ direction: "ltr" | "rtl" }`.
+fn locale_get_text_info(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let lang = data.locale.split('-').next().unwrap_or("en").to_string();
+    let direction = if locale_utils::is_rtl_language(&lang) { "rtl" } else { "ltr" };
+
+    let obj = runtime.alloc_object();
+    let prop = runtime.intern_property_name("direction");
+    let s = runtime.alloc_string(direction);
+    let _ = runtime.objects_mut().set_property(
+        obj,
+        prop,
+        RegisterValue::from_object_handle(s.0),
+    );
+    Ok(RegisterValue::from_object_handle(obj.0))
+}
+
+/// §14.3.17 Intl.Locale.prototype.getWeekInfo()
+/// Spec: <https://tc39.es/ecma402/#sec-intl.locale.prototype.getweekinfo>
+///
+/// Returns `{ firstDay, weekend, minimalDays }`.
+fn locale_get_week_info(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_locale_data(this, runtime)?.clone();
+    let region = extract_subtag_region(&data.locale)
+        .unwrap_or("US")
+        .to_uppercase();
+
+    let (first_day, weekend, minimal_days) = locale_utils::week_info_for_region(&region);
+
+    let obj = runtime.alloc_object();
+
+    // firstDay: 1=Monday … 7=Sunday
+    let prop_first = runtime.intern_property_name("firstDay");
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop_first, RegisterValue::from_i32(first_day));
+
+    // weekend: array of day numbers
+    let weekend_arr = runtime.alloc_array();
+    for &day in &weekend {
+        runtime
+            .objects_mut()
+            .push_element(weekend_arr, RegisterValue::from_i32(day))
+            .map_err(|e| VmNativeCallError::Internal(format!("Locale: {e:?}").into()))?;
+    }
+    let prop_weekend = runtime.intern_property_name("weekend");
+    let _ = runtime.objects_mut().set_property(
+        obj,
+        prop_weekend,
+        RegisterValue::from_object_handle(weekend_arr.0),
+    );
+
+    // minimalDays: 1-7
+    let prop_minimal = runtime.intern_property_name("minimalDays");
+    let _ = runtime
+        .objects_mut()
+        .set_property(obj, prop_minimal, RegisterValue::from_i32(minimal_days));
+
+    Ok(RegisterValue::from_object_handle(obj.0))
+}
+
+/// Helper: allocate a JS array of string slices.
+fn alloc_string_array(
+    runtime: &mut crate::interpreter::RuntimeState,
+    items: &[&str],
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arr = runtime.alloc_array();
+    for &item in items {
+        let s = runtime.alloc_string(item);
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(s.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("Locale: {e:?}").into()))?;
+    }
+    Ok(RegisterValue::from_object_handle(arr.0))
+}
+
+/// Helper: allocate a JS array of owned strings.
+fn alloc_owned_string_array(
+    runtime: &mut crate::interpreter::RuntimeState,
+    items: &[String],
+) -> Result<RegisterValue, VmNativeCallError> {
+    let arr = runtime.alloc_array();
+    for item in items {
+        let s = runtime.alloc_string(item.as_str());
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(s.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("Locale: {e:?}").into()))?;
+    }
+    Ok(RegisterValue::from_object_handle(arr.0))
 }
 
 // ═══════════════════════════════════════════════════════════════════

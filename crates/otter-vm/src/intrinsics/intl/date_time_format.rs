@@ -18,6 +18,7 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
+use crate::object::{ObjectHandle, PropertyAttributes, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::locale_utils;
@@ -35,9 +36,10 @@ pub fn date_time_format_class_descriptor() -> JsClassDescriptor {
             0,
             date_time_format_constructor,
         ))
+        // §12.5.3 — `format` is a getter that returns a bound function.
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("format", 1, date_time_format_format),
+            NativeFunctionDescriptor::getter("format", date_time_format_format_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -45,6 +47,18 @@ pub fn date_time_format_class_descriptor() -> JsClassDescriptor {
                 "formatToParts",
                 1,
                 date_time_format_format_to_parts,
+            ),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("formatRange", 2, date_time_format_format_range),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method(
+                "formatRangeToParts",
+                2,
+                date_time_format_format_range_to_parts,
             ),
         ))
         .with_binding(NativeBindingDescriptor::new(
@@ -87,25 +101,83 @@ fn date_time_format_constructor(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  §12.5.5 Intl.DateTimeFormat.prototype.format(date)
+//  §12.5.3 get Intl.DateTimeFormat.prototype.format
 // ═══════════════════════════════════════════════════════════════════
 
-/// §12.5.5 format(date)
+/// §12.5.3 get Intl.DateTimeFormat.prototype.format
+///
+/// Returns a bound format function. Cached on the instance as `__boundFormat`.
 ///
 /// Spec: <https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.format>
-fn date_time_format_format(
+fn date_time_format_format_getter(
     this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("DateTimeFormat.format getter: expected object".into())
+    })?;
+
+    let cache_prop = runtime.intern_property_name("__boundFormat");
+    let cached = runtime.own_property_value(handle, cache_prop).map_err(dtf_interp_err)?;
+    if cached != RegisterValue::undefined() && cached.as_object_handle().is_some() {
+        return Ok(cached);
+    }
+
+    let desc = NativeFunctionDescriptor::method("format", 1, bound_dtf_format);
+    let fn_id = runtime.register_native_function(desc);
+    let fn_proto = runtime.intrinsics().function_prototype();
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
+    let _ = runtime.objects_mut().set_prototype(bound_fn, Some(fn_proto));
+
+    let dtf_prop = runtime.intern_property_name("__dateTimeFormat__");
+    runtime.objects_mut().define_own_property(
+        bound_fn,
+        dtf_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(handle.0),
+            PropertyAttributes::from_flags(false, false, false),
+        ),
+    ).map_err(dtf_interp_err)?;
+
+    let bound_val = RegisterValue::from_object_handle(bound_fn.0);
+    runtime.objects_mut().define_own_property(
+        handle,
+        cache_prop,
+        PropertyValue::data_with_attrs(bound_val, PropertyAttributes::from_flags(false, false, false)),
+    ).map_err(dtf_interp_err)?;
+
+    Ok(bound_val)
+}
+
+/// Bound format function for DateTimeFormat.
+fn bound_dtf_format(
+    _this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let data = require_dtf_data(this, runtime)?.clone();
+    let fn_handle = runtime.current_native_callee().ok_or_else(|| {
+        VmNativeCallError::Internal("bound format: no callee".into())
+    })?;
+    let dtf_prop = runtime.intern_property_name("__dateTimeFormat__");
+    let dtf_val = runtime.own_property_value(fn_handle, dtf_prop).map_err(dtf_interp_err)?;
+    let dtf_rv = RegisterValue::from_object_handle(
+        dtf_val.as_object_handle().ok_or_else(|| {
+            VmNativeCallError::Internal("bound format: missing __dateTimeFormat__".into())
+        })?,
+    );
 
+    let data = require_dtf_data(&dtf_rv, runtime)?.clone();
     let date_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
     let timestamp_ms = resolve_date_value(date_val, runtime)?;
 
     let formatted = format_date_time(timestamp_ms, &data)?;
     let handle = runtime.alloc_string(formatted);
     Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+fn dtf_interp_err(e: impl std::fmt::Debug) -> VmNativeCallError {
+    VmNativeCallError::Internal(format!("{e:?}").into())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -146,6 +218,153 @@ fn date_time_format_format_to_parts(
     }
 
     Ok(RegisterValue::from_object_handle(arr.0))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §12.5.8 Intl.DateTimeFormat.prototype.formatRange(startDate, endDate)
+// ═══════════════════════════════════════════════════════════════════
+
+/// §12.5.8 Intl.DateTimeFormat.prototype.formatRange(startDate, endDate)
+///
+/// Spec: <https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.formatrange>
+fn date_time_format_format_range(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_dtf_data(this, runtime)?.clone();
+
+    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+
+    if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
+        return Err(type_error(runtime, "startDate and endDate must be provided to formatRange"));
+    }
+
+    let start_ms = resolve_date_value(start_val, runtime)?;
+    let end_ms = resolve_date_value(end_val, runtime)?;
+
+    let start_str = format_date_time(start_ms, &data)?;
+    let end_str = format_date_time(end_ms, &data)?;
+
+    let result = if start_str == end_str {
+        start_str
+    } else {
+        format!("{start_str} \u{2013} {end_str}")
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §12.5.9 Intl.DateTimeFormat.prototype.formatRangeToParts(startDate, endDate)
+// ═══════════════════════════════════════════════════════════════════
+
+/// §12.5.9 Intl.DateTimeFormat.prototype.formatRangeToParts(startDate, endDate)
+///
+/// Spec: <https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.formatrangetoparts>
+fn date_time_format_format_range_to_parts(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_dtf_data(this, runtime)?.clone();
+
+    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+
+    if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
+        return Err(type_error(runtime, "startDate and endDate must be provided to formatRangeToParts"));
+    }
+
+    let start_ms = resolve_date_value(start_val, runtime)?;
+    let end_ms = resolve_date_value(end_val, runtime)?;
+
+    let start_str = format_date_time(start_ms, &data)?;
+    let end_str = format_date_time(end_ms, &data)?;
+
+    let arr = runtime.alloc_array();
+
+    // Start date parts (source: "startRange").
+    let start_parts = decompose_date_parts(&start_str);
+    for (part_type, part_value) in &start_parts {
+        let obj = runtime.alloc_object();
+        set_dtf_string_prop(runtime, obj, "type", part_type);
+        set_dtf_string_prop(runtime, obj, "value", part_value);
+        set_dtf_string_prop(runtime, obj, "source", "startRange");
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(obj.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+    }
+
+    // Literal range separator.
+    let sep_obj = runtime.alloc_object();
+    set_dtf_string_prop(runtime, sep_obj, "type", "literal");
+    set_dtf_string_prop(runtime, sep_obj, "value", " \u{2013} ");
+    set_dtf_string_prop(runtime, sep_obj, "source", "shared");
+    runtime
+        .objects_mut()
+        .push_element(arr, RegisterValue::from_object_handle(sep_obj.0))
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+
+    // End date parts (source: "endRange").
+    let end_parts = decompose_date_parts(&end_str);
+    for (part_type, part_value) in &end_parts {
+        let obj = runtime.alloc_object();
+        set_dtf_string_prop(runtime, obj, "type", part_type);
+        set_dtf_string_prop(runtime, obj, "value", part_value);
+        set_dtf_string_prop(runtime, obj, "source", "endRange");
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(obj.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+    }
+
+    Ok(RegisterValue::from_object_handle(arr.0))
+}
+
+fn set_dtf_string_prop(
+    runtime: &mut crate::interpreter::RuntimeState,
+    obj: crate::object::ObjectHandle,
+    name: &str,
+    value: &str,
+) {
+    let prop = runtime.intern_property_name(name);
+    let s = runtime.alloc_string(value);
+    let _ = runtime.objects_mut().set_property(obj, prop, RegisterValue::from_object_handle(s.0));
+}
+
+/// Simplified decomposition of a formatted date/time string into parts.
+///
+/// Classifies characters into digit, literal, and dayPeriod categories.
+fn decompose_date_parts(formatted: &str) -> Vec<(&'static str, String)> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut current_type: &str = "literal";
+
+    for ch in formatted.chars() {
+        let ch_type = classify_dtf_char(ch);
+        if ch_type != current_type && !current.is_empty() {
+            parts.push((current_type, current.clone()));
+            current.clear();
+        }
+        current_type = ch_type;
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        parts.push((current_type, current));
+    }
+    parts
+}
+
+fn classify_dtf_char(ch: char) -> &'static str {
+    if ch.is_ascii_digit() {
+        "integer"
+    } else {
+        "literal"
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -636,5 +855,15 @@ fn range_error(
     match runtime.alloc_range_error(message) {
         Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
         Err(e) => VmNativeCallError::Internal(format!("RangeError alloc: {e}").into()),
+    }
+}
+
+fn type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> VmNativeCallError {
+    match runtime.alloc_type_error(message) {
+        Ok(err) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(err.0)),
+        Err(e) => VmNativeCallError::Internal(format!("TypeError alloc: {e}").into()),
     }
 }

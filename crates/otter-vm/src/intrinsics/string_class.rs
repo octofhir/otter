@@ -140,6 +140,8 @@ fn string_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("replaceAll", 2, string_replace_all))
         .with_binding(proto("normalize", 0, string_normalize))
         .with_binding(proto("localeCompare", 1, string_locale_compare))
+        .with_binding(proto("toLocaleLowerCase", 0, string_to_locale_lower_case))
+        .with_binding(proto("toLocaleUpperCase", 0, string_to_locale_upper_case))
 }
 
 fn string_constructor(
@@ -1292,13 +1294,19 @@ fn string_normalize(
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
-// ── §22.1.3.11 String.prototype.localeCompare(that) ────────────────────────
+// ── §22.1.3.11 String.prototype.localeCompare(that [, locales [, options]]) ──
+//
+// ECMA-402 §18.1.1: <https://tc39.es/ecma402/#sup-string.prototype.localecompare>
 
 fn string_locale_compare(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    use icu_collator::{Collator, CollatorPreferences};
+    use icu_locale::Locale;
+    use std::str::FromStr;
+
     let s = this_string_value(this, runtime)?;
     let that = args
         .first()
@@ -1310,13 +1318,119 @@ fn string_locale_compare(
         })
         .transpose()?
         .unwrap_or_else(|| "undefined".into());
-    let cmp = s.cmp(&that);
+
+    // Try to resolve locale from args[1] if provided.
+    let locale_str = args
+        .get(1)
+        .filter(|v| **v != RegisterValue::undefined())
+        .map(|v| {
+            runtime
+                .js_to_string(*v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
+        .transpose()?;
+
+    let locale = locale_str
+        .as_deref()
+        .and_then(|s| Locale::from_str(s).ok())
+        .unwrap_or_else(|| Locale::from_str("en-US").expect("en-US parses"));
+    let prefs = CollatorPreferences::from(&locale);
+
+    let collator = Collator::try_new(prefs, Default::default())
+        .unwrap_or_else(|_| Collator::try_new(Default::default(), Default::default()).unwrap());
+
+    let cmp = collator.compare(&s, &that);
     let result = match cmp {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
     Ok(RegisterValue::from_i32(result))
+}
+
+// ── §22.1.3.22 String.prototype.toLocaleLowerCase([locale]) ──────────────
+//
+// ECMA-402 §18.1.2: <https://tc39.es/ecma402/#sup-string.prototype.tolocalelowercase>
+
+fn string_to_locale_lower_case(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let s = this_string_value(this, runtime)?;
+
+    // Determine locale for Turkic special-casing.
+    let locale_str = args
+        .first()
+        .filter(|v| **v != RegisterValue::undefined())
+        .map(|v| {
+            runtime
+                .js_to_string(*v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
+        .transpose()?;
+
+    let is_turkic = locale_str
+        .as_deref()
+        .is_some_and(crate::intrinsics::intl::locale_utils::is_turkic_locale);
+
+    let result = if is_turkic {
+        // Turkish/Azerbaijani: I → ı, İ → i
+        s.chars()
+            .map(|ch| match ch {
+                'I' => 'ı',
+                '\u{130}' => 'i', // İ → i
+                _ => ch.to_lowercase().next().unwrap_or(ch),
+            })
+            .collect::<String>()
+    } else {
+        s.to_lowercase()
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+// ── §22.1.3.23 String.prototype.toLocaleUpperCase([locale]) ──────────────
+//
+// ECMA-402 §18.1.3: <https://tc39.es/ecma402/#sup-string.prototype.tolocaleuppercase>
+
+fn string_to_locale_upper_case(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let s = this_string_value(this, runtime)?;
+
+    let locale_str = args
+        .first()
+        .filter(|v| **v != RegisterValue::undefined())
+        .map(|v| {
+            runtime
+                .js_to_string(*v)
+                .map_err(|e| map_interpreter_error(e, runtime))
+        })
+        .transpose()?;
+
+    let is_turkic = locale_str
+        .as_deref()
+        .is_some_and(crate::intrinsics::intl::locale_utils::is_turkic_locale);
+
+    let result = if is_turkic {
+        // Turkish/Azerbaijani: i → İ, ı → I
+        s.chars()
+            .map(|ch| match ch {
+                'i' => '\u{130}', // İ
+                'ı' => 'I',
+                _ => ch.to_uppercase().next().unwrap_or(ch),
+            })
+            .collect::<String>()
+    } else {
+        s.to_uppercase()
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn number_to_string(number: f64) -> String {

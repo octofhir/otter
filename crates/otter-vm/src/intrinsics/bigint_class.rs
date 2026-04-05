@@ -313,15 +313,30 @@ fn bigint_to_string(
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
-/// §21.2.3.1 BigInt.prototype.toLocaleString()
+/// §21.2.3.1 BigInt.prototype.toLocaleString([locales [, options]])
 /// <https://tc39.es/ecma262/#sec-bigint.prototype.tolocalestring>
+/// ECMA-402 §19.1.1: <https://tc39.es/ecma402/#sup-number.prototype.tolocalestring>
 fn bigint_to_locale_string(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    use fixed_decimal::Decimal;
+    use icu_decimal::DecimalFormatter;
+
     let value_str = require_bigint_value(this, runtime)?.to_string();
-    let handle = runtime.alloc_string(value_str);
+
+    // Parse the BigInt decimal string into a FixedDecimal for locale formatting.
+    let result = if let Ok(decimal) = value_str.parse::<Decimal>() {
+        match DecimalFormatter::try_new(Default::default(), Default::default()) {
+            Ok(fmt) => fmt.format(&decimal).to_string(),
+            Err(_) => value_str,
+        }
+    } else {
+        value_str
+    };
+
+    let handle = runtime.alloc_string(result);
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

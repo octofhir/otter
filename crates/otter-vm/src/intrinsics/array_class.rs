@@ -247,6 +247,10 @@ fn array_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("toLocaleString", 0, array_to_locale_string),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("copyWithin", 2, array_copy_within),
         ))
         .with_binding(NativeBindingDescriptor::new(
@@ -1812,6 +1816,66 @@ fn array_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     // Equivalent to this.join().
     array_join(this, &[], runtime)
+}
+
+/// ECMA-402 §21.1.1 Array.prototype.toLocaleString([locales [, options]])
+///
+/// Calls toLocaleString() on each element and joins with locale-appropriate separator.
+/// Spec: <https://tc39.es/ecma402/#sup-array.prototype.tolocalestring>
+fn array_to_locale_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("Array.prototype.toLocaleString requires array receiver".into())
+    })?;
+    let len = array_length(receiver, runtime, "Array.prototype.toLocaleString")?;
+
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let prop = runtime.intern_property_name(&i.to_string());
+        let elem_receiver = RegisterValue::from_object_handle(receiver.0);
+        let elem = runtime.ordinary_get(receiver, prop, elem_receiver)?;
+
+        if elem == RegisterValue::undefined() || elem == RegisterValue::null() {
+            parts.push(String::new());
+        } else {
+            // Call toLocaleString() on the element.
+            let elem_str = call_to_locale_string(elem, runtime)?;
+            parts.push(elem_str);
+        }
+    }
+
+    let joined = parts.join(",");
+    let handle = runtime.alloc_string(joined);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// Helper: call `.toLocaleString()` on a value.
+fn call_to_locale_string(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<String, VmNativeCallError> {
+    // Get the toLocaleString property.
+    if let Some(h) = value.as_object_handle().map(ObjectHandle) {
+        let prop = runtime.intern_property_name("toLocaleString");
+        let receiver = RegisterValue::from_object_handle(h.0);
+        let method = runtime.ordinary_get(h, prop, receiver)?;
+        if method != RegisterValue::undefined() {
+            let callable = method.as_object_handle().map(ObjectHandle);
+            let result = runtime.call_host_function(callable, value, &[])?;
+            let s = runtime.js_to_string(result).map_err(|e| {
+                VmNativeCallError::Internal(format!("toLocaleString result: {e}").into())
+            })?;
+            return Ok(s.to_string());
+        }
+    }
+    // Fallback: coerce to string.
+    let s = runtime.js_to_string(value).map_err(|e| {
+        VmNativeCallError::Internal(format!("toLocaleString coerce: {e}").into())
+    })?;
+    Ok(s.to_string())
 }
 
 /// ES2024 §23.1.3.3 Array.prototype.copyWithin(target, start [, end])

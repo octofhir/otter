@@ -193,7 +193,7 @@ pub enum PluralRulesType {
     Ordinal,
 }
 
-/// §14.1.3 Intl.Locale internal slots (simplified).
+/// §14.1.3 Intl.Locale internal slots.
 /// Spec: <https://tc39.es/ecma402/#sec-intl-locale-internal-slots>
 #[derive(Debug, Clone)]
 pub struct LocaleData {
@@ -201,6 +201,9 @@ pub struct LocaleData {
     pub calendar: Option<String>,
     pub collation: Option<String>,
     pub numbering_system: Option<String>,
+    pub hour_cycle: Option<String>,
+    pub case_first: Option<String>,
+    pub numeric: Option<bool>,
 }
 
 /// §12.1.3 Intl.DateTimeFormat internal slots.
@@ -236,6 +239,129 @@ pub enum DateTimeStyle {
     Short,
 }
 
+/// §13.1.3 Intl.ListFormat internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-intl-listformat-internal-slots>
+#[derive(Debug, Clone)]
+pub struct ListFormatData {
+    pub locale: String,
+    pub list_type: ListFormatType,
+    pub style: ListFormatStyle,
+}
+
+/// §13.1 ListFormat type option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFormatType {
+    Conjunction,
+    Disjunction,
+    Unit,
+}
+
+/// §13.1 ListFormat style option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFormatStyle {
+    Long,
+    Short,
+    Narrow,
+}
+
+/// §18.1.3 Intl.Segmenter internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-intl-segmenter-internal-slots>
+#[derive(Debug, Clone)]
+pub struct SegmenterData {
+    pub locale: String,
+    pub granularity: SegmenterGranularity,
+}
+
+/// §18.1 Segmenter granularity option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmenterGranularity {
+    Grapheme,
+    Word,
+    Sentence,
+}
+
+/// §18.5.1 Segments object internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-segments-objects>
+#[derive(Debug, Clone)]
+pub struct SegmentsData {
+    pub input: String,
+    pub granularity: SegmenterGranularity,
+    pub locale: String,
+}
+
+/// §18.6.1 Segment Iterator internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-segment-iterator-objects>
+#[derive(Debug, Clone)]
+pub struct SegmentIteratorData {
+    pub input: String,
+    pub granularity: SegmenterGranularity,
+    pub locale: String,
+    /// Precomputed segment breakpoints: Vec of (byte_start, byte_end, is_word_like).
+    pub breakpoints: Vec<(usize, usize, Option<bool>)>,
+    /// Current index into `breakpoints`.
+    pub position: usize,
+}
+
+/// §12.1.3 Intl.DisplayNames internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-intl-displaynames-internal-slots>
+#[derive(Debug, Clone)]
+pub struct DisplayNamesData {
+    pub locale: String,
+    pub display_type: DisplayNamesType,
+    pub style: DisplayNamesStyle,
+    pub fallback: DisplayNamesFallback,
+}
+
+/// §12.1 DisplayNames type option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayNamesType {
+    Language,
+    Region,
+    Script,
+    Currency,
+    Calendar,
+    DateTimeField,
+}
+
+/// §12.1 DisplayNames style option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayNamesStyle {
+    Long,
+    Short,
+    Narrow,
+}
+
+/// §12.1 DisplayNames fallback option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayNamesFallback {
+    Code,
+    None,
+}
+
+/// §17.1.3 Intl.RelativeTimeFormat internal slots.
+/// Spec: <https://tc39.es/ecma402/#sec-intl-relativetimeformat-internal-slots>
+#[derive(Debug, Clone)]
+pub struct RelativeTimeFormatData {
+    pub locale: String,
+    pub style: RelativeTimeStyle,
+    pub numeric: RelativeTimeNumeric,
+}
+
+/// §17.1 RelativeTimeFormat style option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativeTimeStyle {
+    Long,
+    Short,
+    Narrow,
+}
+
+/// §17.1 RelativeTimeFormat numeric option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativeTimeNumeric {
+    Always,
+    Auto,
+}
+
 // ── Payload enum ───────────────────────────────────────────────────
 
 /// Native payload for all Intl type instances.
@@ -246,6 +372,12 @@ pub enum IntlPayload {
     PluralRules(PluralRulesData),
     Locale(LocaleData),
     DateTimeFormat(DateTimeFormatData),
+    ListFormat(ListFormatData),
+    Segmenter(SegmenterData),
+    Segments(SegmentsData),
+    SegmentIterator(SegmentIteratorData),
+    DisplayNames(DisplayNamesData),
+    RelativeTimeFormat(RelativeTimeFormatData),
 }
 
 impl VmTrace for IntlPayload {
@@ -288,6 +420,55 @@ impl IntlPayload {
     pub fn as_date_time_format(&self) -> Option<&DateTimeFormatData> {
         match self {
             Self::DateTimeFormat(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_list_format(&self) -> Option<&ListFormatData> {
+        match self {
+            Self::ListFormat(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_segmenter(&self) -> Option<&SegmenterData> {
+        match self {
+            Self::Segmenter(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_segments(&self) -> Option<&SegmentsData> {
+        match self {
+            Self::Segments(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_segment_iterator(&self) -> Option<&SegmentIteratorData> {
+        match self {
+            Self::SegmentIterator(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_segment_iterator_mut(&mut self) -> Option<&mut SegmentIteratorData> {
+        match self {
+            Self::SegmentIterator(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_display_names(&self) -> Option<&DisplayNamesData> {
+        match self {
+            Self::DisplayNames(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_relative_time_format(&self) -> Option<&RelativeTimeFormatData> {
+        match self {
+            Self::RelativeTimeFormat(v) => Some(v),
             _ => None,
         }
     }

@@ -346,6 +346,16 @@ pub struct VmIntrinsics {
     pub(crate) intl_locale_prototype: ObjectHandle,
     pub(crate) intl_date_time_format_constructor: ObjectHandle,
     pub(crate) intl_date_time_format_prototype: ObjectHandle,
+    pub(crate) intl_list_format_constructor: ObjectHandle,
+    pub(crate) intl_list_format_prototype: ObjectHandle,
+    pub(crate) intl_segmenter_constructor: ObjectHandle,
+    pub(crate) intl_segmenter_prototype: ObjectHandle,
+    pub(crate) intl_segments_prototype: ObjectHandle,
+    pub(crate) intl_segment_iterator_prototype: ObjectHandle,
+    pub(crate) intl_display_names_constructor: ObjectHandle,
+    pub(crate) intl_display_names_prototype: ObjectHandle,
+    pub(crate) intl_relative_time_format_constructor: ObjectHandle,
+    pub(crate) intl_relative_time_format_prototype: ObjectHandle,
     // Temporal (proposal-temporal, Stage 4)
     pub(crate) temporal_namespace: ObjectHandle,
     pub(crate) temporal_instant_constructor: ObjectHandle,
@@ -473,6 +483,16 @@ impl VmIntrinsics {
         let intl_locale_prototype = heap.alloc_object();
         let intl_date_time_format_constructor = heap.alloc_object();
         let intl_date_time_format_prototype = heap.alloc_object();
+        let intl_list_format_constructor = heap.alloc_object();
+        let intl_list_format_prototype = heap.alloc_object();
+        let intl_segmenter_constructor = heap.alloc_object();
+        let intl_segmenter_prototype = heap.alloc_object();
+        let intl_segments_prototype = heap.alloc_object();
+        let intl_segment_iterator_prototype = heap.alloc_object();
+        let intl_display_names_constructor = heap.alloc_object();
+        let intl_display_names_prototype = heap.alloc_object();
+        let intl_relative_time_format_constructor = heap.alloc_object();
+        let intl_relative_time_format_prototype = heap.alloc_object();
         // Temporal (proposal-temporal)
         let temporal_namespace = heap.alloc_object();
         let temporal_instant_constructor = heap.alloc_object();
@@ -618,6 +638,16 @@ impl VmIntrinsics {
             intl_locale_prototype,
             intl_date_time_format_constructor,
             intl_date_time_format_prototype,
+            intl_list_format_constructor,
+            intl_list_format_prototype,
+            intl_segmenter_constructor,
+            intl_segmenter_prototype,
+            intl_segments_prototype,
+            intl_segment_iterator_prototype,
+            intl_display_names_constructor,
+            intl_display_names_prototype,
+            intl_relative_time_format_constructor,
+            intl_relative_time_format_prototype,
             temporal_namespace,
             temporal_instant_constructor,
             temporal_instant_prototype,
@@ -770,6 +800,10 @@ impl VmIntrinsics {
             self.intl_plural_rules_constructor,
             self.intl_locale_constructor,
             self.intl_date_time_format_constructor,
+            self.intl_list_format_constructor,
+            self.intl_segmenter_constructor,
+            self.intl_display_names_constructor,
+            self.intl_relative_time_format_constructor,
         ] {
             heap.set_prototype(ctor, Some(self.function_prototype))?;
         }
@@ -779,6 +813,12 @@ impl VmIntrinsics {
             self.intl_plural_rules_prototype,
             self.intl_locale_prototype,
             self.intl_date_time_format_prototype,
+            self.intl_list_format_prototype,
+            self.intl_segmenter_prototype,
+            self.intl_segments_prototype,
+            self.intl_segment_iterator_prototype,
+            self.intl_display_names_prototype,
+            self.intl_relative_time_format_prototype,
         ] {
             heap.set_prototype(proto, Some(self.object_prototype))?;
         }
@@ -1324,6 +1364,30 @@ impl VmIntrinsics {
         self.intl_date_time_format_prototype
     }
 
+    pub const fn intl_list_format_prototype(&self) -> ObjectHandle {
+        self.intl_list_format_prototype
+    }
+
+    pub const fn intl_segmenter_prototype(&self) -> ObjectHandle {
+        self.intl_segmenter_prototype
+    }
+
+    pub const fn intl_segments_prototype(&self) -> ObjectHandle {
+        self.intl_segments_prototype
+    }
+
+    pub const fn intl_segment_iterator_prototype(&self) -> ObjectHandle {
+        self.intl_segment_iterator_prototype
+    }
+
+    pub const fn intl_display_names_prototype(&self) -> ObjectHandle {
+        self.intl_display_names_prototype
+    }
+
+    pub const fn intl_relative_time_format_prototype(&self) -> ObjectHandle {
+        self.intl_relative_time_format_prototype
+    }
+
     /// Returns `%Temporal.Instant.prototype%`.
     #[must_use]
     pub const fn temporal_instant_prototype(&self) -> ObjectHandle {
@@ -1602,6 +1666,16 @@ impl VmIntrinsics {
             self.intl_locale_prototype,
             self.intl_date_time_format_constructor,
             self.intl_date_time_format_prototype,
+            self.intl_list_format_constructor,
+            self.intl_list_format_prototype,
+            self.intl_segmenter_constructor,
+            self.intl_segmenter_prototype,
+            self.intl_segments_prototype,
+            self.intl_segment_iterator_prototype,
+            self.intl_display_names_constructor,
+            self.intl_display_names_prototype,
+            self.intl_relative_time_format_constructor,
+            self.intl_relative_time_format_prototype,
             self.temporal_namespace,
             self.temporal_instant_constructor,
             self.temporal_instant_prototype,
@@ -1758,7 +1832,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 615);
+        assert_eq!(native_functions.len(), 680);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

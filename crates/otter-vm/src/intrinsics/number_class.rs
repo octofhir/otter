@@ -92,7 +92,7 @@ fn number_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("toLocaleString", 0, number_to_string),
+            NativeFunctionDescriptor::method("toLocaleString", 0, number_to_locale_string),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -266,7 +266,44 @@ fn number_value_of(
     Err(VmNativeCallError::Internal(NUMBER_VALUE_OF_ERROR.into()))
 }
 
-/// ES2024 §21.1.3.6 Number.prototype.toString([radix])
+// ── §19.1.1 Number.prototype.toLocaleString([locales [, options]]) ──────
+//
+// ECMA-402 §19.1.1: <https://tc39.es/ecma402/#sup-number.prototype.tolocalestring>
+
+fn number_to_locale_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    use fixed_decimal::{Decimal as FixedDecimal, FloatPrecision};
+    use icu_decimal::DecimalFormatter;
+
+    let number = this_number_value(*this, runtime)?;
+
+    if number.is_nan() {
+        let handle = runtime.alloc_string("NaN");
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+    if number.is_infinite() {
+        let s = if number.is_sign_negative() { "-Infinity" } else { "Infinity" };
+        let handle = runtime.alloc_string(s);
+        return Ok(RegisterValue::from_object_handle(handle.0));
+    }
+
+    // Use ICU4X DecimalFormatter for locale-aware number formatting.
+    let result = if let Ok(decimal) = FixedDecimal::try_from_f64(number, FloatPrecision::RoundTrip) {
+        match DecimalFormatter::try_new(Default::default(), Default::default()) {
+            Ok(fmt) => fmt.format(&decimal).to_string(),
+            Err(_) => ryu::Buffer::new().format(number).to_string(),
+        }
+    } else {
+        ryu::Buffer::new().format(number).to_string()
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
 fn number_to_string(
     this: &RegisterValue,
     args: &[RegisterValue],

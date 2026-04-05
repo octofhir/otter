@@ -13,7 +13,7 @@ use crate::descriptors::{
     JsClassDescriptor, NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor,
     VmNativeCallError,
 };
-use crate::object::ObjectHandle;
+use crate::object::{ObjectHandle, PropertyAttributes, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::locale_utils;
@@ -36,13 +36,26 @@ pub fn number_format_class_descriptor() -> JsClassDescriptor {
             0,
             number_format_constructor,
         ))
+        // §15.5.3 — `format` is a getter that returns a bound function.
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("format", 1, number_format_format),
+            NativeFunctionDescriptor::getter("format", number_format_format_getter),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("formatToParts", 1, number_format_format_to_parts),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method("formatRange", 2, number_format_format_range),
+        ))
+        .with_binding(NativeBindingDescriptor::new(
+            NativeBindingTarget::Prototype,
+            NativeFunctionDescriptor::method(
+                "formatRangeToParts",
+                2,
+                number_format_format_range_to_parts,
+            ),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
@@ -90,16 +103,70 @@ fn number_format_constructor(
 //  §15.5.4 Intl.NumberFormat.prototype.format(value)
 // ═══════════════════════════════════════════════════════════════════
 
-/// §15.5.4 Intl.NumberFormat.prototype.format(value)
+/// §15.5.3 get Intl.NumberFormat.prototype.format
+///
+/// Returns a bound format function. Cached on the instance as `__boundFormat`.
 ///
 /// Spec: <https://tc39.es/ecma402/#sec-intl.numberformat.prototype.format>
-fn number_format_format(
+fn number_format_format_getter(
     this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        VmNativeCallError::Internal("NumberFormat.format getter: expected object".into())
+    })?;
+
+    let cache_prop = runtime.intern_property_name("__boundFormat");
+    let cached = runtime.own_property_value(handle, cache_prop).map_err(interp_err)?;
+    if cached != RegisterValue::undefined() && cached.as_object_handle().is_some() {
+        return Ok(cached);
+    }
+
+    let desc = NativeFunctionDescriptor::method("format", 1, bound_number_format_format);
+    let fn_id = runtime.register_native_function(desc);
+    let fn_proto = runtime.intrinsics().function_prototype();
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
+    let _ = runtime.objects_mut().set_prototype(bound_fn, Some(fn_proto));
+
+    let nf_prop = runtime.intern_property_name("__numberFormat__");
+    runtime.objects_mut().define_own_property(
+        bound_fn,
+        nf_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(handle.0),
+            PropertyAttributes::from_flags(false, false, false),
+        ),
+    ).map_err(interp_err)?;
+
+    let bound_val = RegisterValue::from_object_handle(bound_fn.0);
+    runtime.objects_mut().define_own_property(
+        handle,
+        cache_prop,
+        PropertyValue::data_with_attrs(bound_val, PropertyAttributes::from_flags(false, false, false)),
+    ).map_err(interp_err)?;
+
+    Ok(bound_val)
+}
+
+/// Bound format function. Reads NumberFormat instance from `__numberFormat__`.
+fn bound_number_format_format(
+    _this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // Clone data to release borrow on runtime before calling js_to_number.
-    let data = require_number_format_data(this, runtime)?.clone();
+    let fn_handle = runtime.current_native_callee().ok_or_else(|| {
+        VmNativeCallError::Internal("bound format: no callee".into())
+    })?;
+    let nf_prop = runtime.intern_property_name("__numberFormat__");
+    let nf_val = runtime.own_property_value(fn_handle, nf_prop).map_err(interp_err)?;
+    let nf_rv = RegisterValue::from_object_handle(
+        nf_val.as_object_handle().ok_or_else(|| {
+            VmNativeCallError::Internal("bound format: missing __numberFormat__".into())
+        })?,
+    );
+
+    let data = require_number_format_data(&nf_rv, runtime)?.clone();
     let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
     let number = runtime
         .js_to_number(value)
@@ -108,6 +175,10 @@ fn number_format_format(
     let formatted = format_number(number, &data);
     let handle = runtime.alloc_string(formatted);
     Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+fn interp_err(e: impl std::fmt::Debug) -> VmNativeCallError {
+    VmNativeCallError::Internal(format!("{e:?}").into())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -280,6 +351,127 @@ fn decompose_formatted_number(
     }
 
     parts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §15.5.7 Intl.NumberFormat.prototype.formatRange(start, end)
+// ═══════════════════════════════════════════════════════════════════
+
+/// §15.5.7 Intl.NumberFormat.prototype.formatRange(start, end)
+///
+/// Spec: <https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrange>
+fn number_format_format_range(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_number_format_data(this, runtime)?.clone();
+
+    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+
+    if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
+        return Err(type_error(runtime, "start and end must be provided to formatRange"));
+    }
+
+    let start = runtime
+        .js_to_number(start_val)
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRange: {e}").into()))?;
+    let end = runtime
+        .js_to_number(end_val)
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRange: {e}").into()))?;
+
+    if start.is_nan() || end.is_nan() {
+        return Err(range_error(runtime, "Invalid number value"));
+    }
+
+    let start_str = format_number(start, &data);
+    let end_str = format_number(end, &data);
+    let result = if start_str == end_str {
+        // §15.5.7 step 5: if start and end produce the same formatted string, return it.
+        format!("~{start_str}")
+    } else {
+        format!("{start_str}\u{2013}{end_str}")
+    };
+
+    let handle = runtime.alloc_string(result);
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  §15.5.8 Intl.NumberFormat.prototype.formatRangeToParts(start, end)
+// ═══════════════════════════════════════════════════════════════════
+
+/// §15.5.8 Intl.NumberFormat.prototype.formatRangeToParts(start, end)
+///
+/// Spec: <https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrangetoparts>
+fn number_format_format_range_to_parts(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let data = require_number_format_data(this, runtime)?.clone();
+
+    let start_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let end_val = args.get(1).copied().unwrap_or_else(RegisterValue::undefined);
+
+    if start_val == RegisterValue::undefined() || end_val == RegisterValue::undefined() {
+        return Err(type_error(runtime, "start and end must be provided to formatRangeToParts"));
+    }
+
+    let start = runtime
+        .js_to_number(start_val)
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e}").into()))?;
+    let end = runtime
+        .js_to_number(end_val)
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e}").into()))?;
+
+    if start.is_nan() || end.is_nan() {
+        return Err(range_error(runtime, "Invalid number value"));
+    }
+
+    let start_formatted = format_number(start, &data);
+    let end_formatted = format_number(end, &data);
+
+    let arr = runtime.alloc_array();
+
+    // Start number parts (source: "startRange").
+    let start_parts = decompose_formatted_number(&start_formatted, start, &data);
+    for (part_type, part_value) in &start_parts {
+        let obj = runtime.alloc_object();
+        set_string_prop(runtime, obj, "type", part_type);
+        set_string_prop(runtime, obj, "value", part_value);
+        set_string_prop(runtime, obj, "source", "startRange");
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(obj.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+    }
+
+    // Literal separator.
+    let sep_obj = runtime.alloc_object();
+    set_string_prop(runtime, sep_obj, "type", "literal");
+    set_string_prop(runtime, sep_obj, "value", "\u{2013}");
+    set_string_prop(runtime, sep_obj, "source", "shared");
+    runtime
+        .objects_mut()
+        .push_element(arr, RegisterValue::from_object_handle(sep_obj.0))
+        .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+
+    // End number parts (source: "endRange").
+    let end_parts = decompose_formatted_number(&end_formatted, end, &data);
+    for (part_type, part_value) in &end_parts {
+        let obj = runtime.alloc_object();
+        set_string_prop(runtime, obj, "type", part_type);
+        set_string_prop(runtime, obj, "value", part_value);
+        set_string_prop(runtime, obj, "source", "endRange");
+        runtime
+            .objects_mut()
+            .push_element(arr, RegisterValue::from_object_handle(obj.0))
+            .map_err(|e| VmNativeCallError::Internal(format!("formatRangeToParts: {e:?}").into()))?;
+    }
+
+    Ok(RegisterValue::from_object_handle(arr.0))
 }
 
 // ═══════════════════════════════════════════════════════════════════

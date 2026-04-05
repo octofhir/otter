@@ -944,15 +944,15 @@ fn date_class_descriptor() -> JsClassDescriptor {
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("toLocaleString", 0, date_to_string),
+            NativeFunctionDescriptor::method("toLocaleString", 0, date_to_locale_string),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("toLocaleDateString", 0, date_to_date_string),
+            NativeFunctionDescriptor::method("toLocaleDateString", 0, date_to_locale_date_string),
         ))
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
-            NativeFunctionDescriptor::method("toLocaleTimeString", 0, date_to_time_string),
+            NativeFunctionDescriptor::method("toLocaleTimeString", 0, date_to_locale_time_string),
         ))
         // ── Legacy (Annex B) ──
         .with_binding(NativeBindingDescriptor::new(
@@ -1913,7 +1913,44 @@ fn date_to_json(
     date_to_iso_string(this, &[], runtime)
 }
 
-// ── Symbol.toPrimitive (§21.4.4.45) ─────────────────────────────────────────
+// ── §20.1.1 Date.prototype.toLocaleString([locales [, options]]) ────────────
+//
+// ECMA-402 §20.1.1: <https://tc39.es/ecma402/#sup-date.prototype.tolocalestring>
+
+fn date_to_locale_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    // Falls back to toString() which gives a full date+time string.
+    date_to_string(this, &[], runtime)
+}
+
+// ── §20.1.2 Date.prototype.toLocaleDateString([locales [, options]]) ───────
+//
+// ECMA-402 §20.1.2: <https://tc39.es/ecma402/#sup-date.prototype.tolocaledatestring>
+
+fn date_to_locale_date_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    date_to_date_string(this, &[], runtime)
+}
+
+// ── §20.1.3 Date.prototype.toLocaleTimeString([locales [, options]]) ───────
+//
+// ECMA-402 §20.1.3: <https://tc39.es/ecma402/#sup-date.prototype.tolocaletimestring>
+
+fn date_to_locale_time_string(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    date_to_time_string(this, &[], runtime)
+}
+
+// ── Symbol.toPrimitive (§21.4.4.45) ────────────────────────────��────────────
 
 /// Date.prototype[@@toPrimitive](hint)
 /// <https://tc39.es/ecma262/#sec-date.prototype-%symbol.toprimitive%>

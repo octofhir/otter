@@ -458,14 +458,12 @@ fn capture_exports(
                 specifier,
                 exported,
             } => {
-                // TODO: Build namespace object for `export * as ns from "..."`.
-                // For now, store undefined.
-                let _ = specifier;
+                let ns_value = build_namespace_object(specifier, registry, runtime);
                 registry
                     .get_mut(url)
                     .unwrap()
                     .namespace
-                    .insert(exported.to_string(), RegisterValue::undefined());
+                    .insert(exported.to_string(), ns_value);
             }
         }
     }

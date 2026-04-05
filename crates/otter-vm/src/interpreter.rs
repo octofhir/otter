@@ -6327,6 +6327,26 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §6.1.6.1.3 Number::exponentiate
+            // Spec: <https://tc39.es/ecma262/#sec-exp-operator>
+            Opcode::Exp => {
+                let lhs = activation.read_bytecode_register(function, instruction.b())?;
+                let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                if lhs.is_bigint() || rhs.is_bigint() {
+                    return Err(InterpreterError::TypeError(
+                        "BigInt exponentiation not yet supported".into(),
+                    ));
+                }
+                let base = runtime.js_to_number(lhs)?;
+                let exponent = runtime.js_to_number(rhs)?;
+                activation.write_bytecode_register(
+                    function,
+                    instruction.a(),
+                    RegisterValue::from_number(base.powf(exponent)),
+                )?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::BitAnd => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;

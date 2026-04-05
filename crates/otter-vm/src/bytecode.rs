@@ -375,6 +375,11 @@ pub enum Opcode {
     /// `ImportMeta dst`
     /// Spec: <https://tc39.es/ecma262/#sec-meta-properties>
     ImportMeta = 0x75,
+
+    /// Exponentiation (`**`).
+    /// `Exp dst, lhs, rhs` — computes `lhs ** rhs`.
+    /// Spec: <https://tc39.es/ecma262/#sec-exp-operator>
+    Exp = 0x76,
 }
 
 impl Opcode {
@@ -485,6 +490,7 @@ impl Opcode {
             0x73 => Some(Self::YieldStar),
             0x74 => Some(Self::DynamicImport),
             0x75 => Some(Self::ImportMeta),
+            0x76 => Some(Self::Exp),
             _ => None,
         }
     }
@@ -1544,6 +1550,17 @@ impl Instruction {
             object,
             BytecodeRegister::new(property.0),
         )
+    }
+
+    /// Encodes an exponentiation: `dst = lhs ** rhs`.
+    /// Spec: <https://tc39.es/ecma262/#sec-exp-operator>
+    #[must_use]
+    pub const fn exp(
+        dst: BytecodeRegister,
+        lhs: BytecodeRegister,
+        rhs: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::Exp, dst, lhs, rhs)
     }
 
     /// §13.3.10 Dynamic `import()` — evaluate specifier and return a Promise.

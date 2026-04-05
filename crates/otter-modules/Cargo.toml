@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "Otter-specific hosted modules for the new runtime stack"
 license = "MIT"
-build = "build.rs"
 
 [dependencies]
 libffi = "4"

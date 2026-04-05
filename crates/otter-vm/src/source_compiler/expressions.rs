@@ -266,6 +266,7 @@ impl<'a> FunctionCompiler<'a> {
             ValueLocation::temp(self.alloc_temp())
         };
 
+        #[allow(unreachable_patterns)]
         match binary.operator {
             BinaryOperator::Addition => {
                 self.instructions.push(Instruction::add(
@@ -413,6 +414,13 @@ impl<'a> FunctionCompiler<'a> {
             }
             BinaryOperator::ShiftRightZeroFill => {
                 self.instructions.push(Instruction::ushr(
+                    result.register,
+                    lhs.register,
+                    rhs.register,
+                ));
+            }
+            BinaryOperator::Exponential => {
+                self.instructions.push(Instruction::exp(
                     result.register,
                     lhs.register,
                     rhs.register,
@@ -1984,9 +1992,19 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(result)
             }
-            _ => Err(SourceLoweringError::Unsupported(
-                "delete target".to_string(),
-            )),
+            // §13.5.1.2 — `delete identifier`: in sloppy mode, attempt to delete
+            // the binding. In strict mode, this is a SyntaxError (caught by parser).
+            // For simplicity, we return `true` (non-configurable bindings are rare
+            // in VM-compiled code; this matches the "always succeeds" behavior
+            // for undeclared globals).
+            Expression::Identifier(_) => self.compile_bool(true),
+            // §13.5.1.2 — `delete <non-reference>`: evaluate the expression
+            // for side effects, then return `true`.
+            _ => {
+                let value = self.compile_expression(argument, module)?;
+                self.release(value);
+                self.compile_bool(true)
+            }
         }
     }
 

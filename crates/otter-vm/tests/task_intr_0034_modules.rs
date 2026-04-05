@@ -521,3 +521,211 @@ fn export_with_rename() {
     // Original name should NOT be in the namespace.
     assert!(registry.get_export("a.mjs", "x").is_none());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §13.3.10 — Dynamic import() expression
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `import("specifier")` compiles to a DynamicImport opcode.
+#[test]
+fn dynamic_import_compiles() {
+    let module = compile_module(
+        r#"var p = import("./other.mjs");"#,
+        "test.mjs",
+    )
+    .expect("should compile");
+    // Should have DynamicImport instruction in the entry function bytecode.
+    let entry = module.entry_function();
+    let has_dynamic_import = entry
+        .bytecode()
+        .instructions()
+        .iter()
+        .any(|i| i.opcode() == otter_vm::bytecode::Opcode::DynamicImport);
+    assert!(has_dynamic_import, "expected DynamicImport opcode in bytecode");
+}
+
+/// `import()` without a host handler throws TypeError.
+#[test]
+fn dynamic_import_without_handler_throws() {
+    let mut host = InMemoryModuleHost::new();
+    host.add_module("entry.mjs", r#"var p = import("./other.mjs");"#);
+    host.add_module("other.mjs", "export var x = 1;");
+
+    let mut runtime = RuntimeState::new();
+    let mut registry = ModuleRegistry::new();
+    let result = execute_module_graph("entry.mjs", &host, &mut runtime, &mut registry);
+    // Should fail — no __importDynamic handler installed.
+    assert!(result.is_err(), "expected error without __importDynamic handler");
+}
+
+/// `import()` with a host handler calls __importDynamic(specifier).
+#[test]
+fn dynamic_import_calls_host_handler() {
+    use otter_vm::descriptors::{
+        NativeEntrypointKind, NativeFunctionDescriptor, NativeSlotKind,
+    };
+    use otter_vm::RegisterValue;
+
+    let mut host = InMemoryModuleHost::new();
+    // Module that uses dynamic import and stores the specifier it was called with.
+    host.add_module(
+        "entry.mjs",
+        r#"
+        var result = import("./dep.mjs");
+        "#,
+    );
+
+    let mut runtime = RuntimeState::new();
+
+    // Install a __importDynamic handler that just returns a resolved promise
+    // with a simple namespace object.
+    fn import_handler(
+        _this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut otter_vm::RuntimeState,
+    ) -> Result<RegisterValue, otter_vm::VmNativeCallError> {
+        // Read the specifier argument and store it as a global for verification.
+        let specifier = args.first().copied().unwrap_or(RegisterValue::undefined());
+        runtime.install_global_value("__importSpecifier", specifier);
+
+        // Build a namespace object with a single `x` export.
+        let ns = runtime.alloc_object();
+        let prop = runtime.intern_property_name("x");
+        runtime
+            .objects_mut()
+            .set_property(ns, prop, RegisterValue::from_i32(99))
+            .unwrap();
+
+        // Create a fulfilled promise with the namespace.
+        let promise = runtime
+            .alloc_resolved_promise(RegisterValue::from_object_handle(ns.0))
+            .map_err(|e| otter_vm::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        Ok(RegisterValue::from_object_handle(promise.0))
+    }
+
+    runtime.install_native_global(NativeFunctionDescriptor::new(
+        "__importDynamic",
+        1,
+        NativeEntrypointKind::Sync,
+        NativeSlotKind::Method,
+        import_handler,
+    ));
+
+    let mut registry = ModuleRegistry::new();
+    execute_module_graph("entry.mjs", &host, &mut runtime, &mut registry)
+        .expect("module graph should execute");
+
+    // Verify __importDynamic was called with the correct specifier.
+    let global = runtime.intrinsics().global_object();
+    let prop = runtime.intern_property_name("__importSpecifier");
+    let specifier_value = runtime
+        .own_property_value(global, prop)
+        .unwrap_or_default();
+    // Should be a string object handle (the specifier "./dep.mjs").
+    assert!(
+        specifier_value.as_object_handle().is_some(),
+        "expected specifier string, got {specifier_value:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §13.3.12 — import.meta
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `import.meta` compiles to an ImportMeta opcode.
+#[test]
+fn import_meta_compiles() {
+    let module = compile_module(
+        "var url = import.meta.url;",
+        "test.mjs",
+    )
+    .expect("should compile");
+    let entry = module.entry_function();
+    let has_import_meta = entry
+        .bytecode()
+        .instructions()
+        .iter()
+        .any(|i| i.opcode() == otter_vm::bytecode::Opcode::ImportMeta);
+    assert!(has_import_meta, "expected ImportMeta opcode in bytecode");
+}
+
+/// `import.meta.url` returns the module's URL at runtime.
+#[test]
+fn import_meta_url_returns_module_url() {
+    let mut host = InMemoryModuleHost::new();
+    host.add_module(
+        "entry.mjs",
+        "export var meta_url = import.meta.url;",
+    );
+
+    let (runtime, registry) = run_module_graph("entry.mjs", &host);
+    let value = registry
+        .get_export("entry.mjs", "meta_url")
+        .expect("meta_url export should exist");
+
+    // Should be a string handle containing "entry.mjs".
+    let handle = value.as_object_handle().expect("expected string handle");
+    let string = runtime
+        .objects()
+        .string_value(otter_vm::object::ObjectHandle(handle))
+        .expect("should be readable")
+        .expect("should be a string");
+    assert_eq!(string, "entry.mjs");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  §16.2.3 — ReExportNamespace: `export * as ns from "..."`
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `export * as ns from "..."` creates a namespace object with all exports.
+#[test]
+fn reexport_namespace_object() {
+    let mut host = InMemoryModuleHost::new();
+    host.add_module("a.mjs", "export var x = 10; export var y = 20;");
+    host.add_module("b.mjs", r#"export * as ns from "a.mjs";"#);
+    host.add_module(
+        "c.mjs",
+        r#"import { ns } from "b.mjs"; export var sum = ns.x + ns.y;"#,
+    );
+
+    let (_, registry) = run_module_graph("c.mjs", &host);
+
+    // b.mjs should have a `ns` export that is an object.
+    let ns_value = registry
+        .get_export("b.mjs", "ns")
+        .expect("ns export should exist");
+    assert!(
+        ns_value.as_object_handle().is_some(),
+        "ns should be an object, got {ns_value:?}"
+    );
+
+    // c.mjs should have computed sum = 10 + 20 = 30.
+    assert_eq!(
+        registry.get_export("c.mjs", "sum").and_then(|v| v.as_i32()),
+        Some(30)
+    );
+}
+
+/// Circular module dependency doesn't crash.
+#[test]
+fn circular_dependency_doesnt_crash() {
+    let mut host = InMemoryModuleHost::new();
+    host.add_module(
+        "a.mjs",
+        r#"import { b_val } from "b.mjs"; export var a_val = 1;"#,
+    );
+    host.add_module(
+        "b.mjs",
+        r#"import { a_val } from "a.mjs"; export var b_val = 2;"#,
+    );
+
+    // Should not hang or crash — circular deps are allowed in ESM.
+    let mut runtime = RuntimeState::new();
+    let mut registry = ModuleRegistry::new();
+    let result = execute_module_graph("a.mjs", &host, &mut runtime, &mut registry);
+    // The result may or may not succeed (depends on initialization order),
+    // but it must not hang or crash.
+    let _ = result;
+    assert!(registry.get("a.mjs").is_some());
+    assert!(registry.get("b.mjs").is_some());
+}

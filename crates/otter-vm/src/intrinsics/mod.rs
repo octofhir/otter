@@ -7,6 +7,7 @@
 
 mod array_class;
 mod arraybuffer_class;
+mod atomics;
 pub(crate) mod async_generator_class;
 mod bigint_class;
 mod boolean_class;
@@ -129,6 +130,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "Function",
     "Array",
     "ArrayBuffer",
+    "Atomics",
     "BigInt",
     "SharedArrayBuffer",
     "String",
@@ -282,6 +284,7 @@ pub struct VmIntrinsics {
     namespace_roots: Vec<ObjectHandle>,
     reflect_namespace: Option<ObjectHandle>,
     json_namespace: Option<ObjectHandle>,
+    atomics_namespace: Option<ObjectHandle>,
     well_known_symbols: [WellKnownSymbol; 15],
     // Error hierarchy
     pub(crate) error_prototype: ObjectHandle,
@@ -357,6 +360,8 @@ pub struct VmIntrinsics {
     pub(crate) intl_display_names_prototype: ObjectHandle,
     pub(crate) intl_relative_time_format_constructor: ObjectHandle,
     pub(crate) intl_relative_time_format_prototype: ObjectHandle,
+    // §10.2.4 %ThrowTypeError% — shared accessor function for strict arguments
+    pub(crate) throw_type_error_function: Option<ObjectHandle>,
     // Temporal (proposal-temporal, Stage 4)
     pub(crate) temporal_namespace: ObjectHandle,
     pub(crate) temporal_instant_constructor: ObjectHandle,
@@ -375,6 +380,22 @@ pub struct VmIntrinsics {
     pub(crate) temporal_plain_month_day_prototype: ObjectHandle,
     pub(crate) temporal_zoned_date_time_constructor: ObjectHandle,
     pub(crate) temporal_zoned_date_time_prototype: ObjectHandle,
+}
+
+/// §10.2.4 %ThrowTypeError% native implementation.
+/// Always throws a TypeError, used for strict arguments callee/caller.
+/// Spec: <https://tc39.es/ecma262/#sec-%throwtypeerror%>
+fn throw_type_error_native(
+    _this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, crate::descriptors::VmNativeCallError> {
+    let error_handle = runtime.alloc_type_error(
+        "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+    ).map_err(|e| crate::descriptors::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    Err(crate::descriptors::VmNativeCallError::Thrown(
+        RegisterValue::from_object_handle(error_handle.0),
+    ))
 }
 
 impl VmIntrinsics {
@@ -569,6 +590,7 @@ impl VmIntrinsics {
             namespace_roots: Vec::new(),
             reflect_namespace: None,
             json_namespace: None,
+            atomics_namespace: None,
             well_known_symbols: [
                 WellKnownSymbol::Iterator,
                 WellKnownSymbol::AsyncIterator,
@@ -650,6 +672,7 @@ impl VmIntrinsics {
             intl_display_names_prototype,
             intl_relative_time_format_constructor,
             intl_relative_time_format_prototype,
+            throw_type_error_function: None,
             temporal_namespace,
             temporal_instant_constructor,
             temporal_instant_prototype,
@@ -1024,6 +1047,21 @@ impl VmIntrinsics {
             )?;
         }
 
+        // §10.2.4 %ThrowTypeError% — shared intrinsic for strict arguments callee/caller.
+        // Spec: <https://tc39.es/ecma262/#sec-%throwtypeerror%>
+        {
+            let desc = crate::descriptors::NativeFunctionDescriptor::method(
+                "%ThrowTypeError%",
+                0,
+                throw_type_error_native,
+            );
+            let host_fn = cx.native_functions.register(desc);
+            let handle = cx.alloc_intrinsic_host_function(host_fn, self.function_prototype)?;
+            // §10.2.4 step 3: SetIntegrityLevel(thrower, "frozen")
+            cx.heap.freeze(handle)?;
+            self.throw_type_error_function = Some(handle);
+        }
+
         self.stage = IntrinsicsStage::Installed;
         Ok(())
     }
@@ -1050,6 +1088,13 @@ impl VmIntrinsics {
     #[must_use]
     pub const fn function_prototype(&self) -> ObjectHandle {
         self.function_prototype
+    }
+
+    /// Returns `%ThrowTypeError%` (§10.2.4).
+    /// Used for strict arguments callee/caller accessors.
+    #[must_use]
+    pub fn throw_type_error_function(&self) -> Option<ObjectHandle> {
+        self.throw_type_error_function
     }
 
     /// Returns `%String%`.
@@ -1461,10 +1506,12 @@ impl VmIntrinsics {
         self.reflect_namespace
     }
 
-    /// Store/retrieve a named namespace (generic for JSON and future namespaces).
+    /// Store/retrieve a named namespace (generic for JSON, Atomics, and future namespaces).
     pub(super) fn set_namespace(&mut self, name: &str, handle: ObjectHandle) {
-        if name == "JSON" {
-            self.json_namespace = Some(handle);
+        match name {
+            "JSON" => self.json_namespace = Some(handle),
+            "Atomics" => self.atomics_namespace = Some(handle),
+            _ => {}
         }
         self.register_namespace_root(handle);
     }
@@ -1472,6 +1519,7 @@ impl VmIntrinsics {
     pub(super) fn namespace(&self, name: &str) -> Option<ObjectHandle> {
         match name {
             "JSON" => self.json_namespace,
+            "Atomics" => self.atomics_namespace,
             _ => None,
         }
     }
@@ -1706,6 +1754,10 @@ impl VmIntrinsics {
             tracer(IntrinsicRoot::Object(handle));
         }
 
+        if let Some(handle) = self.throw_type_error_function {
+            tracer(IntrinsicRoot::Object(handle));
+        }
+
         for handle in &self.namespace_roots {
             tracer(IntrinsicRoot::Object(*handle));
         }
@@ -1716,12 +1768,13 @@ impl VmIntrinsics {
     }
 }
 
-fn core_installers() -> [&'static dyn IntrinsicInstaller; 29] {
+fn core_installers() -> [&'static dyn IntrinsicInstaller; 30] {
     [
         // Iterator must be first — other installers reference iterator prototypes.
         &iterator_class::ITERATOR_INTRINSIC as &dyn IntrinsicInstaller,
         &array_class::ARRAY_INTRINSIC as &dyn IntrinsicInstaller,
         &arraybuffer_class::ARRAY_BUFFER_INTRINSIC as &dyn IntrinsicInstaller,
+        &atomics::ATOMICS_INTRINSIC as &dyn IntrinsicInstaller,
         &bigint_class::BIGINT_INTRINSIC as &dyn IntrinsicInstaller,
         &boolean_class::BOOLEAN_INTRINSIC as &dyn IntrinsicInstaller,
         &dataview_class::DATA_VIEW_INTRINSIC as &dyn IntrinsicInstaller,
@@ -1840,8 +1893,8 @@ mod tests {
             Ok(HeapValueKind::HostFunction)
         );
 
-        assert_eq!(intrinsics.namespace_roots().len(), 3);
-        assert_eq!(native_functions.len(), 714);
+        assert_eq!(intrinsics.namespace_roots().len(), 4);
+        assert_eq!(native_functions.len(), 727);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

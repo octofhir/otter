@@ -76,10 +76,20 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         params: &[ParamInfo<'_>],
     ) -> Result<(), SourceLoweringError> {
+        // §15.1 — Strict mode functions must not have duplicate parameter names.
+        // Spec: <https://tc39.es/ecma262/#sec-function-definitions-static-semantics-early-errors>
+        let mut seen_names: Option<std::collections::HashSet<String>> =
+            if self.strict_mode { Some(std::collections::HashSet::new()) } else { None };
+
         for param in params {
             if param.is_rest {
                 let register = self.allocate_local()?;
                 if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                    if let Some(ref mut seen) = seen_names
+                        && !seen.insert(name.to_string())
+                    {
+                        return Err(SourceLoweringError::DuplicateBinding(name.to_string()));
+                    }
                     self.env
                         .bindings
                         .insert(name.to_string(), Binding::Register(register));
@@ -97,6 +107,11 @@ impl<'a> FunctionCompiler<'a> {
                 .ok_or(SourceLoweringError::TooManyLocals)?;
             self.next_local = self.parameter_count;
             if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                if let Some(ref mut seen) = seen_names
+                    && !seen.insert(name.to_string())
+                {
+                    return Err(SourceLoweringError::DuplicateBinding(name.to_string()));
+                }
                 self.env
                     .bindings
                     .insert(name.to_string(), Binding::Register(register));

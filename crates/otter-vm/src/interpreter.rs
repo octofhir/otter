@@ -5547,10 +5547,30 @@ impl Interpreter {
                     )
                     .ok();
 
-                // §10.4.4.7 step 13: Install `callee` (sloppy mode only).
-                // For now, install if closure is available.
-                if let Some(closure) = activation.closure_handle() {
-                    let callee_key = runtime.intern_property_name("callee");
+                // §10.4.4.6 step 13 / §10.4.4.7 step 8: Install `callee`.
+                let callee_key = runtime.intern_property_name("callee");
+                if function.is_strict() {
+                    // §10.4.4.7 step 8: Unmapped arguments — accessor with %ThrowTypeError%.
+                    // { [[Get]]: %ThrowTypeError%, [[Set]]: %ThrowTypeError%,
+                    //   [[Enumerable]]: false, [[Configurable]]: false }
+                    if let Some(thrower) = runtime.intrinsics().throw_type_error_function() {
+                        runtime
+                            .objects_mut()
+                            .define_own_property(
+                                args_obj,
+                                callee_key,
+                                PropertyValue::Accessor {
+                                    getter: Some(thrower),
+                                    setter: Some(thrower),
+                                    attributes: PropertyAttributes::constant(),
+                                },
+                            )
+                            .ok();
+                    }
+                } else if let Some(closure) = activation.closure_handle() {
+                    // §10.4.4.6 step 13: Mapped arguments — data property with callee.
+                    // { [[Value]]: func, [[Writable]]: true,
+                    //   [[Enumerable]]: false, [[Configurable]]: true }
                     runtime
                         .objects_mut()
                         .define_own_property(

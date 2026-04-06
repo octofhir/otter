@@ -30,10 +30,33 @@ impl<'a> FunctionCompiler<'a> {
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         match expression {
-            Expression::NumericLiteral(literal) => self.compile_numeric_literal(literal.value),
+            Expression::NumericLiteral(literal) => {
+                // §B.1.1 — Legacy octal literals are a SyntaxError in strict mode.
+                // Spec: <https://tc39.es/ecma262/#sec-additional-syntax-numeric-literals>
+                if self.strict_mode
+                    && let Some(raw) = literal.raw.as_ref()
+                    && is_legacy_octal_literal(raw.as_str())
+                {
+                    return Err(SourceLoweringError::Parse(format!(
+                        "Octal literals are not allowed in strict mode: {}",
+                        raw.as_str()
+                    )));
+                }
+                self.compile_numeric_literal(literal.value)
+            }
             Expression::BooleanLiteral(literal) => self.compile_bool(literal.value),
             Expression::NullLiteral(_) => self.load_null(),
             Expression::StringLiteral(literal) => {
+                // §B.1.2 — Legacy octal escape sequences are a SyntaxError in strict mode.
+                // Spec: <https://tc39.es/ecma262/#sec-additional-syntax-string-literals>
+                if self.strict_mode
+                    && let Some(raw) = literal.raw.as_ref()
+                    && let Some(escape) = find_legacy_octal_escape(raw.as_str())
+                {
+                    return Err(SourceLoweringError::Parse(format!(
+                        "Octal escape sequences are not allowed in strict mode: {escape}"
+                    )));
+                }
                 if literal.lone_surrogates {
                     self.compile_js_string_literal(
                         crate::js_string::JsString::from_oxc_encoded(literal.value.as_str()),
@@ -2797,4 +2820,62 @@ impl<'a> FunctionCompiler<'a> {
             )))
         }
     }
+}
+
+/// §B.1.1 — Detects legacy octal numeric literals (e.g. `077`).
+///
+/// Legacy octals start with `0` followed by octal digits, but NOT `0o`, `0x`, `0b`, or `0.`.
+/// Modern `0o777` is always valid.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-additional-syntax-numeric-literals>
+fn is_legacy_octal_literal(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'0' {
+        return false;
+    }
+    // Modern prefixes: 0x, 0X, 0b, 0B, 0o, 0O, 0., 0e, 0E, 0n (bigint)
+    matches!(bytes[1], b'0'..=b'7')
+        && !matches!(bytes[1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'.' | b'e' | b'E' | b'n')
+}
+
+/// §B.1.2 — Detects legacy octal escape sequences in raw string literals.
+///
+/// Scans the raw string (including quotes) for `\1`..`\7`, `\8`, `\9`,
+/// or `\0` followed by another digit. Returns the first offending sequence
+/// if found. `\0` alone (without a following digit) is allowed.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-additional-syntax-string-literals>
+fn find_legacy_octal_escape(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            match next {
+                // \1 through \7 are always legacy octal escapes
+                b'1'..=b'7' => {
+                    return Some(format!("\\{}", next as char));
+                }
+                // \8, \9 are legacy non-octal decimal escapes (also banned)
+                b'8' | b'9' => {
+                    return Some(format!("\\{}", next as char));
+                }
+                // \0 is allowed ONLY if NOT followed by another digit
+                b'0' => {
+                    if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
+                        return Some(format!("\\0{}", bytes[i + 2] as char));
+                    }
+                    // \0 alone is fine (null character)
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }

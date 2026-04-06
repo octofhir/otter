@@ -544,7 +544,7 @@ impl<'a> TinyScriptLowerer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Interpreter;
+    use crate::{Interpreter, RuntimeState};
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::interpreter::InterpreterError;
     use crate::source::{compile_script, compile_test262_basic_script, lower_script};
@@ -5451,5 +5451,138 @@ mod tests {
             "json-round-trip.js",
         );
         assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    // ── §10.2.4 / §10.4.4 Strict mode validation ──
+
+    #[test]
+    fn oxc_rejects_strict_mode_duplicate_parameters() {
+        let result = compile_test262_basic_script(
+            "\"use strict\"; function f(a, a) { return a; }",
+            "strict-dup-params.js",
+        );
+        assert!(result.is_err(), "oxc should reject duplicate params in strict mode");
+    }
+
+    #[test]
+    fn sloppy_mode_duplicate_parameters_allowed() {
+        let result = compile_test262_basic_script(
+            "function f(a, a) { return a; }",
+            "sloppy-dup-params.js",
+        );
+        assert!(result.is_ok(), "sloppy mode should allow duplicate params");
+    }
+
+    #[test]
+    fn oxc_rejects_strict_mode_legacy_octal_literal() {
+        let result = compile_test262_basic_script(
+            "\"use strict\"; var x = 077;",
+            "strict-octal.js",
+        );
+        assert!(result.is_err(), "oxc should reject legacy octal in strict mode");
+    }
+
+    #[test]
+    fn sloppy_mode_legacy_octal_literal_allowed() {
+        let result = compile_test262_basic_script(
+            "var x = 077;",
+            "sloppy-octal.js",
+        );
+        assert!(result.is_ok(), "sloppy mode should allow legacy octal");
+    }
+
+    #[test]
+    fn oxc_rejects_strict_mode_octal_escape() {
+        let result = compile_test262_basic_script(
+            "\"use strict\"; var x = \"\\077\";",
+            "strict-octal-escape.js",
+        );
+        assert!(result.is_err(), "oxc should reject octal escape in strict mode");
+    }
+
+    #[test]
+    fn strict_arguments_callee_throws_type_error() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function strict() {\n",
+                "  \"use strict\";\n",
+                "  try {\n",
+                "    var c = arguments.callee;\n",
+                "    throw new Test262Error(\"should have thrown\");\n",
+                "  } catch (e) {\n",
+                "    if (!(e instanceof TypeError)) {\n",
+                "      throw new Test262Error(\"wrong error type: \" + e);\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+                "strict();\n",
+            ),
+            "strict-arguments-callee.js",
+        )
+        .expect("should compile");
+        let mut runtime = RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let result = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect("strict arguments.callee test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn sloppy_arguments_callee_is_defined() {
+        // Sloppy-mode arguments.callee should be a data property containing
+        // the closure for the executing function (§10.4.4.6 step 13).
+        let result = execute_test262_basic(
+            concat!(
+                "function sloppy() {\n",
+                "  if (typeof arguments.callee !== 'function') {\n",
+                "    throw new Test262Error('callee type: ' + typeof arguments.callee);\n",
+                "  }\n",
+                "}\n",
+                "sloppy();\n",
+            ),
+            "sloppy-arguments-callee.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
+    #[test]
+    fn strict_arguments_callee_set_throws_type_error() {
+        let module = compile_test262_basic_script(
+            concat!(
+                "function strict() {\n",
+                "  \"use strict\";\n",
+                "  try {\n",
+                "    arguments.callee = 1;\n",
+                "    throw new Test262Error(\"should have thrown on set\");\n",
+                "  } catch (e) {\n",
+                "    if (!(e instanceof TypeError)) {\n",
+                "      throw new Test262Error(\"wrong error type: \" + e);\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+                "strict();\n",
+            ),
+            "strict-arguments-callee-set.js",
+        )
+        .expect("should compile");
+        let mut runtime = RuntimeState::new();
+        let global = runtime.intrinsics().global_object();
+        let registers = [RegisterValue::from_object_handle(global.0)];
+        let result = Interpreter::new()
+            .execute_with_runtime(
+                &module,
+                crate::module::FunctionIndex(0),
+                &registers,
+                &mut runtime,
+            )
+            .expect("strict arguments.callee set test should execute");
+        assert_eq!(result.return_value(), RegisterValue::from_i32(0));
     }
 }

@@ -2318,7 +2318,7 @@ impl ObjectHeap {
     }
 
     /// Helper: get immutable data slice from ArrayBuffer or SharedArrayBuffer.
-    fn array_buffer_or_shared_data(&self, handle: ObjectHandle) -> Result<&[u8], ObjectError> {
+    pub fn array_buffer_or_shared_data(&self, handle: ObjectHandle) -> Result<&[u8], ObjectError> {
         match self.object(handle)? {
             HeapValue::ArrayBuffer { data, detached, .. } => {
                 if *detached {
@@ -2333,7 +2333,7 @@ impl ObjectHeap {
     }
 
     /// Helper: get mutable data slice from ArrayBuffer or SharedArrayBuffer.
-    fn array_buffer_or_shared_data_mut(
+    pub fn array_buffer_or_shared_data_mut(
         &mut self,
         handle: ObjectHandle,
     ) -> Result<&mut [u8], ObjectError> {

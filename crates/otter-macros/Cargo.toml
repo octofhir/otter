@@ -23,8 +23,6 @@ syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 
 [dev-dependencies]
 otter-vm = { path = "../otter-vm" }
-otter-vm-core = { path = "../otter-vm-core" }
-otter-vm-runtime = { path = "../otter-vm-runtime" }
 
 [[test]]
 name = "js_class_descriptor"

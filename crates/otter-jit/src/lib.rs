@@ -80,3 +80,13 @@ pub enum JitError {
     #[error("internal error: {0}")]
     Internal(String),
 }
+
+/// Release all thread-local JIT state (code cache, telemetry, helper symbols).
+///
+/// Must be called when an `OtterRuntime` is dropped so that compiled code and
+/// accumulated metrics do not leak across runtime instances.
+pub fn cleanup_thread_locals() {
+    code_cache::clear();
+    telemetry::reset();
+    pipeline::clear_helper_symbols();
+}

@@ -54,6 +54,11 @@ pub fn lookup_helper_address(name: &str) -> Option<usize> {
     HELPER_ADDRS.with(|m| m.borrow().get(name).copied())
 }
 
+/// Clear the helper symbol table (called on runtime teardown).
+pub fn clear_helper_symbols() {
+    HELPER_ADDRS.with(|m| m.borrow_mut().clear());
+}
+
 // ============================================================
 // Compilation & Execution API
 // ============================================================

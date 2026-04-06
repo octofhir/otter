@@ -1937,6 +1937,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-macros"
+version = "0.1.0"
+dependencies = [
+ "otter-vm",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "otter-modules"
 version = "0.1.0"
 dependencies = [
@@ -2036,6 +2046,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "otter-gc",
+ "otter-macros",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",

@@ -30,35 +30,29 @@ just run examples/basic.ts
 just test262-filter "Array/prototype/map"
 ```
 
-Current fast-path CLI surface during migration:
+Current fast-path CLI surface:
 - enabled: `run`, direct file execution, `-e`, `-p`, package-management commands
 - disabled: `repl`, `test`, `build`
 
 ## Key Architecture
 
-Target stack:
+Current runtime stack:
 - `crates/otter-gc`
 - `crates/otter-vm`
 - `crates/otter-runtime`
 - `crates/otter-jit`
 
-Legacy stack being retired:
-- `crates/otter-engine`
-- `crates/otter-vm-runtime`
-- `crates/otter-vm-core`
-
-Migration rules:
-- New runtime/VM/API work must target the target stack.
-- Do not add new dependencies from target-stack crates to legacy crates.
-- Legacy crates may remain in the repo temporarily, but once no active workspace member depends on them they should be removed from `[workspace].members` so they stop participating in compilation.
-- Removing a crate from the workspace is not enough if a live crate still depends on it by path.
+Compatibility rules:
+- New runtime/VM/API work belongs on the current runtime stack.
+- Do not add new dependencies from active crates into parked compatibility shims.
+- Keep `otter-nodejs` and `otter-node-compat` compileable, but treat them as parked surfaces rather than active implementation homes.
 
 ### Crate Layering (bottom-up)
 
 ```
 otterjs (CLI)
     ↓
-target host/runtime integration layer
+    host/runtime integration layer
     ↓
 otter-runtime
     ↓
@@ -75,17 +69,17 @@ otter-gc
 
 3. **GC Safety**: Use `GcRef<T>` for references. Values must be properly rooted across GC boundaries.
 
-4. **Native Functions**: Port native bindings toward the target runtime/VM ABI. Do not add new JS-visible host bindings to legacy crates.
-   `otter:kv`, `otter:sql`, and `otter:ffi` now live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path on the new stack.
+4. **Native Functions**: Add native bindings against the current runtime/VM ABI.
+   `otter:kv`, `otter:sql`, and `otter:ffi` live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path there.
 5. **Types Source Of Truth**: keep Otter `.d.ts` files under `crates/otter-pm/src/types/otter/`; treat `packages/otter-types/` as generated publish output.
 6. **Web API Placement**: standards-facing Web API work belongs in `crates/otter-web`, not in `crates/otter-modules`.
 
 7. **Module System**:
-   - Must move onto the target runtime integration layer
-   - Support for `file://`, `node:`, and `https://` URLs remains required during migration
-   - Import maps and graph semantics should be preserved while removing legacy dependencies
+   - Lives on the runtime integration layer
+   - Support for `file://`, `node:`, and `https://` URLs remains required
+   - Import maps and graph semantics should be preserved as the runtime surface evolves
 
-8. **Async Operations**: Require Tokio runtime handle. New async/runtime behavior must move toward `otter-runtime` + `otter-vm`, not `otter-vm-runtime`.
+8. **Async Operations**: Require Tokio runtime handle.
 
 9. **Parsing**: Always use ASTs via `oxc` parser. **Never use regex to parse JS/TS code.**
 
@@ -115,9 +109,8 @@ just test262-dir "language/expressions"  # Specific directory
 
 ### Node.js Compatibility
 
-`node-compat` is parked while the legacy stack stays frozen. Do not treat the
-old Node.js compatibility runner as an active workflow until it is rebuilt on
-top of `otter-runtime` + `otter-vm`.
+`node-compat` is parked. Do not treat the old Node.js compatibility runner as
+an active workflow until it is rebuilt on top of `otter-runtime` + `otter-vm`.
 
 ### Test-Driven Development Workflow
 When working on features with conformance tests:
@@ -158,13 +151,13 @@ cargo build --release -p otterjs
 
 ## Security Model
 
-Deny-by-default capabilities remain required during migration:
+Deny-by-default capabilities remain required:
 - `fs_read`, `fs_write`: Path allowlists
 - `net`: Host allowlists
 - `env`: Variable allowlists with secret deny patterns (`AWS_*`, `*_SECRET*`, etc.)
 - `subprocess`, `ffi`: Boolean flags
 
-**Never bypass capability checks.** Always enforce at Rust boundary with test coverage, and port the checks to the target stack instead of extending legacy implementations.
+**Never bypass capability checks.** Always enforce at the Rust boundary with test coverage.
 
 ## Rust Best Practices
 
@@ -219,7 +212,7 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 4. **Update the triangle**: Keep runtime ↔ TypeScript `.d.ts` ↔ tests in sync
 5. **AST-first parsing**: Use `oxc` for JS/TS analysis; never regex parsing
 6. **Conformance first**: Check `ES_CONFORMANCE.md` before and after feature work. Track pass rate deltas.
-7. **Protect the migration boundary**: no new target-stack dependency on legacy crates.
+7. **Protect active boundaries**: no new active-runtime dependency on parked compatibility shims.
 
 ## Current Work
 

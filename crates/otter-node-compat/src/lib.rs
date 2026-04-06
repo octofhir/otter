@@ -1,14 +1,14 @@
-//! # Otter Node.js Compatibility Test Runner
+//! Parked Node.js compatibility runner shim.
 //!
-//! Runs Node.js test files against the Otter VM to measure
-//! compatibility with Node.js built-in module APIs.
+//! The original runner depended on the retired engine stack. It remains in the
+//! repository as a compileable placeholder until a new-stack replacement lands.
 
 #![warn(clippy::all)]
 
-pub mod compare;
-pub mod config;
-pub mod report;
-pub mod runner;
+pub const PARKED_MESSAGE: &str =
+    "node-compat is parked during the legacy stack retirement and has no active runtime backend";
 
-pub use report::{FailureInfo, ModuleReport, PersistedReport, TestReport};
-pub use runner::{NodeCompatRunner, TestOutcome, TestResult};
+#[must_use]
+pub const fn parked_message() -> &'static str {
+    PARKED_MESSAGE
+}

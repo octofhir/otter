@@ -2,7 +2,7 @@
 name = "otter-nodejs"
 version = "0.1.0"
 edition = "2024"
-description = "Node.js API compatibility for Otter VM"
+description = "Parked Node.js API compatibility shim for the new Otter runtime stack"
 license = "MIT"
 autotests = false
 
@@ -10,25 +10,7 @@ autotests = false
 test = false
 doctest = false
 
-[dependencies]
-otter-vm-core = { path = "../otter-vm-core" }
-otter-vm-runtime = { path = "../otter-vm-runtime" }
-otter-macros = { path = "../otter-macros" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-base64 = "0.22"
-dunce = "1"
-tokio = { version = "1", features = ["fs", "rt", "io-util", "net", "sync", "macros"] }
-filetime = "0.2"
-sysinfo = "0.38"
-libc = "0.2"
-notify = "8"
-parking_lot = "0.12"
-regex = "1"
-percent-encoding = "2"
-idna = "1"
-url = "2"
+[workspace]
 
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
+[dependencies]
+otter-runtime = { path = "../otter-runtime" }

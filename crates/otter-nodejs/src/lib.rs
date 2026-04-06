@@ -1,69 +1,21 @@
 #![allow(missing_docs)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::clone_on_copy)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::manual_unwrap_or_default)]
 
-//! Node.js API compatibility for Otter VM
+//! Parked Node.js API compatibility shim.
 //!
-//! This crate provides Node.js-compatible APIs as native extensions for the Otter VM.
-//!
-//! # Modules
-//!
-//! - `buffer` - Binary data handling (Buffer class)
-//! - `process` - Process object (env, cwd, exit, etc.)
-//! - `events` - EventEmitter class
-//! - `fs` - File system operations
-//! - `path` - Path manipulation utilities
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use otter_nodejs::nodejs_extensions;
-//!
-//! for ext in nodejs_extensions() {
-//!     runtime.register_native_extension(ext);
-//! }
-//! ```
+//! The legacy Node.js implementation depended on the retired VM stack. This
+//! crate now stays compileable as a thin parking layer while the real Node.js
+//! surface is redesigned on top of `otter-runtime` + `otter-vm`.
 
-pub mod assert_ext;
-pub mod buffer;
-pub mod buffer_ext;
-pub mod child_process_ext;
-pub mod cluster_ext;
-pub mod events_ext;
-mod fs_core;
-pub mod fs_ext;
 mod module_registry;
-pub mod net_ext;
-pub mod os_ext;
-pub mod path_ext;
-pub mod process_ext;
-pub mod provider;
-mod security;
-pub mod stream_ext;
-pub mod test_ext;
-pub mod timers_ext;
-pub mod timers_module_ext;
-pub mod url_ext;
-pub mod util_ext;
-pub mod worker_threads_ext;
+
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use otter_runtime::HostedExtension;
 
 pub use module_registry::NodeModuleEntry;
-use otter_vm_runtime::extension_v2::OtterExtension;
-pub use process_ext::set_process_argv_override;
-pub use provider::{
-    NodeModuleProvider, create_nodejs_provider, create_nodejs_provider_for_profile,
-    create_nodejs_safe_provider,
-};
 
 /// Node.js API compatibility profile.
-///
-/// - `None`: Node APIs are disabled.
-/// - `SafeCore`: only non-host-control modules for embedded-safe usage.
-/// - `Full`: full currently-implemented Node compatibility surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NodeApiProfile {
     #[default]
@@ -72,29 +24,41 @@ pub enum NodeApiProfile {
     Full,
 }
 
-/// Get the list of supported built-in module specifiers.
+/// Placeholder provider retained only so parked callers can still construct a
+/// profile-specific marker without pulling the legacy stack back in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeModuleProvider {
+    profile: NodeApiProfile,
+}
+
+impl NodeModuleProvider {
+    #[must_use]
+    pub const fn profile(self) -> NodeApiProfile {
+        self.profile
+    }
+}
+
+/// Get the list of supported built-in module specifiers from the parked table.
 pub fn builtin_modules() -> &'static [&'static str] {
     module_registry::builtin_modules()
 }
 
-/// Get the list of safe profile built-in module specifiers.
+/// Get the list of safe profile built-in module specifiers from the parked table.
 pub fn safe_builtin_modules() -> &'static [&'static str] {
     module_registry::safe_builtin_modules()
 }
 
-/// Check if a specifier refers to a Node.js built-in module.
-///
-/// Supports both prefixed (`node:fs`) and bare (`fs`) specifiers.
+/// Check if a specifier refers to a parked Node.js built-in module.
 pub fn is_builtin(specifier: &str) -> bool {
     is_builtin_for_profile(specifier, NodeApiProfile::Full)
 }
 
-/// Check if a specifier is allowed for the safe profile.
+/// Check if a specifier is allowed for the parked safe profile.
 pub fn is_safe_builtin(specifier: &str) -> bool {
     is_builtin_for_profile(specifier, NodeApiProfile::SafeCore)
 }
 
-/// Check if a builtin is available for a specific profile.
+/// Check if a parked builtin is available for a specific profile.
 pub fn is_builtin_for_profile(specifier: &str, profile: NodeApiProfile) -> bool {
     module_registry::is_builtin_for_profile(specifier, profile)
 }
@@ -107,56 +71,59 @@ pub fn get_builtin_entry_for_profile(
     module_registry::module_entry_for_profile(name, profile)
 }
 
-/// Get all native extensions for Node.js module compatibility.
-///
-/// These are zero-JS-shim extensions that provide native implementations
-/// of Node.js modules (path, os, etc.).
-pub fn nodejs_extensions() -> Vec<Box<dyn OtterExtension>> {
-    vec![
-        path_ext::node_path_extension(),
-        os_ext::node_os_extension(),
-        process_ext::node_process_extension(),
-        fs_ext::node_fs_extension(),
-        events_ext::node_events_extension(),
-        stream_ext::node_stream_extension(),
-        timers_module_ext::node_timers_extension(),
-        util_ext::node_util_extension(),
-        assert_ext::node_assert_extension(),
-        buffer_ext::node_buffer_extension(),
-        worker_threads_ext::node_worker_threads_extension(),
-        net_ext::node_net_extension(),
-        child_process_ext::node_child_process_extension(),
-        url_ext::node_url_extension(),
-        cluster_ext::node_cluster_extension(),
-        test_ext::node_test_extension(),
-    ]
+/// The active runtime no longer loads Node.js extensions from this crate.
+pub fn nodejs_extensions() -> Vec<Arc<dyn HostedExtension>> {
+    Vec::new()
 }
 
-// Stubs for node-compat overrides (used by test runner)
-use std::cell::RefCell;
+/// Create a parked provider marker for the full profile.
+pub fn create_nodejs_provider() -> Arc<NodeModuleProvider> {
+    create_nodejs_provider_for_profile(NodeApiProfile::Full)
+}
+
+/// Create a parked provider marker for the safe profile.
+pub fn create_nodejs_safe_provider() -> Arc<NodeModuleProvider> {
+    create_nodejs_provider_for_profile(NodeApiProfile::SafeCore)
+}
+
+/// Create a parked provider marker for the requested profile.
+pub fn create_nodejs_provider_for_profile(profile: NodeApiProfile) -> Arc<NodeModuleProvider> {
+    Arc::new(NodeModuleProvider { profile })
+}
 
 thread_local! {
-    static PROCESS_EXEC_ARGV: RefCell<Option<Vec<String>>> = RefCell::new(None);
-    static AUTO_SELECT_FAMILY: RefCell<Option<bool>> = RefCell::new(None);
-    static AUTO_SELECT_FAMILY_TIMEOUT: RefCell<Option<u64>> = RefCell::new(None);
+    static PROCESS_ARGV_OVERRIDE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static PROCESS_EXEC_ARGV_OVERRIDE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static AUTO_SELECT_FAMILY: RefCell<Option<bool>> = const { RefCell::new(None) };
+    static AUTO_SELECT_FAMILY_TIMEOUT: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
-/// Override process.execArgv for test runner.
+/// Override `process.argv` for parked compatibility tooling.
+pub fn set_process_argv_override(argv: Option<Vec<String>>) {
+    PROCESS_ARGV_OVERRIDE.with(|value| *value.borrow_mut() = argv);
+}
+
+/// Read the parked `process.argv` override.
+pub fn get_process_argv_override() -> Option<Vec<String>> {
+    PROCESS_ARGV_OVERRIDE.with(|value| value.borrow().clone())
+}
+
+/// Override `process.execArgv` for parked compatibility tooling.
 pub fn set_process_exec_argv_override(argv: Option<Vec<String>>) {
-    PROCESS_EXEC_ARGV.with(|v| *v.borrow_mut() = argv);
+    PROCESS_EXEC_ARGV_OVERRIDE.with(|value| *value.borrow_mut() = argv);
 }
 
-/// Get the process.execArgv override.
+/// Read the parked `process.execArgv` override.
 pub fn get_process_exec_argv_override() -> Option<Vec<String>> {
-    PROCESS_EXEC_ARGV.with(|v| v.borrow().clone())
+    PROCESS_EXEC_ARGV_OVERRIDE.with(|value| value.borrow().clone())
 }
 
-/// Override net.setDefaultAutoSelectFamily for test runner.
-pub fn set_default_auto_select_family_override(val: Option<bool>) {
-    AUTO_SELECT_FAMILY.with(|v| *v.borrow_mut() = val);
+/// Override `net.setDefaultAutoSelectFamily` for parked compatibility tooling.
+pub fn set_default_auto_select_family_override(value: Option<bool>) {
+    AUTO_SELECT_FAMILY.with(|slot| *slot.borrow_mut() = value);
 }
 
-/// Override net.setDefaultAutoSelectFamilyAttemptTimeout for test runner.
-pub fn set_default_auto_select_family_attempt_timeout_override(val: Option<u64>) {
-    AUTO_SELECT_FAMILY_TIMEOUT.with(|v| *v.borrow_mut() = val);
+/// Override `net.setDefaultAutoSelectFamilyAttemptTimeout` for parked tooling.
+pub fn set_default_auto_select_family_attempt_timeout_override(value: Option<u64>) {
+    AUTO_SELECT_FAMILY_TIMEOUT.with(|slot| *slot.borrow_mut() = value);
 }

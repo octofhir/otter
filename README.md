@@ -9,7 +9,7 @@ Otter is designed to embed scripting in Rust applications or run scripts directl
 1. **Embeddable runtime** - Use `otter-runtime` as the active public embedding API
 2. **Standalone CLI** - Run scripts with the `otter` binary (`otterjs` crate)
 
-The runtime is a custom VM with garbage collection, written in Rust. The active stack is `otter-gc` + `otter-vm` + `otter-runtime`; older engine crates are frozen while functionality is ported over.
+The runtime is a custom VM with garbage collection, written in Rust. The current core crates are `otter-gc` + `otter-vm` + `otter-runtime`, with `otter-jit` as the active JIT pipeline.
 
 ## Installation
 
@@ -41,11 +41,11 @@ otter info
 otter init
 ```
 
-The current fast-path CLI intentionally keeps a smaller active surface during migration. `repl`, `test`, and `build` are not active commands at this stage.
+The current CLI intentionally keeps a smaller active surface. `repl`, `test`, and `build` are not active commands at this stage.
 
 ### Permissions
 
-Capability and host-integration work is being ported to the active runtime stack. Expect this surface to keep evolving while the legacy stack stays frozen.
+Capability and host-integration work is still evolving. Expect this surface to keep growing as more hosted functionality lands directly on `otter-runtime`.
 
 ```bash
 otter run app.ts --allow-read           # file system read
@@ -70,17 +70,17 @@ fn main() -> anyhow::Result<()> {
 ## Runtime Features (current)
 
 - Custom bytecode VM + JS/TS compiler with TypeScript support out of the box
-- Module/runtime host features are being ported onto `otter-runtime`
-- Capability-based permissions remain a design requirement during migration
-- Web/API and extension surfaces are being reintroduced incrementally on the active stack
+- Module/runtime host features live on `otter-runtime`
+- Capability-based permissions remain a core design requirement
+- Web/API and extension surfaces are being expanded incrementally
 - Standards-facing Web APIs now land in `crates/otter-web`, with `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`, and `Headers` already active
 - Active otter-specific hosted modules now live in `crates/otter-modules`, including `otter:kv`, `otter:sql`, and `otter:ffi`
 - Core JavaScript builtins (Object/Array/Map/Set/Date/RegExp/JSON/Promise/Proxy/Reflect/Symbol, etc.)
-- Test262 runner is active on the new runtime stack
+- Test262 runner is active on the current runtime stack
 
 ## Status
 
-Otter is actively evolving. The package ecosystem support is in progress (see `crates/otter-pm`). Expect regular additions to the runtime surface as deferred host features are ported to `otter-runtime`.
+Otter is actively evolving. Package ecosystem support is in progress (see `crates/otter-pm`). Expect regular additions to the runtime surface as more host features land on `otter-runtime`.
 
 ## Project Structure
 
@@ -89,11 +89,13 @@ crates/
 ├── otter-gc           # Active garbage collector
 ├── otter-vm           # Active VM, compiler, intrinsics
 ├── otter-runtime      # Active public runtime API
-├── otter-jit          # Active JIT pipeline for the new VM
+├── otter-jit          # Active JIT pipeline
 ├── otter-modules      # Active otter:* hosted modules (kv/sql/ffi)
-├── otter-web          # Active Web API crate on the new stack
+├── otter-web          # Active Web API crate
 ├── otter-pm           # Package manager integration (in progress)
 ├── otter-test262      # Active conformance runner
+├── otter-nodejs       # Parked Node.js compatibility shim
+├── otter-node-compat  # Parked node-compat shim
 └── otterjs            # CLI binary
 ```
 

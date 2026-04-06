@@ -55,6 +55,17 @@ pub struct OtterRuntime {
     host_state: HostState,
 }
 
+impl Drop for OtterRuntime {
+    fn drop(&mut self) {
+        // Release all thread-local JIT state (code cache, telemetry, helper
+        // symbols). Without this, every `OtterRuntime` instance leaks compiled
+        // Cranelift JITModules and accumulated metrics into the thread-local
+        // code cache — catastrophic for workloads that create many short-lived
+        // runtimes (e.g. the test262 runner).
+        otter_jit::cleanup_thread_locals();
+    }
+}
+
 impl OtterRuntime {
     /// Returns a new [`RuntimeBuilder`] for configuring the runtime.
     pub fn builder() -> RuntimeBuilder {

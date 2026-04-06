@@ -45,4 +45,5 @@ icu_segmenter = "2.1"
 icu_experimental = { version = "0.5", features = ["compiled_data"] }
 
 [dev-dependencies]
+otter-macros = { path = "../otter-macros" }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }

@@ -495,6 +495,10 @@ fn typed_array_base_class_descriptor() -> JsClassDescriptor {
         .with_binding(proto("some", 1, typed_array_some))
         .with_binding(proto("sort", 1, typed_array_sort))
         .with_binding(proto("subarray", 2, typed_array_subarray))
+        // §23.2.3 ES2023 change-by-copy methods
+        .with_binding(proto("toReversed", 0, typed_array_to_reversed))
+        .with_binding(proto("toSorted", 1, typed_array_to_sorted))
+        .with_binding(proto("with", 2, typed_array_with))
         .with_binding(proto("values", 0, typed_array_values))
         .with_binding(proto("toString", 0, typed_array_to_string))
         .with_binding(proto("toLocaleString", 0, typed_array_to_locale_string))
@@ -2357,6 +2361,234 @@ fn find_kind_from_constructor(
     }
     // Default to Uint8Array if we can't determine
     Ok(TypedArrayKind::Uint8)
+}
+
+// ─── ES2023 change-by-copy methods ──────────────────────────────────────────
+
+/// §23.2.3.30 %TypedArray%.prototype.toReversed ( )
+/// <https://tc39.es/ecma262/#sec-%typedarray%.prototype.toreversed>
+///
+/// Returns a new TypedArray of the same kind with elements in reverse order.
+fn typed_array_to_reversed(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_typed_array(this, "%TypedArray%.prototype.toReversed", runtime)?;
+    require_not_detached(handle, "%TypedArray%.prototype.toReversed", runtime)?;
+    let kind = runtime
+        .objects()
+        .typed_array_kind(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    let len = runtime
+        .objects()
+        .typed_array_length(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    // Read elements in reverse.
+    let mut elements = Vec::with_capacity(len);
+    for i in (0..len).rev() {
+        let val = runtime
+            .objects()
+            .typed_array_get_element(handle, i)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
+            .unwrap_or(0.0);
+        elements.push(val);
+    }
+
+    // Allocate new TypedArray with same kind.
+    let result = alloc_typed_array_from_elements(kind, &elements, runtime)?;
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// §23.2.3.31 %TypedArray%.prototype.toSorted ( comparefn )
+/// <https://tc39.es/ecma262/#sec-%typedarray%.prototype.tosorted>
+///
+/// Returns a new TypedArray of the same kind with elements sorted.
+fn typed_array_to_sorted(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_typed_array(this, "%TypedArray%.prototype.toSorted", runtime)?;
+    require_not_detached(handle, "%TypedArray%.prototype.toSorted", runtime)?;
+    let kind = runtime
+        .objects()
+        .typed_array_kind(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+
+    let comparefn = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // §23.2.3.31 step 2: If comparefn is not undefined and not callable, throw TypeError.
+    if comparefn != RegisterValue::undefined() {
+        if let Some(h) = comparefn.as_object_handle().map(ObjectHandle) {
+            if !runtime.objects().is_callable(h) {
+                return Err(type_error(
+                    runtime,
+                    "%TypedArray%.prototype.toSorted: comparefn is not callable",
+                )?);
+            }
+        } else {
+            return Err(type_error(
+                runtime,
+                "%TypedArray%.prototype.toSorted: comparefn is not callable",
+            )?);
+        }
+    }
+
+    let mut elements = read_all_elements(handle, runtime)?;
+
+    if comparefn == RegisterValue::undefined() {
+        // Default: sort numerically (§23.2.3.31 step 8).
+        elements.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        // Insertion sort with user comparefn.
+        for i in 1..elements.len() {
+            let key = elements[i];
+            let mut j = i;
+            while j > 0 {
+                let cmp_result = call_js(
+                    runtime,
+                    comparefn,
+                    RegisterValue::undefined(),
+                    &[
+                        RegisterValue::from_number(elements[j - 1]),
+                        RegisterValue::from_number(key),
+                    ],
+                )?;
+                let cmp = to_num(runtime, cmp_result).unwrap_or(0.0);
+                if cmp <= 0.0 {
+                    break;
+                }
+                elements[j] = elements[j - 1];
+                j -= 1;
+            }
+            elements[j] = key;
+        }
+    }
+
+    let result = alloc_typed_array_from_elements(kind, &elements, runtime)?;
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// §23.2.3.37 %TypedArray%.prototype.with ( index, value )
+/// <https://tc39.es/ecma262/#sec-%typedarray%.prototype.with>
+///
+/// Returns a new TypedArray identical to the original except the element at
+/// `index` is replaced with `value`.
+fn typed_array_with(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = require_typed_array(this, "%TypedArray%.prototype.with", runtime)?;
+    require_not_detached(handle, "%TypedArray%.prototype.with", runtime)?;
+    let kind = runtime
+        .objects()
+        .typed_array_kind(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    let len = runtime
+        .objects()
+        .typed_array_length(handle)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))? as i64;
+
+    // Step 3: Let relativeIndex be ? ToIntegerOrInfinity(index).
+    let raw_index = to_num(
+        runtime,
+        args.first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined),
+    )?
+    .trunc() as i64;
+
+    let actual_index = if raw_index < 0 {
+        len + raw_index
+    } else {
+        raw_index
+    };
+
+    // Step 7: If actualIndex < 0 or actualIndex ≥ len, throw RangeError.
+    if actual_index < 0 || actual_index >= len {
+        let err = runtime
+            .alloc_range_error("TypedArray.prototype.with: index out of range")
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        return Err(VmNativeCallError::Thrown(
+            RegisterValue::from_object_handle(err.0),
+        ));
+    }
+    let actual_index = actual_index as usize;
+
+    // Step 5-6: Coerce value based on content type.
+    let new_value_arg = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+
+    // Read all elements, replace at index.
+    let mut elements = read_all_elements(handle, runtime)?;
+
+    if kind.is_bigint_kind() {
+        // For BigInt typed arrays, the value must be a BigInt.
+        let Some(bigint_handle) = new_value_arg.as_bigint_handle() else {
+            return Err(type_error(
+                runtime,
+                "%TypedArray%.prototype.with: BigInt typed arrays require BigInt values",
+            )?);
+        };
+        let bigint_str = match runtime.objects().bigint_value(ObjectHandle(bigint_handle)) {
+            Ok(Some(s)) => s.to_string(),
+            _ => {
+                return Err(type_error(runtime, "%TypedArray%.prototype.with: invalid BigInt")?);
+            }
+        };
+        let n: f64 = match kind {
+            TypedArrayKind::BigInt64 => {
+                let v: i64 = bigint_str.parse().unwrap_or(0);
+                v as f64
+            }
+            TypedArrayKind::BigUint64 => {
+                let v: u64 = bigint_str.parse().unwrap_or(0);
+                v as f64
+            }
+            _ => unreachable!(),
+        };
+        elements[actual_index] = n;
+    } else {
+        // For numeric typed arrays, coerce to Number.
+        let n = to_num(runtime, new_value_arg)?;
+        elements[actual_index] = n;
+    }
+
+    let result = alloc_typed_array_from_elements(kind, &elements, runtime)?;
+    Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// Helper: allocate a new TypedArray of the given kind from a slice of f64 elements.
+fn alloc_typed_array_from_elements(
+    kind: TypedArrayKind,
+    elements: &[f64],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let byte_length = elements.len() * kind.element_size();
+    let data = vec![0u8; byte_length];
+    let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
+    let buffer = runtime
+        .objects_mut()
+        .alloc_array_buffer_with_data(data, ab_proto);
+    let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
+    let result = runtime
+        .objects_mut()
+        .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto));
+    for (i, &val) in elements.iter().enumerate() {
+        runtime
+            .objects_mut()
+            .typed_array_set_element(result, i, val)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    }
+    Ok(result)
 }
 
 /// Format a number for join/toString.

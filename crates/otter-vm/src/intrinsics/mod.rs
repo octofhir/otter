@@ -391,6 +391,13 @@ pub struct VmIntrinsics {
     pub(crate) eval_error_constructor: ObjectHandle,
     pub(crate) aggregate_error_prototype: ObjectHandle,
     pub(crate) aggregate_error_constructor: ObjectHandle,
+    /// V8-extension `Error.prototype.stack` getter — stored so
+    /// `Error.captureStackTrace` can install an own accessor on arbitrary
+    /// targets.
+    pub(crate) error_stack_getter: Option<ObjectHandle>,
+    /// V8-extension `Error.prototype.stack` setter — stored alongside the
+    /// getter for the same reason.
+    pub(crate) error_stack_setter: Option<ObjectHandle>,
     // Map / Set
     pub(crate) map_constructor: ObjectHandle,
     pub(crate) map_prototype: ObjectHandle,
@@ -762,6 +769,8 @@ impl VmIntrinsics {
             eval_error_constructor,
             aggregate_error_prototype,
             aggregate_error_constructor,
+            error_stack_getter: None,
+            error_stack_setter: None,
             map_constructor,
             map_prototype,
             set_constructor,
@@ -2040,7 +2049,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 4);
-        assert_eq!(native_functions.len(), 731);
+        assert_eq!(native_functions.len(), 734);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

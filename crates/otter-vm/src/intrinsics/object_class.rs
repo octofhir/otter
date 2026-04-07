@@ -696,6 +696,7 @@ fn object_to_string_tag(
         HeapValueKind::TypedArray => Ok("TypedArray"),
         HeapValueKind::DataView => Ok("DataView"),
         HeapValueKind::BigInt => Ok("BigInt"),
+        HeapValueKind::ErrorStackFrames => Ok("Object"),
     }
 }
 

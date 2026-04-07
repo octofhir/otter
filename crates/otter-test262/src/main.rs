@@ -125,169 +125,25 @@ fn test262_done(
     Ok(RegisterValue::undefined())
 }
 
-fn test262_realm_symbol(
-    _this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let description = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    runtime
-        .create_symbol_from_value(description)
-        .map_err(|error| map_interpreter_error(error, runtime))
-}
-
-fn test262_realm_symbol_for(
-    _this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let key = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    runtime
-        .symbol_for_value(key)
-        .map_err(|error| map_interpreter_error(error, runtime))
-}
-
-fn test262_realm_symbol_key_for(
-    _this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let value = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    if !value.is_symbol() {
-        let error = runtime
-            .alloc_type_error("Symbol.keyFor requires a symbol argument")
-            .map_err(|error| {
-                VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
-            })?;
-        return Err(VmNativeCallError::Thrown(
-            RegisterValue::from_object_handle(error.0),
-        ));
-    }
-    let Some(key) = runtime.symbol_registry_key(value).map(str::to_owned) else {
-        return Ok(RegisterValue::undefined());
-    };
-    let key = runtime.alloc_string(key);
-    Ok(RegisterValue::from_object_handle(key.0))
-}
-
-fn install_realm_symbol_wrapper(
-    runtime: &mut RuntimeState,
-    realm_global: otter_runtime::ObjectHandle,
-) -> Result<(), VmNativeCallError> {
-    let symbol_property = runtime.intern_property_name("Symbol");
-    let prototype_property = runtime.intern_property_name("prototype");
-    let for_property = runtime.intern_property_name("for");
-    let key_for_property = runtime.intern_property_name("keyFor");
-
-    let wrapper_ctor = runtime.register_native_function(NativeFunctionDescriptor::method(
-        "Symbol",
-        0,
-        test262_realm_symbol,
-    ));
-    let wrapper_ctor = runtime.alloc_host_function(wrapper_ctor);
-    let symbol_prototype = runtime.intrinsics().symbol_prototype();
-    runtime
-        .objects_mut()
-        .set_property(
-            wrapper_ctor,
-            prototype_property,
-            RegisterValue::from_object_handle(symbol_prototype.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("realm Symbol.prototype install failed: {error:?}").into(),
-            )
-        })?;
-
-    let wrapper_for = runtime.register_native_function(NativeFunctionDescriptor::method(
-        "for",
-        1,
-        test262_realm_symbol_for,
-    ));
-    let wrapper_for = runtime.alloc_host_function(wrapper_for);
-    runtime
-        .objects_mut()
-        .set_property(
-            wrapper_ctor,
-            for_property,
-            RegisterValue::from_object_handle(wrapper_for.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("realm Symbol.for install failed: {error:?}").into(),
-            )
-        })?;
-
-    let wrapper_key_for = runtime.register_native_function(NativeFunctionDescriptor::method(
-        "keyFor",
-        1,
-        test262_realm_symbol_key_for,
-    ));
-    let wrapper_key_for = runtime.alloc_host_function(wrapper_key_for);
-    runtime
-        .objects_mut()
-        .set_property(
-            wrapper_ctor,
-            key_for_property,
-            RegisterValue::from_object_handle(wrapper_key_for.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("realm Symbol.keyFor install failed: {error:?}").into(),
-            )
-        })?;
-
-    let symbols: Vec<_> = runtime.intrinsics().well_known_symbols().to_vec();
-    for symbol in symbols {
-        let property_name = symbol
-            .description()
-            .strip_prefix("Symbol.")
-            .expect("well-known symbol descriptions use Symbol.<name>");
-        let property = runtime.intern_property_name(property_name);
-        let value = runtime.intrinsics().well_known_symbol_value(symbol);
-        runtime
-            .objects_mut()
-            .set_property(wrapper_ctor, property, value)
-            .map_err(|error| {
-                VmNativeCallError::Internal(
-                    format!("realm {} install failed: {error:?}", symbol.description()).into(),
-                )
-            })?;
-    }
-
-    runtime
-        .objects_mut()
-        .set_property(
-            realm_global,
-            symbol_property,
-            RegisterValue::from_object_handle(wrapper_ctor.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("realm global Symbol install failed: {error:?}").into(),
-            )
-        })?;
-    Ok(())
-}
-
+/// `$262.createRealm()` — bootstraps a brand-new ECMAScript realm with its
+/// own intrinsics and global object, and exposes a `{ global }` wrapper in
+/// the **current** realm that test262 harness code uses to reach into it.
 fn test262_create_realm(
     _this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    // §9.3.3 — fresh realm with its own VmIntrinsics, prototypes, and globals.
+    let new_realm_id = runtime.create_realm().map_err(|error| {
+        VmNativeCallError::Internal(
+            format!("$262.createRealm create_realm failed: {error:?}").into(),
+        )
+    })?;
+    let realm_global = runtime.realm(new_realm_id).intrinsics.global_object();
+
+    // The wrapper object lives in the *caller*'s realm; only `.global` is
+    // cross-realm. test262 harness uses `other = $262.createRealm().global`.
     let realm = runtime.alloc_object();
-    let global = runtime.intrinsics().global_object();
-    let realm_global = runtime.alloc_object_with_prototype(Some(global));
-    install_realm_symbol_wrapper(runtime, realm_global)?;
     let global_property = runtime.intern_property_name("global");
     runtime
         .objects_mut()
@@ -302,30 +158,6 @@ fn test262_create_realm(
             )
         })?;
     Ok(RegisterValue::from_object_handle(realm.0))
-}
-
-fn map_interpreter_error(
-    error: otter_runtime::InterpreterError,
-    runtime: &mut RuntimeState,
-) -> VmNativeCallError {
-    match error {
-        otter_runtime::InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
-        otter_runtime::InterpreterError::TypeError(message) => {
-            let error = match runtime.alloc_type_error(&message) {
-                Ok(error) => error,
-                Err(error) => {
-                    return VmNativeCallError::Internal(
-                        format!("TypeError allocation failed: {error}").into(),
-                    );
-                }
-            };
-            VmNativeCallError::Thrown(RegisterValue::from_object_handle(error.0))
-        }
-        otter_runtime::InterpreterError::NativeCall(message) => {
-            VmNativeCallError::Internal(message)
-        }
-        other => VmNativeCallError::Internal(format!("{other}").into()),
-    }
 }
 
 // ---------------------------------------------------------------------------

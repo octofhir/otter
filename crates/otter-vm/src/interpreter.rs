@@ -555,6 +555,12 @@ pub struct RuntimeState {
     current_module: Option<Module>,
     native_call_construct_stack: Vec<bool>,
     native_callee_stack: Vec<ObjectHandle>,
+    /// V8 stack trace API — shadow stack of execution-context activations.
+    /// Pushed at the entry of every JS frame (closure, generator resume,
+    /// async resume) and popped at exit; updated in-place each interpreter
+    /// step so the topmost entry's PC always tracks `activation.pc()`.
+    /// Reference: <https://v8.dev/docs/stack-trace-api>
+    frame_info_stack: Vec<crate::stack_frame::StackFrameInfo>,
     next_symbol_id: u32,
     symbol_descriptions: BTreeMap<u32, Option<Box<str>>>,
     global_symbol_registry: BTreeMap<Box<str>, u32>,
@@ -609,6 +615,7 @@ impl RuntimeState {
             current_module: None,
             native_call_construct_stack: Vec::new(),
             native_callee_stack: Vec::new(),
+            frame_info_stack: Vec::new(),
             next_symbol_id: WellKnownSymbol::Unscopables.stable_id() + 1,
             symbol_descriptions,
             global_symbol_registry: BTreeMap::new(),
@@ -639,6 +646,104 @@ impl RuntimeState {
     #[must_use]
     pub fn realm(&self, id: crate::realm::RealmId) -> &crate::realm::Realm {
         &self.realms[id as usize]
+    }
+
+    // ─── Stack frame snapshot API (V8 stack trace API) ──────────────────
+
+    /// Pushes a new entry onto the shadow execution-context stack.
+    /// Called at the entry of every JS frame run by the interpreter.
+    pub(crate) fn push_frame_info(&mut self, info: crate::stack_frame::StackFrameInfo) {
+        self.frame_info_stack.push(info);
+    }
+
+    /// Pops the topmost shadow execution-context stack entry.
+    /// Called at every return path of the interpreter loop.
+    pub(crate) fn pop_frame_info(&mut self) {
+        self.frame_info_stack.pop();
+    }
+
+    /// Updates the topmost shadow stack entry's PC. Called from the
+    /// interpreter loop at every step so the topmost frame's PC always
+    /// reflects the active activation.
+    pub(crate) fn update_top_frame_pc(&mut self, pc: crate::bytecode::ProgramCounter) {
+        if let Some(top) = self.frame_info_stack.last_mut() {
+            top.pc = pc;
+        }
+    }
+
+    /// Captures a snapshot of the current shadow execution-context stack,
+    /// skipping the topmost `skip` frames. The result is ordered top-down
+    /// (caller-most last), matching V8's `Error.stack` formatting.
+    ///
+    /// Reference: <https://v8.dev/docs/stack-trace-api>
+    #[must_use]
+    pub fn capture_stack_snapshot(
+        &self,
+        skip: usize,
+    ) -> Vec<crate::stack_frame::StackFrameInfo> {
+        if skip >= self.frame_info_stack.len() {
+            return Vec::new();
+        }
+        let take = self.frame_info_stack.len() - skip;
+        self.frame_info_stack
+            .iter()
+            .take(take)
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the depth of the shadow execution-context stack. Used by
+    /// `Error.captureStackTrace(obj, constructorOpt?)` to compute how many
+    /// frames to skip.
+    #[must_use]
+    pub fn frame_info_stack_len(&self) -> usize {
+        self.frame_info_stack.len()
+    }
+
+    /// Returns the topmost shadow stack entries' callees in order
+    /// (top-of-stack last). Used by `Error.captureStackTrace` to look up the
+    /// frame matching the optional `constructorOpt` argument.
+    #[must_use]
+    pub fn frame_info_stack_snapshot(&self) -> &[crate::stack_frame::StackFrameInfo] {
+        &self.frame_info_stack
+    }
+
+    /// §9.3.3 InitializeHostDefinedRealm — creates a brand-new realm with its
+    /// own intrinsics, prototypes, constructors, and global object.
+    ///
+    /// Each new-VM realm holds an independent `VmIntrinsics` so cross-realm
+    /// constructs (e.g. `Reflect.construct(Error, [], otherRealm.Function)`)
+    /// can return prototypes from the *other* realm via
+    /// `GetPrototypeFromConstructor`.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-initializehostdefinedrealm>
+    pub fn create_realm(
+        &mut self,
+    ) -> Result<crate::realm::RealmId, crate::intrinsics::IntrinsicsError> {
+        let new_realm_id: crate::realm::RealmId = self
+            .realms
+            .len()
+            .try_into()
+            .map_err(|_| crate::intrinsics::IntrinsicsError::InvalidLifecycleStage)?;
+
+        let mut intrinsics = VmIntrinsics::allocate(&mut self.objects);
+        intrinsics.wire_prototype_chains(&mut self.objects)?;
+        intrinsics.init_core(
+            &mut self.objects,
+            &mut self.property_names,
+            &mut self.native_functions,
+            new_realm_id,
+        )?;
+        intrinsics.install_on_global(
+            &mut self.objects,
+            &mut self.property_names,
+            &mut self.native_functions,
+            new_realm_id,
+        )?;
+
+        self.realms.push(crate::realm::Realm::new(intrinsics));
+        Ok(new_realm_id)
     }
 
     /// §10.2.3 GetFunctionRealm — returns the realm of the given callable.
@@ -4362,7 +4467,8 @@ impl RuntimeState {
                 | HeapValueKind::RegExp
                 | HeapValueKind::Proxy
                 | HeapValueKind::TypedArray
-                | HeapValueKind::DataView => "object",
+                | HeapValueKind::DataView
+                | HeapValueKind::ErrorStackFrames => "object",
                 HeapValueKind::BigInt => "bigint",
             }
         } else {
@@ -5420,8 +5526,22 @@ impl Interpreter {
             .clone();
         let mut frame_runtime = FrameRuntimeState::new(&function);
 
+        // V8 stack trace API — push the activation onto the shadow execution
+        // context stack so it can be observed by `Error.captureStackTrace`
+        // and Error constructor capture. The matching pop is performed at
+        // every return path below.
+        runtime.push_frame_info(Self::build_frame_info(
+            &current_module,
+            &function,
+            activation,
+            false,
+        ));
+
         loop {
             activation.begin_step();
+            // Update the topmost shadow stack entry's PC so a snapshot taken
+            // mid-step reports the correct call site.
+            runtime.update_top_frame_pc(activation.pc());
             let outcome = match self.step(
                 &function,
                 &current_module,
@@ -5437,6 +5557,7 @@ impl Interpreter {
                 }
                 Err(error) => {
                     runtime.restore_module(previous_module);
+                    runtime.pop_frame_info();
                     return Err(error);
                 }
             };
@@ -5448,6 +5569,7 @@ impl Interpreter {
                 }
                 StepOutcome::Return(return_value) => {
                     runtime.restore_module(previous_module);
+                    runtime.pop_frame_info();
                     return Ok(Completion::Return(return_value));
                 }
                 StepOutcome::Throw(value) => {
@@ -5455,6 +5577,7 @@ impl Interpreter {
                         continue;
                     }
                     runtime.restore_module(previous_module);
+                    runtime.pop_frame_info();
                     return Ok(Completion::Throw(value));
                 }
                 // §14.6 Tail call: replace the current frame in-place and
@@ -5472,6 +5595,15 @@ impl Interpreter {
                         .clone();
                     frame_runtime = FrameRuntimeState::new(&function);
                     runtime.enter_module(&current_module);
+                    // §14.6 Tail call — replace the topmost shadow stack
+                    // entry rather than push a new one.
+                    runtime.pop_frame_info();
+                    runtime.push_frame_info(Self::build_frame_info(
+                        &current_module,
+                        &function,
+                        activation,
+                        false,
+                    ));
                 }
                 StepOutcome::Suspend {
                     awaited_promise,
@@ -5504,6 +5636,7 @@ impl Interpreter {
                                     continue;
                                 }
                                 runtime.restore_module(previous_module);
+                                runtime.pop_frame_info();
                                 return Ok(Completion::Throw(reason));
                             }
                             crate::promise::PromiseState::Pending => {
@@ -5511,12 +5644,14 @@ impl Interpreter {
                                 // This would require full event-loop integration
                                 // (timers, I/O) to resolve. For now, return undefined.
                                 runtime.restore_module(previous_module);
+                                runtime.pop_frame_info();
                                 return Ok(Completion::Return(RegisterValue::undefined()));
                             }
                         }
                     } else {
                         // Not a promise — treat as fulfilled with the value.
                         runtime.restore_module(previous_module);
+                        runtime.pop_frame_info();
                         return Ok(Completion::Return(RegisterValue::undefined()));
                     }
                 }
@@ -5524,9 +5659,40 @@ impl Interpreter {
                     // GeneratorYield inside a non-generator run loop — treat
                     // as a return (shouldn't normally happen outside resume_generator).
                     runtime.restore_module(previous_module);
+                    runtime.pop_frame_info();
                     return Ok(Completion::Return(yielded_value));
                 }
             }
+        }
+    }
+
+    /// Builds a `StackFrameInfo` snapshot from a frame's owning module,
+    /// function, and current activation. Captured at frame entry and at
+    /// every step (the `pc` field is updated separately by
+    /// `RuntimeState::update_top_frame_pc`).
+    fn build_frame_info(
+        module: &Module,
+        function: &Function,
+        activation: &Activation,
+        is_native: bool,
+    ) -> crate::stack_frame::StackFrameInfo {
+        // The compiler stamps the top-level script body's function name with
+        // the module URL so debugger UIs can show "where am I". For V8-style
+        // stack traces we want the top-level frame to render as anonymous.
+        let raw_name = function.name();
+        let function_name = match (raw_name, module.name()) {
+            (Some(name), Some(url)) if name == url => None,
+            (name, _) => name.map(Box::from),
+        };
+        crate::stack_frame::StackFrameInfo {
+            module: module.clone(),
+            function_index: activation.function_index(),
+            function_name,
+            pc: activation.pc(),
+            closure_handle: activation.closure_handle(),
+            is_native,
+            is_async: function.is_async(),
+            is_construct: activation.construct_new_target().is_some(),
         }
     }
 
@@ -9109,6 +9275,11 @@ impl Interpreter {
             .cloned()
             .ok_or(InterpreterError::InvalidCallTarget)?;
 
+        // §9.4 Execution Contexts — the "running execution context" belongs
+        // to the callee's realm for the duration of the call, so host
+        // functions see `runtime.current_realm` = their own realm.
+        let saved_realm = runtime.current_realm;
+        runtime.current_realm = runtime.get_function_realm(callee);
         runtime.native_call_construct_stack.push(is_construct);
         runtime.native_callee_stack.push(callee);
         let completion = match (descriptor.callback())(&receiver, arguments, runtime) {
@@ -9118,6 +9289,7 @@ impl Interpreter {
         };
         runtime.native_callee_stack.pop();
         runtime.native_call_construct_stack.pop();
+        runtime.current_realm = saved_realm;
         completion
     }
 

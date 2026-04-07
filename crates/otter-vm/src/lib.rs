@@ -87,6 +87,8 @@ pub mod source;
 pub(crate) mod source_compiler;
 /// Source-location metadata.
 pub mod source_map;
+/// Stack frame snapshots for V8-parity stack traces.
+pub mod stack_frame;
 /// String-literal side tables for functions.
 pub mod string;
 /// Minimal register value representation.

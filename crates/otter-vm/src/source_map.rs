@@ -94,6 +94,35 @@ impl SourceMap {
     pub fn entries(&self) -> &[SourceMapEntry] {
         &self.entries
     }
+
+    /// Looks up the source location active at the given program counter.
+    ///
+    /// Returns the entry with the largest `pc` that is `<= pc`. Entries must
+    /// be sorted by program counter for this to be correct.
+    #[must_use]
+    pub fn lookup(&self, pc: ProgramCounter) -> Option<SourceLocation> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        // Binary search for the largest entry with entry.pc <= pc.
+        let mut lo = 0usize;
+        let mut hi = self.entries.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entries[mid].pc() <= pc {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            // No entry with pc <= input pc — fall back to the first entry,
+            // which is the function's prologue location.
+            Some(self.entries[0].location())
+        } else {
+            Some(self.entries[lo - 1].location())
+        }
+    }
 }
 
 impl Default for SourceMap {

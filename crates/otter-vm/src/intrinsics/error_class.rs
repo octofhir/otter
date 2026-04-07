@@ -20,6 +20,13 @@ use super::{
 
 pub(super) static ERROR_INTRINSIC: ErrorIntrinsic = ErrorIntrinsic;
 pub(crate) const ERROR_DATA_SLOT: &str = "__otter_error_data__";
+/// Non-enumerable slot holding the captured `Vec<StackFrameInfo>` for an Error
+/// instance. Read by the lazy `Error.prototype.stack` getter.
+pub(crate) const ERROR_STACK_FRAMES_SLOT: &str = "__otter_error_stack_frames__";
+/// Non-enumerable slot caching the materialized `.stack` string after the
+/// first read. Cleared whenever a new frames slot is installed (e.g. via
+/// `Error.captureStackTrace`).
+pub(crate) const ERROR_STACK_STRING_SLOT: &str = "__otter_error_stack_string__";
 
 pub(super) struct ErrorIntrinsic;
 
@@ -98,6 +105,8 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         // Install Error.prototype.toString on the base Error prototype.
         install_error_to_string(intrinsics, cx)?;
         install_error_is_error(intrinsics, cx)?;
+        install_error_stack_accessor(intrinsics, cx)?;
+        install_error_capture_stack_trace(intrinsics, cx)?;
 
         Ok(())
     }
@@ -253,6 +262,7 @@ fn aggregate_error_constructor(
         runtime.intrinsics().aggregate_error_prototype,
     )?;
     install_error_brand(handle, runtime)?;
+    capture_error_stack(runtime, handle, 0)?;
 
     let message_arg = args.get(1).copied().unwrap_or(RegisterValue::undefined());
     if message_arg != RegisterValue::undefined() {
@@ -323,6 +333,139 @@ fn install_error_is_error(
         ),
     )?;
     Ok(())
+}
+
+/// Installs `Error.prototype.stack` as a V8-compatible accessor pair on the
+/// base `Error.prototype`. The getter lazily formats the captured stack
+/// snapshot the first time it is read; the setter lets user code overwrite
+/// the value (matching V8 semantics).
+///
+/// V8 reference: <https://v8.dev/docs/stack-trace-api>
+fn install_error_stack_accessor(
+    intrinsics: &mut VmIntrinsics,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let getter_desc = NativeFunctionDescriptor::method("get stack", 0, error_stack_getter);
+    let getter_id = cx.native_functions.register(getter_desc);
+    let getter =
+        cx.alloc_intrinsic_host_function(getter_id, intrinsics.function_prototype)?;
+    install_function_length_name(getter, 0, "get stack", cx)?;
+
+    let setter_desc = NativeFunctionDescriptor::method("set stack", 1, error_stack_setter);
+    let setter_id = cx.native_functions.register(setter_desc);
+    let setter =
+        cx.alloc_intrinsic_host_function(setter_id, intrinsics.function_prototype)?;
+    install_function_length_name(setter, 1, "set stack", cx)?;
+
+    let stack_prop = cx.property_names.intern("stack");
+    cx.heap.define_own_property(
+        intrinsics.error_prototype,
+        stack_prop,
+        crate::object::PropertyValue::Accessor {
+            getter: Some(getter),
+            setter: Some(setter),
+            attributes: crate::object::PropertyAttributes::from_flags(false, true, true),
+        },
+    )?;
+    intrinsics.error_stack_getter = Some(getter);
+    intrinsics.error_stack_setter = Some(setter);
+    Ok(())
+}
+
+/// Installs V8-extension `Error.captureStackTrace(target, constructorOpt?)`
+/// as a static method on the base `Error` constructor.
+///
+/// V8 reference: <https://v8.dev/docs/stack-trace-api#customizing-stack-traces>
+fn install_error_capture_stack_trace(
+    intrinsics: &VmIntrinsics,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let desc =
+        NativeFunctionDescriptor::method("captureStackTrace", 2, error_capture_stack_trace);
+    let host_id = cx.native_functions.register(desc);
+    let method = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+    install_function_length_name(method, 2, "captureStackTrace", cx)?;
+    let prop = cx.property_names.intern("captureStackTrace");
+    cx.heap.define_own_property(
+        intrinsics.error_constructor,
+        prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(method.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
+    )?;
+    Ok(())
+}
+
+/// V8-extension `Error.captureStackTrace(target, constructorOpt?)`.
+///
+/// Captures the current execution-context stack onto `target.stack`. If
+/// `constructorOpt` is a function, all frames up to *and including* the
+/// innermost frame whose closure handle matches `constructorOpt` are
+/// dropped from the captured snapshot.
+///
+/// V8 reference: <https://v8.dev/docs/stack-trace-api>
+fn error_capture_stack_trace(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let Some(target) = args
+        .first()
+        .and_then(|value| value.as_object_handle().map(ObjectHandle))
+    else {
+        return Err(throw_type_error(
+            runtime,
+            "Error.captureStackTrace called on non-object",
+        ));
+    };
+
+    // Determine how many frames to skip. Native callees (such as
+    // captureStackTrace itself) never push a shadow-stack frame, so the
+    // topmost shadow frame is already the caller — no default skip needed.
+    let extra_skip = if let Some(ctor) = args
+        .get(1)
+        .and_then(|value| value.as_object_handle().map(ObjectHandle))
+    {
+        // Find the innermost (topmost) shadow frame whose closure handle
+        // matches the user-supplied constructor. Skip everything at or
+        // above that frame (inclusive).
+        let stack = runtime.frame_info_stack_snapshot();
+        let mut drop_count = 0usize;
+        for (idx, frame) in stack.iter().enumerate().rev() {
+            if frame.closure_handle == Some(ctor) {
+                // Keep frames [0..idx), drop [idx..len).
+                drop_count = stack.len() - idx;
+                break;
+            }
+        }
+        drop_count
+    } else {
+        0
+    };
+
+    capture_error_stack(runtime, target, extra_skip)?;
+
+    // V8 also installs an own `stack` accessor on the target so that
+    // `target.stack` works regardless of the target's prototype chain.
+    let getter = runtime.intrinsics().error_stack_getter;
+    let setter = runtime.intrinsics().error_stack_setter;
+    if getter.is_some() || setter.is_some() {
+        let stack_prop = runtime.intern_property_name("stack");
+        runtime
+            .objects_mut()
+            .define_own_property(
+                target,
+                stack_prop,
+                crate::object::PropertyValue::Accessor {
+                    getter,
+                    setter,
+                    attributes: crate::object::PropertyAttributes::from_flags(false, true, true),
+                },
+            )
+            .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
+    }
+    Ok(RegisterValue::undefined())
 }
 
 /// ES2024 §20.5.3.4 Error.prototype.toString()
@@ -402,6 +545,7 @@ fn error_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = error_receiver_from_call(this, runtime, runtime.intrinsics().error_prototype)?;
     install_error_brand(handle, runtime)?;
+    capture_error_stack(runtime, handle, 0)?;
 
     if let Some(msg_arg) = args.first()
         && *msg_arg != RegisterValue::undefined()
@@ -634,4 +778,182 @@ fn map_interpreter_error(
         }
         other => VmNativeCallError::Internal(format!("{other}").into()),
     }
+}
+
+/// Captures the current execution-context stack and stores it as a hidden
+/// non-enumerable slot on the given error object. Any cached materialised
+/// `.stack` string is cleared so the next getter invocation re-formats.
+///
+/// `extra_skip` is the number of additional shadow-stack frames to drop from
+/// the top of the captured stack. Used by `Error.captureStackTrace` when a
+/// `constructorOpt` is supplied.
+///
+/// Note: native callees (such as `error_constructor` itself) do not push a
+/// shadow-stack frame, so the topmost shadow frame at this point is the
+/// caller of `new Error(...)`. We capture starting from that frame.
+pub(crate) fn capture_error_stack(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+    extra_skip: usize,
+) -> Result<(), VmNativeCallError> {
+    let snapshot = runtime.capture_stack_snapshot(extra_skip);
+    let frames_handle = runtime.objects_mut().alloc_error_stack_frames(snapshot);
+    define_non_enumerable_data_property(
+        runtime,
+        handle,
+        ERROR_STACK_FRAMES_SLOT,
+        RegisterValue::from_object_handle(frames_handle.0),
+    )?;
+    // Clear any previously cached formatted string so the next getter call
+    // reformats using the freshly captured frames.
+    let cache_prop = runtime.intern_property_name(ERROR_STACK_STRING_SLOT);
+    let _ = runtime.objects_mut().delete_property(handle, cache_prop);
+    Ok(())
+}
+
+/// Reads `__otter_error_stack_frames__` off the error instance and returns
+/// the heap handle to the frames bag (or `None` if the slot is missing).
+fn read_stack_frames_slot(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+) -> Option<ObjectHandle> {
+    let frames_prop = runtime.intern_property_name(ERROR_STACK_FRAMES_SLOT);
+    let lookup = runtime
+        .objects()
+        .get_property(handle, frames_prop)
+        .ok()
+        .flatten()?;
+    if lookup.owner() != handle {
+        return None;
+    }
+    match lookup.value() {
+        PropertyValue::Data { value, .. } => value.as_object_handle().map(ObjectHandle),
+        _ => None,
+    }
+}
+
+fn read_cached_stack_string(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+) -> Option<RegisterValue> {
+    let cache_prop = runtime.intern_property_name(ERROR_STACK_STRING_SLOT);
+    let lookup = runtime
+        .objects()
+        .get_property(handle, cache_prop)
+        .ok()
+        .flatten()?;
+    if lookup.owner() != handle {
+        return None;
+    }
+    match lookup.value() {
+        PropertyValue::Data { value, .. } => Some(value),
+        _ => None,
+    }
+}
+
+/// Reads an Error instance's `name` property, falling back to the spec
+/// default `"Error"` when missing/undefined.
+fn read_error_name(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+) -> Result<String, VmNativeCallError> {
+    let name_prop = runtime.intern_property_name("name");
+    let name_val = runtime.ordinary_get(
+        handle,
+        name_prop,
+        RegisterValue::from_object_handle(handle.0),
+    )?;
+    if name_val == RegisterValue::undefined() {
+        Ok("Error".to_string())
+    } else {
+        runtime
+            .js_to_string(name_val)
+            .map(|s| s.into_string())
+            .map_err(|error| map_interpreter_error(error, runtime))
+    }
+}
+
+/// Reads an Error instance's `message` property, falling back to the empty
+/// string when missing/undefined.
+fn read_error_message(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+) -> Result<String, VmNativeCallError> {
+    let msg_prop = runtime.intern_property_name("message");
+    let msg_val = runtime.ordinary_get(
+        handle,
+        msg_prop,
+        RegisterValue::from_object_handle(handle.0),
+    )?;
+    if msg_val == RegisterValue::undefined() {
+        Ok(String::new())
+    } else {
+        runtime
+            .js_to_string(msg_val)
+            .map(|s| s.into_string())
+            .map_err(|error| map_interpreter_error(error, runtime))
+    }
+}
+
+/// V8-extension `Error.prototype.stack` getter. Lazily formats the captured
+/// shadow-stack snapshot on first read and memoizes the result so subsequent
+/// reads are O(1).
+fn error_stack_getter(
+    this: &RegisterValue,
+    _args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let Some(handle) = this.as_object_handle().map(ObjectHandle) else {
+        return Ok(RegisterValue::undefined());
+    };
+
+    // Cached string wins.
+    if let Some(cached) = read_cached_stack_string(runtime, handle) {
+        return Ok(cached);
+    }
+
+    // No captured frames → return undefined (V8 leaves `.stack` undefined
+    // for objects that were never passed through an Error constructor or
+    // `captureStackTrace`).
+    let Some(frames_handle) = read_stack_frames_slot(runtime, handle) else {
+        return Ok(RegisterValue::undefined());
+    };
+
+    let name = read_error_name(runtime, handle)?;
+    let message = read_error_message(runtime, handle)?;
+
+    // Clone the frames out of the heap so we can drop the borrow before
+    // allocating the formatted string.
+    let frames = match runtime.objects().error_stack_frames(frames_handle) {
+        Ok(Some(slice)) => slice.to_vec(),
+        _ => return Ok(RegisterValue::undefined()),
+    };
+
+    let formatted = crate::stack_frame::format_v8_stack(&name, &message, &frames);
+    let str_handle = runtime.alloc_string(formatted);
+    let value = RegisterValue::from_object_handle(str_handle.0);
+
+    // Memoize.
+    define_non_enumerable_data_property(runtime, handle, ERROR_STACK_STRING_SLOT, value)?;
+    Ok(value)
+}
+
+/// V8-extension `Error.prototype.stack` setter. Stores the user-supplied
+/// value as the cached stack string and drops the underlying frame snapshot
+/// so subsequent reads always return the caller's value verbatim.
+fn error_stack_setter(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let Some(handle) = this.as_object_handle().map(ObjectHandle) else {
+        return Ok(RegisterValue::undefined());
+    };
+    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    define_non_enumerable_data_property(runtime, handle, ERROR_STACK_STRING_SLOT, value)?;
+    // Drop the frames slot — the user's value now *is* the stack, and the
+    // raw frames are no longer authoritative.
+    let frames_prop = runtime.intern_property_name(ERROR_STACK_FRAMES_SLOT);
+    let _ = runtime.objects_mut().delete_property(handle, frames_prop);
+    Ok(RegisterValue::undefined())
 }

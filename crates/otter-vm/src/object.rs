@@ -200,6 +200,9 @@ pub enum HeapValueKind {
     DataView,
     /// ES2024 §6.1.6.2 BigInt primitive (heap-allocated).
     BigInt,
+    /// V8-extension stack frame snapshot bag, used to back the lazily
+    /// formatted `Error.prototype.stack` accessor.
+    ErrorStackFrames,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -934,6 +937,13 @@ enum HeapValue {
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
     BigInt {
         value: Box<str>,
+    },
+    /// V8 extension — captured stack frame snapshots for `Error.prototype.stack`.
+    /// Stored as a heap value so it can be referenced from a non-enumerable
+    /// data property on the error instance and reach `format_v8_stack`.
+    /// Reference: <https://v8.dev/docs/stack-trace-api>
+    ErrorStackFrames {
+        frames: Vec<crate::stack_frame::StackFrameInfo>,
     },
     /// ES2024 §23.1.5.1 — Array Iterator Objects.
     ArrayIterator {
@@ -1688,6 +1698,10 @@ impl Traceable for HeapValue {
                 trace_handle(*handler, visitor);
             }
             HeapValue::BigInt { .. } => {}
+            HeapValue::ErrorStackFrames { .. } => {
+                // Stack frame snapshots clone Module by value (Arc), and
+                // captured names are owned strings — nothing to trace.
+            }
         }
     }
 }
@@ -3556,6 +3570,30 @@ impl ObjectHeap {
         }
     }
 
+    /// Allocates a heap-stored stack frame snapshot bag.
+    ///
+    /// V8 extension — used to back the lazily formatted
+    /// `Error.prototype.stack` accessor.
+    pub fn alloc_error_stack_frames(
+        &mut self,
+        frames: Vec<crate::stack_frame::StackFrameInfo>,
+    ) -> ObjectHandle {
+        let h = self.heap.alloc(HeapValue::ErrorStackFrames { frames });
+        ObjectHandle(h.0)
+    }
+
+    /// Returns the captured stack frames stored on an `ErrorStackFrames`
+    /// heap value.
+    pub fn error_stack_frames(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<&[crate::stack_frame::StackFrameInfo]>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::ErrorStackFrames { frames } => Ok(Some(frames)),
+            _ => Ok(None),
+        }
+    }
+
     /// Allocates a mutable upvalue cell.
     pub fn alloc_upvalue(&mut self, value: RegisterValue) -> ObjectHandle {
         let h = self.heap.alloc(HeapValue::UpvalueCell { value });
@@ -3902,6 +3940,7 @@ impl ObjectHeap {
             HeapValue::TypedArray { .. } => Ok(HeapValueKind::TypedArray),
             HeapValue::Proxy { .. } => Ok(HeapValueKind::Proxy),
             HeapValue::BigInt { .. } => Ok(HeapValueKind::BigInt),
+            HeapValue::ErrorStackFrames { .. } => Ok(HeapValueKind::ErrorStackFrames),
         }
     }
 
@@ -3937,6 +3976,7 @@ impl ObjectHeap {
             HeapValue::Proxy { target, .. } => self.get_prototype(*target),
             HeapValue::UpvalueCell { .. }
             | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -4067,6 +4107,7 @@ impl ObjectHeap {
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -4111,7 +4152,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Ok(None),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Ok(None),
             HeapValue::Closure { .. } => Ok(None),
             HeapValue::Array { elements, .. } if property_name == "length" => Ok(Some(
                 RegisterValue::from_i32(i32::try_from(elements.len()).unwrap_or(i32::MAX)),
@@ -4210,7 +4252,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -4291,7 +4334,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Err(ObjectError::InvalidKind),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Err(ObjectError::InvalidKind),
         }
     }
 
@@ -5222,7 +5266,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Ok(None),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Ok(None),
         }
     }
 
@@ -5261,7 +5306,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Ok(None),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Ok(None),
         }
     }
 
@@ -5303,7 +5349,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Ok(None),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Ok(None),
         }
     }
 
@@ -5360,7 +5407,8 @@ impl ObjectHeap {
             | HeapValue::TypedArray { .. }
             | HeapValue::RegExp { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => Ok(None),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => Ok(None),
         }
     }
 
@@ -6166,7 +6214,8 @@ impl ObjectHeap {
             | HeapValue::Generator { .. }
             | HeapValue::AsyncGenerator { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => return Err(ObjectError::InvalidKind),
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => return Err(ObjectError::InvalidKind),
         } {
             let object = self.object_mut(handle)?;
             let (shape_id, values) = match object {
@@ -6988,7 +7037,8 @@ impl ObjectHeap {
             | HeapValue::Generator { .. }
             | HeapValue::AsyncGenerator { .. }
             | HeapValue::Proxy { .. }
-            | HeapValue::BigInt { .. } => {
+            | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. } => {
                 return Err(ObjectError::InvalidKind);
             }
         } {
@@ -7660,6 +7710,7 @@ impl ObjectHeap {
             }
             HeapValue::UpvalueCell { .. }
             | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }
@@ -7730,6 +7781,7 @@ impl ObjectHeap {
             HeapValue::Proxy { revoked: true, .. } => Err(ObjectError::InvalidKind),
             HeapValue::UpvalueCell { .. }
             | HeapValue::BigInt { .. }
+            | HeapValue::ErrorStackFrames { .. }
             | HeapValue::PropertyIterator { .. }
             | HeapValue::PromiseCapabilityFunction { .. }
             | HeapValue::PromiseCombinatorElement { .. }

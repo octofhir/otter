@@ -33,6 +33,7 @@ use crate::value::{RegisterValue, ValueError};
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
 const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
+const ERROR_DATA_SLOT: &str = "__otter_error_data__";
 
 /// Errors produced by the new interpreter.
 #[derive(Debug, Clone, PartialEq)]
@@ -663,7 +664,7 @@ impl RuntimeState {
         object: ObjectHandle,
     ) -> Result<ObjectHandle, ObjectError> {
         self.objects
-            .alloc_property_iterator(object, &self.property_names)
+            .alloc_property_iterator(object, &mut self.property_names)
     }
 
     /// Creates an empty property iterator (for null/undefined/primitives in for..in).
@@ -1044,7 +1045,7 @@ impl RuntimeState {
     fn is_hidden_internal_property(&self, property: PropertyNameId) -> bool {
         matches!(
             self.property_names.get(property),
-            Some(STRING_DATA_SLOT | NUMBER_DATA_SLOT | BOOLEAN_DATA_SLOT)
+            Some(STRING_DATA_SLOT | NUMBER_DATA_SLOT | BOOLEAN_DATA_SLOT | ERROR_DATA_SLOT)
         )
     }
 

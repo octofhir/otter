@@ -35,6 +35,24 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// Format an `InterpreterError` into a human-readable string.
+///
+/// For `UncaughtThrow`, applies ES spec §7.1.17 ToString to the thrown value
+/// (matching how host environments like Node.js / browsers / JSC display
+/// uncaught exceptions). For Error objects, ToString invokes
+/// `Error.prototype.toString` (§20.5.3.4) which returns `"Name: Message"`.
+pub(crate) fn format_interpreter_error(
+    error: &otter_vm::interpreter::InterpreterError,
+    state: &mut RuntimeState,
+) -> String {
+    use otter_vm::interpreter::InterpreterError;
+
+    if let InterpreterError::UncaughtThrow(value) = error {
+        return state.js_to_string_infallible(*value).to_string();
+    }
+    error.to_string()
+}
+
 /// The Otter JavaScript runtime.
 ///
 /// Created via [`OtterRuntime::builder()`]. Owns the VM state and provides
@@ -150,9 +168,15 @@ impl OtterRuntime {
         let result = match execute_module_entry_with_runtime(module, &mut self.state, interrupt_ptr)
         {
             Ok(result) => result,
-            Err(_) => interpreter
-                .execute_module(module, &mut self.state)
-                .map_err(|e| RunError::Runtime(e.to_string()))?,
+            Err(_) => match interpreter.execute_module(module, &mut self.state) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(RunError::Runtime(format_interpreter_error(
+                        &e,
+                        &mut self.state,
+                    )));
+                }
+            },
         };
 
         // 2. Drain microtasks after top-level execution (ES spec).
@@ -413,6 +437,8 @@ impl TimeoutGuard {
 mod tests {
     use super::*;
     use otter_vm::console::CaptureConsoleBackend;
+    use otter_vm::interpreter::InterpreterError;
+    use otter_vm::value::RegisterValue;
     use std::sync::Arc;
 
     fn rt_with_capture() -> (OtterRuntime, Arc<CaptureConsoleBackend>) {
@@ -469,6 +495,28 @@ mod tests {
         )
         .expect("should run");
         assert_eq!(capture.text(), "42");
+    }
+
+    #[test]
+    fn uncaught_error_is_rendered_without_vm_prefix() {
+        let mut state = RuntimeState::new();
+        let error = state.alloc_type_error("boom").expect("type error alloc");
+        let formatted = format_interpreter_error(
+            &InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(error.0)),
+            &mut state,
+        );
+        assert_eq!(formatted, "TypeError: boom");
+    }
+
+    #[test]
+    fn uncaught_primitive_throw_is_rendered_via_js_tostring() {
+        let mut state = RuntimeState::new();
+        let string = state.alloc_string("boom");
+        let formatted = format_interpreter_error(
+            &InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(string.0)),
+            &mut state,
+        );
+        assert_eq!(formatted, "boom");
     }
 
     #[test]

@@ -7,15 +7,19 @@
 
 use crate::builders::ClassBuilder;
 use crate::descriptors::{JsClassDescriptor, NativeFunctionDescriptor, VmNativeCallError};
-use crate::object::ObjectHandle;
+use crate::object::{HeapValueKind, ObjectHandle, PropertyAttributes, PropertyValue};
 use crate::value::RegisterValue;
 
 use super::{
     IntrinsicsError, VmIntrinsics,
-    install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+    install::{
+        IntrinsicInstallContext, IntrinsicInstaller, install_class_plan,
+        install_function_length_name,
+    },
 };
 
 pub(super) static ERROR_INTRINSIC: ErrorIntrinsic = ErrorIntrinsic;
+pub(crate) const ERROR_DATA_SLOT: &str = "__otter_error_data__";
 
 pub(super) struct ErrorIntrinsic;
 
@@ -86,6 +90,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
 
         // Install Error.prototype.toString on the base Error prototype.
         install_error_to_string(intrinsics, cx)?;
+        install_error_is_error(intrinsics, cx)?;
 
         Ok(())
     }
@@ -140,6 +145,7 @@ fn install_error_class(
     if let Some(ctor_desc) = plan.constructor() {
         let host_id = cx.native_functions.register(ctor_desc.clone());
         let new_ctor = cx.alloc_intrinsic_host_function(host_id, function_prototype)?;
+        install_function_length_name(new_ctor, ctor_desc.length(), ctor_desc.js_name(), cx)?;
         *constructor = new_ctor;
     }
 
@@ -148,19 +154,25 @@ fn install_error_class(
     // Set prototype.name = error type name.
     let name_prop = cx.property_names.intern("name");
     let name_str = cx.heap.alloc_string(name);
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         prototype,
         name_prop,
-        RegisterValue::from_object_handle(name_str.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(name_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
 
     // Set prototype.message = "" (default empty message).
     let message_prop = cx.property_names.intern("message");
     let empty_str = cx.heap.alloc_string("");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         prototype,
         message_prop,
-        RegisterValue::from_object_handle(empty_str.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(empty_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
 
     Ok(())
@@ -187,6 +199,7 @@ fn install_aggregate_error_class(
     if let Some(ctor_desc) = plan.constructor() {
         let host_id = cx.native_functions.register(ctor_desc.clone());
         let new_ctor = cx.alloc_intrinsic_host_function(host_id, function_prototype)?;
+        install_function_length_name(new_ctor, ctor_desc.length(), ctor_desc.js_name(), cx)?;
         *constructor = new_ctor;
     }
 
@@ -195,19 +208,25 @@ fn install_aggregate_error_class(
     // Set prototype.name = "AggregateError".
     let name_prop = cx.property_names.intern("name");
     let name_str = cx.heap.alloc_string("AggregateError");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         prototype,
         name_prop,
-        RegisterValue::from_object_handle(name_str.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(name_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
 
     // Set prototype.message = "" (default empty message).
     let message_prop = cx.property_names.intern("message");
     let empty_str = cx.heap.alloc_string("");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         prototype,
         message_prop,
-        RegisterValue::from_object_handle(empty_str.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(empty_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
 
     Ok(())
@@ -220,37 +239,41 @@ fn aggregate_error_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("AggregateError constructor requires new".into())
-    })?;
+    let handle = error_receiver_from_call(
+        this,
+        runtime,
+        runtime.intrinsics().aggregate_error_prototype,
+    )?;
+    install_error_brand(handle, runtime)?;
 
-    // 1. Set message property if provided and not undefined (§20.5.7.1 step 4).
     let message_arg = args.get(1).copied().unwrap_or(RegisterValue::undefined());
     if message_arg != RegisterValue::undefined() {
-        let msg_str = runtime.js_to_string_infallible(message_arg);
-        let msg_handle = runtime.alloc_string(msg_str);
-        let msg_prop = runtime.intern_property_name("message");
-        runtime
-            .objects_mut()
-            .set_property(
-                handle,
-                msg_prop,
-                RegisterValue::from_object_handle(msg_handle.0),
-            )
-            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        let msg = runtime
+            .js_to_string(message_arg)
+            .map_err(|error| map_interpreter_error(error, runtime))?;
+        let msg_handle = runtime.alloc_string(msg);
+        define_non_enumerable_data_property(
+            runtime,
+            handle,
+            "message",
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
     }
 
-    // 2. Store errors on the `errors` property (§20.5.7.1 step 5).
-    //    Spec calls for IterableToList(errors), but storing the argument directly
-    //    covers the common case of passing an array.
-    let errors_arg = args.first().copied().unwrap_or(RegisterValue::undefined());
-    let errors_prop = runtime.intern_property_name("errors");
-    runtime
-        .objects_mut()
-        .set_property(handle, errors_prop, errors_arg)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    let errors_arg = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let errors_list =
+        iterable_to_array(runtime, errors_arg, "AggregateError errors is not iterable")?;
+    define_non_enumerable_data_property(
+        runtime,
+        handle,
+        "errors",
+        RegisterValue::from_object_handle(errors_list.0),
+    )?;
 
-    Ok(*this)
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Install `Error.prototype.toString` as a host method.
@@ -261,11 +284,35 @@ fn install_error_to_string(
     let desc = NativeFunctionDescriptor::method("toString", 0, error_to_string);
     let host_id = cx.native_functions.register(desc);
     let method = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+    install_function_length_name(method, 0, "toString", cx)?;
     let prop = cx.property_names.intern("toString");
-    cx.heap.set_property(
+    cx.heap.define_own_property(
         intrinsics.error_prototype,
         prop,
-        RegisterValue::from_object_handle(method.0),
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(method.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
+    )?;
+    Ok(())
+}
+
+fn install_error_is_error(
+    intrinsics: &VmIntrinsics,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let desc = NativeFunctionDescriptor::method("isError", 1, error_is_error);
+    let host_id = cx.native_functions.register(desc);
+    let method = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
+    install_function_length_name(method, 1, "isError", cx)?;
+    let prop = cx.property_names.intern("isError");
+    cx.heap.define_own_property(
+        intrinsics.error_constructor,
+        prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(method.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
     )?;
     Ok(())
 }
@@ -276,9 +323,16 @@ fn error_to_string(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Error.prototype.toString requires object".into())
-    })?;
+    let handle = this
+        .as_object_handle()
+        .map(ObjectHandle)
+        .filter(|handle| {
+            !matches!(
+                runtime.objects().kind(*handle),
+                Ok(HeapValueKind::String | HeapValueKind::BigInt)
+            )
+        })
+        .ok_or_else(|| throw_type_error(runtime, "Error.prototype.toString requires an object"))?;
 
     // 1. Let name be ? Get(O, "name").
     let name_prop = runtime.intern_property_name("name");
@@ -294,12 +348,7 @@ fn error_to_string(
     } else {
         runtime
             .js_to_string(name_val)
-            .map_err(|e| match e {
-                crate::interpreter::InterpreterError::UncaughtThrow(v) => {
-                    VmNativeCallError::Thrown(v)
-                }
-                other => VmNativeCallError::Internal(format!("{other}").into()),
-            })?
+            .map_err(|error| map_interpreter_error(error, runtime))?
             .into_string()
     };
 
@@ -317,12 +366,7 @@ fn error_to_string(
     } else {
         runtime
             .js_to_string(msg_val)
-            .map_err(|e| match e {
-                crate::interpreter::InterpreterError::UncaughtThrow(v) => {
-                    VmNativeCallError::Thrown(v)
-                }
-                other => VmNativeCallError::Internal(format!("{other}").into()),
-            })?
+            .map_err(|error| map_interpreter_error(error, runtime))?
             .into_string()
     };
 
@@ -348,25 +392,22 @@ fn error_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| VmNativeCallError::Internal("Error constructor requires new".into()))?;
+    let handle = error_receiver_from_call(this, runtime, runtime.intrinsics().error_prototype)?;
+    install_error_brand(handle, runtime)?;
 
     if let Some(msg_arg) = args.first()
         && *msg_arg != RegisterValue::undefined()
     {
-        let msg_str = runtime.js_to_string_infallible(*msg_arg);
-        let msg_handle = runtime.alloc_string(msg_str);
-        let msg_prop = runtime.intern_property_name("message");
-        runtime
-            .objects_mut()
-            .set_property(
-                handle,
-                msg_prop,
-                RegisterValue::from_object_handle(msg_handle.0),
-            )
-            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        let msg = runtime
+            .js_to_string(*msg_arg)
+            .map_err(|error| map_interpreter_error(error, runtime))?;
+        let msg_handle = runtime.alloc_string(msg);
+        define_non_enumerable_data_property(
+            runtime,
+            handle,
+            "message",
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
     }
 
     // §20.5.1.1 step 5: InstallErrorCause(O, options)
@@ -375,15 +416,214 @@ fn error_constructor(
         && let Some(opts_handle) = options.as_object_handle().map(ObjectHandle)
     {
         let cause_prop = runtime.intern_property_name("cause");
-        if let Ok(Some(lookup)) = runtime.property_lookup(opts_handle, cause_prop)
-            && let crate::object::PropertyValue::Data { value, .. } = lookup.value()
-        {
+        let has_cause = if runtime.is_proxy(opts_handle) {
             runtime
-                .objects_mut()
-                .set_property(handle, cause_prop, value)
-                .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                .proxy_has(opts_handle, cause_prop)
+                .map_err(|error| map_interpreter_error(error, runtime))?
+        } else {
+            runtime
+                .has_property(opts_handle, cause_prop)
+                .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?
+        };
+        if has_cause {
+            let value = runtime
+                .ordinary_get(opts_handle, cause_prop, *options)
+                .map_err(|error| match error {
+                    VmNativeCallError::Thrown(value) => VmNativeCallError::Thrown(value),
+                    other => other,
+                })?;
+            define_non_enumerable_data_property(runtime, handle, "cause", value)?;
         }
     }
 
-    Ok(*this)
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+fn error_is_error(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let Some(handle) = args
+        .first()
+        .and_then(|value| value.as_object_handle().map(ObjectHandle))
+    else {
+        return Ok(RegisterValue::from_bool(false));
+    };
+
+    Ok(RegisterValue::from_bool(has_error_brand(handle, runtime)?))
+}
+
+fn error_receiver_from_call(
+    this: &RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    default_prototype: ObjectHandle,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    if runtime.is_current_native_construct_call() {
+        return this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+            VmNativeCallError::Internal("Error constructor receiver missing".into())
+        });
+    }
+
+    let mut prototype = default_prototype;
+    if let Some(callee) = runtime.current_native_callee() {
+        let callee_value = RegisterValue::from_object_handle(callee.0);
+        let prototype_prop = runtime.intern_property_name("prototype");
+        let prototype_value = if runtime.is_proxy(callee) {
+            runtime
+                .proxy_get(callee, prototype_prop, callee_value)
+                .map_err(|error| map_interpreter_error(error, runtime))?
+        } else {
+            runtime.ordinary_get(callee, prototype_prop, callee_value)?
+        };
+        if let Some(handle) = prototype_value.as_object_handle().map(ObjectHandle) {
+            prototype = handle;
+        }
+    }
+
+    Ok(runtime.alloc_object_with_prototype(Some(prototype)))
+}
+
+fn iterable_to_array(
+    runtime: &mut crate::interpreter::RuntimeState,
+    iterable: RegisterValue,
+    type_error_message: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let Some(iterable_handle) = iterable.as_object_handle().map(ObjectHandle) else {
+        return Err(throw_type_error(runtime, type_error_message));
+    };
+
+    let iterator = get_iterator_object(runtime, iterable_handle, iterable)?;
+    let result = runtime.alloc_array();
+    let mut index = 0usize;
+    loop {
+        let (done, value) = runtime
+            .call_iterator_next_with_value(iterator, RegisterValue::undefined())
+            .map_err(|error| map_interpreter_error(error, runtime))?;
+        if done {
+            break;
+        }
+        runtime
+            .objects_mut()
+            .set_index(result, index, value)
+            .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
+        index += 1;
+    }
+    Ok(result)
+}
+
+fn get_iterator_object(
+    runtime: &mut crate::interpreter::RuntimeState,
+    iterable_handle: ObjectHandle,
+    iterable_value: RegisterValue,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let iterator_symbol =
+        runtime.intern_symbol_property_name(super::WellKnownSymbol::Iterator.stable_id());
+    let iterator_method = runtime.ordinary_get(iterable_handle, iterator_symbol, iterable_value)?;
+
+    if let Some(method) = iterator_method.as_object_handle().map(ObjectHandle) {
+        if runtime.objects().is_callable(method) {
+            let iterator_value = runtime.call_callable(method, iterable_value, &[])?;
+            return iterator_value
+                .as_object_handle()
+                .map(ObjectHandle)
+                .ok_or_else(|| throw_type_error(runtime, "Iterator method returned a non-object"));
+        }
+    }
+
+    let next_prop = runtime.intern_property_name("next");
+    let next_value = runtime.ordinary_get(iterable_handle, next_prop, iterable_value)?;
+    if let Some(next_handle) = next_value.as_object_handle().map(ObjectHandle)
+        && runtime.objects().is_callable(next_handle)
+    {
+        return Ok(iterable_handle);
+    }
+
+    Err(throw_type_error(runtime, "Value is not iterable"))
+}
+
+fn define_non_enumerable_data_property(
+    runtime: &mut crate::interpreter::RuntimeState,
+    handle: ObjectHandle,
+    property_name: &str,
+    value: RegisterValue,
+) -> Result<(), VmNativeCallError> {
+    let property = runtime.intern_property_name(property_name);
+    runtime
+        .objects_mut()
+        .define_own_property(
+            handle,
+            property,
+            PropertyValue::data_with_attrs(
+                value,
+                PropertyAttributes::from_flags(true, false, true),
+            ),
+        )
+        .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
+    Ok(())
+}
+
+fn install_error_brand(
+    handle: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<(), VmNativeCallError> {
+    let property = runtime.intern_property_name(ERROR_DATA_SLOT);
+    runtime
+        .objects_mut()
+        .define_own_property(
+            handle,
+            property,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_bool(true),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )
+        .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
+    Ok(())
+}
+
+fn has_error_brand(
+    handle: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<bool, VmNativeCallError> {
+    let property = runtime.intern_property_name(ERROR_DATA_SLOT);
+    let Some(lookup) = runtime
+        .objects()
+        .get_property(handle, property)
+        .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?
+    else {
+        return Ok(false);
+    };
+
+    Ok(lookup.owner() == handle && matches!(lookup.value(), PropertyValue::Data { .. }))
+}
+
+fn throw_type_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    message: &str,
+) -> VmNativeCallError {
+    match runtime.alloc_type_error(message) {
+        Ok(error) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(error.0)),
+        Err(error) => {
+            VmNativeCallError::Internal(format!("TypeError allocation failed: {error}").into())
+        }
+    }
+}
+
+fn map_interpreter_error(
+    error: crate::interpreter::InterpreterError,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> VmNativeCallError {
+    match error {
+        crate::interpreter::InterpreterError::UncaughtThrow(value) => {
+            VmNativeCallError::Thrown(value)
+        }
+        crate::interpreter::InterpreterError::TypeError(message) => {
+            throw_type_error(runtime, &message)
+        }
+        crate::interpreter::InterpreterError::NativeCall(message) => {
+            VmNativeCallError::Internal(message)
+        }
+        other => VmNativeCallError::Internal(format!("{other}").into()),
+    }
 }

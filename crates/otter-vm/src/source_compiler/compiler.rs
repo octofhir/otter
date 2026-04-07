@@ -2544,11 +2544,17 @@ impl<'a> FunctionCompiler<'a> {
         explicit_captures: &[CaptureSource],
         closure_flags: crate::object::ClosureFlags,
     ) -> Result<(), SourceLoweringError> {
-        let captures = if explicit_captures.is_empty() {
-            self.captures.clone()
-        } else {
-            explicit_captures.to_vec()
-        };
+        // Always use the explicit captures from the inner function's
+        // compilation. The captures are descriptors expressed in *this*
+        // (outer) function's scope: Register(R) means "copy this function's
+        // local R into the new closure's upvalue slot", and Upvalue(I) means
+        // "copy this function's upvalue I into the new closure's upvalue slot".
+        //
+        // We must NOT fall back to `self.captures` here: those are *this*
+        // function's own captures, valid only when *this* closure was created
+        // (in the grandparent context). Using them at a nested-closure site
+        // would point at registers in a frame that does not exist.
+        let captures = explicit_captures.to_vec();
 
         let pc = self.instructions.len();
         self.instructions.push(Instruction::new_closure(
@@ -2568,8 +2574,8 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
         value: ValueLocation,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        match self.resolve_binding(name)? {
-            Binding::Register(register) => {
+        match self.resolve_binding(name) {
+            Ok(Binding::Register(register)) => {
                 if register != value.register {
                     self.instructions
                         .push(Instruction::move_(register, value.register));
@@ -2577,9 +2583,9 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(ValueLocation::local(register))
             }
-            Binding::Function {
+            Ok(Binding::Function {
                 closure_register, ..
-            } => {
+            }) => {
                 if closure_register != value.register {
                     self.instructions
                         .push(Instruction::move_(closure_register, value.register));
@@ -2587,12 +2593,12 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(ValueLocation::local(closure_register))
             }
-            Binding::Upvalue(upvalue) => {
+            Ok(Binding::Upvalue(upvalue)) => {
                 self.instructions
                     .push(Instruction::set_upvalue(value.register, upvalue));
                 Ok(value)
             }
-            Binding::ThisRegister(register) => {
+            Ok(Binding::ThisRegister(register)) => {
                 if register != value.register {
                     self.instructions
                         .push(Instruction::move_(register, value.register));
@@ -2600,11 +2606,20 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 Ok(ValueLocation::local(register))
             }
-            Binding::ThisUpvalue(upvalue) => {
+            Ok(Binding::ThisUpvalue(upvalue)) => {
                 self.instructions
                     .push(Instruction::set_upvalue(value.register, upvalue));
                 Ok(value)
             }
+            // Undeclared identifier → assign to global property
+            // Mirrors the read-path fallback in `compile_identifier`.
+            Err(SourceLoweringError::UnknownBinding(_)) => {
+                let property = self.intern_property_name(name)?;
+                self.instructions
+                    .push(Instruction::set_global(value.register, property));
+                Ok(value)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -2774,6 +2789,23 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         Err(SourceLoweringError::UnknownBinding(name.to_string()))
+    }
+
+    /// Non-mutating check: is `name` visible as a local or captured (parent)
+    /// binding? Used at compile time to detect whether `eval(...)` could be a
+    /// direct eval — per §19.2.1.1, only references that resolve to %eval% are
+    /// direct eval. If `eval` is locally rebound (e.g. `var eval = f`), the
+    /// call is a regular call, not direct eval.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-function-calls-runtime-semantics-evaluation>
+    pub(super) fn is_name_locally_visible(&self, name: &str) -> bool {
+        if self.env.bindings.contains_key(name) {
+            return true;
+        }
+        if let Some(parent_env) = &self.parent_env {
+            return parent_env.bindings.contains_key(name);
+        }
+        false
     }
 
     pub(super) fn allocate_local(&mut self) -> Result<BytecodeRegister, SourceLoweringError> {

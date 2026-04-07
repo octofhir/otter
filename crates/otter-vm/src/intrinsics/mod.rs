@@ -1894,7 +1894,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 4);
-        assert_eq!(native_functions.len(), 730);
+        assert_eq!(native_functions.len(), 731);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

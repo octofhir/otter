@@ -200,3 +200,54 @@ fn aggregate_error_to_string() {
         "AggregateError: oops"
     );
 }
+
+#[test]
+fn error_is_callable_without_new() {
+    assert!(run_bool(
+        "var e = Error('boom'); \
+         var t = TypeError('bad'); \
+         e instanceof Error && e.message === 'boom' && \
+         t instanceof TypeError && t.message === 'bad'"
+    ));
+}
+
+#[test]
+fn error_instance_has_error_brand() {
+    assert_eq!(
+        run_string("Object.prototype.toString.call(new Error('boom'))"),
+        "[object Error]"
+    );
+}
+
+#[test]
+fn error_own_message_property_is_non_enumerable() {
+    assert!(run_bool(
+        "var desc = Object.getOwnPropertyDescriptor(new Error('boom'), 'message'); \
+         !!desc && desc.writable === true && desc.enumerable === false && desc.configurable === true"
+    ));
+}
+
+#[test]
+fn aggregate_error_requires_iterable_argument() {
+    assert!(run_bool(
+        "try { new AggregateError(); false; } catch (error) { error instanceof TypeError }"
+    ));
+}
+
+#[test]
+fn aggregate_error_collects_non_array_iterables() {
+    assert!(run_bool(
+        "var error = new AggregateError(new Set([1, 2, 3]), 'boom'); \
+         Array.isArray(error.errors) && error.errors.length === 3 && error.errors[2] === 3"
+    ));
+}
+
+#[test]
+fn error_is_error_matches_error_instances_only() {
+    assert!(run_bool(
+        "typeof Error.isError === 'function' && \
+         Error.isError(new Error('boom')) === true && \
+         Error.isError(new AggregateError([])) === true && \
+         Error.isError({ message: 'boom' }) === false"
+    ));
+}

@@ -913,11 +913,18 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         // §19.2.1.1 Detect direct eval: `eval(code)`.
-        // A call where the callee is the bare identifier `eval` (not a member
-        // expression or aliased reference) is a "direct eval" per spec.
+        // A call where the callee is the bare identifier `eval` is a *candidate*
+        // for direct eval — but only when the reference would resolve to the
+        // intrinsic %eval% (i.e. the global `eval`). If `eval` has been locally
+        // rebound (e.g. `var eval = f` hoisted in an enclosing function), then
+        // SameValue(func, %eval%) is false at runtime and the call must use
+        // normal call semantics (so tail-call optimization can apply, etc.).
+        // JSC performs the same compile-time check: if `eval` is in any local
+        // scope, it is *not* the intrinsic, so emit a regular call.
         // Spec: <https://tc39.es/ecma262/#sec-function-calls-runtime-semantics-evaluation>
         if let Expression::Identifier(ident) = &call.callee
             && ident.name == "eval"
+            && !self.is_name_locally_visible("eval")
         {
             return self.compile_direct_eval_call(call, module);
         }

@@ -495,10 +495,15 @@ fn evaluate_loaded_module(
     } else {
         let module =
             compile_transformed_module(&transformed_source, url, module_type, source_type)?;
-        Interpreter::new()
-            .execute_module(&module, runtime)
-            .map(|_| ())
-            .map_err(|error| VmNativeCallError::Internal(error.to_string().into()))
+        match Interpreter::new().execute_module(&module, runtime) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // Format the error using §7.1.17 ToString so Error objects show
+                // their proper "Name: Message" rather than `[object#N]`.
+                let message = crate::runtime::format_interpreter_error(&error, runtime);
+                Err(VmNativeCallError::Internal(message.into()))
+            }
+        }
     };
 
     let payload = runtime

@@ -622,27 +622,10 @@ impl NewVmRunner {
     }
 }
 
-fn format_register_value(value: RegisterValue, runtime: &RuntimeState) -> String {
-    if value == RegisterValue::undefined() {
-        return "undefined".to_string();
-    }
-    if value == RegisterValue::null() {
-        return "null".to_string();
-    }
-    if let Some(b) = value.as_bool() {
-        return b.to_string();
-    }
-    if let Some(n) = value.as_number() {
-        return format!("{n}");
-    }
-    if let Some(handle) = value.as_object_handle() {
-        let handle = otter_runtime::ObjectHandle(handle);
-        if let Ok(Some(s)) = runtime.objects().string_value(handle) {
-            return s.to_string();
-        }
-        return format!("[object#{}]", handle.0);
-    }
-    format!("{value:?}")
+fn format_register_value(value: RegisterValue, runtime: &mut RuntimeState) -> String {
+    // ES spec §7.1.17 ToString — for Error objects this invokes
+    // Error.prototype.toString (§20.5.3.4) which returns "Name: Message".
+    runtime.js_to_string_infallible(value).to_string()
 }
 
 // ---------------------------------------------------------------------------

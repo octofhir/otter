@@ -9,6 +9,7 @@ use crate::value::RegisterValue;
 use super::{
     IntrinsicsError, VmIntrinsics, WellKnownSymbol,
     boolean_class::box_boolean_object,
+    error_class::ERROR_DATA_SLOT,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
     number_class::box_number_object,
     string_class::box_string_object,
@@ -658,6 +659,9 @@ fn object_to_string_tag(
     }
     if has_own_data_slot(handle, SYMBOL_DATA_SLOT, runtime)? {
         return Ok("Symbol");
+    }
+    if has_own_data_slot(handle, ERROR_DATA_SLOT, runtime)? {
+        return Ok("Error");
     }
 
     match runtime.objects().kind(handle).map_err(|error| {

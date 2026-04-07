@@ -4729,38 +4729,55 @@ impl ObjectHeap {
         Ok(ObjectHandle(h.0))
     }
 
+    /// ES2024 §14.7.5.6 EnumerateObjectProperties — collects enumerable string
+    /// property keys from the object and its prototype chain for `for..in`.
+    ///
+    /// Spec algorithm:
+    ///   visited = new Set()
+    ///   for each O in (receiver, proto, proto's proto, ...):
+    ///     for each key in O.[[OwnPropertyKeys]]():
+    ///       if key is Symbol: continue
+    ///       if visited has key: continue
+    ///       visited.add(key)                      ← always, even if non-enumerable
+    ///       if O.[[GetOwnProperty]](key).[[Enumerable]]: yield key
+    ///
+    /// **Shadowing**: a non-enumerable property in a descendant still blocks
+    /// same-name enumerable properties in ancestors. Therefore `visited.add`
+    /// precedes the enumerable check.
     pub fn alloc_property_iterator(
         &mut self,
         object: ObjectHandle,
-        property_names: &PropertyNameRegistry,
+        property_names: &mut PropertyNameRegistry,
     ) -> Result<ObjectHandle, ObjectError> {
-        let mut name_ids = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut name_ids: Vec<PropertyNameId> = Vec::new();
+        let mut seen: std::collections::HashSet<PropertyNameId> = std::collections::HashSet::new();
         let mut current = Some(object);
         while let Some(h) = current {
-            let (obj_keys, proto) = match self.object(h)? {
-                HeapValue::Object {
-                    keys, prototype, ..
-                }
-                | HeapValue::NativeObject {
-                    keys, prototype, ..
-                }
-                | HeapValue::Closure {
-                    keys, prototype, ..
-                }
-                | HeapValue::HostFunction {
-                    keys, prototype, ..
-                } => (keys.clone(), *prototype),
-                HeapValue::Array {
-                    keys, prototype, ..
-                }
-                | HeapValue::RegExp {
-                    keys, prototype, ..
-                } => (keys.clone(), *prototype),
-                _ => (Vec::new(), None),
+            // Use `own_keys_with_registry` which interns Array indexed elements,
+            // Array `length`, and String `length` as proper PropertyNameIds.
+            let obj_keys = match self.own_keys_with_registry(h, property_names) {
+                Ok(keys) => keys,
+                Err(ObjectError::InvalidKind) => Vec::new(),
+                Err(e) => return Err(e),
             };
+            let proto = self.get_prototype(h)?;
+
             for key in obj_keys {
-                if seen.insert(key) {
+                // Symbols are never enumerable via for-in (ES §13.7.5.15).
+                if property_names.is_symbol(key) {
+                    continue;
+                }
+                // Shadowing: always mark visited, even if non-enumerable —
+                // this blocks same-name properties in ancestors.
+                if !seen.insert(key) {
+                    continue;
+                }
+                // Check [[Enumerable]] for yielding.
+                let enumerable = match self.own_property_descriptor(h, key, property_names)? {
+                    Some(prop) => prop.attributes().enumerable(),
+                    None => continue,
+                };
+                if enumerable {
                     name_ids.push(key);
                 }
             }
@@ -4770,7 +4787,6 @@ impl ObjectHeap {
         // Pre-allocate string handles for all collected keys.
         let key_handles: Vec<ObjectHandle> = name_ids
             .iter()
-            .filter(|id| !property_names.is_symbol(**id))
             .filter_map(|id| property_names.get(*id).map(|name| self.alloc_string(name)))
             .collect();
 

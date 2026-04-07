@@ -17,8 +17,9 @@
 
 use std::time::{Duration, Instant};
 
+use otter_macros::dive;
 use otter_vm::console::ConsoleBackend;
-use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
+use otter_vm::descriptors::VmNativeCallError;
 use otter_vm::interpreter::RuntimeState;
 use otter_vm::value::RegisterValue;
 
@@ -37,8 +38,7 @@ fn install_performance_global(state: &mut RuntimeState) {
     // Force epoch initialization.
     let _ = *EPOCH;
 
-    let now_desc = NativeFunctionDescriptor::method("now", 0, performance_now);
-    let now_id = state.register_native_function(now_desc);
+    let now_id = state.register_native_function(performance_now_descriptor());
     let now_fn = state.alloc_host_function(now_id);
 
     let perf_obj = state.alloc_object();
@@ -55,6 +55,7 @@ fn install_performance_global(state: &mut RuntimeState) {
     state.install_global_value("performance", RegisterValue::from_object_handle(perf_obj.0));
 }
 
+#[dive(name = "now", length = 0)]
 fn performance_now(
     _this: &RegisterValue,
     _args: &[RegisterValue],

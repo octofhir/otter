@@ -133,10 +133,7 @@ fn type_error(
 }
 
 /// Allocates and returns a RangeError as `VmNativeCallError::Thrown`.
-fn range_error(
-    runtime: &mut RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn range_error(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
     let error = runtime.alloc_range_error(message);
     match error {
         Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
@@ -155,12 +152,24 @@ fn validate_integer_typed_array(
 ) -> Result<(ObjectHandle, TypedArrayKind), VmNativeCallError> {
     // 1. If waitable is not present, set waitable to false.
     // 2. Perform ? ValidateTypedArray(typedArray, unordered).
-    let ta_val = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let ta_val = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let Some(handle) = ta_val.as_object_handle().map(ObjectHandle) else {
-        return Err(type_error(runtime, "Atomics: first argument must be a TypedArray")?);
+        return Err(type_error(
+            runtime,
+            "Atomics: first argument must be a TypedArray",
+        )?);
     };
-    if !matches!(runtime.objects().kind(handle), Ok(HeapValueKind::TypedArray)) {
-        return Err(type_error(runtime, "Atomics: first argument must be a TypedArray")?);
+    if !matches!(
+        runtime.objects().kind(handle),
+        Ok(HeapValueKind::TypedArray)
+    ) {
+        return Err(type_error(
+            runtime,
+            "Atomics: first argument must be a TypedArray",
+        )?);
     }
 
     let kind = runtime
@@ -236,10 +245,7 @@ fn validate_atomic_access(
 
 /// §7.1.22 ToIndex — convert to a non-negative integer index.
 /// <https://tc39.es/ecma262/#sec-toindex>
-fn to_index(
-    value: RegisterValue,
-    runtime: &mut RuntimeState,
-) -> Result<usize, VmNativeCallError> {
+fn to_index(value: RegisterValue, runtime: &mut RuntimeState) -> Result<usize, VmNativeCallError> {
     if value == RegisterValue::undefined() {
         return Ok(0);
     }
@@ -336,9 +342,7 @@ fn read_atomic(
     let data = runtime
         .objects()
         .array_buffer_or_shared_data(buffer)
-        .map_err(|_| {
-            VmNativeCallError::Internal("Atomics: buffer access failed".into())
-        })?;
+        .map_err(|_| VmNativeCallError::Internal("Atomics: buffer access failed".into()))?;
     let elem_size = kind.element_size();
     if byte_offset + elem_size > data.len() {
         return Err(VmNativeCallError::Internal(
@@ -360,9 +364,7 @@ fn write_atomic(
     let data = runtime
         .objects_mut()
         .array_buffer_or_shared_data_mut(buffer)
-        .map_err(|_| {
-            VmNativeCallError::Internal("Atomics: buffer access failed".into())
-        })?;
+        .map_err(|_| VmNativeCallError::Internal("Atomics: buffer access failed".into()))?;
     let elem_size = kind.element_size();
     if byte_offset + elem_size > data.len() {
         return Err(VmNativeCallError::Internal(
@@ -485,7 +487,9 @@ fn atomic_rmw(
 
 fn rmw_add(old: AtomicValue, new: AtomicValue) -> AtomicValue {
     match (old, new) {
-        (AtomicValue::F64(a), AtomicValue::F64(b)) => AtomicValue::F64((a as i64).wrapping_add(b as i64) as f64),
+        (AtomicValue::F64(a), AtomicValue::F64(b)) => {
+            AtomicValue::F64((a as i64).wrapping_add(b as i64) as f64)
+        }
         (AtomicValue::I64(a), AtomicValue::I64(b)) => AtomicValue::I64(a.wrapping_add(b)),
         (AtomicValue::U64(a), AtomicValue::U64(b)) => AtomicValue::U64(a.wrapping_add(b)),
         _ => old,
@@ -494,7 +498,9 @@ fn rmw_add(old: AtomicValue, new: AtomicValue) -> AtomicValue {
 
 fn rmw_sub(old: AtomicValue, new: AtomicValue) -> AtomicValue {
     match (old, new) {
-        (AtomicValue::F64(a), AtomicValue::F64(b)) => AtomicValue::F64((a as i64).wrapping_sub(b as i64) as f64),
+        (AtomicValue::F64(a), AtomicValue::F64(b)) => {
+            AtomicValue::F64((a as i64).wrapping_sub(b as i64) as f64)
+        }
         (AtomicValue::I64(a), AtomicValue::I64(b)) => AtomicValue::I64(a.wrapping_sub(b)),
         (AtomicValue::U64(a), AtomicValue::U64(b)) => AtomicValue::U64(a.wrapping_sub(b)),
         _ => old,
@@ -503,7 +509,9 @@ fn rmw_sub(old: AtomicValue, new: AtomicValue) -> AtomicValue {
 
 fn rmw_and(old: AtomicValue, new: AtomicValue) -> AtomicValue {
     match (old, new) {
-        (AtomicValue::F64(a), AtomicValue::F64(b)) => AtomicValue::F64(((a as i64) & (b as i64)) as f64),
+        (AtomicValue::F64(a), AtomicValue::F64(b)) => {
+            AtomicValue::F64(((a as i64) & (b as i64)) as f64)
+        }
         (AtomicValue::I64(a), AtomicValue::I64(b)) => AtomicValue::I64(a & b),
         (AtomicValue::U64(a), AtomicValue::U64(b)) => AtomicValue::U64(a & b),
         _ => old,
@@ -512,7 +520,9 @@ fn rmw_and(old: AtomicValue, new: AtomicValue) -> AtomicValue {
 
 fn rmw_or(old: AtomicValue, new: AtomicValue) -> AtomicValue {
     match (old, new) {
-        (AtomicValue::F64(a), AtomicValue::F64(b)) => AtomicValue::F64(((a as i64) | (b as i64)) as f64),
+        (AtomicValue::F64(a), AtomicValue::F64(b)) => {
+            AtomicValue::F64(((a as i64) | (b as i64)) as f64)
+        }
         (AtomicValue::I64(a), AtomicValue::I64(b)) => AtomicValue::I64(a | b),
         (AtomicValue::U64(a), AtomicValue::U64(b)) => AtomicValue::U64(a | b),
         _ => old,
@@ -521,7 +531,9 @@ fn rmw_or(old: AtomicValue, new: AtomicValue) -> AtomicValue {
 
 fn rmw_xor(old: AtomicValue, new: AtomicValue) -> AtomicValue {
     match (old, new) {
-        (AtomicValue::F64(a), AtomicValue::F64(b)) => AtomicValue::F64(((a as i64) ^ (b as i64)) as f64),
+        (AtomicValue::F64(a), AtomicValue::F64(b)) => {
+            AtomicValue::F64(((a as i64) ^ (b as i64)) as f64)
+        }
         (AtomicValue::I64(a), AtomicValue::I64(b)) => AtomicValue::I64(a ^ b),
         (AtomicValue::U64(a), AtomicValue::U64(b)) => AtomicValue::U64(a ^ b),
         _ => old,
@@ -669,7 +681,10 @@ fn atomics_notify(
     // 3. If count is undefined, let c be +∞.
     //    Otherwise, let intCount be ? ToIntegerOrInfinity(count), c be max(intCount, 0).
     // In single-threaded mode, we just validate and return 0.
-    let _count_val = args.get(2).copied().unwrap_or_else(RegisterValue::undefined);
+    let _count_val = args
+        .get(2)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     // Don't need to actually use count — no waiters exist.
 
     // 4. Single-threaded: return +0𝔽 (no waiters).
@@ -739,7 +754,10 @@ fn atomics_wait(
     let expected = coerce_atomic_value(args, 2, kind, runtime)?;
 
     // 4. Get timeout (default: +Infinity).
-    let timeout_val = args.get(3).copied().unwrap_or_else(RegisterValue::undefined);
+    let timeout_val = args
+        .get(3)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     let timeout = if timeout_val == RegisterValue::undefined() {
         f64::INFINITY
     } else {
@@ -749,7 +767,11 @@ fn atomics_wait(
     };
 
     // 5. If timeout is NaN, set to +Infinity.
-    let _timeout = if timeout.is_nan() { f64::INFINITY } else { timeout };
+    let _timeout = if timeout.is_nan() {
+        f64::INFINITY
+    } else {
+        timeout
+    };
 
     // 6. Read current value.
     let buffer = get_buffer(ta, runtime)?;

@@ -2,10 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use otter_runtime::{
-    HostedNativeModule, HostedNativeModuleLoader, NativeFunctionDescriptor, ObjectHandle,
-    RegisterValue, RuntimeState, VmNativeCallError,
-};
+use otter_macros::{burrow, dive, lodge};
+use otter_runtime::{ObjectHandle, RegisterValue, RuntimeState, VmNativeCallError};
 use otter_vm::object::HeapValueKind;
 use otter_vm::payload::{VmTrace, VmValueTracer};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -239,43 +237,17 @@ impl VmTrace for KvStorePayload {
     fn trace(&self, _tracer: &mut dyn VmValueTracer) {}
 }
 
-#[derive(Debug)]
-pub(crate) struct KvModule;
+lodge!(
+    kv_module,
+    module_specifiers = ["otter:kv"],
+    default = function(kv_open as "kv"),
+    functions = [
+        ("kv", kv_open),
+        ("openKv", kv_open as "openKv"),
+    ],
+);
 
-impl HostedNativeModuleLoader for KvModule {
-    fn load(&self, runtime: &mut RuntimeState) -> Result<HostedNativeModule, String> {
-        let namespace = runtime.alloc_object();
-        let kv = alloc_named_function(runtime, "kv", 1, kv_open);
-        let open_kv = alloc_named_function(runtime, "openKv", 1, kv_open);
-        let default_prop = runtime.intern_property_name("default");
-        let kv_prop = runtime.intern_property_name("kv");
-        let open_prop = runtime.intern_property_name("openKv");
-
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                default_prop,
-                RegisterValue::from_object_handle(kv.0),
-            )
-            .map_err(|error| format!("failed to install otter:kv default export: {error:?}"))?;
-        runtime
-            .objects_mut()
-            .set_property(namespace, kv_prop, RegisterValue::from_object_handle(kv.0))
-            .map_err(|error| format!("failed to install otter:kv named export: {error:?}"))?;
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                open_prop,
-                RegisterValue::from_object_handle(open_kv.0),
-            )
-            .map_err(|error| format!("failed to install otter:kv openKv export: {error:?}"))?;
-
-        Ok(HostedNativeModule::Esm(namespace))
-    }
-}
-
+#[dive(name = "kv", length = 1)]
 fn kv_open(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -297,21 +269,27 @@ fn kv_open(
         is_memory,
     });
 
-    install_method(runtime, object, "set", 2, kv_set)?;
-    install_method(runtime, object, "get", 1, kv_get)?;
-    install_method(runtime, object, "delete", 1, kv_delete)?;
-    install_method(runtime, object, "has", 1, kv_has)?;
-    install_method(runtime, object, "keys", 0, kv_keys)?;
-    install_method(runtime, object, "clear", 0, kv_clear)?;
-    install_method(runtime, object, "close", 0, kv_close)?;
-    install_getter(runtime, object, "size", kv_size)?;
-    install_getter(runtime, object, "path", kv_path)?;
-    install_getter(runtime, object, "isMemory", kv_is_memory)?;
-    install_getter(runtime, object, "closed", kv_closed)?;
+    let members = burrow! {
+        fns = [
+            kv_set,
+            kv_get,
+            kv_delete,
+            kv_has,
+            kv_keys,
+            kv_clear,
+            kv_close,
+            kv_size,
+            kv_path,
+            kv_is_memory,
+            kv_closed
+        ]
+    };
+    runtime.install_burrow(object, &members)?;
 
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
+#[dive(name = "set", length = 2)]
 fn kv_set(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -326,6 +304,7 @@ fn kv_set(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "get", length = 1)]
 fn kv_get(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -339,6 +318,7 @@ fn kv_get(
     }
 }
 
+#[dive(name = "delete", length = 1)]
 fn kv_delete(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -349,6 +329,7 @@ fn kv_delete(
     Ok(RegisterValue::from_bool(deleted))
 }
 
+#[dive(name = "has", length = 1)]
 fn kv_has(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -359,6 +340,7 @@ fn kv_has(
     Ok(RegisterValue::from_bool(has))
 }
 
+#[dive(name = "keys", length = 0)]
 fn kv_keys(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -374,6 +356,7 @@ fn kv_keys(
     ))
 }
 
+#[dive(name = "clear", length = 0)]
 fn kv_clear(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -383,6 +366,7 @@ fn kv_clear(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "close", length = 0)]
 fn kv_close(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -401,6 +385,7 @@ fn kv_close(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "size", getter)]
 fn kv_size(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -410,6 +395,7 @@ fn kv_size(
     Ok(RegisterValue::from_number(size as f64))
 }
 
+#[dive(name = "path", getter)]
 fn kv_path(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -432,6 +418,7 @@ fn kv_path(
     ))
 }
 
+#[dive(name = "isMemory", getter)]
 fn kv_is_memory(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -452,6 +439,7 @@ fn kv_is_memory(
     Ok(RegisterValue::from_bool(is_memory))
 }
 
+#[dive(name = "closed", getter)]
 fn kv_closed(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -616,74 +604,6 @@ fn with_store_mut<T>(
         None => return Err(throw_type_error(runtime, "KV store is closed")),
     };
     f(store).map_err(|error| kv_error(runtime, error))
-}
-
-fn install_method(
-    runtime: &mut RuntimeState,
-    target: ObjectHandle,
-    name: &str,
-    arity: u16,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> Result<(), VmNativeCallError> {
-    let function = alloc_named_function(runtime, name, arity, callback);
-    let property = runtime.intern_property_name(name);
-    runtime
-        .objects_mut()
-        .set_property(
-            target,
-            property,
-            RegisterValue::from_object_handle(function.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("failed to install kv method '{name}': {error:?}").into(),
-            )
-        })?;
-    Ok(())
-}
-
-fn install_getter(
-    runtime: &mut RuntimeState,
-    target: ObjectHandle,
-    name: &str,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> Result<(), VmNativeCallError> {
-    let descriptor = NativeFunctionDescriptor::getter(name, callback);
-    let getter_id = runtime.register_native_function(descriptor);
-    let getter = runtime.alloc_host_function(getter_id);
-    let property = runtime.intern_property_name(name);
-    runtime
-        .objects_mut()
-        .define_accessor(target, property, Some(getter), None)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("failed to install kv getter '{name}': {error:?}").into(),
-            )
-        })?;
-    Ok(())
-}
-
-fn alloc_named_function(
-    runtime: &mut RuntimeState,
-    name: &str,
-    arity: u16,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> ObjectHandle {
-    let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
-    let function = runtime.register_native_function(descriptor);
-    runtime.alloc_host_function(function)
 }
 
 fn required_string_arg(

@@ -16,6 +16,7 @@ all = "deny"
 dirs = "6.0"
 dunce = "1"
 md5 = "0.8"
+otter-macros = { path = "../otter-macros" }
 otter-jit = { path = "../otter-jit" }
 otter-vm = { path = "../otter-vm" }
 oxc_allocator = "0.123"

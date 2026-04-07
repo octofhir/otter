@@ -14,6 +14,7 @@ all = "deny"
 
 [dependencies]
 otter-gc = { path = "../otter-gc" }
+otter-macros = { path = "../otter-macros" }
 oxc_allocator = "0.123"
 oxc_ast = "0.123"
 oxc_parser = "0.123"
@@ -45,5 +46,4 @@ icu_segmenter = "2.1"
 icu_experimental = { version = "0.5", features = ["compiled_data"] }
 
 [dev-dependencies]
-otter-macros = { path = "../otter-macros" }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }

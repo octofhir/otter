@@ -51,7 +51,7 @@ impl Counter {
 }
 
 #[test]
-fn js_class_descriptor_collects_new_vm_metadata() {
+fn js_class_descriptor_collects_active_runtime_metadata() {
     let descriptor = Counter::js_class_descriptor();
 
     assert_eq!(Counter::JS_CLASS_NAME, "Counter");

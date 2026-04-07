@@ -2,7 +2,7 @@
 name = "otter-macros"
 version = "0.1.0"
 edition = "2024"
-description = "Proc-macros for Otter runtime - #[dive] attribute for native functions"
+description = "Proc-macros for descriptor-driven JS bindings in the Otter runtime"
 license = "MIT"
 autotests = false
 repository = "https://github.com/octofhir/otter"
@@ -22,6 +22,7 @@ quote = "1"
 syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 
 [dev-dependencies]
+otter-runtime = { path = "../otter-runtime" }
 otter-vm = { path = "../otter-vm" }
 
 [[test]]
@@ -31,3 +32,19 @@ path = "tests/js_class_descriptor.rs"
 [[test]]
 name = "js_namespace_descriptor"
 path = "tests/js_namespace_descriptor.rs"
+
+[[test]]
+name = "dive_descriptor"
+path = "tests/dive_descriptor.rs"
+
+[[test]]
+name = "raft_bindings"
+path = "tests/raft_bindings.rs"
+
+[[test]]
+name = "burrow_descriptors"
+path = "tests/burrow_descriptors.rs"
+
+[[test]]
+name = "lodge_loader"
+path = "tests/lodge_loader.rs"

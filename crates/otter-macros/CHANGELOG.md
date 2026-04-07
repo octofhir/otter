@@ -7,9 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Initial release
-- `#[dive]` attribute macro for marking Rust functions callable from JavaScript
-- `#[dive(swift)]` mode for synchronous functions
-- `#[dive(deep)]` mode for async functions returning Promises
-- Automatic argument deserialization from JSON
-- Automatic result serialization to JSON
-- Support for `Result<T, E>` return types with error mapping
+- `#[dive]` attribute macro for active-runtime native bindings
+- `#[dive(deep)]` mode for async descriptor metadata
+- `#[js_class]` and `#[js_namespace]` descriptor macros
+- `raft!`, `burrow!`, and `lodge!` helpers for binding and module assembly

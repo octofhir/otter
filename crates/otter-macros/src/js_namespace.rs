@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemImpl, ItemStruct};
 
-use crate::{JsClassArgs, JsMemberKind, is_new_vm_js_class_method, parse_js_member_attr};
+use crate::{JsClassArgs, JsMemberKind, is_active_js_class_method, parse_js_member_attr};
 
 pub(crate) fn expand_js_namespace_struct(input: ItemStruct, args: JsClassArgs) -> TokenStream {
     let struct_name = &input.ident;
@@ -101,11 +101,11 @@ pub(crate) fn expand_js_namespace_impl(input: ItemImpl) -> TokenStream {
                 }
             }
 
-            if !is_new_vm_js_class_method(method) {
+            if !is_active_js_class_method(method) {
                 errors.push(
                     syn::Error::new_spanned(
                         &method.sig.ident,
-                        "js_namespace only supports new-VM methods with signature fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>.",
+                        "js_namespace only supports active runtime methods with signature fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>.",
                     )
                     .to_compile_error(),
                 );
@@ -173,7 +173,7 @@ pub(crate) fn expand_js_namespace_impl(input: ItemImpl) -> TokenStream {
             };
 
             quote! {
-                /// New-VM descriptor for this js_namespace member.
+                /// Descriptor for this js_namespace member.
                 pub fn #descriptor_fn_name() -> ::otter_vm::NativeFunctionDescriptor {
                     let callback = Self::#rust_ident as ::otter_vm::VmNativeFunction;
                     #descriptor_ctor
@@ -216,7 +216,7 @@ pub(crate) fn expand_js_namespace_impl(input: ItemImpl) -> TokenStream {
 
             #(#descriptor_fns)*
 
-            /// Aggregate new-VM namespace descriptor emitted by #[js_namespace].
+            /// Aggregate namespace descriptor emitted by #[js_namespace].
             pub fn js_namespace_descriptor() -> ::otter_vm::JsNamespaceDescriptor {
                 let mut descriptor =
                     ::otter_vm::JsNamespaceDescriptor::new(Self::JS_NAMESPACE_NAME);

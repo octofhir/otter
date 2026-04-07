@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use libffi::middle::{Arg, Cif};
 use libloading::Library as DynLib;
+use otter_macros::{dive, lodge};
 use otter_runtime::{
-    HostedNativeModule, HostedNativeModuleLoader, NativeFunctionDescriptor, ObjectHandle,
-    RegisterValue, RuntimeState, VmNativeCallError, current_capabilities,
+    NativeFunctionDescriptor, ObjectHandle, RegisterValue, RuntimeState, VmNativeCallError,
+    current_capabilities,
 };
 use otter_vm::object::HeapValueKind;
 use otter_vm::payload::{VmTrace, VmValueTracer};
@@ -287,112 +288,37 @@ impl VmTrace for JsCallbackPayload {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct FfiModule;
-
-impl HostedNativeModuleLoader for FfiModule {
-    fn load(&self, runtime: &mut RuntimeState) -> Result<HostedNativeModule, String> {
-        let namespace = runtime.alloc_object();
-        let default_export = runtime.alloc_object();
-        let dlopen = alloc_named_function(runtime, "dlopen", 2, ffi_dlopen);
-        let ptr = alloc_named_function(runtime, "ptr", 2, ffi_ptr);
-        let cstring = alloc_named_function(runtime, "CString", 2, ffi_cstring);
-        let to_array_buffer =
-            alloc_named_function(runtime, "toArrayBuffer", 3, ffi_to_array_buffer);
-        let to_buffer = alloc_named_function(runtime, "toBuffer", 3, ffi_to_buffer);
-        let cfunction = alloc_named_function(runtime, "CFunction", 1, ffi_cfunction);
-        let link_symbols = alloc_named_function(runtime, "linkSymbols", 1, ffi_link_symbols);
-        let js_callback = alloc_named_function(runtime, "JSCallback", 2, ffi_js_callback);
-        let suffix = RegisterValue::from_object_handle(runtime.alloc_string(platform_suffix()).0);
-        let read = build_read_namespace(runtime)?;
-        let ffi_type = build_ffi_type_object(runtime)?;
-
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "dlopen",
-            RegisterValue::from_object_handle(dlopen.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "ptr",
-            RegisterValue::from_object_handle(ptr.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "CString",
-            RegisterValue::from_object_handle(cstring.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "toArrayBuffer",
-            RegisterValue::from_object_handle(to_array_buffer.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "toBuffer",
-            RegisterValue::from_object_handle(to_buffer.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "CFunction",
-            RegisterValue::from_object_handle(cfunction.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "linkSymbols",
-            RegisterValue::from_object_handle(link_symbols.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
-            "JSCallback",
-            RegisterValue::from_object_handle(js_callback.0),
-        )?;
-        install_value_export(runtime, namespace, default_export, "suffix", suffix)?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
+lodge!(
+    ffi_module,
+    module_specifiers = ["otter:ffi"],
+    default = object,
+    functions = [
+        ("dlopen", ffi_dlopen),
+        ("ptr", ffi_ptr),
+        ("CString", ffi_cstring),
+        ("toArrayBuffer", ffi_to_array_buffer),
+        ("toBuffer", ffi_to_buffer),
+        ("CFunction", ffi_cfunction),
+        ("linkSymbols", ffi_link_symbols),
+        ("JSCallback", ffi_js_callback),
+    ],
+    values = [
+        (
+            "suffix",
+            RegisterValue::from_object_handle(runtime.alloc_string(platform_suffix()).0)
+        ),
+        (
             "read",
-            RegisterValue::from_object_handle(read.0),
-        )?;
-        install_value_export(
-            runtime,
-            namespace,
-            default_export,
+            RegisterValue::from_object_handle(build_read_namespace(runtime)?.0)
+        ),
+        (
             "FFIType",
-            RegisterValue::from_object_handle(ffi_type.0),
-        )?;
+            RegisterValue::from_object_handle(build_ffi_type_object(runtime)?.0)
+        ),
+    ],
+);
 
-        let default_prop = runtime.intern_property_name("default");
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                default_prop,
-                RegisterValue::from_object_handle(default_export.0),
-            )
-            .map_err(|error| format!("failed to install otter:ffi default export: {error:?}"))?;
-
-        Ok(HostedNativeModule::Esm(namespace))
-    }
-}
-
+#[dive(name = "dlopen", length = 2)]
 fn ffi_dlopen(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -771,6 +697,7 @@ fn ffi_read_cstring(
     ))
 }
 
+#[dive(name = "ptr", length = 2)]
 fn ffi_ptr(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -847,6 +774,7 @@ fn ffi_ptr(
     }
 }
 
+#[dive(name = "CString", length = 2)]
 fn ffi_cstring(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -863,6 +791,7 @@ fn ffi_cstring(
     ffi_read_cstring(this, args, runtime)
 }
 
+#[dive(name = "toArrayBuffer", length = 3)]
 fn ffi_to_array_buffer(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -888,6 +817,7 @@ fn ffi_to_array_buffer(
     Ok(RegisterValue::from_object_handle(buffer.0))
 }
 
+#[dive(name = "toBuffer", length = 3)]
 fn ffi_to_buffer(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -896,6 +826,7 @@ fn ffi_to_buffer(
     ffi_to_array_buffer(this, args, runtime)
 }
 
+#[dive(name = "CFunction", length = 1)]
 fn ffi_cfunction(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -912,6 +843,7 @@ fn ffi_cfunction(
     Ok(RegisterValue::from_object_handle(callable.0))
 }
 
+#[dive(name = "linkSymbols", length = 1)]
 fn ffi_link_symbols(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -1018,6 +950,7 @@ fn ffi_bound_callable_call(
     marshal_raw_to_value(raw, signature.returns, runtime)
 }
 
+#[dive(name = "JSCallback", length = 2)]
 fn ffi_js_callback(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -1636,27 +1569,6 @@ fn build_ffi_type_object(runtime: &mut RuntimeState) -> Result<ObjectHandle, Str
             .map_err(|error| format!("failed to install FFIType.{}: {error:?}", ty.name()))?;
     }
     Ok(object)
-}
-
-fn install_value_export(
-    runtime: &mut RuntimeState,
-    namespace: ObjectHandle,
-    default_export: ObjectHandle,
-    name: &str,
-    value: RegisterValue,
-) -> Result<(), String> {
-    let property = runtime.intern_property_name(name);
-    runtime
-        .objects_mut()
-        .set_property(namespace, property, value)
-        .map_err(|error| format!("failed to install otter:ffi export '{name}': {error:?}"))?;
-    runtime
-        .objects_mut()
-        .set_property(default_export, property, value)
-        .map_err(|error| {
-            format!("failed to install otter:ffi default export '{name}': {error:?}")
-        })?;
-    Ok(())
 }
 
 fn install_function(

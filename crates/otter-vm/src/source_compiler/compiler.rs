@@ -78,8 +78,11 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<(), SourceLoweringError> {
         // §15.1 — Strict mode functions must not have duplicate parameter names.
         // Spec: <https://tc39.es/ecma262/#sec-function-definitions-static-semantics-early-errors>
-        let mut seen_names: Option<std::collections::HashSet<String>> =
-            if self.strict_mode { Some(std::collections::HashSet::new()) } else { None };
+        let mut seen_names: Option<std::collections::HashSet<String>> = if self.strict_mode {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
 
         for param in params {
             if param.is_rest {
@@ -1922,6 +1925,18 @@ impl<'a> FunctionCompiler<'a> {
         return_statement: &oxc_ast::ast::ReturnStatement<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<bool, SourceLoweringError> {
+        // §15.10.2 HasCallInTailPosition — in strict mode, the return
+        // argument may contain a call in tail position (possibly nested
+        // inside conditional, comma, or logical expressions).
+        // Spec: <https://tc39.es/ecma262/#sec-static-semantics-hascallintailposition>
+        if self.is_tail_call_eligible() {
+            if let Some(argument) = &return_statement.argument {
+                if Self::has_call_in_tail_position(argument) {
+                    return self.compile_return_with_tail_calls(argument, module);
+                }
+            }
+        }
+
         let value = if let Some(argument) = &return_statement.argument {
             self.compile_expression(argument, module)?
         } else {
@@ -1948,6 +1963,420 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_iterator_closes_for_active_loops();
         self.instructions.push(Instruction::ret(value.register));
         self.release(value);
+        Ok(true)
+    }
+
+    /// Whether this function is eligible for tail calls at all.
+    fn is_tail_call_eligible(&self) -> bool {
+        self.strict_mode
+            && self.finally_stack.is_empty()
+            && !self.kind.is_generator()
+            && !self.kind.is_async()
+    }
+
+    /// §15.10.2 HasCallInTailPosition — recursively check whether an
+    /// expression contains a call in tail position.
+    /// Spec: <https://tc39.es/ecma262/#sec-static-semantics-hascallintailposition>
+    fn has_call_in_tail_position(expr: &Expression<'_>) -> bool {
+        match expr {
+            // §12.3.4.1 — `eval(...)` CAN be in tail position. The direct-eval
+            // check (SameValue(func, %eval%)) is a *runtime* check, not
+            // compile-time. When `eval` is rebound to a non-eval function the
+            // call must be tail-call optimized. The TailCallClosure handler
+            // falls back to a regular call for native callees, so this is safe.
+            Expression::CallExpression(call) => {
+                !matches!(&call.callee, Expression::Super(_))
+                    && !call
+                        .arguments
+                        .iter()
+                        .any(|arg| matches!(arg, Argument::SpreadElement(_)))
+            }
+            Expression::ConditionalExpression(cond) => {
+                Self::has_call_in_tail_position(&cond.consequent)
+                    || Self::has_call_in_tail_position(&cond.alternate)
+            }
+            Expression::SequenceExpression(seq) => seq
+                .expressions
+                .last()
+                .is_some_and(|last| Self::has_call_in_tail_position(last)),
+            Expression::LogicalExpression(logical) => {
+                Self::has_call_in_tail_position(&logical.right)
+            }
+            Expression::ParenthesizedExpression(paren) => {
+                Self::has_call_in_tail_position(&paren.expression)
+            }
+            Expression::TaggedTemplateExpression(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Compile a return argument with tail-call awareness.
+    /// Recursively walks conditional/comma/logical, emitting `TailCallClosure`
+    /// for calls in tail position and `Return` for non-tail paths.
+    fn compile_return_with_tail_calls(
+        &mut self,
+        expr: &Expression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        match expr {
+            // Direct call in tail position (including `eval(...)` — see
+            // has_call_in_tail_position for rationale).
+            Expression::CallExpression(call)
+                if !matches!(&call.callee, Expression::Super(_))
+                    && !call
+                        .arguments
+                        .iter()
+                        .any(|arg| matches!(arg, Argument::SpreadElement(_))) =>
+            {
+                self.emit_tail_call(call, module)
+            }
+
+            // §15.10.2 ConditionalExpression — both branches in tail position.
+            Expression::ConditionalExpression(cond) => {
+                let test = self.compile_expression(&cond.test, module)?;
+                let jump_to_alt =
+                    self.emit_conditional_placeholder(Opcode::JumpIfFalse, test.register);
+                self.release(test);
+
+                self.compile_return_with_tail_calls(&cond.consequent, module)?;
+                let jump_to_end = self.emit_jump_placeholder();
+
+                self.patch_jump(jump_to_alt, self.instructions.len())?;
+                self.compile_return_with_tail_calls(&cond.alternate, module)?;
+
+                self.patch_jump(jump_to_end, self.instructions.len())?;
+                Ok(true)
+            }
+
+            // §15.10.2 SequenceExpression — last element in tail position.
+            Expression::SequenceExpression(seq) => {
+                let len = seq.expressions.len();
+                for (i, sub_expr) in seq.expressions.iter().enumerate() {
+                    if i == len - 1 {
+                        return self.compile_return_with_tail_calls(sub_expr, module);
+                    }
+                    let val = self.compile_expression(sub_expr, module)?;
+                    self.release(val);
+                }
+                let val = self.load_undefined()?;
+                self.emit_iterator_closes_for_active_loops();
+                self.instructions.push(Instruction::ret(val.register));
+                self.release(val);
+                Ok(true)
+            }
+
+            // §15.10.2 LogicalExpression — right operand in tail position.
+            Expression::LogicalExpression(logical) => {
+                self.compile_logical_tail_call(logical, module)
+            }
+
+            // Parenthesized — transparent to tail position.
+            Expression::ParenthesizedExpression(paren) => {
+                self.compile_return_with_tail_calls(&paren.expression, module)
+            }
+
+            // §15.10.2 TaggedTemplateExpression — tag call in tail position.
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.emit_tail_call_tagged_template(tagged, module)
+            }
+
+            // Not a tail-call form — compile normally and return.
+            _ => {
+                let value = self.compile_expression(expr, module)?;
+                self.emit_iterator_closes_for_active_loops();
+                self.instructions.push(Instruction::ret(value.register));
+                self.release(value);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Compile `return a OP b` where OP is &&, ||, ?? and `b` is in tail position.
+    fn compile_logical_tail_call(
+        &mut self,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        let left = self.compile_expression(&logical.left, module)?;
+        let result_reg = if left.is_temp {
+            left.register
+        } else {
+            let reg = self.alloc_temp();
+            self.instructions
+                .push(Instruction::move_(reg, left.register));
+            reg
+        };
+
+        match logical.operator {
+            LogicalOperator::And => {
+                let jump_short = self.emit_conditional_placeholder(Opcode::JumpIfFalse, result_reg);
+                // RHS is in tail position.
+                self.compile_return_with_tail_calls(&logical.right, module)?;
+                // Short-circuit: return LHS.
+                self.patch_jump(jump_short, self.instructions.len())?;
+                self.emit_iterator_closes_for_active_loops();
+                self.instructions.push(Instruction::ret(result_reg));
+            }
+            LogicalOperator::Or => {
+                let jump_short = self.emit_conditional_placeholder(Opcode::JumpIfTrue, result_reg);
+                self.compile_return_with_tail_calls(&logical.right, module)?;
+                self.patch_jump(jump_short, self.instructions.len())?;
+                self.emit_iterator_closes_for_active_loops();
+                self.instructions.push(Instruction::ret(result_reg));
+            }
+            LogicalOperator::Coalesce => {
+                let null_val = self.load_null()?;
+                let cmp = ValueLocation::temp(self.alloc_temp());
+                self.instructions.push(Instruction::eq(
+                    cmp.register,
+                    result_reg,
+                    null_val.register,
+                ));
+                self.release(null_val);
+                let jump_if_null =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp.register);
+
+                let undef_val = self.load_undefined()?;
+                self.instructions.push(Instruction::eq(
+                    cmp.register,
+                    result_reg,
+                    undef_val.register,
+                ));
+                self.release(undef_val);
+                let jump_if_undef =
+                    self.emit_conditional_placeholder(Opcode::JumpIfTrue, cmp.register);
+                self.release(cmp);
+
+                // Not nullish — return LHS.
+                self.emit_iterator_closes_for_active_loops();
+                self.instructions.push(Instruction::ret(result_reg));
+                let jump_past_rhs = self.emit_jump_placeholder();
+
+                // Nullish — RHS in tail position.
+                let rhs_start = self.instructions.len();
+                self.patch_jump(jump_if_null, rhs_start)?;
+                self.patch_jump(jump_if_undef, rhs_start)?;
+                self.compile_return_with_tail_calls(&logical.right, module)?;
+
+                self.patch_jump(jump_past_rhs, self.instructions.len())?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Emit a `TailCallClosure` instruction for a single call expression.
+    fn emit_tail_call(
+        &mut self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        let (callee, receiver) = self.compile_call_target(&call.callee, module)?;
+        let receiver = match receiver {
+            Some(receiver) if receiver.is_temp => Some(self.stabilize_binding_value(receiver)?),
+            other => other,
+        };
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
+
+        let argument_count = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let mut argument_values = Vec::with_capacity(usize::from(argument_count));
+
+        for argument in &call.arguments {
+            let value = self.compile_expression(
+                argument.as_expression().ok_or_else(|| {
+                    SourceLoweringError::Unsupported("unsupported call argument".to_string())
+                })?,
+                module,
+            )?;
+            argument_values.push(if value.is_temp {
+                self.stabilize_binding_value(value)?
+            } else {
+                value
+            });
+        }
+
+        let arg_start = if argument_count == 0 {
+            BytecodeRegister::new(self.next_local + self.next_temp)
+        } else {
+            self.reserve_temp_window(argument_count)?
+        };
+
+        for (offset, value) in argument_values.into_iter().enumerate() {
+            let destination = BytecodeRegister::new(arg_start.index() + offset as u16);
+            if value.register != destination {
+                self.instructions
+                    .push(Instruction::move_(destination, value.register));
+                self.release(value);
+            }
+        }
+
+        self.emit_iterator_closes_for_active_loops();
+
+        let pc = self.instructions.len();
+        self.instructions
+            .push(Instruction::tail_call_closure(callee.register, arg_start));
+        let call_site = match receiver {
+            Some(receiver) => CallSite::Closure(ClosureCall::new_with_receiver(
+                argument_count,
+                FrameFlags::new(false, true, false),
+                receiver.register,
+            )),
+            None => CallSite::Closure(ClosureCall::new(
+                argument_count,
+                FrameFlags::new(false, true, false),
+            )),
+        };
+        self.record_call_site(pc, call_site);
+
+        if argument_count != 0 {
+            self.release_temp_window(argument_count.saturating_sub(1));
+        }
+        self.release(callee);
+        if let Some(receiver) = receiver {
+            self.release(receiver);
+        }
+        Ok(true)
+    }
+
+    /// Emit a `TailCallClosure` for a tagged template expression in tail position.
+    /// Mirrors `compile_tagged_template_expression` but emits TailCallClosure
+    /// instead of CallClosure at the end.
+    fn emit_tail_call_tagged_template(
+        &mut self,
+        tagged: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<bool, SourceLoweringError> {
+        let template = &tagged.quasi;
+
+        // 1. Compile the tag expression (callee + optional receiver).
+        let (callee, receiver) = self.compile_call_target(&tagged.tag, module)?;
+        let receiver = match receiver {
+            Some(r) if r.is_temp => Some(self.stabilize_binding_value(r)?),
+            other => other,
+        };
+        let callee = if callee.is_temp {
+            self.stabilize_binding_value(callee)?
+        } else {
+            callee
+        };
+
+        // 2. Build the template strings array (cooked values).
+        let quasis_count = template.quasis.len() as u16;
+        let strings_arr = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(strings_arr.register, quasis_count));
+        let strings_arr = self.stabilize_binding_value(strings_arr)?;
+
+        for (i, quasi) in template.quasis.iter().enumerate() {
+            let cooked = quasi.value.cooked.as_ref().map(|s| s.as_str());
+            let val = match cooked {
+                Some(s) => self.compile_string_literal(s)?,
+                None => {
+                    let v = ValueLocation::temp(self.alloc_temp());
+                    self.instructions
+                        .push(Instruction::load_undefined(v.register));
+                    v
+                }
+            };
+            let idx = self.compile_numeric_literal(i as f64)?;
+            self.instructions.push(Instruction::set_index(
+                strings_arr.register,
+                idx.register,
+                val.register,
+            ));
+            self.release(idx);
+            self.release(val);
+        }
+
+        // 3. Build the raw strings array.
+        let raw_arr = ValueLocation::temp(self.alloc_temp());
+        self.instructions
+            .push(Instruction::new_array(raw_arr.register, quasis_count));
+        let raw_arr = self.stabilize_binding_value(raw_arr)?;
+
+        for (i, quasi) in template.quasis.iter().enumerate() {
+            let raw_str = quasi.value.raw.as_str();
+            let val = self.compile_string_literal(raw_str)?;
+            let idx = self.compile_numeric_literal(i as f64)?;
+            self.instructions.push(Instruction::set_index(
+                raw_arr.register,
+                idx.register,
+                val.register,
+            ));
+            self.release(idx);
+            self.release(val);
+        }
+
+        // 4. Set `strings.raw = rawArray`.
+        let raw_prop = self.intern_property_name("raw")?;
+        self.instructions.push(Instruction::set_property(
+            strings_arr.register,
+            raw_arr.register,
+            raw_prop,
+        ));
+        self.release(raw_arr);
+
+        // 5. Evaluate substitution expressions.
+        let mut sub_values = Vec::with_capacity(template.expressions.len());
+        for expr in &template.expressions {
+            let val = self.compile_expression(expr, module)?;
+            sub_values.push(if val.is_temp {
+                self.stabilize_binding_value(val)?
+            } else {
+                val
+            });
+        }
+
+        // 6. Emit TailCallClosure: tag(strings, sub0, sub1, ...)
+        let total_args = 1 + sub_values.len();
+        let argument_count =
+            RegisterIndex::try_from(total_args).map_err(|_| SourceLoweringError::TooManyLocals)?;
+        let arg_start = self.reserve_temp_window(argument_count)?;
+
+        // First arg: template strings array.
+        self.instructions
+            .push(Instruction::move_(arg_start, strings_arr.register));
+        self.release(strings_arr);
+
+        // Remaining args: substitution values.
+        for (i, val) in sub_values.into_iter().enumerate() {
+            let dst = BytecodeRegister::new(arg_start.index() + 1 + i as u16);
+            if val.register != dst {
+                self.instructions
+                    .push(Instruction::move_(dst, val.register));
+                self.release(val);
+            }
+        }
+
+        self.emit_iterator_closes_for_active_loops();
+
+        let pc = self.instructions.len();
+        self.instructions
+            .push(Instruction::tail_call_closure(callee.register, arg_start));
+        let call_site = match receiver {
+            Some(recv) => CallSite::Closure(ClosureCall::new_with_receiver(
+                argument_count,
+                FrameFlags::new(false, true, false),
+                recv.register,
+            )),
+            None => CallSite::Closure(ClosureCall::new(
+                argument_count,
+                FrameFlags::new(false, true, false),
+            )),
+        };
+        self.record_call_site(pc, call_site);
+
+        if argument_count != 0 {
+            self.release_temp_window(argument_count.saturating_sub(1));
+        }
+        self.release(callee);
+        if let Some(receiver) = receiver {
+            self.release(receiver);
+        }
         Ok(true)
     }
 

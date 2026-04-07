@@ -2541,7 +2541,10 @@ fn typed_array_with(
         let bigint_str = match runtime.objects().bigint_value(ObjectHandle(bigint_handle)) {
             Ok(Some(s)) => s.to_string(),
             _ => {
-                return Err(type_error(runtime, "%TypedArray%.prototype.with: invalid BigInt")?);
+                return Err(type_error(
+                    runtime,
+                    "%TypedArray%.prototype.with: invalid BigInt",
+                )?);
             }
         };
         let n: f64 = match kind {
@@ -2579,9 +2582,10 @@ fn alloc_typed_array_from_elements(
         .objects_mut()
         .alloc_array_buffer_with_data(data, ab_proto);
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
-    let result = runtime
-        .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto));
+    let result =
+        runtime
+            .objects_mut()
+            .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto));
     for (i, &val) in elements.iter().enumerate() {
         runtime
             .objects_mut()

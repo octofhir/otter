@@ -11,48 +11,33 @@
 
 use std::time::Duration;
 
-use crate::descriptors::{
-    NativeBindingDescriptor, NativeBindingTarget, NativeFunctionDescriptor, VmNativeCallError,
-};
+use crate::descriptors::{NativeBindingDescriptor, VmNativeCallError};
 use crate::interpreter::RuntimeState;
 use crate::microtask::MicrotaskJob;
 use crate::object::ObjectHandle;
 use crate::value::RegisterValue;
+use otter_macros::{dive, raft};
 
 /// Returns the binding descriptors for all timer/microtask globals.
 pub(super) fn timer_global_bindings() -> Vec<NativeBindingDescriptor> {
-    vec![
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("setTimeout", 1, set_timeout),
-        ),
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("setInterval", 1, set_interval),
-        ),
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("clearTimeout", 1, clear_timeout),
-        ),
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("clearInterval", 1, clear_interval),
-        ),
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("queueMicrotask", 1, queue_microtask),
-        ),
-        NativeBindingDescriptor::new(
-            NativeBindingTarget::Global,
-            NativeFunctionDescriptor::method("structuredClone", 1, structured_clone),
-        ),
-    ]
+    raft! {
+        target = Global,
+        fns = [
+            set_timeout,
+            set_interval,
+            clear_timeout,
+            clear_interval,
+            queue_microtask,
+            structured_clone
+        ]
+    }
 }
 
 /// `setTimeout(callback, delay?)` — HTML5 §8.6
 ///
 /// Schedules `callback` to run after `delay` milliseconds (default 0).
 /// Returns a numeric timer ID for `clearTimeout`.
+#[dive(name = "setTimeout", length = 1)]
 fn set_timeout(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -79,6 +64,7 @@ fn set_timeout(
 }
 
 /// `setInterval(callback, interval?)` — HTML5 §8.6
+#[dive(name = "setInterval", length = 1)]
 fn set_interval(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -105,6 +91,7 @@ fn set_interval(
 }
 
 /// `clearTimeout(id)` — HTML5 §8.6
+#[dive(name = "clearTimeout", length = 1)]
 fn clear_timeout(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -117,6 +104,7 @@ fn clear_timeout(
 }
 
 /// `clearInterval(id)` — same as clearTimeout per spec
+#[dive(name = "clearInterval", length = 1)]
 fn clear_interval(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -126,6 +114,7 @@ fn clear_interval(
 }
 
 /// `queueMicrotask(callback)` — WHATWG §8.7
+#[dive(name = "queueMicrotask", length = 1)]
 fn queue_microtask(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -170,6 +159,7 @@ fn queue_microtask(
 ///
 /// Non-serializable types (Function, Promise, WeakMap, WeakSet, Generator,
 /// Symbol values, etc.) throw DataCloneError per spec §2.7.2 step 15.
+#[dive(name = "structuredClone", length = 1)]
 fn structured_clone(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -184,10 +174,7 @@ fn structured_clone(
 
 const MAX_CLONE_DEPTH: usize = 64;
 
-fn data_clone_error(
-    runtime: &mut RuntimeState,
-    message: &str,
-) -> VmNativeCallError {
+fn data_clone_error(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
     // Per spec this should be a DOMException "DataCloneError", but our VM
     // doesn't have DOMException. Use TypeError as the closest equivalent.
     match runtime.alloc_type_error(message) {
@@ -281,9 +268,13 @@ fn structured_clone_inner(
             // Check for Date (stored as plain object with __otter_date_data__ slot).
             let date_prop = runtime.intern_property_name("__otter_date_data__");
             if let Ok(Some(lookup)) = runtime.property_lookup(handle, date_prop)
-                && let PropertyValue::Data { value: date_val, .. } = lookup.value()
+                && let PropertyValue::Data {
+                    value: date_val, ..
+                } = lookup.value()
             {
-                let date_ms = date_val.as_number().or_else(|| date_val.as_i32().map(|i| i as f64));
+                let date_ms = date_val
+                    .as_number()
+                    .or_else(|| date_val.as_i32().map(|i| i as f64));
                 if let Some(ms) = date_ms {
                     // Clone the Date: create new object with same prototype and date slot.
                     let proto = runtime.intrinsics().date_prototype();
@@ -333,10 +324,20 @@ fn structured_clone_inner(
 
         // §2.7.2 step 9: RegExp — clone pattern and flags.
         HeapValueKind::RegExp => {
-            let pattern = runtime.objects().regexp_pattern(handle).unwrap_or("").to_string();
-            let flags = runtime.objects().regexp_flags(handle).unwrap_or("").to_string();
+            let pattern = runtime
+                .objects()
+                .regexp_pattern(handle)
+                .unwrap_or("")
+                .to_string();
+            let flags = runtime
+                .objects()
+                .regexp_flags(handle)
+                .unwrap_or("")
+                .to_string();
             let proto = runtime.intrinsics().regexp_prototype;
-            let clone = runtime.objects_mut().alloc_regexp(&pattern, &flags, Some(proto));
+            let clone = runtime
+                .objects_mut()
+                .alloc_regexp(&pattern, &flags, Some(proto));
             // Clone lastIndex.
             let li_prop = runtime.intern_property_name("lastIndex");
             if let Ok(Some(lookup)) = runtime.property_lookup(handle, li_prop)
@@ -411,10 +412,7 @@ fn structured_clone_inner(
                 .data_view_buffer(handle)
                 .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
             let offset = runtime.objects().data_view_byte_offset(handle).unwrap_or(0);
-            let length = runtime
-                .objects()
-                .data_view_byte_length(handle)
-                .unwrap_or(0);
+            let length = runtime.objects().data_view_byte_length(handle).unwrap_or(0);
             let buf_data = runtime
                 .objects()
                 .array_buffer_data(buffer)
@@ -427,9 +425,12 @@ fn structured_clone_inner(
                 .objects_mut()
                 .alloc_array_buffer_with_data(buf_data, Some(ab_proto));
             let dv_proto = runtime.intrinsics().data_view_prototype;
-            let clone = runtime
-                .objects_mut()
-                .alloc_data_view(cloned_buf, offset, Some(length), Some(dv_proto));
+            let clone = runtime.objects_mut().alloc_data_view(
+                cloned_buf,
+                offset,
+                Some(length),
+                Some(dv_proto),
+            );
             Ok(RegisterValue::from_object_handle(clone.0))
         }
 
@@ -462,8 +463,7 @@ fn structured_clone_inner(
                 .objects()
                 .set_entries(handle)
                 .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-            let live_entries: Vec<RegisterValue> =
-                entries.iter().filter_map(|e| *e).collect();
+            let live_entries: Vec<RegisterValue> = entries.iter().filter_map(|e| *e).collect();
             let proto = runtime.intrinsics().set_prototype;
             let clone = runtime.objects_mut().alloc_set(Some(proto));
             for val in live_entries {
@@ -489,10 +489,7 @@ fn structured_clone_inner(
         )),
 
         // Iterator, PromiseCapabilityFunction, etc. — not serializable.
-        _ => Err(data_clone_error(
-            runtime,
-            "object cannot be cloned",
-        )),
+        _ => Err(data_clone_error(runtime, "object cannot be cloned")),
     }
 }
 
@@ -520,7 +517,10 @@ fn clone_own_data_properties(
             && let PropertyValue::Data { value: v, .. } = lookup.value()
         {
             let cloned_v = structured_clone_inner(v, runtime, depth + 1)?;
-            runtime.objects_mut().set_property(target, key_id, cloned_v).ok();
+            runtime
+                .objects_mut()
+                .set_property(target, key_id, cloned_v)
+                .ok();
         }
     }
 

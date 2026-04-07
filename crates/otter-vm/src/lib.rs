@@ -7,6 +7,8 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+extern crate self as otter_vm;
+
 /// Shared execution ABI.
 pub mod abi;
 /// ECMAScript abstract operations shared across interpreter and intrinsics.
@@ -51,10 +53,10 @@ pub mod host_callbacks;
 pub mod interpreter;
 /// Runtime-owned intrinsic registry and root model.
 pub mod intrinsics;
-/// §6.1.4 — WTF-16 JavaScript string type.
-pub mod js_string;
 /// JIT-facing ABI surface.
 pub mod jit_abi;
+/// §6.1.4 — WTF-16 JavaScript string type.
+pub mod js_string;
 /// Tiny lowering bridge from structured subset to bytecode/module form.
 pub mod lowering;
 /// VM-internal microtask queue (promise jobs, nextTick, queueMicrotask).
@@ -90,9 +92,10 @@ pub mod value;
 
 pub use abi::VmAbiVersion;
 pub use builders::{
-    ClassAccessorPlan, ClassBuilder, ClassBuilderError, ClassInstallPlan, ClassMemberPlan,
-    ConstructorBuilder, GlobalBuilder, NamespaceBuilder, ObjectAccessorPlan, ObjectBuilderError,
-    ObjectInstallPlan, ObjectMemberPlan, PrototypeBuilder,
+    BurrowBuilder, BurrowBuilderError, BurrowPlan, ClassAccessorPlan, ClassBuilder,
+    ClassBuilderError, ClassInstallPlan, ClassMemberPlan, ConstructorBuilder, GlobalBuilder,
+    NamespaceBuilder, ObjectAccessorPlan, ObjectBuilderError, ObjectInstallPlan, ObjectMemberPlan,
+    PrototypeBuilder,
 };
 pub use descriptors::{
     ClassDescriptorConsumer, JsClassDescriptor, JsNamespaceDescriptor, NamespaceDescriptorConsumer,

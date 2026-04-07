@@ -386,6 +386,14 @@ pub enum Opcode {
     /// context, inheriting strict mode.
     /// Spec: <https://tc39.es/ecma262/#sec-performeval>
     CallEval = 0x77,
+
+    /// §14.6 Tail Position Calls — `TailCallClosure callee, arg_start`.
+    /// Like `CallClosure` but the current frame is reused: arguments are
+    /// written into the callee's parameter range, then the activation is
+    /// replaced in-place.  Only emitted in strict-mode tail position
+    /// (ES2024 §15.10.2 HasCallInTailPosition).
+    /// Spec: <https://tc39.es/ecma262/#sec-tail-position-calls>
+    TailCallClosure = 0x78,
 }
 
 impl Opcode {
@@ -498,6 +506,7 @@ impl Opcode {
             0x75 => Some(Self::ImportMeta),
             0x76 => Some(Self::Exp),
             0x77 => Some(Self::CallEval),
+            0x78 => Some(Self::TailCallClosure),
             _ => None,
         }
     }
@@ -1301,6 +1310,19 @@ impl Instruction {
         arg_start: BytecodeRegister,
     ) -> Self {
         Self::encode_abc(Opcode::CallClosure, dst, callee, arg_start)
+    }
+
+    /// Encodes a tail-call closure instruction (no destination — result is
+    /// returned directly from the caller's frame).
+    /// `TailCallClosure callee, arg_start`
+    #[must_use]
+    pub const fn tail_call_closure(callee: BytecodeRegister, arg_start: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::TailCallClosure,
+            callee,
+            arg_start,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Encodes a throw instruction.

@@ -54,7 +54,7 @@ impl ToolsNamespace {
 }
 
 #[test]
-fn js_namespace_descriptor_collects_new_vm_metadata() {
+fn js_namespace_descriptor_collects_active_runtime_metadata() {
     let descriptor: JsNamespaceDescriptor = ToolsNamespace::js_namespace_descriptor();
 
     assert_eq!(ToolsNamespace::JS_NAMESPACE_NAME, "Tools");

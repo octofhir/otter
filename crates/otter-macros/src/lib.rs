@@ -1,6 +1,10 @@
 //! # Otter Macros
 //!
-//! Proc macros for defining operations and extensions in the Otter VM.
+//! Proc macros for descriptor-driven JS bindings in the Otter VM.
+//!
+//! `#[js_class]` / `#[js_namespace]` are the main descriptor macros for the
+//! active VM. `#[dive]` is the otter-themed macro for single native bindings
+//! and emits descriptor metadata for the active runtime stack.
 //!
 //! ## Otter Terminology
 //!
@@ -11,45 +15,45 @@
 //!
 //! ## `#[dive]` — Native-First Function Binding
 //!
-//! Generates a `NativeFn` (the VM's native function type) directly, using
-//! `FromValue`/`IntoValue` for automatic type marshalling. No serde.
+//! It emits `NativeFunctionDescriptor` metadata directly for the active VM.
 //!
 //! ### Parameters
 //!
 //! - `name = "jsName"` — JavaScript-visible name (default: Rust fn name)
-//! - `length = N` — `.length` property (auto-inferred from typed param count)
+//! - `length = N` — `.length` property
 //! - `method` — marks as instance method (has `this`)
 //!
-//! ### Supported Signatures
+//! ### Required Signature
 //!
-//! **Pattern A — Full native (pass-through):**
 //! ```ignore
-//! #[dive(name = "push", length = 1)]
-//! fn array_push(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> { .. }
+//! use otter_runtime::RuntimeState;
+//! use otter_vm::{RegisterValue, VmNativeCallError};
+//! use otter_macros::dive;
+//!
+//! #[dive(name = "now")]
+//! fn performance_now(
+//!     this: &RegisterValue,
+//!     args: &[RegisterValue],
+//!     runtime: &mut RuntimeState,
+//! ) -> Result<RegisterValue, VmNativeCallError> {
+//!     // ...
+//! }
 //! ```
 //!
-//! **Pattern B — Args + NativeContext:**
-//! ```ignore
-//! #[dive(name = "join", length = 0)]
-//! fn path_join(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> { .. }
-//! ```
+//! ## `lodge!` — Hosted Module Declaration
 //!
-//! **Pattern C — Typed params (auto-conversion via FromValue/IntoValue):**
-//! ```ignore
-//! #[dive(name = "abs", length = 1)]
-//! fn math_abs(x: f64) -> f64 { x.abs() }
-//! ```
-//!
-//! ## `dive_module!` — Extension Declaration
-//!
-//! Generates an `OtterExtension` impl from a list of `#[dive]` functions.
+//! Generates a `HostedNativeModuleLoader` for the active runtime stack.
 //!
 //! ```ignore
-//! dive_module!(
-//!     node_path,
-//!     profiles = [SafeCore, Full],
+//! lodge!(
+//!     path_module,
 //!     module_specifiers = ["node:path", "path"],
-//!     fns = [path_join, path_dirname, path_basename],
+//!     default = object,
+//!     functions = [
+//!         ("join", path_join),
+//!         ("dirname", path_dirname),
+//!         ("basename", path_basename),
+//!     ],
 //! );
 //! ```
 
@@ -79,6 +83,12 @@ struct DiveArgs {
     deep: bool,
     /// Whether this is an instance method
     method: bool,
+    /// Whether this is a getter
+    getter: bool,
+    /// Whether this is a setter
+    setter: bool,
+    /// Whether this is a constructor
+    constructor: bool,
 }
 
 impl Parse for DiveArgs {
@@ -113,11 +123,20 @@ impl Parse for DiveArgs {
                 "method" => {
                     args.method = true;
                 }
+                "getter" => {
+                    args.getter = true;
+                }
+                "setter" => {
+                    args.setter = true;
+                }
+                "constructor" => {
+                    args.constructor = true;
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         ident,
                         format!(
-                            "Unknown dive argument '{}'. Expected 'name', 'length', 'deep', or 'method'.",
+                            "Unknown dive argument '{}'. Expected 'name', 'length', 'deep', 'method', 'getter', 'setter', or 'constructor'.",
                             other
                         ),
                     ));
@@ -135,108 +154,46 @@ impl Parse for DiveArgs {
     }
 }
 
-/// Detected parameter pattern for the function
-enum ParamPattern {
-    /// `(this: &Value, args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>`
-    FullNative,
-    /// `(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError>`
-    ArgsAndNcx,
-    /// `(ncx: &mut NativeContext) -> Result<T, VmError>` (only NativeContext)
-    NcxOnly,
-    /// Typed parameters via FromValue/IntoValue
-    Typed {
-        /// Parameter names and types for extraction
-        params: Vec<(Ident, Box<Type>)>,
-    },
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiveSlotKind {
+    Method,
+    Getter,
+    Setter,
+    Constructor,
 }
 
-/// Detect which parameter pattern the function uses.
-fn detect_pattern(input: &ItemFn) -> ParamPattern {
-    let params: Vec<_> = input.sig.inputs.iter().collect();
+impl DiveArgs {
+    fn slot_kind(&self) -> Result<DiveSlotKind, syn::Error> {
+        let enabled = [self.method, self.getter, self.setter, self.constructor]
+            .into_iter()
+            .filter(|flag| *flag)
+            .count();
 
-    // Check for reference types that indicate native patterns
-    if params.len() >= 3
-        && is_value_ref(params[0])
-        && is_value_slice(params[1])
-        && is_native_context(params[2])
-    {
-        return ParamPattern::FullNative;
-    }
+        if enabled > 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "dive accepts at most one of: method, getter, setter, constructor",
+            ));
+        }
 
-    if params.len() >= 2 && is_value_slice(params[0]) && is_native_context(params[1]) {
-        return ParamPattern::ArgsAndNcx;
-    }
-
-    if params.len() == 1 && is_native_context(params[0]) {
-        return ParamPattern::NcxOnly;
-    }
-
-    // Typed parameters
-    let mut typed_params = Vec::new();
-    for arg in &params {
-        if let FnArg::Typed(pat_type) = arg
-            && let syn::Pat::Ident(pat_ident) = &*pat_type.pat
-        {
-            // Skip ncx parameter if it's the last one
-            if is_native_context(arg) {
-                continue;
-            }
-            typed_params.push((pat_ident.ident.clone(), pat_type.ty.clone()));
+        if self.getter {
+            Ok(DiveSlotKind::Getter)
+        } else if self.setter {
+            Ok(DiveSlotKind::Setter)
+        } else if self.constructor {
+            Ok(DiveSlotKind::Constructor)
+        } else {
+            Ok(DiveSlotKind::Method)
         }
     }
-
-    ParamPattern::Typed {
-        params: typed_params,
-    }
 }
 
-/// Check if a FnArg is `&Value` (reference to Value)
-fn is_value_ref(arg: &FnArg) -> bool {
-    let FnArg::Typed(pat_type) = arg else {
-        return false;
-    };
-    // Check the actual type
-    if let Type::Reference(type_ref) = &*pat_type.ty
-        && let Type::Path(type_path) = &*type_ref.elem
-        && let Some(seg) = type_path.path.segments.last()
-        && seg.ident == "Value"
-    {
-        return true;
-    }
-    // Fallback: string match
-    let ty_str = quote!(#pat_type.ty).to_string();
-    ty_str.contains("& Value") || ty_str.contains("&Value")
-}
-
-/// Check if a FnArg is `&[Value]` (slice of Value)
-fn is_value_slice(arg: &FnArg) -> bool {
-    if let FnArg::Typed(pat_type) = arg
-        && let Type::Reference(type_ref) = &*pat_type.ty
-        && let Type::Slice(type_slice) = &*type_ref.elem
-        && let Type::Path(type_path) = &*type_slice.elem
-        && let Some(seg) = type_path.path.segments.last()
-    {
-        return seg.ident == "Value";
-    }
-    false
-}
-
-/// Check if a FnArg is `&mut NativeContext` or `&mut NativeContext<'_>`
-fn is_native_context(arg: &FnArg) -> bool {
-    if let FnArg::Typed(pat_type) = arg
-        && let Type::Reference(type_ref) = &*pat_type.ty
-        && type_ref.mutability.is_some()
-        && let Type::Path(type_path) = &*type_ref.elem
-        && let Some(seg) = type_path.path.segments.last()
-    {
-        return seg.ident == "NativeContext";
-    }
-    false
-}
-
-/// Check if the last param is `&mut NativeContext`
-fn has_trailing_ncx(input: &ItemFn) -> bool {
-    input.sig.inputs.last().is_some_and(is_native_context)
+fn is_active_dive_signature(input: &ItemFn) -> bool {
+    let params: Vec<_> = input.sig.inputs.iter().collect();
+    params.len() == 3
+        && is_register_value_ref(params[0])
+        && is_register_value_slice(params[1])
+        && is_runtime_state_ref(params[2])
 }
 
 /// Marks a function as callable from JavaScript.
@@ -246,145 +203,137 @@ fn has_trailing_ncx(input: &ItemFn) -> bool {
 /// ## Parameters
 ///
 /// - `name = "jsName"` — JavaScript-visible name (default: Rust fn name)
-/// - `length = N` — `.length` property for the JS function (auto-inferred for typed params)
+/// - `length = N` — `.length` property for the JS function
 /// - `method` — marks as instance method
 /// - `deep` — async operation (returns Promise)
 ///
 /// ## Generated Code
 ///
-/// The macro generates:
+/// For active runtime signatures, the macro generates:
 /// 1. The original function (unchanged)
-/// 2. `fn_name_native_fn() -> NativeFn` — creates the NativeFn wrapper (cached via OnceLock)
-/// 3. `FN_NAME_NAME: &str` — the JS name constant
-/// 4. `FN_NAME_LENGTH: u32` — the length constant
-/// 5. `fn_name_decl() -> (&'static str, NativeFn, u32)` — convenience tuple
+/// 2. `FN_NAME_NAME: &str` — the JS name constant
+/// 3. `FN_NAME_LENGTH: u32` — the length constant
+/// 4. `fn_name_descriptor() -> NativeFunctionDescriptor`
+/// 5. `fn_name_binding(target) -> NativeBindingDescriptor`
 ///
 /// ## Example
 ///
 /// ```ignore
+/// use otter_runtime::RuntimeState;
+/// use otter_vm::{RegisterValue, VmNativeCallError};
 /// use otter_macros::dive;
 ///
-/// // length auto-inferred as 1 from typed param count
-/// #[dive(name = "abs")]
-/// fn math_abs(x: f64) -> f64 { x.abs() }
-///
-/// // length explicit for varargs patterns
-/// #[dive(name = "join", length = 0)]
-/// fn path_join(args: &[Value], ncx: &mut NativeContext) -> Result<Value, VmError> { .. }
+/// #[dive(name = "now")]
+/// fn performance_now(
+///     this: &RegisterValue,
+///     args: &[RegisterValue],
+///     runtime: &mut RuntimeState,
+/// ) -> Result<RegisterValue, VmNativeCallError> {
+///     // ...
+/// }
 /// ```
 #[proc_macro_attribute]
 pub fn dive(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as DiveArgs);
     let input = parse_macro_input!(item as ItemFn);
 
-    expand_dive_native(input, args)
+    if !is_active_dive_signature(&input) {
+        let error = syn::Error::new_spanned(
+            &input.sig,
+            "#[dive] requires the active runtime signature: fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>",
+        )
+        .to_compile_error();
+        return quote! {
+            #input
+            #error
+        }
+        .into();
+    }
+
+    expand_dive_active(input, args)
 }
 
-/// Expand #[dive] to generate NativeFn-based code
-fn expand_dive_native(input: ItemFn, args: DiveArgs) -> TokenStream {
+fn expand_dive_active(input: ItemFn, args: DiveArgs) -> TokenStream {
     let fn_name = &input.sig.ident;
     let vis = &input.vis;
-    let pattern = detect_pattern(&input);
 
-    // Auto-infer length from typed params count if not explicitly set
-    let length = args.length.unwrap_or(match &pattern {
-        ParamPattern::Typed { params } => params.len() as u32,
+    let slot_kind = match args.slot_kind() {
+        Ok(slot_kind) => slot_kind,
+        Err(error) => {
+            let error = error.to_compile_error();
+            return quote! {
+                #input
+                #error
+            }
+            .into();
+        }
+    };
+
+    if args.deep && slot_kind != DiveSlotKind::Method {
+        let error = syn::Error::new_spanned(
+            &input.sig.ident,
+            "dive(deep) is only supported for method-style active-VM bindings",
+        )
+        .to_compile_error();
+        return quote! {
+            #input
+            #error
+        }
+        .into();
+    }
+
+    let length = args.length.unwrap_or(match slot_kind {
+        DiveSlotKind::Setter => 1,
         _ => 0,
     });
-
-    // JS name (from attr or function name)
     let js_name = args.name.unwrap_or_else(|| fn_name.to_string());
 
-    // Generated identifiers
-    let native_fn_ident = format_ident!("{}_native_fn", fn_name);
-    let decl_ident = format_ident!("{}_decl", fn_name);
+    let descriptor_ident = format_ident!("{}_descriptor", fn_name);
+    let binding_ident = format_ident!("{}_binding", fn_name);
     let name_const = format_ident!("{}_NAME", fn_name.to_string().to_uppercase());
     let length_const = format_ident!("{}_LENGTH", fn_name.to_string().to_uppercase());
 
-    let wrapper_body = match pattern {
-        ParamPattern::FullNative => {
-            // Function already has the NativeFn signature — just call it directly
+    let descriptor_ctor = match slot_kind {
+        DiveSlotKind::Method if args.deep => {
             quote! {
-                #fn_name(_this, _args, _ncx)
+                ::otter_vm::NativeFunctionDescriptor::async_method(
+                    #name_const,
+                    #length_const as u16,
+                    callback,
+                )
             }
         }
-        ParamPattern::ArgsAndNcx => {
-            // Function takes (args, ncx) — pass through
+        DiveSlotKind::Method => {
             quote! {
-                #fn_name(_args, _ncx)
+                ::otter_vm::NativeFunctionDescriptor::method(
+                    #name_const,
+                    #length_const as u16,
+                    callback,
+                )
             }
         }
-        ParamPattern::NcxOnly => {
-            // Function takes only ncx
-            let return_handling = generate_return_handling(&input);
-            match return_handling {
-                ReturnHandling::ResultValue => quote! {
-                    #fn_name(_ncx)
-                },
-                ReturnHandling::ResultTyped => quote! {
-                    match #fn_name(_ncx) {
-                        Ok(v) => Ok(otter_vm_core::convert::IntoValue::into_value(v)),
-                        Err(e) => Err(e),
-                    }
-                },
-                ReturnHandling::PlainTyped => quote! {
-                    Ok(otter_vm_core::convert::IntoValue::into_value(#fn_name(_ncx)))
-                },
-                ReturnHandling::Unit => quote! {
-                    #fn_name(_ncx);
-                    Ok(otter_vm_core::value::Value::undefined())
-                },
+        DiveSlotKind::Getter => {
+            quote! {
+                ::otter_vm::NativeFunctionDescriptor::getter(#name_const, callback)
             }
         }
-        ParamPattern::Typed { ref params } => {
-            // Extract typed parameters via FromValue
-            let has_ncx = has_trailing_ncx(&input);
-            let extractions: Vec<_> = params
-                .iter()
-                .enumerate()
-                .map(|(i, (name, ty))| {
-                    quote! {
-                        let #name: #ty = otter_vm_core::convert::FromValue::from_value(
-                            _args.get(#i).unwrap_or(&otter_vm_core::value::Value::undefined())
-                        )?;
-                    }
-                })
-                .collect();
-
-            let arg_names: Vec<_> = params.iter().map(|(name, _)| name.clone()).collect();
-            let call = if has_ncx {
-                quote! { #fn_name(#(#arg_names),*, _ncx) }
-            } else {
-                quote! { #fn_name(#(#arg_names),*) }
-            };
-
-            let return_handling = generate_return_handling(&input);
-            let invocation = match return_handling {
-                ReturnHandling::ResultValue => quote! { #call },
-                ReturnHandling::ResultTyped => quote! {
-                    match #call {
-                        Ok(v) => Ok(otter_vm_core::convert::IntoValue::into_value(v)),
-                        Err(e) => Err(e),
-                    }
-                },
-                ReturnHandling::PlainTyped => quote! {
-                    Ok(otter_vm_core::convert::IntoValue::into_value(#call))
-                },
-                ReturnHandling::Unit => quote! {
-                    #call;
-                    Ok(otter_vm_core::value::Value::undefined())
-                },
-            };
-
+        DiveSlotKind::Setter => {
             quote! {
-                #(#extractions)*
-                #invocation
+                ::otter_vm::NativeFunctionDescriptor::setter(#name_const, callback)
+            }
+        }
+        DiveSlotKind::Constructor => {
+            quote! {
+                ::otter_vm::NativeFunctionDescriptor::constructor(
+                    #name_const,
+                    #length_const as u16,
+                    callback,
+                )
             }
         }
     };
 
-    let expanded = quote! {
-        // Original function (unchanged)
+    quote! {
         #input
 
         /// JS name for this dive function.
@@ -393,162 +342,109 @@ fn expand_dive_native(input: ItemFn, args: DiveArgs) -> TokenStream {
         /// JS `.length` for this dive function.
         #vis const #length_const: u32 = #length;
 
-        /// Get the cached `NativeFn` wrapper for this dive function.
-        #vis fn #native_fn_ident() -> std::sync::Arc<
-            dyn Fn(
-                &otter_vm_core::value::Value,
-                &[otter_vm_core::value::Value],
-                &mut otter_vm_core::context::NativeContext<'_>,
-            ) -> std::result::Result<otter_vm_core::value::Value, otter_vm_core::error::VmError>
-                + Send
-                + Sync,
-        > {
-            type NativeFnArc = std::sync::Arc<
-                dyn Fn(
-                    &otter_vm_core::value::Value,
-                    &[otter_vm_core::value::Value],
-                    &mut otter_vm_core::context::NativeContext<'_>,
-                ) -> std::result::Result<otter_vm_core::value::Value, otter_vm_core::error::VmError>
-                    + Send
-                    + Sync,
-            >;
-            static CACHED: std::sync::OnceLock<NativeFnArc> = std::sync::OnceLock::new();
-            CACHED.get_or_init(|| {
-                std::sync::Arc::new(|_this: &otter_vm_core::value::Value,
-                                      _args: &[otter_vm_core::value::Value],
-                                      _ncx: &mut otter_vm_core::context::NativeContext<'_>|
-                    -> std::result::Result<otter_vm_core::value::Value, otter_vm_core::error::VmError> {
-                    #wrapper_body
-                })
-            }).clone()
+        /// Active-VM native function descriptor for this dive function.
+        #vis fn #descriptor_ident() -> ::otter_vm::NativeFunctionDescriptor {
+            let callback = #fn_name as ::otter_vm::VmNativeFunction;
+            #descriptor_ctor
         }
 
-        /// Convenience: `(name, native_fn, length)` tuple for module registration.
-        #vis fn #decl_ident() -> (
-            &'static str,
-            std::sync::Arc<
-                dyn Fn(
-                    &otter_vm_core::value::Value,
-                    &[otter_vm_core::value::Value],
-                    &mut otter_vm_core::context::NativeContext<'_>,
-                ) -> std::result::Result<otter_vm_core::value::Value, otter_vm_core::error::VmError>
-                    + Send
-                    + Sync,
-            >,
-            u32,
-        ) {
-            (#name_const, #native_fn_ident(), #length_const)
-        }
-    };
-
-    TokenStream::from(expanded)
-}
-
-/// How to handle the return value
-enum ReturnHandling {
-    /// Already returns `Result<Value, VmError>` — pass through
-    ResultValue,
-    /// Returns `Result<T, VmError>` where T: IntoValue
-    ResultTyped,
-    /// Returns a plain type T: IntoValue
-    PlainTyped,
-    /// Returns () — map to undefined
-    Unit,
-}
-
-fn generate_return_handling(input: &ItemFn) -> ReturnHandling {
-    match &input.sig.output {
-        syn::ReturnType::Default => ReturnHandling::Unit,
-        syn::ReturnType::Type(_, ty) => {
-            // Check for Result<T, E>
-            if let Type::Path(type_path) = ty.as_ref()
-                && let Some(seg) = type_path.path.segments.last()
-                && seg.ident == "Result"
-            {
-                // Check if the Ok type is Value
-                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-                    && let Some(syn::GenericArgument::Type(ok_type)) = args.args.first()
-                    && is_value_type(ok_type)
-                {
-                    return ReturnHandling::ResultValue;
-                }
-                return ReturnHandling::ResultTyped;
-            }
-
-            // Check for unit type ()
-            if let Type::Tuple(tuple) = ty.as_ref()
-                && tuple.elems.is_empty()
-            {
-                return ReturnHandling::Unit;
-            }
-            ReturnHandling::PlainTyped
+        /// Convenience wrapper for installing this dive function on a target.
+        #vis fn #binding_ident(
+            target: ::otter_vm::NativeBindingTarget,
+        ) -> ::otter_vm::NativeBindingDescriptor {
+            ::otter_vm::NativeBindingDescriptor::new(target, #descriptor_ident())
         }
     }
-}
-
-/// Check if a type is `Value`
-fn is_value_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty
-        && let Some(seg) = type_path.path.segments.last()
-        && seg.ident == "Value"
-    {
-        return true;
-    }
-    false
+    .into()
 }
 
 // =============================================================================
-// dive_module! macro
+// lodge! macro
 // =============================================================================
 
-/// Input for `dive_module!` macro
-struct DiveModuleInput {
-    /// Extension struct name (e.g., `node_path` -> `NodePathExtension`)
-    name: Ident,
-    /// Dependencies
-    deps: Vec<LitStr>,
-    /// Profiles
-    profiles: Vec<Ident>,
-    /// Module specifiers (e.g., "node:path", "path")
-    module_specifiers: Vec<LitStr>,
-    /// Function names to include in the module
-    fns: Vec<Ident>,
-    /// Static properties (name => expr pairs)
-    properties: Vec<(LitStr, syn::Expr)>,
+#[derive(Clone)]
+struct LodgeFunctionExport {
+    export_name: LitStr,
+    source: Ident,
+    js_name: Option<LitStr>,
 }
 
-impl Parse for DiveModuleInput {
+impl Parse for LodgeFunctionExport {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        // Parse extension name
+        let content;
+        syn::parenthesized!(content in input);
+        let export_name: LitStr = content.parse()?;
+        content.parse::<Token![,]>()?;
+        let source: Ident = content.parse()?;
+        let js_name = if content.peek(Token![as]) {
+            content.parse::<Token![as]>()?;
+            Some(content.parse()?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            export_name,
+            source,
+            js_name,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct LodgeValueExport {
+    export_name: LitStr,
+    expr: syn::Expr,
+}
+
+impl Parse for LodgeValueExport {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let content;
+        syn::parenthesized!(content in input);
+        let export_name: LitStr = content.parse()?;
+        content.parse::<Token![,]>()?;
+        let expr: syn::Expr = content.parse()?;
+        Ok(Self { export_name, expr })
+    }
+}
+
+#[derive(Clone)]
+struct LodgeDefaultFunction {
+    source: Ident,
+    js_name: Option<LitStr>,
+}
+
+#[derive(Clone)]
+enum LodgeDefault {
+    Object,
+    Function(LodgeDefaultFunction),
+    Value(syn::Expr),
+}
+
+/// Input for `lodge!` macro
+struct LodgeInput {
+    name: Ident,
+    module_specifiers: Vec<LitStr>,
+    functions: Vec<LodgeFunctionExport>,
+    values: Vec<LodgeValueExport>,
+    default: Option<LodgeDefault>,
+}
+
+impl Parse for LodgeInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
         let name: Ident = input.parse()?;
         input.parse::<Token![,]>()?;
 
-        let mut deps = Vec::new();
-        let mut profiles = Vec::new();
         let mut module_specifiers = Vec::new();
-        let mut fns = Vec::new();
-        let mut properties = Vec::new();
+        let mut functions = Vec::new();
+        let mut values = Vec::new();
+        let mut default = None;
 
-        // Parse remaining key = value pairs
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
 
             match key.to_string().as_str() {
-                "deps" => {
-                    let content;
-                    syn::bracketed!(content in input);
-                    deps = Punctuated::<LitStr, Token![,]>::parse_terminated(&content)?
-                        .into_iter()
-                        .collect();
-                }
-                "profiles" => {
-                    let content;
-                    syn::bracketed!(content in input);
-                    profiles = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
-                        .into_iter()
-                        .collect();
-                }
                 "module_specifiers" => {
                     let content;
                     syn::bracketed!(content in input);
@@ -557,31 +453,57 @@ impl Parse for DiveModuleInput {
                             .into_iter()
                             .collect();
                 }
-                "fns" => {
+                "functions" => {
                     let content;
                     syn::bracketed!(content in input);
-                    fns = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
+                    functions =
+                        Punctuated::<LodgeFunctionExport, Token![,]>::parse_terminated(&content)?
+                            .into_iter()
+                            .collect();
+                }
+                "values" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    values = Punctuated::<LodgeValueExport, Token![,]>::parse_terminated(&content)?
                         .into_iter()
                         .collect();
                 }
-                "properties" => {
-                    let content;
-                    syn::braced!(content in input);
-                    while !content.is_empty() {
-                        let prop_name: LitStr = content.parse()?;
-                        content.parse::<Token![=>]>()?;
-                        let prop_expr: syn::Expr = content.parse()?;
-                        properties.push((prop_name, prop_expr));
-                        if content.peek(Token![,]) {
-                            content.parse::<Token![,]>()?;
+                "default" => {
+                    let mode: Ident = input.parse()?;
+                    default = Some(match mode.to_string().as_str() {
+                        "object" => LodgeDefault::Object,
+                        "function" => {
+                            let content;
+                            syn::parenthesized!(content in input);
+                            let source: Ident = content.parse()?;
+                            let js_name = if content.peek(Token![as]) {
+                                content.parse::<Token![as]>()?;
+                                Some(content.parse()?)
+                            } else {
+                                None
+                            };
+                            LodgeDefault::Function(LodgeDefaultFunction { source, js_name })
                         }
-                    }
+                        "value" => {
+                            let content;
+                            syn::parenthesized!(content in input);
+                            LodgeDefault::Value(content.parse()?)
+                        }
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                mode,
+                                format!(
+                                    "Unknown lodge! default mode '{other}'. Expected: object, function(...), value(...)."
+                                ),
+                            ));
+                        }
+                    });
                 }
                 other => {
                     return Err(syn::Error::new_spanned(
                         &key,
                         format!(
-                            "Unknown dive_module option '{}'. Expected: deps, profiles, module_specifiers, fns, properties.",
+                            "Unknown lodge! option '{}'. Expected: module_specifiers, functions, values, default.",
                             other
                         ),
                     ));
@@ -595,149 +517,339 @@ impl Parse for DiveModuleInput {
 
         Ok(Self {
             name,
-            deps,
-            profiles,
             module_specifiers,
-            fns,
-            properties,
+            functions,
+            values,
+            default,
         })
     }
 }
 
-/// Declare a native extension module.
-///
-/// Generates an `OtterExtension` implementation from `#[dive]` functions.
-///
-/// ## Example
-///
-/// ```ignore
-/// dive_module!(
-///     node_path,
-///     profiles = [SafeCore, Full],
-///     module_specifiers = ["node:path", "path"],
-///     fns = [path_join, path_dirname, path_basename],
-///     properties = {
-///         "sep" => Value::string(JsString::intern("/")),
-///     },
-/// );
-/// ```
-///
-/// This generates:
-/// - `pub struct NodePathExtension;`
-/// - `impl OtterExtension for NodePathExtension { ... }`
-/// - `pub fn node_path_extension() -> Box<dyn OtterExtension>`
-#[proc_macro]
-pub fn dive_module(input: TokenStream) -> TokenStream {
-    let module_input = parse_macro_input!(input as DiveModuleInput);
-    expand_dive_module(module_input)
+struct RaftInput {
+    target: Ident,
+    fns: Vec<Ident>,
 }
 
-fn expand_dive_module(input: DiveModuleInput) -> TokenStream {
-    let ext_name_str = input.name.to_string();
+impl Parse for RaftInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut target = None;
+        let mut fns = Vec::new();
 
-    // Convert snake_case name to PascalCase for the struct
-    let struct_name_str = to_pascal_case(&ext_name_str);
-    let struct_name = format_ident!("{}Extension", struct_name_str);
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
 
-    // Factory function name
-    let factory_fn = format_ident!("{}_extension", ext_name_str);
+            match key.to_string().as_str() {
+                "target" => {
+                    target = Some(input.parse()?);
+                }
+                "fns" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    fns = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect();
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        key,
+                        format!("Unknown raft! option '{other}'. Expected: target, fns."),
+                    ));
+                }
+            }
 
-    // Deps
-    let deps: Vec<_> = input.deps.iter().collect();
-    let deps_len = deps.len();
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
 
-    // Profiles
-    let profile_variants: Vec<_> = input
-        .profiles
-        .iter()
-        .map(|p| {
-            let variant = format_ident!("{}", p);
-            quote! { otter_vm_runtime::extension_v2::Profile::#variant }
-        })
-        .collect();
-    let profiles_len = profile_variants.len();
+        let target = target.ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "raft! requires target = ...",
+            )
+        })?;
 
-    // Module specifiers
-    let specifiers: Vec<_> = input.module_specifiers.iter().collect();
-    let specifiers_len = specifiers.len();
+        Ok(Self { target, fns })
+    }
+}
 
-    // Function registrations for load_module
-    let fn_registrations: Vec<_> = input
+struct BurrowInput {
+    fns: Vec<Ident>,
+}
+
+impl Parse for BurrowInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut fns = Vec::new();
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+
+            match key.to_string().as_str() {
+                "fns" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    fns = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect();
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        key,
+                        format!("Unknown burrow! option '{other}'. Expected: fns."),
+                    ));
+                }
+            }
+
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(Self { fns })
+    }
+}
+
+/// Declare one hosted module loader for the active runtime stack.
+///
+/// Generates a `HostedNativeModuleLoader` plus an `*_entries()` helper for
+/// registering all declared specifiers on an extension.
+#[proc_macro]
+pub fn lodge(input: TokenStream) -> TokenStream {
+    let module_input = parse_macro_input!(input as LodgeInput);
+    expand_lodge_module(module_input)
+}
+
+#[proc_macro]
+pub fn raft(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as RaftInput);
+    let target = &input.target;
+    let bindings: Vec<_> = input
         .fns
         .iter()
         .map(|fn_name| {
-            let decl_fn = format_ident!("{}_decl", fn_name);
+            let binding_fn = format_ident!("{}_binding", fn_name);
+            quote! {
+                #binding_fn(::otter_vm::NativeBindingTarget::#target)
+            }
+        })
+        .collect();
+
+    quote! {
+        vec![#(#bindings),*]
+    }
+    .into()
+}
+
+#[proc_macro]
+pub fn burrow(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as BurrowInput);
+    let descriptors: Vec<_> = input
+        .fns
+        .iter()
+        .map(|fn_name| {
+            let descriptor_fn = format_ident!("{}_descriptor", fn_name);
+            quote! {
+                #descriptor_fn()
+            }
+        })
+        .collect();
+
+    quote! {
+        vec![#(#descriptors),*]
+    }
+    .into()
+}
+
+fn expand_lodge_module(input: LodgeInput) -> TokenStream {
+    let input_name = input.name.to_string();
+    let struct_name = format_ident!("{}", to_pascal_case(&input_name));
+    let entries_fn = format_ident!("{}_entries", input.name);
+    let alloc_fn = format_ident!("{}_alloc_exported_function", input.name);
+    let install_fn = format_ident!("{}_install_export", input.name);
+    let default = input.default.clone();
+
+    let specifiers: Vec<_> = input.module_specifiers.iter().collect();
+
+    let function_exports: Vec<_> = input
+        .functions
+        .iter()
+        .map(|export| {
+            let export_name = &export.export_name;
+            let descriptor_fn = format_ident!("{}_descriptor", export.source);
+            let js_name = export
+                .js_name
+                .as_ref()
+                .map(|value| quote! { Some(#value) })
+                .unwrap_or_else(|| quote! { None });
+
             quote! {
                 {
-                    let (name, native_fn, length) = #decl_fn();
-                    ns = ns.function(name, native_fn, length);
+                    let handle = #alloc_fn(runtime, #export_name, #descriptor_fn(), #js_name)?;
+                    let value = ::otter_runtime::RegisterValue::from_object_handle(handle.0);
+                    #install_fn(runtime, namespace, #export_name, value)?;
+                    if let Some(default_object) = default_object {
+                        #install_fn(runtime, default_object, #export_name, value)?;
+                    }
                 }
             }
         })
         .collect();
 
-    // Property registrations
-    let prop_registrations: Vec<_> = input
-        .properties
+    let value_exports: Vec<_> = input
+        .values
         .iter()
-        .map(|(name, expr)| {
+        .map(|export| {
+            let export_name = &export.export_name;
+            let expr = &export.expr;
+
             quote! {
-                ns = ns.property(#name, #expr);
+                {
+                    let value: ::otter_runtime::RegisterValue = { #expr };
+                    #install_fn(runtime, namespace, #export_name, value)?;
+                    if let Some(default_object) = default_object {
+                        #install_fn(runtime, default_object, #export_name, value)?;
+                    }
+                }
             }
         })
         .collect();
 
-    let expanded = quote! {
-        /// Auto-generated extension struct for the `#ext_name_str` module.
-        pub struct #struct_name;
+    let default_setup = match default.clone() {
+        Some(LodgeDefault::Object) => quote! {
+            let default_object = Some(runtime.alloc_object());
+            let default_value: Option<::otter_runtime::RegisterValue> = None;
+        },
+        Some(LodgeDefault::Function(function)) => {
+            let descriptor_fn = format_ident!("{}_descriptor", function.source);
+            let js_name = function
+                .js_name
+                .as_ref()
+                .map(|value| quote! { Some(#value) })
+                .unwrap_or_else(|| quote! { None });
 
-        impl otter_vm_runtime::extension_v2::OtterExtension for #struct_name {
-            fn name(&self) -> &str {
-                #ext_name_str
-            }
-
-            fn profiles(&self) -> &[otter_vm_runtime::extension_v2::Profile] {
-                static PROFILES: [otter_vm_runtime::extension_v2::Profile; #profiles_len] =
-                    [#(#profile_variants),*];
-                &PROFILES
-            }
-
-            fn deps(&self) -> &[&str] {
-                static DEPS: [&str; #deps_len] = [#(#deps),*];
-                &DEPS
-            }
-
-            fn module_specifiers(&self) -> &[&str] {
-                static SPECIFIERS: [&str; #specifiers_len] = [#(#specifiers),*];
-                &SPECIFIERS
-            }
-
-            fn install(
-                &self,
-                _ctx: &mut otter_vm_runtime::registration::RegistrationContext,
-            ) -> std::result::Result<(), otter_vm_core::error::VmError> {
-                Ok(())
-            }
-
-            fn load_module(
-                &self,
-                _specifier: &str,
-                ctx: &mut otter_vm_runtime::registration::RegistrationContext,
-            ) -> Option<otter_vm_core::gc::GcRef<otter_vm_core::object::JsObject>> {
-                let mut ns = ctx.module_namespace();
-                #(#fn_registrations)*
-                #(#prop_registrations)*
-                Some(ns.build())
+            quote! {
+                let default_object: Option<::otter_runtime::ObjectHandle> = None;
+                let default_value = Some(::otter_runtime::RegisterValue::from_object_handle(
+                    #alloc_fn(runtime, "default", #descriptor_fn(), #js_name)?.0,
+                ));
             }
         }
-
-        /// Create a boxed extension instance for registration.
-        pub fn #factory_fn() -> Box<dyn otter_vm_runtime::extension_v2::OtterExtension> {
-            Box::new(#struct_name)
-        }
+        Some(LodgeDefault::Value(expr)) => quote! {
+            let default_object: Option<::otter_runtime::ObjectHandle> = None;
+            let default_value = Some({
+                let value: ::otter_runtime::RegisterValue = { #expr };
+                value
+            });
+        },
+        None => quote! {
+            let default_object: Option<::otter_runtime::ObjectHandle> = None;
+            let default_value: Option<::otter_runtime::RegisterValue> = None;
+        },
     };
 
-    TokenStream::from(expanded)
+    let finalize_default = match default {
+        Some(LodgeDefault::Object) => quote! {
+            if let Some(default_object) = default_object {
+                #install_fn(
+                    runtime,
+                    namespace,
+                    "default",
+                    ::otter_runtime::RegisterValue::from_object_handle(default_object.0),
+                )?;
+            }
+        },
+        _ => quote! {
+            if let Some(default_value) = default_value {
+                #install_fn(runtime, namespace, "default", default_value)?;
+            }
+        },
+    };
+
+    quote! {
+        #[derive(Debug, Clone, Copy, Default)]
+        pub(crate) struct #struct_name;
+
+        fn #alloc_fn(
+            runtime: &mut ::otter_runtime::RuntimeState,
+            export_name: &str,
+            descriptor: ::otter_vm::NativeFunctionDescriptor,
+            js_name_override: Option<&str>,
+        ) -> Result<::otter_runtime::ObjectHandle, String> {
+            let function_name = js_name_override.unwrap_or(descriptor.js_name());
+            let callback = *descriptor.callback();
+            let function_descriptor = match (descriptor.slot_kind(), descriptor.entrypoint_kind()) {
+                (::otter_vm::NativeSlotKind::Method, ::otter_vm::NativeEntrypointKind::Sync) => {
+                    ::otter_vm::NativeFunctionDescriptor::method(
+                        function_name,
+                        descriptor.length(),
+                        callback,
+                    )
+                }
+                (::otter_vm::NativeSlotKind::Method, ::otter_vm::NativeEntrypointKind::Async) => {
+                    ::otter_vm::NativeFunctionDescriptor::async_method(
+                        function_name,
+                        descriptor.length(),
+                        callback,
+                    )
+                }
+                (slot_kind, _) => {
+                    return Err(format!(
+                        "module export '{export_name}' must use method metadata, got {slot_kind:?}"
+                    ));
+                }
+            };
+
+            runtime
+                .alloc_host_function_from_descriptor(function_descriptor)
+                .map_err(|error| {
+                    format!("failed to allocate function export '{export_name}': {error}")
+                })
+        }
+
+        fn #install_fn(
+            runtime: &mut ::otter_runtime::RuntimeState,
+            target: ::otter_runtime::ObjectHandle,
+            export_name: &str,
+            value: ::otter_runtime::RegisterValue,
+        ) -> Result<(), String> {
+            let property = runtime.intern_property_name(export_name);
+            runtime
+                .objects_mut()
+                .set_property(target, property, value)
+                .map(|_| ())
+                .map_err(|error| format!("failed to install module export '{export_name}': {error:?}"))
+        }
+
+        impl ::otter_runtime::HostedNativeModuleLoader for #struct_name {
+            fn load(
+                &self,
+                runtime: &mut ::otter_runtime::RuntimeState,
+            ) -> Result<::otter_runtime::HostedNativeModule, String> {
+                let namespace = runtime.alloc_object();
+                #default_setup
+                #(#function_exports)*
+                #(#value_exports)*
+                #finalize_default
+                Ok(::otter_runtime::HostedNativeModule::Esm(namespace))
+            }
+        }
+
+        pub(crate) fn #entries_fn() -> Vec<::otter_runtime::HostedExtensionModule> {
+            let loader: ::std::sync::Arc<dyn ::otter_runtime::HostedNativeModuleLoader> =
+                ::std::sync::Arc::new(#struct_name);
+            vec![
+                #(
+                    ::otter_runtime::HostedExtensionModule {
+                        specifier: #specifiers.to_string(),
+                        loader: loader.clone(),
+                    }
+                ),*
+            ]
+        }
+    }
+    .into()
 }
 
 /// Convert snake_case to PascalCase
@@ -822,7 +934,7 @@ pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let item_clone = item.clone();
     if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
-        return expand_new_js_class_impl(i);
+        return expand_active_js_class_impl(i);
     }
 
     syn::Error::new(
@@ -833,30 +945,7 @@ pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Legacy JS class macro retained only for old VM/core callsites.
-#[proc_macro_attribute]
-pub fn legacy_js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as JsClassArgs);
-
-    let item_clone = item.clone();
-    if let Ok(s) = syn::parse::<ItemStruct>(item_clone) {
-        return expand_js_class_struct(s, args);
-    }
-
-    let item_clone = item.clone();
-    if let Ok(i) = syn::parse::<ItemImpl>(item_clone) {
-        return expand_legacy_js_class_impl(i);
-    }
-
-    syn::Error::new(
-        proc_macro2::Span::call_site(),
-        "Expected struct or impl block",
-    )
-    .to_compile_error()
-    .into()
-}
-
-/// Mark a struct or impl block as a JavaScript namespace in the new VM.
+/// Mark a struct or impl block as a JavaScript namespace in the active VM.
 #[proc_macro_attribute]
 pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as JsClassArgs);
@@ -1049,105 +1138,6 @@ fn parse_js_member_attr(attr: &syn::Attribute) -> syn::Result<Option<JsMemberAtt
     Ok(parsed)
 }
 
-fn parse_legacy_js_member_attr(attr: &syn::Attribute) -> syn::Result<Option<JsMemberAttr>> {
-    let mut parsed = if attr.path().is_ident("legacy_js_constructor") {
-        Some(JsMemberAttr {
-            kind: JsMemberKind::Constructor,
-            name: None,
-            length: None,
-        })
-    } else if attr.path().is_ident("legacy_js_method") {
-        Some(JsMemberAttr {
-            kind: JsMemberKind::Method,
-            name: None,
-            length: None,
-        })
-    } else if attr.path().is_ident("legacy_js_static") {
-        Some(JsMemberAttr {
-            kind: JsMemberKind::Static,
-            name: None,
-            length: None,
-        })
-    } else if attr.path().is_ident("legacy_js_getter") {
-        Some(JsMemberAttr {
-            kind: JsMemberKind::Getter,
-            name: None,
-            length: None,
-        })
-    } else if attr.path().is_ident("legacy_js_setter") {
-        Some(JsMemberAttr {
-            kind: JsMemberKind::Setter,
-            name: None,
-            length: None,
-        })
-    } else {
-        None
-    };
-
-    let Some(ref mut parsed_attr) = parsed else {
-        return Ok(None);
-    };
-
-    if let syn::Meta::List(list) = &attr.meta {
-        syn::parse::Parser::parse2(
-            |input: ParseStream| {
-                while !input.is_empty() {
-                    let ident: Ident = input.parse()?;
-                    match ident.to_string().as_str() {
-                        "name" => {
-                            input.parse::<Token![=]>()?;
-                            let lit: LitStr = input.parse()?;
-                            parsed_attr.name = Some(lit.value());
-                        }
-                        "length" => {
-                            input.parse::<Token![=]>()?;
-                            let lit: LitInt = input.parse()?;
-                            parsed_attr.length = Some(lit.base10_parse()?);
-                        }
-                        "constructor" => {
-                            parsed_attr.kind = JsMemberKind::Constructor;
-                        }
-                        "kind" => {
-                            input.parse::<Token![=]>()?;
-                            let lit: LitStr = input.parse()?;
-                            parsed_attr.kind = match lit.value().as_str() {
-                                "method" => JsMemberKind::Method,
-                                "getter" => JsMemberKind::Getter,
-                                "setter" => JsMemberKind::Setter,
-                                "static" => JsMemberKind::Static,
-                                other => {
-                                    return Err(syn::Error::new_spanned(
-                                        lit,
-                                        format!(
-                                            "Unknown legacy_js_class member kind '{other}'. Expected method, getter, setter, or static."
-                                        ),
-                                    ));
-                                }
-                            };
-                        }
-                        other => {
-                            return Err(syn::Error::new_spanned(
-                                ident,
-                                format!(
-                                    "Unknown legacy_js_class member option '{other}'. Expected name, length, constructor, or kind."
-                                ),
-                            ));
-                        }
-                    }
-
-                    if input.peek(Token![,]) {
-                        input.parse::<Token![,]>()?;
-                    }
-                }
-                Ok(())
-            },
-            list.tokens.clone(),
-        )?;
-    }
-
-    Ok(parsed)
-}
-
 fn is_type_named(ty: &Type, expected: &str) -> bool {
     match ty {
         Type::Path(type_path) => type_path
@@ -1197,7 +1187,7 @@ fn is_runtime_state_ref(arg: &FnArg) -> bool {
     false
 }
 
-fn is_new_vm_js_class_method(method: &syn::ImplItemFn) -> bool {
+fn is_active_js_class_method(method: &syn::ImplItemFn) -> bool {
     let params: Vec<_> = method.sig.inputs.iter().collect();
     params.len() == 3
         && is_register_value_ref(params[0])
@@ -1205,7 +1195,7 @@ fn is_new_vm_js_class_method(method: &syn::ImplItemFn) -> bool {
         && is_runtime_state_ref(params[2])
 }
 
-fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
+fn expand_active_js_class_impl(input: ItemImpl) -> TokenStream {
     let self_ty = &input.self_ty;
     let mut errors = Vec::new();
 
@@ -1267,11 +1257,11 @@ fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
                 JsMemberKind::Setter => js_setters.push(rust_name.clone()),
             }
 
-            if !is_new_vm_js_class_method(method) {
+            if !is_active_js_class_method(method) {
                 errors.push(
                     syn::Error::new_spanned(
                         &method.sig.ident,
-                        "js_class only supports new-VM methods with signature fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>.",
+                        "js_class only supports active runtime methods with signature fn(&RegisterValue, &[RegisterValue], &mut RuntimeState) -> Result<RegisterValue, VmNativeCallError>.",
                     )
                     .to_compile_error(),
                 );
@@ -1290,7 +1280,7 @@ fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
                     errors.push(
                         syn::Error::new_spanned(
                             &method.sig.ident,
-                            "Expected at most one js_class constructor for new-VM metadata.",
+                            "Expected at most one js_class constructor for descriptor metadata.",
                         )
                         .to_compile_error(),
                     );
@@ -1352,7 +1342,7 @@ fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
             };
 
             quote! {
-                /// New-VM descriptor for this js_class member.
+                /// Descriptor for this js_class member.
                 pub fn #descriptor_fn_name() -> ::otter_vm::NativeFunctionDescriptor {
                     let callback = Self::#rust_ident as ::otter_vm::VmNativeFunction;
                     #descriptor_ctor
@@ -1394,7 +1384,7 @@ fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
             .collect();
 
         quote! {
-            /// Aggregate new-VM class descriptor emitted by #[js_class].
+            /// Aggregate class descriptor emitted by #[js_class].
             pub fn js_class_descriptor() -> ::otter_vm::JsClassDescriptor {
                 let mut descriptor = ::otter_vm::JsClassDescriptor::new(Self::JS_CLASS_NAME);
                 #constructor_binding
@@ -1443,175 +1433,6 @@ fn expand_new_js_class_impl(input: ItemImpl) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-fn expand_legacy_js_class_impl(input: ItemImpl) -> TokenStream {
-    let self_ty = &input.self_ty;
-    let mut errors = Vec::new();
-
-    let mut constructors = Vec::new();
-    let mut methods = Vec::new();
-    let mut static_methods = Vec::new();
-    let mut js_getters = Vec::new();
-    let mut js_setters = Vec::new();
-
-    struct DeclInfo {
-        rust_ident: Ident,
-        js_name: String,
-        length: u32,
-    }
-    let mut all_decls: Vec<DeclInfo> = Vec::new();
-
-    for item in &input.items {
-        if let syn::ImplItem::Fn(method) = item {
-            let rust_ident = method.sig.ident.clone();
-            let rust_name = rust_ident.to_string();
-            let mut member_attr = None;
-
-            for attr in &method.attrs {
-                match parse_legacy_js_member_attr(attr) {
-                    Ok(Some(parsed_attr)) => {
-                        if member_attr.is_some() {
-                            errors.push(
-                                syn::Error::new_spanned(
-                                    attr,
-                                    "Expected at most one legacy_js_class member attribute per method.",
-                                )
-                                .to_compile_error(),
-                            );
-                            continue;
-                        }
-                        member_attr = Some(parsed_attr);
-                    }
-                    Ok(None) => {}
-                    Err(error) => errors.push(error.to_compile_error()),
-                }
-            }
-
-            let Some(member_attr) = member_attr else {
-                continue;
-            };
-
-            let js_name = member_attr.name.unwrap_or_else(|| rust_name.clone());
-            let length = member_attr
-                .length
-                .unwrap_or_else(|| member_attr.kind.default_length());
-
-            match member_attr.kind {
-                JsMemberKind::Constructor => constructors.push(rust_name.clone()),
-                JsMemberKind::Method => methods.push(rust_name.clone()),
-                JsMemberKind::Static => static_methods.push(rust_name.clone()),
-                JsMemberKind::Getter => js_getters.push(rust_name.clone()),
-                JsMemberKind::Setter => js_setters.push(rust_name.clone()),
-            }
-
-            all_decls.push(DeclInfo {
-                rust_ident: rust_ident.clone(),
-                js_name,
-                length,
-            });
-        }
-    }
-
-    if !errors.is_empty() {
-        return quote! {
-            #(#errors)*
-            #input
-        }
-        .into();
-    }
-
-    let decl_fns: Vec<_> = all_decls
-        .iter()
-        .map(|info| {
-            let decl_fn_name = format_ident!("{}_decl", info.rust_ident);
-            let js_name = &info.js_name;
-            let length = info.length;
-            let rust_ident = &info.rust_ident;
-
-            quote! {
-                /// NativeFn declaration: `(js_name, native_fn, length)`.
-                pub fn #decl_fn_name() -> (
-                    &'static str,
-                    std::sync::Arc<
-                        dyn Fn(
-                            &otter_vm_core::value::Value,
-                            &[otter_vm_core::value::Value],
-                            &mut otter_vm_core::context::NativeContext<'_>,
-                        ) -> std::result::Result<
-                            otter_vm_core::value::Value,
-                            otter_vm_core::error::VmError,
-                        > + Send
-                            + Sync,
-                    >,
-                    u32,
-                ) {
-                    type NativeFnArc = std::sync::Arc<
-                        dyn Fn(
-                            &otter_vm_core::value::Value,
-                            &[otter_vm_core::value::Value],
-                            &mut otter_vm_core::context::NativeContext<'_>,
-                        ) -> std::result::Result<
-                            otter_vm_core::value::Value,
-                            otter_vm_core::error::VmError,
-                        > + Send
-                            + Sync,
-                    >;
-                    static CACHED: std::sync::OnceLock<NativeFnArc> =
-                        std::sync::OnceLock::new();
-                    let f = CACHED
-                        .get_or_init(|| {
-                            std::sync::Arc::new(
-                                |this, args, ncx|
-                                 -> std::result::Result<
-                                    otter_vm_core::value::Value,
-                                    otter_vm_core::error::VmError,
-                                > {
-                                    Self::#rust_ident(this, args, ncx)
-                                },
-                            )
-                        })
-                        .clone();
-                    (#js_name, f, #length)
-                }
-            }
-        })
-        .collect();
-
-    let expanded = quote! {
-        #input
-
-        impl #self_ty {
-            /// Get JS constructor names
-            pub fn js_constructors() -> &'static [&'static str] {
-                &[#(#constructors),*]
-            }
-
-            /// Get JS method names
-            pub fn js_methods() -> &'static [&'static str] {
-                &[#(#methods),*]
-            }
-
-            /// Get JS static method names
-            pub fn js_static_methods() -> &'static [&'static str] {
-                &[#(#static_methods),*]
-            }
-
-            /// Get JS getter names
-            pub fn js_getters() -> &'static [&'static str] {
-                &[#(#js_getters),*]
-            }
-
-            /// Get JS setter names
-            pub fn js_setters() -> &'static [&'static str] {
-                &[#(#js_setters),*]
-            }
-
-            #(#decl_fns)*
-        }
-    };
-
-    TokenStream::from(expanded)
-}
-
 // =============================================================================
 // Helper attribute macros for #[js_class]
 // =============================================================================
@@ -1643,36 +1464,6 @@ pub fn js_getter(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a method as JS setter
 #[proc_macro_attribute]
 pub fn js_setter(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-
-/// Mark a legacy old-VM method as JS constructor
-#[proc_macro_attribute]
-pub fn legacy_js_constructor(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-
-/// Mark a legacy old-VM method as JS instance method
-#[proc_macro_attribute]
-pub fn legacy_js_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-
-/// Mark a legacy old-VM method as JS static method
-#[proc_macro_attribute]
-pub fn legacy_js_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-
-/// Mark a legacy old-VM method as JS getter
-#[proc_macro_attribute]
-pub fn legacy_js_getter(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-
-/// Mark a legacy old-VM method as JS setter
-#[proc_macro_attribute]
-pub fn legacy_js_setter(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 

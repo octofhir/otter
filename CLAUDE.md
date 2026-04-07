@@ -71,6 +71,14 @@ otter-gc
 
 4. **Native Functions**: Add native bindings against the current runtime/VM ABI.
    `otter:kv`, `otter:sql`, and `otter:ffi` live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path there.
+   Prefer the active macro set when it matches the surface:
+   - `#[js_class]` for classes
+   - `#[js_namespace]` for namespaces
+   - `#[dive]` for one binding
+     `#[dive]` is sync by default; `#[dive(deep)]` is the async variant of the same macro
+   - `raft!` for grouped target bindings
+   - `burrow!` for host-owned object surfaces
+   - `lodge!` for hosted module loaders
 5. **Types Source Of Truth**: keep Otter `.d.ts` files under `crates/otter-pm/src/types/otter/`; treat `packages/otter-types/` as generated publish output.
 6. **Web API Placement**: standards-facing Web API work belongs in `crates/otter-web`, not in `crates/otter-modules`.
 
@@ -213,6 +221,13 @@ fn process(value: &Value, depth: usize) -> Result<(), Error> {
 5. **AST-first parsing**: Use `oxc` for JS/TS analysis; never regex parsing
 6. **Conformance first**: Check `ES_CONFORMANCE.md` before and after feature work. Track pass rate deltas.
 7. **Protect active boundaries**: no new active-runtime dependency on parked compatibility shims.
+
+## Macro Rules
+
+- Treat `crates/otter-macros/README.md` as the user-facing source of truth for macro usage and examples.
+- Prefer descriptor-driven macros over manual boilerplate when the surface clearly matches one of the active macros.
+- Keep macro use explicit: JS names, arity, and export shape should remain obvious in the declaration site.
+- Keep code manual when capability checks, complex runtime sequencing, or non-obvious installation order matter more than boilerplate reduction.
 
 ## Current Work
 

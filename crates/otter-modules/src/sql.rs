@@ -2,10 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use otter_runtime::{
-    HostedNativeModule, HostedNativeModuleLoader, NativeFunctionDescriptor, ObjectHandle,
-    RegisterValue, RuntimeState, VmNativeCallError,
-};
+use otter_macros::{burrow, dive, lodge};
+use otter_runtime::{ObjectHandle, RegisterValue, RuntimeState, VmNativeCallError};
 use otter_vm::object::HeapValueKind;
 use otter_vm::payload::{VmTrace, VmValueTracer};
 use rusqlite::types::{ToSqlOutput, Value as RusqliteValue, ValueRef};
@@ -219,47 +217,17 @@ impl rusqlite::ToSql for RusqliteParam {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SqlModule;
+lodge!(
+    sql_module,
+    module_specifiers = ["otter:sql"],
+    default = function(sql_open as "openSql"),
+    functions = [
+        ("openSql", sql_open as "openSql"),
+        ("sql", sql_open),
+    ],
+);
 
-impl HostedNativeModuleLoader for SqlModule {
-    fn load(&self, runtime: &mut RuntimeState) -> Result<HostedNativeModule, String> {
-        let namespace = runtime.alloc_object();
-        let open = alloc_named_function(runtime, "openSql", 1, sql_open);
-        let sql = alloc_named_function(runtime, "sql", 1, sql_open);
-        let default_prop = runtime.intern_property_name("default");
-        let open_prop = runtime.intern_property_name("openSql");
-        let sql_prop = runtime.intern_property_name("sql");
-
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                default_prop,
-                RegisterValue::from_object_handle(open.0),
-            )
-            .map_err(|error| format!("failed to install otter:sql default export: {error:?}"))?;
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                open_prop,
-                RegisterValue::from_object_handle(open.0),
-            )
-            .map_err(|error| format!("failed to install otter:sql openSql export: {error:?}"))?;
-        runtime
-            .objects_mut()
-            .set_property(
-                namespace,
-                sql_prop,
-                RegisterValue::from_object_handle(sql.0),
-            )
-            .map_err(|error| format!("failed to install otter:sql sql export: {error:?}"))?;
-
-        Ok(HostedNativeModule::Esm(namespace))
-    }
-}
-
+#[dive(name = "sql", length = 1)]
 fn sql_open(
     _this: &RegisterValue,
     args: &[RegisterValue],
@@ -284,25 +252,31 @@ fn sql_open(
         last_insert_row_id: None,
     });
 
-    install_method(runtime, object, "query", 2, sql_query)?;
-    install_method(runtime, object, "queryOne", 2, sql_query_one)?;
-    install_method(runtime, object, "queryValue", 2, sql_query_value)?;
-    install_method(runtime, object, "execute", 2, sql_execute)?;
-    install_method(runtime, object, "executeMeta", 2, sql_execute_meta)?;
-    install_method(runtime, object, "begin", 0, sql_begin)?;
-    install_method(runtime, object, "commit", 0, sql_commit)?;
-    install_method(runtime, object, "rollback", 0, sql_rollback)?;
-    install_method(runtime, object, "close", 0, sql_close)?;
-    install_getter(runtime, object, "adapter", sql_adapter)?;
-    install_getter(runtime, object, "path", sql_path)?;
-    install_getter(runtime, object, "isMemory", sql_is_memory)?;
-    install_getter(runtime, object, "closed", sql_closed)?;
-    install_getter(runtime, object, "inTransaction", sql_in_transaction)?;
-    install_getter(runtime, object, "lastInsertRowId", sql_last_insert_row_id)?;
+    let members = burrow! {
+        fns = [
+            sql_query,
+            sql_query_one,
+            sql_query_value,
+            sql_execute,
+            sql_execute_meta,
+            sql_begin,
+            sql_commit,
+            sql_rollback,
+            sql_close,
+            sql_adapter,
+            sql_path,
+            sql_is_memory,
+            sql_closed,
+            sql_in_transaction,
+            sql_last_insert_row_id
+        ]
+    };
+    runtime.install_burrow(object, &members)?;
 
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
+#[dive(name = "query", length = 2)]
 fn sql_query(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -314,6 +288,7 @@ fn sql_query(
     json_array_to_js(rows, runtime)
 }
 
+#[dive(name = "execute", length = 2)]
 fn sql_execute(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -330,6 +305,7 @@ fn sql_execute(
     Ok(RegisterValue::from_number(meta.rows_affected as f64))
 }
 
+#[dive(name = "executeMeta", length = 2)]
 fn sql_execute_meta(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -379,6 +355,7 @@ fn sql_execute_meta(
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
+#[dive(name = "queryOne", length = 2)]
 fn sql_query_one(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -393,6 +370,7 @@ fn sql_query_one(
     }
 }
 
+#[dive(name = "queryValue", length = 2)]
 fn sql_query_value(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -407,6 +385,7 @@ fn sql_query_value(
     }
 }
 
+#[dive(name = "begin", length = 0)]
 fn sql_begin(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -421,6 +400,7 @@ fn sql_begin(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "commit", length = 0)]
 fn sql_commit(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -435,6 +415,7 @@ fn sql_commit(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "rollback", length = 0)]
 fn sql_rollback(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -449,6 +430,7 @@ fn sql_rollback(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "close", length = 0)]
 fn sql_close(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -468,6 +450,7 @@ fn sql_close(
     Ok(RegisterValue::undefined())
 }
 
+#[dive(name = "adapter", getter)]
 fn sql_adapter(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -490,6 +473,7 @@ fn sql_adapter(
     ))
 }
 
+#[dive(name = "path", getter)]
 fn sql_path(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -512,6 +496,7 @@ fn sql_path(
     ))
 }
 
+#[dive(name = "isMemory", getter)]
 fn sql_is_memory(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -532,6 +517,7 @@ fn sql_is_memory(
     Ok(RegisterValue::from_bool(is_memory))
 }
 
+#[dive(name = "closed", getter)]
 fn sql_closed(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -552,6 +538,7 @@ fn sql_closed(
     Ok(RegisterValue::from_bool(closed))
 }
 
+#[dive(name = "inTransaction", getter)]
 fn sql_in_transaction(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -572,6 +559,7 @@ fn sql_in_transaction(
     Ok(RegisterValue::from_bool(in_transaction))
 }
 
+#[dive(name = "lastInsertRowId", getter)]
 fn sql_last_insert_row_id(
     this: &RegisterValue,
     _args: &[RegisterValue],
@@ -898,74 +886,6 @@ fn json_to_register(
             Ok(RegisterValue::from_object_handle(object.0))
         }
     }
-}
-
-fn install_method(
-    runtime: &mut RuntimeState,
-    target: ObjectHandle,
-    name: &str,
-    arity: u16,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> Result<(), VmNativeCallError> {
-    let function = alloc_named_function(runtime, name, arity, callback);
-    let property = runtime.intern_property_name(name);
-    runtime
-        .objects_mut()
-        .set_property(
-            target,
-            property,
-            RegisterValue::from_object_handle(function.0),
-        )
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("failed to install sql method '{name}': {error:?}").into(),
-            )
-        })?;
-    Ok(())
-}
-
-fn install_getter(
-    runtime: &mut RuntimeState,
-    target: ObjectHandle,
-    name: &str,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> Result<(), VmNativeCallError> {
-    let descriptor = NativeFunctionDescriptor::getter(name, callback);
-    let getter_id = runtime.register_native_function(descriptor);
-    let getter = runtime.alloc_host_function(getter_id);
-    let property = runtime.intern_property_name(name);
-    runtime
-        .objects_mut()
-        .define_accessor(target, property, Some(getter), None)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("failed to install sql getter '{name}': {error:?}").into(),
-            )
-        })?;
-    Ok(())
-}
-
-fn alloc_named_function(
-    runtime: &mut RuntimeState,
-    name: &str,
-    arity: u16,
-    callback: fn(
-        &RegisterValue,
-        &[RegisterValue],
-        &mut RuntimeState,
-    ) -> Result<RegisterValue, VmNativeCallError>,
-) -> ObjectHandle {
-    let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
-    let function = runtime.register_native_function(descriptor);
-    runtime.alloc_host_function(function)
 }
 
 fn required_string_arg(

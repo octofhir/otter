@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 libffi = "4"
 libloading = "0.8"
+otter-macros = { path = "../otter-macros" }
 otter-runtime = { path = "../otter-runtime" }
 otter-vm = { path = "../otter-vm" }
 redb = "3"

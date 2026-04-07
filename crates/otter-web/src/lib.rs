@@ -3,12 +3,12 @@ mod headers_api;
 mod request_response_api;
 mod url_api;
 
+use otter_macros::{js_class, js_constructor, js_getter, js_method};
 use otter_runtime::{HostedExtension, RuntimeProfile, RuntimeState};
-use otter_vm::RegisterValue;
-use otter_vm::WellKnownSymbol;
-use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
+use otter_vm::descriptors::{JsClassDescriptor, NativeFunctionDescriptor, VmNativeCallError};
 use otter_vm::object::{HeapValueKind, ObjectHandle, TypedArrayKind};
 use otter_vm::payload::{VmTrace, VmValueTracer};
+use otter_vm::{ClassBuilder, ClassMemberPlan, RegisterValue, WellKnownSymbol};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OtterWebExtension;
@@ -56,202 +56,157 @@ impl VmTrace for TextDecoderPayload {
 }
 
 fn install_text_encoder(runtime: &mut RuntimeState) -> Result<(), String> {
-    if has_global(runtime, "TextEncoder") {
-        return Ok(());
-    }
-    let prototype = runtime.alloc_object();
-    install_method(
-        runtime,
-        prototype,
-        "encode",
-        1,
-        text_encoder_encode,
-        "TextEncoder.prototype.encode",
-    )?;
-    install_getter(
-        runtime,
-        prototype,
-        "encoding",
-        text_encoder_get_encoding,
-        "TextEncoder.prototype.encoding",
-    )?;
-
-    let constructor = alloc_constructor(runtime, "TextEncoder", 0, text_encoder_constructor);
-    link_constructor_and_prototype(runtime, constructor, prototype)?;
-    runtime.install_global_value(
-        "TextEncoder",
-        RegisterValue::from_object_handle(constructor.0),
-    );
-    Ok(())
+    install_js_class(runtime, &TextEncoderClass::js_class_descriptor())
 }
 
 fn install_text_decoder(runtime: &mut RuntimeState) -> Result<(), String> {
-    if has_global(runtime, "TextDecoder") {
-        return Ok(());
-    }
-    let prototype = runtime.alloc_object();
-    install_method(
-        runtime,
-        prototype,
-        "decode",
-        1,
-        text_decoder_decode,
-        "TextDecoder.prototype.decode",
-    )?;
-    install_getter(
-        runtime,
-        prototype,
-        "encoding",
-        text_decoder_get_encoding,
-        "TextDecoder.prototype.encoding",
-    )?;
-    install_getter(
-        runtime,
-        prototype,
-        "fatal",
-        text_decoder_get_fatal,
-        "TextDecoder.prototype.fatal",
-    )?;
-    install_getter(
-        runtime,
-        prototype,
-        "ignoreBOM",
-        text_decoder_get_ignore_bom,
-        "TextDecoder.prototype.ignoreBOM",
-    )?;
-
-    let constructor = alloc_constructor(runtime, "TextDecoder", 1, text_decoder_constructor);
-    link_constructor_and_prototype(runtime, constructor, prototype)?;
-    runtime.install_global_value(
-        "TextDecoder",
-        RegisterValue::from_object_handle(constructor.0),
-    );
-    Ok(())
+    install_js_class(runtime, &TextDecoderClass::js_class_descriptor())
 }
 
-fn text_encoder_constructor(
-    _this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = class_prototype(runtime, "TextEncoder")?;
-    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), TextEncoderPayload);
-    Ok(RegisterValue::from_object_handle(instance.0))
-}
+#[js_class(name = "TextEncoder")]
+struct TextEncoderClass;
 
-fn text_encoder_encode(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    require_text_encoder(runtime, this)?;
-    let input = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    let bytes = if input == RegisterValue::undefined() {
-        Vec::new()
-    } else {
-        runtime
-            .js_to_string_infallible(input)
-            .into_string()
-            .into_bytes()
-    };
-    let value = alloc_uint8_array(runtime, bytes);
-    Ok(RegisterValue::from_object_handle(value.0))
-}
-
-fn text_encoder_get_encoding(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    require_text_encoder(runtime, this)?;
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string("utf-8").0,
-    ))
-}
-
-fn text_decoder_constructor(
-    _this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let label = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    let options = args
-        .get(1)
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-
-    validate_utf8_label(runtime, label)?;
-    let (fatal, ignore_bom) = parse_text_decoder_options(runtime, options)?;
-    let prototype = class_prototype(runtime, "TextDecoder")?;
-    let instance = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        TextDecoderPayload { fatal, ignore_bom },
-    );
-    Ok(RegisterValue::from_object_handle(instance.0))
-}
-
-fn text_decoder_decode(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let payload = require_text_decoder(runtime, this)?;
-    let input = args
-        .first()
-        .copied()
-        .unwrap_or_else(RegisterValue::undefined);
-    let mut bytes = bytes_from_buffer_source(runtime, input)?;
-    if !payload.ignore_bom && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        bytes.drain(..3);
+#[js_class]
+impl TextEncoderClass {
+    #[js_constructor(name = "TextEncoder", length = 0)]
+    fn constructor(
+        _this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let prototype = class_prototype(runtime, "TextEncoder")?;
+        let instance =
+            runtime.alloc_native_object_with_prototype(Some(prototype), TextEncoderPayload);
+        Ok(RegisterValue::from_object_handle(instance.0))
     }
 
-    let decoded = if payload.fatal {
-        match String::from_utf8(bytes) {
-            Ok(value) => value,
-            Err(_) => return Err(type_error(runtime, "TextDecoder fatal decode failed")),
+    #[js_method(name = "encode", length = 1)]
+    fn encode(
+        this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        require_text_encoder(runtime, this)?;
+        let input = args
+            .first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        let bytes = if input == RegisterValue::undefined() {
+            Vec::new()
+        } else {
+            runtime
+                .js_to_string_infallible(input)
+                .into_string()
+                .into_bytes()
+        };
+        let value = alloc_uint8_array(runtime, bytes);
+        Ok(RegisterValue::from_object_handle(value.0))
+    }
+
+    #[js_getter(name = "encoding")]
+    fn encoding(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        require_text_encoder(runtime, this)?;
+        Ok(RegisterValue::from_object_handle(
+            runtime.alloc_string("utf-8").0,
+        ))
+    }
+}
+
+#[js_class(name = "TextDecoder")]
+struct TextDecoderClass;
+
+#[js_class]
+impl TextDecoderClass {
+    #[js_constructor(name = "TextDecoder", length = 1)]
+    fn constructor(
+        _this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let label = args
+            .first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        let options = args
+            .get(1)
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+
+        validate_utf8_label(runtime, label)?;
+        let (fatal, ignore_bom) = parse_text_decoder_options(runtime, options)?;
+        let prototype = class_prototype(runtime, "TextDecoder")?;
+        let instance = runtime.alloc_native_object_with_prototype(
+            Some(prototype),
+            TextDecoderPayload { fatal, ignore_bom },
+        );
+        Ok(RegisterValue::from_object_handle(instance.0))
+    }
+
+    #[js_method(name = "decode", length = 1)]
+    fn decode(
+        this: &RegisterValue,
+        args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let payload = require_text_decoder(runtime, this)?;
+        let input = args
+            .first()
+            .copied()
+            .unwrap_or_else(RegisterValue::undefined);
+        let mut bytes = bytes_from_buffer_source(runtime, input)?;
+        if !payload.ignore_bom && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(..3);
         }
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
 
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(decoded).0,
-    ))
-}
+        let decoded = if payload.fatal {
+            match String::from_utf8(bytes) {
+                Ok(value) => value,
+                Err(_) => return Err(type_error(runtime, "TextDecoder fatal decode failed")),
+            }
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
 
-fn text_decoder_get_encoding(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    require_text_decoder(runtime, this)?;
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string("utf-8").0,
-    ))
-}
+        Ok(RegisterValue::from_object_handle(
+            runtime.alloc_string(decoded).0,
+        ))
+    }
 
-fn text_decoder_get_fatal(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let payload = require_text_decoder(runtime, this)?;
-    Ok(RegisterValue::from_bool(payload.fatal))
-}
+    #[js_getter(name = "encoding")]
+    fn encoding(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        require_text_decoder(runtime, this)?;
+        Ok(RegisterValue::from_object_handle(
+            runtime.alloc_string("utf-8").0,
+        ))
+    }
 
-fn text_decoder_get_ignore_bom(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let payload = require_text_decoder(runtime, this)?;
-    Ok(RegisterValue::from_bool(payload.ignore_bom))
+    #[js_getter(name = "fatal")]
+    fn fatal(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let payload = require_text_decoder(runtime, this)?;
+        Ok(RegisterValue::from_bool(payload.fatal))
+    }
+
+    #[js_getter(name = "ignoreBOM")]
+    fn ignore_bom(
+        this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let payload = require_text_decoder(runtime, this)?;
+        Ok(RegisterValue::from_bool(payload.ignore_bom))
+    }
 }
 
 fn parse_text_decoder_options(
@@ -469,6 +424,106 @@ fn require_text_decoder(
                 "TextDecoder method called on incompatible receiver",
             )
         })
+}
+
+fn install_js_class(
+    runtime: &mut RuntimeState,
+    descriptor: &JsClassDescriptor,
+) -> Result<(), String> {
+    if has_global(runtime, descriptor.js_name()) {
+        return Ok(());
+    }
+
+    let plan = ClassBuilder::from_descriptor(descriptor)
+        .map_err(|error| {
+            format!(
+                "failed to normalize {} class descriptor: {error}",
+                descriptor.js_name()
+            )
+        })?
+        .build();
+    let class_name = plan.js_name().to_string();
+    let constructor_descriptor = plan
+        .constructor()
+        .cloned()
+        .ok_or_else(|| format!("{class_name} class descriptor is missing constructor metadata"))?;
+    let constructor_id = runtime.register_native_function(constructor_descriptor);
+    let constructor = runtime.alloc_host_function(constructor_id);
+    let prototype = runtime.alloc_object();
+
+    install_class_members(
+        runtime,
+        prototype,
+        plan.prototype_members(),
+        &class_name,
+        "prototype",
+    )?;
+    install_class_members(
+        runtime,
+        constructor,
+        plan.static_members(),
+        &class_name,
+        "constructor",
+    )?;
+    link_constructor_and_prototype(runtime, constructor, prototype)?;
+    runtime.install_global_value(
+        &class_name,
+        RegisterValue::from_object_handle(constructor.0),
+    );
+    Ok(())
+}
+
+fn install_class_members(
+    runtime: &mut RuntimeState,
+    target: ObjectHandle,
+    members: &[ClassMemberPlan],
+    class_name: &str,
+    surface: &str,
+) -> Result<(), String> {
+    for member in members {
+        match member {
+            ClassMemberPlan::Method(descriptor) => {
+                let id = runtime.register_native_function(descriptor.clone());
+                let function = runtime.alloc_host_function(id);
+                let property = runtime.intern_property_name(descriptor.js_name());
+                runtime
+                    .objects_mut()
+                    .set_property(
+                        target,
+                        property,
+                        RegisterValue::from_object_handle(function.0),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "failed to install {class_name}.{surface}.{}: {error:?}",
+                            descriptor.js_name()
+                        )
+                    })?;
+            }
+            ClassMemberPlan::Accessor(accessor) => {
+                let getter = accessor.getter().cloned().map(|descriptor| {
+                    let id = runtime.register_native_function(descriptor);
+                    runtime.alloc_host_function(id)
+                });
+                let setter = accessor.setter().cloned().map(|descriptor| {
+                    let id = runtime.register_native_function(descriptor);
+                    runtime.alloc_host_function(id)
+                });
+                let property = runtime.intern_property_name(accessor.js_name());
+                runtime
+                    .objects_mut()
+                    .define_accessor(target, property, getter, setter)
+                    .map_err(|error| {
+                        format!(
+                            "failed to install {class_name}.{surface}.{} accessor: {error:?}",
+                            accessor.js_name()
+                        )
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn has_global(runtime: &mut RuntimeState, name: &str) -> bool {

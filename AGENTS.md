@@ -50,7 +50,7 @@ Repository rules:
 
 ### Supporting crates
 - `crates/otter-jit`: JIT pipeline for the VM.
-- `crates/otter-macros`: `#[dive]` proc-macro for native function bindings.
+- `crates/otter-macros`: descriptor-driven proc-macros for JS classes, namespaces, native bindings, host-owned object surfaces, and hosted modules.
 - `crates/otter-nodejs`: parked Node.js compatibility shim kept compileable until a real runtime-native port lands.
 - `crates/otter-pm`: package management + bundled type definitions (`@types/otter`).
 - `crates/otter-modules`: active home for otter-specific hosted modules (`otter:kv`, `otter:sql`, `otter:ffi`, and similar surfaces).
@@ -101,12 +101,33 @@ New ECMAScript builtins, global namespaces, Web API globals, and extension-visib
 
 ## Macro and Async Agreements
 
-### Macro usage (`#[dive]`)
+### Macro usage
 
-- Prefer `#[dive]` for simple native bindings where argument mapping is straightforward and improves readability.
-- For module loaders / namespace wiring (`node:*`, profile-gated exports, mixed sync+async APIs), prefer explicit `OtterExtension` + manual module builders instead of hiding behavior behind macros.
-- Keep public JS API shape obvious in Rust code: exported names and arity should be visible in one place (`*_ext.rs` module builder).
-- If a macro-based API surface changes, update the corresponding tests and `.d.ts` declarations in the same patch.
+Canonical active macros:
+
+- `#[js_class]` for constructor-backed JS classes
+- `#[js_namespace]` for namespace-style JS objects
+- `#[dive]` for single native bindings
+- `raft!` for grouped bindings on one install target
+- `burrow!` for host-owned object surfaces
+- `lodge!` for `HostedNativeModuleLoader` declarations
+
+Rules:
+
+- Prefer `#[js_class]` and `#[js_namespace]` over hand-written descriptor assembly when the JS surface is class/namespace shaped.
+- Prefer `#[dive]` for simple native bindings with the active runtime signature.
+  `#[dive]` is sync by default; use `#[dive(deep)]` for the async variant of the same macro.
+- Prefer `raft!` over hand-written `vec![*_binding(...)]` boilerplate.
+- Prefer `burrow!` plus `RuntimeState::install_burrow(...)` over repeated local `install_method` / `install_getter` helpers on native objects.
+- Prefer `lodge!` over hand-written `HostedNativeModuleLoader` impls for active hosted modules.
+- Keep exported JS names and arity explicit in the macro declaration. Do not hide API shape in unrelated helper code.
+- If a macro-based API surface changes, update tests and `.d.ts` declarations in the same patch when applicable.
+
+Keep code manual when:
+
+- capability enforcement is the main behavior
+- bootstrap/install order is delicate
+- the macro would hide important control flow
 
 ### Async model
 
@@ -201,7 +222,7 @@ otter-gc
 ```
 
 Supporting crates:
-- `otter-macros` - `#[dive]` proc-macro for registering native Rust functions callable from JS
+- `otter-macros` - descriptor-driven proc-macros for classes, namespaces, native bindings, host-owned objects, and hosted modules
 - `otter-nodejs` / `otter-modules` - parked or active support crates around the runtime
 - `otter-pm` - NPM package manager integration
 

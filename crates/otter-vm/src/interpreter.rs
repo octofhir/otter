@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use num_traits::Zero;
 
+use crate::builders::{BurrowBuilder, ObjectMemberPlan};
 use crate::bytecode::{BytecodeRegister, Instruction, Opcode, ProgramCounter};
 use crate::call::{ClosureCall, DirectCall};
 use crate::closure::{CaptureDescriptor, ClosureTemplate, UpvalueId};
-use crate::descriptors::{NativeSlotKind, VmNativeCallError};
+use crate::descriptors::{NativeFunctionDescriptor, NativeSlotKind, VmNativeCallError};
 use crate::feedback::{FeedbackKind, FeedbackSlotId};
 use crate::float::FloatId;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
@@ -482,6 +483,14 @@ enum StepOutcome {
     Continue,
     Return(RegisterValue),
     Throw(RegisterValue),
+    /// §14.6 Tail call — replace the current activation with the callee's.
+    /// The execution loop swaps module/activation/function in-place instead
+    /// of recursing into `run_completion_with_runtime`.
+    /// Spec: <https://tc39.es/ecma262/#sec-tail-position-calls>
+    TailCall {
+        module: Module,
+        activation: Activation,
+    },
     /// The interpreter should suspend at an `await` on a pending promise.
     /// The caller captures the frame state and enqueues a resume job.
     Suspend {
@@ -899,17 +908,13 @@ impl RuntimeState {
                 if idx >= utf16.len() {
                     crate::object::IteratorStep::done()
                 } else {
-                    let (_, advance) = js_str
-                        .code_point_at(idx)
-                        .unwrap_or((utf16[idx] as u32, 1));
+                    let (_, advance) = js_str.code_point_at(idx).unwrap_or((utf16[idx] as u32, 1));
                     let ch_units = utf16[idx..idx + advance].to_vec();
                     let ch_str = crate::js_string::JsString::from_utf16(ch_units);
                     let str_handle = self.objects.alloc_js_string(ch_str);
                     // Set prototype for the new string.
                     let proto = self.intrinsics.string_prototype();
-                    self.objects
-                        .set_prototype(str_handle, Some(proto))
-                        .ok();
+                    self.objects.set_prototype(str_handle, Some(proto)).ok();
                     let step = crate::object::IteratorStep::yield_value(
                         RegisterValue::from_object_handle(str_handle.0),
                     );
@@ -2140,6 +2145,99 @@ impl RuntimeState {
         handle
     }
 
+    /// Allocates one host function from descriptor metadata and installs `.name` / `.length`.
+    pub fn alloc_host_function_from_descriptor(
+        &mut self,
+        descriptor: NativeFunctionDescriptor,
+    ) -> Result<ObjectHandle, VmNativeCallError> {
+        let js_name = descriptor.js_name().to_string();
+        let length = descriptor.length();
+        let host_function = self.register_native_function(descriptor);
+        let handle = self.alloc_host_function(host_function);
+        self.install_host_function_length_name(handle, length, &js_name)?;
+        Ok(handle)
+    }
+
+    /// Installs descriptor-driven members onto one existing host-owned object.
+    pub fn install_burrow(
+        &mut self,
+        target: ObjectHandle,
+        descriptors: &[NativeFunctionDescriptor],
+    ) -> Result<(), VmNativeCallError> {
+        let plan = BurrowBuilder::from_descriptors(descriptors)
+            .map(BurrowBuilder::build)
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("failed to normalize host object surface: {error}").into(),
+                )
+            })?;
+
+        for member in plan.members() {
+            match member {
+                ObjectMemberPlan::Method(function) => {
+                    let host_function = self.register_native_function(function.clone());
+                    let handle = self.alloc_host_function(host_function);
+                    self.install_host_function_length_name(
+                        handle,
+                        function.length(),
+                        function.js_name(),
+                    )?;
+                    let property = self.intern_property_name(function.js_name());
+                    self.objects
+                        .define_own_property(
+                            target,
+                            property,
+                            PropertyValue::data_with_attrs(
+                                RegisterValue::from_object_handle(handle.0),
+                                PropertyAttributes::builtin_method(),
+                            ),
+                        )
+                        .map_err(|error| {
+                            VmNativeCallError::Internal(
+                                format!(
+                                    "failed to install host object method '{}': {error:?}",
+                                    function.js_name()
+                                )
+                                .into(),
+                            )
+                        })?;
+                }
+                ObjectMemberPlan::Accessor(accessor) => {
+                    let getter = accessor
+                        .getter()
+                        .cloned()
+                        .map(|descriptor| {
+                            let function = self.register_native_function(descriptor);
+                            Ok(self.alloc_host_function(function))
+                        })
+                        .transpose()?;
+                    let setter = accessor
+                        .setter()
+                        .cloned()
+                        .map(|descriptor| {
+                            let function = self.register_native_function(descriptor);
+                            Ok(self.alloc_host_function(function))
+                        })
+                        .transpose()?;
+                    let property = self.intern_property_name(accessor.js_name());
+                    self.objects
+                        .define_accessor(target, property, getter, setter)
+                        .map_err(|error| {
+                            VmNativeCallError::Internal(
+                                format!(
+                                    "failed to install host object accessor '{}': {error:?}",
+                                    accessor.js_name()
+                                )
+                                .into(),
+                            )
+                        })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Registers a native function and installs it as a property on the global object.
     ///
     /// This is the primary API for embedders to inject host-provided globals
@@ -2170,6 +2268,48 @@ impl RuntimeState {
         self.objects
             .set_property(global, prop, value)
             .expect("global property installation should succeed");
+    }
+
+    fn install_host_function_length_name(
+        &mut self,
+        handle: ObjectHandle,
+        length: u16,
+        name: &str,
+    ) -> Result<(), VmNativeCallError> {
+        let length_prop = self.intern_property_name("length");
+        self.objects
+            .define_own_property(
+                handle,
+                length_prop,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_i32(i32::from(length)),
+                    PropertyAttributes::function_length(),
+                ),
+            )
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("failed to install function length for '{name}': {error:?}").into(),
+                )
+            })?;
+
+        let name_prop = self.intern_property_name("name");
+        let name_handle = self.alloc_string(name);
+        self.objects
+            .define_own_property(
+                handle,
+                name_prop,
+                PropertyValue::data_with_attrs(
+                    RegisterValue::from_object_handle(name_handle.0),
+                    PropertyAttributes::function_length(),
+                ),
+            )
+            .map_err(|error| {
+                VmNativeCallError::Internal(
+                    format!("failed to install function name for '{name}': {error:?}").into(),
+                )
+            })?;
+
+        Ok(())
     }
 
     /// Allocates one bytecode closure with the runtime default function prototype.
@@ -5136,6 +5276,10 @@ impl Interpreter {
                         "await is not supported in this execution mode".into(),
                     ));
                 }
+                StepOutcome::TailCall { .. } => {
+                    // TCO not supported in feedback-collection mode.
+                    return Ok(frame_runtime.property_feedback);
+                }
                 StepOutcome::GeneratorYield { .. } => {
                     // Yield not supported in feedback-collection mode.
                     return Ok(frame_runtime.property_feedback);
@@ -5163,16 +5307,24 @@ impl Interpreter {
         runtime: &mut RuntimeState,
     ) -> Result<Completion, InterpreterError> {
         let previous_module = runtime.enter_module(module);
-        let function = module
-            .function(activation.function_index())
-            .expect("activation function index must be valid");
 
-        let mut frame_runtime = FrameRuntimeState::new(function);
+        // These are mutable because TailCallClosure can replace them in-place.
+        let mut current_module = module.clone();
+        let mut function = current_module
+            .function(activation.function_index())
+            .expect("activation function index must be valid")
+            .clone();
+        let mut frame_runtime = FrameRuntimeState::new(&function);
 
         loop {
             activation.begin_step();
-            let outcome = match self.step(function, module, activation, runtime, &mut frame_runtime)
-            {
+            let outcome = match self.step(
+                &function,
+                &current_module,
+                activation,
+                runtime,
+                &mut frame_runtime,
+            ) {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
                 Err(InterpreterError::TypeError(message)) => {
@@ -5195,11 +5347,26 @@ impl Interpreter {
                     return Ok(Completion::Return(return_value));
                 }
                 StepOutcome::Throw(value) => {
-                    if self.transfer_exception(function, activation, value) {
+                    if self.transfer_exception(&function, activation, value) {
                         continue;
                     }
                     runtime.restore_module(previous_module);
                     return Ok(Completion::Throw(value));
+                }
+                // §14.6 Tail call: replace the current frame in-place and
+                // continue the same loop — no new Rust stack frame.
+                StepOutcome::TailCall {
+                    module: callee_module,
+                    activation: callee_activation,
+                } => {
+                    current_module = callee_module;
+                    *activation = callee_activation;
+                    function = current_module
+                        .function(activation.function_index())
+                        .expect("tail-call function index must be valid")
+                        .clone();
+                    frame_runtime = FrameRuntimeState::new(&function);
+                    runtime.enter_module(&current_module);
                 }
                 StepOutcome::Suspend {
                     awaited_promise,
@@ -5208,7 +5375,7 @@ impl Interpreter {
                     // ES2024 §27.7.5.3 Await — suspend until the promise settles.
                     // Drain microtasks inline; if the promise settles, resume.
                     // This handles synchronously-resolvable chains (most common case).
-                    Self::drain_microtasks_for_await(runtime, module);
+                    Self::drain_microtasks_for_await(runtime, &current_module);
 
                     // Check if the awaited promise settled during drain.
                     if let Some(promise) = runtime.objects.get_promise(awaited_promise) {
@@ -5228,7 +5395,7 @@ impl Interpreter {
                                 if current_pc > 0 {
                                     activation.set_pc(current_pc - 1);
                                 }
-                                if self.transfer_exception(function, activation, reason) {
+                                if self.transfer_exception(&function, activation, reason) {
                                     continue;
                                 }
                                 runtime.restore_module(previous_module);
@@ -7812,6 +7979,99 @@ impl Interpreter {
                     }
                 }
             }
+            // §14.6 Tail Position Calls — reuse the current frame.
+            // The execution loop in `run_completion_with_runtime` handles
+            // `StepOutcome::TailCall` by swapping module/activation in-place.
+            // Spec: <https://tc39.es/ecma262/#sec-tail-position-calls>
+            Opcode::TailCallClosure => {
+                let call = Self::resolve_closure_call(function, activation.pc())?;
+                let caller_function = module
+                    .function(activation.function_index())
+                    .expect("activation function index must be valid");
+                let callee_value =
+                    activation.read_bytecode_register(caller_function, instruction.a())?;
+                let Some(callee) = callee_value.as_object_handle().map(ObjectHandle) else {
+                    let error = runtime.alloc_type_error("Value is not callable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                };
+
+                // For non-closure callables (native, proxy, bound, host, etc.)
+                // fall back to a regular call + return — TCO only applies to
+                // bytecode closures.
+                let is_plain_closure =
+                    matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
+                        && !runtime.objects.closure_flags(callee).is_ok_and(|f| {
+                            f.is_generator() || f.is_async() || f.is_class_constructor()
+                        })
+                        && runtime.objects.host_function(callee)?.is_none();
+
+                if is_plain_closure {
+                    // Prepare callee activation and return TailCall to the loop.
+                    let (callee_module, callee_activation) = Self::prepare_closure_call(
+                        module,
+                        activation,
+                        runtime,
+                        instruction.a(),
+                        instruction.b(),
+                        call,
+                    )?;
+                    Ok(StepOutcome::TailCall {
+                        module: callee_module,
+                        activation: callee_activation,
+                    })
+                } else {
+                    // Non-closure target: execute as normal call, then return
+                    // the result from this frame.
+                    let arguments = Self::read_call_arguments(
+                        caller_function,
+                        activation,
+                        instruction.b(),
+                        call.argument_count(),
+                    )?;
+                    let receiver = Self::resolve_call_receiver(
+                        caller_function,
+                        activation,
+                        call.flags(),
+                        call.receiver(),
+                        None,
+                    )?;
+
+                    if runtime.is_proxy(callee) {
+                        match runtime.proxy_apply(callee, receiver, &arguments) {
+                            Ok(value) => Ok(StepOutcome::Return(value)),
+                            Err(InterpreterError::UncaughtThrow(value)) => {
+                                Ok(StepOutcome::Throw(value))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else if let Some(host_function) = runtime.objects.host_function(callee)? {
+                        match Self::invoke_host_function(
+                            callee,
+                            caller_function,
+                            activation,
+                            runtime,
+                            host_function,
+                            instruction.b(),
+                            call,
+                        )? {
+                            Completion::Return(value) => Ok(StepOutcome::Return(value)),
+                            Completion::Throw(value) => Ok(StepOutcome::Throw(value)),
+                        }
+                    } else {
+                        // Bound function or other exotic: regular call path.
+                        let result = runtime.call_callable(callee, receiver, &arguments);
+                        match result {
+                            Ok(value) => Ok(StepOutcome::Return(value)),
+                            Err(VmNativeCallError::Thrown(value)) => Ok(StepOutcome::Throw(value)),
+                            Err(VmNativeCallError::Internal(message)) => {
+                                Err(InterpreterError::NativeCall(message))
+                            }
+                        }
+                    }
+                }
+            }
             Opcode::CallSuper => {
                 if !function.is_derived_constructor()
                     || !activation.metadata().flags().is_construct()
@@ -9211,6 +9471,11 @@ impl Interpreter {
                         .ok();
                     return Err(VmNativeCallError::Thrown(value));
                 }
+                // TailCallClosure is never emitted for generators (compiler
+                // skips TCO for generator/async function kinds).
+                StepOutcome::TailCall { .. } => {
+                    unreachable!("TailCallClosure inside generator body")
+                }
                 StepOutcome::Suspend { .. } => {
                     runtime.restore_module(previous_module);
                     runtime
@@ -9701,6 +9966,10 @@ impl Interpreter {
                         .set_register(await_resume_reg, await_val)
                         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
                     continue;
+                }
+                // TailCallClosure is never emitted for async generators.
+                StepOutcome::TailCall { .. } => {
+                    unreachable!("TailCallClosure inside async generator body")
                 }
                 StepOutcome::GeneratorYield {
                     yielded_value,

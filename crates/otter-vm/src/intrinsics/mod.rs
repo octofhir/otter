@@ -7,8 +7,8 @@
 
 mod array_class;
 mod arraybuffer_class;
-mod atomics;
 pub(crate) mod async_generator_class;
+mod atomics;
 mod bigint_class;
 mod boolean_class;
 mod dataview_class;

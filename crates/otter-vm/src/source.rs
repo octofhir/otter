@@ -544,11 +544,11 @@ impl<'a> TinyScriptLowerer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Interpreter, RuntimeState};
     use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
     use crate::interpreter::InterpreterError;
     use crate::source::{compile_script, compile_test262_basic_script, lower_script};
     use crate::value::RegisterValue;
+    use crate::{Interpreter, RuntimeState};
 
     fn install_test262_global(runtime: &mut crate::interpreter::RuntimeState) {
         fn create_realm(
@@ -5461,33 +5461,32 @@ mod tests {
             "\"use strict\"; function f(a, a) { return a; }",
             "strict-dup-params.js",
         );
-        assert!(result.is_err(), "oxc should reject duplicate params in strict mode");
+        assert!(
+            result.is_err(),
+            "oxc should reject duplicate params in strict mode"
+        );
     }
 
     #[test]
     fn sloppy_mode_duplicate_parameters_allowed() {
-        let result = compile_test262_basic_script(
-            "function f(a, a) { return a; }",
-            "sloppy-dup-params.js",
-        );
+        let result =
+            compile_test262_basic_script("function f(a, a) { return a; }", "sloppy-dup-params.js");
         assert!(result.is_ok(), "sloppy mode should allow duplicate params");
     }
 
     #[test]
     fn oxc_rejects_strict_mode_legacy_octal_literal() {
-        let result = compile_test262_basic_script(
-            "\"use strict\"; var x = 077;",
-            "strict-octal.js",
+        let result =
+            compile_test262_basic_script("\"use strict\"; var x = 077;", "strict-octal.js");
+        assert!(
+            result.is_err(),
+            "oxc should reject legacy octal in strict mode"
         );
-        assert!(result.is_err(), "oxc should reject legacy octal in strict mode");
     }
 
     #[test]
     fn sloppy_mode_legacy_octal_literal_allowed() {
-        let result = compile_test262_basic_script(
-            "var x = 077;",
-            "sloppy-octal.js",
-        );
+        let result = compile_test262_basic_script("var x = 077;", "sloppy-octal.js");
         assert!(result.is_ok(), "sloppy mode should allow legacy octal");
     }
 
@@ -5497,7 +5496,10 @@ mod tests {
             "\"use strict\"; var x = \"\\077\";",
             "strict-octal-escape.js",
         );
-        assert!(result.is_err(), "oxc should reject octal escape in strict mode");
+        assert!(
+            result.is_err(),
+            "oxc should reject octal escape in strict mode"
+        );
     }
 
     #[test]

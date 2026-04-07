@@ -58,9 +58,9 @@ impl<'a> FunctionCompiler<'a> {
                     )));
                 }
                 if literal.lone_surrogates {
-                    self.compile_js_string_literal(
-                        crate::js_string::JsString::from_oxc_encoded(literal.value.as_str()),
-                    )
+                    self.compile_js_string_literal(crate::js_string::JsString::from_oxc_encoded(
+                        literal.value.as_str(),
+                    ))
                 } else {
                     self.compile_string_literal(literal.value.as_str())
                 }
@@ -165,7 +165,7 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
-    fn compile_numeric_literal(
+    pub(super) fn compile_numeric_literal(
         &mut self,
         value: f64,
     ) -> Result<ValueLocation, SourceLoweringError> {
@@ -1372,7 +1372,7 @@ impl<'a> FunctionCompiler<'a> {
         Ok(result)
     }
 
-    fn compile_call_target(
+    pub(super) fn compile_call_target(
         &mut self,
         callee: &Expression<'_>,
         module: &mut ModuleCompiler<'a>,
@@ -2835,7 +2835,10 @@ fn is_legacy_octal_literal(raw: &str) -> bool {
     }
     // Modern prefixes: 0x, 0X, 0b, 0B, 0o, 0O, 0., 0e, 0E, 0n (bigint)
     matches!(bytes[1], b'0'..=b'7')
-        && !matches!(bytes[1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'.' | b'e' | b'E' | b'n')
+        && !matches!(
+            bytes[1],
+            b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'.' | b'e' | b'E' | b'n'
+        )
 }
 
 /// §B.1.2 — Detects legacy octal escape sequences in raw string literals.

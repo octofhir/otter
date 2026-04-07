@@ -1940,6 +1940,7 @@ dependencies = [
 name = "otter-macros"
 version = "0.1.0"
 dependencies = [
+ "otter-runtime",
  "otter-vm",
  "proc-macro2",
  "quote",
@@ -1952,6 +1953,7 @@ version = "0.1.0"
 dependencies = [
  "libffi",
  "libloading",
+ "otter-macros",
  "otter-runtime",
  "otter-vm",
  "redb",
@@ -1994,6 +1996,7 @@ dependencies = [
  "dunce",
  "md5",
  "otter-jit",
+ "otter-macros",
  "otter-vm",
  "oxc_allocator",
  "oxc_ast",
@@ -2065,6 +2068,7 @@ dependencies = [
 name = "otter-web"
 version = "0.1.0"
 dependencies = [
+ "otter-macros",
  "otter-runtime",
  "otter-vm",
  "reqwest",

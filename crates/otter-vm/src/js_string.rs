@@ -73,8 +73,7 @@ impl JsString {
             if chars[i] == '\u{FFFD}' {
                 // Check for the oxc encoding: \u{FFFD} followed by 4 hex digits
                 if i + 4 < chars.len() {
-                    let hex_str: String =
-                        chars[i + 1..i + 5].iter().collect();
+                    let hex_str: String = chars[i + 1..i + 5].iter().collect();
                     if let Ok(code_unit) = u16::from_str_radix(&hex_str, 16) {
                         units.push(code_unit);
                         i += 5;

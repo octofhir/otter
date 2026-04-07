@@ -159,6 +159,54 @@ impl core::fmt::Display for ObjectBuilderError {
 
 impl std::error::Error for ObjectBuilderError {}
 
+/// Error produced while normalizing descriptors for one host-owned object surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BurrowBuilderError {
+    /// Constructor metadata is not valid on host-owned object members.
+    ConstructorDescriptorNotAllowed { js_name: Box<str> },
+    /// Two members attempted to claim the same property.
+    DuplicateMember { js_name: Box<str> },
+    /// A getter or setter conflicted with an already-declared method.
+    ConflictingMemberKinds { js_name: Box<str> },
+    /// An accessor declared more than one getter on the same property.
+    DuplicateGetter { js_name: Box<str> },
+    /// An accessor declared more than one setter on the same property.
+    DuplicateSetter { js_name: Box<str> },
+}
+
+impl core::fmt::Display for BurrowBuilderError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ConstructorDescriptorNotAllowed { js_name } => {
+                write!(
+                    f,
+                    "host-owned object surface cannot use constructor metadata for '{js_name}'"
+                )
+            }
+            Self::DuplicateMember { js_name } => {
+                write!(
+                    f,
+                    "host-owned object surface already defines member '{js_name}'"
+                )
+            }
+            Self::ConflictingMemberKinds { js_name } => write!(
+                f,
+                "host-owned object surface mixes method and accessor metadata for '{js_name}'"
+            ),
+            Self::DuplicateGetter { js_name } => write!(
+                f,
+                "host-owned object surface already defines a getter for '{js_name}'"
+            ),
+            Self::DuplicateSetter { js_name } => write!(
+                f,
+                "host-owned object surface already defines a setter for '{js_name}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BurrowBuilderError {}
+
 /// Normalized accessor entry for future class installation.
 #[derive(Clone)]
 pub struct ClassAccessorPlan {
@@ -262,6 +310,19 @@ impl ObjectInstallPlan {
     }
 }
 
+/// Validated installation plan for one host-owned object surface.
+#[derive(Clone)]
+pub struct BurrowPlan {
+    members: Vec<ObjectMemberPlan>,
+}
+
+impl BurrowPlan {
+    #[must_use]
+    pub fn members(&self) -> &[ObjectMemberPlan] {
+        &self.members
+    }
+}
+
 /// Validated class-installation plan derived from [`JsClassDescriptor`].
 #[derive(Clone)]
 pub struct ClassInstallPlan {
@@ -269,6 +330,64 @@ pub struct ClassInstallPlan {
     constructor: Option<NativeFunctionDescriptor>,
     prototype_members: Vec<ClassMemberPlan>,
     static_members: Vec<ClassMemberPlan>,
+}
+
+/// Builder that normalizes descriptor metadata for one host-owned object surface.
+#[derive(Clone, Default)]
+pub struct BurrowBuilder {
+    members: Vec<ObjectMemberPlan>,
+}
+
+impl BurrowBuilder {
+    /// Creates an empty builder for one host-owned object surface.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            members: Vec::new(),
+        }
+    }
+
+    /// Creates a builder from a list of function descriptors.
+    pub fn from_descriptors(
+        descriptors: &[NativeFunctionDescriptor],
+    ) -> Result<Self, BurrowBuilderError> {
+        let mut builder = Self::new();
+        for descriptor in descriptors {
+            builder.absorb_descriptor(descriptor)?;
+        }
+        Ok(builder)
+    }
+
+    /// Absorbs one function descriptor into the builder.
+    pub fn absorb_descriptor(
+        &mut self,
+        descriptor: &NativeFunctionDescriptor,
+    ) -> Result<(), BurrowBuilderError> {
+        match descriptor.slot_kind() {
+            NativeSlotKind::Method => {
+                push_burrow_method_member(&mut self.members, descriptor.clone())
+            }
+            NativeSlotKind::Getter => {
+                push_burrow_accessor_member(&mut self.members, descriptor.clone(), true)
+            }
+            NativeSlotKind::Setter => {
+                push_burrow_accessor_member(&mut self.members, descriptor.clone(), false)
+            }
+            NativeSlotKind::Constructor => {
+                Err(BurrowBuilderError::ConstructorDescriptorNotAllowed {
+                    js_name: descriptor.js_name().into(),
+                })
+            }
+        }
+    }
+
+    /// Finalizes the normalized host-object install plan.
+    #[must_use]
+    pub fn build(self) -> BurrowPlan {
+        BurrowPlan {
+            members: self.members,
+        }
+    }
 }
 
 impl ClassInstallPlan {
@@ -617,6 +736,65 @@ fn push_object_accessor_member(
     Ok(())
 }
 
+fn push_burrow_method_member(
+    members: &mut Vec<ObjectMemberPlan>,
+    function: NativeFunctionDescriptor,
+) -> Result<(), BurrowBuilderError> {
+    if members
+        .iter()
+        .any(|member| member.js_name() == function.js_name())
+    {
+        return Err(BurrowBuilderError::DuplicateMember {
+            js_name: function.js_name().into(),
+        });
+    }
+
+    members.push(ObjectMemberPlan::Method(function));
+    Ok(())
+}
+
+fn push_burrow_accessor_member(
+    members: &mut Vec<ObjectMemberPlan>,
+    function: NativeFunctionDescriptor,
+    is_getter: bool,
+) -> Result<(), BurrowBuilderError> {
+    if let Some(member) = members
+        .iter_mut()
+        .find(|member| member.js_name() == function.js_name())
+    {
+        let ObjectMemberPlan::Accessor(plan) = member else {
+            return Err(BurrowBuilderError::ConflictingMemberKinds {
+                js_name: function.js_name().into(),
+            });
+        };
+
+        if is_getter {
+            if plan.getter.is_some() {
+                return Err(BurrowBuilderError::DuplicateGetter {
+                    js_name: function.js_name().into(),
+                });
+            }
+            plan.getter = Some(function);
+        } else {
+            if plan.setter.is_some() {
+                return Err(BurrowBuilderError::DuplicateSetter {
+                    js_name: function.js_name().into(),
+                });
+            }
+            plan.setter = Some(function);
+        }
+
+        return Ok(());
+    }
+
+    members.push(ObjectMemberPlan::Accessor(ObjectAccessorPlan {
+        js_name: function.js_name().into(),
+        getter: is_getter.then_some(function.clone()),
+        setter: (!is_getter).then_some(function),
+    }));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::descriptors::{
@@ -626,8 +804,9 @@ mod tests {
     use crate::value::RegisterValue;
 
     use super::{
-        ClassBuilder, ClassBuilderError, ClassMemberPlan, ConstructorBuilder, GlobalBuilder,
-        NamespaceBuilder, ObjectBuilderError, ObjectMemberPlan, PrototypeBuilder,
+        BurrowBuilder, BurrowBuilderError, ClassBuilder, ClassBuilderError, ClassMemberPlan,
+        ConstructorBuilder, GlobalBuilder, NamespaceBuilder, ObjectBuilderError, ObjectMemberPlan,
+        PrototypeBuilder,
     };
 
     fn passthrough_callback() -> VmNativeFunction {
@@ -897,5 +1076,54 @@ mod tests {
         let value = (method.callback())(&RegisterValue::from_i32(9), &[], &mut Default::default())
             .expect("callback should succeed");
         assert_eq!(value, RegisterValue::from_i32(9));
+    }
+
+    #[test]
+    fn burrow_builder_maps_descriptors_into_host_object_plan() {
+        let descriptors = vec![
+            NativeFunctionDescriptor::method("set", 2, passthrough_callback()),
+            NativeFunctionDescriptor::getter("size", passthrough_callback()),
+            NativeFunctionDescriptor::setter("size", passthrough_callback()),
+        ];
+
+        let plan = BurrowBuilder::from_descriptors(&descriptors)
+            .expect("descriptors should normalize")
+            .build();
+
+        assert_eq!(plan.members().len(), 2);
+
+        match &plan.members()[0] {
+            ObjectMemberPlan::Method(method) => assert_eq!(method.js_name(), "set"),
+            ObjectMemberPlan::Accessor(_) => panic!("expected method"),
+        }
+
+        match &plan.members()[1] {
+            ObjectMemberPlan::Accessor(accessor) => {
+                assert_eq!(accessor.js_name(), "size");
+                assert!(accessor.getter().is_some());
+                assert!(accessor.setter().is_some());
+            }
+            ObjectMemberPlan::Method(_) => panic!("expected accessor"),
+        }
+    }
+
+    #[test]
+    fn burrow_builder_rejects_constructor_metadata() {
+        let descriptors = vec![NativeFunctionDescriptor::constructor(
+            "Thing",
+            0,
+            passthrough_callback(),
+        )];
+
+        let error = match BurrowBuilder::from_descriptors(&descriptors) {
+            Ok(_) => panic!("constructor slot should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            BurrowBuilderError::ConstructorDescriptorNotAllowed {
+                js_name: "Thing".into(),
+            }
+        );
     }
 }

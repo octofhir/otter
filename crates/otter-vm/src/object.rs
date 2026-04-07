@@ -7585,9 +7585,7 @@ impl ObjectHeap {
                 if property_name == "length" {
                     return Ok(Some((
                         PropertyValue::data_with_attrs(
-                            RegisterValue::from_i32(
-                                i32::try_from(value.len()).unwrap_or(i32::MAX),
-                            ),
+                            RegisterValue::from_i32(i32::try_from(value.len()).unwrap_or(i32::MAX)),
                             PropertyAttributes::from_flags(false, false, false),
                         ),
                         PropertyInlineCache::new(ObjectShapeId(0), 0),

@@ -6,8 +6,6 @@ pub use ffi::{FFIType, FfiError, FfiResult, FfiSignature};
 pub use kv::{KvError, KvResult, KvStore};
 pub use sql::{SqlDatabase, SqlError, SqlResult};
 
-use std::sync::Arc;
-
 use otter_runtime::{HostedExtension, HostedExtensionModule, RuntimeProfile, RuntimeState};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,20 +25,10 @@ impl HostedExtension for OtterModulesExtension {
     }
 
     fn native_modules(&self) -> Vec<HostedExtensionModule> {
-        vec![
-            HostedExtensionModule {
-                specifier: "otter:kv".to_string(),
-                loader: Arc::new(kv::KvModule),
-            },
-            HostedExtensionModule {
-                specifier: "otter:ffi".to_string(),
-                loader: Arc::new(ffi::FfiModule),
-            },
-            HostedExtensionModule {
-                specifier: "otter:sql".to_string(),
-                loader: Arc::new(sql::SqlModule),
-            },
-        ]
+        let mut modules = kv::kv_module_entries();
+        modules.extend(ffi::ffi_module_entries());
+        modules.extend(sql::sql_module_entries());
+        modules
     }
 }
 

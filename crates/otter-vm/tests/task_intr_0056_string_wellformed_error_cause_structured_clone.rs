@@ -154,7 +154,9 @@ fn to_well_formed_replaces_lone_low_surrogate() {
 #[test]
 fn to_well_formed_preserves_valid_surrogate_pair() {
     // \uD800\uDC00 is a valid pair → should not be replaced
-    assert!(run_bool("'\\uD800\\uDC00'.toWellFormed() === '\\uD800\\uDC00'"));
+    assert!(run_bool(
+        "'\\uD800\\uDC00'.toWellFormed() === '\\uD800\\uDC00'"
+    ));
 }
 
 #[test]

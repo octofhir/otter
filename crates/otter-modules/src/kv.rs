@@ -193,6 +193,10 @@ impl KvStore {
         self.keys().map(|keys| keys.len())
     }
 
+    pub fn is_empty(&self) -> KvResult<bool> {
+        self.len().map(|n| n == 0)
+    }
+
     pub fn clear(&self) -> KvResult<()> {
         let keys = self.keys()?;
         let write_txn = self

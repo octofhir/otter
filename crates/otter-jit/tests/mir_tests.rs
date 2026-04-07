@@ -10,10 +10,8 @@ fn compile_and_build_mir(source: &str) -> otter_jit::mir::graph::MirGraph {
     // Pick the first named user function (skip the module body).
     let func = module
         .functions()
-        .iter()
-        .skip(1)
-        .next()
-        .unwrap_or_else(|| &module.functions()[0]);
+        .get(1)
+        .unwrap_or(&module.functions()[0]);
     build_mir(func, None).expect("MIR should build")
 }
 

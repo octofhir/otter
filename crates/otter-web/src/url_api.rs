@@ -625,15 +625,16 @@ fn parse_url_arg(
     input: &str,
     base: Option<&RegisterValue>,
 ) -> Result<Url, VmNativeCallError> {
-    if let Some(base) = base {
-        if *base != RegisterValue::undefined() && *base != RegisterValue::null() {
-            let base_string = base_string(runtime, *base)?;
-            let base_url = Url::parse(&base_string)
-                .map_err(|_| type_error(runtime, "URL: invalid base URL"))?;
-            return base_url
-                .join(input)
-                .map_err(|_| type_error(runtime, "URL: invalid URL"));
-        }
+    if let Some(base) = base
+        && *base != RegisterValue::undefined()
+        && *base != RegisterValue::null()
+    {
+        let base_string = base_string(runtime, *base)?;
+        let base_url = Url::parse(&base_string)
+            .map_err(|_| type_error(runtime, "URL: invalid base URL"))?;
+        return base_url
+            .join(input)
+            .map_err(|_| type_error(runtime, "URL: invalid URL"));
     }
     Url::parse(input).map_err(|_| type_error(runtime, "URL: invalid URL"))
 }

@@ -1135,15 +1135,13 @@ unsafe extern "C" fn ffi_js_callback_trampoline(
             }
         };
     let mut cstrings = Vec::new();
-    *result = match marshal_value_to_raw(
+    *result = marshal_value_to_raw(
         callback_result,
         userdata.return_type,
         runtime,
         &mut cstrings,
-    ) {
-        Ok(raw) => raw,
-        Err(_) => 0,
-    };
+    )
+    .unwrap_or_default();
 }
 
 fn build_direct_callable(

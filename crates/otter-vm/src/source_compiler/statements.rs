@@ -711,7 +711,11 @@ impl<'a> FunctionCompiler<'a> {
         handler: &oxc_ast::ast::CatchClause<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<bool, SourceLoweringError> {
-        let saved_env = self.env.clone();
+        // Save the bindings map so the catch parameter and any inner
+        // declarations are scoped to the catch body. We restore *only*
+        // bindings; captures and capture_ids accumulate across the whole
+        // function and must persist past the catch body.
+        let saved_bindings = self.scope.borrow().bindings.clone();
 
         // §14.15.2 CatchClauseEvaluation — bind the caught exception to
         // the catch parameter (simple identifier or destructuring pattern).
@@ -720,7 +724,8 @@ impl<'a> FunctionCompiler<'a> {
             match &param.pattern {
                 BindingPattern::BindingIdentifier(identifier) => {
                     let register = self.allocate_local()?;
-                    self.env
+                    self.scope
+                        .borrow_mut()
                         .bindings
                         .insert(identifier.name.to_string(), Binding::Register(register));
                     self.instructions
@@ -742,7 +747,7 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         let terminated = self.compile_statements(&handler.body.body, module)?;
-        self.env = saved_env;
+        self.scope.borrow_mut().bindings = saved_bindings;
         Ok(terminated)
     }
 

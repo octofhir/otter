@@ -1172,19 +1172,16 @@ fn parse_body_init(
         });
     }
 
-    if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
-        match runtime.objects().kind(handle) {
-            Ok(
-                HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView,
-            ) => {
-                return Ok(ParsedBodyInit {
-                    bytes: bytes_from_buffer_source(runtime, value)?,
-                    content_type: None,
-                    present: true,
-                });
-            }
-            _ => {}
-        }
+    if let Some(handle) = value.as_object_handle().map(ObjectHandle)
+        && let Ok(
+            HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView,
+        ) = runtime.objects().kind(handle)
+    {
+        return Ok(ParsedBodyInit {
+            bytes: bytes_from_buffer_source(runtime, value)?,
+            content_type: None,
+            present: true,
+        });
     }
 
     let string = runtime.js_to_string_infallible(value).into_string();
@@ -1624,10 +1621,10 @@ fn cancel_reader_state(
 }
 
 fn trace_body_state(body: &Arc<Mutex<BodyState>>, tracer: &mut dyn VmValueTracer) {
-    if let Ok(state) = body.lock() {
-        if let Some(stream) = state.stream {
-            stream.trace(tracer);
-        }
+    if let Ok(state) = body.lock()
+        && let Some(stream) = state.stream
+    {
+        stream.trace(tracer);
     }
 }
 

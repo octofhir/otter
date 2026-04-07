@@ -193,6 +193,80 @@ fn collect_var_names_from_statement(statement: &AstStatement<'_>, names: &mut Ve
     }
 }
 
+/// §8.1.1.2 TopLevelLexicallyDeclaredNames — names introduced by `let`,
+/// `const`, or `class` declarations at the top level of a function body or
+/// script body. Does NOT recurse into nested blocks/loops/try/etc., because
+/// `let`/`const`/`class` are block-scoped — only the immediate body counts.
+///
+/// Used during `predeclare_function_scope` so that hoisted nested function
+/// declarations can correctly capture top-level lexical bindings via the
+/// closure scope chain (rather than falling back to a runtime global lookup
+/// that misses script-level `let` bindings).
+pub(super) fn collect_top_level_lexical_names(statements: &[AstStatement<'_>]) -> Vec<String> {
+    fn push_unique(names: &mut Vec<String>, name: &str) {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for statement in statements {
+        match statement {
+            AstStatement::VariableDeclaration(declaration)
+                if matches!(
+                    declaration.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                ) =>
+            {
+                let mut bound = Vec::new();
+                for declarator in &declaration.declarations {
+                    collect_binding_identifier_names(&declarator.id, &mut bound);
+                }
+                for name in bound {
+                    push_unique(&mut names, &name);
+                }
+            }
+            AstStatement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    push_unique(&mut names, id.name.as_str());
+                }
+            }
+            AstStatement::ExportNamedDeclaration(export) => match &export.declaration {
+                Some(oxc_ast::ast::Declaration::VariableDeclaration(declaration))
+                    if matches!(
+                        declaration.kind,
+                        VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                    ) =>
+                {
+                    let mut bound = Vec::new();
+                    for declarator in &declaration.declarations {
+                        collect_binding_identifier_names(&declarator.id, &mut bound);
+                    }
+                    for name in bound {
+                        push_unique(&mut names, &name);
+                    }
+                }
+                Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) => {
+                    if let Some(id) = &class.id {
+                        push_unique(&mut names, id.name.as_str());
+                    }
+                }
+                _ => {}
+            },
+            AstStatement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
+                    &export.declaration
+                    && let Some(id) = &class.id
+                {
+                    push_unique(&mut names, id.name.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 pub(super) fn collect_function_declarations<'a>(
     statements: &'a [AstStatement<'a>],
     functions: &mut Vec<&'a Function<'a>>,

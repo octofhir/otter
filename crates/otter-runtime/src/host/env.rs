@@ -344,12 +344,11 @@ fn parse_env_value(
         return Ok(String::new());
     }
 
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
+    if ((value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\'')))
+        && value.len() >= 2
     {
-        if value.len() >= 2 {
-            return Ok(value[1..value.len() - 1].to_string());
-        }
+        return Ok(value[1..value.len() - 1].to_string());
     }
 
     if value.starts_with('"') && !value.ends_with('"') {

@@ -242,7 +242,7 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
     ) -> Result<ValueLocation, SourceLoweringError> {
         // Global value identifiers — always available, not bindings.
-        if !self.env.bindings.contains_key(name) {
+        if !self.scope.borrow().bindings.contains_key(name) {
             match name {
                 "undefined" => return self.load_undefined(),
                 "NaN" => return self.load_nan(),
@@ -610,7 +610,7 @@ impl<'a> FunctionCompiler<'a> {
                 // ES2024 §13.5.1: typeof on an unresolvable global reference
                 // must return "undefined", not throw ReferenceError.
                 if let oxc_ast::ast::Expression::Identifier(ident) = &unary.argument
-                    && !self.env.bindings.contains_key(ident.name.as_str())
+                    && !self.scope.borrow().bindings.contains_key(ident.name.as_str())
                 {
                     // Global variable — use TypeOfGlobal which doesn't throw.
                     let result = ValueLocation::temp(self.alloc_temp());
@@ -1243,7 +1243,8 @@ impl<'a> FunctionCompiler<'a> {
             arg_start,
             argument_count,
         ));
-        if let Some(Binding::ThisRegister(this_register)) = self.env.bindings.get("this").copied()
+        if let Some(Binding::ThisRegister(this_register)) =
+            self.scope.borrow().bindings.get("this").copied()
             && this_register != result.register
         {
             self.instructions
@@ -1325,7 +1326,8 @@ impl<'a> FunctionCompiler<'a> {
         ));
         self.release(args_array);
 
-        if let Some(Binding::ThisRegister(this_register)) = self.env.bindings.get("this").copied()
+        if let Some(Binding::ThisRegister(this_register)) =
+            self.scope.borrow().bindings.get("this").copied()
             && this_register != result.register
         {
             self.instructions
@@ -1671,7 +1673,7 @@ impl<'a> FunctionCompiler<'a> {
             } else {
                 FunctionKind::Ordinary
             },
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             self.strict_mode
                 || super::ast::has_use_strict_directive(
                     function
@@ -2140,7 +2142,7 @@ impl<'a> FunctionCompiler<'a> {
                 expression,
                 &params,
                 arrow_kind,
-                Some(self.env.clone()),
+                self.parent_scopes_for_child(),
                 self.strict_mode,
             )?
         } else {
@@ -2158,7 +2160,7 @@ impl<'a> FunctionCompiler<'a> {
                 &arrow.body.statements,
                 &params,
                 arrow_kind,
-                Some(self.env.clone()),
+                self.parent_scopes_for_child(),
                 self.strict_mode
                     || super::ast::has_use_strict_directive(arrow.body.directives.as_slice()),
             )?

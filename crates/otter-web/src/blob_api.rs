@@ -583,16 +583,13 @@ fn append_blob_part(
         return Ok(());
     }
 
-    if let Some(handle) = part.as_object_handle().map(ObjectHandle) {
-        match runtime.objects().kind(handle) {
-            Ok(
-                HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView,
-            ) => {
-                target.extend_from_slice(&bytes_from_buffer_source(runtime, part)?);
-                return Ok(());
-            }
-            _ => {}
-        }
+    if let Some(handle) = part.as_object_handle().map(ObjectHandle)
+        && let Ok(
+            HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView,
+        ) = runtime.objects().kind(handle)
+    {
+        target.extend_from_slice(&bytes_from_buffer_source(runtime, part)?);
+        return Ok(());
     }
 
     target.extend_from_slice(

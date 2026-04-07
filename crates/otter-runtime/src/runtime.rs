@@ -253,8 +253,8 @@ impl OtterRuntime {
             .ensure_module_runtime(&mut self.state, &self.host);
         preload_module_graph(&mut self.state, session, self.host.loader().clone(), &graph)
             .map_err(RunError::Runtime)?;
-        return execute_preloaded_entry(&mut self.state, session, &module.url)
-            .map_err(RunError::Runtime);
+        execute_preloaded_entry(&mut self.state, session, &module.url)
+            .map_err(RunError::Runtime)
     }
 
     // -----------------------------------------------------------------------
@@ -301,39 +301,38 @@ impl OtterRuntime {
                 // (not a capability function), settle it based on the handler's result.
                 // §27.2.2.1 step 1.e-h: If handler returned normally, resolve;
                 // if handler threw, reject.
-                if let Some(result_promise) = job.result_promise {
-                    if !callback_is_self_settling {
-                        match call_result {
-                            Ok(handler_result) => {
-                                // Resolve result_promise with the handler's return value.
-                                let resolve =
-                                    self.state.objects_mut().alloc_promise_capability_function(
-                                        result_promise,
-                                        otter_vm::promise::ReactionKind::Fulfill,
-                                    );
-                                let _ = Interpreter::call_function(
-                                    &mut self.state,
-                                    module,
-                                    resolve,
-                                    otter_vm::value::RegisterValue::undefined(),
-                                    &[handler_result],
+                if let Some(result_promise) = job.result_promise
+                    && !callback_is_self_settling
+                {
+                    match call_result {
+                        Ok(handler_result) => {
+                            // Resolve result_promise with the handler's return value.
+                            let resolve =
+                                self.state.objects_mut().alloc_promise_capability_function(
+                                    result_promise,
+                                    otter_vm::promise::ReactionKind::Fulfill,
                                 );
-                            }
-                            Err(err) => {
-                                // Handler threw — reject result_promise with the error.
-                                // §27.2.2.1 step 1.g
-                                let reason = match err {
-                                    otter_vm::interpreter::InterpreterError::UncaughtThrow(v) => v,
-                                    _ => otter_vm::value::RegisterValue::undefined(),
-                                };
-                                if let Some(promise) =
-                                    self.state.objects_mut().get_promise_mut(result_promise)
-                                {
-                                    if let Some(jobs) = promise.reject(reason) {
-                                        for j in jobs {
-                                            self.state.microtasks_mut().enqueue_promise_job(j);
-                                        }
-                                    }
+                            let _ = Interpreter::call_function(
+                                &mut self.state,
+                                module,
+                                resolve,
+                                otter_vm::value::RegisterValue::undefined(),
+                                &[handler_result],
+                            );
+                        }
+                        Err(err) => {
+                            // Handler threw — reject result_promise with the error.
+                            // §27.2.2.1 step 1.g
+                            let reason = match err {
+                                otter_vm::interpreter::InterpreterError::UncaughtThrow(v) => v,
+                                _ => otter_vm::value::RegisterValue::undefined(),
+                            };
+                            if let Some(promise) =
+                                self.state.objects_mut().get_promise_mut(result_promise)
+                                && let Some(jobs) = promise.reject(reason)
+                            {
+                                for j in jobs {
+                                    self.state.microtasks_mut().enqueue_promise_job(j);
                                 }
                             }
                         }

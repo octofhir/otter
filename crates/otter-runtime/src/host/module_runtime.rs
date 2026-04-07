@@ -223,11 +223,10 @@ fn module_import(
         .map(|value| runtime.js_to_string_infallible(*value).into_string())
         .unwrap_or_default();
     ensure_loaded_module(runtime, helper, &specifier)?;
-    let module_url = if referrer.is_empty() {
-        specifier
-    } else {
-        specifier
-    };
+    // TODO: resolve `specifier` against `referrer` once relative-import
+    // resolution lands. For now both paths fall through to the bare specifier.
+    let _ = referrer;
+    let module_url = specifier;
     evaluate_loaded_module(runtime, helper, &module_url)?;
     let namespace = namespace_value(runtime, helper, &module_url)?;
     Ok(RegisterValue::from_object_handle(namespace.0))

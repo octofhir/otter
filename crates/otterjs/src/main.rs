@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing_subscriber::filter::EnvFilter;
 
@@ -302,7 +302,7 @@ fn command_temporarily_disabled(command: &str) -> Result<()> {
     ))
 }
 
-async fn run_file(path: &PathBuf, _script_args: &[String], cli: &Cli) -> Result<()> {
+async fn run_file(path: &Path, _script_args: &[String], cli: &Cli) -> Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", path.display()))?;
@@ -353,8 +353,10 @@ fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
         builder.build()
     };
 
-    let mut loader = otter_runtime::ModuleLoaderConfig::default();
-    loader.base_dir = std::env::current_dir()?;
+    let loader = otter_runtime::ModuleLoaderConfig {
+        base_dir: std::env::current_dir()?,
+        ..Default::default()
+    };
 
     let profile = match cli.node_api {
         NodeApiMode::None => otter_runtime::RuntimeProfile::Core,

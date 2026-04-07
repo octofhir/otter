@@ -112,14 +112,13 @@ fn test262_done(
 ) -> Result<RegisterValue, VmNativeCallError> {
     HARNESS_STATE.with(|cell| {
         let mut inner = cell.borrow_mut();
-        if let Some(arg) = args.first() {
-            if *arg != RegisterValue::undefined()
-                && *arg != RegisterValue::null()
-                && arg.as_bool() != Some(false)
-            {
-                inner.done_result = Some(Err(format_register_value(*arg, runtime)));
-                return;
-            }
+        if let Some(arg) = args.first()
+            && *arg != RegisterValue::undefined()
+            && *arg != RegisterValue::null()
+            && arg.as_bool() != Some(false)
+        {
+            inner.done_result = Some(Err(format_register_value(*arg, runtime)));
+            return;
         }
         inner.done_result = Some(Ok(()));
     });
@@ -349,10 +348,10 @@ impl NewVmRunner {
         if harness_dir.is_dir() {
             for entry in fs::read_dir(&harness_dir).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".js") {
-                    if let Ok(content) = fs::read_to_string(entry.path()) {
-                        harness_cache.insert(name, content);
-                    }
+                if name.ends_with(".js")
+                    && let Ok(content) = fs::read_to_string(entry.path())
+                {
+                    harness_cache.insert(name, content);
                 }
             }
         }
@@ -723,10 +722,10 @@ fn main() {
                 }
             }
 
-            if let Some(ref mut writer) = log_writer {
-                if let Ok(line) = serde_json::to_string(result) {
-                    let _ = writeln!(writer, "{line}");
-                }
+            if let Some(ref mut writer) = log_writer
+                && let Ok(line) = serde_json::to_string(result)
+            {
+                let _ = writeln!(writer, "{line}");
             }
 
             summary.record(result, false);

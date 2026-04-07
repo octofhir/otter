@@ -521,14 +521,14 @@ fn get_iterator_object(
         runtime.intern_symbol_property_name(super::WellKnownSymbol::Iterator.stable_id());
     let iterator_method = runtime.ordinary_get(iterable_handle, iterator_symbol, iterable_value)?;
 
-    if let Some(method) = iterator_method.as_object_handle().map(ObjectHandle) {
-        if runtime.objects().is_callable(method) {
-            let iterator_value = runtime.call_callable(method, iterable_value, &[])?;
-            return iterator_value
-                .as_object_handle()
-                .map(ObjectHandle)
-                .ok_or_else(|| throw_type_error(runtime, "Iterator method returned a non-object"));
-        }
+    if let Some(method) = iterator_method.as_object_handle().map(ObjectHandle)
+        && runtime.objects().is_callable(method)
+    {
+        let iterator_value = runtime.call_callable(method, iterable_value, &[])?;
+        return iterator_value
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| throw_type_error(runtime, "Iterator method returned a non-object"));
     }
 
     let next_prop = runtime.intern_property_name("next");

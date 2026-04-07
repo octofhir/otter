@@ -5,8 +5,8 @@ use super::ast::{
 };
 use super::module_compiler::{FunctionIdentity, ModuleCompiler};
 use super::shared::{
-    Binding, CaptureSource, CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind,
-    LoopScope, PendingFunction, ValueLocation,
+    Binding, CaptureSource, CompiledFunction, FunctionCompiler, FunctionKind, LoopScope,
+    PendingFunction, ScopeRef, ValueLocation, new_scope_ref,
 };
 use super::*;
 
@@ -15,7 +15,7 @@ impl<'a> FunctionCompiler<'a> {
         mode: LoweringMode,
         function_name: Option<String>,
         kind: FunctionKind,
-        parent_env: Option<CompileEnv>,
+        parent_scopes: Vec<ScopeRef>,
     ) -> Self {
         Self {
             mode,
@@ -24,8 +24,8 @@ impl<'a> FunctionCompiler<'a> {
             has_instance_fields: false,
             function_name,
             kind,
-            parent_env,
-            env: CompileEnv::new(),
+            parent_scopes,
+            scope: new_scope_ref(),
             next_local: 0,
             parameter_count: 0,
             next_temp: 0,
@@ -43,8 +43,6 @@ impl<'a> FunctionCompiler<'a> {
             closure_templates: Vec::new(),
             call_sites: Vec::new(),
             exception_handlers: Vec::new(),
-            captures: Vec::new(),
-            capture_ids: BTreeMap::new(),
             hoisted_functions: Vec::new(),
             finally_stack: Vec::new(),
             loop_stack: Vec::new(),
@@ -53,9 +51,24 @@ impl<'a> FunctionCompiler<'a> {
             rest_local: None,
             parameter_binding_registers: Vec::new(),
             parameter_tdz_active: false,
+            predeclared_lexical_names: std::collections::BTreeSet::new(),
             eval_completion_register: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Returns the parent scope chain a child function compiler should
+    /// inherit: this function's own scope first, then this function's
+    /// existing parent scopes. Each is an `Rc` clone — child compilations
+    /// share the same `RefCell`s and can materialize upvalues into
+    /// intermediate ancestors via `borrow_mut`.
+    pub(super) fn parent_scopes_for_child(&self) -> Vec<ScopeRef> {
+        let mut chain = Vec::with_capacity(self.parent_scopes.len() + 1);
+        chain.push(self.scope.clone());
+        for parent in &self.parent_scopes {
+            chain.push(parent.clone());
+        }
+        chain
     }
 
     fn declare_parameter_pattern_bindings(
@@ -66,7 +79,10 @@ impl<'a> FunctionCompiler<'a> {
         collect_binding_identifier_names(pattern, &mut names);
         for name in names {
             let register = self.allocate_local()?;
-            self.env.bindings.insert(name, Binding::Register(register));
+            self.scope
+                .borrow_mut()
+                .bindings
+                .insert(name, Binding::Register(register));
             self.parameter_binding_registers.push(register);
         }
         Ok(())
@@ -93,7 +109,8 @@ impl<'a> FunctionCompiler<'a> {
                     {
                         return Err(SourceLoweringError::DuplicateBinding(name.to_string()));
                     }
-                    self.env
+                    self.scope
+                        .borrow_mut()
                         .bindings
                         .insert(name.to_string(), Binding::Register(register));
                     self.parameter_binding_registers.push(register);
@@ -115,7 +132,8 @@ impl<'a> FunctionCompiler<'a> {
                 {
                     return Err(SourceLoweringError::DuplicateBinding(name.to_string()));
                 }
-                self.env
+                self.scope
+                    .borrow_mut()
                     .bindings
                     .insert(name.to_string(), Binding::Register(register));
                 self.parameter_binding_registers.push(register);
@@ -137,7 +155,8 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             self.instructions.push(Instruction::load_this(register));
         }
-        self.env
+        self.scope
+            .borrow_mut()
             .bindings
             .insert("this".to_string(), Binding::ThisRegister(register));
         Ok(())
@@ -279,6 +298,30 @@ impl<'a> FunctionCompiler<'a> {
             self.declare_variable_binding(&name, true)?;
         }
 
+        // §9.1.2 GetIdentifierReference + §10.2.11 FunctionDeclarationInstantiation:
+        // Pre-declare top-level `let`/`const`/`class` bindings BEFORE compiling
+        // hoisted nested function declarations. Otherwise the nested closures
+        // can't see top-level lexical names via the scope chain at compile
+        // time and will fall back to a runtime global lookup that misses the
+        // (non-global) script-level lexical environment.
+        //
+        // The bindings are initially in TDZ — `load_hole` so any read before
+        // the actual `let foo = ...` statement throws ReferenceError. The
+        // real declaration claims the same register slot via
+        // `declare_variable_binding`.
+        for name in super::ast::collect_top_level_lexical_names(statements) {
+            if self.scope.borrow().bindings.contains_key(&name) {
+                continue;
+            }
+            let register = self.allocate_local()?;
+            self.instructions.push(Instruction::load_hole(register));
+            self.scope
+                .borrow_mut()
+                .bindings
+                .insert(name.clone(), Binding::Register(register));
+            self.predeclared_lexical_names.insert(name);
+        }
+
         let mut reserved = Vec::new();
         collect_function_declarations(statements, &mut reserved);
         let mut pending_functions = Vec::with_capacity(reserved.len());
@@ -336,7 +379,7 @@ impl<'a> FunctionCompiler<'a> {
                 } else {
                     FunctionKind::Ordinary
                 },
-                Some(self.env.clone()),
+                self.parent_scopes_for_child(),
                 self.strict_mode
                     || super::ast::has_use_strict_directive(
                         function
@@ -421,6 +464,14 @@ impl<'a> FunctionCompiler<'a> {
             SourceMap::default(),
         );
 
+        // The child compiler owns its scope frame uniquely (the parent only
+        // holds clones of *ancestor* scopes, never of this child's own
+        // scope), so unwrapping the `Rc` here always succeeds. We extract
+        // the captures vec without an extra clone.
+        let captures = std::rc::Rc::try_unwrap(self.scope)
+            .map(|cell| cell.into_inner().captures)
+            .unwrap_or_else(|shared| shared.borrow().captures.clone());
+
         Ok(CompiledFunction {
             function: VmFunction::new_with_length(
                 name,
@@ -433,7 +484,7 @@ impl<'a> FunctionCompiler<'a> {
             .with_derived_constructor(self.is_derived_constructor)
             .with_generator(self.kind.is_generator())
             .with_async(self.kind.is_async()),
-            captures: self.captures,
+            captures,
         })
     }
 
@@ -982,7 +1033,7 @@ impl<'a> FunctionCompiler<'a> {
             self.mode,
             Some(format!("{class_name}.__field_init__")),
             super::shared::FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
         );
         init_compiler.strict_mode = true;
         init_compiler.declare_parameters(&[])?;
@@ -1208,7 +1259,7 @@ impl<'a> FunctionCompiler<'a> {
                 .unwrap_or(&[]),
             &params,
             kind,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             true, // class bodies are always strict
         )?;
         module.set_function(reserved, compiled.function);
@@ -1327,7 +1378,7 @@ impl<'a> FunctionCompiler<'a> {
             init_expr,
             &[],
             super::shared::FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             true,
         )?;
         module.set_function(reserved, compiled.function);
@@ -1385,7 +1436,7 @@ impl<'a> FunctionCompiler<'a> {
             &block.body,
             &[],
             super::shared::FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             true, // class bodies are always strict
         )?;
         module.set_function(reserved, compiled.function);
@@ -1483,7 +1534,7 @@ impl<'a> FunctionCompiler<'a> {
                 .unwrap_or(&[]),
             &params,
             kind,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             true, // class bodies are always strict
         )?;
         module.set_function(reserved, compiled.function);
@@ -1597,7 +1648,7 @@ impl<'a> FunctionCompiler<'a> {
             &[],
             &[],
             FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
             true,
         )?;
         module.set_function(reserved, compiled.function);
@@ -1629,7 +1680,7 @@ impl<'a> FunctionCompiler<'a> {
             self.mode,
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
         );
         compiler.strict_mode = true;
         compiler.is_derived_constructor = derived;
@@ -1702,7 +1753,7 @@ impl<'a> FunctionCompiler<'a> {
             self.mode,
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
         );
         compiler.strict_mode = true;
         compiler.has_instance_fields = true;
@@ -1742,7 +1793,7 @@ impl<'a> FunctionCompiler<'a> {
             self.mode,
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
-            Some(self.env.clone()),
+            self.parent_scopes_for_child(),
         );
         compiler.strict_mode = true;
         compiler.is_derived_constructor = true;
@@ -1760,7 +1811,7 @@ impl<'a> FunctionCompiler<'a> {
             .instructions
             .push(Instruction::call_super_forward(forwarded.register));
         if let Some(Binding::ThisRegister(this_register)) =
-            compiler.env.bindings.get("this").copied()
+            compiler.scope.borrow().bindings.get("this").copied()
             && this_register != forwarded.register
         {
             compiler
@@ -1929,12 +1980,11 @@ impl<'a> FunctionCompiler<'a> {
         // argument may contain a call in tail position (possibly nested
         // inside conditional, comma, or logical expressions).
         // Spec: <https://tc39.es/ecma262/#sec-static-semantics-hascallintailposition>
-        if self.is_tail_call_eligible() {
-            if let Some(argument) = &return_statement.argument {
-                if Self::has_call_in_tail_position(argument) {
-                    return self.compile_return_with_tail_calls(argument, module);
-                }
-            }
+        if self.is_tail_call_eligible()
+            && let Some(argument) = &return_statement.argument
+            && Self::has_call_in_tail_position(argument)
+        {
+            return self.compile_return_with_tail_calls(argument, module);
         }
 
         let value = if let Some(argument) = &return_statement.argument {
@@ -2642,7 +2692,16 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
         allow_redeclare: bool,
     ) -> Result<BytecodeRegister, SourceLoweringError> {
-        if let Some(existing) = self.env.bindings.get(name).copied() {
+        if let Some(existing) = self.scope.borrow().bindings.get(name).copied() {
+            // A pre-declared lexical placeholder (let/const/class hoisted by
+            // `predeclare_function_scope`) gets reclaimed by the real
+            // declaration here, regardless of `allow_redeclare`.
+            if self.predeclared_lexical_names.remove(name)
+                && let Binding::Register(register) = existing
+            {
+                return Ok(register);
+            }
+
             return match existing {
                 Binding::Register(register) => {
                     if allow_redeclare {
@@ -2667,7 +2726,8 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         let register = self.allocate_local()?;
-        self.env
+        self.scope
+            .borrow_mut()
             .bindings
             .insert(name.to_string(), Binding::Register(register));
         Ok(register)
@@ -2677,7 +2737,8 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         name: &str,
     ) -> Result<BytecodeRegister, SourceLoweringError> {
-        let closure_register = if let Some(existing) = self.env.bindings.get(name).copied() {
+        let closure_register = if let Some(existing) = self.scope.borrow().bindings.get(name).copied()
+        {
             match existing {
                 Binding::Register(register) => register,
                 Binding::ThisRegister(register) => register,
@@ -2694,7 +2755,8 @@ impl<'a> FunctionCompiler<'a> {
             self.allocate_local()?
         };
 
-        self.env
+        self.scope
+            .borrow_mut()
             .bindings
             .insert(name.to_string(), Binding::Function { closure_register });
         Ok(closure_register)
@@ -2722,7 +2784,8 @@ impl<'a> FunctionCompiler<'a> {
             return Ok(());
         }
         let Some(name) = self
-            .env
+            .scope
+            .borrow()
             .bindings
             .iter()
             .find(|(_, binding)| {
@@ -2742,29 +2805,93 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     pub(super) fn resolve_binding(&mut self, name: &str) -> Result<Binding, SourceLoweringError> {
-        if let Some(binding) = self.env.bindings.get(name).copied() {
+        if let Some(binding) = self.scope.borrow().bindings.get(name).copied() {
             return Ok(binding);
         }
 
-        if let Some(parent_env) = &self.parent_env
-            && let Some(binding) = parent_env.bindings.get(name).copied()
-        {
-            let upvalue = if let Some(existing) = self.capture_ids.get(name).copied() {
+        // §9.1.2 GetIdentifierReference: walk the full ancestor scope chain
+        // (not just one level up). When the name is found at level `k`,
+        // materialize implicit upvalues at every intermediate level
+        // [k-1..0] AND in this function's own scope, so each closure
+        // properly forwards the captured slot to the next.
+        // Spec: <https://tc39.es/ecma262/#sec-getidentifierreference>
+        let mut found_level: Option<usize> = None;
+        let mut found_binding: Option<Binding> = None;
+        for (level, parent_scope) in self.parent_scopes.iter().enumerate() {
+            if let Some(binding) = parent_scope.borrow().bindings.get(name).copied() {
+                found_level = Some(level);
+                found_binding = Some(binding);
+                break;
+            }
+        }
+
+        if let (Some(level), Some(deepest_binding)) = (found_level, found_binding) {
+            let is_this = matches!(
+                deepest_binding,
+                Binding::ThisRegister(_) | Binding::ThisUpvalue(_)
+            );
+
+            // Walk DOWN from the level just below where we found the binding
+            // (level - 1) toward the immediate parent (0). At each step we
+            // make sure that scope captures the name from the level above and
+            // exposes it as a local upvalue binding so the next-deeper
+            // closure can capture *that* upvalue.
+            //
+            // After this loop, `source_binding` is what the *current*
+            // function should capture from `parent_scopes[0]` (its immediate
+            // parent).
+            let mut source_binding = deepest_binding;
+            for inner_level in (0..level).rev() {
+                let inner_scope = &self.parent_scopes[inner_level];
+                let already = inner_scope.borrow().capture_ids.get(name).copied();
+                let upvalue_id = if let Some(id) = already {
+                    id
+                } else {
+                    let mut frame = inner_scope.borrow_mut();
+                    let id = UpvalueId(
+                        u16::try_from(frame.captures.len())
+                            .map_err(|_| SourceLoweringError::TooManyLocals)?,
+                    );
+                    frame.captures.push(source_binding.capture_source());
+                    frame.capture_ids.insert(name.to_string(), id);
+                    let captured = if is_this {
+                        Binding::ThisUpvalue(id)
+                    } else {
+                        Binding::Upvalue(id)
+                    };
+                    frame.bindings.insert(name.to_string(), captured);
+                    id
+                };
+                source_binding = if is_this {
+                    Binding::ThisUpvalue(upvalue_id)
+                } else {
+                    Binding::Upvalue(upvalue_id)
+                };
+            }
+
+            // Materialize the upvalue in this function's own scope.
+            let already_self = self.scope.borrow().capture_ids.get(name).copied();
+            let upvalue = if let Some(existing) = already_self {
                 existing
             } else {
-                let upvalue = UpvalueId(
-                    u16::try_from(self.captures.len())
+                let mut scope = self.scope.borrow_mut();
+                let id = UpvalueId(
+                    u16::try_from(scope.captures.len())
                         .map_err(|_| SourceLoweringError::TooManyLocals)?,
                 );
-                self.captures.push(binding.capture_source());
-                self.capture_ids.insert(name.to_string(), upvalue);
-                upvalue
+                scope.captures.push(source_binding.capture_source());
+                scope.capture_ids.insert(name.to_string(), id);
+                id
             };
-            let captured = match binding {
-                Binding::ThisRegister(_) | Binding::ThisUpvalue(_) => Binding::ThisUpvalue(upvalue),
-                _ => Binding::Upvalue(upvalue),
+            let captured = if is_this {
+                Binding::ThisUpvalue(upvalue)
+            } else {
+                Binding::Upvalue(upvalue)
             };
-            self.env.bindings.insert(name.to_string(), captured);
+            self.scope
+                .borrow_mut()
+                .bindings
+                .insert(name.to_string(), captured);
             return Ok(captured);
         }
 
@@ -2778,10 +2905,12 @@ impl<'a> FunctionCompiler<'a> {
                 self.arguments_local = Some(reg);
                 reg
             };
-            if !self.env.bindings.contains_key("arguments") {
+            let needs_create = !self.scope.borrow().bindings.contains_key("arguments");
+            if needs_create {
                 self.instructions
                     .push(Instruction::create_arguments(register));
-                self.env
+                self.scope
+                    .borrow_mut()
                     .bindings
                     .insert("arguments".to_string(), Binding::Register(register));
             }
@@ -2799,11 +2928,13 @@ impl<'a> FunctionCompiler<'a> {
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-function-calls-runtime-semantics-evaluation>
     pub(super) fn is_name_locally_visible(&self, name: &str) -> bool {
-        if self.env.bindings.contains_key(name) {
+        if self.scope.borrow().bindings.contains_key(name) {
             return true;
         }
-        if let Some(parent_env) = &self.parent_env {
-            return parent_env.bindings.contains_key(name);
+        for parent_scope in &self.parent_scopes {
+            if parent_scope.borrow().bindings.contains_key(name) {
+                return true;
+            }
         }
         false
     }
@@ -2848,7 +2979,7 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn declare_intrinsic_global_binding(&mut self, name: &str) -> Result<(), SourceLoweringError> {
-        if self.env.bindings.contains_key(name) {
+        if self.scope.borrow().bindings.contains_key(name) {
             return Ok(());
         }
 
@@ -2859,7 +2990,8 @@ impl<'a> FunctionCompiler<'a> {
         self.instructions
             .push(Instruction::get_property(binding, global, property));
         self.release(ValueLocation::temp(global));
-        self.env
+        self.scope
+            .borrow_mut()
             .bindings
             .insert(name.to_string(), Binding::Register(binding));
         Ok(())

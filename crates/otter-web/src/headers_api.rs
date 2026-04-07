@@ -10,6 +10,8 @@ use crate::{
     type_error,
 };
 
+type HeadersEntries = Arc<Mutex<Vec<(String, String)>>>;
+
 pub(crate) fn install(runtime: &mut RuntimeState) -> Result<(), String> {
     if has_global(runtime, "Headers") {
         return Ok(());
@@ -231,10 +233,10 @@ fn parse_headers_record(
             .unwrap_or_else(|_| RegisterValue::undefined());
         entries.push((name, normalize_header_value(runtime, Some(value))?));
     }
-    Ok(entries
+    entries
         .into_iter()
         .map(|(name, value)| normalize_parsed_header(runtime, name, value))
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn normalize_parsed_header(
@@ -251,7 +253,7 @@ fn normalize_parsed_header(
 fn require_headers_entries(
     runtime: &mut RuntimeState,
     value: &RegisterValue,
-) -> Result<Arc<Mutex<Vec<(String, String)>>>, VmNativeCallError> {
+) -> Result<HeadersEntries, VmNativeCallError> {
     let Ok(payload) = runtime.native_payload_from_value::<HeadersPayload>(value) else {
         return Err(type_error(
             runtime,

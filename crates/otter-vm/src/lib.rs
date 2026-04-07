@@ -71,6 +71,8 @@ pub mod object;
 pub mod payload;
 /// Promise intrinsic — ES2024 §27.2 implementation.
 pub mod promise;
+/// §9.3 ECMAScript Realm Records.
+pub mod realm;
 /// Property side tables for named access.
 pub mod property;
 /// Shared CopyDataProperties helpers for object spread/rest semantics.
@@ -116,6 +118,7 @@ pub use payload::{
     VmValueTracer,
 };
 pub use promise::VmPromise;
+pub use realm::{Realm, RealmId};
 pub use value::RegisterValue;
 
 /// Returns the current execution ABI version of the new VM.

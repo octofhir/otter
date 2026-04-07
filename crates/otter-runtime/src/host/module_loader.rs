@@ -125,8 +125,8 @@ impl SourceCache {
     }
 
     fn insert(&mut self, url: String, module: ResolvedModule) {
-        if self.map.contains_key(&url) {
-            self.map.insert(url, module);
+        if let Some(existing) = self.map.get_mut(&url) {
+            *existing = module;
             return;
         }
 

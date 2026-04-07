@@ -480,6 +480,12 @@ impl Activation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct TailCallPayload {
+    module: Module,
+    activation: Activation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum StepOutcome {
     Continue,
     Return(RegisterValue),
@@ -488,10 +494,7 @@ enum StepOutcome {
     /// The execution loop swaps module/activation/function in-place instead
     /// of recursing into `run_completion_with_runtime`.
     /// Spec: <https://tc39.es/ecma262/#sec-tail-position-calls>
-    TailCall {
-        module: Module,
-        activation: Activation,
-    },
+    TailCall(Box<TailCallPayload>),
     /// The interpreter should suspend at an `await` on a pending promise.
     /// The caller captures the frame state and enqueues a resume job.
     Suspend {
@@ -533,7 +536,14 @@ pub(crate) enum ToPrimitiveHint {
 
 /// Shared execution runtime for one interpreter/JIT run.
 pub struct RuntimeState {
-    intrinsics: VmIntrinsics,
+    /// §9.3 — Realm records owned by this runtime. The vector is grown only
+    /// (entries are never removed), so [`crate::realm::RealmId`] indices
+    /// remain stable for the lifetime of the runtime.
+    realms: Vec<crate::realm::Realm>,
+    /// §9.4.1 \[\[Realm\]\] of the running execution context. Updated by the
+    /// interpreter when crossing realm boundaries (e.g. via `$262.createRealm`
+    /// or future cross-realm proxies).
+    current_realm: crate::realm::RealmId,
     objects: ObjectHeap,
     property_names: PropertyNameRegistry,
     native_functions: NativeFunctionRegistry,
@@ -580,7 +590,8 @@ impl RuntimeState {
         }
 
         Self {
-            intrinsics,
+            realms: vec![crate::realm::Realm::new(intrinsics)],
+            current_realm: 0,
             objects,
             property_names,
             native_functions,
@@ -5356,10 +5367,11 @@ impl Interpreter {
                 }
                 // §14.6 Tail call: replace the current frame in-place and
                 // continue the same loop — no new Rust stack frame.
-                StepOutcome::TailCall {
-                    module: callee_module,
-                    activation: callee_activation,
-                } => {
+                StepOutcome::TailCall(payload) => {
+                    let TailCallPayload {
+                        module: callee_module,
+                        activation: callee_activation,
+                    } = *payload;
                     current_module = callee_module;
                     *activation = callee_activation;
                     function = current_module
@@ -8018,10 +8030,10 @@ impl Interpreter {
                         instruction.b(),
                         call,
                     )?;
-                    Ok(StepOutcome::TailCall {
+                    Ok(StepOutcome::TailCall(Box::new(TailCallPayload {
                         module: callee_module,
                         activation: callee_activation,
-                    })
+                    })))
                 } else {
                     // Non-closure target: execute as normal call, then return
                     // the result from this frame.

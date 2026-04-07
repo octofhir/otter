@@ -1,5 +1,5 @@
 use super::ast::{ParamInfo, has_use_strict_directive};
-use super::shared::{CompileEnv, CompiledFunction, FunctionCompiler, FunctionKind};
+use super::shared::{CompiledFunction, FunctionCompiler, FunctionKind, ScopeRef};
 use super::*;
 
 use crate::module::{ExportRecord, ImportRecord};
@@ -65,7 +65,7 @@ impl<'a> ModuleCompiler<'a> {
             &program.body,
             &[],
             FunctionKind::Script,
-            None,
+            Vec::new(),
             inherited_strict,
         )?;
         self.functions[entry.0 as usize] = Some(compiled.function);
@@ -116,7 +116,7 @@ impl<'a> ModuleCompiler<'a> {
         statements: &[AstStatement<'_>],
         params: &[ParamInfo<'_>],
         kind: FunctionKind,
-        parent_env: Option<CompileEnv>,
+        parent_scopes: Vec<ScopeRef>,
         inherited_strict: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         self.compile_function_from_statements_with_options(
@@ -125,7 +125,7 @@ impl<'a> ModuleCompiler<'a> {
             statements,
             params,
             kind,
-            parent_env,
+            parent_scopes,
             inherited_strict,
             false,
         )
@@ -139,12 +139,12 @@ impl<'a> ModuleCompiler<'a> {
         statements: &[AstStatement<'_>],
         params: &[ParamInfo<'_>],
         kind: FunctionKind,
-        parent_env: Option<CompileEnv>,
+        parent_scopes: Vec<ScopeRef>,
         inherited_strict: bool,
         is_derived_constructor: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
-            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
+            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_scopes);
         compiler.strict_mode = inherited_strict;
         compiler.is_derived_constructor = is_derived_constructor;
 
@@ -194,11 +194,11 @@ impl<'a> ModuleCompiler<'a> {
         expression: &Expression<'_>,
         params: &[ParamInfo<'_>],
         kind: FunctionKind,
-        parent_env: Option<CompileEnv>,
+        parent_scopes: Vec<ScopeRef>,
         inherited_strict: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler =
-            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_env);
+            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_scopes);
         compiler.strict_mode = inherited_strict;
 
         compiler.declare_parameters(params)?;

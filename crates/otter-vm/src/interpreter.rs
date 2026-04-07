@@ -578,11 +578,17 @@ impl RuntimeState {
         intrinsics
             .wire_prototype_chains(&mut objects)
             .expect("intrinsic prototype wiring should bootstrap cleanly");
+        // §9.3 Realm Records — bootstrap intrinsics into the initial realm (id = 0).
         intrinsics
-            .init_core(&mut objects, &mut property_names, &mut native_functions)
+            .init_core(&mut objects, &mut property_names, &mut native_functions, 0)
             .expect("intrinsic core init should bootstrap cleanly");
         intrinsics
-            .install_on_global(&mut objects, &mut property_names, &mut native_functions)
+            .install_on_global(
+                &mut objects,
+                &mut property_names,
+                &mut native_functions,
+                0,
+            )
             .expect("intrinsic global install should bootstrap cleanly");
         let mut symbol_descriptions = BTreeMap::new();
         for &symbol in intrinsics.well_known_symbols() {
@@ -612,15 +618,89 @@ impl RuntimeState {
         }
     }
 
-    /// Returns the intrinsic registry owned by the runtime.
+    /// Returns the intrinsic registry owned by the runtime's current realm.
     #[must_use]
     pub fn intrinsics(&self) -> &VmIntrinsics {
-        &self.intrinsics
+        &self.realms[self.current_realm as usize].intrinsics
     }
 
-    /// Returns the mutable intrinsic registry owned by the runtime.
+    /// Returns the mutable intrinsic registry owned by the runtime's current realm.
     pub fn intrinsics_mut(&mut self) -> &mut VmIntrinsics {
-        &mut self.intrinsics
+        &mut self.realms[self.current_realm as usize].intrinsics
+    }
+
+    /// Returns the realm record currently bound as the running execution context's `[[Realm]]`.
+    #[must_use]
+    pub fn current_realm_id(&self) -> crate::realm::RealmId {
+        self.current_realm
+    }
+
+    /// Returns the realm record at the given index.
+    #[must_use]
+    pub fn realm(&self, id: crate::realm::RealmId) -> &crate::realm::Realm {
+        &self.realms[id as usize]
+    }
+
+    /// §10.2.3 GetFunctionRealm — returns the realm of the given callable.
+    ///
+    /// For bound function exotic objects this falls through the chain of targets
+    /// (their `[[Realm]]` is set to the target's realm at bind time, so a single
+    /// read is sufficient). For proxy exotic objects this recurses on the target.
+    /// Revoked proxies and non-callable values fall back to the current realm
+    /// per the spirit of §10.2.3 step 4 — callers needing strict spec error
+    /// reporting should validate beforehand.
+    /// Spec: <https://tc39.es/ecma262/#sec-getfunctionrealm>
+    #[must_use]
+    pub fn get_function_realm(&self, callable: ObjectHandle) -> crate::realm::RealmId {
+        if let Ok(Some(realm)) = self.objects.function_realm(callable) {
+            return realm;
+        }
+        if !self.objects.is_proxy_revoked(callable)
+            && let Ok((target, _handler)) = self.objects.proxy_parts(callable)
+        {
+            return self.get_function_realm(target);
+        }
+        self.current_realm
+    }
+
+    /// §10.1.14 GetPrototypeFromConstructor — looks up `constructor.prototype`
+    /// and, if it is not an object, falls back to
+    /// `realm.[[Intrinsics]].[[<intrinsic_default>]]` where `realm` comes from
+    /// `GetFunctionRealm(constructor)`.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    pub fn get_prototype_from_constructor(
+        &mut self,
+        constructor: ObjectHandle,
+        intrinsic_default: crate::intrinsics::IntrinsicKey,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let prototype_property = self.intern_property_name("prototype");
+        // §10.1.14 step 2: Let proto be ? Get(constructor, "prototype").
+        // Use proxy [[Get]] if the constructor is a proxy (§10.5.8).
+        let proto_val = if self.is_proxy(constructor) {
+            self.proxy_get(
+                constructor,
+                prototype_property,
+                RegisterValue::from_object_handle(constructor.0),
+            )?
+        } else {
+            self.ordinary_get(
+                constructor,
+                prototype_property,
+                RegisterValue::from_object_handle(constructor.0),
+            )
+            .map_err(|error| match error {
+                VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?
+        };
+        // §10.1.14 step 3: If Type(proto) is not Object …
+        if let Some(handle) = proto_val.as_object_handle().map(ObjectHandle) {
+            return Ok(handle);
+        }
+        // … 3a-b: realm = GetFunctionRealm(constructor); proto = realm intrinsic.
+        let realm = self.get_function_realm(constructor);
+        Ok(self.realms[realm as usize].intrinsics.get(intrinsic_default))
     }
 
     /// Returns the current object heap.
@@ -925,7 +1005,7 @@ impl RuntimeState {
                     let ch_str = crate::js_string::JsString::from_utf16(ch_units);
                     let str_handle = self.objects.alloc_js_string(ch_str);
                     // Set prototype for the new string.
-                    let proto = self.intrinsics.string_prototype();
+                    let proto = self.intrinsics().string_prototype();
                     self.objects.set_prototype(str_handle, Some(proto)).ok();
                     let step = crate::object::IteratorStep::yield_value(
                         RegisterValue::from_object_handle(str_handle.0),
@@ -1919,7 +1999,7 @@ impl RuntimeState {
     /// Collects roots from intrinsics and the provided register window,
     /// then triggers collection if memory pressure warrants it.
     pub fn gc_safepoint(&mut self, registers: &[RegisterValue]) {
-        let mut roots = self.intrinsics.gc_root_handles();
+        let mut roots = self.intrinsics().gc_root_handles();
         // Extract ObjectHandle roots from the current register window.
         for reg in registers {
             if let Some(handle) = reg.as_object_handle() {
@@ -1931,7 +2011,7 @@ impl RuntimeState {
 
     /// Allocates one ordinary object with the runtime default prototype.
     pub fn alloc_object(&mut self) -> ObjectHandle {
-        let prototype = self.intrinsics.object_prototype();
+        let prototype = self.intrinsics().object_prototype();
         let handle = self.objects.alloc_object();
         self.objects
             .set_prototype(handle, Some(prototype))
@@ -1953,7 +2033,7 @@ impl RuntimeState {
     where
         T: VmTrace + Any,
     {
-        let prototype = self.intrinsics.object_prototype();
+        let prototype = self.intrinsics().object_prototype();
         self.alloc_native_object_with_prototype(Some(prototype), payload)
     }
 
@@ -1976,7 +2056,7 @@ impl RuntimeState {
 
     /// Allocates one dense array with the runtime default prototype.
     pub fn alloc_array(&mut self) -> ObjectHandle {
-        let prototype = self.intrinsics.array_prototype();
+        let prototype = self.intrinsics().array_prototype();
         let handle = self.objects.alloc_array();
         self.objects
             .set_prototype(handle, Some(prototype))
@@ -2034,7 +2114,7 @@ impl RuntimeState {
 
     /// Allocates one string object with the runtime default prototype.
     pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
-        let prototype = self.intrinsics.string_prototype();
+        let prototype = self.intrinsics().string_prototype();
         let handle = self.objects.alloc_string(value);
         self.objects
             .set_prototype(handle, Some(prototype))
@@ -2046,7 +2126,7 @@ impl RuntimeState {
     ///
     /// Preserves lone surrogates as-is.
     pub fn alloc_js_string(&mut self, value: crate::js_string::JsString) -> ObjectHandle {
-        let prototype = self.intrinsics.string_prototype();
+        let prototype = self.intrinsics().string_prototype();
         let handle = self.objects.alloc_js_string(value);
         self.objects
             .set_prototype(handle, Some(prototype))
@@ -2148,9 +2228,11 @@ impl RuntimeState {
     }
 
     /// Allocates one host-callable function with the runtime default prototype.
+    /// The function is bound to the runtime's currently-active realm.
     pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
-        let prototype = self.intrinsics.function_prototype();
-        let handle = self.objects.alloc_host_function(function);
+        let prototype = self.intrinsics().function_prototype();
+        let realm = self.current_realm;
+        let handle = self.objects.alloc_host_function(function, realm);
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
@@ -2260,7 +2342,7 @@ impl RuntimeState {
     ) -> ObjectHandle {
         let host_fn = self.native_functions.register(descriptor);
         let handle = self.alloc_host_function(host_fn);
-        let global = self.intrinsics.global_object();
+        let global = self.intrinsics().global_object();
         let prop = self.property_names.intern(
             self.native_functions
                 .get(host_fn)
@@ -2275,7 +2357,7 @@ impl RuntimeState {
 
     /// Installs a value property on the global object.
     pub fn install_global_value(&mut self, name: &str, value: RegisterValue) {
-        let global = self.intrinsics.global_object();
+        let global = self.intrinsics().global_object();
         let prop = self.property_names.intern(name);
         self.objects
             .set_property(global, prop, value)
@@ -2325,18 +2407,22 @@ impl RuntimeState {
     }
 
     /// Allocates one bytecode closure with the runtime default function prototype.
+    /// The closure is bound to the runtime's currently-active realm.
     pub fn alloc_closure(
         &mut self,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
         flags: ObjectClosureFlags,
     ) -> ObjectHandle {
-        let prototype = self.intrinsics.function_prototype();
+        let prototype = self.intrinsics().function_prototype();
         let module = self
             .current_module
             .clone()
             .expect("closure allocation requires active module context");
-        let handle = self.objects.alloc_closure(module, callee, upvalues, flags);
+        let realm = self.current_realm;
+        let handle = self
+            .objects
+            .alloc_closure(module, callee, upvalues, flags, realm);
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
@@ -3024,8 +3110,10 @@ impl RuntimeState {
                             "construct target host function is missing".into(),
                         )
                     })?;
+                let intrinsic_default =
+                    Interpreter::host_function_default_intrinsic(self, host_function);
                 let default_receiver = RegisterValue::from_object_handle(
-                    Interpreter::allocate_construct_receiver(self, new_target)
+                    Interpreter::allocate_construct_receiver(self, new_target, intrinsic_default)
                         .map_err(|error| match error {
                             InterpreterError::UncaughtThrow(value) => {
                                 VmNativeCallError::Thrown(value)
@@ -3068,14 +3156,18 @@ impl RuntimeState {
                     RegisterValue::undefined()
                 } else {
                     RegisterValue::from_object_handle(
-                        Interpreter::allocate_construct_receiver(self, new_target)
-                            .map_err(|error| match error {
-                                InterpreterError::UncaughtThrow(value) => {
-                                    VmNativeCallError::Thrown(value)
-                                }
-                                other => VmNativeCallError::Internal(format!("{other}").into()),
-                            })?
-                            .0,
+                        Interpreter::allocate_construct_receiver(
+                            self,
+                            new_target,
+                            crate::intrinsics::IntrinsicKey::ObjectPrototype,
+                        )
+                        .map_err(|error| match error {
+                            InterpreterError::UncaughtThrow(value) => {
+                                VmNativeCallError::Thrown(value)
+                            }
+                            other => VmNativeCallError::Internal(format!("{other}").into()),
+                        })?
+                        .0,
                     )
                 };
                 let mut activation = Activation::with_context(
@@ -3366,7 +3458,7 @@ impl RuntimeState {
         }
         if value.is_bigint() {
             let wrapper =
-                self.alloc_object_with_prototype(Some(self.intrinsics.bigint_prototype()));
+                self.alloc_object_with_prototype(Some(self.intrinsics().bigint_prototype()));
             return Ok(wrapper);
         }
         if value.is_symbol() {
@@ -3398,13 +3490,13 @@ impl RuntimeState {
             return Ok(handle);
         }
         if value.as_bool().is_some() {
-            return Ok(self.intrinsics.boolean_prototype());
+            return Ok(self.intrinsics().boolean_prototype());
         }
         if value.as_number().is_some() {
-            return Ok(self.intrinsics.number_prototype());
+            return Ok(self.intrinsics().number_prototype());
         }
         if value.is_symbol() {
-            return Ok(self.intrinsics.symbol_prototype());
+            return Ok(self.intrinsics().symbol_prototype());
         }
         Err(InterpreterError::InvalidObjectValue)
     }
@@ -4005,7 +4097,7 @@ impl RuntimeState {
 
     /// Allocate an error object with the correct prototype chain.
     fn alloc_reference_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
-        let prototype = self.intrinsics.reference_error_prototype;
+        let prototype = self.intrinsics().reference_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype));
         let msg_handle = self.objects.alloc_string(message);
         let msg_prop = self.intern_property_name("message");
@@ -4019,7 +4111,7 @@ impl RuntimeState {
 
     /// Allocate a TypeError object with the correct prototype chain.
     pub fn alloc_type_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
-        let prototype = self.intrinsics.type_error_prototype;
+        let prototype = self.intrinsics().type_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype));
         let msg_handle = self.objects.alloc_string(message);
         let msg_prop = self.intern_property_name("message");
@@ -4033,7 +4125,7 @@ impl RuntimeState {
 
     /// Allocates one RangeError instance with the given message.
     pub fn alloc_range_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
-        let prototype = self.intrinsics.range_error_prototype;
+        let prototype = self.intrinsics().range_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype));
         let msg_handle = self.objects.alloc_string(message);
         let msg_prop = self.intern_property_name("message");
@@ -4313,7 +4405,7 @@ impl RuntimeState {
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
     ) -> ObjectHandle {
-        let prototype = self.intrinsics.generator_prototype();
+        let prototype = self.intrinsics().generator_prototype();
         self.objects.alloc_generator(
             Some(prototype),
             module,
@@ -4349,7 +4441,7 @@ impl RuntimeState {
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
     ) -> ObjectHandle {
-        let prototype = self.intrinsics.async_generator_prototype();
+        let prototype = self.intrinsics().async_generator_prototype();
         self.objects.alloc_async_generator(
             Some(prototype),
             module,
@@ -4582,7 +4674,7 @@ impl RuntimeState {
     /// §20.5.5.4 NativeError
     /// Spec: <https://tc39.es/ecma262/#sec-nativeerror-message>
     pub fn alloc_syntax_error(&mut self, message: &str) -> VmNativeCallError {
-        let prototype = self.intrinsics.syntax_error_prototype;
+        let prototype = self.intrinsics().syntax_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype));
         let msg = self.alloc_string(message);
         let msg_prop = self.intern_property_name("message");
@@ -8854,8 +8946,9 @@ impl Interpreter {
             if !Self::is_host_function_constructible(runtime, host_function)? {
                 return Err(InterpreterError::InvalidCallTarget);
             }
+            let intrinsic_default = Self::host_function_default_intrinsic(runtime, host_function);
             Some(RegisterValue::from_object_handle(
-                Self::allocate_construct_receiver(runtime, callable)?.0,
+                Self::allocate_construct_receiver(runtime, callable, intrinsic_default)?.0,
             ))
         } else {
             None
@@ -9058,36 +9151,31 @@ impl Interpreter {
         Ok(())
     }
 
+    /// §10.1.13 OrdinaryCreateFromConstructor: allocate a fresh ordinary
+    /// object whose [[Prototype]] is taken from `constructor.prototype`, or
+    /// from the constructor's realm's `intrinsic_default` when that property
+    /// is not an object.
     fn allocate_construct_receiver(
         runtime: &mut RuntimeState,
         constructor: ObjectHandle,
+        intrinsic_default: crate::intrinsics::IntrinsicKey,
     ) -> Result<ObjectHandle, InterpreterError> {
-        let prototype_property = runtime.intern_property_name("prototype");
-        let default_prototype = runtime.intrinsics().object_prototype();
-        // §10.5.8 — If constructor is a proxy, use proxy [[Get]] to find "prototype".
-        let proto_val = if runtime.is_proxy(constructor) {
-            runtime.proxy_get(
-                constructor,
-                prototype_property,
-                RegisterValue::from_object_handle(constructor.0),
-            )?
-        } else {
-            runtime
-                .ordinary_get(
-                    constructor,
-                    prototype_property,
-                    RegisterValue::from_object_handle(constructor.0),
-                )
-                .map_err(|error| match error {
-                    VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
-                    VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
-                })?
-        };
-        let prototype = proto_val
-            .as_object_handle()
-            .map(ObjectHandle)
-            .unwrap_or(default_prototype);
+        let prototype = runtime.get_prototype_from_constructor(constructor, intrinsic_default)?;
         Ok(runtime.alloc_object_with_prototype(Some(prototype)))
+    }
+
+    /// Returns the `IntrinsicKey` that the given host function's descriptor
+    /// declares as its `intrinsicDefaultProto` (§10.1.14), if any. Falls back
+    /// to `ObjectPrototype`.
+    fn host_function_default_intrinsic(
+        runtime: &RuntimeState,
+        host_function: HostFunctionId,
+    ) -> crate::intrinsics::IntrinsicKey {
+        runtime
+            .native_functions()
+            .get(host_function)
+            .and_then(NativeFunctionDescriptor::default_intrinsic)
+            .unwrap_or(crate::intrinsics::IntrinsicKey::ObjectPrototype)
     }
 
     fn is_host_function_constructible(

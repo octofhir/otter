@@ -67,11 +67,10 @@ fn proto(
 
 fn map_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Map")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Map",
-            0,
-            map_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Map", 0, map_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::MapPrototype),
+        )
         .with_binding(proto("get", 1, map_get))
         .with_binding(proto("set", 2, map_set))
         .with_binding(proto("has", 1, map_has))
@@ -385,11 +384,10 @@ fn require_map(
 
 fn set_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Set")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Set",
-            0,
-            set_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Set", 0, set_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::SetPrototype),
+        )
         .with_binding(proto("add", 1, set_add))
         .with_binding(proto("has", 1, set_has))
         .with_binding(proto("delete", 1, set_delete))

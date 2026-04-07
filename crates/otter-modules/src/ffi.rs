@@ -350,12 +350,14 @@ fn ffi_dlopen(
             state: shared.clone(),
         });
         let target = alloc_named_function(runtime, &name, 0, ffi_symbol_call);
+        let target_realm = runtime.get_function_realm(target);
         let bound = runtime
             .objects_mut()
             .alloc_bound_function(
                 target,
                 RegisterValue::from_object_handle(symbol.0),
                 Vec::new(),
+                target_realm,
             )
             .map_err(|error| {
                 VmNativeCallError::Internal(
@@ -1161,12 +1163,14 @@ fn build_direct_callable(
         u16::try_from(signature.args.len()).unwrap_or(u16::MAX),
         ffi_bound_callable_call,
     );
+    let target_realm = runtime.get_function_realm(target);
     runtime
         .objects_mut()
         .alloc_bound_function(
             target,
             RegisterValue::from_object_handle(payload.0),
             Vec::new(),
+            target_realm,
         )
         .map_err(|error| {
             VmNativeCallError::Internal(

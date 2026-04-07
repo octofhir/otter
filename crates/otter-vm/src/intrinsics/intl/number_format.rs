@@ -136,7 +136,8 @@ fn number_format_format_getter(
     let desc = NativeFunctionDescriptor::method("format", 1, bound_number_format_format);
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
-    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id);
+    let realm = runtime.current_realm_id();
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm);
     let _ = runtime
         .objects_mut()
         .set_prototype(bound_fn, Some(fn_proto));

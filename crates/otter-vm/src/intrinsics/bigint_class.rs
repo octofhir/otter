@@ -109,11 +109,10 @@ fn stat(
 
 fn bigint_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("BigInt")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "BigInt",
-            1,
-            bigint_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("BigInt", 1, bigint_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::BigIntPrototype),
+        )
         .with_binding(proto("toString", 0, bigint_to_string))
         .with_binding(proto("toLocaleString", 0, bigint_to_locale_string))
         .with_binding(proto("valueOf", 0, bigint_value_of))

@@ -121,11 +121,10 @@ fn proto(
 
 fn data_view_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("DataView")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "DataView",
-            1,
-            data_view_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("DataView", 1, data_view_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::DataViewPrototype),
+        )
         // §25.3.4.5–16 getXxx methods
         .with_binding(proto("getInt8", 1, data_view_get_int8))
         .with_binding(proto("getUint8", 1, data_view_get_uint8))

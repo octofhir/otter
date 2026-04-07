@@ -65,11 +65,12 @@ fn make_add_int32_mir() -> MirGraph {
     graph
 }
 
+#[allow(clippy::approx_constant)]
 fn make_add_f64_mir() -> MirGraph {
     let mut graph = MirGraph::new("add_f64".into(), 0, 2, 0);
     let entry = graph.entry_block;
 
-    let v0 = graph.push_instr(entry, MirOp::ConstFloat64(3.15), 0);
+    let v0 = graph.push_instr(entry, MirOp::ConstFloat64(3.14), 0);
     let v1 = graph.push_instr(entry, MirOp::ConstFloat64(2.86), 1);
     let v2 = graph.push_instr(entry, MirOp::AddF64 { lhs: v0, rhs: v1 }, 2);
     let v3 = graph.push_instr(entry, MirOp::BoxFloat64(v2), 3);

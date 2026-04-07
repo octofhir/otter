@@ -31,13 +31,10 @@ impl IntrinsicInstaller for SymbolIntrinsic {
         intrinsics: &mut VmIntrinsics,
         cx: &mut IntrinsicInstallContext<'_>,
     ) -> Result<(), IntrinsicsError> {
-        let constructor_id = cx
-            .native_functions
-            .register(NativeFunctionDescriptor::constructor(
-                "Symbol",
-                0,
-                symbol_function,
-            ));
+        let constructor_id = cx.native_functions.register(
+            NativeFunctionDescriptor::constructor("Symbol", 0, symbol_function)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::SymbolPrototype),
+        );
         let constructor =
             cx.alloc_intrinsic_host_function(constructor_id, intrinsics.function_prototype())?;
         install_function_length_name(constructor, 0, "Symbol", cx)?;

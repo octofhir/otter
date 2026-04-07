@@ -86,11 +86,10 @@ fn type_error(
 
 fn weakref_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("WeakRef")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "WeakRef",
-            1,
-            weakref_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("WeakRef", 1, weakref_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::WeakRefPrototype),
+        )
         .with_binding(proto("deref", 0, weakref_deref))
 }
 
@@ -204,11 +203,14 @@ fn weakref_deref(
 
 fn finalization_registry_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("FinalizationRegistry")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "FinalizationRegistry",
-            1,
-            finalization_registry_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor(
+                "FinalizationRegistry",
+                1,
+                finalization_registry_constructor,
+            )
+            .with_default_intrinsic(crate::intrinsics::IntrinsicKey::FinalizationRegistryPrototype),
+        )
         .with_binding(proto("register", 2, finalization_registry_register))
         .with_binding(proto("unregister", 1, finalization_registry_unregister))
 }

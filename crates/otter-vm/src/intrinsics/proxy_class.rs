@@ -163,7 +163,8 @@ fn proxy_revocable(
     let revoke_desc = NativeFunctionDescriptor::method("", 0, proxy_revoke_function);
     let revoke_id = runtime.register_native_function(revoke_desc);
     let fn_proto = runtime.intrinsics().function_prototype();
-    let revoke_fn = runtime.objects_mut().alloc_host_function(revoke_id);
+    let realm = runtime.current_realm_id();
+    let revoke_fn = runtime.objects_mut().alloc_host_function(revoke_id, realm);
     let _ = runtime
         .objects_mut()
         .set_prototype(revoke_fn, Some(fn_proto));

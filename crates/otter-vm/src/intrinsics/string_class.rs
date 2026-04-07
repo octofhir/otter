@@ -120,11 +120,10 @@ fn static_method(
 
 fn string_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("String")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "String",
-            1,
-            string_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("String", 1, string_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::StringPrototype),
+        )
         // ── Static methods ──
         .with_binding(static_method("fromCharCode", 1, string_from_char_code))
         .with_binding(static_method("fromCodePoint", 1, string_from_code_point))

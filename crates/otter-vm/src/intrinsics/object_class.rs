@@ -72,11 +72,10 @@ impl IntrinsicInstaller for ObjectIntrinsic {
 
 fn object_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Object")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Object",
-            1,
-            object_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Object", 1, object_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::ObjectPrototype),
+        )
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("toString", 0, object_to_string),

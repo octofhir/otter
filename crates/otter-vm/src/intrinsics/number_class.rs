@@ -77,11 +77,10 @@ impl IntrinsicInstaller for NumberIntrinsic {
 
 fn number_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Number")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Number",
-            1,
-            number_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Number", 1, number_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::NumberPrototype),
+        )
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("valueOf", 0, number_value_of),

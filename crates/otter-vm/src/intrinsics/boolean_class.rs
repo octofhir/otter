@@ -65,11 +65,10 @@ impl IntrinsicInstaller for BooleanIntrinsic {
 
 fn boolean_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Boolean")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Boolean",
-            1,
-            boolean_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Boolean", 1, boolean_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::BooleanPrototype),
+        )
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("toString", 0, boolean_to_string),

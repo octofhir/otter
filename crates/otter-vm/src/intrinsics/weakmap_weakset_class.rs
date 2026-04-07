@@ -74,11 +74,10 @@ fn proto(
 
 fn weakmap_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("WeakMap")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "WeakMap",
-            0,
-            weakmap_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("WeakMap", 0, weakmap_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::WeakMapPrototype),
+        )
         .with_binding(proto("get", 1, weakmap_get))
         .with_binding(proto("set", 2, weakmap_set))
         .with_binding(proto("has", 1, weakmap_has))
@@ -276,11 +275,10 @@ fn require_weakmap(
 
 fn weakset_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("WeakSet")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "WeakSet",
-            0,
-            weakset_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("WeakSet", 0, weakset_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::WeakSetPrototype),
+        )
         .with_binding(proto("add", 1, weakset_add))
         .with_binding(proto("has", 1, weakset_has))
         .with_binding(proto("delete", 1, weakset_delete))

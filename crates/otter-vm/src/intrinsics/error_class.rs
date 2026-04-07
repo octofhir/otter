@@ -11,7 +11,7 @@ use crate::object::{HeapValueKind, ObjectHandle, PropertyAttributes, PropertyVal
 use crate::value::RegisterValue;
 
 use super::{
-    IntrinsicsError, VmIntrinsics,
+    IntrinsicKey, IntrinsicsError, VmIntrinsics,
     install::{
         IntrinsicInstallContext, IntrinsicInstaller, install_class_plan,
         install_function_length_name,
@@ -32,6 +32,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         // Install each error type using the same class builder pattern.
         install_error_class(
             "Error",
+            IntrinsicKey::ErrorPrototype,
             intrinsics.error_prototype,
             &mut intrinsics.error_constructor,
             intrinsics.function_prototype,
@@ -39,6 +40,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "TypeError",
+            IntrinsicKey::TypeErrorPrototype,
             intrinsics.type_error_prototype,
             &mut intrinsics.type_error_constructor,
             intrinsics.function_prototype,
@@ -46,6 +48,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "ReferenceError",
+            IntrinsicKey::ReferenceErrorPrototype,
             intrinsics.reference_error_prototype,
             &mut intrinsics.reference_error_constructor,
             intrinsics.function_prototype,
@@ -53,6 +56,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "RangeError",
+            IntrinsicKey::RangeErrorPrototype,
             intrinsics.range_error_prototype,
             &mut intrinsics.range_error_constructor,
             intrinsics.function_prototype,
@@ -60,6 +64,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "SyntaxError",
+            IntrinsicKey::SyntaxErrorPrototype,
             intrinsics.syntax_error_prototype,
             &mut intrinsics.syntax_error_constructor,
             intrinsics.function_prototype,
@@ -67,6 +72,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "URIError",
+            IntrinsicKey::URIErrorPrototype,
             intrinsics.uri_error_prototype,
             &mut intrinsics.uri_error_constructor,
             intrinsics.function_prototype,
@@ -74,6 +80,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
         )?;
         install_error_class(
             "EvalError",
+            IntrinsicKey::EvalErrorPrototype,
             intrinsics.eval_error_prototype,
             &mut intrinsics.eval_error_constructor,
             intrinsics.function_prototype,
@@ -121,22 +128,22 @@ impl IntrinsicInstaller for ErrorIntrinsic {
     }
 }
 
-fn error_class_descriptor(name: &str) -> JsClassDescriptor {
-    JsClassDescriptor::new(name).with_constructor(NativeFunctionDescriptor::constructor(
-        name,
-        1,
-        error_constructor,
-    ))
+fn error_class_descriptor(name: &str, intrinsic_default: IntrinsicKey) -> JsClassDescriptor {
+    JsClassDescriptor::new(name).with_constructor(
+        NativeFunctionDescriptor::constructor(name, 1, error_constructor)
+            .with_default_intrinsic(intrinsic_default),
+    )
 }
 
 fn install_error_class(
     name: &str,
+    intrinsic_default: IntrinsicKey,
     prototype: ObjectHandle,
     constructor: &mut ObjectHandle,
     function_prototype: ObjectHandle,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let descriptor = error_class_descriptor(name);
+    let descriptor = error_class_descriptor(name, intrinsic_default);
     let plan = ClassBuilder::from_descriptor(&descriptor)
         .expect("Error class descriptor should normalize")
         .build();
@@ -190,7 +197,8 @@ fn install_aggregate_error_class(
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
     let descriptor = JsClassDescriptor::new("AggregateError").with_constructor(
-        NativeFunctionDescriptor::constructor("AggregateError", 2, aggregate_error_constructor),
+        NativeFunctionDescriptor::constructor("AggregateError", 2, aggregate_error_constructor)
+            .with_default_intrinsic(IntrinsicKey::AggregateErrorPrototype),
     );
     let plan = ClassBuilder::from_descriptor(&descriptor)
         .expect("AggregateError class descriptor should normalize")

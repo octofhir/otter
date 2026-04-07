@@ -73,6 +73,11 @@ pub struct NativeFunctionDescriptor {
     entrypoint_kind: NativeEntrypointKind,
     slot_kind: NativeSlotKind,
     callback: VmNativeFunction,
+    /// §10.1.14 — Default `intrinsicDefaultProto` to use when this descriptor is
+    /// invoked as a constructor and `newTarget.prototype` is not an object.
+    /// `None` for non-constructor descriptors and constructors that have no
+    /// realm-scoped intrinsic prototype (use Object.prototype).
+    default_intrinsic: Option<crate::intrinsics::IntrinsicKey>,
 }
 
 impl NativeFunctionDescriptor {
@@ -91,7 +96,17 @@ impl NativeFunctionDescriptor {
             entrypoint_kind,
             slot_kind,
             callback,
+            default_intrinsic: None,
         }
+    }
+
+    /// Sets the default `intrinsicDefaultProto` (§10.1.14) used when this
+    /// descriptor is invoked as a constructor and `newTarget.prototype` is not
+    /// an object.
+    #[must_use]
+    pub fn with_default_intrinsic(mut self, key: crate::intrinsics::IntrinsicKey) -> Self {
+        self.default_intrinsic = Some(key);
+        self
     }
 
     /// Convenience constructor for an instance or namespace method.
@@ -190,6 +205,13 @@ impl NativeFunctionDescriptor {
     #[must_use]
     pub fn callback(&self) -> &VmNativeFunction {
         &self.callback
+    }
+
+    /// Returns the `intrinsicDefaultProto` (§10.1.14) for this descriptor when
+    /// it acts as a constructor, if any.
+    #[must_use]
+    pub const fn default_intrinsic(&self) -> Option<crate::intrinsics::IntrinsicKey> {
+        self.default_intrinsic
     }
 }
 

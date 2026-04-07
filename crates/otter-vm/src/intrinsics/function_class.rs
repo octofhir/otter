@@ -164,11 +164,10 @@ impl IntrinsicInstaller for FunctionIntrinsic {
 
 fn function_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Function")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Function",
-            1,
-            function_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Function", 1, function_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::FunctionPrototype),
+        )
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,
             NativeFunctionDescriptor::method("call", 1, function_call),
@@ -315,9 +314,11 @@ fn function_bind(
     let bound_name = target_function_name(target, runtime)?;
 
     // ES2024 §10.4.1.3 BoundFunctionCreate — create a proper bound function exotic object.
+    // Step 2: Set obj.[[Realm]] to ? GetFunctionRealm(target).
+    let target_realm = runtime.get_function_realm(target);
     let bound = runtime
         .objects_mut()
-        .alloc_bound_function(target, bound_this, bound_args)
+        .alloc_bound_function(target, bound_this, bound_args, target_realm)
         .map_err(|error| {
             VmNativeCallError::Internal(format!("bound function alloc: {error:?}").into())
         })?;

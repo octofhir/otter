@@ -525,7 +525,23 @@ fn make_concrete_constructor(kind: TypedArrayKind) -> NativeFunctionDescriptor {
         TypedArrayKind::BigInt64 => bigint64_array_constructor,
         TypedArrayKind::BigUint64 => biguint64_array_constructor,
     };
+    let intrinsic = match kind {
+        TypedArrayKind::Int8 => crate::intrinsics::IntrinsicKey::Int8ArrayPrototype,
+        TypedArrayKind::Uint8 => crate::intrinsics::IntrinsicKey::Uint8ArrayPrototype,
+        TypedArrayKind::Uint8Clamped => {
+            crate::intrinsics::IntrinsicKey::Uint8ClampedArrayPrototype
+        }
+        TypedArrayKind::Int16 => crate::intrinsics::IntrinsicKey::Int16ArrayPrototype,
+        TypedArrayKind::Uint16 => crate::intrinsics::IntrinsicKey::Uint16ArrayPrototype,
+        TypedArrayKind::Int32 => crate::intrinsics::IntrinsicKey::Int32ArrayPrototype,
+        TypedArrayKind::Uint32 => crate::intrinsics::IntrinsicKey::Uint32ArrayPrototype,
+        TypedArrayKind::Float32 => crate::intrinsics::IntrinsicKey::Float32ArrayPrototype,
+        TypedArrayKind::Float64 => crate::intrinsics::IntrinsicKey::Float64ArrayPrototype,
+        TypedArrayKind::BigInt64 => crate::intrinsics::IntrinsicKey::BigInt64ArrayPrototype,
+        TypedArrayKind::BigUint64 => crate::intrinsics::IntrinsicKey::BigUint64ArrayPrototype,
+    };
     NativeFunctionDescriptor::constructor(kind.constructor_name(), 3, ctor_fn)
+        .with_default_intrinsic(intrinsic)
 }
 
 // ── %TypedArray% base constructor ───────────────────────────────────

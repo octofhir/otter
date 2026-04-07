@@ -33,7 +33,7 @@ pub fn install_temporal_now(
     for &(name, arity, func) in methods {
         let desc = NativeFunctionDescriptor::method(name, arity, func);
         let host_id = cx.native_functions.register(desc);
-        let fn_handle = cx.heap.alloc_host_function(host_id);
+        let fn_handle = cx.heap.alloc_host_function(host_id, cx.realm);
         cx.heap
             .set_prototype(fn_handle, Some(intrinsics.function_prototype()))?;
         let prop = cx.property_names.intern(name);

@@ -128,11 +128,14 @@ fn proto(
 
 fn shared_array_buffer_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("SharedArrayBuffer")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "SharedArrayBuffer",
-            1,
-            shared_array_buffer_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor(
+                "SharedArrayBuffer",
+                1,
+                shared_array_buffer_constructor,
+            )
+            .with_default_intrinsic(crate::intrinsics::IntrinsicKey::SharedArrayBufferPrototype),
+        )
         .with_binding(proto("grow", 1, shared_array_buffer_grow))
         .with_binding(proto("slice", 2, shared_array_buffer_slice))
 }

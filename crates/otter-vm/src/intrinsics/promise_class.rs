@@ -75,11 +75,10 @@ impl IntrinsicInstaller for PromiseIntrinsic {
 
 fn promise_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Promise")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Promise",
-            1,
-            promise_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Promise", 1, promise_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::PromisePrototype),
+        )
         // Prototype methods — §27.2.5
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Prototype,

@@ -116,11 +116,10 @@ impl IntrinsicInstaller for ArrayIntrinsic {
 
 fn array_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Array")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Array",
-            1,
-            array_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Array", 1, array_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::ArrayPrototype),
+        )
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,
             NativeFunctionDescriptor::method("isArray", 1, array_is_array),

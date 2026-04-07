@@ -879,6 +879,10 @@ enum HeapValue {
         module: Module,
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
+        /// §10.2 ECMAScript Function Objects — `[[Realm]]` slot.
+        /// The realm in which this closure was created.
+        /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-function-objects>
+        realm: crate::realm::RealmId,
         /// §15.7.14 — class field initializer closure, if this is a class constructor.
         /// Stored during ClassDefinitionEvaluation, invoked by RunClassFieldInitializer.
         /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
@@ -904,6 +908,10 @@ enum HeapValue {
         shape_id: ObjectShapeId,
         keys: Vec<PropertyNameId>,
         values: Vec<PropertyValue>,
+        /// §10.2 ECMAScript Function Objects — `[[Realm]]` slot.
+        /// The realm in which this host function was installed.
+        /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-function-objects>
+        realm: crate::realm::RealmId,
     },
     /// ES2024 §10.4.1 Bound Function Exotic Objects.
     BoundFunction {
@@ -915,6 +923,9 @@ enum HeapValue {
         target: ObjectHandle,
         bound_this: RegisterValue,
         bound_args: Vec<RegisterValue>,
+        /// §10.4.1 Bound Function Exotic Objects — `[[Realm]]` slot.
+        /// Spec: <https://tc39.es/ecma262/#sec-bound-function-exotic-objects>
+        realm: crate::realm::RealmId,
     },
     UpvalueCell {
         value: RegisterValue,
@@ -3558,6 +3569,7 @@ impl ObjectHeap {
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
         flags: ClosureFlags,
+        realm: crate::realm::RealmId,
     ) -> ObjectHandle {
         let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::Closure {
@@ -3574,12 +3586,17 @@ impl ObjectHeap {
             class_id: 0,
             private_methods: Vec::new(),
             private_elements: Vec::new(),
+            realm,
         });
         ObjectHandle(h.0)
     }
 
     /// Allocates a host-callable native function object.
-    pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
+    pub fn alloc_host_function(
+        &mut self,
+        function: HostFunctionId,
+        realm: crate::realm::RealmId,
+    ) -> ObjectHandle {
         let shape_id = self.allocate_shape();
         let h = self.heap.alloc(HeapValue::HostFunction {
             function,
@@ -3588,6 +3605,7 @@ impl ObjectHeap {
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
+            realm,
         });
         ObjectHandle(h.0)
     }
@@ -4829,6 +4847,33 @@ impl ObjectHeap {
     pub fn closure_callee(&self, handle: ObjectHandle) -> Result<FunctionIndex, ObjectError> {
         match self.object(handle)? {
             HeapValue::Closure { callee, .. } => Ok(*callee),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the `[[Realm]]` slot stored on a callable object, if any.
+    /// Returns `None` for non-callable values; for bound functions and proxies the
+    /// caller is responsible for traversing further per §10.2.3 GetFunctionRealm.
+    /// Spec: <https://tc39.es/ecma262/#sec-getfunctionrealm>
+    pub fn function_realm(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<crate::realm::RealmId>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure { realm, .. }
+            | HeapValue::HostFunction { realm, .. }
+            | HeapValue::BoundFunction { realm, .. } => Ok(Some(*realm)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Returns the target stored in a bound function exotic object.
+    pub fn bound_function_target(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::BoundFunction { target, .. } => Ok(*target),
             _ => Err(ObjectError::InvalidKind),
         }
     }
@@ -6357,11 +6402,14 @@ impl ObjectHeap {
     }
 
     /// ES2024 §10.4.1.3 — Allocates a bound function exotic object.
+    /// The `realm` is taken from the target via `function_realm`, falling back to
+    /// the caller's current realm.
     pub fn alloc_bound_function(
         &mut self,
         target: ObjectHandle,
         bound_this: RegisterValue,
         bound_args: Vec<RegisterValue>,
+        realm: crate::realm::RealmId,
     ) -> Result<ObjectHandle, ObjectError> {
         let prototype = self.get_prototype(target)?;
         let shape_id = self.allocate_shape();
@@ -6374,6 +6422,7 @@ impl ObjectHeap {
             target,
             bound_this,
             bound_args,
+            realm,
         });
         Ok(ObjectHandle(h.0))
     }
@@ -8081,6 +8130,7 @@ mod tests {
             FunctionIndex(7),
             vec![upvalue],
             ClosureFlags::normal(),
+            0,
         );
 
         assert_eq!(heap.kind(closure), Ok(HeapValueKind::Closure));
@@ -8102,7 +8152,7 @@ mod tests {
     #[test]
     fn object_heap_supports_host_function_objects() {
         let mut heap = ObjectHeap::new();
-        let function = heap.alloc_host_function(HostFunctionId(7));
+        let function = heap.alloc_host_function(HostFunctionId(7), 0);
         let property = PropertyNameId(0);
 
         assert_eq!(heap.kind(function), Ok(HeapValueKind::HostFunction));

@@ -108,7 +108,9 @@ pub use frame::FrameLayout;
 pub use host::{HostFunctionId, NativeFunctionRegistry};
 pub use host_callbacks::HostCallbackSender;
 pub use interpreter::{Interpreter, RuntimeState};
-pub use intrinsics::{IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
+pub use intrinsics::{
+    IntrinsicKey, IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol,
+};
 pub use module::{
     ExportRecord, Function, FunctionIndex, ImportBinding, ImportRecord, Module, ModuleError,
 };

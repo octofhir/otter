@@ -143,11 +143,10 @@ fn stat(
 
 fn array_buffer_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("ArrayBuffer")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "ArrayBuffer",
-            1,
-            array_buffer_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("ArrayBuffer", 1, array_buffer_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::ArrayBufferPrototype),
+        )
         .with_binding(proto("slice", 2, array_buffer_slice))
         .with_binding(proto("resize", 1, array_buffer_resize))
         .with_binding(proto("transfer", 0, array_buffer_transfer))

@@ -10,6 +10,10 @@ pub(super) struct IntrinsicInstallContext<'a> {
     pub(super) heap: &'a mut ObjectHeap,
     pub(super) property_names: &'a mut PropertyNameRegistry,
     pub(super) native_functions: &'a mut NativeFunctionRegistry,
+    /// §9.3 The realm whose intrinsics are currently being installed.
+    /// All host functions allocated through this context inherit this realm
+    /// as their `[[Realm]]` slot per §10.2.
+    pub(super) realm: crate::realm::RealmId,
 }
 
 impl<'a> IntrinsicInstallContext<'a> {
@@ -17,11 +21,13 @@ impl<'a> IntrinsicInstallContext<'a> {
         heap: &'a mut ObjectHeap,
         property_names: &'a mut PropertyNameRegistry,
         native_functions: &'a mut NativeFunctionRegistry,
+        realm: crate::realm::RealmId,
     ) -> Self {
         Self {
             heap,
             property_names,
             native_functions,
+            realm,
         }
     }
 
@@ -57,7 +63,7 @@ impl<'a> IntrinsicInstallContext<'a> {
         function: crate::host::HostFunctionId,
         prototype: ObjectHandle,
     ) -> Result<ObjectHandle, IntrinsicsError> {
-        let handle = self.heap.alloc_host_function(function);
+        let handle = self.heap.alloc_host_function(function, self.realm);
         self.heap.set_prototype(handle, Some(prototype))?;
         Ok(handle)
     }
@@ -290,8 +296,12 @@ mod tests {
             .expect("intrinsic prototype wiring should succeed");
 
         let namespace = {
-            let mut cx =
-                IntrinsicInstallContext::new(&mut heap, &mut property_names, &mut native_functions);
+            let mut cx = IntrinsicInstallContext::new(
+                &mut heap,
+                &mut property_names,
+                &mut native_functions,
+                0,
+            );
             let namespace = cx
                 .alloc_intrinsic_object(Some(intrinsics.object_prototype()))
                 .expect("namespace object should allocate");

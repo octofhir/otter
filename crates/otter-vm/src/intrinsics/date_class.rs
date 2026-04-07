@@ -761,11 +761,10 @@ fn install_symbol_method(
 
 fn date_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("Date")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "Date",
-            7,
-            date_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("Date", 7, date_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::DatePrototype),
+        )
         // ── Static methods ──
         .with_binding(NativeBindingDescriptor::new(
             NativeBindingTarget::Constructor,

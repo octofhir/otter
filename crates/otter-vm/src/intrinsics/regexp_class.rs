@@ -270,11 +270,10 @@ fn proto_method(
 
 fn regexp_class_descriptor() -> JsClassDescriptor {
     JsClassDescriptor::new("RegExp")
-        .with_constructor(NativeFunctionDescriptor::constructor(
-            "RegExp",
-            2,
-            regexp_constructor,
-        ))
+        .with_constructor(
+            NativeFunctionDescriptor::constructor("RegExp", 2, regexp_constructor)
+                .with_default_intrinsic(crate::intrinsics::IntrinsicKey::RegExpPrototype),
+        )
         .with_binding(proto_method("exec", 1, regexp_exec))
         .with_binding(proto_method("test", 1, regexp_test))
         .with_binding(proto_method("toString", 0, regexp_to_string))

@@ -124,6 +124,94 @@ pub enum IntrinsicRoot {
     Symbol(WellKnownSymbol),
 }
 
+/// §10.1.14 GetPrototypeFromConstructor — symbolic reference to a realm-scoped
+/// intrinsic prototype object. Each variant corresponds to a `%Foo.prototype%`
+/// reference in the spec text and is used as the `intrinsicDefaultProto` argument
+/// when allocating a new object whose constructor's `.prototype` is not an Object.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntrinsicKey {
+    /// `%Object.prototype%`
+    ObjectPrototype,
+    /// `%Function.prototype%`
+    FunctionPrototype,
+    /// `%Array.prototype%`
+    ArrayPrototype,
+    /// `%Error.prototype%`
+    ErrorPrototype,
+    /// `%TypeError.prototype%`
+    TypeErrorPrototype,
+    /// `%RangeError.prototype%`
+    RangeErrorPrototype,
+    /// `%ReferenceError.prototype%`
+    ReferenceErrorPrototype,
+    /// `%SyntaxError.prototype%`
+    SyntaxErrorPrototype,
+    /// `%URIError.prototype%`
+    URIErrorPrototype,
+    /// `%EvalError.prototype%`
+    EvalErrorPrototype,
+    /// `%AggregateError.prototype%`
+    AggregateErrorPrototype,
+    /// `%Promise.prototype%`
+    PromisePrototype,
+    /// `%Map.prototype%`
+    MapPrototype,
+    /// `%Set.prototype%`
+    SetPrototype,
+    /// `%WeakMap.prototype%`
+    WeakMapPrototype,
+    /// `%WeakSet.prototype%`
+    WeakSetPrototype,
+    /// `%WeakRef.prototype%`
+    WeakRefPrototype,
+    /// `%FinalizationRegistry.prototype%`
+    FinalizationRegistryPrototype,
+    /// `%ArrayBuffer.prototype%`
+    ArrayBufferPrototype,
+    /// `%SharedArrayBuffer.prototype%`
+    SharedArrayBufferPrototype,
+    /// `%DataView.prototype%`
+    DataViewPrototype,
+    /// `%Date.prototype%`
+    DatePrototype,
+    /// `%RegExp.prototype%`
+    RegExpPrototype,
+    /// `%String.prototype%`
+    StringPrototype,
+    /// `%Number.prototype%`
+    NumberPrototype,
+    /// `%BigInt.prototype%`
+    BigIntPrototype,
+    /// `%Boolean.prototype%`
+    BooleanPrototype,
+    /// `%Symbol.prototype%`
+    SymbolPrototype,
+    /// `%Int8Array.prototype%`
+    Int8ArrayPrototype,
+    /// `%Uint8Array.prototype%`
+    Uint8ArrayPrototype,
+    /// `%Uint8ClampedArray.prototype%`
+    Uint8ClampedArrayPrototype,
+    /// `%Int16Array.prototype%`
+    Int16ArrayPrototype,
+    /// `%Uint16Array.prototype%`
+    Uint16ArrayPrototype,
+    /// `%Int32Array.prototype%`
+    Int32ArrayPrototype,
+    /// `%Uint32Array.prototype%`
+    Uint32ArrayPrototype,
+    /// `%Float32Array.prototype%`
+    Float32ArrayPrototype,
+    /// `%Float64Array.prototype%`
+    Float64ArrayPrototype,
+    /// `%BigInt64Array.prototype%`
+    BigInt64ArrayPrototype,
+    /// `%BigUint64Array.prototype%`
+    BigUint64ArrayPrototype,
+}
+
 /// Shared list of ECMAScript globals installed by the new-VM intrinsic bootstrap.
 pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "Object",
@@ -399,6 +487,56 @@ fn throw_type_error_native(
 }
 
 impl VmIntrinsics {
+    /// Returns the realm-scoped intrinsic prototype handle for the given key.
+    /// Used by `GetPrototypeFromConstructor` (§10.1.14) when a constructor's
+    /// `.prototype` is not an Object — the implementation falls back to the
+    /// realm's `%intrinsicDefaultProto%` named here.
+    /// Spec: <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    #[must_use]
+    pub fn get(&self, key: IntrinsicKey) -> ObjectHandle {
+        match key {
+            IntrinsicKey::ObjectPrototype => self.object_prototype,
+            IntrinsicKey::FunctionPrototype => self.function_prototype,
+            IntrinsicKey::ArrayPrototype => self.array_prototype,
+            IntrinsicKey::ErrorPrototype => self.error_prototype,
+            IntrinsicKey::TypeErrorPrototype => self.type_error_prototype,
+            IntrinsicKey::RangeErrorPrototype => self.range_error_prototype,
+            IntrinsicKey::ReferenceErrorPrototype => self.reference_error_prototype,
+            IntrinsicKey::SyntaxErrorPrototype => self.syntax_error_prototype,
+            IntrinsicKey::URIErrorPrototype => self.uri_error_prototype,
+            IntrinsicKey::EvalErrorPrototype => self.eval_error_prototype,
+            IntrinsicKey::AggregateErrorPrototype => self.aggregate_error_prototype,
+            IntrinsicKey::PromisePrototype => self.promise_prototype,
+            IntrinsicKey::MapPrototype => self.map_prototype,
+            IntrinsicKey::SetPrototype => self.set_prototype,
+            IntrinsicKey::WeakMapPrototype => self.weakmap_prototype,
+            IntrinsicKey::WeakSetPrototype => self.weakset_prototype,
+            IntrinsicKey::WeakRefPrototype => self.weakref_prototype,
+            IntrinsicKey::FinalizationRegistryPrototype => self.finalization_registry_prototype,
+            IntrinsicKey::ArrayBufferPrototype => self.array_buffer_prototype,
+            IntrinsicKey::SharedArrayBufferPrototype => self.shared_array_buffer_prototype,
+            IntrinsicKey::DataViewPrototype => self.data_view_prototype,
+            IntrinsicKey::DatePrototype => self.date_prototype,
+            IntrinsicKey::RegExpPrototype => self.regexp_prototype,
+            IntrinsicKey::StringPrototype => self.string_prototype,
+            IntrinsicKey::NumberPrototype => self.number_prototype,
+            IntrinsicKey::BigIntPrototype => self.bigint_prototype,
+            IntrinsicKey::BooleanPrototype => self.boolean_prototype,
+            IntrinsicKey::SymbolPrototype => self.symbol_prototype,
+            IntrinsicKey::Int8ArrayPrototype => self.int8_array_prototype,
+            IntrinsicKey::Uint8ArrayPrototype => self.uint8_array_prototype,
+            IntrinsicKey::Uint8ClampedArrayPrototype => self.uint8_clamped_array_prototype,
+            IntrinsicKey::Int16ArrayPrototype => self.int16_array_prototype,
+            IntrinsicKey::Uint16ArrayPrototype => self.uint16_array_prototype,
+            IntrinsicKey::Int32ArrayPrototype => self.int32_array_prototype,
+            IntrinsicKey::Uint32ArrayPrototype => self.uint32_array_prototype,
+            IntrinsicKey::Float32ArrayPrototype => self.float32_array_prototype,
+            IntrinsicKey::Float64ArrayPrototype => self.float64_array_prototype,
+            IntrinsicKey::BigInt64ArrayPrototype => self.bigint64_array_prototype,
+            IntrinsicKey::BigUint64ArrayPrototype => self.biguint64_array_prototype,
+        }
+    }
+
     /// Allocates the minimal intrinsic root set.
     pub fn allocate(heap: &mut ObjectHeap) -> Self {
         let global_object = heap.alloc_object();
@@ -916,17 +1054,23 @@ impl VmIntrinsics {
     }
 
     /// Populates intrinsic objects with core methods/properties.
+    ///
+    /// `realm_id` is the realm whose intrinsics are being installed; all host
+    /// functions allocated through the install context will inherit it as their
+    /// `[[Realm]]` slot per §10.2.
     pub fn init_core(
         &mut self,
         heap: &mut ObjectHeap,
         property_names: &mut PropertyNameRegistry,
         native_functions: &mut NativeFunctionRegistry,
+        realm_id: crate::realm::RealmId,
     ) -> Result<(), IntrinsicsError> {
         if self.stage != IntrinsicsStage::Wired {
             return Err(IntrinsicsError::InvalidLifecycleStage);
         }
 
-        let mut cx = IntrinsicInstallContext::new(heap, property_names, native_functions);
+        let mut cx =
+            IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
         for installer in core_installers() {
             installer.init(self, &mut cx)?;
         }
@@ -941,12 +1085,14 @@ impl VmIntrinsics {
         heap: &mut ObjectHeap,
         property_names: &mut PropertyNameRegistry,
         native_functions: &mut NativeFunctionRegistry,
+        realm_id: crate::realm::RealmId,
     ) -> Result<(), IntrinsicsError> {
         if self.stage != IntrinsicsStage::Initialized {
             return Err(IntrinsicsError::InvalidLifecycleStage);
         }
 
-        let mut cx = IntrinsicInstallContext::new(heap, property_names, native_functions);
+        let mut cx =
+            IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
         for installer in core_installers() {
             installer.install_on_global(self, &mut cx)?;
         }
@@ -1825,12 +1971,12 @@ mod tests {
         assert_eq!(intrinsics.stage(), IntrinsicsStage::Wired);
 
         intrinsics
-            .init_core(&mut heap, &mut property_names, &mut native_functions)
+            .init_core(&mut heap, &mut property_names, &mut native_functions, 0)
             .expect("init should succeed");
         assert_eq!(intrinsics.stage(), IntrinsicsStage::Initialized);
 
         intrinsics
-            .install_on_global(&mut heap, &mut property_names, &mut native_functions)
+            .install_on_global(&mut heap, &mut property_names, &mut native_functions, 0)
             .expect("install should succeed");
         assert_eq!(intrinsics.stage(), IntrinsicsStage::Installed);
 

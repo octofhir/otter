@@ -691,11 +691,40 @@ fn array_length(
     runtime: &mut crate::interpreter::RuntimeState,
     op: &str,
 ) -> Result<usize, VmNativeCallError> {
-    runtime
-        .objects()
-        .array_length(receiver)
-        .map_err(|error| VmNativeCallError::Internal(format!("{op}: {error:?}").into()))?
-        .ok_or_else(|| VmNativeCallError::Internal(format!("{op} requires array receiver").into()))
+    // Per §23.1.3 every Array.prototype method (except a few that
+    // explicitly require a real Array) walks through
+    //   1. Let O be ? ToObject(this value).
+    //   2. Let len be ? LengthOfArrayLike(O).
+    // — i.e. they are all generic over array-like receivers. If the
+    // receiver happens to be a real dense Array the fast internal
+    // `array_length` returns the tracked length in O(1); otherwise we
+    // fall back to `LengthOfArrayLike` which reads the `"length"`
+    // property and applies ToLength. This makes
+    // `Array.prototype.reduce.call({0:'a',1:'b',length:2}, ...)`,
+    // `Array.prototype.map.call(arguments, ...)`, and every other
+    // `Array.prototype.*.call(arrayLike, ...)` idiom work.
+    //
+    // Spec: <https://tc39.es/ecma262/#sec-array-prototype-object>
+    //       <https://tc39.es/ecma262/#sec-lengthofarraylike>
+    if let Ok(Some(len)) = runtime.objects().array_length(receiver) {
+        return Ok(len);
+    }
+    let len = length_of_array_like(receiver, runtime)?;
+    // Pragmatic cap for non-Array array-like receivers. Real engines
+    // (V8, SpiderMonkey) walk sparse property keys instead of iterating
+    // 0..len when the spec-clamped length would otherwise force a
+    // 9 quadrillion iteration loop on objects like
+    // `{ length: Infinity, 0: 'a' }`. Until that sparse-aware path is
+    // implemented (TODO), we surface a catchable RangeError so the
+    // runner doesn't hang for hours on tests like
+    // `built-ins/Array/prototype/includes/length-boundaries.js`.
+    const NON_ARRAY_LEN_CAP: usize = 1 << 24; // 16M iterations
+    if len > NON_ARRAY_LEN_CAP {
+        return Err(runtime.throw_range_error(&format!(
+            "{op}: array-like receiver length {len} exceeds the {NON_ARRAY_LEN_CAP} iteration cap"
+        )));
+    }
+    Ok(len)
 }
 
 /// ES2024 §7.3.2 LengthOfArrayLike(obj)

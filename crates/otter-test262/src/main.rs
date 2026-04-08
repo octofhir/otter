@@ -18,6 +18,7 @@ use otter_runtime::{
     NativeFunctionDescriptor, OtterRuntime, RegisterValue, RunError, RuntimeState,
     VmNativeCallError,
 };
+use otter_test262::config::Test262Config;
 use otter_test262::metadata::{ExecutionMode, TestMetadata};
 use otter_test262::{RunSummary, TestOutcome, TestResult};
 
@@ -32,6 +33,13 @@ struct Cli {
     /// Path to test262 directory
     #[arg(short, long, default_value = "tests/test262")]
     test_dir: PathBuf,
+
+    /// Path to the TOML config file (default: `test262_config.toml` in the
+    /// current working directory). The config provides the default list of
+    /// skipped features, ignored test-path patterns, and known-panic
+    /// patterns. CLI flags still take precedence over values it supplies.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Filter tests by path pattern
     #[arg(short, long)]
@@ -191,6 +199,15 @@ struct NewVmRunner {
     test_dir: PathBuf,
     filter: Option<String>,
     skip_features: HashSet<String>,
+    /// Test-path substrings (from `test262_config.toml` `ignored_tests`)
+    /// whose matching tests are reported as `Skip` with reason
+    /// "ignored by config". This matches the ad-hoc CLI skipping that was
+    /// previously necessary and keeps pass-rate numbers honest.
+    ignored_test_patterns: Vec<String>,
+    /// Known-panic test-path substrings. Tests matching one of these are
+    /// reported as `Skip` with reason "known panic". The intent is to keep
+    /// the runner moving forward while the underlying crash is fixed.
+    known_panic_patterns: Vec<String>,
     harness_cache: HashMap<String, String>,
     timeout: Duration,
     /// Hard heap cap passed to every `OtterRuntime::builder().max_heap_bytes`
@@ -220,6 +237,8 @@ impl NewVmRunner {
             test_dir: test_dir.to_path_buf(),
             filter: None,
             skip_features: HashSet::new(),
+            ignored_test_patterns: Vec::new(),
+            known_panic_patterns: Vec::new(),
             harness_cache,
             timeout,
             max_heap_bytes,
@@ -242,6 +261,34 @@ impl NewVmRunner {
     fn with_skip_features(mut self, features: Vec<String>) -> Self {
         self.skip_features = features.into_iter().collect();
         self
+    }
+
+    fn with_ignored_tests(mut self, patterns: Vec<String>) -> Self {
+        self.ignored_test_patterns = patterns;
+        self
+    }
+
+    fn with_known_panics(mut self, patterns: Vec<String>) -> Self {
+        self.known_panic_patterns = patterns;
+        self
+    }
+
+    /// Returns Some(reason) if the given normalized test path matches one
+    /// of the configured ignore patterns. The reason is the matched pattern
+    /// itself — both for user visibility and so the summary can group the
+    /// skips by category.
+    fn ignored_reason(&self, path: &str) -> Option<&str> {
+        self.ignored_test_patterns
+            .iter()
+            .find(|p| path.contains(p.as_str()))
+            .map(String::as_str)
+    }
+
+    fn known_panic_reason(&self, path: &str) -> Option<&str> {
+        self.known_panic_patterns
+            .iter()
+            .find(|p| path.contains(p.as_str()))
+            .map(String::as_str)
     }
 
     fn list_tests(&self, subdir: Option<&str>) -> Vec<PathBuf> {
@@ -311,6 +358,34 @@ impl NewVmRunner {
     }
 
     fn run_test_all_modes(&self, path: &Path) -> Vec<TestResult> {
+        let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
+        let relative_path_str = relative_path.to_string_lossy().replace('\\', "/");
+
+        // Config-driven skips: the list lives in `test262_config.toml` so
+        // users can update it without touching Rust. Apply BEFORE reading
+        // the file so known-panic / ignored patterns skip cheaply without
+        // risking a crash on disk I/O paths we already know are broken.
+        if let Some(reason) = self.known_panic_reason(&relative_path_str) {
+            return vec![TestResult {
+                path: relative_path_str,
+                mode: ExecutionMode::NonStrict,
+                outcome: TestOutcome::Skip,
+                duration_ms: 0,
+                error: Some(format!("Known panic: {reason}")),
+                features: vec![],
+            }];
+        }
+        if let Some(reason) = self.ignored_reason(&relative_path_str) {
+            return vec![TestResult {
+                path: relative_path_str,
+                mode: ExecutionMode::NonStrict,
+                outcome: TestOutcome::Skip,
+                duration_ms: 0,
+                error: Some(format!("Ignored by config: {reason}")),
+                features: vec![],
+            }];
+        }
+
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -338,9 +413,6 @@ impl NewVmRunner {
                 }];
             }
         };
-
-        let relative_path = path.strip_prefix(&self.test_dir).unwrap_or(path);
-        let relative_path_str = relative_path.to_string_lossy().replace('\\', "/");
 
         // Skip features.
         for feature in &metadata.features {
@@ -586,18 +658,60 @@ fn main() {
     eprintln!("{}", "Otter Test262 Runner".bold().cyan());
     eprintln!("Test directory: {}", cli.test_dir.display());
 
+    // Load `test262_config.toml` (or the path the user gave via --config).
+    // CLI flags remain authoritative — the config only provides defaults
+    // the user can override.
+    let config = Test262Config::load_or_default(cli.config.as_deref());
+    if !config.skip_features.is_empty() || !config.ignored_tests.is_empty() || !config.known_panics.is_empty() {
+        eprintln!(
+            "Config loaded: skip_features={}, ignored_tests={}, known_panics={}",
+            config.skip_features.len(),
+            config.ignored_tests.len(),
+            config.known_panics.len(),
+        );
+    }
+
+    // Merge CLI `--skip-features` (higher priority) with config defaults.
+    let mut merged_skip_features: Vec<String> = config.skip_features.clone();
+    for feat in &cli.skip_features {
+        if !merged_skip_features.contains(feat) {
+            merged_skip_features.push(feat.clone());
+        }
+    }
+
+    // Resolve timeout: CLI flag wins, then config `timeout_secs`, then
+    // the clap default (5000 ms).
+    let timeout_ms = if cli.timeout != 5000 {
+        cli.timeout
+    } else if let Some(secs) = config.timeout_secs {
+        secs.saturating_mul(1000)
+    } else {
+        cli.timeout
+    };
+
+    // Resolve heap cap the same way.
+    let max_heap_bytes = if cli.max_heap_bytes != 536_870_912 {
+        cli.max_heap_bytes
+    } else if let Some(bytes) = config.max_heap_bytes_per_test {
+        bytes
+    } else {
+        cli.max_heap_bytes
+    };
+
     let mut runner = NewVmRunner::new(
         &cli.test_dir,
-        Duration::from_millis(cli.timeout),
-        cli.max_heap_bytes,
+        Duration::from_millis(timeout_ms),
+        max_heap_bytes,
     )
-    .with_memory_profile(cli.memory_profile, cli.memory_profile_interval);
+    .with_memory_profile(cli.memory_profile, cli.memory_profile_interval)
+    .with_ignored_tests(config.ignored_tests.clone())
+    .with_known_panics(config.known_panics.clone());
 
-    if cli.max_heap_bytes > 0 {
+    if max_heap_bytes > 0 {
         eprintln!(
             "Max heap bytes per test: {} ({} MB)",
-            cli.max_heap_bytes,
-            cli.max_heap_bytes / (1024 * 1024)
+            max_heap_bytes,
+            max_heap_bytes / (1024 * 1024)
         );
     } else {
         eprintln!("Max heap bytes per test: unlimited");
@@ -607,9 +721,9 @@ fn main() {
         runner = runner.with_filter(filter.clone());
         eprintln!("Filter: {filter}");
     }
-    if !cli.skip_features.is_empty() {
-        eprintln!("Skipping features: {:?}", cli.skip_features);
-        runner = runner.with_skip_features(cli.skip_features.clone());
+    if !merged_skip_features.is_empty() {
+        eprintln!("Skipping features: {} total", merged_skip_features.len());
+        runner = runner.with_skip_features(merged_skip_features);
     }
 
     let mut tests = runner.list_tests(cli.subdir.as_deref());

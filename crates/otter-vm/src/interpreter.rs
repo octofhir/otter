@@ -2419,6 +2419,36 @@ impl RuntimeState {
         self.objects.alloc_bigint(value)
     }
 
+    /// Allocates a fully-initialized RegExp instance with the spec-mandated
+    /// own `lastIndex` property.
+    ///
+    /// §22.2.3.1 RegExpCreate / §22.2.3.1.1 RegExpAlloc steps 4-5 require the
+    /// object to expose `lastIndex` as a data property with attributes
+    /// `{ [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: false }`
+    /// and value 0. Defining it up front (instead of letting the first write
+    /// create a writable/enumerable/configurable slot) is what lets
+    /// `/./.lastIndex === 0`, `verifyProperty` checks, and `delete re.lastIndex`
+    /// behave per spec.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-regexpcreate>
+    pub fn alloc_regexp(
+        &mut self,
+        pattern: &str,
+        flags: &str,
+        prototype: Option<ObjectHandle>,
+    ) -> ObjectHandle {
+        let handle = self.objects.alloc_regexp(pattern, flags, prototype);
+        let last_index = self.intern_property_name("lastIndex");
+        let descriptor = crate::object::PropertyValue::data_with_attrs(
+            RegisterValue::from_i32(0),
+            crate::object::PropertyAttributes::from_flags(true, false, false),
+        );
+        self.objects
+            .define_own_property(handle, last_index, descriptor)
+            .ok();
+        handle
+    }
+
     /// Returns the decimal string backing a BigInt handle.
     ///
     /// §6.1.6.2 The BigInt Type
@@ -6124,11 +6154,11 @@ impl Interpreter {
             Opcode::NewRegExp => {
                 let entry = Self::resolve_regexp_literal(function, instruction.b())?;
                 let prototype = runtime.intrinsics().regexp_prototype();
-                let handle = runtime.objects_mut().alloc_regexp(
-                    &entry.pattern,
-                    &entry.flags,
-                    Some(prototype),
-                );
+                // §22.2.3.1 RegExpCreate — the runtime-level helper handles
+                // the spec-mandated `lastIndex` own-property initialization.
+                let pattern = entry.pattern.to_string();
+                let flags = entry.flags.to_string();
+                let handle = runtime.alloc_regexp(&pattern, &flags, Some(prototype));
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),

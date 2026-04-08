@@ -2027,6 +2027,33 @@ impl<'a> FunctionCompiler<'a> {
         Ok(reg)
     }
 
+    /// §19.2.1 — Emits the directive-prologue string literals so their
+    /// values land in the eval completion register. oxc lifts directive
+    /// prologues out of the statement body and into `program.directives`,
+    /// so without this step `eval("'hello'")` would return `undefined`
+    /// instead of `"hello"`.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    pub(super) fn compile_eval_directive_completions(
+        &mut self,
+        directives: &[oxc_ast::ast::Directive<'_>],
+    ) -> Result<(), SourceLoweringError> {
+        debug_assert!(self.mode == LoweringMode::Eval && self.kind == FunctionKind::Script);
+        for directive in directives {
+            // Each directive's string literal evaluates to its cooked
+            // value. We reuse the existing string-literal compile helper
+            // to intern it, then copy the result into the completion
+            // register.
+            let lit = &directive.expression;
+            let value = self.compile_string_literal(lit.value.as_str())?;
+            let completion_reg = self.ensure_eval_completion_register()?;
+            self.instructions
+                .push(Instruction::move_(completion_reg, value.register));
+            self.release(value);
+        }
+        Ok(())
+    }
+
     fn compile_return_statement(
         &mut self,
         return_statement: &oxc_ast::ast::ReturnStatement<'_>,

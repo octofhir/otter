@@ -884,17 +884,32 @@ fn object_define_properties(
     let descriptors = crate::abstract_ops::collect_define_properties(properties, runtime)?;
     let property_names = runtime.property_names().clone();
     for (property, descriptor) in descriptors {
-        let success = runtime
+        let result = runtime
             .objects_mut()
             .define_own_property_from_descriptor_with_registry(
                 target,
                 property,
                 descriptor,
                 &property_names,
-            )
-            .map_err(|e| {
-                VmNativeCallError::Internal(format!("Object.defineProperties: {e:?}").into())
-            })?;
+            );
+        let success = match result {
+            Ok(ok) => ok,
+            Err(crate::object::ObjectError::OutOfMemory) => {
+                // Heap cap hit while growing the dense element vector
+                // (e.g. `defineProperties(arr, { "4294967294": ... })`).
+                // Surface as a catchable `RangeError` per the same pattern
+                // used by Array.prototype methods and `set_array_length`.
+                return Err(runtime.throw_range_error("out of memory: heap limit exceeded"));
+            }
+            Err(crate::object::ObjectError::InvalidArrayLength) => {
+                return Err(runtime.throw_range_error("Invalid array length"));
+            }
+            Err(e) => {
+                return Err(VmNativeCallError::Internal(
+                    format!("Object.defineProperties: {e:?}").into(),
+                ));
+            }
+        };
         if !success {
             return Err(throw_type_error(
                 runtime,

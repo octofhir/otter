@@ -78,7 +78,18 @@ impl<'a> ModuleCompiler<'a> {
         let entry = self.reserve_function();
         // §10.2.1 — Module code is always strict.
         let inherited_strict = is_module || has_use_strict_directive(program.directives.as_slice());
-        let compiled = self.compile_function_from_statements(
+        // §19.2.1 — In Eval mode, directive prologue string literals are
+        // ExpressionStatements at the top level; per §14.1.11 they produce
+        // a completion value, so eval("'hello'") must return "hello".
+        // The oxc parser lifts directives into `program.directives`, so we
+        // thread them through to the entry function compile for Eval mode.
+        let eval_directives: &[oxc_ast::ast::Directive<'_>] =
+            if self.mode == LoweringMode::Eval {
+                program.directives.as_slice()
+            } else {
+                &[]
+            };
+        let compiled = self.compile_function_from_statements_with_options(
             entry,
             FunctionIdentity {
                 debug_name: Some(self.source_url.to_string()),
@@ -90,6 +101,8 @@ impl<'a> ModuleCompiler<'a> {
             FunctionKind::Script,
             Vec::new(),
             inherited_strict,
+            false,
+            eval_directives,
         )?;
         self.functions[entry.0 as usize] = Some(compiled.function);
 
@@ -155,6 +168,7 @@ impl<'a> ModuleCompiler<'a> {
             parent_scopes,
             inherited_strict,
             false,
+            &[],
         )
     }
 
@@ -169,6 +183,7 @@ impl<'a> ModuleCompiler<'a> {
         parent_scopes: Vec<ScopeRef>,
         inherited_strict: bool,
         is_derived_constructor: bool,
+        eval_directives: &[oxc_ast::ast::Directive<'_>],
     ) -> Result<CompiledFunction, SourceLoweringError> {
         let mut compiler = FunctionCompiler::new(
             self.mode,
@@ -197,6 +212,17 @@ impl<'a> ModuleCompiler<'a> {
         }
         compiler.predeclare_function_scope(statements, self)?;
         compiler.emit_hoisted_function_initializers()?;
+        // §19.2.1 — In Eval mode at the script entry, directive prologue
+        // string literals (e.g. the inner `'hello'` in `eval("'hello'")`)
+        // are ExpressionStatements that must contribute to the completion
+        // value, even though oxc exposes them through `program.directives`
+        // instead of `program.body`.
+        if !eval_directives.is_empty()
+            && kind == FunctionKind::Script
+            && self.mode == LoweringMode::Eval
+        {
+            compiler.compile_eval_directive_completions(eval_directives)?;
+        }
         let terminated = compiler.compile_statements(statements, self)?;
 
         // §16.2.3 — In module mode, ensure all exported local bindings are

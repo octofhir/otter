@@ -335,10 +335,11 @@ fn structured_clone_inner(
                 .unwrap_or("")
                 .to_string();
             let proto = runtime.intrinsics().regexp_prototype;
-            let clone = runtime
-                .objects_mut()
-                .alloc_regexp(&pattern, &flags, Some(proto));
-            // Clone lastIndex.
+            // §22.2.3.1 — use the runtime helper so `lastIndex` is installed
+            // with the spec-mandated attributes before we overwrite its
+            // value from the source RegExp.
+            let clone = runtime.alloc_regexp(&pattern, &flags, Some(proto));
+            // Clone lastIndex value; attributes are already correct.
             let li_prop = runtime.intern_property_name("lastIndex");
             if let Ok(Some(lookup)) = runtime.property_lookup(handle, li_prop)
                 && let PropertyValue::Data { value: v, .. } = lookup.value()

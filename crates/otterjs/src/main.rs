@@ -92,11 +92,19 @@ struct Cli {
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
 
-    /// Maximum old-space size in MB (Otter's analogue of Node.js's
-    /// `--max-old-space-size`). When exceeded, Otter throws a catchable
-    /// `RangeError` instead of letting the OS kill the process. Default
-    /// `2048` (2 GB) matches modern Node.js; pass `0` to disable.
-    #[arg(long = "max-old-space-size", global = true, default_value = "2048")]
+    /// Maximum old-space size in MB. Drop-in compatible with Node.js's
+    /// `--max-old-space-size` — Otter accepts both the dashed and
+    /// underscored forms (Node V8-flag convention). When exceeded, Otter
+    /// throws a catchable `RangeError` instead of letting the OS kill
+    /// the process. Default `2048` (2 GB) matches modern Node.js; pass
+    /// `0` to disable.
+    #[arg(
+        long = "max-old-space-size",
+        visible_alias = "max_old_space_size",
+        global = true,
+        default_value = "2048",
+        value_name = "MB"
+    )]
     max_old_space_size: u64,
 
     /// Show profiling information (memory usage)

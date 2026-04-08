@@ -6320,6 +6320,30 @@ impl ObjectHeap {
             self.new_property_from_descriptor(desc)
         };
 
+        // Reserve the storage for the dense-vector growth against the
+        // configured heap cap BEFORE calling `elements.resize`. Without this,
+        // a pattern like `Object.defineProperty(arr, 4294967294, { ... })`
+        // would force a 32 GB `Vec<Value>::resize` call on the Rust side —
+        // bypassing the Otter heap cap and OOM-ing the host process.
+        // `set_array_length` / `set_index` use the same reservation pattern;
+        // this brings `[[DefineOwnProperty]]` on array indices into line.
+        let elem_size = std::mem::size_of::<RegisterValue>();
+        let current_len = match self.object(handle)? {
+            HeapValue::Array { elements, .. } => elements.len(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let grow_delta = if index >= current_len {
+            index
+                .saturating_add(1)
+                .saturating_sub(current_len)
+                .saturating_mul(elem_size)
+        } else {
+            0
+        };
+        if grow_delta > 0 {
+            self.heap.reserve_bytes(grow_delta)?;
+        }
+
         let array = self.object_mut(handle)?;
         let HeapValue::Array {
             extensible,
@@ -6334,13 +6358,20 @@ impl ObjectHeap {
             return Err(ObjectError::InvalidKind);
         };
 
-        match next {
+        let consumed_reservation = match next {
             PropertyValue::Data { value, attributes } => {
+                let mut consumed = false;
                 if index >= elements.len() {
                     if !*extensible || !*length_writable {
-                        return Ok(false);
+                        return {
+                            if grow_delta > 0 {
+                                self.heap.release_bytes(grow_delta);
+                            }
+                            Ok(false)
+                        };
                     }
                     elements.resize(index.saturating_add(1), RegisterValue::hole());
+                    consumed = true;
                 }
                 elements[index] = value;
 
@@ -6352,18 +6383,25 @@ impl ObjectHeap {
                     indexed_properties
                         .insert(index, PropertyValue::data_with_attrs(value, attributes));
                 }
-                Ok(true)
+                consumed
             }
             PropertyValue::Accessor {
                 getter,
                 setter,
                 attributes,
             } => {
+                let mut consumed = false;
                 if index >= elements.len() {
                     if !*extensible || !*length_writable {
-                        return Ok(false);
+                        return {
+                            if grow_delta > 0 {
+                                self.heap.release_bytes(grow_delta);
+                            }
+                            Ok(false)
+                        };
                     }
                     elements.resize(index.saturating_add(1), RegisterValue::hole());
+                    consumed = true;
                 } else {
                     elements[index] = RegisterValue::hole();
                 }
@@ -6376,9 +6414,15 @@ impl ObjectHeap {
                     },
                 );
                 let _ = (elements_writable, elements_configurable);
-                Ok(true)
+                consumed
             }
+        };
+
+        if grow_delta > 0 && !consumed_reservation {
+            self.heap.release_bytes(grow_delta);
         }
+
+        Ok(true)
     }
 
     fn define_array_named_property_from_descriptor(

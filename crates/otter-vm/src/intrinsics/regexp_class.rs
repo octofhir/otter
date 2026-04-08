@@ -728,14 +728,12 @@ fn regexp_constructor(
     // Canonicalize flags (sort alphabetically).
     let canonical_flags = canonical_flags_str(&flags);
 
-    // Allocate the RegExp object.
+    // Allocate the RegExp object. The runtime-level `alloc_regexp` helper
+    // installs `lastIndex` as a spec-compliant data property
+    // (writable, non-enumerable, non-configurable), so there is no
+    // separate `set_last_index` call required here.
     let prototype = runtime.intrinsics().regexp_prototype;
-    let handle = runtime
-        .objects_mut()
-        .alloc_regexp(&pattern, &canonical_flags, Some(prototype));
-
-    // Set lastIndex = 0.
-    set_last_index(handle, 0.0, runtime);
+    let handle = runtime.alloc_regexp(&pattern, &canonical_flags, Some(prototype));
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -1043,10 +1041,7 @@ fn regexp_symbol_match_all(
     };
 
     let prototype = runtime.intrinsics().regexp_prototype;
-    let clone_handle = runtime
-        .objects_mut()
-        .alloc_regexp(&pattern, &flags_with_g, Some(prototype));
-    set_last_index(clone_handle, 0.0, runtime);
+    let clone_handle = runtime.alloc_regexp(&pattern, &flags_with_g, Some(prototype));
 
     // Collect all matches into an array (simplified iterator).
     let result_arr = runtime.objects_mut().alloc_array();
@@ -1415,9 +1410,7 @@ fn regexp_symbol_split(
     };
 
     let prototype = runtime.intrinsics().regexp_prototype;
-    let splitter = runtime
-        .objects_mut()
-        .alloc_regexp(&pattern, &sticky_flags, Some(prototype));
+    let splitter = runtime.alloc_regexp(&pattern, &sticky_flags, Some(prototype));
 
     let input_utf16: Vec<u16> = input.encode_utf16().collect();
     let size = input_utf16.len();

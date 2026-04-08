@@ -923,21 +923,6 @@ fn try_symbol_dispatch(
     Ok(Some(result))
 }
 
-fn set_regexp_last_index(
-    handle: ObjectHandle,
-    value: f64,
-    runtime: &mut crate::interpreter::RuntimeState,
-) {
-    let prop = runtime.intern_property_name("lastIndex");
-    let val =
-        if value == (value as i32) as f64 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
-            RegisterValue::from_i32(value as i32)
-        } else {
-            RegisterValue::from_number(value)
-        };
-    runtime.objects_mut().set_property(handle, prop, val).ok();
-}
-
 // ── §22.1.3.12 String.prototype.match(regexp) ────────────────────────────
 
 fn string_match(
@@ -962,10 +947,7 @@ fn string_match(
         .js_to_string(regexp_arg)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime
-        .objects_mut()
-        .alloc_regexp(&search_str, "", Some(prototype));
-    set_regexp_last_index(re, 0.0, runtime);
+    let re = runtime.alloc_regexp(&search_str, "", Some(prototype));
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Match, re_val, this, &[], runtime)? {
         return Ok(result);
@@ -1019,10 +1001,7 @@ fn string_match_all(
             .to_string()
     };
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime
-        .objects_mut()
-        .alloc_regexp(&pattern, "g", Some(prototype));
-    set_regexp_last_index(re, 0.0, runtime);
+    let re = runtime.alloc_regexp(&pattern, "g", Some(prototype));
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) =
         try_symbol_dispatch(WellKnownSymbol::MatchAll, re_val, this, &[], runtime)?
@@ -1056,10 +1035,7 @@ fn string_search(
         .js_to_string(regexp_arg)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime
-        .objects_mut()
-        .alloc_regexp(&search_str, "", Some(prototype));
-    set_regexp_last_index(re, 0.0, runtime);
+    let re = runtime.alloc_regexp(&search_str, "", Some(prototype));
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Search, re_val, this, &[], runtime)?
     {

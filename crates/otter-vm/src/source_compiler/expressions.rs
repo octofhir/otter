@@ -578,10 +578,24 @@ impl<'a> FunctionCompiler<'a> {
         match unary.operator {
             UnaryOperator::UnaryNegation => {
                 // §6.1.6.2.1 BigInt::unaryMinus — compile `-42n` as BigInt("-42").
+                // Normalize the literal source first so non-decimal bases
+                // (`-0xFFn`, `-0b1_0n`) collapse to the canonical decimal form
+                // expected by the runtime's BigInt storage invariant.
                 if let Expression::BigIntLiteral(lit) = &unary.argument {
                     let raw = lit.raw.as_ref().map_or("0n", |a| a.as_str());
-                    let value = raw.strip_suffix('n').unwrap_or(raw);
-                    let negated = format!("-{value}");
+                    let decimal = normalize_bigint_literal(raw).map_err(|err| {
+                        SourceLoweringError::Unsupported(format!(
+                            "invalid BigInt literal {raw}: {err}"
+                        ))
+                    })?;
+                    let negated = if decimal == "0" {
+                        // §6.1.6.2 BigInt is a mathematical integer — no `-0n`.
+                        "0".to_string()
+                    } else if let Some(rest) = decimal.strip_prefix('-') {
+                        rest.to_string()
+                    } else {
+                        format!("-{decimal}")
+                    };
                     return self.compile_bigint_literal_value(&negated);
                 }
                 let zero = self.load_i32(0)?;
@@ -2817,12 +2831,21 @@ impl<'a> FunctionCompiler<'a> {
     /// §6.1.6.2 The BigInt Type
     /// Spec: <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
     fn compile_bigint_literal(&mut self, raw: &str) -> Result<ValueLocation, SourceLoweringError> {
-        // The raw text includes the trailing `n` suffix — strip it.
-        let value = raw.strip_suffix('n').unwrap_or(raw);
-        self.compile_bigint_literal_value(value)
+        // §12.8.6 NumericLiteral :: BigIntLiteralSuffixed
+        // Spec: <https://tc39.es/ecma262/#sec-numeric-literals>
+        // The raw text includes the trailing `n` suffix and may use
+        // prefixes (0x/0o/0b) and numeric-literal separators (`_`).
+        // Normalize to the canonical decimal form so that the rest of
+        // the runtime (num_bigint parsing, SameValue, arithmetic) sees
+        // a consistent representation.
+        let decimal = normalize_bigint_literal(raw).map_err(|err| {
+            SourceLoweringError::Unsupported(format!("invalid BigInt literal {raw}: {err}"))
+        })?;
+        self.compile_bigint_literal_value(&decimal)
     }
 
-    /// Compiles a BigInt value (already stripped of `n` suffix) into a LoadBigInt.
+    /// Compiles a BigInt value (already normalized to a decimal string,
+    /// optionally signed) into a LoadBigInt.
     fn compile_bigint_literal_value(
         &mut self,
         value: &str,
@@ -2959,4 +2982,58 @@ fn find_legacy_octal_escape(raw: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+/// Normalize a BigInt literal source string (e.g. `0x0_Fn`, `0b1_0n`,
+/// `1_000n`) to its canonical unsigned decimal string representation.
+///
+/// The returned string is what the runtime stores and what all arithmetic
+/// and comparison paths parse with `num_bigint::BigInt::from_str`. Handles:
+/// - trailing `n` suffix removal;
+/// - numeric-literal separators (`_`) per §12.8.6;
+/// - base prefixes `0x`/`0X` (16), `0o`/`0O` (8), `0b`/`0B` (2);
+/// - decimal literals (default).
+///
+/// Spec: <https://tc39.es/ecma262/#sec-literals-numeric-literals>
+fn normalize_bigint_literal(raw: &str) -> Result<String, String> {
+    use num_bigint::BigInt;
+    use num_traits::Num;
+
+    let body = raw.strip_suffix('n').unwrap_or(raw);
+    if body.is_empty() {
+        return Err("empty BigInt literal".to_string());
+    }
+
+    // Strip numeric-literal separators. Lexer rules already guarantee
+    // the separators appear only between digits, so a naive filter is
+    // sufficient at this stage — oxc has already validated the grammar.
+    let cleaned: String = body.chars().filter(|c| *c != '_').collect();
+
+    let (radix, digits) = if let Some(rest) = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else if let Some(rest) = cleaned
+        .strip_prefix("0o")
+        .or_else(|| cleaned.strip_prefix("0O"))
+    {
+        (8, rest)
+    } else if let Some(rest) = cleaned
+        .strip_prefix("0b")
+        .or_else(|| cleaned.strip_prefix("0B"))
+    {
+        (2, rest)
+    } else {
+        (10, cleaned.as_str())
+    };
+
+    if digits.is_empty() {
+        return Err("BigInt literal has no digits".to_string());
+    }
+
+    let value = BigInt::from_str_radix(digits, radix)
+        .map_err(|err| format!("parse error (radix {radix}): {err}"))?;
+
+    Ok(value.to_string())
 }

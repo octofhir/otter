@@ -461,18 +461,143 @@ impl OtterRuntime {
     }
 }
 
-/// RAII guard that spawns a thread to set the interrupt flag after a timeout.
+/// RAII guard that signals an interrupt flag after a timeout.
+///
+/// A shared watchdog thread (one per process) owns a min-heap of pending
+/// deadlines. Arming the guard pushes an entry; dropping the guard marks
+/// that entry cancelled so the watchdog skips it. This replaces the old
+/// "spawn one thread per `run_script`" design which leaked threads under
+/// bulk harnesses like test262 — every guard would sleep for the full
+/// timeout even after the run had long finished, eventually tripping the
+/// OS thread limit (macOS: ~4096 per task) and panicking the runner.
 struct TimeoutGuard {
-    _handle: std::thread::JoinHandle<()>,
+    entry: Option<Arc<TimeoutEntry>>,
 }
 
 impl TimeoutGuard {
     fn arm(flag: Arc<AtomicBool>, timeout: Duration) -> Self {
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            flag.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + timeout;
+        let entry = Arc::new(TimeoutEntry {
+            deadline,
+            cancelled: AtomicBool::new(false),
+            flag,
         });
-        Self { _handle: handle }
+        timeout_watchdog().enqueue(entry.clone());
+        Self { entry: Some(entry) }
+    }
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            // Mark cancelled so the shared watchdog skips firing the flag.
+            // The entry stays in the heap until its deadline expires, which
+            // is fine — only the cancel flag matters at fire time.
+            entry.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct TimeoutEntry {
+    deadline: std::time::Instant,
+    cancelled: AtomicBool,
+    flag: Arc<AtomicBool>,
+}
+
+/// Min-heap ordering: earliest deadline first.
+impl PartialEq for TimeoutEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+impl Eq for TimeoutEntry {}
+impl PartialOrd for TimeoutEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimeoutEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is a max-heap; reverse so the earliest deadline pops first.
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+struct TimeoutWatchdog {
+    inner: std::sync::Mutex<std::collections::BinaryHeap<Arc<TimeoutEntry>>>,
+    condvar: std::sync::Condvar,
+}
+
+impl TimeoutWatchdog {
+    fn enqueue(&self, entry: Arc<TimeoutEntry>) {
+        let mut heap = self.inner.lock().expect("timeout watchdog mutex poisoned");
+        let need_wake = heap
+            .peek()
+            .map_or(true, |head| entry.deadline < head.deadline);
+        heap.push(entry);
+        if need_wake {
+            self.condvar.notify_one();
+        }
+    }
+}
+
+/// Returns the shared watchdog instance, lazily starting its worker thread.
+fn timeout_watchdog() -> &'static TimeoutWatchdog {
+    static WATCHDOG: std::sync::OnceLock<&'static TimeoutWatchdog> = std::sync::OnceLock::new();
+    WATCHDOG.get_or_init(|| {
+        let watchdog: &'static TimeoutWatchdog = Box::leak(Box::new(TimeoutWatchdog {
+            inner: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+            condvar: std::sync::Condvar::new(),
+        }));
+        // Daemon thread: detached, never joined, runs for the lifetime of
+        // the process. This is the *only* watchdog thread for the whole
+        // runtime, no matter how many `run_script` calls we make.
+        std::thread::Builder::new()
+            .name("otter-timeout-watchdog".into())
+            .spawn(move || timeout_watchdog_loop(watchdog))
+            .expect("failed to spawn timeout watchdog");
+        watchdog
+    })
+}
+
+fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
+    use std::time::Instant;
+    let mut heap = watchdog
+        .inner
+        .lock()
+        .expect("timeout watchdog mutex poisoned");
+    loop {
+        // Discard any cancelled entries at the head before waiting.
+        while let Some(top) = heap.peek() {
+            if top.cancelled.load(Ordering::Acquire) {
+                heap.pop();
+            } else {
+                break;
+            }
+        }
+
+        if let Some(top) = heap.peek().cloned() {
+            let now = Instant::now();
+            if now >= top.deadline {
+                heap.pop();
+                if !top.cancelled.load(Ordering::Acquire) {
+                    top.flag.store(true, Ordering::Release);
+                }
+                continue;
+            }
+            let wait = top.deadline - now;
+            let (new_heap, _) = watchdog
+                .condvar
+                .wait_timeout(heap, wait)
+                .expect("timeout watchdog mutex poisoned");
+            heap = new_heap;
+        } else {
+            // Heap empty — sleep indefinitely until something is enqueued.
+            heap = watchdog
+                .condvar
+                .wait(heap)
+                .expect("timeout watchdog mutex poisoned");
+        }
     }
 }
 

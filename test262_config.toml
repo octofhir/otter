@@ -10,6 +10,12 @@
 # Default timeout in seconds per test
 timeout_secs = 10
 
+# Hard heap cap per test, in bytes (Otter analogue of Node's
+# --max-old-space-size). Protects against pathological Array tests that
+# would otherwise OOM the host. 0 = disabled. 512 MB is a comfortable
+# headroom for normal tests while stopping the 32 GB Vec::resize path.
+max_heap_bytes_per_test = 536870912
+
 # Directory for saving results
 # results_dir = "test262_results"
 

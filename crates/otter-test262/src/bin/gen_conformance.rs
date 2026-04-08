@@ -20,11 +20,14 @@ struct Stats {
     timeout: usize,
     skip: usize,
     crash: usize,
+    /// Heap-cap violations — tracked separately so pathological Array
+    /// tests don't get lumped in with real VM crashes.
+    oom: usize,
 }
 
 impl Stats {
     fn total_run(&self) -> usize {
-        self.pass + self.fail + self.timeout + self.crash
+        self.pass + self.fail + self.timeout + self.crash + self.oom
     }
 
     fn pass_rate(&self) -> f64 {
@@ -43,6 +46,7 @@ impl Stats {
             TestOutcome::Skip => self.skip += 1,
             TestOutcome::Timeout => self.timeout += 1,
             TestOutcome::Crash => self.crash += 1,
+            TestOutcome::OutOfMemory => self.oom += 1,
         }
     }
 }

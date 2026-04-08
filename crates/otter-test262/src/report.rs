@@ -22,6 +22,9 @@ pub struct TestReport {
     pub timeout: usize,
     /// Number of crashed tests
     pub crashed: usize,
+    /// Number of tests killed by the heap cap (`--max-heap-bytes`).
+    #[serde(default)]
+    pub out_of_memory: usize,
     /// Pass rate as percentage (excluding skipped)
     pub pass_rate: f64,
     /// Results by feature
@@ -66,6 +69,7 @@ impl TestReport {
             skipped: 0,
             timeout: 0,
             crashed: 0,
+            out_of_memory: 0,
             pass_rate: 0.0,
             by_feature: HashMap::new(),
             failures: Vec::new(),
@@ -91,6 +95,7 @@ impl TestReport {
                         .push(format!("{} ({})", result.path, result.mode));
                 }
                 TestOutcome::Crash => report.crashed += 1,
+                TestOutcome::OutOfMemory => report.out_of_memory += 1,
             }
 
             // Track by feature
@@ -214,6 +219,7 @@ pub struct RunSummary {
     pub skipped: usize,
     pub timeout: usize,
     pub crashed: usize,
+    pub out_of_memory: usize,
     pub by_feature: HashMap<String, FeatureReport>,
     pub by_edition: HashMap<editions::EsEdition, editions::EditionReport>,
     pub failures: Vec<FailureInfo>,
@@ -231,6 +237,7 @@ impl RunSummary {
             skipped: 0,
             timeout: 0,
             crashed: 0,
+            out_of_memory: 0,
             by_feature: HashMap::new(),
             by_edition: HashMap::new(),
             failures: Vec::new(),
@@ -261,6 +268,7 @@ impl RunSummary {
                     .push(format!("{} ({})", result.path, result.mode));
             }
             TestOutcome::Crash => self.crashed += 1,
+            TestOutcome::OutOfMemory => self.out_of_memory += 1,
         }
 
         // Track by feature
@@ -304,7 +312,8 @@ impl RunSummary {
     }
 
     pub fn into_report(self) -> TestReport {
-        let run_count = self.passed + self.failed + self.timeout + self.crashed;
+        let run_count =
+            self.passed + self.failed + self.timeout + self.crashed + self.out_of_memory;
         let pass_rate = if run_count > 0 {
             (self.passed as f64 / run_count as f64) * 100.0
         } else {
@@ -317,6 +326,7 @@ impl RunSummary {
             skipped: self.skipped,
             timeout: self.timeout,
             crashed: self.crashed,
+            out_of_memory: self.out_of_memory,
             pass_rate,
             by_feature: self.by_feature,
             failures: self.failures,

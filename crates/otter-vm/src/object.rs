@@ -2,7 +2,16 @@
 
 use std::collections::BTreeMap;
 
-use otter_gc::typed::{Handle as GcHandle, Traceable, TypedHeap};
+use otter_gc::heap::GcConfig;
+use otter_gc::typed::{Handle as GcHandle, OutOfMemory, Traceable, TypedHeap};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+/// Maximum JavaScript array length, per ECMA-262 §7.1.22
+/// (<https://tc39.es/ecma262/#sec-tolength>) and §22.1.3.1
+/// (<https://tc39.es/ecma262/#sec-array.prototype.concat>). A valid array
+/// length is a uint32 value `<= 2^32 - 1`.
+pub const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
 
 use crate::bytecode::ProgramCounter;
 use crate::host::HostFunctionId;
@@ -123,6 +132,37 @@ impl PropertyLookup {
     }
 }
 
+/// Outcome of the inner `set_array_length_inner` mutation, reported back
+/// to the outer `set_array_length` so it can reconcile the heap budget
+/// without holding a mutable borrow into the object.
+#[derive(Debug, Clone, Copy)]
+struct SetLengthOutcome {
+    /// Whether the spec-level result is `true` (success) or `false`
+    /// (no-op due to `!extensible` / `!configurable` etc.).
+    ok: bool,
+    /// True if the Vec was actually grown — caller should keep the byte
+    /// reservation. False means the caller should release it.
+    grew: bool,
+    /// Number of bytes freed by a truncation. Caller releases these from
+    /// the heap budget after the mutable borrow ends.
+    shrunk_bytes: usize,
+}
+
+/// Per-type heap statistics returned by [`ObjectHeap::collect_type_stats`].
+/// Used by the memory-leak profiler in the test262 runner to detect growth
+/// between tests.
+#[derive(Debug, Clone, Default)]
+pub struct HeapTypeStats {
+    /// Total number of live objects across all variants.
+    pub total_count: usize,
+    /// Tracked memory footprint across all variants, in bytes. Includes
+    /// `size_of::<HeapValue>()` for every slot plus estimated internals
+    /// (Array elements, ArrayBuffer bytes, Object value slots).
+    pub total_bytes: usize,
+    /// Per-variant count + bytes.
+    pub by_type: std::collections::BTreeMap<&'static str, (usize, usize)>,
+}
+
 /// Error produced by the minimal object heap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectError {
@@ -134,8 +174,18 @@ pub enum ObjectError {
     InvalidIndex,
     /// The requested array length is not a valid ECMAScript array length.
     InvalidArrayLength,
+    /// The operation would exceed the configured heap cap. Set when a
+    /// container growth (e.g. `Array.elements.resize`) overshoots the
+    /// reservation budget via `TypedHeap::reserve_bytes`.
+    OutOfMemory,
     /// A TypeError-level semantic violation (e.g. private name access).
     TypeError(Box<str>),
+}
+
+impl From<OutOfMemory> for ObjectError {
+    fn from(_: OutOfMemory) -> Self {
+        ObjectError::OutOfMemory
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1742,13 +1792,124 @@ impl Clone for ObjectHeap {
 }
 
 impl ObjectHeap {
-    /// Creates an empty object heap.
+    /// Creates an empty object heap with the default GC configuration
+    /// (no heap cap).
     #[must_use]
     pub fn new() -> Self {
         Self {
             heap: TypedHeap::new(),
             next_shape_id: 1,
         }
+    }
+
+    /// Creates an empty object heap backed by a [`TypedHeap`] with the
+    /// provided GC configuration. Use this to set a hard heap cap
+    /// (`GcConfig::max_heap_bytes`), the Otter analogue of Node's
+    /// `--max-old-space-size`.
+    #[must_use]
+    pub fn with_config(config: GcConfig) -> Self {
+        Self {
+            heap: TypedHeap::with_config(config),
+            next_shape_id: 1,
+        }
+    }
+
+    /// Returns a clone of the underlying TypedHeap's OOM signal flag.
+    /// The interpreter polls this at GC safepoints to raise a catchable
+    /// `RangeError` when the hard heap cap has been exceeded.
+    pub fn oom_flag(&self) -> Arc<AtomicBool> {
+        self.heap.oom_flag()
+    }
+
+    /// Clears the OOM signal flag.
+    pub fn clear_oom_flag(&self) {
+        self.heap.clear_oom_flag();
+    }
+
+    /// Returns the configured hard heap cap in bytes, if any.
+    pub fn max_heap_bytes(&self) -> Option<usize> {
+        self.heap.max_heap_bytes()
+    }
+
+    /// Returns the current tracked memory footprint in bytes.
+    pub fn tracked_bytes(&self) -> usize {
+        self.heap.tracked_bytes()
+    }
+
+    /// Reserves `bytes` in the heap budget. Returns `Err(OutOfMemory)` and
+    /// sets the OOM flag if the reservation would exceed the hard cap.
+    /// Must be paired with [`release_bytes`] when the memory is freed.
+    ///
+    /// Used by Array growth paths (`Vec::resize` of `elements`) so that
+    /// container internals are accounted against the heap cap in addition
+    /// to the object shells.
+    pub fn reserve_bytes(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
+        self.heap.reserve_bytes(bytes)
+    }
+
+    /// Releases a previous byte reservation.
+    pub fn release_bytes(&mut self, bytes: usize) {
+        self.heap.release_bytes(bytes);
+    }
+
+    /// Walks every live `HeapValue` and returns a per-variant count. The
+    /// total return is `(total_count, total_tracked_bytes, per_variant)`.
+    ///
+    /// Used by the test262 runner's `--memory-profile` mode to detect
+    /// leaks by comparing deltas between snapshots. The walk is O(N) over
+    /// the slot table, so callers should take snapshots sparingly (every
+    /// N tests, not every test).
+    pub fn collect_type_stats(&self) -> HeapTypeStats {
+        let mut stats = HeapTypeStats::default();
+        let elem_size = std::mem::size_of::<RegisterValue>();
+        self.heap.for_each(|_, any| {
+            let Some(value) = any.downcast_ref::<HeapValue>() else {
+                return;
+            };
+            stats.total_count += 1;
+            let shell = std::mem::size_of::<HeapValue>();
+            let (name, extra) = match value {
+                HeapValue::Object { values, .. } => ("Object", values.len() * elem_size),
+                HeapValue::NativeObject { .. } => ("NativeObject", 0),
+                HeapValue::HostFunction { .. } => ("HostFunction", 0),
+                HeapValue::Array { elements, .. } => ("Array", elements.len() * elem_size),
+                HeapValue::String { .. } => ("String", 0),
+                HeapValue::Closure { .. } => ("Closure", 0),
+                HeapValue::BoundFunction { .. } => ("BoundFunction", 0),
+                HeapValue::UpvalueCell { .. } => ("UpvalueCell", 0),
+                HeapValue::ArrayIterator { .. } => ("ArrayIterator", 0),
+                HeapValue::StringIterator { .. } => ("StringIterator", 0),
+                HeapValue::PropertyIterator { .. } => ("PropertyIterator", 0),
+                HeapValue::Promise { .. } => ("Promise", 0),
+                HeapValue::PromiseCapabilityFunction { .. } => ("PromiseCapabilityFn", 0),
+                HeapValue::PromiseCombinatorElement { .. } => ("PromiseCombinatorElem", 0),
+                HeapValue::PromiseFinallyFunction { .. } => ("PromiseFinallyFn", 0),
+                HeapValue::PromiseValueThunk { .. } => ("PromiseValueThunk", 0),
+                HeapValue::Map { .. } => ("Map", 0),
+                HeapValue::Set { .. } => ("Set", 0),
+                HeapValue::MapIterator { .. } => ("MapIterator", 0),
+                HeapValue::SetIterator { .. } => ("SetIterator", 0),
+                HeapValue::WeakMap { .. } => ("WeakMap", 0),
+                HeapValue::WeakSet { .. } => ("WeakSet", 0),
+                HeapValue::WeakRef { .. } => ("WeakRef", 0),
+                HeapValue::FinalizationRegistry { .. } => ("FinalizationRegistry", 0),
+                HeapValue::Generator { .. } => ("Generator", 0),
+                HeapValue::AsyncGenerator { .. } => ("AsyncGenerator", 0),
+                HeapValue::ArrayBuffer { data, .. } => ("ArrayBuffer", data.len()),
+                HeapValue::SharedArrayBuffer { data, .. } => ("SharedArrayBuffer", data.len()),
+                HeapValue::DataView { .. } => ("DataView", 0),
+                HeapValue::TypedArray { .. } => ("TypedArray", 0),
+                HeapValue::RegExp { .. } => ("RegExp", 0),
+                HeapValue::Proxy { .. } => ("Proxy", 0),
+                HeapValue::BigInt { .. } => ("BigInt", 0),
+                HeapValue::ErrorStackFrames { .. } => ("ErrorStackFrames", 0),
+            };
+            let entry = stats.by_type.entry(name).or_default();
+            entry.0 += 1;
+            entry.1 += shell + extra;
+            stats.total_bytes += shell + extra;
+        });
+        stats
     }
 
     /// Allocates a plain empty object.
@@ -4264,6 +4425,50 @@ impl ObjectHeap {
         index: usize,
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
+        // Spec cap: a valid array index is `< 2^32 - 1` (ECMA-262 §7.1.22).
+        // Rejecting at the lowest level keeps pathological tests like
+        // `arr[2**32 - 1] = v` from growing a 32 GB `Vec<RegisterValue>`.
+        if index >= MAX_ARRAY_LENGTH {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        // Heap budget: reserve bytes for any sparse-hole grow before
+        // borrowing the heap mutably. We compute the delta first, then
+        // reserve, then perform the mutation. The mutation is scoped into
+        // a helper that returns whether the reservation was actually used,
+        // so we can release it on the "not extensible" exit path without
+        // tripping the clippy `drop_non_drop` lint.
+        let elem_size = std::mem::size_of::<RegisterValue>();
+        let current_len = match self.object(handle)? {
+            HeapValue::Array { elements, .. } => elements.len(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let grow_delta = if index >= current_len {
+            index
+                .saturating_add(1)
+                .saturating_sub(current_len)
+                .saturating_mul(elem_size)
+        } else {
+            0
+        };
+        if grow_delta > 0 {
+            self.heap.reserve_bytes(grow_delta)?;
+        }
+        let used_reservation = self.set_index_inner(handle, index, value)?;
+        if grow_delta > 0 && !used_reservation {
+            self.heap.release_bytes(grow_delta);
+        }
+        Ok(())
+    }
+
+    /// Inner helper for [`set_index`]. Returns `Ok(true)` when the caller's
+    /// byte reservation was consumed by a real `Vec::resize`, `Ok(false)`
+    /// when the array wasn't grown (so the reservation must be released).
+    fn set_index_inner(
+        &mut self,
+        handle: ObjectHandle,
+        index: usize,
+        value: RegisterValue,
+    ) -> Result<bool, ObjectError> {
         match self.object_mut(handle)? {
             HeapValue::Array {
                 extensible,
@@ -4273,11 +4478,13 @@ impl ObjectHeap {
                 length_writable,
                 ..
             } => {
+                let mut grew = false;
                 if index >= elements.len() {
                     if !*extensible || !*length_writable {
-                        return Ok(());
+                        return Ok(false);
                     }
                     elements.resize(index.saturating_add(1), RegisterValue::hole());
+                    grew = true;
                 }
 
                 if let Some(property) = indexed_properties.get_mut(&index) {
@@ -4287,21 +4494,21 @@ impl ObjectHeap {
                             attributes,
                         } => {
                             if !attributes.writable() {
-                                return Ok(());
+                                return Ok(grew);
                             }
                             *slot = value;
                             elements[index] = value;
-                            return Ok(());
+                            return Ok(grew);
                         }
-                        PropertyValue::Accessor { .. } => return Ok(()),
+                        PropertyValue::Accessor { .. } => return Ok(grew),
                     }
                 }
 
                 if !*elements_writable {
-                    return Ok(());
+                    return Ok(grew);
                 }
                 elements[index] = value;
-                Ok(())
+                Ok(grew)
             }
             HeapValue::Object { .. }
             | HeapValue::NativeObject { .. }
@@ -4369,6 +4576,50 @@ impl ObjectHeap {
         handle: ObjectHandle,
         length: usize,
     ) -> Result<bool, ObjectError> {
+        // Spec cap: §22.1.3.1. `length > 2^32 - 1` is a `RangeError`.
+        // Intercept here so we never attempt a `Vec::resize(2^32, ..)`.
+        if length > MAX_ARRAY_LENGTH {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+        // Reserve the heap budget for the tracked slice so the shared OOM
+        // flag is raised when the configured hard cap is crossed. Shrinks
+        // and no-ops release an equivalent amount after the mutation — the
+        // core mutation lives in `set_array_length_inner` so the match arm
+        // can drop its mutable borrow before we call back into `self.heap`.
+        let elem_size = std::mem::size_of::<RegisterValue>();
+        let current_len = match self.object(handle)? {
+            HeapValue::Array { elements, .. } => elements.len(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if length > current_len {
+            let additional = length.saturating_sub(current_len).saturating_mul(elem_size);
+            self.heap.reserve_bytes(additional)?;
+        }
+        let outcome = self.set_array_length_inner(handle, length)?;
+        // Reconcile the reservation with what actually happened inside the
+        // mutation: release any bytes we optimistically reserved but did
+        // not grow, and release any bytes freed by a shrink.
+        let reserve_delta = length.saturating_sub(current_len).saturating_mul(elem_size);
+        let release_delta = current_len.saturating_sub(length).saturating_mul(elem_size);
+        if !outcome.grew {
+            self.heap.release_bytes(reserve_delta);
+        }
+        if outcome.shrunk_bytes > 0 {
+            self.heap.release_bytes(outcome.shrunk_bytes.min(release_delta));
+        }
+        Ok(outcome.ok)
+    }
+
+    /// Inner helper for [`set_array_length`]. Performs the mutation under a
+    /// scoped mutable borrow, returning a small outcome struct so the
+    /// caller can reconcile the heap budget after the borrow ends without
+    /// tripping `clippy::drop_non_drop`.
+    fn set_array_length_inner(
+        &mut self,
+        handle: ObjectHandle,
+        length: usize,
+    ) -> Result<SetLengthOutcome, ObjectError> {
+        let elem_size = std::mem::size_of::<RegisterValue>();
         match self.object_mut(handle)? {
             HeapValue::Array {
                 extensible,
@@ -4380,7 +4631,11 @@ impl ObjectHeap {
             } => {
                 if length < elements.len() {
                     if !*elements_configurable {
-                        return Ok(false);
+                        return Ok(SetLengthOutcome {
+                            ok: false,
+                            grew: false,
+                            shrunk_bytes: 0,
+                        });
                     }
 
                     let first_non_configurable =
@@ -4392,22 +4647,45 @@ impl ObjectHeap {
                             });
 
                     if let Some(index) = first_non_configurable {
+                        let removed = elements.len().saturating_sub(index.saturating_add(1));
                         elements.truncate(index.saturating_add(1));
                         indexed_properties.retain(|&key, _| key <= index);
-                        return Ok(false);
+                        return Ok(SetLengthOutcome {
+                            ok: false,
+                            grew: false,
+                            shrunk_bytes: removed.saturating_mul(elem_size),
+                        });
                     }
 
+                    let removed = elements.len().saturating_sub(length);
                     elements.truncate(length);
                     indexed_properties.retain(|&key, _| key < length);
-                    return Ok(true);
+                    return Ok(SetLengthOutcome {
+                        ok: true,
+                        grew: false,
+                        shrunk_bytes: removed.saturating_mul(elem_size),
+                    });
                 }
                 if length > elements.len() {
                     if !*extensible || !*length_writable {
-                        return Ok(false);
+                        return Ok(SetLengthOutcome {
+                            ok: false,
+                            grew: false,
+                            shrunk_bytes: 0,
+                        });
                     }
                     elements.resize(length, RegisterValue::hole());
+                    return Ok(SetLengthOutcome {
+                        ok: true,
+                        grew: true,
+                        shrunk_bytes: 0,
+                    });
                 }
-                Ok(true)
+                Ok(SetLengthOutcome {
+                    ok: true,
+                    grew: false,
+                    shrunk_bytes: 0,
+                })
             }
             _ => Err(ObjectError::InvalidKind),
         }
@@ -5998,6 +6276,12 @@ impl ObjectHeap {
         index: usize,
         desc: PropertyDescriptor,
     ) -> Result<bool, ObjectError> {
+        // Spec cap (ECMA-262 §7.1.22): array indices must fit in uint32.
+        // This intercepts patterns like `Object.defineProperty(arr, 2**32-1, ..)`
+        // before they grow `elements` past 32 GB.
+        if index >= MAX_ARRAY_LENGTH {
+            return Err(ObjectError::InvalidArrayLength);
+        }
         let existing = match self.object(handle)? {
             HeapValue::Array {
                 elements,

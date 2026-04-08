@@ -5,6 +5,8 @@
 //! interpreter uses for allocation and rooting.
 
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::align_up;
 use crate::barrier::WriteBarrier;
@@ -24,6 +26,15 @@ pub struct GcConfig {
     /// Old generation byte threshold for triggering a full GC. Default: 8 MB.
     /// After each GC, the threshold is set to `2 * live_bytes` (adaptive).
     pub old_gen_threshold: usize,
+    /// Hard cap for the total heap size (young + old + large-object, in bytes).
+    /// `None` disables the cap (legacy behavior — the GC will only trigger on
+    /// generational thresholds). This is the Otter analogue of Node.js's
+    /// `--max-old-space-size`.
+    pub max_heap_bytes: Option<usize>,
+    /// Soft-limit ratio in `(0.0, 1.0]`. When the projected heap size crosses
+    /// `soft_limit_ratio * max_heap_bytes`, a young GC is triggered early. The
+    /// hard limit is the full value of `max_heap_bytes`. Default: 0.85.
+    pub soft_limit_ratio: f32,
 }
 
 impl Default for GcConfig {
@@ -31,6 +42,8 @@ impl Default for GcConfig {
         Self {
             young_gen_size: 4 * 1024 * 1024,
             old_gen_threshold: 8 * 1024 * 1024,
+            max_heap_bytes: None,
+            soft_limit_ratio: 0.85,
         }
     }
 }
@@ -63,6 +76,11 @@ pub struct GcHeap {
     marking: MarkingState,
     config: GcConfig,
     stats: GcStats,
+    /// Out-of-memory flag. Set by allocation paths when the hard heap limit
+    /// is exceeded after emergency GC. Polled by the interpreter at GC
+    /// safepoints to raise a catchable `RangeError`. Cloned from the heap
+    /// via [`GcHeap::oom_flag`] so embedders share the same signal.
+    oom_flag: Arc<AtomicBool>,
 }
 
 impl GcHeap {
@@ -81,12 +99,130 @@ impl GcHeap {
             marking: MarkingState::new(),
             config,
             stats: GcStats::default(),
+            oom_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Creates a heap with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(GcConfig::default())
+    }
+
+    /// Creates a heap with the default configuration plus a hard cap on the
+    /// total heap size (analogue of Node.js's `--max-old-space-size`).
+    pub fn with_max_heap_bytes(max_bytes: usize) -> Self {
+        Self::new(GcConfig {
+            max_heap_bytes: Some(max_bytes),
+            ..GcConfig::default()
+        })
+    }
+
+    /// Returns a clone of the OOM signal flag. The interpreter polls this at
+    /// GC safepoints and raises `RangeError: out of memory` when set.
+    pub fn oom_flag(&self) -> Arc<AtomicBool> {
+        self.oom_flag.clone()
+    }
+
+    /// Clears the OOM flag. Called by the runtime when starting a new script
+    /// so one OOM does not cause every subsequent script to abort immediately.
+    pub fn clear_oom_flag(&self) {
+        self.oom_flag.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns the current total allocated bytes across all spaces.
+    ///
+    /// This is an exact running total maintained by the spaces themselves
+    /// (never cached), so it is safe to call from the hot allocation path.
+    #[inline]
+    pub fn current_heap_bytes(&self) -> usize {
+        self.new_space.allocated_bytes()
+            + self.old_space.allocated_bytes()
+            + self.large_space.allocated_bytes()
+    }
+
+    /// Returns the configured hard cap on the heap size, if any.
+    #[inline]
+    pub fn max_heap_bytes(&self) -> Option<usize> {
+        self.config.max_heap_bytes
+    }
+
+    /// Computes the soft limit in bytes, rounded down. Returns `None` if no
+    /// hard limit is configured.
+    #[inline]
+    fn soft_limit_bytes(&self) -> Option<usize> {
+        self.config.max_heap_bytes.map(|max| {
+            let ratio = self.config.soft_limit_ratio.clamp(0.1, 1.0);
+            (max as f64 * ratio as f64) as usize
+        })
+    }
+
+    /// Emergency GC sequence when an allocation is about to exceed a limit.
+    ///
+    /// Two-phase, mirroring V8's Orinoco fallback: first a scavenge to
+    /// reclaim the young generation, then — if still over — a full GC to
+    /// reclaim old/large spaces. Returns `true` if the projected allocation
+    /// fits under the hard cap after reclamation.
+    fn try_reclaim(&mut self, incoming: usize) -> bool {
+        let hard_limit = match self.config.max_heap_bytes {
+            Some(limit) => limit,
+            None => return true,
+        };
+
+        // Phase 1: scavenge young generation.
+        self.collect_young();
+        if self.current_heap_bytes() + incoming <= hard_limit {
+            return true;
+        }
+
+        // Phase 2: full old-generation GC.
+        self.collect_full();
+        if self.current_heap_bytes() + incoming <= hard_limit {
+            return true;
+        }
+
+        false
+    }
+
+    /// Checks whether allocating `aligned` bytes would cross the configured
+    /// heap limits and, if so, triggers GC. Sets `oom_flag` and returns
+    /// `false` when the hard cap cannot be respected even after a full GC.
+    ///
+    /// When `None`/no-limit is configured this is a cheap no-op.
+    #[inline]
+    fn enforce_heap_limit(&mut self, aligned: usize) -> bool {
+        let hard_limit = match self.config.max_heap_bytes {
+            Some(limit) => limit,
+            None => return true,
+        };
+
+        let current = self.current_heap_bytes();
+        let projected = current.saturating_add(aligned);
+
+        // Fast path: well below any limit — no-op.
+        if let Some(soft) = self.soft_limit_bytes()
+            && projected < soft
+        {
+            return true;
+        }
+
+        // Soft-limit crossing: trigger a young GC early. If that restores
+        // headroom below the soft limit we're done; no need for a full GC.
+        if projected >= self.soft_limit_bytes().unwrap_or(hard_limit) && projected < hard_limit {
+            self.collect_young();
+            if self.current_heap_bytes().saturating_add(aligned) < hard_limit {
+                return true;
+            }
+        }
+
+        // Hard-limit path: run the full emergency sequence.
+        if self.current_heap_bytes().saturating_add(aligned) >= hard_limit
+            && !self.try_reclaim(aligned)
+        {
+            self.oom_flag.store(true, Ordering::Relaxed);
+            return false;
+        }
+
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -108,11 +244,21 @@ impl GcHeap {
     /// If young space is full, triggers a scavenge first.
     /// If the object is too large for young space, allocates in large object space.
     ///
+    /// When a hard heap cap is configured (see [`GcConfig::max_heap_bytes`]),
+    /// the limit is enforced before the allocation. If the cap cannot be
+    /// respected even after an emergency full GC, the OOM flag is raised and
+    /// `None` is returned.
+    ///
     /// The caller must immediately write a valid `GcHeader` at the returned
     /// pointer and initialize the object payload.
     pub fn alloc_young(&mut self, size: usize) -> Option<NonNull<u8>> {
         let aligned = align_up(size, CELL_SIZE);
         debug_assert!(aligned >= HEADER_SIZE);
+
+        // Hard heap cap check (no-op when unconfigured).
+        if !self.enforce_heap_limit(aligned) {
+            return None;
+        }
 
         // Large objects go directly to large object space.
         if aligned > crate::page::PAGE_PAYLOAD_SIZE / 2 {
@@ -133,8 +279,13 @@ impl GcHeap {
 
     /// Allocates `size` bytes directly in old generation.
     /// Used for promoted objects and pre-tenured allocations.
+    ///
+    /// Respects the hard heap cap like [`GcHeap::alloc_young`].
     pub fn alloc_old(&mut self, size: usize) -> Option<NonNull<u8>> {
         let aligned = align_up(size, CELL_SIZE);
+        if !self.enforce_heap_limit(aligned) {
+            return None;
+        }
         self.old_space.alloc(aligned)
     }
 
@@ -352,6 +503,7 @@ mod tests {
         let mut heap = GcHeap::new(GcConfig {
             young_gen_size: 1024 * 1024, // 1MB for tests
             old_gen_threshold: 512 * 1024,
+            ..GcConfig::default()
         });
         heap.register_trace_fn(TAG_NODE, trace_node);
         heap
@@ -481,5 +633,92 @@ mod tests {
 
         heap.collect_full();
         assert_eq!(heap.stats().full_collections, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Heap limit (max_heap_bytes) tests
+    // -----------------------------------------------------------------------
+
+    fn heap_with_max(max_bytes: usize) -> GcHeap {
+        let mut heap = GcHeap::new(GcConfig {
+            young_gen_size: 256 * 1024,
+            old_gen_threshold: 128 * 1024,
+            max_heap_bytes: Some(max_bytes),
+            ..GcConfig::default()
+        });
+        heap.register_trace_fn(TAG_NODE, trace_node);
+        heap
+    }
+
+    #[test]
+    fn default_config_has_no_heap_cap() {
+        let heap = GcHeap::with_defaults();
+        assert!(heap.max_heap_bytes().is_none());
+        assert!(!heap.oom_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn current_heap_bytes_sums_all_spaces() {
+        let mut heap = setup_heap();
+        let before = heap.current_heap_bytes();
+        alloc_young_leaf(&mut heap, 1);
+        let after = heap.current_heap_bytes();
+        assert!(after > before, "heap byte count should grow after alloc");
+    }
+
+    #[test]
+    fn unrooted_allocs_stay_below_limit() {
+        // Plenty of headroom (1 MB) — leaves are unrooted so scavenge reclaims them.
+        let mut heap = heap_with_max(1024 * 1024);
+        for i in 0..10_000_u64 {
+            let _ = alloc_young_leaf(&mut heap, i);
+        }
+        assert!(
+            !heap.oom_flag().load(Ordering::Relaxed),
+            "OOM should not trip when the working set is collectible"
+        );
+    }
+
+    #[test]
+    fn oom_flag_trips_when_live_set_exceeds_cap() {
+        // Tight cap: rooted allocations cannot be reclaimed, so the flag should
+        // eventually trip. Cap sized well below what 2_000 live leaves need.
+        let mut heap = heap_with_max(16 * 1024);
+        let mut rooted = 0usize;
+        for i in 0..4_096_u64 {
+            let size = align_up(std::mem::size_of::<Leaf>(), CELL_SIZE);
+            match heap.alloc_young(size) {
+                Some(ptr) => unsafe {
+                    let leaf = ptr.as_ptr() as *mut Leaf;
+                    (*leaf).header = GcHeader::new_young(TAG_LEAF, size as u32);
+                    (*leaf).value = i;
+                    heap.root(ptr.as_ptr() as *const GcHeader);
+                    rooted += 1;
+                },
+                None => break,
+            }
+        }
+        assert!(
+            heap.oom_flag().load(Ordering::Relaxed),
+            "OOM flag should be set after exhausting a tight heap cap"
+        );
+        assert!(
+            rooted > 0,
+            "some allocations must succeed before the cap is hit"
+        );
+    }
+
+    #[test]
+    fn clear_oom_flag_resets_signal() {
+        let heap = heap_with_max(8 * 1024);
+        heap.oom_flag().store(true, Ordering::Relaxed);
+        heap.clear_oom_flag();
+        assert!(!heap.oom_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn with_max_heap_bytes_constructor() {
+        let heap = GcHeap::with_max_heap_bytes(64 * 1024);
+        assert_eq!(heap.max_heap_bytes(), Some(64 * 1024));
     }
 }

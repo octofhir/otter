@@ -175,9 +175,18 @@ impl OtterRuntime {
 
     /// Executes a pre-compiled module to completion with the runtime's state.
     pub fn run_module(&mut self, module: &Module) -> Result<ExecutionResult, RunError> {
-        // Set up timeout interrupt if configured.
+        // Clear any stale OOM flag from a previous script — a once-hit heap
+        // cap should not abort every subsequent execution on the same runtime.
+        self.state.clear_oom_flag();
+
+        // Set up timeout interrupt if configured, and attach the shared OOM
+        // signal so the interpreter raises a catchable RangeError when the
+        // configured heap cap is exceeded.
         let interrupt_flag = Arc::new(AtomicBool::new(false));
-        let interpreter = Interpreter::new().with_interrupt_flag(interrupt_flag.clone());
+        let oom_flag = self.state.oom_flag();
+        let interpreter = Interpreter::new()
+            .with_interrupt_flag(interrupt_flag.clone())
+            .with_oom_flag(oom_flag);
         let _interrupt_guard = self
             .timeout
             .map(|timeout| TimeoutGuard::arm(interrupt_flag.clone(), timeout));
@@ -2011,5 +2020,82 @@ mod tests {
         )
         .expect("should run");
         assert_eq!(capture.text(), "data");
+    }
+
+    // -----------------------------------------------------------------------
+    // Heap limit (`max_heap_bytes`) end-to-end tests — analogue of Node.js's
+    // `--max-old-space-size`. The runtime should surface `OutOfMemory` as a
+    // catchable, non-fatal `RangeError`-style error.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_heap_bytes_unlimited_by_default() {
+        let mut rt = OtterRuntime::builder().build();
+        // Plenty of small allocations under the uncapped default: should
+        // complete without triggering any OOM plumbing.
+        rt.run_script(
+            "var arr = []; for (var i = 0; i < 10; i++) arr.push(i);",
+            "no-cap.js",
+        )
+        .expect("uncapped runtime should accept normal workloads");
+    }
+
+    #[test]
+    fn max_heap_bytes_zero_disables_cap() {
+        // `.max_heap_bytes(0)` is the explicit opt-out from the Node-style
+        // default limit. Must behave identically to the uncapped default.
+        let mut rt = OtterRuntime::builder().max_heap_bytes(0).build();
+        rt.run_script("var x = 1 + 2;", "zero.js")
+            .expect("zero cap should be unlimited");
+    }
+
+    #[test]
+    fn pathological_array_length_is_caught_as_range_error() {
+        // `new Array(0xFFFFFFFF + 1)` with a spec-valid constructor length
+        // uses the ES §22.1.1 path; for a direct `length` set on an array
+        // we rely on the VM `set_array_length` MAX_ARRAY_LENGTH guard.
+        let mut rt = OtterRuntime::builder().build();
+        let code = concat!(
+            "let threw = false;\n",
+            "try { let a = []; a.length = 4294967296; }\n",
+            "catch (e) { if (e instanceof RangeError) threw = true; }\n",
+            "if (!threw) throw new Error('expected RangeError');\n",
+        );
+        rt.run_script(code, "cap.js")
+            .expect("RangeError should be caught by JS, runtime must stay alive");
+    }
+
+    #[test]
+    fn concat_above_uint32_cap_throws_range_error() {
+        // §22.1.3.1 — `{[Symbol.isConcatSpreadable]: true, length: 2^32}`
+        // must not trigger a 32 GB `Vec::resize`. With the Phase 3 defenses
+        // concat pre-computes the total and throws RangeError instead.
+        let mut rt = OtterRuntime::builder().build();
+        let code = concat!(
+            "let threw = false;\n",
+            "try {\n",
+            "  let huge = {length: 4294967296};\n",
+            "  huge[Symbol.isConcatSpreadable] = true;\n",
+            "  [].concat(huge);\n",
+            "} catch (e) { if (e instanceof RangeError) threw = true; }\n",
+            "if (!threw) throw new Error('expected RangeError from concat');\n",
+        );
+        rt.run_script(code, "concat-cap.js")
+            .expect("spec-cap violation should surface as RangeError");
+    }
+
+    #[test]
+    fn set_length_beyond_cap_throws_range_error() {
+        // Pathological `length = 2^32` on an existing array must trip the
+        // `set_array_length` MAX_ARRAY_LENGTH guard.
+        let mut rt = OtterRuntime::builder().build();
+        let code = concat!(
+            "let threw = false;\n",
+            "try { [].length = 4294967296; }\n",
+            "catch (e) { if (e instanceof RangeError) threw = true; }\n",
+            "if (!threw) throw new Error('expected RangeError');\n",
+        );
+        rt.run_script(code, "setlen-cap.js")
+            .expect("huge array length set should surface as RangeError");
     }
 }

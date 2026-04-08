@@ -404,6 +404,13 @@ fn array_push(
 }
 
 /// ES2024 §23.1.3.15 Array.prototype.join(separator)
+///
+/// The per-call `Vec::with_capacity(length)` was the single largest OOM
+/// source in test262 Array tests — a sparse array with `length = 2^32-1`
+/// would reserve ~96 GB of `String` slots even though only a handful of
+/// real values exist. We now use the capped helper [`safe_with_capacity`]
+/// and poll [`RuntimeState::check_oom`] every 4K iterations so the script
+/// fails fast with a catchable `RangeError` when the heap cap is exceeded.
 fn array_join(
     this: &RegisterValue,
     args: &[RegisterValue],
@@ -424,8 +431,11 @@ fn array_join(
         ",".to_string()
     };
 
-    let mut parts = Vec::with_capacity(length);
+    let mut parts: Vec<String> = safe_with_capacity(length);
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.join")?;
         let part = match value {
             None => String::new(),
@@ -442,6 +452,28 @@ fn array_join(
     let result = parts.join(&separator);
     let handle = runtime.alloc_string(result);
     Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// Upper bound for a single `Vec::with_capacity(n)` call inside array
+/// intrinsics. Picked to stay well under the spec cap while still covering
+/// every realistic test262 working set. Larger collections will grow the
+/// Vec on demand (amortised doubling) so the eventual allocation can still
+/// reach `MAX_ARRAY_LENGTH` when the heap cap allows, but we never reserve
+/// dozens of gigabytes up front for a sparse length probe.
+const WITH_CAPACITY_CAP: usize = 64 * 1024;
+
+/// Interval at which tight native loops poll the OOM flag so the
+/// interpreter can surface a `RangeError` without waiting for the next GC
+/// safepoint.
+const OOM_POLL_INTERVAL: usize = 4096;
+
+/// Capped variant of `Vec::with_capacity` that never reserves more than
+/// [`WITH_CAPACITY_CAP`] elements up front. Prevents a single pathological
+/// `length` from triggering a multi-GB reservation that would abort the
+/// process before our heap-cap machinery can react.
+#[inline]
+pub(crate) fn safe_with_capacity<T>(len: usize) -> Vec<T> {
+    Vec::with_capacity(len.min(WITH_CAPACITY_CAP))
 }
 
 /// ES2024 §23.1.3.14 Array.prototype.indexOf(searchElement [, fromIndex])
@@ -483,63 +515,103 @@ fn array_index_of(
 }
 
 /// ES2024 §23.1.3.1 Array.prototype.concat(...items)
-/// ES2024 §22.1.3.1 Array.prototype.concat(...items)
 /// Spec: <https://tc39.es/ecma262/#sec-array.prototype.concat>
+///
+/// Pre-computes the result length across all items and throws `RangeError`
+/// if it would exceed the spec-mandated `2^32 - 1` limit, so that we never
+/// reach `Vec::resize(2^33, ..)` on pathological `{length: 2**32}` inputs.
 fn array_concat(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // 1. Let O be ? ToObject(this value).
-    let result = runtime.alloc_array();
-    let mut next_index: usize = 0;
+    use crate::object::MAX_ARRAY_LENGTH;
 
-    // 3. Let items be a List whose first element is O and whose subsequent
-    //    elements are the elements of args.
-    // We iterate over `this` first, then `args`.
+    // ---- Pass 1: plan. Walk items, compute per-item length, check cap. ----
     let this_val = *this;
-    let items = std::iter::once(&this_val).chain(args.iter());
-
-    for item in items {
-        // 4.a. Let spreadable be ? IsConcatSpreadable(E).
+    let mut plans: Vec<(RegisterValue, Option<(ObjectHandle, usize)>)> = Vec::new();
+    let mut total: usize = 0;
+    for item in std::iter::once(&this_val).chain(args.iter()) {
         if is_concat_spreadable(*item, runtime)? {
-            // 4.a.i. Spreadable: treat as array-like
-            // ES2024 §22.1.3.1 step 5.c.ii: Let len be ? LengthOfArrayLike(E).
             let handle = item.as_object_handle().map(ObjectHandle).ok_or_else(|| {
                 VmNativeCallError::Internal("concat: spreadable value must be an object".into())
             })?;
             let len = length_of_array_like(handle, runtime)?;
-            runtime
-                .objects_mut()
-                .set_array_length(result, next_index.saturating_add(len))
-                .ok();
-            for offset in 0..len {
-                // 5.c.iv.2: Let exists be ? HasProperty(E, P).
-                // 5.c.iv.3: If exists is true, let subElement be ? Get(E, P).
-                if let Some(elem) =
-                    array_index_value(handle, offset, runtime, "Array.prototype.concat")?
-                {
-                    runtime
-                        .objects_mut()
-                        .set_index(result, next_index.saturating_add(offset), elem)
-                        .ok();
-                }
+            // Spec cap: result length must fit in uint32.
+            let next_total = total.saturating_add(len);
+            if next_total > MAX_ARRAY_LENGTH {
+                return Err(invalid_array_length_error(runtime));
             }
-            next_index = next_index.saturating_add(len);
+            total = next_total;
+            plans.push((*item, Some((handle, len))));
         } else {
-            // 4.a.ii. Not spreadable: append as single element.
-            runtime
-                .objects_mut()
-                .set_index(result, next_index, *item)
-                .ok();
-            next_index = next_index.saturating_add(1);
+            let next_total = total.saturating_add(1);
+            if next_total > MAX_ARRAY_LENGTH {
+                return Err(invalid_array_length_error(runtime));
+            }
+            total = next_total;
+            plans.push((*item, None));
         }
     }
-    runtime
-        .objects_mut()
-        .set_array_length(result, next_index)
-        .ok();
+
+    // ---- Pass 2: allocate + copy. ----
+    let result = runtime.alloc_array();
+    // Pre-size the result once — this is the single `Vec::resize` call. If
+    // the heap cap is exceeded, surface the OOM as a catchable RangeError.
+    if let Err(err) = runtime.objects_mut().set_array_length(result, total) {
+        return Err(object_error_to_vm_error(runtime, err));
+    }
+    let mut next_index: usize = 0;
+    for (item, plan) in plans {
+        match plan {
+            Some((handle, len)) => {
+                for offset in 0..len {
+                    // Spec: HasProperty + Get. Missing slots become holes.
+                    if let Some(elem) =
+                        array_index_value(handle, offset, runtime, "Array.prototype.concat")?
+                        && let Err(err) = runtime.objects_mut().set_index(
+                            result,
+                            next_index.saturating_add(offset),
+                            elem,
+                        )
+                    {
+                        return Err(object_error_to_vm_error(runtime, err));
+                    }
+                }
+                next_index = next_index.saturating_add(len);
+            }
+            None => {
+                if let Err(err) = runtime.objects_mut().set_index(result, next_index, item) {
+                    return Err(object_error_to_vm_error(runtime, err));
+                }
+                next_index = next_index.saturating_add(1);
+            }
+        }
+    }
     Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// Converts an `ObjectError` raised by a mutation helper (e.g. `set_index`,
+/// `set_array_length`) into the appropriate native-call error. Array length
+/// violations become catchable `RangeError`, heap-cap exhaustion becomes a
+/// `RangeError: out of memory`, and everything else is treated as an
+/// internal error.
+fn object_error_to_vm_error(
+    runtime: &mut crate::interpreter::RuntimeState,
+    error: crate::object::ObjectError,
+) -> VmNativeCallError {
+    use crate::object::ObjectError;
+    match error {
+        ObjectError::InvalidArrayLength => invalid_array_length_error(runtime),
+        ObjectError::OutOfMemory => runtime.throw_range_error("out of memory: heap limit exceeded"),
+        ObjectError::TypeError(msg) => {
+            let msg = msg.into_string();
+            type_error(runtime, &msg)
+        }
+        ObjectError::InvalidHandle | ObjectError::InvalidKind | ObjectError::InvalidIndex => {
+            VmNativeCallError::Internal("object mutation failed".into())
+        }
+    }
 }
 
 /// ES2024 §22.1.3.1.1 IsConcatSpreadable(O)
@@ -1080,8 +1152,19 @@ fn array_fill(
         raw_end.min(len) as usize
     };
 
+    // `start..end` can span up to `MAX_ARRAY_LENGTH` iterations on sparse
+    // arrays; the previous `.ok()` silently swallowed every `set_index`
+    // failure, so a heap-cap violation or invalid array-length only showed
+    // up as a runaway allocation. Propagate those errors and poll the OOM
+    // flag every few thousand iterations so the script can exit quickly
+    // with a catchable `RangeError`.
     for index in start..end {
-        runtime.objects_mut().set_index(receiver, index, value).ok();
+        if index % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
+        if let Err(err) = runtime.objects_mut().set_index(receiver, index, value) {
+            return Err(object_error_to_vm_error(runtime, err));
+        }
     }
 
     Ok(*this)
@@ -1530,8 +1613,11 @@ fn array_sort(
         .filter(|h| runtime.objects().is_callable(*h));
 
     // Collect non-hole elements.
-    let mut items = Vec::with_capacity(length);
+    let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         if let Some(v) = array_index_value(receiver, index, runtime, "Array.prototype.sort")? {
             items.push(v);
         }
@@ -1770,14 +1856,39 @@ fn array_flat(
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
+/// Hard cap on `Array.prototype.flat` recursion. Neither ECMA-262 nor any
+/// browser engine specifies a numeric limit — V8/SpiderMonkey rely on
+/// native stack exhaustion — but we set an explicit cap so a pathological
+/// input aborts with a catchable `RangeError` long before the Rust stack
+/// unwinds.
+const MAX_FLAT_DEPTH: usize = 1024;
+
 fn flatten_into_array(
     source: ObjectHandle,
     target: ObjectHandle,
     depth: usize,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<(), VmNativeCallError> {
+    flatten_into_array_bounded(source, target, depth, 0, runtime)
+}
+
+fn flatten_into_array_bounded(
+    source: ObjectHandle,
+    target: ObjectHandle,
+    depth: usize,
+    call_depth: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<(), VmNativeCallError> {
+    if call_depth >= MAX_FLAT_DEPTH {
+        return Err(
+            runtime.throw_range_error("Array.prototype.flat: maximum nesting depth exceeded")
+        );
+    }
     let length = array_length(source, runtime, "flat")?;
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let Some(value) = array_index_value(source, index, runtime, "flat")? else {
             continue;
         };
@@ -1785,10 +1896,12 @@ fn flatten_into_array(
             && let Some(h) = value.as_object_handle().map(ObjectHandle)
             && matches!(runtime.objects().kind(h), Ok(HeapValueKind::Array))
         {
-            flatten_into_array(h, target, depth - 1, runtime)?;
+            flatten_into_array_bounded(h, target, depth - 1, call_depth + 1, runtime)?;
             continue;
         }
-        runtime.objects_mut().push_element(target, value).ok();
+        if let Err(err) = runtime.objects_mut().push_element(target, value) {
+            return Err(object_error_to_vm_error(runtime, err));
+        }
     }
     Ok(())
 }
@@ -1851,8 +1964,11 @@ fn array_to_locale_string(
     })?;
     let len = array_length(receiver, runtime, "Array.prototype.toLocaleString")?;
 
-    let mut parts = Vec::with_capacity(len);
+    let mut parts: Vec<String> = safe_with_capacity(len);
     for i in 0..len {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let prop = runtime.intern_property_name(&i.to_string());
         let elem_receiver = RegisterValue::from_object_handle(receiver.0);
         let elem = runtime.ordinary_get(receiver, prop, elem_receiver)?;
@@ -1939,8 +2055,11 @@ fn array_copy_within(
     let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
 
     // Collect values first to avoid aliasing issues.
-    let mut vals = Vec::with_capacity(count);
+    let mut vals: Vec<Option<RegisterValue>> = safe_with_capacity(count);
     for i in 0..count {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         vals.push(array_index_value(
             receiver,
             from + i,
@@ -1949,8 +2068,10 @@ fn array_copy_within(
         )?);
     }
     for (i, val) in vals.into_iter().enumerate() {
-        if let Some(v) = val {
-            runtime.objects_mut().set_index(receiver, to + i, v).ok();
+        if let Some(v) = val
+            && let Err(err) = runtime.objects_mut().set_index(receiver, to + i, v)
+        {
+            return Err(object_error_to_vm_error(runtime, err));
         }
     }
     Ok(*this)
@@ -1975,8 +2096,11 @@ fn array_to_reversed(
     })?;
     let length = array_length(receiver, runtime, "Array.prototype.toReversed")?;
 
-    let mut elements = Vec::with_capacity(length);
+    let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in (0..length).rev() {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toReversed")?
             .unwrap_or_else(RegisterValue::undefined);
         elements.push(val);
@@ -2007,8 +2131,11 @@ fn array_to_sorted(
         .filter(|h| runtime.objects().is_callable(*h));
 
     // Collect all elements (holes become undefined per spec).
-    let mut items = Vec::with_capacity(length);
+    let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSorted")?
             .unwrap_or_else(RegisterValue::undefined);
         items.push(val);
@@ -2075,10 +2202,17 @@ fn array_to_spliced(
 
     // Build new array: [0..actual_start] + insert_items + [actual_start+actual_delete_count..len].
     let new_len = len - actual_delete_count + insert_items.len();
-    let mut elements = Vec::with_capacity(new_len);
+    // Spec cap (§22.1.3.1 analogue): result length must fit in uint32.
+    if new_len > crate::object::MAX_ARRAY_LENGTH {
+        return Err(invalid_array_length_error(runtime));
+    }
+    let mut elements: Vec<RegisterValue> = safe_with_capacity(new_len);
 
     // Copy before splice point.
     for i in 0..actual_start {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
             .unwrap_or_else(RegisterValue::undefined);
         elements.push(val);
@@ -2089,6 +2223,9 @@ fn array_to_spliced(
 
     // Copy after splice point.
     for i in (actual_start + actual_delete_count)..len {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
             .unwrap_or_else(RegisterValue::undefined);
         elements.push(val);
@@ -2138,8 +2275,11 @@ fn array_with(
         .unwrap_or_else(RegisterValue::undefined);
 
     // Build new array with the replacement.
-    let mut elements = Vec::with_capacity(length);
+    let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
+        if i % OOM_POLL_INTERVAL == 0 {
+            runtime.check_oom()?;
+        }
         if i == actual_index {
             elements.push(new_value);
         } else {

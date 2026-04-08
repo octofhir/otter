@@ -47,4 +47,8 @@ pub enum TestOutcome {
     Timeout,
     /// Test crashed
     Crash,
+    /// Test exceeded the configured heap cap. Distinguished from `Crash`
+    /// so conformance reports can differentiate pathological Array tests
+    /// from real VM crashes.
+    OutOfMemory,
 }

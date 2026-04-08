@@ -92,6 +92,13 @@ struct Cli {
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
 
+    /// Maximum old-space size in MB (Otter's analogue of Node.js's
+    /// `--max-old-space-size`). When exceeded, Otter throws a catchable
+    /// `RangeError` instead of letting the OS kill the process. Default
+    /// `2048` (2 GB) matches modern Node.js; pass `0` to disable.
+    #[arg(long = "max-old-space-size", global = true, default_value = "2048")]
+    max_old_space_size: u64,
+
     /// Show profiling information (memory usage)
     #[arg(long, global = true)]
     profile: bool,
@@ -463,6 +470,13 @@ fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
 
     if cli.timeout > 0 {
         builder = builder.timeout(Duration::from_secs(cli.timeout));
+    }
+
+    if cli.max_old_space_size > 0 {
+        // Convert the Node-style MB unit into bytes before handing off to
+        // the runtime builder.
+        let bytes = (cli.max_old_space_size as usize).saturating_mul(1024 * 1024);
+        builder = builder.max_heap_bytes(bytes);
     }
 
     Ok(builder.build())

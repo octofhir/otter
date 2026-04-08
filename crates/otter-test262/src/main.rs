@@ -53,13 +53,36 @@ struct Cli {
     #[arg(long, default_value = "5000")]
     timeout: u64,
 
-    /// Path for JSONL result log
+    /// Path for JSONL result log (one TestResult per line — streaming).
     #[arg(long)]
     log: Option<PathBuf>,
+
+    /// Save a canonical `PersistedReport` JSON (summary + all results) to
+    /// the given path at the end of the run. This is the format consumed
+    /// by `gen-conformance` and by the batch-merge tool.
+    #[arg(long)]
+    save: Option<PathBuf>,
 
     /// Features to skip (comma-separated)
     #[arg(long, value_delimiter = ',')]
     skip_features: Vec<String>,
+
+    /// Hard heap cap per test in bytes. Protects against pathological
+    /// Array tests (e.g. `new Array(2**32-1)`) that would otherwise OOM
+    /// the host. Default: 512 MB. Pass `0` to disable the cap.
+    #[arg(long, default_value = "536870912")]
+    max_heap_bytes: usize,
+
+    /// Enable memory-leak profiling — takes a heap snapshot every
+    /// `--memory-profile-interval` tests and reports the top growing
+    /// types. Intended for diagnosing leaks, not for every run.
+    #[arg(long)]
+    memory_profile: bool,
+
+    /// Interval (in tests) between memory profile snapshots. Defaults
+    /// to 100 so the O(N) heap walk happens at most 1% of the time.
+    #[arg(long, default_value = "100")]
+    memory_profile_interval: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,10 +193,15 @@ struct NewVmRunner {
     skip_features: HashSet<String>,
     harness_cache: HashMap<String, String>,
     timeout: Duration,
+    /// Hard heap cap passed to every `OtterRuntime::builder().max_heap_bytes`
+    /// call. `0` disables the cap.
+    max_heap_bytes: usize,
+    memory_profile: bool,
+    memory_profile_interval: usize,
 }
 
 impl NewVmRunner {
-    fn new(test_dir: &Path, timeout: Duration) -> Self {
+    fn new(test_dir: &Path, timeout: Duration, max_heap_bytes: usize) -> Self {
         let harness_dir = test_dir.join("harness");
         let mut harness_cache = HashMap::new();
 
@@ -194,7 +222,16 @@ impl NewVmRunner {
             skip_features: HashSet::new(),
             harness_cache,
             timeout,
+            max_heap_bytes,
+            memory_profile: false,
+            memory_profile_interval: 100,
         }
+    }
+
+    fn with_memory_profile(mut self, enabled: bool, interval: usize) -> Self {
+        self.memory_profile = enabled;
+        self.memory_profile_interval = interval.max(1);
+        self
     }
 
     fn with_filter(mut self, filter: String) -> Self {
@@ -360,7 +397,10 @@ impl NewVmRunner {
 
         // Fresh runtime per test.
         harness_clear();
-        let mut rt = OtterRuntime::builder().timeout(self.timeout).build();
+        let mut rt = OtterRuntime::builder()
+            .timeout(self.timeout)
+            .max_heap_bytes(self.max_heap_bytes)
+            .build();
         Self::setup_harness(&mut rt);
 
         if !metadata.is_raw() {
@@ -430,6 +470,11 @@ impl NewVmRunner {
             Err(RunError::Runtime(e)) => {
                 if e.contains("execution interrupted") {
                     (TestOutcome::Timeout, Some(e))
+                } else if e.contains("out of memory") {
+                    // Heap-cap violation: tracked as a distinct outcome so
+                    // conformance reports can tell pathological Array tests
+                    // apart from real VM crashes.
+                    (TestOutcome::OutOfMemory, Some(e))
                 } else if metadata.expects_runtime_error() {
                     (TestOutcome::Pass, None)
                 } else {
@@ -488,13 +533,75 @@ fn format_register_value(value: RegisterValue, runtime: &mut RuntimeState) -> St
 // Main
 // ---------------------------------------------------------------------------
 
+/// Build a fresh runtime, install the test262 harness, and snapshot its
+/// heap stats. The returned value is the `HeapTypeStats` "starting line"
+/// for an unused runtime — any drift of this baseline across tests is a
+/// leak signal in thread-local or process-global state.
+fn probe_heap_baseline(runner: &NewVmRunner) -> otter_runtime::HeapTypeStats {
+    let mut rt = OtterRuntime::builder()
+        .timeout(runner.timeout)
+        .max_heap_bytes(runner.max_heap_bytes)
+        .build();
+    NewVmRunner::setup_harness(&mut rt);
+    rt.state().collect_heap_stats()
+}
+
+/// Render a human-readable delta between two `HeapTypeStats` snapshots.
+/// Only the top 10 growing variants by byte delta are shown, which keeps
+/// the output line count bounded during a long run.
+fn print_heap_diff(
+    baseline: &otter_runtime::HeapTypeStats,
+    current: &otter_runtime::HeapTypeStats,
+    test_index: usize,
+) {
+    let count_delta = current.total_count as i64 - baseline.total_count as i64;
+    let bytes_delta = current.total_bytes as i64 - baseline.total_bytes as i64;
+    eprintln!(
+        "[memory] test={test_index} total: count {:+} ({}), bytes {:+} ({})",
+        count_delta, current.total_count, bytes_delta, current.total_bytes
+    );
+
+    let mut deltas: Vec<(&'static str, i64, i64)> = Vec::new();
+    for (name, (count, bytes)) in &current.by_type {
+        let (base_count, base_bytes) = baseline.by_type.get(name).copied().unwrap_or_default();
+        let dc = *count as i64 - base_count as i64;
+        let db = *bytes as i64 - base_bytes as i64;
+        if dc != 0 || db != 0 {
+            deltas.push((name, dc, db));
+        }
+    }
+    // Sort by byte delta, largest first.
+    deltas.sort_by(|a, b| b.2.cmp(&a.2));
+    for (name, dc, db) in deltas.iter().take(10) {
+        if *dc == 0 && *db == 0 {
+            continue;
+        }
+        eprintln!("  {name:<24} count {dc:+6} bytes {db:+10}");
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     eprintln!("{}", "Otter Test262 Runner".bold().cyan());
     eprintln!("Test directory: {}", cli.test_dir.display());
 
-    let mut runner = NewVmRunner::new(&cli.test_dir, Duration::from_millis(cli.timeout));
+    let mut runner = NewVmRunner::new(
+        &cli.test_dir,
+        Duration::from_millis(cli.timeout),
+        cli.max_heap_bytes,
+    )
+    .with_memory_profile(cli.memory_profile, cli.memory_profile_interval);
+
+    if cli.max_heap_bytes > 0 {
+        eprintln!(
+            "Max heap bytes per test: {} ({} MB)",
+            cli.max_heap_bytes,
+            cli.max_heap_bytes / (1024 * 1024)
+        );
+    } else {
+        eprintln!("Max heap bytes per test: unlimited");
+    }
 
     if let Some(ref filter) = cli.filter {
         runner = runner.with_filter(filter.clone());
@@ -545,7 +652,32 @@ fn main() {
     let mut summary = RunSummary::new(10000);
     let run_start = Instant::now();
 
-    for path in &tests {
+    // Memory-profile baseline (captured from the first probed runtime).
+    // The runner creates a fresh `OtterRuntime` for every test, so the
+    // interesting leak signal is *baseline drift* across identical
+    // harness-setup runtimes — drift indicates thread-local/static state
+    // accumulating between drops (exactly what the new-vm drop+jit cleanup
+    // path guards against).
+    let mut memory_baseline: Option<otter_runtime::HeapTypeStats> = None;
+    let memory_profile = runner.memory_profile;
+    let memory_profile_interval = runner.memory_profile_interval;
+    if memory_profile {
+        eprintln!("Memory profile enabled (interval: every {memory_profile_interval} tests)");
+    }
+
+    for (test_index, path) in tests.iter().enumerate() {
+        if memory_profile && test_index.is_multiple_of(memory_profile_interval) {
+            let stats = probe_heap_baseline(&runner);
+            if let Some(ref baseline) = memory_baseline {
+                print_heap_diff(baseline, &stats, test_index);
+            } else {
+                eprintln!(
+                    "[memory] baseline at test {test_index}: total_count={}, total_bytes={}",
+                    stats.total_count, stats.total_bytes
+                );
+                memory_baseline = Some(stats);
+            }
+        }
         let results = runner.run_test_all_modes(path);
 
         for result in &results {
@@ -558,6 +690,7 @@ fn main() {
                         TestOutcome::Skip => "S".yellow(),
                         TestOutcome::Timeout => "T".magenta(),
                         TestOutcome::Crash => "!".red().bold(),
+                        TestOutcome::OutOfMemory => "M".red().bold(),
                     };
                     eprint!("{ch}");
                     if summary.total % 80 == 79 {
@@ -571,6 +704,7 @@ fn main() {
                         TestOutcome::Skip => "SKIP".yellow(),
                         TestOutcome::Timeout => "TIME".magenta(),
                         TestOutcome::Crash => "CRASH".red().bold(),
+                        TestOutcome::OutOfMemory => "OOM".red().bold(),
                     };
                     eprintln!("[{status}] {} ({})", result.path, result.mode);
                     if let Some(ref err) = result.error {
@@ -585,7 +719,9 @@ fn main() {
                 let _ = writeln!(writer, "{line}");
             }
 
-            summary.record(result, false);
+            // `--save` writes a full `PersistedReport` at the end of the
+            // run, so we need to keep every individual `TestResult`.
+            summary.record(result, cli.save.is_some());
         }
 
         if let Some(ref pb) = pb {
@@ -609,7 +745,28 @@ fn main() {
     }
 
     let duration = run_start.elapsed();
+    let save_path = cli.save.clone();
+    let all_results = if save_path.is_some() {
+        std::mem::take(&mut summary.all_results)
+    } else {
+        Vec::new()
+    };
     let report = summary.into_report();
     report.print_summary();
     eprintln!("Duration: {:.1}s", duration.as_secs_f64());
+
+    if let Some(path) = save_path {
+        let persisted = otter_test262::PersistedReport {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            otter_version: env!("CARGO_PKG_VERSION").to_string(),
+            test262_commit: None,
+            duration_secs: duration.as_secs_f64(),
+            summary: report,
+            results: all_results,
+        };
+        match persisted.save(&path) {
+            Ok(()) => eprintln!("Saved PersistedReport to {}", path.display()),
+            Err(e) => eprintln!("Warning: failed to save report to {}: {e}", path.display()),
+        }
+    }
 }

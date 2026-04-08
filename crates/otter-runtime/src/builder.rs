@@ -71,6 +71,9 @@ pub struct RuntimeBuilder {
     console: Option<Box<dyn ConsoleBackend>>,
     timeout: Option<Duration>,
     host: HostConfig,
+    /// Hard cap on the total heap size, in bytes. Analogue of Node.js's
+    /// `--max-old-space-size`. `None` = unlimited.
+    max_heap_bytes: Option<usize>,
 }
 
 impl RuntimeBuilder {
@@ -80,6 +83,7 @@ impl RuntimeBuilder {
             console: None,
             timeout: None,
             host: HostConfig::default(),
+            max_heap_bytes: None,
         }
     }
 
@@ -94,6 +98,18 @@ impl RuntimeBuilder {
     /// will be interrupted with an error.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets a hard cap on the total heap size (object shells + explicit
+    /// container reservations), analogous to Node.js's
+    /// `--max-old-space-size`. When exceeded, the runtime raises a
+    /// catchable `RangeError` (`"out of memory: heap limit exceeded"`)
+    /// instead of allowing the OS to terminate the process.
+    ///
+    /// Passing `0` disables the cap.
+    pub fn max_heap_bytes(mut self, bytes: usize) -> Self {
+        self.max_heap_bytes = if bytes == 0 { None } else { Some(bytes) };
         self
     }
 
@@ -154,7 +170,11 @@ impl RuntimeBuilder {
 
     /// Builds the configured runtime.
     pub fn build(self) -> OtterRuntime {
-        let mut state = RuntimeState::new();
+        let gc_config = otter_vm::otter_gc::heap::GcConfig {
+            max_heap_bytes: self.max_heap_bytes,
+            ..otter_vm::otter_gc::heap::GcConfig::default()
+        };
+        let mut state = RuntimeState::with_gc_config(gc_config);
         let mut host = self.host;
 
         // Apply console backend.

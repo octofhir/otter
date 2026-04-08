@@ -22,6 +22,11 @@ name = "gen-conformance"
 path = "src/bin/gen_conformance.rs"
 test = false
 
+[[bin]]
+name = "merge-reports"
+path = "src/bin/merge_reports.rs"
+test = false
+
 [dependencies]
 otter-runtime = { path = "../otter-runtime", version = "0.1.0" }
 

@@ -113,7 +113,40 @@ cargo test --all                     # All unit tests
 just test262                         # Run all Test262 tests
 just test262-filter "Array"          # Filter by pattern
 just test262-dir "language/expressions"  # Specific directory
+
+# Heap-cap + OS-level guard for pathological suites (see below)
+bash scripts/test262-safe.sh built-ins/Array
 ```
+
+**Heap cap (`--max-heap-bytes`).** The test262 runner passes a heap cap
+to every fresh `OtterRuntime` (default 512 MB per test, configured via
+`max_heap_bytes_per_test` in `test262_config.toml`). Tests that exceed
+the cap surface a catchable `RangeError` (`"out of memory: heap limit
+exceeded"`) and are recorded as `OutOfMemory` outcomes — distinct from
+`Crash` so conformance reports can tell pathological Array tests apart
+from real VM crashes. Pass `--max-heap-bytes 0` to disable the cap.
+
+**Safe Array runs.** `built-ins/Array/**` contains inputs like
+`new Array(2**32 - 1)`, `[].concat({length: 2**32})`, and
+`arr.fill(0, 0, 2**31)` that would allocate dozens of GB on an
+unprotected VM. Two layers protect the host:
+
+1. **Inner cap (Otter heap limit)** — `--max-heap-bytes` surfaces as a
+   catchable `RangeError` and is the primary defence.
+2. **Outer cap (OS ulimit)** — `scripts/test262-safe.sh` also sets
+   `ulimit -v` on Linux so a runaway native allocation is killed by
+   the kernel before it can exhaust the host.
+
+Always use `bash scripts/test262-safe.sh built-ins/Array` (or pass
+`--max-heap-bytes` explicitly) when running the Array suite. The
+`scripts/test262-full-run.sh` batch runner applies both layers for
+every subdir.
+
+**Memory leak profiling.** The runner supports `--memory-profile`
+(optional `--memory-profile-interval N`) which snapshots the heap after
+harness setup every N tests and prints the top-growing types. Intended
+for diagnosing leaks in thread-local or process-global state, not for
+every run — the O(N) walk over the slot table adds noticeable overhead.
 
 ### Node.js Compatibility
 

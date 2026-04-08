@@ -47,6 +47,7 @@ impl From<ObjectError> for NativePayloadError {
             ObjectError::InvalidKind
             | ObjectError::InvalidIndex
             | ObjectError::InvalidArrayLength
+            | ObjectError::OutOfMemory
             | ObjectError::TypeError(_) => Self::MissingPayload,
         }
     }

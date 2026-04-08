@@ -9,6 +9,11 @@
 
 extern crate self as otter_vm;
 
+/// Re-export of the underlying GC crate so downstream consumers (e.g.
+/// `otter-runtime`) can configure heap parameters without a direct
+/// dependency on `otter-gc`.
+pub use otter_gc;
+
 /// Shared execution ABI.
 pub mod abi;
 /// ECMAScript abstract operations shared across interpreter and intrinsics.

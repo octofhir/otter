@@ -58,6 +58,6 @@ pub use runtime::{OtterRuntime, RunError};
 pub use otter_vm::console;
 pub use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError, VmNativeFunction};
 pub use otter_vm::interpreter::{ExecutionResult, InterpreterError, RuntimeState};
-pub use otter_vm::object::ObjectHandle;
+pub use otter_vm::object::{HeapTypeStats, ObjectHandle};
 pub use otter_vm::source;
 pub use otter_vm::value::RegisterValue;

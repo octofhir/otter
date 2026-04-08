@@ -78,6 +78,10 @@ pub enum InterpreterError {
     UncaughtThrow(RegisterValue),
     /// A native host function failed before producing a JS-visible completion.
     NativeCall(Box<str>),
+    /// The configured heap cap was exceeded. Raised by the GC safepoint
+    /// when the shared OOM flag is set and surfaced to the host as a
+    /// catchable `RangeError` by the outer runtime layer.
+    OutOfMemory,
 }
 
 impl fmt::Display for InterpreterError {
@@ -125,6 +129,7 @@ impl fmt::Display for InterpreterError {
             }
             Self::UncaughtThrow(value) => write!(f, "uncaught throw: {:?}", value),
             Self::NativeCall(message) => write!(f, "native host call failed: {message}"),
+            Self::OutOfMemory => f.write_str("out of memory: heap limit exceeded"),
         }
     }
 }
@@ -144,6 +149,7 @@ impl From<ObjectError> for InterpreterError {
             ObjectError::InvalidIndex => Self::InvalidHeapSlot,
             ObjectError::InvalidKind => Self::InvalidHeapValueKind,
             ObjectError::InvalidArrayLength => Self::NativeCall("invalid array length".into()),
+            ObjectError::OutOfMemory => Self::OutOfMemory,
             ObjectError::TypeError(msg) => Self::TypeError(msg),
         }
     }
@@ -584,10 +590,19 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
-    /// Creates a fresh runtime state with an empty object heap.
+    /// Creates a fresh runtime state with an empty, uncapped object heap.
     #[must_use]
     pub fn new() -> Self {
-        let mut objects = ObjectHeap::new();
+        Self::with_gc_config(otter_gc::heap::GcConfig::default())
+    }
+
+    /// Creates a fresh runtime state whose underlying object heap enforces
+    /// the provided GC configuration. Use this to set a hard heap cap
+    /// (`GcConfig::max_heap_bytes`) — the Otter analogue of Node's
+    /// `--max-old-space-size`.
+    #[must_use]
+    pub fn with_gc_config(config: otter_gc::heap::GcConfig) -> Self {
+        let mut objects = ObjectHeap::with_config(config);
         let mut intrinsics = VmIntrinsics::allocate(&mut objects);
         let mut property_names = PropertyNameRegistry::new();
         let mut native_functions = NativeFunctionRegistry::new();
@@ -655,6 +670,67 @@ impl RuntimeState {
     /// Returns the mutable intrinsic registry owned by the runtime's current realm.
     pub fn intrinsics_mut(&mut self) -> &mut VmIntrinsics {
         &mut self.realms[self.current_realm as usize].intrinsics
+    }
+
+    /// Returns the shared OOM signal flag owned by the object heap. Cloned
+    /// for sharing with the interpreter (see [`Interpreter::with_oom_flag`]).
+    pub fn oom_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.objects.oom_flag()
+    }
+
+    /// Snapshot of per-variant heap statistics. Intended for the test262
+    /// runner's `--memory-profile` mode — not a hot-path API.
+    pub fn collect_heap_stats(&self) -> crate::object::HeapTypeStats {
+        self.objects.collect_type_stats()
+    }
+
+    /// Clears the OOM signal flag. Called by the host runtime at script
+    /// entry so a previous heap-cap violation does not immediately abort a
+    /// subsequent script.
+    pub fn clear_oom_flag(&self) {
+        self.objects.clear_oom_flag();
+    }
+
+    /// Returns `Err(OutOfMemory)` if the object heap has signalled that the
+    /// hard cap was crossed. Intended for native function implementations
+    /// that allocate in bulk (e.g. `Array.prototype.concat`) so they fail
+    /// fast with a catchable RangeError instead of continuing after a
+    /// silent budget violation.
+    pub fn check_oom(&mut self) -> Result<(), crate::descriptors::VmNativeCallError> {
+        use std::sync::atomic::Ordering;
+        if self.objects.oom_flag().load(Ordering::Relaxed) {
+            Err(crate::descriptors::VmNativeCallError::Thrown(
+                self.alloc_range_error_value("out of memory: heap limit exceeded"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Allocates a freshly-constructed `RangeError` object with the given
+    /// message and returns it as a `RegisterValue`, ready to be surfaced
+    /// via [`VmNativeCallError::Thrown`]. Mirrors the helper used by
+    /// `invalid_array_length_error` in `intrinsics::array_class`.
+    pub fn alloc_range_error_value(&mut self, message: &str) -> RegisterValue {
+        let prototype = self.intrinsics().range_error_prototype;
+        let handle = self.alloc_object_with_prototype(Some(prototype));
+        let message_string = self.alloc_string(message);
+        let message_prop = self.intern_property_name("message");
+        self.objects_mut()
+            .set_property(
+                handle,
+                message_prop,
+                RegisterValue::from_object_handle(message_string.0),
+            )
+            .ok();
+        RegisterValue::from_object_handle(handle.0)
+    }
+
+    /// Throws a fresh `RangeError` with the given message. Returns the
+    /// `VmNativeCallError::Thrown` envelope used by native function
+    /// implementations.
+    pub fn throw_range_error(&mut self, message: &str) -> crate::descriptors::VmNativeCallError {
+        crate::descriptors::VmNativeCallError::Thrown(self.alloc_range_error_value(message))
     }
 
     /// Returns the realm record currently bound as the running execution context's `[[Realm]]`.
@@ -4949,6 +5025,12 @@ pub struct Interpreter {
     /// `Relaxed` atomic load per loop iteration (~1-2 CPU cycles, branch
     /// predicted not-taken >99.999% of the time).
     interrupt_flag: Option<Arc<AtomicBool>>,
+    /// Out-of-memory flag shared with the underlying object heap. Set by
+    /// the allocator/reservation paths in [`otter_gc::typed::TypedHeap`]
+    /// when the configured `max_heap_bytes` cap is crossed. Polled at the
+    /// same GC safepoints as `interrupt_flag` and surfaced to the host as
+    /// [`InterpreterError::OutOfMemory`].
+    oom_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Interpreter {
@@ -4963,6 +5045,7 @@ impl Interpreter {
     pub fn new() -> Self {
         Self {
             interrupt_flag: None,
+            oom_flag: None,
         }
     }
 
@@ -4973,6 +5056,15 @@ impl Interpreter {
     #[must_use]
     pub fn with_interrupt_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.interrupt_flag = Some(flag);
+        self
+    }
+
+    /// Attaches the OOM signal flag owned by the runtime's object heap.
+    /// When set, the interpreter raises [`InterpreterError::OutOfMemory`]
+    /// at the next GC safepoint.
+    #[must_use]
+    pub fn with_oom_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.oom_flag = Some(flag);
         self
     }
 
@@ -4987,13 +5079,21 @@ impl Interpreter {
         }
     }
 
-    /// Checks the interrupt flag and returns an error if it is set.
+    /// Checks the interrupt and OOM flags; returns an error if either is set.
+    /// The OOM check is evaluated after the interrupt check so that a script
+    /// receiving both signals (e.g. OOM inside a timeout-interrupted loop)
+    /// still surfaces the timeout first.
     #[inline]
     fn check_interrupt(&self) -> Result<(), InterpreterError> {
         if let Some(ref flag) = self.interrupt_flag
             && flag.load(Ordering::Relaxed)
         {
             return Err(InterpreterError::Interrupted);
+        }
+        if let Some(ref flag) = self.oom_flag
+            && flag.load(Ordering::Relaxed)
+        {
+            return Err(InterpreterError::OutOfMemory);
         }
         Ok(())
     }

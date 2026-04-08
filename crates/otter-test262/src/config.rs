@@ -27,6 +27,16 @@ pub struct Test262Config {
 
     /// Directory for saving results
     pub results_dir: Option<PathBuf>,
+
+    /// Hard heap cap applied to every fresh `OtterRuntime` instance, in
+    /// bytes. Protects against pathological Array tests (e.g.
+    /// `new Array(2**32 - 1)`) that would otherwise OOM the host. A value
+    /// of `0` disables the cap.
+    ///
+    /// Resolution order when the runner builds its configuration:
+    /// CLI `--max-heap-bytes` takes precedence over this field, which in
+    /// turn overrides the compiled-in default (512 MB).
+    pub max_heap_bytes_per_test: Option<usize>,
 }
 
 impl Test262Config {

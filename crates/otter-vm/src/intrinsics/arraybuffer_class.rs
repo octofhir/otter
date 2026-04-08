@@ -341,7 +341,12 @@ fn array_buffer_constructor(
     )?;
 
     let prototype = Some(runtime.intrinsics().array_buffer_prototype);
-    let handle = match requested_max {
+    // §25.1.2.1 CreateByteDataBlock — surfaces an `OutOfMemory` ObjectError
+    // when the requested byte budget exceeds the configured heap cap. We
+    // map it to a catchable `RangeError` here so test262's
+    // `new ArrayBuffer(2**52)` style tests behave per spec instead of
+    // aborting the host process via a Rust allocator panic.
+    let result = match requested_max {
         Some(max_byte_length) => {
             // 7. If requestedMaxByteLength is not empty:
             //    a. If byteLength > requestedMaxByteLength, throw a RangeError.
@@ -364,6 +369,15 @@ fn array_buffer_constructor(
                 .alloc_array_buffer(byte_length, prototype)
         }
     };
+    let handle = result.map_err(|err| match err {
+        crate::object::ObjectError::OutOfMemory => range_error(
+            runtime,
+            "ArrayBuffer allocation failed: byte length exceeds heap limit",
+        ),
+        other => {
+            VmNativeCallError::Internal(format!("ArrayBuffer allocation: {other:?}").into())
+        }
+    })?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

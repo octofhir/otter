@@ -90,6 +90,13 @@ pub struct OtterRuntime {
     timeout: Option<Duration>,
     host: HostConfig,
     host_state: HostState,
+    /// Per-call cooperative interrupt flag. Lives only between
+    /// `run_module` enter / exit, gives `drain_microtasks` and
+    /// `run_event_loop` something to poll so a runaway test that
+    /// keeps re-enqueueing microtasks (e.g. async iterator + yield*
+    /// loops) can be cut off by the watchdog instead of running
+    /// forever at 100% CPU.
+    current_interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for OtterRuntime {
@@ -120,6 +127,7 @@ impl OtterRuntime {
             timeout,
             host,
             host_state: HostState::default(),
+            current_interrupt: None,
         }
     }
 
@@ -191,14 +199,23 @@ impl OtterRuntime {
             .timeout
             .map(|timeout| TimeoutGuard::arm(interrupt_flag.clone(), timeout));
         let interrupt_ptr = Arc::as_ptr(&interrupt_flag).cast::<u8>();
+        // Publish the flag so `drain_microtasks` and `run_event_loop`
+        // can poll it; cleared at the end of this call so the next
+        // `run_module` invocation gets a fresh one.
+        self.current_interrupt = Some(interrupt_flag.clone());
 
         // 1. Execute top-level code.
-        let result = match execute_module_entry_with_runtime(module, &mut self.state, interrupt_ptr)
-        {
+        let result = match execute_module_entry_with_runtime(
+            module,
+            &mut self.state,
+            interrupt_ptr,
+            Some(interrupt_flag.clone()),
+        ) {
             Ok(result) => result,
             Err(_) => match interpreter.execute_module(module, &mut self.state) {
                 Ok(result) => result,
                 Err(e) => {
+                    self.current_interrupt = None;
                     return Err(run_error_from_interpreter(&e, &mut self.state));
                 }
             },
@@ -209,6 +226,11 @@ impl OtterRuntime {
 
         // 3. Event loop: process pending timers + microtasks until quiescent.
         self.run_event_loop(module);
+
+        // Drop the published interrupt flag so subsequent runs get a
+        // fresh one (and `drain_microtasks` from outside `run_module`
+        // — there is none today, but be defensive — sees None).
+        self.current_interrupt = None;
 
         Ok(result)
     }
@@ -305,11 +327,32 @@ impl OtterRuntime {
     // Internal: microtask drain
     // -----------------------------------------------------------------------
 
+    /// Returns `true` when the watchdog has tripped this run's interrupt
+    /// flag. Used by `drain_microtasks` and `run_event_loop` to bail out
+    /// of host-side reactor loops that would otherwise spin at 100% CPU
+    /// (async iterator + yield* infinite reaction queues, etc.).
+    fn interrupted(&self) -> bool {
+        self.current_interrupt
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
     fn drain_microtasks(&mut self, module: &Module) {
         loop {
+            // Cooperative bail: if the watchdog has set the interrupt
+            // flag, stop draining instead of looping forever on a test
+            // that keeps re-enqueueing reactions. The interpreter's
+            // own bytecode loop checks the same flag at back-edges.
+            if self.interrupted() {
+                return;
+            }
             let mut did_work = false;
 
             while let Some(job) = self.state.microtasks_mut().pop_next_tick() {
+                if self.interrupted() {
+                    return;
+                }
                 let _ = Interpreter::call_function(
                     &mut self.state,
                     module,
@@ -321,6 +364,9 @@ impl OtterRuntime {
             }
 
             while let Some(job) = self.state.microtasks_mut().pop_promise_job() {
+                if self.interrupted() {
+                    return;
+                }
                 // ES2024 §27.2.2.1 NewPromiseReactionJob
                 let callback_kind = self.state.objects().kind(job.callback);
                 // Self-settling callables handle their own promise settlement.
@@ -386,6 +432,9 @@ impl OtterRuntime {
             }
 
             while let Some(job) = self.state.microtasks_mut().pop_microtask() {
+                if self.interrupted() {
+                    return;
+                }
                 let _ = Interpreter::call_function(
                     &mut self.state,
                     module,
@@ -408,6 +457,10 @@ impl OtterRuntime {
 
     fn run_event_loop(&mut self, module: &Module) {
         loop {
+            // Watchdog bail: matches the same poll inside drain_microtasks.
+            if self.interrupted() {
+                return;
+            }
             self.state.drain_host_callbacks();
             self.drain_microtasks(module);
 

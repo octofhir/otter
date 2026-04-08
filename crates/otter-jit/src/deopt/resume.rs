@@ -1,5 +1,8 @@
 //! Explicit deopt handoff and interpreter-resume helpers for the JIT path.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use otter_vm::RuntimeState;
 use otter_vm::deopt::{DeoptHandoff, DeoptId, DeoptReason, DeoptSite};
 use otter_vm::interpreter::{ExecutionResult, InterpreterError};
@@ -136,10 +139,17 @@ pub fn execute_function_profiled_with_fallback(
 
 /// Execute the module entry through the JIT on an existing runtime and fall back
 /// to the interpreter on bailout or unsupported paths.
+///
+/// `interrupt_arc`, when present, is forwarded to the bailout interpreter so
+/// the watchdog can interrupt long-running scripts that take the
+/// interpreter path. Without this, every script that fails to JIT (the
+/// vast majority of test262 tests) would silently lose its watchdog flag
+/// and infinite loops would never be cancellable.
 pub fn execute_module_entry_with_runtime(
     module: &Module,
     runtime: &mut RuntimeState,
     interrupt_flag: *const u8,
+    interrupt_arc: Option<Arc<AtomicBool>>,
 ) -> Result<ExecutionResult, DeoptError> {
     let function_index = module.entry();
     let function = module
@@ -152,6 +162,14 @@ pub fn execute_module_entry_with_runtime(
         let global = runtime.intrinsics().global_object();
         registers[usize::from(receiver_slot)] = RegisterValue::from_object_handle(global.0);
     }
+
+    let make_interpreter = || -> Interpreter {
+        let mut interp = Interpreter::new();
+        if let Some(ref flag) = interrupt_arc {
+            interp = interp.with_interrupt_flag(flag.clone());
+        }
+        interp
+    };
 
     match execute_function_profiled_with_runtime(
         module,
@@ -172,7 +190,7 @@ pub fn execute_module_entry_with_runtime(
             reason,
         } => {
             let handoff = handoff_for_bailout(function, bytecode_pc, reason);
-            Ok(Interpreter::new().resume_with_runtime(
+            Ok(make_interpreter().resume_with_runtime(
                 module,
                 function_index,
                 handoff.resume_pc(),
@@ -180,7 +198,7 @@ pub fn execute_module_entry_with_runtime(
                 runtime,
             )?)
         }
-        JitExecResult::NotCompiled => Ok(Interpreter::new().execute_with_runtime(
+        JitExecResult::NotCompiled => Ok(make_interpreter().execute_with_runtime(
             module,
             function_index,
             &registers,

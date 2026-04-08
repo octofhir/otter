@@ -88,16 +88,40 @@ pub(crate) fn to_property_descriptor(
         )?);
     }
 
-    let value = get_descriptor_data_field(runtime, obj, "value")?;
-    let writable = get_descriptor_bool_field(runtime, obj, "writable", false)?;
-    let enumerable = get_descriptor_bool_field(runtime, obj, "enumerable", false)?;
-    let configurable = get_descriptor_bool_field(runtime, obj, "configurable", false)?;
+    // §6.2.6.5 ToPropertyDescriptor uses HasProperty (with proto chain),
+    // not HasOwnProperty. Cache presence flags so we don't call into the
+    // VM twice per field.
+    let has_value = has_property_inherited(runtime, obj, "value")?;
+    let value = if has_value {
+        let key = runtime.intern_property_name("value");
+        Some(runtime.ordinary_get(obj, key, RegisterValue::from_object_handle(obj.0))?)
+    } else {
+        None
+    };
+    let has_writable = has_property_inherited(runtime, obj, "writable")?;
+    let writable = if has_writable {
+        get_descriptor_bool_field(runtime, obj, "writable", false)?
+    } else {
+        false
+    };
+    let has_enumerable = has_property_inherited(runtime, obj, "enumerable")?;
+    let enumerable = if has_enumerable {
+        get_descriptor_bool_field(runtime, obj, "enumerable", false)?
+    } else {
+        false
+    };
+    let has_configurable = has_property_inherited(runtime, obj, "configurable")?;
+    let configurable = if has_configurable {
+        get_descriptor_bool_field(runtime, obj, "configurable", false)?
+    } else {
+        false
+    };
 
     let (has_get, getter) = get_descriptor_callable_field(runtime, obj, "get")?;
     let (has_set, setter) = get_descriptor_callable_field(runtime, obj, "set")?;
 
     let is_accessor_descriptor = has_get || has_set;
-    let is_data_descriptor = value.is_some() || has_own_descriptor_field(runtime, obj, "writable")?;
+    let is_data_descriptor = has_value || has_writable;
 
     if is_accessor_descriptor && is_data_descriptor {
         return Err(type_error(
@@ -110,23 +134,23 @@ pub(crate) fn to_property_descriptor(
         return Ok(PropertyDescriptor::accessor(
             has_get.then_some(getter),
             has_set.then_some(setter),
-            has_own_descriptor_field(runtime, obj, "enumerable")?.then_some(enumerable),
-            has_own_descriptor_field(runtime, obj, "configurable")?.then_some(configurable),
+            has_enumerable.then_some(enumerable),
+            has_configurable.then_some(configurable),
         ));
     }
 
     if is_data_descriptor {
         return Ok(PropertyDescriptor::data(
             value,
-            has_own_descriptor_field(runtime, obj, "writable")?.then_some(writable),
-            has_own_descriptor_field(runtime, obj, "enumerable")?.then_some(enumerable),
-            has_own_descriptor_field(runtime, obj, "configurable")?.then_some(configurable),
+            has_writable.then_some(writable),
+            has_enumerable.then_some(enumerable),
+            has_configurable.then_some(configurable),
         ));
     }
 
     Ok(PropertyDescriptor::generic(
-        has_own_descriptor_field(runtime, obj, "enumerable")?.then_some(enumerable),
-        has_own_descriptor_field(runtime, obj, "configurable")?.then_some(configurable),
+        has_enumerable.then_some(enumerable),
+        has_configurable.then_some(configurable),
     ))
 }
 
@@ -171,39 +195,50 @@ fn define_descriptor_field(
         })
 }
 
-fn has_own_descriptor_field(
-    runtime: &mut RuntimeState,
-    obj: ObjectHandle,
-    name: &str,
-) -> Result<bool, VmNativeCallError> {
-    let key = runtime.intern_property_name(name);
-    runtime
-        .objects()
-        .has_own_property(obj, key)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("descriptor field '{name}' lookup failed: {error:?}").into(),
-            )
-        })
-}
-
+/// §6.2.6.5 ToPropertyDescriptor step 4-13: each `Has(Obj, name)` /
+/// `Get(Obj, name)` pair must use the regular `[[HasProperty]]` /
+/// `[[Get]]` paths so that:
+///   1. Properties inherited from the prototype chain are visible.
+///   2. Accessor descriptors are *invoked* (the previous implementation
+///      treated an accessor-typed `value` field as "missing", which
+///      broke `Object.defineProperties(o, { p: descObjWithGetterValue })`
+///      style tests in test262).
+///
+/// `Get` invokes the accessor; the property's "presence" is then a
+/// separate `HasProperty` check via `has_property_inherited`. Returns
+/// `None` only when the property is genuinely absent — not when its
+/// value is undefined or the slot is an accessor.
 fn get_descriptor_data_field(
     runtime: &mut RuntimeState,
     obj: ObjectHandle,
     name: &str,
 ) -> Result<Option<RegisterValue>, VmNativeCallError> {
+    if !has_property_inherited(runtime, obj, name)? {
+        return Ok(None);
+    }
     let key = runtime.intern_property_name(name);
-    Ok(runtime
-        .property_lookup(obj, key)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("descriptor field '{name}' get failed: {error:?}").into(),
-            )
-        })?
-        .and_then(|lookup| match lookup.value() {
-            PropertyValue::Data { value, .. } => Some(value),
-            PropertyValue::Accessor { .. } => None,
-        }))
+    let value = runtime.ordinary_get(obj, key, RegisterValue::from_object_handle(obj.0))?;
+    Ok(Some(value))
+}
+
+/// §7.3.11 HasProperty(O, P) — walks the [[Prototype]] chain.
+///
+/// `has_own_property` only checks the receiver's own slots, but
+/// ToPropertyDescriptor needs to see inherited fields too: tests in
+/// `built-ins/Object/defineProperties` create a descriptor object via
+/// `Object.create(protoWithGetters)` and rely on the inherited
+/// `enumerable`/`configurable`/`value` accessors firing.
+fn has_property_inherited(
+    runtime: &mut RuntimeState,
+    obj: ObjectHandle,
+    name: &str,
+) -> Result<bool, VmNativeCallError> {
+    let key = runtime.intern_property_name(name);
+    runtime.property_lookup(obj, key).map(|lookup| lookup.is_some()).map_err(|error| {
+        VmNativeCallError::Internal(
+            format!("descriptor field '{name}' presence check failed: {error:?}").into(),
+        )
+    })
 }
 
 fn get_descriptor_bool_field(
@@ -228,13 +263,17 @@ fn get_descriptor_callable_field(
     obj: ObjectHandle,
     name: &str,
 ) -> Result<(bool, Option<ObjectHandle>), VmNativeCallError> {
-    let present = has_own_descriptor_field(runtime, obj, name)?;
-    let Some(value) = get_descriptor_data_field(runtime, obj, name)? else {
-        return Ok((present, None));
-    };
+    // §6.2.6.5 step 8/10: HasProperty (with proto chain) for the
+    // accessor field, then Get if present.
+    let present = has_property_inherited(runtime, obj, name)?;
+    if !present {
+        return Ok((false, None));
+    }
+    let key = runtime.intern_property_name(name);
+    let value = runtime.ordinary_get(obj, key, RegisterValue::from_object_handle(obj.0))?;
 
     if value == RegisterValue::undefined() {
-        return Ok((present, None));
+        return Ok((true, None));
     }
 
     let handle = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
@@ -253,5 +292,5 @@ fn get_descriptor_callable_field(
         .unwrap_or_else(|error| error));
     }
 
-    Ok((present, Some(handle)))
+    Ok((true, Some(handle)))
 }

@@ -504,7 +504,7 @@ fn to_object_for_descriptor_map(
     }
 }
 
-fn to_object_for_prototype_method(
+pub(super) fn to_object_for_prototype_method(
     value: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
     context: &str,

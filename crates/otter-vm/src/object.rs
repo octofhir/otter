@@ -1984,8 +1984,14 @@ impl ObjectHeap {
         &mut self,
         byte_length: usize,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
-        self.alloc_array_buffer_full(vec![0; byte_length], byte_length, false, prototype)
+    ) -> Result<ObjectHandle, ObjectError> {
+        // §25.1.2.1 CreateByteDataBlock — pre-charge the byte budget against
+        // the heap cap so a `new ArrayBuffer(2**52)` raises a catchable
+        // RangeError instead of aborting the host with a 7 PB
+        // `Vec::with_capacity` allocator panic.
+        self.heap.reserve_bytes(byte_length)?;
+        let data = vec![0u8; byte_length];
+        Ok(self.alloc_array_buffer_full(data, byte_length, false, prototype))
     }
 
     /// Allocates an ArrayBuffer object with explicit backing bytes (fixed-length).
@@ -2007,8 +2013,13 @@ impl ObjectHeap {
         byte_length: usize,
         max_byte_length: usize,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
-        self.alloc_array_buffer_full(vec![0; byte_length], max_byte_length, true, prototype)
+    ) -> Result<ObjectHandle, ObjectError> {
+        // Reserve the worst-case byte budget (the resizable cap) so a
+        // resizable buffer with `maxByteLength: 2**40` is rejected up
+        // front rather than discovered later when growth allocates.
+        self.heap.reserve_bytes(max_byte_length)?;
+        let data = vec![0u8; byte_length];
+        Ok(self.alloc_array_buffer_full(data, max_byte_length, true, prototype))
     }
 
     /// Allocates an ArrayBuffer with all fields specified.

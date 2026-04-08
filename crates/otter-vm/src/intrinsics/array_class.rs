@@ -361,46 +361,55 @@ fn array_is_array(
     Ok(RegisterValue::from_bool(is_array))
 }
 
+/// ES2024 §23.1.3.20 Array.prototype.push(...items)
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.push>
+///
+/// 1. Let O be ? ToObject(this value).
+/// 2. Let len be ? LengthOfArrayLike(O).
+/// 3. Let argCount be the number of elements in items.
+/// 4. If len + argCount > 2^53 - 1, throw a TypeError exception.
+/// 5. For each element E of items, do
+///      Perform ? Set(O, ! ToString(F(len)), E, true).
+///      Set len to len + 1.
+/// 6. Perform ? Set(O, "length", F(len), true).
+/// 7. Return F(len).
 fn array_push(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.push requires array receiver".into())
-    })?;
-    if !matches!(runtime.objects().kind(receiver), Ok(HeapValueKind::Array)) {
-        return Err(VmNativeCallError::Internal(
-            "Array.prototype.push requires array receiver".into(),
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.push")?;
+    let start = array_length(receiver, runtime, "Array.prototype.push")?;
+
+    // Step 4: 2^53-1 cap on the resulting length.
+    let new_length = start.saturating_add(args.len());
+    const MAX_SAFE_INTEGER: usize = (1u64 << 53) as usize - 1;
+    if new_length > MAX_SAFE_INTEGER {
+        return Err(type_error(
+            runtime,
+            "Array.prototype.push: resulting length exceeds 2^53 - 1",
         ));
     }
 
-    let start = runtime
-        .objects()
-        .array_length(receiver)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("Array.prototype.push length lookup failed: {error:?}").into(),
-            )
-        })?
-        .ok_or_else(|| {
-            VmNativeCallError::Internal("Array.prototype.push requires array receiver".into())
-        })?;
-
     for (offset, value) in args.iter().copied().enumerate() {
-        runtime
-            .objects_mut()
-            .set_index(receiver, start.saturating_add(offset), value)
-            .map_err(|error| {
-                VmNativeCallError::Internal(
-                    format!("Array.prototype.push element store failed: {error:?}").into(),
-                )
-            })?;
+        array_set_index_value(
+            receiver,
+            start.saturating_add(offset),
+            value,
+            runtime,
+            "Array.prototype.push",
+        )?;
     }
 
-    Ok(RegisterValue::from_i32(
-        i32::try_from(start.saturating_add(args.len())).unwrap_or(i32::MAX),
-    ))
+    // Step 6: publish the new length on the receiver. For real arrays this
+    // is already updated by `set_index`, but generic objects need it.
+    array_set_length_value(receiver, new_length, runtime, "Array.prototype.push")?;
+
+    Ok(if let Ok(n) = i32::try_from(new_length) {
+        RegisterValue::from_i32(n)
+    } else {
+        RegisterValue::from_number(new_length as f64)
+    })
 }
 
 /// ES2024 §23.1.3.15 Array.prototype.join(separator)
@@ -416,9 +425,7 @@ fn array_join(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.join requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.join")?;
     let length = array_length(receiver, runtime, "Array.prototype.join")?;
 
     let separator = if let Some(sep_arg) = args.first().copied() {
@@ -477,14 +484,20 @@ pub(crate) fn safe_with_capacity<T>(len: usize) -> Vec<T> {
 }
 
 /// ES2024 §23.1.3.14 Array.prototype.indexOf(searchElement [, fromIndex])
+/// ES2024 §23.1.3.16 Array.prototype.indexOf(searchElement [, fromIndex])
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.indexof>
+///
+/// Step 11.b uses **IsStrictlyEqual** (`===`), so string comparison must be
+/// content-based, not handle-based. The previous implementation used
+/// `RegisterValue`'s `PartialEq` which compares pointer bits — that meant
+/// `[].indexOf.call({0: 'y', 1: 'x', length: 2}, 'y')` returned -1 even
+/// when the string was present.
 fn array_index_of(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.indexOf requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.indexOf")?;
     let length = array_length(receiver, runtime, "Array.prototype.indexOf")?;
 
     let search = args
@@ -507,7 +520,9 @@ fn array_index_of(
         else {
             continue;
         };
-        if elem == search {
+        let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
+            .map_err(|e| VmNativeCallError::Internal(format!("indexOf compare failed: {e:?}").into()))?;
+        if equal {
             return Ok(RegisterValue::from_i32(index as i32));
         }
     }
@@ -647,9 +662,7 @@ fn array_slice(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.slice requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.slice")?;
     let len = array_length(receiver, runtime, "Array.prototype.slice")? as i32;
 
     let raw_start = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
@@ -684,6 +697,24 @@ fn array_slice(
         }
     }
     Ok(RegisterValue::from_object_handle(result.0))
+}
+
+/// §7.1.18 ToObject coercion shared by all `Array.prototype.*` methods.
+///
+/// `Array.prototype.push.call(undefined, ...)` and friends must throw a
+/// `TypeError`, while primitive receivers (`Array.prototype.indexOf.call("ab", "b")`)
+/// must auto-box. Delegating to the canonical implementation in
+/// `object_class.rs` keeps the boxing logic in one place.
+fn to_object_receiver(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    op: &str,
+) -> Result<ObjectHandle, VmNativeCallError> {
+    super::object_class::to_object_for_prototype_method(
+        value,
+        runtime,
+        &format!("{op} called on null or undefined"),
+    )
 }
 
 fn array_length(
@@ -732,28 +763,59 @@ fn array_length(
 ///
 /// Works for any object with a "length" property (arrays, array-like objects,
 /// arguments objects, etc.).
+///
+/// Implements `ToLength(? Get(obj, "length"))` per §7.1.20:
+///   1. Let len be ? ToIntegerOrInfinity(argument).
+///   2. If len ≤ 0, return +0𝔽.
+///   3. Return 𝔽(min(len, 2^53 - 1)).
+///
+/// Crucially, this means non-numeric `length` values (e.g. `length: "2"`,
+/// which is a coerce-from-string case in the test262 forEach/map suites)
+/// must first be put through ToNumber. Reading `length` is also allowed
+/// to throw — accessor errors must propagate to the caller.
 fn length_of_array_like(
     obj: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<usize, VmNativeCallError> {
-    // 1. Return ℝ(? ToLength(? Get(obj, "length"))).
+    // §7.3.2 step 1: Let len be ? ToLength(? Get(obj, "length")).
     let length_prop = runtime.intern_property_name("length");
     let length_val =
         runtime.ordinary_get(obj, length_prop, RegisterValue::from_object_handle(obj.0))?;
-    // ToLength: undefined/NaN → 0, number → clamp to [0, 2^53 - 1]
-    if length_val == RegisterValue::undefined() || length_val == RegisterValue::null() {
-        return Ok(0);
-    }
+
+    // Fast path for already-numeric values; avoids the ToNumber dispatch.
     if let Some(n) = length_val.as_i32() {
         return Ok(n.max(0) as usize);
     }
     if let Some(n) = length_val.as_number() {
-        if n.is_nan() || n < 0.0 {
-            return Ok(0);
-        }
-        return Ok(n.min(((1u64 << 53) - 1) as f64) as usize);
+        return Ok(clamp_to_length(n));
     }
-    Ok(0)
+
+    // §7.1.20 ToLength → §7.1.5 ToIntegerOrInfinity → §7.1.4 ToNumber.
+    // Strings, booleans, null, undefined, and objects with a `valueOf`
+    // hook all need this path. Errors from ToNumber (e.g. throwing
+    // `valueOf`) must surface to the caller, not be swallowed.
+    let n = runtime.js_to_number(length_val).map_err(|e| match e {
+        crate::interpreter::InterpreterError::UncaughtThrow(value) => {
+            VmNativeCallError::Thrown(value)
+        }
+        other => VmNativeCallError::Internal(format!("LengthOfArrayLike: {other}").into()),
+    })?;
+    Ok(clamp_to_length(n))
+}
+
+/// §7.1.20 ToLength clamping rule, factored out so the fast path and
+/// the ToNumber-coerced slow path share one place.
+fn clamp_to_length(n: f64) -> usize {
+    if n.is_nan() || n <= 0.0 {
+        return 0;
+    }
+    if !n.is_finite() {
+        // Per spec: ToLength of +∞ is 2^53-1.
+        return ((1u64 << 53) - 1) as usize;
+    }
+    // ToInteger: trunc toward zero. Then clamp to [0, 2^53-1].
+    let truncated = n.trunc();
+    truncated.min(((1u64 << 53) - 1) as f64) as usize
 }
 
 fn array_index_value(
@@ -763,6 +825,82 @@ fn array_index_value(
     _op: &str,
 ) -> Result<Option<RegisterValue>, VmNativeCallError> {
     runtime.get_array_index_value(receiver, index)
+}
+
+/// Spec-aligned `Set(O, ! ToString(F(index)), value, true)` used by every
+/// Array.prototype mutator that needs to write to a numeric index on a
+/// generic array-like receiver.
+///
+/// For real `HeapValue::Array` instances we take the fast `set_index` path
+/// which updates the dense `Vec<Value>` directly; otherwise we intern the
+/// numeric key as a string and route through `set_property_with_registry`,
+/// which handles the indexed-property storage on ordinary objects.
+fn array_set_index_value(
+    receiver: ObjectHandle,
+    index: usize,
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    op: &str,
+) -> Result<(), VmNativeCallError> {
+    if matches!(
+        runtime.objects().kind(receiver),
+        Ok(crate::object::HeapValueKind::Array)
+    ) {
+        runtime
+            .objects_mut()
+            .set_index(receiver, index, value)
+            .map_err(|e| object_error_to_vm_error(runtime, e))?;
+        return Ok(());
+    }
+    // Generic object: route through ordinary [[Set]] with the integer
+    // key as a property name. We intern lazily on every call — array-like
+    // hot loops should hit the dense fast path above instead.
+    let key = runtime.intern_property_name(&index.to_string());
+    let property_names = runtime.property_names().clone();
+    runtime
+        .objects_mut()
+        .set_property_with_registry(receiver, key, value, &property_names)
+        .map_err(|e| {
+            VmNativeCallError::Internal(format!("{op} indexed-set failed: {e:?}").into())
+        })?;
+    Ok(())
+}
+
+/// `Set(O, "length", F(value), true)` — used by mutators that need to
+/// publish a new length on a generic array-like receiver after mutating
+/// elements (push, copyWithin, splice, etc.).
+fn array_set_length_value(
+    receiver: ObjectHandle,
+    new_length: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+    op: &str,
+) -> Result<(), VmNativeCallError> {
+    let length_prop = runtime.intern_property_name("length");
+    let len_value = if let Ok(n) = i32::try_from(new_length) {
+        RegisterValue::from_i32(n)
+    } else {
+        RegisterValue::from_number(new_length as f64)
+    };
+    if matches!(
+        runtime.objects().kind(receiver),
+        Ok(crate::object::HeapValueKind::Array)
+    ) {
+        // For real arrays, set_array_length is the right call — but
+        // set_property already routes there via set_array_length_from_value.
+        let property_names = runtime.property_names().clone();
+        runtime
+            .objects_mut()
+            .set_property_with_registry(receiver, length_prop, len_value, &property_names)
+            .map_err(|e| object_error_to_vm_error(runtime, e))?;
+    } else {
+        runtime
+            .objects_mut()
+            .set_property(receiver, length_prop, len_value)
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("{op} length-set failed: {e:?}").into())
+            })?;
+    }
+    Ok(())
 }
 
 fn invalid_array_length_error(runtime: &mut crate::interpreter::RuntimeState) -> VmNativeCallError {
@@ -821,9 +959,7 @@ fn array_map(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.map requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.map")?;
     let length = array_length(receiver, runtime, "Array.prototype.map")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.map")?;
 
@@ -852,9 +988,7 @@ fn array_filter(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.filter requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.filter")?;
     let length = array_length(receiver, runtime, "Array.prototype.filter")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.filter")?;
 
@@ -889,9 +1023,7 @@ fn array_for_each(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.forEach requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.forEach")?;
     let length = array_length(receiver, runtime, "Array.prototype.forEach")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.forEach")?;
 
@@ -916,9 +1048,7 @@ fn array_reduce(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.reduce requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.reduce")?;
     let length = array_length(receiver, runtime, "Array.prototype.reduce")?;
     let callback = args
         .first()
@@ -983,9 +1113,7 @@ fn array_find(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.find requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.find")?;
     let length = array_length(receiver, runtime, "Array.prototype.find")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.find")?;
 
@@ -1014,9 +1142,7 @@ fn array_find_index(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.findIndex requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.findIndex")?;
     let length = array_length(receiver, runtime, "Array.prototype.findIndex")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findIndex")?;
 
@@ -1045,9 +1171,7 @@ fn array_some(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.some requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.some")?;
     let length = array_length(receiver, runtime, "Array.prototype.some")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.some")?;
 
@@ -1078,9 +1202,7 @@ fn array_every(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.every requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.every")?;
     let length = array_length(receiver, runtime, "Array.prototype.every")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.every")?;
 
@@ -1111,9 +1233,7 @@ fn array_includes(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.includes requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.includes")?;
     let length = array_length(receiver, runtime, "Array.prototype.includes")?;
 
     let search = args
@@ -1150,9 +1270,7 @@ fn array_fill(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.fill requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.fill")?;
     let len = array_length(receiver, runtime, "Array.prototype.fill")? as i32;
 
     let value = args
@@ -1205,9 +1323,7 @@ fn array_reverse(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.reverse requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.reverse")?;
     let length = array_length(receiver, runtime, "Array.prototype.reverse")?;
 
     let mut lower = 0usize;
@@ -1253,9 +1369,7 @@ fn array_pop(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.pop requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.pop")?;
     let length = array_length(receiver, runtime, "Array.prototype.pop")?;
     if length == 0 {
         return Ok(RegisterValue::undefined());
@@ -1276,9 +1390,7 @@ fn array_shift(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.shift requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.shift")?;
     let length = array_length(receiver, runtime, "Array.prototype.shift")?;
     if length == 0 {
         return Ok(RegisterValue::undefined());
@@ -1307,9 +1419,7 @@ fn array_unshift(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.unshift requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.unshift")?;
     let length = array_length(receiver, runtime, "Array.prototype.unshift")?;
     let arg_count = args.len();
 
@@ -1344,9 +1454,7 @@ fn array_splice(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.splice requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.splice")?;
     let len = array_length(receiver, runtime, "Array.prototype.splice")? as i32;
 
     let raw_start = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
@@ -1433,14 +1541,17 @@ fn array_splice(
 }
 
 /// ES2024 §23.1.3.17 Array.prototype.lastIndexOf(searchElement [, fromIndex])
+/// ES2024 §23.1.3.17 Array.prototype.lastIndexOf(searchElement [, fromIndex])
+/// Spec: <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
+///
+/// Like indexOf, must use **IsStrictlyEqual** so string content equality
+/// works for `[].lastIndexOf.call(arrayLike, "x")`.
 fn array_last_index_of(
     this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.lastIndexOf requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.lastIndexOf")?;
     let length = array_length(receiver, runtime, "Array.prototype.lastIndexOf")?;
     if length == 0 {
         return Ok(RegisterValue::from_i32(-1));
@@ -1464,10 +1575,18 @@ fn array_last_index_of(
     let mut index = start;
     while index >= 0 {
         let i = index as usize;
-        if let Some(elem) = array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
-            && elem == search
+        if let Some(elem) =
+            array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
         {
-            return Ok(RegisterValue::from_i32(index));
+            let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
+                .map_err(|e| {
+                    VmNativeCallError::Internal(
+                        format!("lastIndexOf compare failed: {e:?}").into(),
+                    )
+                })?;
+            if equal {
+                return Ok(RegisterValue::from_i32(index));
+            }
         }
         index -= 1;
     }
@@ -1610,9 +1729,7 @@ fn create_array_iterator(
     kind: crate::object::ArrayIteratorKind,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array iterator requires object receiver".into())
-    })?;
+    let handle = to_object_receiver(*this, runtime, "Array iterator")?;
     let iterator = runtime.objects_mut().alloc_array_iterator(handle, kind);
     // Set prototype to %ArrayIteratorPrototype%.
     let proto = runtime.intrinsics().array_iterator_prototype();
@@ -1629,9 +1746,7 @@ fn array_sort(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.sort requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.sort")?;
     let length = array_length(receiver, runtime, "Array.prototype.sort")?;
 
     let comparefn = args
@@ -1726,9 +1841,7 @@ fn array_reduce_right(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.reduceRight requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.reduceRight")?;
     let length = array_length(receiver, runtime, "Array.prototype.reduceRight")?;
     let callback = args
         .first()
@@ -1803,9 +1916,7 @@ fn array_find_last(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.findLast requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.findLast")?;
     let length = array_length(receiver, runtime, "Array.prototype.findLast")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findLast")?;
 
@@ -1833,9 +1944,7 @@ fn array_find_last_index(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.findLastIndex requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.findLastIndex")?;
     let length = array_length(receiver, runtime, "Array.prototype.findLastIndex")?;
     let (callback, this_arg) =
         callback_and_this_arg(args, runtime, "Array.prototype.findLastIndex")?;
@@ -1864,9 +1973,7 @@ fn array_flat(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.flat requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.flat")?;
     let depth = args
         .first()
         .copied()
@@ -1941,9 +2048,7 @@ fn array_flat_map(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.flatMap requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.flatMap")?;
     let length = array_length(receiver, runtime, "Array.prototype.flatMap")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.flatMap")?;
 
@@ -1988,9 +2093,7 @@ fn array_to_locale_string(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.toLocaleString requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.toLocaleString")?;
     let len = array_length(receiver, runtime, "Array.prototype.toLocaleString")?;
 
     let mut parts: Vec<String> = safe_with_capacity(len);
@@ -2048,9 +2151,7 @@ fn array_copy_within(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.copyWithin requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.copyWithin")?;
     let len = array_length(receiver, runtime, "Array.prototype.copyWithin")? as i32;
 
     let raw_target = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
@@ -2120,9 +2221,7 @@ fn array_to_reversed(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.toReversed requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.toReversed")?;
     let length = array_length(receiver, runtime, "Array.prototype.toReversed")?;
 
     let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
@@ -2147,9 +2246,7 @@ fn array_to_sorted(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.toSorted requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.toSorted")?;
     let length = array_length(receiver, runtime, "Array.prototype.toSorted")?;
 
     let comparefn = args
@@ -2199,9 +2296,7 @@ fn array_to_spliced(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.toSpliced requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.toSpliced")?;
     let len = array_length(receiver, runtime, "Array.prototype.toSpliced")?;
     let len_i = len as i64;
 
@@ -2275,9 +2370,7 @@ fn array_with(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.with requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.with")?;
     let length = array_length(receiver, runtime, "Array.prototype.with")?;
     let len_i = length as i64;
 
@@ -2328,9 +2421,7 @@ fn array_at(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
-        VmNativeCallError::Internal("Array.prototype.at requires array receiver".into())
-    })?;
+    let receiver = to_object_receiver(*this, runtime, "Array.prototype.at")?;
     let length = array_length(receiver, runtime, "Array.prototype.at")? as i32;
     let index = args.first().and_then(|v| v.as_i32()).unwrap_or(0);
     let actual = if index < 0 { length + index } else { index };

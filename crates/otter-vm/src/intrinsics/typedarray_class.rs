@@ -528,9 +528,7 @@ fn make_concrete_constructor(kind: TypedArrayKind) -> NativeFunctionDescriptor {
     let intrinsic = match kind {
         TypedArrayKind::Int8 => crate::intrinsics::IntrinsicKey::Int8ArrayPrototype,
         TypedArrayKind::Uint8 => crate::intrinsics::IntrinsicKey::Uint8ArrayPrototype,
-        TypedArrayKind::Uint8Clamped => {
-            crate::intrinsics::IntrinsicKey::Uint8ClampedArrayPrototype
-        }
+        TypedArrayKind::Uint8Clamped => crate::intrinsics::IntrinsicKey::Uint8ClampedArrayPrototype,
         TypedArrayKind::Int16 => crate::intrinsics::IntrinsicKey::Int16ArrayPrototype,
         TypedArrayKind::Uint16 => crate::intrinsics::IntrinsicKey::Uint16ArrayPrototype,
         TypedArrayKind::Int32 => crate::intrinsics::IntrinsicKey::Int32ArrayPrototype,

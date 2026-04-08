@@ -13,7 +13,7 @@ mod bigint_class;
 mod boolean_class;
 mod dataview_class;
 mod date_class;
-mod error_class;
+pub(crate) mod error_class;
 mod eval;
 mod function_class;
 mod generator_class;
@@ -1078,8 +1078,7 @@ impl VmIntrinsics {
             return Err(IntrinsicsError::InvalidLifecycleStage);
         }
 
-        let mut cx =
-            IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
+        let mut cx = IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
         for installer in core_installers() {
             installer.init(self, &mut cx)?;
         }
@@ -1100,8 +1099,7 @@ impl VmIntrinsics {
             return Err(IntrinsicsError::InvalidLifecycleStage);
         }
 
-        let mut cx =
-            IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
+        let mut cx = IntrinsicInstallContext::new(heap, property_names, native_functions, realm_id);
         for installer in core_installers() {
             installer.install_on_global(self, &mut cx)?;
         }

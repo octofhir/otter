@@ -571,6 +571,16 @@ pub struct RuntimeState {
     /// §14.4.4 Transient: set by `YieldStar` opcode, consumed by
     /// the generator resume loop when handling `GeneratorYield`.
     pending_delegation_iterator: Option<ObjectHandle>,
+    /// Pending uncaught throw value, stashed by host integration code that
+    /// converts an `InterpreterError::UncaughtThrow` into a textual native
+    /// error so the **outer** runtime layer can later promote the error
+    /// back to a structured `JsRuntimeDiagnostic`. This avoids losing the
+    /// thrown value across the host module-loader boundary, where the
+    /// natural error type is `String`.
+    ///
+    /// `None` once consumed; populated lazily and cleared by the next
+    /// `take_pending_uncaught_throw` call.
+    pending_uncaught_throw: Option<RegisterValue>,
 }
 
 impl RuntimeState {
@@ -589,12 +599,7 @@ impl RuntimeState {
             .init_core(&mut objects, &mut property_names, &mut native_functions, 0)
             .expect("intrinsic core init should bootstrap cleanly");
         intrinsics
-            .install_on_global(
-                &mut objects,
-                &mut property_names,
-                &mut native_functions,
-                0,
-            )
+            .install_on_global(&mut objects, &mut property_names, &mut native_functions, 0)
             .expect("intrinsic global install should bootstrap cleanly");
         let mut symbol_descriptions = BTreeMap::new();
         for &symbol in intrinsics.well_known_symbols() {
@@ -622,7 +627,23 @@ impl RuntimeState {
             global_symbol_registry_reverse: BTreeMap::new(),
             next_class_id: 1,
             pending_delegation_iterator: None,
+            pending_uncaught_throw: None,
         }
+    }
+
+    /// Stash an uncaught-throw value so the outer host layer can later lift
+    /// it back into a structured diagnostic. Called by the module-loader
+    /// glue right before it converts an interpreter error to a string for
+    /// the legacy native-error API.
+    pub fn stash_pending_uncaught_throw(&mut self, value: RegisterValue) {
+        self.pending_uncaught_throw = Some(value);
+    }
+
+    /// Drains the pending uncaught-throw value, if any. The host runtime
+    /// uses this after a hosted module-loader execution failure to promote
+    /// the throw back into a `JsRuntimeDiagnostic`.
+    pub fn take_pending_uncaught_throw(&mut self) -> Option<RegisterValue> {
+        self.pending_uncaught_throw.take()
     }
 
     /// Returns the intrinsic registry owned by the runtime's current realm.
@@ -662,6 +683,14 @@ impl RuntimeState {
         self.frame_info_stack.pop();
     }
 
+    /// Truncates the shadow execution-context stack down to `baseline`.
+    /// Used by `run_completion_with_runtime` to clean up any extra tail-call
+    /// frames pushed during this loop's lifetime — see the §14.6 comment in
+    /// the runner for the rationale.
+    pub(crate) fn truncate_frame_info_stack(&mut self, baseline: usize) {
+        self.frame_info_stack.truncate(baseline);
+    }
+
     /// Updates the topmost shadow stack entry's PC. Called from the
     /// interpreter loop at every step so the topmost frame's PC always
     /// reflects the active activation.
@@ -677,10 +706,7 @@ impl RuntimeState {
     ///
     /// Reference: <https://v8.dev/docs/stack-trace-api>
     #[must_use]
-    pub fn capture_stack_snapshot(
-        &self,
-        skip: usize,
-    ) -> Vec<crate::stack_frame::StackFrameInfo> {
+    pub fn capture_stack_snapshot(&self, skip: usize) -> Vec<crate::stack_frame::StackFrameInfo> {
         if skip >= self.frame_info_stack.len() {
             return Vec::new();
         }
@@ -707,6 +733,74 @@ impl RuntimeState {
     #[must_use]
     pub fn frame_info_stack_snapshot(&self) -> &[crate::stack_frame::StackFrameInfo] {
         &self.frame_info_stack
+    }
+
+    /// Returns the captured stack frames attached to a JS error instance
+    /// (via `Error()` / `Error.captureStackTrace`), or `None` when the
+    /// object has no `__otter_error_stack_frames__` slot.
+    ///
+    /// Used by host integrations (`otter-runtime` diagnostics, the test262
+    /// runner) to lift V8-style frames out of an uncaught throw without
+    /// having to invoke `Error.prototype.stack` and reparse the formatted
+    /// string.
+    pub fn read_error_stack_frames(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Option<Vec<crate::stack_frame::StackFrameInfo>> {
+        let frames_prop =
+            self.intern_property_name(crate::intrinsics::error_class::ERROR_STACK_FRAMES_SLOT);
+        let lookup = self
+            .objects()
+            .get_property(handle, frames_prop)
+            .ok()
+            .flatten()?;
+        if lookup.owner() != handle {
+            return None;
+        }
+        let frames_handle = match lookup.value() {
+            crate::object::PropertyValue::Data { value, .. } => {
+                value.as_object_handle().map(ObjectHandle)?
+            }
+            _ => return None,
+        };
+        match self.objects().error_stack_frames(frames_handle) {
+            Ok(Some(slice)) => Some(slice.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// Reads `name` and `message` off a JS error instance, returning the
+    /// V8/Node-style `(name, message)` pair used to format `Error.stack`.
+    /// Falls back to `("Error", "")` when slots are missing or non-string,
+    /// matching the spec defaults from §20.5.3.
+    pub fn read_error_name_and_message(&mut self, handle: ObjectHandle) -> (String, String) {
+        let name_prop = self.intern_property_name("name");
+        let msg_prop = self.intern_property_name("message");
+        let name_val = self
+            .ordinary_get(
+                handle,
+                name_prop,
+                RegisterValue::from_object_handle(handle.0),
+            )
+            .unwrap_or_else(|_| RegisterValue::undefined());
+        let msg_val = self
+            .ordinary_get(
+                handle,
+                msg_prop,
+                RegisterValue::from_object_handle(handle.0),
+            )
+            .unwrap_or_else(|_| RegisterValue::undefined());
+        let name = if name_val == RegisterValue::undefined() {
+            "Error".to_string()
+        } else {
+            self.js_to_string_infallible(name_val).to_string()
+        };
+        let message = if msg_val == RegisterValue::undefined() {
+            String::new()
+        } else {
+            self.js_to_string_infallible(msg_val).to_string()
+        };
+        (name, message)
     }
 
     /// §9.3.3 InitializeHostDefinedRealm — creates a brand-new realm with its
@@ -805,7 +899,9 @@ impl RuntimeState {
         }
         // … 3a-b: realm = GetFunctionRealm(constructor); proto = realm intrinsic.
         let realm = self.get_function_realm(constructor);
-        Ok(self.realms[realm as usize].intrinsics.get(intrinsic_default))
+        Ok(self.realms[realm as usize]
+            .intrinsics
+            .get(intrinsic_default))
     }
 
     /// Returns the current object heap.
@@ -5530,6 +5626,13 @@ impl Interpreter {
         // context stack so it can be observed by `Error.captureStackTrace`
         // and Error constructor capture. The matching pop is performed at
         // every return path below.
+        //
+        // §14.6 + diagnostic friendliness: tail calls push *additional*
+        // shadow frames on top of this one (rather than replacing it) so
+        // stack traces match Node/V8/Bun. We snapshot the stack length
+        // here and pop down to that on every exit, cleaning up any tail
+        // frames the loop accumulated.
+        let shadow_baseline = runtime.frame_info_stack_len();
         runtime.push_frame_info(Self::build_frame_info(
             &current_module,
             &function,
@@ -5553,11 +5656,29 @@ impl Interpreter {
                 Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
                 Err(InterpreterError::TypeError(message)) => {
                     let error = runtime.alloc_type_error(&message)?;
+                    // Attach the current shadow stack so the diagnostic
+                    // reporter has frame info to render. `capture_error_stack`
+                    // is a no-op for synthetic native frames.
+                    let _ = crate::intrinsics::error_class::capture_error_stack(runtime, error, 0);
+                    StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
+                }
+                // §7.1.18 RequireObjectCoercible — accessing a property on
+                // `null` / `undefined` is a TypeError per the spec, not an
+                // engine-internal error. Promote the dispatch-level guard
+                // into a JS-visible TypeError so user code can catch it
+                // and the diagnostic reporter can underline the access
+                // site (which the source-map entry on the GetProperty /
+                // GetIndex opcode now identifies precisely).
+                // Spec: <https://tc39.es/ecma262/#sec-requireobjectcoercible>
+                Err(InterpreterError::InvalidObjectValue) => {
+                    let error =
+                        runtime.alloc_type_error("Cannot read properties of null or undefined")?;
+                    let _ = crate::intrinsics::error_class::capture_error_stack(runtime, error, 0);
                     StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
                 }
                 Err(error) => {
                     runtime.restore_module(previous_module);
-                    runtime.pop_frame_info();
+                    runtime.truncate_frame_info_stack(shadow_baseline);
                     return Err(error);
                 }
             };
@@ -5569,7 +5690,7 @@ impl Interpreter {
                 }
                 StepOutcome::Return(return_value) => {
                     runtime.restore_module(previous_module);
-                    runtime.pop_frame_info();
+                    runtime.truncate_frame_info_stack(shadow_baseline);
                     return Ok(Completion::Return(return_value));
                 }
                 StepOutcome::Throw(value) => {
@@ -5577,7 +5698,7 @@ impl Interpreter {
                         continue;
                     }
                     runtime.restore_module(previous_module);
-                    runtime.pop_frame_info();
+                    runtime.truncate_frame_info_stack(shadow_baseline);
                     return Ok(Completion::Throw(value));
                 }
                 // §14.6 Tail call: replace the current frame in-place and
@@ -5595,9 +5716,29 @@ impl Interpreter {
                         .clone();
                     frame_runtime = FrameRuntimeState::new(&function);
                     runtime.enter_module(&current_module);
-                    // §14.6 Tail call — replace the topmost shadow stack
-                    // entry rather than push a new one.
-                    runtime.pop_frame_info();
+                    // §14.6 Tail call — push the new frame ON TOP of the
+                    // caller in the shadow stack instead of replacing it.
+                    //
+                    // The actual VM frame stack still gets the tail-call
+                    // optimization (no recursive Rust frame, no register
+                    // file growth), but the shadow stack — which is *only*
+                    // used for stack-trace rendering — keeps the caller
+                    // visible. This makes diagnostics match Node/V8/Bun,
+                    // which never tail-call elide and therefore always
+                    // show the caller.
+                    //
+                    // To bound memory in pathological deep recursive tail
+                    // calls (e.g. mutually recursive functions iterating
+                    // millions of times), we cap the shadow stack at
+                    // `SHADOW_STACK_TAIL_CAP` and start eliding the OLDEST
+                    // tail-called frame once the cap is hit. The most
+                    // recent N frames always survive so the diagnostic
+                    // user sees the failing call site and its closest
+                    // callers.
+                    const SHADOW_STACK_TAIL_CAP: usize = 1024;
+                    if runtime.frame_info_stack_len() >= SHADOW_STACK_TAIL_CAP {
+                        runtime.pop_frame_info();
+                    }
                     runtime.push_frame_info(Self::build_frame_info(
                         &current_module,
                         &function,

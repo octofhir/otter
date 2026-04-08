@@ -1,5 +1,7 @@
+use super::source_mapper::SourceMapper;
 use super::*;
 use crate::closure::CaptureDescriptor;
+use crate::source_map::{SourceLocation, SourceMapEntry};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -197,5 +199,24 @@ pub(super) struct FunctionCompiler<'a> {
     /// In eval mode, holds the register for the completion value of the last
     /// expression statement. Allocated lazily on the first expression statement.
     pub(super) eval_completion_register: Option<crate::bytecode::BytecodeRegister>,
+    /// Shared JS↔original source mapper. Used to resolve every AST span into
+    /// an original-source 1-based `(line, col)` for inclusion in the VM
+    /// `SourceMap`.
+    pub(super) source_mapper: Rc<SourceMapper>,
+    /// Per-function source-map entries, keyed by program counter. Populated
+    /// by `record_location` as statements are compiled and materialized into
+    /// a `SourceMap` in `finish`.
+    pub(super) source_map_entries: Vec<SourceMapEntry>,
+    /// Most recent location recorded. Used to dedup redundant entries so we
+    /// only emit one entry per distinct `(line, col)` location change.
+    pub(super) last_recorded_location: Option<SourceLocation>,
+    /// "Site" span for the next throwable opcode the compiler will emit.
+    /// Set by parent expression compilers (CallExpression, NewExpression)
+    /// before recursing into argument compilation, then read and re-recorded
+    /// by the call helpers immediately before emitting the call/construct
+    /// opcode. This ensures the diagnostic underline lands on the *call
+    /// site* (e.g. `new TypeError("boom")`) rather than the last
+    /// sub-expression compiled inside the argument list.
+    pub(super) pending_site_span: Option<oxc_span::Span>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

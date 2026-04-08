@@ -1,0 +1,17 @@
+---
+source: crates/otterjs/tests/cli_diagnostic.rs
+description: V8 stack header + miette snippet pointing at the throw site
+expression: stderr
+---
+
+  × TypeError: boom
+  │     at doStuff (file://<TMPDIR>/fixture.js:2:9)
+  │     at main (file://<TMPDIR>/fixture.js:5:3)
+  │     at file://<TMPDIR>/fixture.js:7:1
+   ╭─[file://<TMPDIR>/fixture.js:2:9]
+ 1 │ function doStuff() {
+ 2 │   throw new TypeError("boom");
+   ·         ┬
+   ·         ╰── thrown here
+ 3 │ }
+   ╰────

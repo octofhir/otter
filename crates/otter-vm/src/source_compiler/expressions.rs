@@ -29,6 +29,14 @@ impl<'a> FunctionCompiler<'a> {
         expression: &Expression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // Span attribution lives at the *statement* level — the enclosing
+        // `compile_statement` call records the active source location once
+        // and we keep that location until the next statement. Sub-expressions
+        // intentionally do NOT re-record because that would clobber the
+        // outer statement span and make the diagnostic underline land in the
+        // middle of the throw argument (e.g., `b.value` inside
+        // `throw new TypeError(b.value as string)`) instead of the `throw`
+        // keyword itself.
         match expression {
             Expression::NumericLiteral(literal) => {
                 // §B.1.1 — Legacy octal literals are a SyntaxError in strict mode.
@@ -610,7 +618,11 @@ impl<'a> FunctionCompiler<'a> {
                 // ES2024 §13.5.1: typeof on an unresolvable global reference
                 // must return "undefined", not throw ReferenceError.
                 if let oxc_ast::ast::Expression::Identifier(ident) = &unary.argument
-                    && !self.scope.borrow().bindings.contains_key(ident.name.as_str())
+                    && !self
+                        .scope
+                        .borrow()
+                        .bindings
+                        .contains_key(ident.name.as_str())
                 {
                     // Global variable — use TypeOfGlobal which doesn't throw.
                     let result = ValueLocation::temp(self.alloc_temp());
@@ -948,11 +960,21 @@ impl<'a> FunctionCompiler<'a> {
             .iter()
             .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
-        if has_spread {
+        // Stash the call expression's own span on the compiler. The call
+        // helpers below compile the argument list (which will overwrite
+        // the active span via per-sub-expression record_location calls),
+        // then read this stash and re-record it RIGHT BEFORE emitting the
+        // CallClosure / CallSpread opcode. That way the underline lands
+        // on the call site itself when the callee throws — not on the
+        // last argument.
+        let saved = self.pending_site_span.replace(call.span);
+        let result = if has_spread {
             self.compile_call_with_spread(&call.arguments, callee, receiver, false, module)
         } else {
             self.compile_call_static_args(&call.arguments, callee, receiver, false, module)
-        }
+        };
+        self.pending_site_span = saved;
+        result
     }
 
     /// §19.2.1.1 Compile a direct eval call: `eval(code)`.
@@ -1043,6 +1065,10 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             ValueLocation::temp(self.alloc_temp())
         };
+        // Re-attribute the next opcode to the parent call/new expression.
+        if let Some(site_span) = self.pending_site_span {
+            self.record_location(site_span);
+        }
         let pc = self.instructions.len();
         self.instructions.push(Instruction::call_closure(
             result.register,
@@ -1080,6 +1106,14 @@ impl<'a> FunctionCompiler<'a> {
         {
             self.release(receiver);
         }
+        // The bumper allocator releases are not strictly LIFO: the arg window
+        // shrink and the callee release may leave `next_temp` pointing *below*
+        // the slot that actually holds the live result. Subsequent `alloc_temp`
+        // calls would then hand out that live register to a new temp and clobber
+        // it (reproducer: `arr.findIndex(inline-fn)` inside `assert.sameValue`
+        // where `-1` is compiled into the allocator holes that overlap the
+        // result). Force `next_temp` to cover the stable result register.
+        self.ensure_temp_region_covers(result.register);
         Ok(result)
     }
 
@@ -1144,6 +1178,10 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             ValueLocation::temp(self.alloc_temp())
         };
+        // Re-attribute the next opcode to the parent call/new expression.
+        if let Some(site_span) = self.pending_site_span {
+            self.record_location(site_span);
+        }
         let pc = self.instructions.len();
         self.instructions.push(Instruction::call_spread(
             result.register,
@@ -1367,11 +1405,17 @@ impl<'a> FunctionCompiler<'a> {
             .iter()
             .any(|arg| matches!(arg, Argument::SpreadElement(_)));
 
+        // Stash `new`'s span; the call helper re-records it right before
+        // emitting the Construct opcode so error frames captured at
+        // constructor invocation (Error / TypeError / etc.) underline the
+        // whole `new Foo(...)` expression rather than the last argument.
+        let saved = self.pending_site_span.replace(new_expression.span);
         let result = if has_spread {
             self.compile_call_with_spread(arguments, callee, None, true, module)?
         } else {
             self.compile_call_static_args(arguments, callee, None, true, module)?
         };
+        self.pending_site_span = saved;
 
         if let Some(value) = cleanup
             && value.register != result.register
@@ -1403,8 +1447,20 @@ impl<'a> FunctionCompiler<'a> {
             }
             Expression::StaticMemberExpression(member) => {
                 let receiver = self.compile_expression(&member.object, module)?;
+                // Stabilize a temp receiver before allocating the callee
+                // register. The bumper's `release` does not enforce LIFO, so
+                // the temp count after compiling `member.object` may
+                // underestimate the highest live slot, causing `alloc_temp()`
+                // to return the receiver's own register and clobber it via
+                // GetProperty.
+                let receiver = if receiver.is_temp {
+                    self.stabilize_binding_value(receiver)?
+                } else {
+                    receiver
+                };
                 let callee_register = self.alloc_temp();
                 let property = self.intern_property_name(member.property.name.as_str())?;
+                self.record_location(member.span);
                 self.instructions.push(Instruction::get_property(
                     callee_register,
                     receiver.register,
@@ -1422,6 +1478,7 @@ impl<'a> FunctionCompiler<'a> {
                 match &member.expression {
                     Expression::StringLiteral(literal) => {
                         let property = self.intern_property_name(literal.value.as_str())?;
+                        self.record_location(member.span);
                         self.instructions.push(Instruction::get_property(
                             callee_register,
                             receiver.register,
@@ -1430,6 +1487,7 @@ impl<'a> FunctionCompiler<'a> {
                     }
                     _ => {
                         let index = self.compile_expression(&member.expression, module)?;
+                        self.record_location(member.span);
                         self.instructions.push(Instruction::get_index(
                             callee_register,
                             receiver.register,
@@ -1450,6 +1508,7 @@ impl<'a> FunctionCompiler<'a> {
                 };
                 let callee_register = self.alloc_temp();
                 let prop_id = self.intern_property_name(member.field.name.as_str())?;
+                self.record_location(member.span);
                 self.instructions.push(Instruction::get_private_field(
                     callee_register,
                     receiver.register,
@@ -1474,6 +1533,7 @@ impl<'a> FunctionCompiler<'a> {
                 let object = self.compile_expression(&member.object, module)?;
                 let callee_register = self.alloc_temp();
                 let property = self.intern_property_name(member.property.name.as_str())?;
+                self.record_location(member.span);
                 self.instructions.push(Instruction::get_property(
                     callee_register,
                     object.register,
@@ -1491,6 +1551,7 @@ impl<'a> FunctionCompiler<'a> {
                 match &member.expression {
                     Expression::StringLiteral(literal) => {
                         let property = self.intern_property_name(literal.value.as_str())?;
+                        self.record_location(member.span);
                         self.instructions.push(Instruction::get_property(
                             callee_register,
                             object.register,
@@ -1499,6 +1560,7 @@ impl<'a> FunctionCompiler<'a> {
                     }
                     _ => {
                         let index = self.compile_expression(&member.expression, module)?;
+                        self.record_location(member.span);
                         self.instructions.push(Instruction::get_index(
                             callee_register,
                             object.register,
@@ -1968,6 +2030,11 @@ impl<'a> FunctionCompiler<'a> {
             ValueLocation::temp(self.alloc_temp())
         };
         let property = self.intern_property_name(member.property.name.as_str())?;
+        // Re-record the member-access span right before emit so that any
+        // TypeError thrown by `GetProperty` (e.g., `null.foo`) underlines
+        // the access expression itself, not whatever sub-expression
+        // happened to set the active location last.
+        self.record_location(member.span);
         self.instructions.push(Instruction::get_property(
             result.register,
             object.register,
@@ -1997,6 +2064,7 @@ impl<'a> FunctionCompiler<'a> {
         match &member.expression {
             Expression::StringLiteral(literal) => {
                 let property = self.intern_property_name(literal.value.as_str())?;
+                self.record_location(member.span);
                 self.instructions.push(Instruction::get_property(
                     result.register,
                     object.register,
@@ -2005,6 +2073,7 @@ impl<'a> FunctionCompiler<'a> {
             }
             _ => {
                 let index = self.compile_expression(&member.expression, module)?;
+                self.record_location(member.span);
                 self.instructions.push(Instruction::get_index(
                     result.register,
                     object.register,

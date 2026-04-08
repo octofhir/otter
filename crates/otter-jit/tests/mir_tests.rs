@@ -8,10 +8,7 @@ fn compile_and_build_mir(source: &str) -> otter_jit::mir::graph::MirGraph {
     let module = source::compile_script(source, "test.js").expect("compilation failed");
     // The module body is at index 0 (named after the source URL).
     // Pick the first named user function (skip the module body).
-    let func = module
-        .functions()
-        .get(1)
-        .unwrap_or(&module.functions()[0]);
+    let func = module.functions().get(1).unwrap_or(&module.functions()[0]);
     build_mir(func, None).expect("MIR should build")
 }
 

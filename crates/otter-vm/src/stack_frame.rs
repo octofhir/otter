@@ -92,7 +92,11 @@ pub fn format_v8_stack(error_name: &str, message: &str, frames: &[StackFrameInfo
             Some(loc) => (loc.line(), loc.column()),
             None => (0, 0),
         };
-        let prefix = if frame.is_async { "    at async " } else { "    at " };
+        let prefix = if frame.is_async {
+            "    at async "
+        } else {
+            "    at "
+        };
         if fn_name == "<anonymous>" {
             let _ = write!(out, "\n{prefix}{url}:{line}:{column}");
         } else {

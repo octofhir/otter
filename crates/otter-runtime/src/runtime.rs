@@ -22,6 +22,10 @@ pub enum RunError {
     Compile(String),
     /// Runtime error during execution.
     Runtime(String),
+    /// Uncaught JS throw, with structured frames + source text for rich
+    /// rendering (V8/Node-style stack header + miette snippet at the throw
+    /// site). The diagnostic is `Box`ed to keep `RunError` small.
+    JsThrow(Box<crate::diagnostic::JsRuntimeDiagnostic>),
 }
 
 impl std::fmt::Display for RunError {
@@ -29,6 +33,7 @@ impl std::fmt::Display for RunError {
         match self {
             Self::Compile(e) => write!(f, "CompileError: {e}"),
             Self::Runtime(e) => write!(f, "RuntimeError: {e}"),
+            Self::JsThrow(diag) => write!(f, "{diag}"),
         }
     }
 }
@@ -51,6 +56,20 @@ pub(crate) fn format_interpreter_error(
         return state.js_to_string_infallible(*value).to_string();
     }
     error.to_string()
+}
+
+/// Promote an `InterpreterError` into a `RunError`. For `UncaughtThrow` of
+/// an Error-like object we prefer the structured `JsThrow` variant; for
+/// thrown primitives or non-Error objects we fall back to the legacy
+/// `Runtime(String)` form so older callers keep their existing display.
+pub(crate) fn run_error_from_interpreter(
+    error: &otter_vm::interpreter::InterpreterError,
+    state: &mut RuntimeState,
+) -> RunError {
+    if let Some(diagnostic) = crate::diagnostic::build_js_diagnostic(error, state) {
+        return RunError::JsThrow(Box::new(diagnostic));
+    }
+    RunError::Runtime(format_interpreter_error(error, state))
 }
 
 /// The Otter JavaScript runtime.
@@ -171,10 +190,7 @@ impl OtterRuntime {
             Err(_) => match interpreter.execute_module(module, &mut self.state) {
                 Ok(result) => result,
                 Err(e) => {
-                    return Err(RunError::Runtime(format_interpreter_error(
-                        &e,
-                        &mut self.state,
-                    )));
+                    return Err(run_error_from_interpreter(&e, &mut self.state));
                 }
             },
         };
@@ -251,10 +267,29 @@ impl OtterRuntime {
         let session = self
             .host_state
             .ensure_module_runtime(&mut self.state, &self.host);
-        preload_module_graph(&mut self.state, session, self.host.loader().clone(), &graph)
-            .map_err(RunError::Runtime)?;
+        if let Err(error) =
+            preload_module_graph(&mut self.state, session, self.host.loader().clone(), &graph)
+        {
+            return Err(self.lift_pending_throw_or(error));
+        }
         execute_preloaded_entry(&mut self.state, session, &module.url)
-            .map_err(RunError::Runtime)
+            .map_err(|error| self.lift_pending_throw_or(error))
+    }
+
+    /// Promotes a stashed pending uncaught throw (set by the host module
+    /// runtime when JS code threw inside a hosted module load) into a
+    /// structured `RunError::JsThrow`. Falls back to the legacy
+    /// `RunError::Runtime` form when no throw is pending.
+    fn lift_pending_throw_or(&mut self, fallback_message: String) -> RunError {
+        if let Some(value) = self.state.take_pending_uncaught_throw() {
+            let error = otter_vm::interpreter::InterpreterError::UncaughtThrow(value);
+            if let Some(diagnostic) =
+                crate::diagnostic::build_js_diagnostic(&error, &mut self.state)
+            {
+                return RunError::JsThrow(Box::new(diagnostic));
+            }
+        }
+        RunError::Runtime(fallback_message)
     }
 
     // -----------------------------------------------------------------------
@@ -505,6 +540,59 @@ mod tests {
             &mut state,
         );
         assert_eq!(formatted, "TypeError: boom");
+    }
+
+    #[test]
+    fn run_script_returns_js_throw_for_uncaught_error_with_stack() {
+        // The structured `RunError::JsThrow` variant should fire whenever a
+        // script throws an Error-like object. This is the path the CLI uses
+        // to render miette snippets, so it's a load-bearing assertion.
+        let (mut rt, _capture) = rt_with_capture();
+        let err = rt
+            .run_script(
+                concat!(
+                    "function doStuff() {\n",
+                    "  throw new TypeError(\"boom\");\n",
+                    "}\n",
+                    "function main() {\n",
+                    "  doStuff();\n",
+                    "}\n",
+                    "main();\n",
+                ),
+                "uncaught.js",
+            )
+            .expect_err("script should throw");
+        match err {
+            RunError::JsThrow(diag) => {
+                assert_eq!(diag.name(), "TypeError");
+                assert_eq!(diag.message(), "boom");
+                assert!(
+                    diag.rendered_stack().contains("TypeError: boom"),
+                    "stack header missing TypeError: boom: {}",
+                    diag.rendered_stack(),
+                );
+                // The stack should mention at least one of the user
+                // functions; tail-call elision aside, both should appear
+                // since neither is a tail call.
+                assert!(
+                    diag.rendered_stack().contains("doStuff")
+                        || diag.rendered_stack().contains("main"),
+                    "stack missing user frames: {}",
+                    diag.rendered_stack(),
+                );
+                // At least one frame should resolve to a real (non-zero)
+                // line number now that the source map is populated.
+                let has_real_location = diag
+                    .frames()
+                    .iter()
+                    .any(|f| f.location.map(|l| l.line() > 0).unwrap_or(false));
+                assert!(
+                    has_real_location,
+                    "expected at least one frame with a non-zero line number",
+                );
+            }
+            other => panic!("expected JsThrow, got {other:?}"),
+        }
     }
 
     #[test]

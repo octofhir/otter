@@ -392,6 +392,17 @@ impl NewVmRunner {
                             Some(format!("Harness runtime error in {include}: {e}")),
                         );
                     }
+                    Err(RunError::JsThrow(diag)) => {
+                        // Render the V8-style stack via the diagnostic so
+                        // that `-vv` keeps the structured frame info.
+                        return (
+                            TestOutcome::Fail,
+                            Some(format!(
+                                "Harness runtime error in {include}: {}",
+                                diag.rendered_stack()
+                            )),
+                        );
+                    }
                 }
             }
         }
@@ -423,6 +434,20 @@ impl NewVmRunner {
                     (TestOutcome::Pass, None)
                 } else {
                     (TestOutcome::Fail, Some(format!("RuntimeError: {e}")))
+                }
+            }
+            Err(RunError::JsThrow(diag)) => {
+                // Spec-required error path: tests like
+                // `built-ins/Error/prototype/toString/tostring-get-throws.js`
+                // ARE allowed to throw runtime errors. Treat the structured
+                // diagnostic the same as the legacy runtime error variant.
+                if metadata.expects_runtime_error() {
+                    (TestOutcome::Pass, None)
+                } else {
+                    (
+                        TestOutcome::Fail,
+                        Some(format!("RuntimeError: {}", diag.rendered_stack())),
+                    )
                 }
             }
         }

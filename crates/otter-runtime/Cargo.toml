@@ -24,6 +24,7 @@ oxc_ast = "0.123"
 oxc_parser = "0.123"
 oxc_resolver = "11.16"
 oxc_span = "0.123"
+oxc-miette = { workspace = true }
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
 serde_json = "1"
 thiserror.workspace = true

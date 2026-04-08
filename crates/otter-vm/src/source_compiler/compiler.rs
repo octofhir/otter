@@ -8,7 +8,11 @@ use super::shared::{
     Binding, CaptureSource, CompiledFunction, FunctionCompiler, FunctionKind, LoopScope,
     PendingFunction, ScopeRef, ValueLocation, new_scope_ref,
 };
+use super::source_mapper::SourceMapper;
 use super::*;
+use crate::source_map::SourceMapEntry;
+use oxc_span::{GetSpan, Span};
+use std::rc::Rc;
 
 impl<'a> FunctionCompiler<'a> {
     pub(super) fn new(
@@ -16,6 +20,7 @@ impl<'a> FunctionCompiler<'a> {
         function_name: Option<String>,
         kind: FunctionKind,
         parent_scopes: Vec<ScopeRef>,
+        source_mapper: Rc<SourceMapper>,
     ) -> Self {
         Self {
             mode,
@@ -53,8 +58,45 @@ impl<'a> FunctionCompiler<'a> {
             parameter_tdz_active: false,
             predeclared_lexical_names: std::collections::BTreeSet::new(),
             eval_completion_register: None,
+            source_mapper,
+            source_map_entries: Vec::new(),
+            last_recorded_location: None,
+            pending_site_span: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Records a source-map entry at the current program counter for the
+    /// given AST span. Coalesces consecutive identical locations so the
+    /// resulting `SourceMap` only contains distinct entries.
+    ///
+    /// Callers pass the span of whatever AST node they are about to compile
+    /// (statement, expression, or even a single `throw`). The first entry
+    /// wins on ties so the span of the outer node defines the attribution
+    /// for the instructions that follow until the next `record_location`.
+    pub(super) fn record_location(&mut self, span: Span) {
+        if span.is_unspanned() {
+            return;
+        }
+        let location = self.source_mapper.locate(span);
+        if self.last_recorded_location == Some(location) {
+            return;
+        }
+        let pc = u32::try_from(self.instructions.len()).unwrap_or(u32::MAX);
+        // If the previous recorded entry was at the same pc, update it in
+        // place so only the most recent (typically the more specific) span
+        // wins. This happens when `record_location` is called multiple times
+        // before any instruction is emitted (e.g., at the start of a block).
+        if let Some(last) = self.source_map_entries.last_mut()
+            && last.pc() == pc
+        {
+            *last = SourceMapEntry::new(pc, location);
+            self.last_recorded_location = Some(location);
+            return;
+        }
+        self.source_map_entries
+            .push(SourceMapEntry::new(pc, location));
+        self.last_recorded_location = Some(location);
     }
 
     /// Returns the parent scope chain a child function compiler should
@@ -461,7 +503,7 @@ impl<'a> FunctionCompiler<'a> {
             FeedbackTableLayout::default(),
             DeoptTable::default(),
             ExceptionTable::new(self.exception_handlers),
-            SourceMap::default(),
+            SourceMap::new(self.source_map_entries),
         );
 
         // The child compiler owns its scope frame uniquely (the parent only
@@ -508,6 +550,11 @@ impl<'a> FunctionCompiler<'a> {
         statement: &AstStatement<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<bool, SourceLoweringError> {
+        // Tag the next bytecode instructions with this statement's span so
+        // runtime stack traces and diagnostics point at the right line/col.
+        // `record_location` dedups identical `(line, col)` so this is cheap
+        // on tight expression sequences.
+        self.record_location(statement.span());
         match statement {
             AstStatement::EmptyStatement(_) => Ok(false),
             AstStatement::BlockStatement(block) => self.compile_statements(&block.body, module),
@@ -636,6 +683,11 @@ impl<'a> FunctionCompiler<'a> {
             AstStatement::ThrowStatement(throw_statement) => {
                 let value = self.compile_expression(&throw_statement.argument, module)?;
                 self.emit_iterator_closes_for_active_loops();
+                // Re-record the throw statement's own span just before
+                // emitting the throw opcode so the diagnostic underline
+                // lands on the `throw` keyword, not on the last
+                // sub-expression that happened to set the active span.
+                self.record_location(throw_statement.span);
                 self.instructions.push(Instruction::throw(value.register));
                 self.release(value);
                 Ok(true)
@@ -1034,6 +1086,7 @@ impl<'a> FunctionCompiler<'a> {
             Some(format!("{class_name}.__field_init__")),
             super::shared::FunctionKind::Ordinary,
             self.parent_scopes_for_child(),
+            module.source_mapper(),
         );
         init_compiler.strict_mode = true;
         init_compiler.declare_parameters(&[])?;
@@ -1681,6 +1734,7 @@ impl<'a> FunctionCompiler<'a> {
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
             self.parent_scopes_for_child(),
+            module.source_mapper(),
         );
         compiler.strict_mode = true;
         compiler.is_derived_constructor = derived;
@@ -1754,6 +1808,7 @@ impl<'a> FunctionCompiler<'a> {
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
             self.parent_scopes_for_child(),
+            module.source_mapper(),
         );
         compiler.strict_mode = true;
         compiler.has_instance_fields = true;
@@ -1794,6 +1849,7 @@ impl<'a> FunctionCompiler<'a> {
             Some(class_name.to_string()),
             FunctionKind::Ordinary,
             self.parent_scopes_for_child(),
+            module.source_mapper(),
         );
         compiler.strict_mode = true;
         compiler.is_derived_constructor = true;
@@ -2737,23 +2793,23 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         name: &str,
     ) -> Result<BytecodeRegister, SourceLoweringError> {
-        let closure_register = if let Some(existing) = self.scope.borrow().bindings.get(name).copied()
-        {
-            match existing {
-                Binding::Register(register) => register,
-                Binding::ThisRegister(register) => register,
-                Binding::Function {
-                    closure_register, ..
-                } => closure_register,
-                Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
-                    return Err(SourceLoweringError::Unsupported(format!(
-                        "function declaration {name} conflicts with an upvalue binding"
-                    )));
+        let closure_register =
+            if let Some(existing) = self.scope.borrow().bindings.get(name).copied() {
+                match existing {
+                    Binding::Register(register) => register,
+                    Binding::ThisRegister(register) => register,
+                    Binding::Function {
+                        closure_register, ..
+                    } => closure_register,
+                    Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
+                        return Err(SourceLoweringError::Unsupported(format!(
+                            "function declaration {name} conflicts with an upvalue binding"
+                        )));
+                    }
                 }
-            }
-        } else {
-            self.allocate_local()?
-        };
+            } else {
+                self.allocate_local()?
+            };
 
         self.scope
             .borrow_mut()
@@ -2978,6 +3034,27 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
+    /// Ensure the temp-region count `next_temp` is large enough that `register`
+    /// falls within `[next_local, next_local + next_temp)`.
+    ///
+    /// Used when a helper returns a `ValueLocation::temp(register)` whose slot
+    /// sits at a position higher than the current `next_temp` tracking. This
+    /// happens in `compile_call_static_args` when the post-call stable register
+    /// is higher than where intermediate releases left `next_temp`: without
+    /// this correction, subsequent `alloc_temp` calls would hand out the same
+    /// register as the live result and clobber it.
+    pub(super) fn ensure_temp_region_covers(&mut self, register: BytecodeRegister) {
+        let idx = register.index();
+        if idx < self.next_local {
+            return;
+        }
+        let required = idx - self.next_local + 1;
+        if self.next_temp < required {
+            self.next_temp = required;
+            self.max_temp = self.max_temp.max(self.next_temp);
+        }
+    }
+
     fn declare_intrinsic_global_binding(&mut self, name: &str) -> Result<(), SourceLoweringError> {
         if self.scope.borrow().bindings.contains_key(name) {
             return Ok(());
@@ -3012,13 +3089,53 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         value: ValueLocation,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let register = self.allocate_local()?;
+        // Promote the value into a freshly-allocated local slot so the caller
+        // can treat its register as stable across subsequent compile steps.
+        //
+        // `allocate_local()` returns `next_local`, which equals the register
+        // index of the *lowest* currently-active temp. If the value is a
+        // temp at that same slot we can repurpose it in place. Otherwise,
+        // allocating a local there would alias with (and the subsequent
+        // Move would clobber) a lower temp that outer callers still hold.
+        //
+        // To stay safe, fall back to allocating a fresh temp above all
+        // current temps when there would be a collision. The temp is still
+        // stable against LIFO discipline as long as the caller doesn't
+        // release it. Returning a temp instead of a local is acceptable:
+        // callers uniformly either release or ignore the returned value,
+        // never treating it as a named local.
+        if value.is_temp && value.register.index() == self.next_local {
+            // Lowest temp: promote in place. No move, just reinterpret.
+            let register = self.allocate_local()?;
+            debug_assert_eq!(register.index(), value.register.index());
+            self.release(value);
+            return Ok(ValueLocation::local(register));
+        }
+
+        if self.next_temp == 0 {
+            // No active temps — safe to allocate a fresh local.
+            let register = self.allocate_local()?;
+            if value.register != register {
+                self.instructions
+                    .push(Instruction::move_(register, value.register));
+            }
+            self.release(value);
+            return Ok(ValueLocation::local(register));
+        }
+
+        // Collision risk: active temps exist and the value is not the
+        // lowest. Snapshot to a fresh temp above the live temps. This is
+        // stable as long as nothing releases it, which matches the caller's
+        // expectation (they treat the returned value as immutable).
+        let register = self.alloc_temp();
         if value.register != register {
             self.instructions
                 .push(Instruction::move_(register, value.register));
         }
-        self.release(value);
-        Ok(ValueLocation::local(register))
+        // Note: if the input was a temp, we now have two active slots for it
+        // (the original and the fresh snapshot). That's a one-register leak,
+        // not a correctness bug — the original is still valid but unused.
+        Ok(ValueLocation::temp(register))
     }
 
     pub(super) fn emit_iterator_closes_for_active_loops(&mut self) {

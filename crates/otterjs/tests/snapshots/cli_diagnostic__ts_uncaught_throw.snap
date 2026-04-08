@@ -1,0 +1,17 @@
+---
+source: crates/otterjs/tests/cli_diagnostic.rs
+description: TS source (types intact) rendered via miette
+expression: stderr
+---
+
+  × TypeError: boom
+  │     at unbox (file://<TMPDIR>/fixture.ts:3:9)
+  │     at main (file://<TMPDIR>/fixture.ts:6:3)
+  │     at file://<TMPDIR>/fixture.ts:8:1
+   ╭─[file://<TMPDIR>/fixture.ts:3:9]
+ 2 │ function unbox<T>(b: Box<T>): T {
+ 3 │   throw new TypeError("boom");
+   ·         ┬
+   ·         ╰── thrown here
+ 4 │ }
+   ╰────

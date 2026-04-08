@@ -1,0 +1,7 @@
+---
+source: crates/otterjs/tests/cli_diagnostic.rs
+description: "Plain primitive throw — no miette snippet, legacy line"
+expression: stderr
+---
+
+  × Error

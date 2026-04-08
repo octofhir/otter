@@ -1173,9 +1173,8 @@ fn parse_body_init(
     }
 
     if let Some(handle) = value.as_object_handle().map(ObjectHandle)
-        && let Ok(
-            HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView,
-        ) = runtime.objects().kind(handle)
+        && let Ok(HeapValueKind::ArrayBuffer | HeapValueKind::TypedArray | HeapValueKind::DataView) =
+            runtime.objects().kind(handle)
     {
         return Ok(ParsedBodyInit {
             bytes: bytes_from_buffer_source(runtime, value)?,

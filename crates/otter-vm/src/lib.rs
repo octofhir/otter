@@ -71,12 +71,12 @@ pub mod object;
 pub mod payload;
 /// Promise intrinsic — ES2024 §27.2 implementation.
 pub mod promise;
-/// §9.3 ECMAScript Realm Records.
-pub mod realm;
 /// Property side tables for named access.
 pub mod property;
 /// Shared CopyDataProperties helpers for object spread/rest semantics.
 mod property_copy;
+/// §9.3 ECMAScript Realm Records.
+pub mod realm;
 /// RegExp-literal side tables for functions.
 pub mod regexp;
 /// Small smoke harness for iterative validation.
@@ -87,6 +87,8 @@ pub mod source;
 pub(crate) mod source_compiler;
 /// Source-location metadata.
 pub mod source_map;
+/// JS to JS transformation (e.g. stripping TypeScript)
+pub mod source_transform;
 /// Stack frame snapshots for V8-parity stack traces.
 pub mod stack_frame;
 /// String-literal side tables for functions.
@@ -110,9 +112,7 @@ pub use frame::FrameLayout;
 pub use host::{HostFunctionId, NativeFunctionRegistry};
 pub use host_callbacks::HostCallbackSender;
 pub use interpreter::{Interpreter, RuntimeState};
-pub use intrinsics::{
-    IntrinsicKey, IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol,
-};
+pub use intrinsics::{IntrinsicKey, IntrinsicRoot, IntrinsicsStage, VmIntrinsics, WellKnownSymbol};
 pub use module::{
     ExportRecord, Function, FunctionIndex, ImportBinding, ImportRecord, Module, ModuleError,
 };

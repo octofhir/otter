@@ -497,6 +497,13 @@ fn evaluate_loaded_module(
         match Interpreter::new().execute_module(&module, runtime) {
             Ok(_) => Ok(()),
             Err(error) => {
+                // Stash the raw thrown value (when present) so the outer
+                // host runtime can promote it back into a structured
+                // `JsRuntimeDiagnostic` for the CLI reporter. The legacy
+                // string path stays as the fallback.
+                if let otter_vm::interpreter::InterpreterError::UncaughtThrow(value) = &error {
+                    runtime.stash_pending_uncaught_throw(*value);
+                }
                 // Format the error using §7.1.17 ToString so Error objects show
                 // their proper "Name: Message" rather than `[object#N]`.
                 let message = crate::runtime::format_interpreter_error(&error, runtime);

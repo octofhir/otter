@@ -1,5 +1,6 @@
 use super::ast::{ParamInfo, has_use_strict_directive};
 use super::shared::{CompiledFunction, FunctionCompiler, FunctionKind, ScopeRef};
+use super::source_mapper::SourceMapper;
 use super::*;
 
 use crate::module::{ExportRecord, ImportRecord};
@@ -19,17 +20,39 @@ pub(super) struct ModuleCompiler<'a> {
     imports: Vec<ImportRecord>,
     /// §16.2.3 — Export records collected during module compilation.
     exports: Vec<ExportRecord>,
+    /// Shared source mapper, cloned into every `FunctionCompiler` so they
+    /// can resolve AST spans to 1-based `(line, column)` in the **original**
+    /// source (TS or JS as written by the user).
+    source_mapper: Rc<SourceMapper>,
+    /// Original source text attached to the produced `Module` so runtime
+    /// diagnostics can render snippets that match what the user wrote. For
+    /// `.js` files this is the literal JS; for `.ts` files this is the
+    /// literal TS (not the generated JS).
+    original_source: Arc<str>,
 }
 
 impl<'a> ModuleCompiler<'a> {
-    pub(super) fn new(source_url: &'a str, mode: LoweringMode) -> Self {
+    pub(super) fn new(
+        source_url: &'a str,
+        mode: LoweringMode,
+        source_mapper: Rc<SourceMapper>,
+        original_source: Arc<str>,
+    ) -> Self {
         Self {
             source_url,
             mode,
             functions: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            source_mapper,
+            original_source,
         }
+    }
+
+    /// Returns a handle to the shared source mapper for child
+    /// `FunctionCompiler` creation.
+    pub(super) fn source_mapper(&self) -> Rc<SourceMapper> {
+        self.source_mapper.clone()
     }
 
     /// Adds an import record (used by import declaration compilation).
@@ -84,6 +107,7 @@ impl<'a> ModuleCompiler<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let source_text = self.original_source.clone();
         if is_module {
             Module::new_esm(
                 Some(self.source_url),
@@ -92,13 +116,16 @@ impl<'a> ModuleCompiler<'a> {
                 self.imports,
                 self.exports,
             )
+            .map(|module| module.with_source_text(source_text))
             .map_err(|error| {
                 SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
             })
         } else {
-            Module::new(Some(self.source_url), functions, entry).map_err(|error| {
-                SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
-            })
+            Module::new(Some(self.source_url), functions, entry)
+                .map(|module| module.with_source_text(source_text))
+                .map_err(|error| {
+                    SourceLoweringError::Unsupported(format!("failed to construct module: {error}"))
+                })
         }
     }
 
@@ -143,8 +170,13 @@ impl<'a> ModuleCompiler<'a> {
         inherited_strict: bool,
         is_derived_constructor: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
-        let mut compiler =
-            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_scopes);
+        let mut compiler = FunctionCompiler::new(
+            self.mode,
+            identity.debug_name.clone(),
+            kind,
+            parent_scopes,
+            self.source_mapper.clone(),
+        );
         compiler.strict_mode = inherited_strict;
         compiler.is_derived_constructor = is_derived_constructor;
 
@@ -197,8 +229,13 @@ impl<'a> ModuleCompiler<'a> {
         parent_scopes: Vec<ScopeRef>,
         inherited_strict: bool,
     ) -> Result<CompiledFunction, SourceLoweringError> {
-        let mut compiler =
-            FunctionCompiler::new(self.mode, identity.debug_name.clone(), kind, parent_scopes);
+        let mut compiler = FunctionCompiler::new(
+            self.mode,
+            identity.debug_name.clone(),
+            kind,
+            parent_scopes,
+            self.source_mapper.clone(),
+        );
         compiler.strict_mode = inherited_strict;
 
         compiler.declare_parameters(params)?;

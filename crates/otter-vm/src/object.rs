@@ -4912,10 +4912,7 @@ impl ObjectHeap {
     }
 
     /// Returns the target stored in a bound function exotic object.
-    pub fn bound_function_target(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<ObjectHandle, ObjectError> {
+    pub fn bound_function_target(&self, handle: ObjectHandle) -> Result<ObjectHandle, ObjectError> {
         match self.object(handle)? {
             HeapValue::BoundFunction { target, .. } => Ok(*target),
             _ => Err(ObjectError::InvalidKind),

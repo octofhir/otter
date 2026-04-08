@@ -6,7 +6,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use miette::{GraphicalReportHandler, GraphicalTheme, Report};
+use otter_runtime::RunError;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::filter::EnvFilter;
 
@@ -245,27 +248,34 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse()?))
-        .init();
+async fn main() -> ExitCode {
+    let init_result = (|| -> Result<()> {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive("warn".parse()?))
+            .init();
+        Ok(())
+    })();
+    if let Err(err) = init_result {
+        eprintln!("error: {err}");
+        return ExitCode::from(1);
+    }
 
     let cli = Cli::parse();
 
     if let Some(ref code) = cli.print {
-        return run_eval_new_vm(code, true, &cli);
+        return run_eval(code, true, &cli);
     }
 
     if let Some(ref code) = cli.eval {
-        return run_eval_new_vm(code, false, &cli);
+        return run_eval(code, false, &cli);
     }
 
     if let Some(ref file) = cli.file {
         return run_file(file, &cli.file_args, &cli).await;
     }
 
-    match &cli.command {
-        Some(Commands::Run { file, args }) => run_file(file, args, &cli).await,
+    let result: Result<()> = match &cli.command {
+        Some(Commands::Run { file, args }) => return run_file(file, args, &cli).await,
         Some(Commands::Repl) => command_temporarily_disabled("repl"),
         Some(Commands::Test { .. }) => command_temporarily_disabled("test"),
         Some(Commands::Check { files }) => {
@@ -279,19 +289,27 @@ async fn main() -> Result<()> {
         Some(Commands::Add { package, dev }) => commands::add::run(package, *dev).await,
         Some(Commands::Remove { package }) => commands::remove::run(package).await,
         Some(Commands::Exec { command, args }) => commands::exec::run(command, args).await,
-        Some(Commands::Init) => {
-            commands::init::run()?;
-            Ok(())
-        }
+        Some(Commands::Init) => commands::init::run().map(|_| ()),
         Some(Commands::Info { json }) => {
             commands::info::run(*json);
             Ok(())
         }
         None => {
             use clap::CommandFactory;
-            Cli::command().print_help()?;
-            println!();
-            Ok(())
+            match Cli::command().print_help() {
+                Ok(_) => {
+                    println!();
+                    Ok(())
+                }
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            }
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::from(0),
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
         }
     }
 }
@@ -302,18 +320,90 @@ fn command_temporarily_disabled(command: &str) -> Result<()> {
     ))
 }
 
-async fn run_file(path: &Path, _script_args: &[String], cli: &Cli) -> Result<()> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", path.display()))?;
-    let mut rt = build_runtime_for_cli(cli)?;
-    rt.run_entry_specifier(path_str, None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
+/// Picks the right miette `GraphicalTheme` based on `NO_COLOR` and whether
+/// stderr is a TTY. Mirrors what miette's own auto-detection does, but
+/// applied explicitly so we don't have to rely on the `Debug` impl picking
+/// up an installed hook.
+///
+/// Honors the [NO_COLOR](https://no-color.org/) convention so CI logs and
+/// piped output stay plain.
+fn pick_graphical_theme() -> GraphicalTheme {
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let stderr_is_tty = atty::is(atty::Stream::Stderr);
+    if no_color || !stderr_is_tty {
+        GraphicalTheme::unicode_nocolor()
+    } else {
+        GraphicalTheme::unicode()
+    }
 }
 
-fn run_eval_new_vm(source: &str, print_result: bool, cli: &Cli) -> Result<()> {
-    let mut rt = build_runtime_for_cli(cli)?;
+/// Renders a `RunError` to stderr and returns the appropriate exit code.
+///
+/// `JsThrow` is the rich path: we build a `miette::Report`, render it with
+/// an explicit `GraphicalReportHandler` so colors and box-drawing actually
+/// show up (Display fallback is plain text). `Compile` and `Runtime` keep
+/// the legacy plain `error: ...` shape so existing scripts that grep stderr
+/// still work.
+fn report_run_error(err: RunError) -> ExitCode {
+    match err {
+        RunError::JsThrow(diagnostic) => {
+            let report: Report = Report::new(*diagnostic);
+            let theme = pick_graphical_theme();
+            // Width: prefer COLUMNS, then terminal_size, then default 120.
+            let width = std::env::var("COLUMNS")
+                .ok()
+                .and_then(|w| w.parse::<usize>().ok())
+                .unwrap_or(120);
+            let handler = GraphicalReportHandler::new_themed(theme).with_width(width);
+            let mut rendered = String::new();
+            // Best-effort render. If miette refuses for any reason, fall
+            // back to the textual stack so the user still sees something.
+            if handler
+                .render_report(&mut rendered, report.as_ref())
+                .is_err()
+            {
+                rendered = format!("error: {report}");
+            }
+            eprintln!("{rendered}");
+            ExitCode::from(1)
+        }
+        RunError::Compile(message) => {
+            eprintln!("error: CompileError: {message}");
+            ExitCode::from(1)
+        }
+        RunError::Runtime(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_file(path: &Path, _script_args: &[String], cli: &Cli) -> ExitCode {
+    let Some(path_str) = path.to_str() else {
+        eprintln!("error: invalid file path: {}", path.display());
+        return ExitCode::from(1);
+    };
+    let mut rt = match build_runtime_for_cli(cli) {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match rt.run_entry_specifier(path_str, None) {
+        Ok(_) => ExitCode::from(0),
+        Err(error) => report_run_error(error),
+    }
+}
+
+fn run_eval(source: &str, print_result: bool, cli: &Cli) -> ExitCode {
+    let mut rt = match build_runtime_for_cli(cli) {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
     match rt.eval(source) {
         Ok(result) => {
             if print_result {
@@ -321,9 +411,9 @@ fn run_eval_new_vm(source: &str, print_result: bool, cli: &Cli) -> Result<()> {
                     otter_runtime::console::format_value(result.return_value(), rt.state());
                 println!("{formatted}");
             }
-            Ok(())
+            ExitCode::from(0)
         }
-        Err(e) => Err(anyhow::anyhow!("{e}")),
+        Err(error) => report_run_error(error),
     }
 }
 

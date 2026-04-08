@@ -347,14 +347,12 @@ fn install_error_stack_accessor(
 ) -> Result<(), IntrinsicsError> {
     let getter_desc = NativeFunctionDescriptor::method("get stack", 0, error_stack_getter);
     let getter_id = cx.native_functions.register(getter_desc);
-    let getter =
-        cx.alloc_intrinsic_host_function(getter_id, intrinsics.function_prototype)?;
+    let getter = cx.alloc_intrinsic_host_function(getter_id, intrinsics.function_prototype)?;
     install_function_length_name(getter, 0, "get stack", cx)?;
 
     let setter_desc = NativeFunctionDescriptor::method("set stack", 1, error_stack_setter);
     let setter_id = cx.native_functions.register(setter_desc);
-    let setter =
-        cx.alloc_intrinsic_host_function(setter_id, intrinsics.function_prototype)?;
+    let setter = cx.alloc_intrinsic_host_function(setter_id, intrinsics.function_prototype)?;
     install_function_length_name(setter, 1, "set stack", cx)?;
 
     let stack_prop = cx.property_names.intern("stack");
@@ -380,8 +378,7 @@ fn install_error_capture_stack_trace(
     intrinsics: &VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let desc =
-        NativeFunctionDescriptor::method("captureStackTrace", 2, error_capture_stack_trace);
+    let desc = NativeFunctionDescriptor::method("captureStackTrace", 2, error_capture_stack_trace);
     let host_id = cx.native_functions.register(desc);
     let method = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype)?;
     install_function_length_name(method, 2, "captureStackTrace", cx)?;
@@ -949,7 +946,10 @@ fn error_stack_setter(
     let Some(handle) = this.as_object_handle().map(ObjectHandle) else {
         return Ok(RegisterValue::undefined());
     };
-    let value = args.first().copied().unwrap_or_else(RegisterValue::undefined);
+    let value = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
     define_non_enumerable_data_property(runtime, handle, ERROR_STACK_STRING_SLOT, value)?;
     // Drop the frames slot — the user's value now *is* the stack, and the
     // raw frames are no longer authoritative.

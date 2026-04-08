@@ -1,6 +1,7 @@
 //! Executable module and function containers for the new VM.
 
 use core::fmt;
+use std::sync::Arc;
 
 use crate::bigint::BigIntTable;
 use crate::bytecode::Bytecode;
@@ -482,6 +483,14 @@ pub struct Module {
     /// §16.2.3 — Static export records.
     /// Spec: <https://tc39.es/ecma262/#sec-exports>
     exports: Vec<ExportRecord>,
+    /// Original source text (TypeScript or JavaScript as written by the user).
+    ///
+    /// Populated by the source compiler with the *pre-transformation* source
+    /// text so runtime diagnostics can render snippets that match what the
+    /// developer typed byte-for-byte, not the post-codegen JavaScript. `None`
+    /// for synthetic modules (host-installed shims, native modules, etc.)
+    /// where no single source text is meaningful.
+    source_text: Option<Arc<str>>,
 }
 
 impl Module {
@@ -507,6 +516,7 @@ impl Module {
             is_esm: false,
             imports: Vec::new(),
             exports: Vec::new(),
+            source_text: None,
         })
     }
 
@@ -534,7 +544,24 @@ impl Module {
             is_esm: true,
             imports,
             exports,
+            source_text: None,
         })
+    }
+
+    /// Attaches the original (pre-transform) source text to this module.
+    ///
+    /// Consumed by diagnostic rendering so error snippets show what the user
+    /// actually wrote — identical for `.js` and pre-strip for `.ts`.
+    #[must_use]
+    pub fn with_source_text(mut self, source_text: Arc<str>) -> Self {
+        self.source_text = Some(source_text);
+        self
+    }
+
+    /// Returns the original source text, if one was attached at compile time.
+    #[must_use]
+    pub fn source_text(&self) -> Option<&Arc<str>> {
+        self.source_text.as_ref()
     }
 
     /// Returns the module name, if present.

@@ -36,10 +36,12 @@
 //! ```
 
 mod builder;
+mod diagnostic;
 mod host;
 mod runtime;
 
 pub use builder::RuntimeBuilder;
+pub use diagnostic::{DiagnosticFrame, JsRuntimeDiagnostic};
 pub use host::{
     Capabilities, CapabilitiesBuilder, DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder,
     EnvWriteError, HostConfig, HostedExtension, HostedExtensionModule, HostedExtensionRegistry,

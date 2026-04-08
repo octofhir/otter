@@ -14,6 +14,8 @@ use oxc_span::SourceType;
 use crate::frame::RegisterIndex;
 use crate::lowering::{self, BinaryOp, Expr, LocalId, Program, Statement};
 use crate::module::Module;
+use crate::source_compiler::ProgramInput;
+use crate::source_transform::{TransformedSource, transform_source};
 
 /// Error produced while lowering JS source into the tiny `otter-vm` subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,29 +67,32 @@ impl From<lowering::LoweringError> for SourceLoweringError {
     }
 }
 
-/// Parse, lower, and compile a tiny JS script into an `otter-vm` module.
+/// Parse, lower, and compile a JS/TS script into an `otter-vm` module.
+///
+/// When `source_url` has a TypeScript extension (`.ts`/`.mts`/`.cts`), the
+/// source is first run through `oxc_transformer` to strip TS types, then the
+/// resulting JavaScript is parsed and compiled. The original source is still
+/// attached to the module so diagnostics render the user-written source, not
+/// the stripped JS.
 pub fn compile_script(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
-    let allocator = Allocator::default();
-    let ast = parse_script(&allocator, source, source_url)?;
-    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Script)
+    let transformed = transform_source(source, source_url)?;
+    compile_from_transformed(transformed, source_url, LoweringMode::Script, false)
 }
 
-/// Parse, lower, and compile JS source in eval mode.
+/// Parse, lower, and compile JS/TS source in eval mode.
 /// Returns the completion value of the last expression statement.
 /// Used by `-p` (print) and REPL-style evaluation.
 pub fn compile_eval(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
-    let allocator = Allocator::default();
-    let ast = parse_script(&allocator, source, source_url)?;
-    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Eval)
+    let transformed = transform_source(source, source_url)?;
+    compile_from_transformed(transformed, source_url, LoweringMode::Eval, false)
 }
 
-/// Parse, lower, and compile a JS module (ESM) into an `otter-vm` module.
+/// Parse, lower, and compile a JS/TS module (ESM) into an `otter-vm` module.
 /// Module mode enables top-level `await` and strict mode by default.
 /// Spec: <https://tc39.es/ecma262/#sec-modules>
 pub fn compile_module(source: &str, source_url: &str) -> Result<Module, SourceLoweringError> {
-    let allocator = Allocator::default();
-    let ast = parse_module(&allocator, source, source_url)?;
-    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Module)
+    let transformed = transform_source(source, source_url)?;
+    compile_from_transformed(transformed, source_url, LoweringMode::Module, true)
 }
 
 /// Parse, lower, and compile a tiny native Test262 script into an `otter-vm` module.
@@ -95,9 +100,38 @@ pub fn compile_test262_basic_script(
     source: &str,
     source_url: &str,
 ) -> Result<Module, SourceLoweringError> {
+    // Test262 fixtures are always plain JavaScript; bypass the transformer
+    // entirely so the hot path stays allocation-free beyond the parse.
+    let transformed = TransformedSource::identity(source, source_url);
+    compile_from_transformed(transformed, source_url, LoweringMode::Test262Basic, false)
+}
+
+fn compile_from_transformed(
+    transformed: TransformedSource,
+    source_url: &str,
+    mode: LoweringMode,
+    is_module: bool,
+) -> Result<Module, SourceLoweringError> {
+    let TransformedSource {
+        generated_js,
+        original,
+        source_map,
+        ..
+    } = transformed;
     let allocator = Allocator::default();
-    let ast = parse_script(&allocator, source, source_url)?;
-    crate::source_compiler::compile_program_to_module(&ast, source_url, LoweringMode::Test262Basic)
+    let ast = if is_module {
+        parse_module(&allocator, &generated_js, source_url)?
+    } else {
+        parse_script(&allocator, &generated_js, source_url)?
+    };
+    crate::source_compiler::compile_program_to_module(ProgramInput {
+        program: &ast,
+        source_url,
+        mode,
+        generated_js: &generated_js,
+        original_source: original,
+        oxc_map: source_map,
+    })
 }
 
 /// Parse and lower a tiny JS script into a structured `otter-vm` program.
@@ -117,14 +151,14 @@ fn lower_script_with_mode(
 
 fn parse_module<'a>(
     allocator: &'a Allocator,
-    source: &'a str,
-    source_url: &str,
+    generated_js: &'a str,
+    _source_url: &str,
 ) -> Result<AstProgram<'a>, SourceLoweringError> {
-    let source_type = SourceType::from_path(source_url)
-        .unwrap_or_default()
-        .with_module(true);
+    // As with `parse_script`, TS has already been stripped upstream by
+    // `transform_source`, so we always parse plain JavaScript here.
+    let source_type = SourceType::default().with_module(true);
 
-    let parsed = Parser::new(allocator, source, source_type).parse();
+    let parsed = Parser::new(allocator, generated_js, source_type).parse();
     if let Some(error) = parsed.errors.first() {
         return Err(SourceLoweringError::Parse(error.to_string()));
     }
@@ -133,22 +167,16 @@ fn parse_module<'a>(
 
 fn parse_script<'a>(
     allocator: &'a Allocator,
-    source: &'a str,
-    source_url: &str,
+    generated_js: &'a str,
+    _source_url: &str,
 ) -> Result<AstProgram<'a>, SourceLoweringError> {
-    let mut source_type = SourceType::from_path(source_url)
-        .unwrap_or_else(|_| SourceType::default().with_script(true))
-        .with_script(true);
+    // The input is always plain JavaScript at this point: either the user
+    // provided `.js`/`.mjs`/`.cjs` and `transform_source` returned an
+    // identity passthrough, or the user provided `.ts` and we've already
+    // stripped types via `oxc_transformer` + `oxc_codegen`.
+    let source_type = SourceType::default().with_script(true).with_module(false);
 
-    if source_type.is_typescript() || source_type.is_jsx() {
-        return Err(SourceLoweringError::Unsupported(
-            "TypeScript and JSX source are not enabled on the tiny new-VM path".to_string(),
-        ));
-    }
-
-    source_type = source_type.with_module(false);
-
-    let parsed = Parser::new(allocator, source, source_type).parse();
+    let parsed = Parser::new(allocator, generated_js, source_type).parse();
     if let Some(error) = parsed.errors.first() {
         return Err(SourceLoweringError::Parse(error.to_string()));
     }
@@ -640,6 +668,24 @@ mod tests {
             .expect_err("test262 basic script should throw")
     }
 
+    /// Regression: the bumper register allocator used to leave `next_temp`
+    /// below the slot holding the live result of a `CallClosure` emitted by
+    /// `compile_call_static_args`. The next `alloc_temp()` (here for the `-1`
+    /// literal inside `assert.sameValue`) would then overwrite the call's
+    /// result register. Minimal reproducer: a bare-statement inline method
+    /// call that "dirties" the temp region, followed by an assert that uses
+    /// an inline method call as its `actual` argument.
+    #[test]
+    fn call_result_survives_unary_neg_in_assert_same_value() {
+        let result = execute_test262_basic(
+            "var arr = [1,2,3,4,5]; \
+             arr.findIndex(function(x) { return x > 3; }); \
+             assert.sameValue(arr.findIndex(function(y) { return y > 10; }), -1);",
+            "call-result-survives-unary-neg.js",
+        );
+        assert_eq!(result, RegisterValue::from_i32(0));
+    }
+
     #[test]
     fn lowers_basic_loop_script() {
         let program = lower_script(
@@ -657,6 +703,79 @@ mod tests {
         .expect("script should lower");
 
         assert_eq!(program.name(), Some("basic-loop.js"));
+    }
+
+    #[test]
+    fn compile_script_attaches_original_source_text_for_js() {
+        let src = "let x = 1;\nx = x + 2;\n";
+        let module = compile_script(src, "module-source-text.js").expect("script should compile");
+        // Phase 2: Module should hold the original JS source byte-for-byte.
+        let stored = module
+            .source_text()
+            .expect("Module should expose source_text after compile_script");
+        assert_eq!(stored.as_ref(), src);
+    }
+
+    #[test]
+    fn compile_script_attaches_original_source_text_for_typescript() {
+        // TS source: type annotations get stripped by the transformer, but
+        // `Module::source_text` MUST hold the original TS string verbatim
+        // so diagnostics render the user-written types and identifiers.
+        let src = "const x: number = 1;\nconst y: string = 'a';\n";
+        let module =
+            compile_script(src, "module-source-text.ts").expect("ts script should compile");
+        let stored = module
+            .source_text()
+            .expect("Module should expose source_text after compile_script");
+        assert_eq!(
+            stored.as_ref(),
+            src,
+            "Module.source_text must hold the pre-strip TS source",
+        );
+    }
+
+    #[test]
+    fn compile_script_populates_source_map_entries_for_js() {
+        // Phase 1: every emitted instruction should be tagged with a real
+        // 1-based (line, col). The first statement is on line 1; the third
+        // statement is on line 3. We don't pin exact PCs (those depend on
+        // codegen choices), but the source map MUST contain at least two
+        // distinct (line) entries that match the source.
+        let src = "let x = 1;\nlet y = 2;\nlet z = x + y;\n";
+        let module = compile_script(src, "smap-pop.js").expect("script should compile");
+        let entry = module.entry_function();
+        let smap = entry.source_map();
+        assert!(!smap.is_empty(), "expected populated source map, got empty");
+        let lines: std::collections::BTreeSet<u32> =
+            smap.entries().iter().map(|e| e.location().line()).collect();
+        assert!(
+            lines.contains(&1) && lines.contains(&2) && lines.contains(&3),
+            "expected source-map lines to cover lines 1..=3, got: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn compile_script_source_map_locates_throw_for_typescript() {
+        // Phase 1 + Phase 0: A `throw` inside a TS function should resolve
+        // to the **TS** line/column, not the post-strip JS column.
+        let src = "function g(x: number) {\n  throw 1;\n}\n";
+        let module = compile_script(src, "smap-ts.ts").expect("ts script should compile");
+        // Find a function with at least one bytecode instruction.
+        let throw_function = module
+            .functions()
+            .iter()
+            .find(|f| !f.source_map().is_empty() && f.name() == Some("g"))
+            .expect("g function with source map present");
+        let lines: std::collections::BTreeSet<u32> = throw_function
+            .source_map()
+            .entries()
+            .iter()
+            .map(|e| e.location().line())
+            .collect();
+        assert!(
+            lines.contains(&2),
+            "expected throw to resolve to TS line 2, got: {lines:?}",
+        );
     }
 
     #[test]

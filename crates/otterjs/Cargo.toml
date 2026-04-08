@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2024"
 description = "Otter CLI - A fast TypeScript/JavaScript runtime"
 license = "MIT"
-autotests = false
+autotests = true
 repository = "https://github.com/octofhir/otter"
 homepage = "https://github.com/octofhir/otter"
 keywords = ["typescript", "javascript", "runtime", "cli"]
@@ -27,9 +27,15 @@ otter-pm = { path = "../otter-pm", version = "0.1.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+oxc-miette = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 atty = "0.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+insta = { version = "1", features = ["filters"] }
+tempfile = "3"

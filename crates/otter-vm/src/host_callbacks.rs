@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::Thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::interpreter::RuntimeState;
 
@@ -11,9 +14,31 @@ type HostCallback = Box<dyn FnOnce(&mut RuntimeState) + Send + 'static>;
 pub struct HostCallbackSender {
     sender: Sender<HostCallback>,
     pending: Arc<AtomicUsize>,
+    waiter: Arc<Mutex<Option<Thread>>>,
 }
 
 impl HostCallbackSender {
+    fn wake_waiter(&self) {
+        if let Some(waiter) = self
+            .waiter
+            .lock()
+            .expect("host callback waiter mutex poisoned")
+            .as_ref()
+        {
+            waiter.unpark();
+        }
+    }
+
+    fn register_waiter(&self, waiter: Thread) -> WaiterRegistration {
+        *self
+            .waiter
+            .lock()
+            .expect("host callback waiter mutex poisoned") = Some(waiter);
+        WaiterRegistration {
+            waiter: Arc::clone(&self.waiter),
+        }
+    }
+
     pub fn enqueue<F>(&self, callback: F) -> Result<(), String>
     where
         F: FnOnce(&mut RuntimeState) + Send + 'static,
@@ -21,8 +46,10 @@ impl HostCallbackSender {
         self.pending.fetch_add(1, Ordering::SeqCst);
         if self.sender.send(Box::new(callback)).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.wake_waiter();
             return Err("host callback queue is closed".into());
         }
+        self.wake_waiter();
         Ok(())
     }
 
@@ -48,8 +75,10 @@ impl HostCallbackReservation {
         self.active = false;
         if self.sender.sender.send(Box::new(callback)).is_err() {
             self.sender.pending.fetch_sub(1, Ordering::SeqCst);
+            self.sender.wake_waiter();
             return Err("host callback queue is closed".into());
         }
+        self.sender.wake_waiter();
         Ok(())
     }
 }
@@ -58,7 +87,21 @@ impl Drop for HostCallbackReservation {
     fn drop(&mut self) {
         if self.active {
             self.sender.pending.fetch_sub(1, Ordering::SeqCst);
+            self.sender.wake_waiter();
         }
+    }
+}
+
+struct WaiterRegistration {
+    waiter: Arc<Mutex<Option<Thread>>>,
+}
+
+impl Drop for WaiterRegistration {
+    fn drop(&mut self) {
+        *self
+            .waiter
+            .lock()
+            .expect("host callback waiter mutex poisoned") = None;
     }
 }
 
@@ -71,8 +114,13 @@ impl HostCallbackQueue {
     pub fn new() -> Self {
         let (sender, receiver) = channel();
         let pending = Arc::new(AtomicUsize::new(0));
+        let waiter = Arc::new(Mutex::new(None));
         Self {
-            sender: HostCallbackSender { sender, pending },
+            sender: HostCallbackSender {
+                sender,
+                pending,
+                waiter,
+            },
             receiver,
         }
     }
@@ -93,19 +141,38 @@ impl HostCallbackQueue {
         callbacks
     }
 
-    pub fn wait_and_drain(&mut self, timeout: Option<Duration>) -> Vec<HostCallback> {
-        let first = match timeout {
-            Some(timeout) => self.receiver.recv_timeout(timeout).ok(),
-            None => self.receiver.recv().ok(),
-        };
+    pub fn wait_and_drain_interruptible<F>(
+        &mut self,
+        timeout: Option<Duration>,
+        interrupted: F,
+    ) -> Vec<HostCallback>
+    where
+        F: Fn() -> bool,
+    {
+        let _registration = self.sender.register_waiter(std::thread::current());
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
 
-        let Some(first) = first else {
-            return Vec::new();
-        };
+        loop {
+            let callbacks = self.drain_ready();
+            if !callbacks.is_empty() {
+                return callbacks;
+            }
 
-        let mut callbacks = vec![first];
-        callbacks.extend(self.drain_ready());
-        callbacks
+            if interrupted() || !self.has_pending() {
+                return Vec::new();
+            }
+
+            match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Vec::new();
+                    }
+                    std::thread::park_timeout(deadline - now);
+                }
+                None => std::thread::park(),
+            }
+        }
     }
 
     pub fn complete_one(&self) {

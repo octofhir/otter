@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::Thread;
 use std::time::Duration;
 
 use otter_jit::deopt::execute_module_entry_with_runtime;
@@ -204,35 +205,37 @@ impl OtterRuntime {
         // `run_module` invocation gets a fresh one.
         self.current_interrupt = Some(interrupt_flag.clone());
 
-        // 1. Execute top-level code.
-        let result = match execute_module_entry_with_runtime(
-            module,
-            &mut self.state,
-            interrupt_ptr,
-            Some(interrupt_flag.clone()),
-        ) {
-            Ok(result) => result,
-            Err(_) => match interpreter.execute_module(module, &mut self.state) {
-                Ok(result) => result,
-                Err(e) => {
-                    self.current_interrupt = None;
-                    return Err(run_error_from_interpreter(&e, &mut self.state));
-                }
-            },
-        };
+        let run_result =
+            (|| -> Result<ExecutionResult, otter_vm::interpreter::InterpreterError> {
+                // 1. Execute top-level code.
+                let result = match execute_module_entry_with_runtime(
+                    module,
+                    &mut self.state,
+                    interrupt_ptr,
+                    Some(interrupt_flag.clone()),
+                ) {
+                    Ok(result) => result,
+                    Err(_) => interpreter.execute_module(module, &mut self.state)?,
+                };
 
-        // 2. Drain microtasks after top-level execution (ES spec).
-        self.drain_microtasks(module);
+                // 2. Drain microtasks after top-level execution (ES spec).
+                self.drain_microtasks(module)?;
 
-        // 3. Event loop: process pending timers + microtasks until quiescent.
-        self.run_event_loop(module);
+                // 3. Event loop: process pending timers + microtasks until quiescent.
+                self.run_event_loop(module)?;
+
+                Ok(result)
+            })();
 
         // Drop the published interrupt flag so subsequent runs get a
         // fresh one (and `drain_microtasks` from outside `run_module`
         // — there is none today, but be defensive — sees None).
         self.current_interrupt = None;
 
-        Ok(result)
+        match run_result {
+            Ok(result) => Ok(result),
+            Err(error) => Err(run_error_from_interpreter(&error, &mut self.state)),
+        }
     }
 
     /// Returns a reference to the underlying VM runtime state.
@@ -338,21 +341,28 @@ impl OtterRuntime {
             .unwrap_or(false)
     }
 
-    fn drain_microtasks(&mut self, module: &Module) {
+    fn check_interrupt(&self) -> Result<(), otter_vm::interpreter::InterpreterError> {
+        if self.interrupted() {
+            Err(otter_vm::interpreter::InterpreterError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn drain_microtasks(
+        &mut self,
+        module: &Module,
+    ) -> Result<(), otter_vm::interpreter::InterpreterError> {
         loop {
             // Cooperative bail: if the watchdog has set the interrupt
             // flag, stop draining instead of looping forever on a test
             // that keeps re-enqueueing reactions. The interpreter's
             // own bytecode loop checks the same flag at back-edges.
-            if self.interrupted() {
-                return;
-            }
+            self.check_interrupt()?;
             let mut did_work = false;
 
             while let Some(job) = self.state.microtasks_mut().pop_next_tick() {
-                if self.interrupted() {
-                    return;
-                }
+                self.check_interrupt()?;
                 let _ = Interpreter::call_function(
                     &mut self.state,
                     module,
@@ -364,9 +374,7 @@ impl OtterRuntime {
             }
 
             while let Some(job) = self.state.microtasks_mut().pop_promise_job() {
-                if self.interrupted() {
-                    return;
-                }
+                self.check_interrupt()?;
                 // ES2024 §27.2.2.1 NewPromiseReactionJob
                 let callback_kind = self.state.objects().kind(job.callback);
                 // Self-settling callables handle their own promise settlement.
@@ -432,9 +440,7 @@ impl OtterRuntime {
             }
 
             while let Some(job) = self.state.microtasks_mut().pop_microtask() {
-                if self.interrupted() {
-                    return;
-                }
+                self.check_interrupt()?;
                 let _ = Interpreter::call_function(
                     &mut self.state,
                     module,
@@ -449,20 +455,36 @@ impl OtterRuntime {
                 break;
             }
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Internal: event loop
     // -----------------------------------------------------------------------
 
-    fn run_event_loop(&mut self, module: &Module) {
+    fn sleep_until_interruptible(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), otter_vm::interpreter::InterpreterError> {
+        loop {
+            self.check_interrupt()?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            std::thread::park_timeout(deadline - now);
+        }
+    }
+
+    fn run_event_loop(
+        &mut self,
+        module: &Module,
+    ) -> Result<(), otter_vm::interpreter::InterpreterError> {
         loop {
             // Watchdog bail: matches the same poll inside drain_microtasks.
-            if self.interrupted() {
-                return;
-            }
+            self.check_interrupt()?;
             self.state.drain_host_callbacks();
-            self.drain_microtasks(module);
+            self.drain_microtasks(module)?;
 
             let has_timers = self.state.timers().has_pending();
             let has_microtasks = !self.state.microtasks().is_empty();
@@ -482,17 +504,24 @@ impl OtterRuntime {
                     let timeout = self.state.timers().next_deadline().map(|deadline| {
                         deadline.saturating_duration_since(std::time::Instant::now())
                     });
-                    if self.state.wait_for_host_callbacks(timeout) {
-                        self.drain_microtasks(module);
+                    let interrupt_flag = self.current_interrupt.clone();
+                    if self
+                        .state
+                        .wait_for_host_callbacks_interruptible(timeout, || {
+                            interrupt_flag
+                                .as_ref()
+                                .map(|flag| flag.load(Ordering::Acquire))
+                                .unwrap_or(false)
+                        })
+                    {
+                        self.drain_microtasks(module)?;
                         continue;
                     }
+                    self.check_interrupt()?;
                 }
 
                 if let Some(deadline) = self.state.timers().next_deadline() {
-                    let now = std::time::Instant::now();
-                    if deadline > now {
-                        std::thread::sleep(deadline - now);
-                    }
+                    self.sleep_until_interruptible(deadline)?;
                     continue;
                 }
                 break;
@@ -506,11 +535,12 @@ impl OtterRuntime {
                     timer.this_value,
                     &[],
                 );
-                self.drain_microtasks(module);
+                self.drain_microtasks(module)?;
             }
 
-            self.drain_microtasks(module);
+            self.drain_microtasks(module)?;
         }
+        Ok(())
     }
 }
 
@@ -534,6 +564,7 @@ impl TimeoutGuard {
             deadline,
             cancelled: AtomicBool::new(false),
             flag,
+            thread: std::thread::current(),
         });
         timeout_watchdog().enqueue(entry.clone());
         Self { entry: Some(entry) }
@@ -555,6 +586,7 @@ struct TimeoutEntry {
     deadline: std::time::Instant,
     cancelled: AtomicBool,
     flag: Arc<AtomicBool>,
+    thread: Thread,
 }
 
 /// Min-heap ordering: earliest deadline first.
@@ -635,6 +667,7 @@ fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
                 heap.pop();
                 if !top.cancelled.load(Ordering::Acquire) {
                     top.flag.store(true, Ordering::Release);
+                    top.thread.unpark();
                 }
                 continue;
             }
@@ -661,6 +694,7 @@ mod tests {
     use otter_vm::interpreter::InterpreterError;
     use otter_vm::value::RegisterValue;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn rt_with_capture() -> (OtterRuntime, Arc<CaptureConsoleBackend>) {
         let capture = Arc::new(CaptureConsoleBackend::new());
@@ -668,6 +702,18 @@ mod tests {
             .console(CaptureForTest(capture.clone()))
             .build();
         (rt, capture)
+    }
+
+    fn assert_runtime_interrupted(error: RunError) {
+        match error {
+            RunError::Runtime(message) => {
+                assert!(
+                    message.contains("execution interrupted"),
+                    "expected execution interrupted, got {message}"
+                );
+            }
+            other => panic!("expected Runtime execution interrupted, got {other:?}"),
+        }
     }
 
     struct CaptureForTest(Arc<CaptureConsoleBackend>);
@@ -2275,5 +2321,104 @@ mod tests {
         );
         rt.run_script(code, "setlen-cap.js")
             .expect("huge array length set should surface as RangeError");
+    }
+
+    #[test]
+    fn timeout_interrupts_sync_infinite_loop() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let started = std::time::Instant::now();
+        let error = rt
+            .run_script("while (true) {}", "sync-infinite-loop.js")
+            .expect_err("sync infinite loop should time out");
+
+        assert_runtime_interrupted(error);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout should interrupt promptly"
+        );
+    }
+
+    #[test]
+    fn timeout_interrupts_infinite_microtask_chain() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let error = rt
+            .run_script(
+                concat!(
+                    "function spin() { Promise.resolve().then(spin); }\n",
+                    "Promise.resolve().then(spin);\n",
+                ),
+                "microtask-spin.js",
+            )
+            .expect_err("microtask spin should time out");
+
+        assert_runtime_interrupted(error);
+    }
+
+    #[test]
+    fn timeout_interrupts_await_local_microtask_spin() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let error = rt
+            .run_script(
+                concat!(
+                    "async function f() {\n",
+                    "  Promise.resolve().then(function spin() { Promise.resolve().then(spin); });\n",
+                    "  await Promise.resolve(1);\n",
+                    "}\n",
+                    "f();\n",
+                ),
+                "await-microtask-spin.js",
+            )
+            .expect_err("await-local microtask spin should time out");
+
+        assert_runtime_interrupted(error);
+    }
+
+    #[test]
+    fn timeout_interrupts_pending_host_callback_wait() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+        let _reservation = rt.state().host_callback_sender().reserve();
+
+        let started = std::time::Instant::now();
+        let error = rt
+            .run_script("1 + 1;", "pending-host-callback.js")
+            .expect_err("pending host callback wait should time out");
+
+        assert_runtime_interrupted(error);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "host callback wait should wake promptly on timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_interrupts_sleeping_timer_wait() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let started = std::time::Instant::now();
+        let error = rt
+            .run_script(
+                "setTimeout(function() {}, 60_000);",
+                "sleeping-timer-wait.js",
+            )
+            .expect_err("sleeping timer wait should time out");
+
+        assert_runtime_interrupted(error);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timer sleep should wake promptly on timeout"
+        );
     }
 }

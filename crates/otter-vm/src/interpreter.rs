@@ -1508,8 +1508,17 @@ impl RuntimeState {
     /// Blocks until at least one pending host completion is ready, or timeout elapses.
     ///
     /// Returns `true` when at least one callback was invoked.
-    pub fn wait_for_host_callbacks(&mut self, timeout: Option<std::time::Duration>) -> bool {
-        let callbacks = self.host_callbacks.wait_and_drain(timeout);
+    pub fn wait_for_host_callbacks_interruptible<F>(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+        interrupted: F,
+    ) -> bool
+    where
+        F: Fn() -> bool,
+    {
+        let callbacks = self
+            .host_callbacks
+            .wait_and_drain_interruptible(timeout, interrupted);
         if callbacks.is_empty() {
             return false;
         }
@@ -5883,7 +5892,7 @@ impl Interpreter {
                     // ES2024 §27.7.5.3 Await — suspend until the promise settles.
                     // Drain microtasks inline; if the promise settles, resume.
                     // This handles synchronously-resolvable chains (most common case).
-                    Self::drain_microtasks_for_await(runtime, &current_module);
+                    self.drain_microtasks_for_await(runtime, &current_module)?;
 
                     // Check if the awaited promise settled during drain.
                     if let Some(promise) = runtime.objects.get_promise(awaited_promise) {
@@ -5969,12 +5978,18 @@ impl Interpreter {
 
     /// Drains microtasks inline during an await suspension.
     /// This settles promise chains that resolve synchronously (without timers/IO).
-    fn drain_microtasks_for_await(runtime: &mut RuntimeState, module: &Module) {
+    fn drain_microtasks_for_await(
+        &self,
+        runtime: &mut RuntimeState,
+        module: &Module,
+    ) -> Result<(), InterpreterError> {
         // Simple drain loop — process all promise jobs until exhausted.
         // This mirrors OtterRuntime::drain_microtasks but runs inside the interpreter.
         loop {
+            self.check_interrupt()?;
             let mut did_work = false;
             while let Some(job) = runtime.microtasks_mut().pop_promise_job() {
+                self.check_interrupt()?;
                 let callback_is_self_settling = matches!(
                     runtime.objects.kind(job.callback),
                     Ok(HeapValueKind::PromiseCapabilityFunction
@@ -6024,6 +6039,7 @@ impl Interpreter {
                 break;
             }
         }
+        Ok(())
     }
 
     fn transfer_exception(

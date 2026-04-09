@@ -555,6 +555,7 @@ fn parse_blob_parts(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<Vec<u8>, VmNativeCallError> {
+    runtime.check_interrupt()?;
     if value == RegisterValue::undefined() || value == RegisterValue::null() {
         return Ok(Vec::new());
     }
@@ -564,6 +565,7 @@ fn parse_blob_parts(
         && runtime.objects().kind(handle) == Ok(HeapValueKind::Array)
     {
         for part in runtime.array_to_args(handle)? {
+            runtime.check_interrupt()?;
             append_blob_part(runtime, &mut bytes, part)?;
         }
         return Ok(bytes);
@@ -578,6 +580,7 @@ fn append_blob_part(
     target: &mut Vec<u8>,
     part: RegisterValue,
 ) -> Result<(), VmNativeCallError> {
+    runtime.check_interrupt()?;
     if let Ok(payload) = runtime.native_payload_from_value::<BlobPayload>(&part) {
         target.extend_from_slice(&payload.bytes);
         return Ok(());

@@ -494,7 +494,7 @@ fn evaluate_loaded_module(
     } else {
         let module =
             compile_transformed_module(&transformed_source, url, module_type, source_type)?;
-        match Interpreter::new().execute_module(&module, runtime) {
+        match Interpreter::for_runtime(runtime).execute_module(&module, runtime) {
             Ok(_) => Ok(()),
             Err(error) => {
                 // Stash the raw thrown value (when present) so the outer

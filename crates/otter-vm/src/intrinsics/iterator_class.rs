@@ -22,6 +22,18 @@ pub(super) static ITERATOR_INTRINSIC: IteratorIntrinsic = IteratorIntrinsic;
 
 pub(super) struct IteratorIntrinsic;
 
+const ITERATOR_INTERRUPT_POLL_INTERVAL: usize = 4096;
+
+fn check_iterator_interrupt(
+    runtime: &crate::interpreter::RuntimeState,
+    index: usize,
+) -> Result<(), VmNativeCallError> {
+    if index % ITERATOR_INTERRUPT_POLL_INTERVAL == 0 {
+        runtime.check_interrupt()?;
+    }
+    Ok(())
+}
+
 impl IntrinsicInstaller for IteratorIntrinsic {
     fn init(
         &self,
@@ -555,6 +567,7 @@ fn map_iterator_next(
 
     let mut idx = next_index;
     while idx < entries.len() {
+        check_iterator_interrupt(runtime, idx)?;
         if let Some((key, value)) = &entries[idx] {
             let key = *key;
             let value = *value;
@@ -628,6 +641,7 @@ fn set_iterator_next(
 
     let mut idx = next_index;
     while idx < entries.len() {
+        check_iterator_interrupt(runtime, idx)?;
         if let Some(value) = &entries[idx] {
             let value = *value;
             runtime
@@ -904,6 +918,7 @@ fn wrapper_iterator_next(
             create_iter_result_object(mapped, false, runtime)
         }
         KIND_FILTER => loop {
+            runtime.check_interrupt()?;
             let (value, done) = iter_step(source, runtime)?;
             if done {
                 return create_iter_result_object(RegisterValue::undefined(), true, runtime);
@@ -939,6 +954,7 @@ fn wrapper_iterator_next(
                 .unwrap_or(0);
             // Skip `remaining` elements.
             while remaining > 0 {
+                runtime.check_interrupt()?;
                 let (_, done) = iter_step(source, runtime)?;
                 if done {
                     return create_iter_result_object(RegisterValue::undefined(), true, runtime);
@@ -974,6 +990,7 @@ fn wrapper_iterator_next(
             }
             // Pull from source and create new inner iterator.
             loop {
+                runtime.check_interrupt()?;
                 let (value, done) = iter_step(source, runtime)?;
                 if done {
                     return create_iter_result_object(RegisterValue::undefined(), true, runtime);
@@ -1106,6 +1123,7 @@ fn iterator_to_array(
     let handle = require_this_iterator(this, "Iterator.prototype.toArray")?;
     let array = runtime.alloc_array();
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             break;
@@ -1132,6 +1150,7 @@ fn iterator_for_each(
         .unwrap_or_else(RegisterValue::undefined);
     let cb = require_callable(callback, runtime, "Iterator.prototype.forEach")?;
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             break;
@@ -1158,6 +1177,7 @@ fn iterator_some(
         .unwrap_or_else(RegisterValue::undefined);
     let cb = require_callable(callback, runtime, "Iterator.prototype.some")?;
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             return Ok(RegisterValue::from_bool(false));
@@ -1186,6 +1206,7 @@ fn iterator_every(
         .unwrap_or_else(RegisterValue::undefined);
     let cb = require_callable(callback, runtime, "Iterator.prototype.every")?;
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             return Ok(RegisterValue::from_bool(true));
@@ -1214,6 +1235,7 @@ fn iterator_find(
         .unwrap_or_else(RegisterValue::undefined);
     let cb = require_callable(callback, runtime, "Iterator.prototype.find")?;
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             return Ok(RegisterValue::undefined());
@@ -1257,6 +1279,7 @@ fn iterator_reduce(
     };
 
     loop {
+        runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;
         if done {
             return Ok(accumulator);

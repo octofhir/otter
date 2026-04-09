@@ -25,6 +25,7 @@ pub(super) static JSON_INTRINSIC: JsonIntrinsic = JsonIntrinsic;
 pub(super) struct JsonIntrinsic;
 
 const MAX_DEPTH: usize = 512;
+const JSON_INTERRUPT_POLL_INTERVAL: usize = 4096;
 
 impl IntrinsicInstaller for JsonIntrinsic {
     fn init(
@@ -86,6 +87,8 @@ fn json_parse(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    runtime.check_interrupt()?;
+
     let text = args
         .first()
         .copied()
@@ -146,6 +149,7 @@ impl<'de, 'a> DeserializeSeed<'de> for HeapSeed<'a> {
         self,
         deserializer: D,
     ) -> Result<RegisterValue, D::Error> {
+        check_interrupt_de::<D::Error>(self.runtime)?;
         if self.depth > MAX_DEPTH {
             return Err(de::Error::custom("JSON.parse: too deeply nested"));
         }
@@ -221,6 +225,9 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
             runtime: self.runtime,
             depth: self.depth + 1,
         })? {
+            if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+                check_interrupt_de::<A::Error>(self.runtime)?;
+            }
             self.runtime
                 .objects_mut()
                 .set_index(handle, index, elem)
@@ -232,7 +239,11 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<RegisterValue, A::Error> {
         let handle = self.runtime.alloc_object();
+        let mut index = 0usize;
         while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+                check_interrupt_de::<A::Error>(self.runtime)?;
+            }
             let prop = self.runtime.intern_property_name(&key);
             let value = map.next_value_seed(HeapSeed {
                 runtime: self.runtime,
@@ -242,8 +253,17 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
                 .objects_mut()
                 .set_property(handle, prop, value)
                 .map_err(|e| de::Error::custom(format!("{e:?}")))?;
+            index += 1;
         }
         Ok(RegisterValue::from_object_handle(handle.0))
+    }
+}
+
+fn check_interrupt_de<E: de::Error>(runtime: &crate::interpreter::RuntimeState) -> Result<(), E> {
+    if runtime.is_execution_interrupted() {
+        Err(de::Error::custom("execution interrupted"))
+    } else {
+        Ok(())
     }
 }
 
@@ -255,6 +275,7 @@ fn walk_reviver(
     runtime: &mut crate::interpreter::RuntimeState,
     depth: usize,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    runtime.check_interrupt()?;
     if depth > MAX_DEPTH {
         return Ok(RegisterValue::undefined());
     }
@@ -284,6 +305,9 @@ fn walk_reviver(
                     .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
                     .unwrap_or(0);
                 for i in 0..length {
+                    if i % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+                        runtime.check_interrupt()?;
+                    }
                     let idx_str = runtime.alloc_string(i.to_string());
                     let new_val = walk_reviver(
                         obj_handle,
@@ -312,6 +336,7 @@ fn walk_reviver(
                     .own_keys_with_registry(obj_handle, &mut pn_clone)
                     .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
                 for prop_id in keys {
+                    runtime.check_interrupt()?;
                     let prop_name = property_names.get(prop_id).unwrap_or("").to_string();
                     let prop_str = runtime.alloc_string(&*prop_name);
                     let new_val = walk_reviver(
@@ -378,6 +403,8 @@ fn json_stringify(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    runtime.check_interrupt()?;
+
     let value = args
         .first()
         .copied()
@@ -404,6 +431,9 @@ fn json_stringify(
                 let len = runtime.objects().array_length(h).ok()?.unwrap_or(0);
                 let mut list = Vec::with_capacity(len);
                 for i in 0..len {
+                    if i % JSON_INTERRUPT_POLL_INTERVAL == 0 && runtime.is_execution_interrupted() {
+                        return None;
+                    }
                     if let Ok(Some(v)) = runtime.get_array_index_value(h, i)
                         && let Ok(s) = runtime.js_to_string(v)
                     {
@@ -475,6 +505,8 @@ fn stringify_value(
     runtime: &mut crate::interpreter::RuntimeState,
     depth: usize,
 ) -> Result<bool, VmNativeCallError> {
+    runtime.check_interrupt()?;
+
     if depth > MAX_DEPTH {
         out.push_str("null");
         return Ok(true);
@@ -595,6 +627,9 @@ fn stringify_array(
 
     let mut first = true;
     for i in 0..length {
+        if i % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+            runtime.check_interrupt()?;
+        }
         if !first {
             out.push(',');
         }
@@ -724,6 +759,8 @@ fn stringify_object(
 
     let mut first = true;
     for (prop_name, val) in entries {
+        runtime.check_interrupt()?;
+
         let val = if let Some(replacer) = replacer_fn {
             let key_str = runtime.alloc_string(&*prop_name);
             let holder = RegisterValue::from_object_handle(handle.0);

@@ -192,6 +192,7 @@ fn parse_headers_sequence(
     let values = runtime.array_to_args(handle)?;
     let mut entries = Vec::with_capacity(values.len());
     for value in values {
+        runtime.check_interrupt()?;
         let tuple = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
             type_error(
                 runtime,
@@ -225,6 +226,7 @@ fn parse_headers_record(
 ) -> Result<Vec<(String, String)>, VmNativeCallError> {
     let mut entries = Vec::new();
     for key in runtime.enumerable_own_property_keys(handle)? {
+        runtime.check_interrupt()?;
         let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
             continue;
         };

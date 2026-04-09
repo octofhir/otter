@@ -161,7 +161,7 @@ pub fn execute_module_graph(
     }
 
     // Phase 3: Evaluate in topological order.
-    let interpreter = crate::Interpreter::new();
+    let interpreter = crate::Interpreter::for_runtime(runtime);
     for url in &topo_order {
         evaluate_module(url, &interpreter, runtime, registry)?;
     }

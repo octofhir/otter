@@ -97,7 +97,38 @@ pub struct OtterRuntime {
     /// keeps re-enqueueing microtasks (e.g. async iterator + yield*
     /// loops) can be cut off by the watchdog instead of running
     /// forever at 100% CPU.
-    current_interrupt: Option<Arc<AtomicBool>>,
+    current_interrupt: Option<Arc<RunInterrupt>>,
+}
+
+struct RunInterrupt {
+    flag: Arc<AtomicBool>,
+    vm_thread: Thread,
+}
+
+impl RunInterrupt {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            vm_thread: std::thread::current(),
+        }
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.flag.clone()
+    }
+
+    fn flag_ptr(&self) -> *const u8 {
+        Arc::as_ptr(&self.flag).cast::<u8>()
+    }
+
+    fn interrupted(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    fn fire(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.vm_thread.unpark();
+    }
 }
 
 impl Drop for OtterRuntime {
@@ -191,22 +222,26 @@ impl OtterRuntime {
         // Set up timeout interrupt if configured, and attach the shared OOM
         // signal so the interpreter raises a catchable RangeError when the
         // configured heap cap is exceeded.
-        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let interrupt = Arc::new(RunInterrupt::new());
+        let interrupt_flag = interrupt.flag();
         let oom_flag = self.state.oom_flag();
         let interpreter = Interpreter::new()
             .with_interrupt_flag(interrupt_flag.clone())
             .with_oom_flag(oom_flag);
         let _interrupt_guard = self
             .timeout
-            .map(|timeout| TimeoutGuard::arm(interrupt_flag.clone(), timeout));
-        let interrupt_ptr = Arc::as_ptr(&interrupt_flag).cast::<u8>();
+            .map(|timeout| TimeoutGuard::arm(interrupt.clone(), timeout));
+        let interrupt_ptr = interrupt.flag_ptr();
         // Publish the flag so `drain_microtasks` and `run_event_loop`
         // can poll it; cleared at the end of this call so the next
         // `run_module` invocation gets a fresh one.
-        self.current_interrupt = Some(interrupt_flag.clone());
+        self.current_interrupt = Some(interrupt.clone());
 
         let run_result =
             (|| -> Result<ExecutionResult, otter_vm::interpreter::InterpreterError> {
+                self.state
+                    .set_active_interrupt_flag(Some(interrupt_flag.clone()));
+
                 // 1. Execute top-level code.
                 let result = match execute_module_entry_with_runtime(
                     module,
@@ -231,6 +266,7 @@ impl OtterRuntime {
         // fresh one (and `drain_microtasks` from outside `run_module`
         // — there is none today, but be defensive — sees None).
         self.current_interrupt = None;
+        self.state.set_active_interrupt_flag(None);
 
         match run_result {
             Ok(result) => Ok(result),
@@ -337,7 +373,7 @@ impl OtterRuntime {
     fn interrupted(&self) -> bool {
         self.current_interrupt
             .as_ref()
-            .map(|flag| flag.load(Ordering::Acquire))
+            .map(|interrupt| interrupt.interrupted())
             .unwrap_or(false)
     }
 
@@ -504,13 +540,13 @@ impl OtterRuntime {
                     let timeout = self.state.timers().next_deadline().map(|deadline| {
                         deadline.saturating_duration_since(std::time::Instant::now())
                     });
-                    let interrupt_flag = self.current_interrupt.clone();
+                    let interrupt = self.current_interrupt.clone();
                     if self
                         .state
                         .wait_for_host_callbacks_interruptible(timeout, || {
-                            interrupt_flag
+                            interrupt
                                 .as_ref()
-                                .map(|flag| flag.load(Ordering::Acquire))
+                                .map(|interrupt| interrupt.interrupted())
                                 .unwrap_or(false)
                         })
                     {
@@ -558,13 +594,12 @@ struct TimeoutGuard {
 }
 
 impl TimeoutGuard {
-    fn arm(flag: Arc<AtomicBool>, timeout: Duration) -> Self {
+    fn arm(interrupt: Arc<RunInterrupt>, timeout: Duration) -> Self {
         let deadline = std::time::Instant::now() + timeout;
         let entry = Arc::new(TimeoutEntry {
             deadline,
             cancelled: AtomicBool::new(false),
-            flag,
-            thread: std::thread::current(),
+            interrupt,
         });
         timeout_watchdog().enqueue(entry.clone());
         Self { entry: Some(entry) }
@@ -585,8 +620,7 @@ impl Drop for TimeoutGuard {
 struct TimeoutEntry {
     deadline: std::time::Instant,
     cancelled: AtomicBool,
-    flag: Arc<AtomicBool>,
-    thread: Thread,
+    interrupt: Arc<RunInterrupt>,
 }
 
 /// Min-heap ordering: earliest deadline first.
@@ -666,8 +700,7 @@ fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
             if now >= top.deadline {
                 heap.pop();
                 if !top.cancelled.load(Ordering::Acquire) {
-                    top.flag.store(true, Ordering::Release);
-                    top.thread.unpark();
+                    top.interrupt.fire();
                 }
                 continue;
             }
@@ -691,7 +724,8 @@ fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
 mod tests {
     use super::*;
     use otter_vm::console::CaptureConsoleBackend;
-    use otter_vm::interpreter::InterpreterError;
+    use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
+    use otter_vm::interpreter::{InterpreterError, RuntimeState};
     use otter_vm::value::RegisterValue;
     use std::sync::Arc;
     use std::time::Duration;
@@ -726,6 +760,20 @@ mod tests {
         }
         fn error(&self, msg: &str) {
             self.0.error(msg);
+        }
+    }
+
+    fn cooperative_native_spin(
+        _this: &RegisterValue,
+        _args: &[RegisterValue],
+        runtime: &mut RuntimeState,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let mut iterations = 0u64;
+        loop {
+            if iterations % 4096 == 0 {
+                runtime.check_interrupt()?;
+            }
+            iterations = iterations.wrapping_add(1);
         }
     }
 
@@ -2361,6 +2409,22 @@ mod tests {
     }
 
     #[test]
+    fn timeout_interrupts_js_loop_inside_promise_handler() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let error = rt
+            .run_script(
+                "Promise.resolve().then(function() { while (true) {} });",
+                "promise-handler-infinite-loop.js",
+            )
+            .expect_err("JS loop in promise handler should time out");
+
+        assert_runtime_interrupted(error);
+    }
+
+    #[test]
     fn timeout_interrupts_await_local_microtask_spin() {
         let mut rt = OtterRuntime::builder()
             .timeout(Duration::from_millis(20))
@@ -2419,6 +2483,121 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timer sleep should wake promptly on timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_interrupts_js_loop_inside_timer_callback() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let error = rt
+            .run_script(
+                "setTimeout(function() { while (true) {} }, 0);",
+                "timer-callback-infinite-loop.js",
+            )
+            .expect_err("JS loop in timer callback should time out");
+
+        assert_runtime_interrupted(error);
+    }
+
+    #[test]
+    fn timeout_interrupts_cooperative_native_loop() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+        rt.state_mut()
+            .install_native_global(NativeFunctionDescriptor::method(
+                "nativeSpin",
+                0,
+                cooperative_native_spin,
+            ));
+
+        let started = std::time::Instant::now();
+        let error = rt
+            .run_script("nativeSpin();", "cooperative-native-spin.js")
+            .expect_err("cooperative native loop should time out");
+
+        assert_runtime_interrupted(error);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "native cooperative loop should observe timeout promptly"
+        );
+    }
+
+    #[test]
+    fn timeout_interrupts_array_like_native_scan() {
+        let mut rt = OtterRuntime::builder()
+            .timeout(Duration::from_millis(20))
+            .build();
+
+        let started = std::time::Instant::now();
+        let error = rt
+            .run_script(
+                concat!(
+                    "const a = { length: 16777216 };\n",
+                    "Array.prototype.includes.call(a, 1);\n",
+                ),
+                "array-like-native-scan.js",
+            )
+            .expect_err("array-like native scan should time out");
+
+        assert_runtime_interrupted(error);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "native array scan should observe timeout promptly"
+        );
+    }
+
+    #[test]
+    fn runtime_can_run_again_after_timeout() {
+        let (mut rt, capture) = {
+            let capture = Arc::new(CaptureConsoleBackend::new());
+            let rt = OtterRuntime::builder()
+                .timeout(Duration::from_millis(200))
+                .console(CaptureForTest(capture.clone()))
+                .build();
+            (rt, capture)
+        };
+
+        let error = rt
+            .run_script("while (true) {}", "first-times-out.js")
+            .expect_err("first run should time out");
+        assert_runtime_interrupted(error);
+
+        rt.run_script("console.log('second run ok');", "second-run.js")
+            .expect("fresh run must not observe stale interrupt");
+        assert_eq!(capture.text(), "second run ok");
+    }
+
+    #[test]
+    fn host_callback_wakes_event_loop_before_timeout() {
+        let (mut rt, capture) = {
+            let capture = Arc::new(CaptureConsoleBackend::new());
+            let rt = OtterRuntime::builder()
+                .timeout(Duration::from_secs(2))
+                .console(CaptureForTest(capture.clone()))
+                .build();
+            (rt, capture)
+        };
+        let reservation = rt.state().host_callback_sender().reserve();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = reservation.enqueue(|runtime| {
+                runtime.console().log("host callback fired");
+            });
+        });
+
+        let started = std::time::Instant::now();
+        rt.run_script("1 + 1;", "host-callback-wake.js")
+            .expect("host callback should wake event loop before timeout");
+
+        assert_eq!(capture.text(), "host callback fired");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "host callback should wake promptly"
         );
     }
 }

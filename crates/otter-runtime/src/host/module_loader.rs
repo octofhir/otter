@@ -2,6 +2,9 @@ use oxc_resolver::{ResolveOptions, Resolver};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+const REMOTE_MODULE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Module loader configuration for hosted entry resolution and loading.
 #[derive(Debug, Clone)]
@@ -345,7 +348,17 @@ impl ModuleLoader {
             });
         }
 
-        let response = reqwest::blocking::get(url)
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(REMOTE_MODULE_HTTP_TIMEOUT)
+            .timeout(REMOTE_MODULE_HTTP_TIMEOUT)
+            .build()
+            .map_err(|error| {
+                ModuleLoaderError::Load(format!("failed to initialize HTTP module loader: {error}"))
+            })?;
+
+        let response = client
+            .get(url)
+            .send()
             .and_then(|response| response.error_for_status())
             .map_err(|error| {
                 ModuleLoaderError::Load(format!("failed to fetch '{url}': {error}"))

@@ -6,6 +6,52 @@ use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use crate::interpreter::RuntimeState;
 use crate::value::RegisterValue;
 
+const URI_INTERRUPT_POLL_INTERVAL: usize = 4096;
+
+#[derive(Debug)]
+enum UriCodecError {
+    Uri(String),
+    Interrupted,
+}
+
+impl From<String> for UriCodecError {
+    fn from(message: String) -> Self {
+        Self::Uri(message)
+    }
+}
+
+impl From<&'static str> for UriCodecError {
+    fn from(message: &'static str) -> Self {
+        Self::Uri(message.into())
+    }
+}
+
+fn poll_uri_interrupt(runtime: Option<&RuntimeState>, index: usize) -> Result<(), UriCodecError> {
+    if index % URI_INTERRUPT_POLL_INTERVAL == 0
+        && runtime.is_some_and(RuntimeState::is_execution_interrupted)
+    {
+        return Err(UriCodecError::Interrupted);
+    }
+    Ok(())
+}
+
+fn uri_codec_result(
+    runtime: &mut RuntimeState,
+    result: Result<String, UriCodecError>,
+) -> Result<RegisterValue, VmNativeCallError> {
+    match result {
+        Ok(output) => {
+            let handle = runtime.alloc_string(output);
+            Ok(RegisterValue::from_object_handle(handle.0))
+        }
+        Err(UriCodecError::Uri(message)) => Err(uri_error(runtime, &message)),
+        Err(UriCodecError::Interrupted) => {
+            runtime.check_interrupt()?;
+            Err(VmNativeCallError::Internal("execution interrupted".into()))
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  §19.2.1 eval(x)
 //  Spec: <https://tc39.es/ecma262/#sec-eval-x>
@@ -65,16 +111,10 @@ fn global_encode_uri(
     const URI_UNESCAPED_RESERVED: &str =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'();/?:@&=+$,#";
 
-    match encode_uri_component_impl(&s, URI_UNESCAPED_RESERVED) {
-        Ok(encoded) => {
-            let handle = runtime.alloc_string(encoded);
-            Ok(RegisterValue::from_object_handle(handle.0))
-        }
-        Err(msg) => {
-            let err = uri_error(runtime, &msg);
-            Err(err)
-        }
-    }
+    uri_codec_result(
+        runtime,
+        encode_uri_component_impl(&s, URI_UNESCAPED_RESERVED, Some(runtime)),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -103,16 +143,10 @@ fn global_encode_uri_component(
     const URI_UNRESERVED: &str =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
 
-    match encode_uri_component_impl(&s, URI_UNRESERVED) {
-        Ok(encoded) => {
-            let handle = runtime.alloc_string(encoded);
-            Ok(RegisterValue::from_object_handle(handle.0))
-        }
-        Err(msg) => {
-            let err = uri_error(runtime, &msg);
-            Err(err)
-        }
-    }
+    uri_codec_result(
+        runtime,
+        encode_uri_component_impl(&s, URI_UNRESERVED, Some(runtime)),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -141,16 +175,10 @@ fn global_decode_uri(
     // Characters whose escapes should NOT be decoded (URI reserved set).
     const RESERVED_URI_SET: &str = ";/?:@&=+$,#";
 
-    match decode_uri_impl(&s, RESERVED_URI_SET) {
-        Ok(decoded) => {
-            let handle = runtime.alloc_string(decoded);
-            Ok(RegisterValue::from_object_handle(handle.0))
-        }
-        Err(msg) => {
-            let err = uri_error(runtime, &msg);
-            Err(err)
-        }
-    }
+    uri_codec_result(
+        runtime,
+        decode_uri_impl(&s, RESERVED_URI_SET, Some(runtime)),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -177,16 +205,7 @@ fn global_decode_uri_component(
         .map_err(|e| VmNativeCallError::Internal(format!("decodeURIComponent: {e}").into()))?;
 
     // No reserved set — decode everything.
-    match decode_uri_impl(&s, "") {
-        Ok(decoded) => {
-            let handle = runtime.alloc_string(decoded);
-            Ok(RegisterValue::from_object_handle(handle.0))
-        }
-        Err(msg) => {
-            let err = uri_error(runtime, &msg);
-            Err(err)
-        }
-    }
+    uri_codec_result(runtime, decode_uri_impl(&s, "", Some(runtime)))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -199,9 +218,14 @@ fn global_decode_uri_component(
 /// Handles surrogate pairs per the spec.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-encode>
-fn encode_uri_component_impl(s: &str, unescaped_set: &str) -> Result<String, String> {
+fn encode_uri_component_impl(
+    s: &str,
+    unescaped_set: &str,
+    runtime: Option<&RuntimeState>,
+) -> Result<String, UriCodecError> {
     let mut result = String::with_capacity(s.len());
-    for ch in s.chars() {
+    for (index, ch) in s.chars().enumerate() {
+        poll_uri_interrupt(runtime, index)?;
         if unescaped_set.contains(ch) {
             result.push(ch);
         } else {
@@ -224,13 +248,18 @@ fn encode_uri_component_impl(s: &str, unescaped_set: &str) -> Result<String, Str
 /// in `reserved_set` are left as-is.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-decode>
-fn decode_uri_impl(s: &str, reserved_set: &str) -> Result<String, String> {
+fn decode_uri_impl(
+    s: &str,
+    reserved_set: &str,
+    runtime: Option<&RuntimeState>,
+) -> Result<String, UriCodecError> {
     let bytes = s.as_bytes();
     let len = bytes.len();
     let mut result = String::with_capacity(len);
     let mut i = 0;
 
     while i < len {
+        poll_uri_interrupt(runtime, i)?;
         if bytes[i] == b'%' {
             // Decode one or more percent-encoded bytes.
             let start = i;
@@ -265,11 +294,11 @@ fn decode_uri_impl(s: &str, reserved_set: &str) -> Result<String, String> {
                     i += 3;
                 }
                 let decoded = std::str::from_utf8(&utf8_bytes)
-                    .map_err(|_| "URIError: malformed URI sequence".to_string())?;
+                    .map_err(|_| UriCodecError::Uri("URIError: malformed URI sequence".into()))?;
                 let ch = decoded
                     .chars()
                     .next()
-                    .ok_or_else(|| "URIError: malformed URI sequence".to_string())?;
+                    .ok_or("URIError: malformed URI sequence")?;
                 if reserved_set.contains(ch) {
                     result.push_str(&s[start..i]);
                 } else {
@@ -285,7 +314,7 @@ fn decode_uri_impl(s: &str, reserved_set: &str) -> Result<String, String> {
     Ok(result)
 }
 
-fn decode_hex_pair(bytes: &[u8], start: usize, len: usize) -> Result<u8, String> {
+fn decode_hex_pair(bytes: &[u8], start: usize, len: usize) -> Result<u8, UriCodecError> {
     if start + 1 >= len {
         return Err("URIError: malformed URI sequence".into());
     }
@@ -349,56 +378,56 @@ mod tests {
     fn encode_uri_basic() {
         let unescaped =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'();/?:@&=+$,#";
-        let result = encode_uri_component_impl("hello world", unescaped).unwrap();
+        let result = encode_uri_component_impl("hello world", unescaped, None).unwrap();
         assert_eq!(result, "hello%20world");
     }
 
     #[test]
     fn encode_uri_component_basic() {
         let unescaped = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
-        let result = encode_uri_component_impl("hello world&foo=bar", unescaped).unwrap();
+        let result = encode_uri_component_impl("hello world&foo=bar", unescaped, None).unwrap();
         assert_eq!(result, "hello%20world%26foo%3Dbar");
     }
 
     #[test]
     fn decode_uri_basic() {
-        let result = decode_uri_impl("hello%20world", "").unwrap();
+        let result = decode_uri_impl("hello%20world", "", None).unwrap();
         assert_eq!(result, "hello world");
     }
 
     #[test]
     fn decode_uri_preserves_reserved() {
         // decodeURI should NOT decode reserved characters like #
-        let result = decode_uri_impl("hello%23world", ";/?:@&=+$,#").unwrap();
+        let result = decode_uri_impl("hello%23world", ";/?:@&=+$,#", None).unwrap();
         assert_eq!(result, "hello%23world");
     }
 
     #[test]
     fn decode_uri_component_decodes_reserved() {
         // decodeURIComponent decodes everything
-        let result = decode_uri_impl("hello%23world", "").unwrap();
+        let result = decode_uri_impl("hello%23world", "", None).unwrap();
         assert_eq!(result, "hello#world");
     }
 
     #[test]
     fn decode_uri_multibyte_utf8() {
-        let result = decode_uri_impl("%C3%A9", "").unwrap();
+        let result = decode_uri_impl("%C3%A9", "", None).unwrap();
         assert_eq!(result, "é");
     }
 
     #[test]
     fn decode_uri_malformed() {
-        assert!(decode_uri_impl("%G0", "").is_err());
-        assert!(decode_uri_impl("%", "").is_err());
-        assert!(decode_uri_impl("%0", "").is_err());
+        assert!(decode_uri_impl("%G0", "", None).is_err());
+        assert!(decode_uri_impl("%", "", None).is_err());
+        assert!(decode_uri_impl("%0", "", None).is_err());
     }
 
     #[test]
     fn encode_decode_roundtrip() {
         let unescaped = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
         let original = "こんにちは世界 hello=world&foo";
-        let encoded = encode_uri_component_impl(original, unescaped).unwrap();
-        let decoded = decode_uri_impl(&encoded, "").unwrap();
+        let encoded = encode_uri_component_impl(original, unescaped, None).unwrap();
+        let decoded = decode_uri_impl(&encoded, "", None).unwrap();
         assert_eq!(decoded, original);
     }
 }

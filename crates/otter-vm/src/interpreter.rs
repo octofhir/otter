@@ -34,6 +34,7 @@ const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
 const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
 const ERROR_DATA_SLOT: &str = "__otter_error_data__";
+const EXECUTION_INTERRUPTED_MESSAGE: &str = "execution interrupted";
 
 /// Errors produced by the new interpreter.
 #[derive(Debug, Clone, PartialEq)]
@@ -587,6 +588,9 @@ pub struct RuntimeState {
     /// `None` once consumed; populated lazily and cleared by the next
     /// `take_pending_uncaught_throw` call.
     pending_uncaught_throw: Option<RegisterValue>,
+    /// Per-host-run interrupt signal inherited by JS callbacks entered from
+    /// microtasks, timers, host callbacks, accessors, and promise handlers.
+    active_interrupt_flag: Option<Arc<AtomicBool>>,
 }
 
 impl RuntimeState {
@@ -643,6 +647,7 @@ impl RuntimeState {
             next_class_id: 1,
             pending_delegation_iterator: None,
             pending_uncaught_throw: None,
+            active_interrupt_flag: None,
         }
     }
 
@@ -689,6 +694,39 @@ impl RuntimeState {
     /// subsequent script.
     pub fn clear_oom_flag(&self) {
         self.objects.clear_oom_flag();
+    }
+
+    /// Publishes the host-run interrupt flag to VM re-entry paths.
+    pub fn set_active_interrupt_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.active_interrupt_flag = flag;
+    }
+
+    /// Returns the active host-run interrupt flag, if this runtime is inside
+    /// an interruptible run.
+    pub fn active_interrupt_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.active_interrupt_flag.clone()
+    }
+
+    /// Returns true once the active host run has been interrupted, normally
+    /// by the timeout watchdog.
+    #[must_use]
+    pub fn is_execution_interrupted(&self) -> bool {
+        self.active_interrupt_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Cooperative interrupt poll for native Rust entrypoints. Long native
+    /// loops should call this periodically; the host-call boundary promotes
+    /// this internal sentinel back to `InterpreterError::Interrupted`.
+    pub fn check_interrupt(&self) -> Result<(), VmNativeCallError> {
+        if self.is_execution_interrupted() {
+            Err(VmNativeCallError::Internal(
+                EXECUTION_INTERRUPTED_MESSAGE.into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `Err(OutOfMemory)` if the object heap has signalled that the
@@ -3137,6 +3175,8 @@ impl RuntimeState {
         receiver: RegisterValue,
         arguments: &[RegisterValue],
     ) -> Result<RegisterValue, VmNativeCallError> {
+        self.check_interrupt()?;
+
         let Some(callable) = callable else {
             return Ok(RegisterValue::undefined());
         };
@@ -3241,6 +3281,7 @@ impl RuntimeState {
         self.native_callee_stack.push(callable);
         let result = (descriptor.callback())(&receiver, arguments, self);
         self.native_callee_stack.pop();
+        self.check_interrupt()?;
         match result {
             Ok(value) => Ok(value),
             Err(VmNativeCallError::Thrown(value)) => Err(VmNativeCallError::Thrown(value)),
@@ -3521,7 +3562,7 @@ impl RuntimeState {
                     activation.overflow_args = arguments[param_count as usize..].to_vec();
                 }
 
-                let completion = Interpreter::new()
+                let completion = Interpreter::for_runtime(self)
                     .run_completion_with_runtime(&module, &mut activation, self)
                     .map_err(|error| match error {
                         InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
@@ -4976,7 +5017,7 @@ impl RuntimeState {
         })?;
 
         // §19.2.1.1 Step 16-25: Evaluate the parsed script.
-        let interpreter = Interpreter::new();
+        let interpreter = Interpreter::for_runtime(self);
         let result = interpreter
             .execute_module(&module, self)
             .map_err(|e| match e {
@@ -5118,6 +5159,18 @@ impl Interpreter {
         }
     }
 
+    /// Creates an interpreter configured with the runtime's active interrupt
+    /// and OOM signals. Use this for every JS re-entry from runtime/native
+    /// code instead of constructing an uninterruptible interpreter.
+    #[must_use]
+    pub fn for_runtime(runtime: &RuntimeState) -> Self {
+        let mut interpreter = Self::new().with_oom_flag(runtime.oom_flag());
+        if let Some(flag) = runtime.active_interrupt_flag() {
+            interpreter = interpreter.with_interrupt_flag(flag);
+        }
+        interpreter
+    }
+
     /// Checks the interrupt and OOM flags; returns an error if either is set.
     /// The OOM check is evaluated after the interrupt check so that a script
     /// receiving both signals (e.g. OOM inside a timeout-interrupted loop)
@@ -5251,7 +5304,7 @@ impl Interpreter {
                     // execute the body, and settle the promise on completion.
                     Self::execute_async_function_body(runtime, &module, &mut activation)
                 } else {
-                    let interpreter = Interpreter::new();
+                    let interpreter = Interpreter::for_runtime(runtime);
                     let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
                     Ok(result.return_value())
                 }
@@ -5325,7 +5378,7 @@ impl Interpreter {
         };
 
         // §27.7.5.1 step 4: Execute the async function body.
-        let interpreter = Interpreter::new();
+        let interpreter = Interpreter::for_runtime(runtime);
         let result = interpreter.run_completion_with_runtime(module, activation, runtime);
 
         match result {
@@ -9562,6 +9615,10 @@ impl Interpreter {
             .cloned()
             .ok_or(InterpreterError::InvalidCallTarget)?;
 
+        runtime
+            .check_interrupt()
+            .map_err(|_| InterpreterError::Interrupted)?;
+
         // §9.4 Execution Contexts — the "running execution context" belongs
         // to the callee's realm for the duration of the call, so host
         // functions see `runtime.current_realm` = their own realm.
@@ -9572,11 +9629,20 @@ impl Interpreter {
         let completion = match (descriptor.callback())(&receiver, arguments, runtime) {
             Ok(value) => Ok(Completion::Return(value)),
             Err(VmNativeCallError::Thrown(value)) => Ok(Completion::Throw(value)),
+            Err(VmNativeCallError::Internal(message))
+                if runtime.is_execution_interrupted()
+                    && message.as_ref() == EXECUTION_INTERRUPTED_MESSAGE =>
+            {
+                Err(InterpreterError::Interrupted)
+            }
             Err(VmNativeCallError::Internal(message)) => Err(InterpreterError::NativeCall(message)),
         };
         runtime.native_callee_stack.pop();
         runtime.native_call_construct_stack.pop();
         runtime.current_realm = saved_realm;
+        if completion.is_ok() && runtime.is_execution_interrupted() {
+            return Err(InterpreterError::Interrupted);
+        }
         completion
     }
 
@@ -9861,7 +9927,7 @@ impl Interpreter {
             }
         };
 
-        let interp = Interpreter::new();
+        let interp = Interpreter::for_runtime(runtime);
         let previous_module = runtime.enter_module(&module);
 
         // §14.4.4 — Check for active yield* delegation before entering the execution loop.
@@ -10213,7 +10279,7 @@ impl Interpreter {
             }
         };
 
-        let interp = Interpreter::new();
+        let interp = Interpreter::for_runtime(runtime);
         let previous_module = runtime.enter_module(&module);
 
         // §14.4.4 — Check for active yield* delegation before entering the execution loop.

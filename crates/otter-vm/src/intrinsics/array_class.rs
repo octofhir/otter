@@ -441,7 +441,7 @@ fn array_join(
     let mut parts: Vec<String> = safe_with_capacity(length);
     for index in 0..length {
         if index % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.join")?;
         let part = match value {
@@ -473,6 +473,14 @@ const WITH_CAPACITY_CAP: usize = 64 * 1024;
 /// interpreter can surface a `RangeError` without waiting for the next GC
 /// safepoint.
 const OOM_POLL_INTERVAL: usize = 4096;
+
+#[inline]
+fn check_native_loop(
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<(), VmNativeCallError> {
+    runtime.check_interrupt()?;
+    runtime.check_oom()
+}
 
 /// Capped variant of `Vec::with_capacity` that never reserves more than
 /// [`WITH_CAPACITY_CAP`] elements up front. Prevents a single pathological
@@ -516,12 +524,17 @@ fn array_index_of(
     };
 
     for index in start..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.indexOf")?
         else {
             continue;
         };
         let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
-            .map_err(|e| VmNativeCallError::Internal(format!("indexOf compare failed: {e:?}").into()))?;
+            .map_err(|e| {
+                VmNativeCallError::Internal(format!("indexOf compare failed: {e:?}").into())
+            })?;
         if equal {
             return Ok(RegisterValue::from_i32(index as i32));
         }
@@ -581,6 +594,9 @@ fn array_concat(
         match plan {
             Some((handle, len)) => {
                 for offset in 0..len {
+                    if offset % OOM_POLL_INTERVAL == 0 {
+                        check_native_loop(runtime)?;
+                    }
                     // Spec: HasProperty + Get. Missing slots become holes.
                     if let Some(elem) =
                         array_index_value(handle, offset, runtime, "Array.prototype.concat")?
@@ -692,6 +708,9 @@ fn array_slice(
     let count = end.saturating_sub(start);
     runtime.objects_mut().set_array_length(result, count).ok();
     for (offset, index) in (start..end).enumerate() {
+        if offset % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         if let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.slice")? {
             runtime.objects_mut().set_index(result, offset, elem).ok();
         }
@@ -967,6 +986,9 @@ fn array_map(
     runtime.objects_mut().set_array_length(result, length).ok();
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.map")?
         else {
             continue; // hole — skip
@@ -996,6 +1018,9 @@ fn array_filter(
     let mut to = 0usize;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.filter")?
         else {
             continue;
@@ -1028,6 +1053,9 @@ fn array_for_each(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.forEach")?;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.forEach")?
         else {
             continue;
@@ -1070,6 +1098,9 @@ fn array_reduce(
         accumulator = RegisterValue::undefined();
         start = 0;
         for index in 0..length {
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             if let Some(value) =
                 array_index_value(receiver, index, runtime, "Array.prototype.reduce")?
             {
@@ -1088,6 +1119,9 @@ fn array_reduce(
     }
 
     for index in start..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.reduce")?
         else {
             continue;
@@ -1118,6 +1152,9 @@ fn array_find(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.find")?;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.find")?
             .unwrap_or_else(RegisterValue::undefined);
         let test_result = runtime.call_callable(
@@ -1147,6 +1184,9 @@ fn array_find_index(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findIndex")?;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findIndex")?
             .unwrap_or_else(RegisterValue::undefined);
         let test_result = runtime.call_callable(
@@ -1176,6 +1216,9 @@ fn array_some(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.some")?;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.some")?
         else {
             continue;
@@ -1207,6 +1250,9 @@ fn array_every(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.every")?;
 
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.every")?
         else {
             continue;
@@ -1252,6 +1298,9 @@ fn array_includes(
     };
 
     for index in start..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.includes")?
             .unwrap_or_else(RegisterValue::undefined);
         // SameValueZero comparison.
@@ -1307,7 +1356,7 @@ fn array_fill(
     // with a catchable `RangeError`.
     for index in start..end {
         if index % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         if let Err(err) = runtime.objects_mut().set_index(receiver, index, value) {
             return Err(object_error_to_vm_error(runtime, err));
@@ -1329,6 +1378,9 @@ fn array_reverse(
     let mut lower = 0usize;
     let mut upper = length.saturating_sub(1);
     while lower < upper {
+        if lower % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let lower_val = array_index_value(receiver, lower, runtime, "Array.prototype.reverse")?;
         let upper_val = array_index_value(receiver, upper, runtime, "Array.prototype.reverse")?;
         match (lower_val, upper_val) {
@@ -1399,6 +1451,9 @@ fn array_shift(
         .unwrap_or_else(RegisterValue::undefined);
     // Shift elements left.
     for index in 1..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         if let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.shift")? {
             runtime
                 .objects_mut()
@@ -1426,6 +1481,9 @@ fn array_unshift(
     if arg_count > 0 {
         // Shift existing elements right by arg_count.
         for index in (0..length).rev() {
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             if let Some(value) =
                 array_index_value(receiver, index, runtime, "Array.prototype.unshift")?
             {
@@ -1479,6 +1537,9 @@ fn array_splice(
     // Build deleted elements array.
     let deleted = runtime.alloc_array();
     for offset in 0..delete_count {
+        if offset % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         if let Some(value) = array_index_value(
             receiver,
             actual_start + offset,
@@ -1496,6 +1557,9 @@ fn array_splice(
         // Shrinking: shift elements left.
         let shift = delete_count - item_count;
         for index in (actual_start + delete_count)..current_len {
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             if let Some(value) =
                 array_index_value(receiver, index, runtime, "Array.prototype.splice")?
             {
@@ -1518,6 +1582,9 @@ fn array_splice(
             .set_array_length(receiver, new_len)
             .ok();
         for index in (actual_start + delete_count..current_len).rev() {
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             if let Some(value) =
                 array_index_value(receiver, index, runtime, "Array.prototype.splice")?
             {
@@ -1575,14 +1642,14 @@ fn array_last_index_of(
     let mut index = start;
     while index >= 0 {
         let i = index as usize;
-        if let Some(elem) =
-            array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
+        if i % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
+        if let Some(elem) = array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
         {
             let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
                 .map_err(|e| {
-                    VmNativeCallError::Internal(
-                        format!("lastIndexOf compare failed: {e:?}").into(),
-                    )
+                    VmNativeCallError::Internal(format!("lastIndexOf compare failed: {e:?}").into())
                 })?;
             if equal {
                 return Ok(RegisterValue::from_i32(index));
@@ -1632,6 +1699,9 @@ fn array_from(
         let result = runtime.alloc_array();
         runtime.objects_mut().set_array_length(result, length).ok();
         for index in 0..length {
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             let value = array_index_value(source_handle, index, runtime, "Array.from")?
                 .unwrap_or_else(RegisterValue::undefined);
             let mapped = if let Some(callback) = map_fn {
@@ -1658,6 +1728,9 @@ fn array_from(
     let result = runtime.alloc_array();
     runtime.objects_mut().set_array_length(result, length).ok();
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let idx_prop = runtime.intern_property_name(&index.to_string());
         let value = runtime
             .ordinary_get(source_handle, idx_prop, items)
@@ -1760,7 +1833,7 @@ fn array_sort(
     let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for index in 0..length {
         if index % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         if let Some(v) = array_index_value(receiver, index, runtime, "Array.prototype.sort")? {
             items.push(v);
@@ -1769,9 +1842,15 @@ fn array_sort(
 
     // Sort with a simple insertion sort (stable, handles comparefn errors).
     for i in 1..items.len() {
+        if i % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let key = items[i];
         let mut j = i;
         while j > 0 {
+            if j % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             let cmp = sort_compare(items[j - 1], key, comparefn, runtime)?;
             if cmp <= 0.0 {
                 break;
@@ -1784,10 +1863,16 @@ fn array_sort(
 
     // Write back sorted items, then holes.
     for (index, value) in items.iter().copied().enumerate() {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         runtime.objects_mut().set_index(receiver, index, value).ok();
     }
     // Clear remaining slots (holes).
     for index in items.len()..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let prop = runtime.intern_property_name(&index.to_string());
         let names = runtime.property_names().clone();
         runtime
@@ -1867,12 +1952,13 @@ fn array_reduce_right(
         accumulator = RegisterValue::undefined();
         start = length as i64 - 1;
         while start >= 0 {
-            if let Some(value) = array_index_value(
-                receiver,
-                start as usize,
-                runtime,
-                "Array.prototype.reduceRight",
-            )? {
+            let index = start as usize;
+            if index % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
+            if let Some(value) =
+                array_index_value(receiver, index, runtime, "Array.prototype.reduceRight")?
+            {
                 accumulator = value;
                 start -= 1;
                 found = true;
@@ -1890,6 +1976,9 @@ fn array_reduce_right(
 
     while start >= 0 {
         let index = start as usize;
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         if let Some(value) =
             array_index_value(receiver, index, runtime, "Array.prototype.reduceRight")?
         {
@@ -1921,6 +2010,9 @@ fn array_find_last(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findLast")?;
 
     for index in (0..length).rev() {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findLast")?
             .unwrap_or_else(RegisterValue::undefined);
         let test_result = runtime.call_callable(
@@ -1950,6 +2042,9 @@ fn array_find_last_index(
         callback_and_this_arg(args, runtime, "Array.prototype.findLastIndex")?;
 
     for index in (0..length).rev() {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findLastIndex")?
             .unwrap_or_else(RegisterValue::undefined);
         let test_result = runtime.call_callable(
@@ -2023,7 +2118,7 @@ fn flatten_into_array_bounded(
     let length = array_length(source, runtime, "flat")?;
     for index in 0..length {
         if index % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(source, index, runtime, "flat")? else {
             continue;
@@ -2054,6 +2149,9 @@ fn array_flat_map(
 
     let result = runtime.alloc_array();
     for index in 0..length {
+        if index % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.flatMap")?
         else {
             continue;
@@ -2099,7 +2197,7 @@ fn array_to_locale_string(
     let mut parts: Vec<String> = safe_with_capacity(len);
     for i in 0..len {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let prop = runtime.intern_property_name(&i.to_string());
         let elem_receiver = RegisterValue::from_object_handle(receiver.0);
@@ -2188,7 +2286,7 @@ fn array_copy_within(
     let mut vals: Vec<Option<RegisterValue>> = safe_with_capacity(count);
     for i in 0..count {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         vals.push(array_index_value(
             receiver,
@@ -2227,7 +2325,7 @@ fn array_to_reversed(
     let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in (0..length).rev() {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toReversed")?
             .unwrap_or_else(RegisterValue::undefined);
@@ -2260,7 +2358,7 @@ fn array_to_sorted(
     let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSorted")?
             .unwrap_or_else(RegisterValue::undefined);
@@ -2269,9 +2367,15 @@ fn array_to_sorted(
 
     // Stable insertion sort (same as Array.prototype.sort).
     for i in 1..items.len() {
+        if i % OOM_POLL_INTERVAL == 0 {
+            check_native_loop(runtime)?;
+        }
         let key = items[i];
         let mut j = i;
         while j > 0 {
+            if j % OOM_POLL_INTERVAL == 0 {
+                check_native_loop(runtime)?;
+            }
             let cmp = sort_compare(items[j - 1], key, comparefn, runtime)?;
             if cmp <= 0.0 {
                 break;
@@ -2335,7 +2439,7 @@ fn array_to_spliced(
     // Copy before splice point.
     for i in 0..actual_start {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
             .unwrap_or_else(RegisterValue::undefined);
@@ -2348,7 +2452,7 @@ fn array_to_spliced(
     // Copy after splice point.
     for i in (actual_start + actual_delete_count)..len {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
             .unwrap_or_else(RegisterValue::undefined);
@@ -2400,7 +2504,7 @@ fn array_with(
     let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
         if i % OOM_POLL_INTERVAL == 0 {
-            runtime.check_oom()?;
+            check_native_loop(runtime)?;
         }
         if i == actual_index {
             elements.push(new_value);

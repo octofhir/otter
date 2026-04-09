@@ -16,6 +16,19 @@ pub(super) static STRING_INTRINSIC: StringIntrinsic = StringIntrinsic;
 
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const STRING_VALUE_OF_ERROR: &str = "String.prototype.valueOf requires a string receiver";
+const STRING_INTERRUPT_POLL_INTERVAL: usize = 4096;
+const MAX_INTRINSIC_STRING_BYTES: usize = 256 * 1024 * 1024;
+
+#[inline]
+fn check_interrupt_poll(
+    runtime: &crate::interpreter::RuntimeState,
+    index: usize,
+) -> Result<(), VmNativeCallError> {
+    if index % STRING_INTERRUPT_POLL_INTERVAL == 0 {
+        runtime.check_interrupt()?;
+    }
+    Ok(())
+}
 
 pub(super) struct StringIntrinsic;
 
@@ -795,7 +808,22 @@ fn string_repeat(
     if count < 0 {
         return Err(range_error(runtime, "Invalid count value"));
     }
-    let result = s.repeat(count as usize);
+    let repeat_count = count as usize;
+    let result_len = s
+        .len()
+        .checked_mul(repeat_count)
+        .ok_or_else(|| range_error(runtime, "Invalid string length: repeat result is too large"))?;
+    if result_len > MAX_INTRINSIC_STRING_BYTES {
+        return Err(range_error(
+            runtime,
+            "Invalid string length: repeat result is too large",
+        ));
+    }
+    let mut result = String::with_capacity(result_len);
+    for i in 0..repeat_count {
+        check_interrupt_poll(runtime, i)?;
+        result.push_str(&s);
+    }
     let handle = runtime.alloc_string(result);
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -821,6 +849,12 @@ fn string_pad_start(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
     let max_len = int_arg(args, 0, 0).max(0) as usize;
+    if max_len > MAX_INTRINSIC_STRING_BYTES {
+        return Err(range_error(
+            runtime,
+            "Invalid string length: padded string is too large",
+        ));
+    }
     let s_units: Vec<u16> = s.encode_utf16().collect();
     if s_units.len() >= max_len {
         let handle = runtime.alloc_string(&*s);
@@ -845,6 +879,7 @@ fn string_pad_start(
     let pad_needed = max_len - s_units.len();
     let mut padded: Vec<u16> = Vec::with_capacity(max_len);
     for i in 0..pad_needed {
+        check_interrupt_poll(runtime, i)?;
         padded.push(fill_units[i % fill_units.len()]);
     }
     padded.extend_from_slice(&s_units);
@@ -862,6 +897,12 @@ fn string_pad_end(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
     let max_len = int_arg(args, 0, 0).max(0) as usize;
+    if max_len > MAX_INTRINSIC_STRING_BYTES {
+        return Err(range_error(
+            runtime,
+            "Invalid string length: padded string is too large",
+        ));
+    }
     let s_units: Vec<u16> = s.encode_utf16().collect();
     if s_units.len() >= max_len {
         let handle = runtime.alloc_string(&*s);
@@ -887,6 +928,7 @@ fn string_pad_end(
     let mut padded: Vec<u16> = Vec::with_capacity(max_len);
     padded.extend_from_slice(&s_units);
     for i in 0..pad_needed {
+        check_interrupt_poll(runtime, i)?;
         padded.push(fill_units[i % fill_units.len()]);
     }
     let result = String::from_utf16_lossy(&padded);
@@ -1111,6 +1153,7 @@ fn string_split(
         // Split into individual characters.
         let chars: Vec<char> = s.chars().collect();
         for (i, ch) in chars.iter().enumerate() {
+            check_interrupt_poll(runtime, i)?;
             if i >= limit {
                 break;
             }
@@ -1128,6 +1171,7 @@ fn string_split(
     let s_bytes = s.as_bytes();
     let sep_bytes = sep.as_bytes();
     while start <= s_bytes.len() && count < limit {
+        check_interrupt_poll(runtime, count)?;
         match s_bytes[start..]
             .windows(sep_bytes.len())
             .position(|w| w == sep_bytes)
@@ -1265,7 +1309,8 @@ fn string_replace_all(
         let chars: Vec<char> = s.chars().collect();
         let mut result = String::new();
         result.push_str(&replace_str);
-        for ch in &chars {
+        for (index, ch) in chars.iter().enumerate() {
+            check_interrupt_poll(runtime, index)?;
             result.push(*ch);
             result.push_str(&replace_str);
         }
@@ -1495,7 +1540,8 @@ fn string_from_char_code(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let mut buf: Vec<u16> = Vec::with_capacity(args.len());
-    for &arg in args {
+    for (index, &arg) in args.iter().enumerate() {
+        check_interrupt_poll(runtime, index)?;
         // §7.1.8 ToUint16 — ToNumber then modulo 2^16.
         let n = runtime
             .js_to_number(arg)
@@ -1520,7 +1566,8 @@ fn string_from_code_point(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let mut result = String::with_capacity(args.len());
-    for &arg in args {
+    for (index, &arg) in args.iter().enumerate() {
+        check_interrupt_poll(runtime, index)?;
         let n = runtime
             .js_to_number(arg)
             .map_err(|e| map_interpreter_error(e, runtime))?;
@@ -1599,6 +1646,7 @@ fn string_raw(
     let mut result = String::new();
 
     for i in 0..literal_segments {
+        check_interrupt_poll(runtime, i)?;
         // Step 7.a: Get raw[i] and ToString it.
         let segment_val = runtime
             .objects_mut()

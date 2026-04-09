@@ -11,7 +11,15 @@ use rusqlite::{Connection, OpenFlags, Row};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 const MAX_JSON_DEPTH: usize = 64;
+const JSON_INTERRUPT_POLL_INTERVAL: usize = 4096;
 static MEMORY_DB_ID: AtomicU64 = AtomicU64::new(1);
+
+fn check_json_interrupt(runtime: &RuntimeState, index: usize) -> Result<(), VmNativeCallError> {
+    if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+        runtime.check_interrupt()?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -758,7 +766,8 @@ fn json_array_to_js(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let mut values = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
+        check_json_interrupt(runtime, index)?;
         values.push(json_to_register(&row, runtime, 0)?);
     }
     Ok(RegisterValue::from_object_handle(
@@ -772,6 +781,7 @@ fn register_to_json(
     depth: usize,
     seen: &mut HashSet<ObjectHandle>,
 ) -> Result<JsonValue, VmNativeCallError> {
+    runtime.check_interrupt()?;
     if depth > MAX_JSON_DEPTH {
         return Err(throw_type_error(
             runtime,
@@ -810,14 +820,20 @@ fn register_to_json(
         Ok(HeapValueKind::Array) => {
             let elements = runtime.array_to_args(handle)?;
             let mut values = Vec::with_capacity(elements.len());
-            for element in elements {
+            for (index, element) in elements.into_iter().enumerate() {
+                check_json_interrupt(runtime, index)?;
                 values.push(register_to_json(element, runtime, depth + 1, seen)?);
             }
             Ok(JsonValue::Array(values))
         }
         Ok(HeapValueKind::Object) => {
             let mut map = JsonMap::new();
-            for key in runtime.enumerable_own_property_keys(handle)? {
+            for (index, key) in runtime
+                .enumerable_own_property_keys(handle)?
+                .into_iter()
+                .enumerate()
+            {
+                check_json_interrupt(runtime, index)?;
                 let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
                     continue;
                 };
@@ -838,6 +854,7 @@ fn json_to_register(
     runtime: &mut RuntimeState,
     depth: usize,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    runtime.check_interrupt()?;
     if depth > MAX_JSON_DEPTH {
         return Err(throw_type_error(
             runtime,
@@ -862,7 +879,8 @@ fn json_to_register(
         )),
         JsonValue::Array(values) => {
             let mut elements = Vec::with_capacity(values.len());
-            for value in values {
+            for (index, value) in values.iter().enumerate() {
+                check_json_interrupt(runtime, index)?;
                 elements.push(json_to_register(value, runtime, depth + 1)?);
             }
             Ok(RegisterValue::from_object_handle(
@@ -871,7 +889,8 @@ fn json_to_register(
         }
         JsonValue::Object(entries) => {
             let object = runtime.alloc_object();
-            for (key, value) in entries {
+            for (index, (key, value)) in entries.iter().enumerate() {
+                check_json_interrupt(runtime, index)?;
                 let property = runtime.intern_property_name(key);
                 let value = json_to_register(value, runtime, depth + 1)?;
                 runtime

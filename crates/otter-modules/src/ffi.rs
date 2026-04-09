@@ -860,6 +860,7 @@ fn ffi_link_symbols(
     let symbols = runtime.alloc_object();
     let mut entries = Vec::new();
     for key in runtime.enumerable_own_property_keys(declarations)? {
+        runtime.check_interrupt()?;
         let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
             continue;
         };
@@ -880,6 +881,7 @@ fn ffi_link_symbols(
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (name, fn_ptr, signature) in entries {
+        runtime.check_interrupt()?;
         let callable = build_direct_callable(runtime, &name, fn_ptr, signature)?;
         let property = runtime.intern_property_name(&name);
         runtime
@@ -1228,6 +1230,7 @@ fn parse_symbol_declarations(
 ) -> Result<HashMap<String, FfiSignature>, VmNativeCallError> {
     let mut signatures = HashMap::new();
     for key in runtime.enumerable_own_property_keys(declarations)? {
+        runtime.check_interrupt()?;
         let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
             continue;
         };
@@ -1315,6 +1318,7 @@ fn marshal_args(
     let mut raw = Vec::with_capacity(expected.len());
     let mut cstrings = Vec::new();
     for (index, ty) in expected.iter().copied().enumerate() {
+        runtime.check_interrupt()?;
         let value = args
             .get(index)
             .copied()

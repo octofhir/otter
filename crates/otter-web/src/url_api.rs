@@ -703,6 +703,7 @@ fn parse_search_params_init(
             let values = runtime.array_to_args(handle)?;
             let mut pairs = Vec::with_capacity(values.len());
             for value in values {
+                runtime.check_interrupt()?;
                 let tuple = value.as_object_handle().map(ObjectHandle).ok_or_else(|| {
                     type_error(
                         runtime,
@@ -732,6 +733,7 @@ fn parse_search_params_init(
         _ => {
             let mut pairs = Vec::new();
             for key in runtime.enumerable_own_property_keys(handle)? {
+                runtime.check_interrupt()?;
                 let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
                     continue;
                 };

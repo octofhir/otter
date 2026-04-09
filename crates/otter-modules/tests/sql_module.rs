@@ -128,7 +128,11 @@ fn sql_database_throws_after_close() {
     let error = runtime
         .run_entry_specifier("./main.mjs", None)
         .expect_err("closed sql database should throw");
-    assert!(error.to_string().contains("RuntimeError:"));
+    assert!(
+        error
+            .to_string()
+            .contains("TypeError: SQL database is closed")
+    );
 }
 
 #[test]

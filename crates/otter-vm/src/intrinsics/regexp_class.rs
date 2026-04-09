@@ -16,6 +16,19 @@ pub(super) static REGEXP_INTRINSIC: RegExpIntrinsic = RegExpIntrinsic;
 
 pub(super) struct RegExpIntrinsic;
 
+const REGEXP_INTERRUPT_POLL_INTERVAL: usize = 4096;
+
+#[inline]
+fn check_interrupt_poll(
+    runtime: &crate::interpreter::RuntimeState,
+    index: usize,
+) -> Result<(), VmNativeCallError> {
+    if index % REGEXP_INTERRUPT_POLL_INTERVAL == 0 {
+        runtime.check_interrupt()?;
+    }
+    Ok(())
+}
+
 impl IntrinsicInstaller for RegExpIntrinsic {
     fn init(
         &self,
@@ -976,6 +989,7 @@ fn regexp_symbol_match(
         let result_arr = runtime.objects_mut().alloc_array();
         let mut idx = 0usize;
         loop {
+            check_interrupt_poll(runtime, idx)?;
             let m = regexp_builtin_exec(handle, &input, runtime)?;
             match m {
                 None => break,
@@ -1047,6 +1061,7 @@ fn regexp_symbol_match_all(
     let result_arr = runtime.objects_mut().alloc_array();
     let mut idx = 0usize;
     loop {
+        check_interrupt_poll(runtime, idx)?;
         match regexp_builtin_exec(clone_handle, &input, runtime)? {
             None => break,
             Some(arr) => {
@@ -1103,6 +1118,7 @@ fn regexp_symbol_replace(
     let mut results: Vec<ObjectHandle> = Vec::new();
 
     loop {
+        check_interrupt_poll(runtime, results.len())?;
         match regexp_builtin_exec(handle, &input, runtime)? {
             None => break,
             Some(arr) => {
@@ -1122,7 +1138,8 @@ fn regexp_symbol_replace(
     let mut output = String::new();
     let mut last_end_utf16 = 0usize;
 
-    for arr in results {
+    for (result_index, arr) in results.into_iter().enumerate() {
+        check_interrupt_poll(runtime, result_index)?;
         let index_prop = runtime.intern_property_name("index");
         let match_index = runtime
             .property_lookup(arr, index_prop)
@@ -1162,6 +1179,7 @@ fn regexp_symbol_replace(
             let mut fn_args = vec![full_match_val];
             let mut cap_idx = 1;
             loop {
+                check_interrupt_poll(runtime, cap_idx)?;
                 match runtime.objects_mut().get_index(arr, cap_idx) {
                     Ok(Some(v)) if v != RegisterValue::undefined() => {
                         fn_args.push(v);
@@ -1436,6 +1454,7 @@ fn regexp_symbol_split(
     let mut q = 0usize; // current search position
 
     while q < size {
+        check_interrupt_poll(runtime, q)?;
         set_last_index(splitter, q as f64, runtime);
         let z = regexp_builtin_exec(splitter, &input, runtime)?;
         match z {
@@ -1462,6 +1481,7 @@ fn regexp_symbol_split(
                     // Add captures.
                     let mut cap_idx = 1;
                     while let Ok(Some(_)) = runtime.objects_mut().get_index(arr, cap_idx) {
+                        check_interrupt_poll(runtime, cap_idx)?;
                         let cap_val = runtime
                             .objects_mut()
                             .get_index(arr, cap_idx)

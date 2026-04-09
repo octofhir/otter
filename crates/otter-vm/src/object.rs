@@ -13,6 +13,14 @@ use std::sync::atomic::AtomicBool;
 /// length is a uint32 value `<= 2^32 - 1`.
 pub const MAX_ARRAY_LENGTH: usize = u32::MAX as usize;
 
+/// Upper bound for the current dense-Vec Array backing store.
+///
+/// ECMAScript arrays may have lengths up to `2^32 - 1`, but Otter's active
+/// Array representation is still dense (`Vec<RegisterValue>`). Until sparse
+/// array storage lands, refuse single resizes beyond this cap instead of
+/// asking the OS for tens of gigabytes and killing the process.
+pub const MAX_DENSE_ARRAY_STORAGE_LENGTH: usize = 16 * 1024 * 1024;
+
 use crate::bytecode::ProgramCounter;
 use crate::host::HostFunctionId;
 use crate::js_string::JsString;
@@ -4453,6 +4461,9 @@ impl ObjectHeap {
             HeapValue::Array { elements, .. } => elements.len(),
             _ => return Err(ObjectError::InvalidKind),
         };
+        if index >= MAX_DENSE_ARRAY_STORAGE_LENGTH && index >= current_len {
+            return Err(ObjectError::OutOfMemory);
+        }
         let grow_delta = if index >= current_len {
             index
                 .saturating_add(1)
@@ -4602,6 +4613,9 @@ impl ObjectHeap {
             HeapValue::Array { elements, .. } => elements.len(),
             _ => return Err(ObjectError::InvalidKind),
         };
+        if length > MAX_DENSE_ARRAY_STORAGE_LENGTH && length > current_len {
+            return Err(ObjectError::OutOfMemory);
+        }
         if length > current_len {
             let additional = length.saturating_sub(current_len).saturating_mul(elem_size);
             self.heap.reserve_bytes(additional)?;
@@ -4616,7 +4630,8 @@ impl ObjectHeap {
             self.heap.release_bytes(reserve_delta);
         }
         if outcome.shrunk_bytes > 0 {
-            self.heap.release_bytes(outcome.shrunk_bytes.min(release_delta));
+            self.heap
+                .release_bytes(outcome.shrunk_bytes.min(release_delta));
         }
         Ok(outcome.ok)
     }

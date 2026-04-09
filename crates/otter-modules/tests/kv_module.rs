@@ -134,5 +134,5 @@ fn kv_store_throws_after_close() {
     let error = runtime
         .run_entry_specifier("./main.mjs", None)
         .expect_err("closed store should throw");
-    assert!(error.to_string().contains("RuntimeError:"));
+    assert!(error.to_string().contains("TypeError: KV store is closed"));
 }

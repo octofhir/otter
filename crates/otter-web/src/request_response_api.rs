@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use otter_runtime::current_capabilities;
 use otter_vm::descriptors::VmNativeCallError;
@@ -7,6 +8,8 @@ use otter_vm::payload::{VmTrace, VmValueTracer};
 use otter_vm::{RegisterValue, RuntimeState};
 use reqwest::Method;
 use url::Url;
+
+const FETCH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::blob_api::{
     BlobPayload, FormDataPayload, alloc_array_buffer, alloc_blob_instance, require_blob_payload,
@@ -1244,6 +1247,8 @@ fn perform_fetch(request: FetchRequestState) -> Result<FetchResponseState, Strin
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|error| format!("fetch method is invalid: {error}"))?;
     let client = reqwest::blocking::Client::builder()
+        .connect_timeout(FETCH_HTTP_TIMEOUT)
+        .timeout(FETCH_HTTP_TIMEOUT)
         .build()
         .map_err(|error| format!("fetch client initialization failed: {error}"))?;
     let mut builder = client.request(method, &request.url);

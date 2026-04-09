@@ -26,6 +26,19 @@ pub(super) static TYPED_ARRAY_INTRINSIC: TypedArrayIntrinsic = TypedArrayIntrins
 
 pub(super) struct TypedArrayIntrinsic;
 
+const TYPED_ARRAY_INTERRUPT_POLL_INTERVAL: usize = 4096;
+
+#[inline]
+fn check_interrupt_poll(
+    runtime: &crate::interpreter::RuntimeState,
+    index: usize,
+) -> Result<(), VmNativeCallError> {
+    if index % TYPED_ARRAY_INTERRUPT_POLL_INTERVAL == 0 {
+        runtime.check_interrupt()?;
+    }
+    Ok(())
+}
+
 impl IntrinsicInstaller for TypedArrayIntrinsic {
     fn init(
         &self,
@@ -782,6 +795,7 @@ fn typed_array_from_typed_array(
     // Read all elements from source as f64
     let mut elements = Vec::with_capacity(src_length);
     for i in 0..src_length {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(source, i)
@@ -804,6 +818,7 @@ fn typed_array_from_typed_array(
 
     // Write elements
     for (i, val) in elements.into_iter().enumerate() {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(handle, i, val)
@@ -843,6 +858,7 @@ fn typed_array_from_array_like(
 
     // Copy elements via get_index
     for i in 0..length {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects_mut()
             .get_index(source, i)
@@ -963,6 +979,7 @@ fn read_all_elements(
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -984,6 +1001,7 @@ fn typed_array_to_plain_array(
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let arr = runtime.alloc_array();
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1095,12 +1113,14 @@ fn typed_array_copy_within(
     if from < to && to < from + count {
         // Copy backwards (overlapping region)
         for i in (0..count).rev() {
+            check_interrupt_poll(runtime, i)?;
             new_elements[to + i] = elements[from + i];
         }
     } else {
         new_elements[to..to + count].copy_from_slice(&elements[from..from + count]);
     }
     for (i, val) in new_elements.into_iter().enumerate() {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(handle, i, val)
@@ -1211,6 +1231,7 @@ fn typed_array_fill(
         end.min(len)
     } as usize;
     for i in k..fin {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(handle, i, fill_value)
@@ -1245,6 +1266,7 @@ fn typed_array_filter(
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let mut kept = Vec::new();
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1528,6 +1550,7 @@ fn typed_array_includes(
         (len + from).max(0) as usize
     };
     for i in k..len as usize {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1609,6 +1632,7 @@ fn typed_array_join(
     };
     let mut result = String::new();
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         if i > 0 {
             result.push_str(&sep);
         }
@@ -1873,6 +1897,7 @@ fn typed_array_reverse(
     let mut elements = read_all_elements(handle, runtime)?;
     elements.reverse();
     for (i, val) in elements.into_iter().enumerate() {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(handle, i, val)
@@ -1928,6 +1953,7 @@ fn typed_array_set(
         }
         let elements = read_all_elements(src, runtime)?;
         for (i, val) in elements.into_iter().enumerate() {
+            check_interrupt_poll(runtime, i)?;
             runtime
                 .objects_mut()
                 .typed_array_set_element(handle, target_offset + i, val)
@@ -1950,6 +1976,7 @@ fn typed_array_set(
             ));
         }
         for i in 0..src_length {
+            check_interrupt_poll(runtime, i)?;
             let val = runtime
                 .objects_mut()
                 .get_index(src, i)
@@ -2024,6 +2051,7 @@ fn typed_array_slice(
         .alloc_typed_array(kind, buffer, 0, count, Some(proto));
 
     for i in 0..count {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, k + i)
@@ -2096,7 +2124,7 @@ fn typed_array_sort(
 
     if comparefn == RegisterValue::undefined() {
         // Default: sort numerically
-        elements.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        numeric_sort_elements(&mut elements, runtime)?;
     } else {
         // Use comparefn — we need a simple sort that calls the callback
         // Insertion sort to avoid complex error handling in Rust closures
@@ -2125,6 +2153,7 @@ fn typed_array_sort(
     }
 
     for (i, val) in elements.into_iter().enumerate() {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(handle, i, val)
@@ -2300,6 +2329,7 @@ fn typed_array_from(
         .alloc_typed_array(kind, buffer, 0, len, Some(proto));
 
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects_mut()
             .get_index(src, i)
@@ -2402,6 +2432,7 @@ fn typed_array_to_reversed(
     // Read elements in reverse.
     let mut elements = Vec::with_capacity(len);
     for i in (0..len).rev() {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -2457,7 +2488,7 @@ fn typed_array_to_sorted(
 
     if comparefn == RegisterValue::undefined() {
         // Default: sort numerically (§23.2.3.31 step 8).
-        elements.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        numeric_sort_elements(&mut elements, runtime)?;
     } else {
         // Insertion sort with user comparefn.
         for i in 1..elements.len() {
@@ -2601,12 +2632,35 @@ fn alloc_typed_array_from_elements(
             .objects_mut()
             .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto));
     for (i, &val) in elements.iter().enumerate() {
+        check_interrupt_poll(runtime, i)?;
         runtime
             .objects_mut()
             .typed_array_set_element(result, i, val)
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     }
     Ok(result)
+}
+
+fn numeric_sort_elements(
+    elements: &mut [f64],
+    runtime: &crate::interpreter::RuntimeState,
+) -> Result<(), VmNativeCallError> {
+    for i in 1..elements.len() {
+        check_interrupt_poll(runtime, i)?;
+        let key = elements[i];
+        let mut j = i;
+        while j > 0
+            && elements[j - 1]
+                .partial_cmp(&key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .is_gt()
+        {
+            elements[j] = elements[j - 1];
+            j -= 1;
+        }
+        elements[j] = key;
+    }
+    Ok(())
 }
 
 /// Format a number for join/toString.

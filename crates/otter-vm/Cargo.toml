@@ -17,6 +17,7 @@ otter-gc = { path = "../otter-gc" }
 otter-macros = { path = "../otter-macros" }
 oxc_allocator = "0.123"
 oxc_ast = "0.123"
+oxc_ast_visit = "0.123"
 oxc_parser = "0.123"
 oxc_span = "0.123"
 oxc_transformer = "0.123"

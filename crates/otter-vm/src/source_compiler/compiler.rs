@@ -62,6 +62,7 @@ impl<'a> FunctionCompiler<'a> {
             source_map_entries: Vec::new(),
             last_recorded_location: None,
             pending_site_span: None,
+            private_name_scopes: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -843,10 +844,220 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    /// §15.7.14 PrivateBoundNames uniqueness check.
+    ///
+    /// Collects every private declaration in the class body (private fields,
+    /// private methods, private getters, private setters — instance and
+    /// static alike) and rejects duplicate entries per the spec's early-error
+    /// rule. The only allowed duplication is a `{getter, setter}` pair that
+    /// shares its `static` flag with no other entries on the same name.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-static-semantics-privateboundnames>
+    /// Spec: <https://tc39.es/ecma262/#sec-class-definitions-static-semantics-early-errors>
+    fn validate_private_bound_names(
+        &self,
+        class: &Class<'_>,
+    ) -> Result<std::collections::HashSet<String>, SourceLoweringError> {
+        use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyDefinitionType};
+
+        /// One private declaration kind plus its static-ness.
+        #[derive(Debug, Clone, Copy)]
+        enum PrivateEntry {
+            Field,
+            Method,
+            Getter { is_static: bool },
+            Setter { is_static: bool },
+        }
+
+        // PrivateBoundNames treats static and instance members as the same
+        // namespace (§8.2.3), so we key by the bare name and collect the
+        // list of entries observed for each.
+        let mut seen: std::collections::HashMap<String, Vec<PrivateEntry>> =
+            std::collections::HashMap::new();
+
+        let mut record = |name: &str,
+                          entry: PrivateEntry|
+         -> Result<(), SourceLoweringError> {
+            let list = seen.entry(name.to_string()).or_default();
+            list.push(entry);
+            // Allowed multiplicities:
+            //   - 1 entry of any kind
+            //   - 2 entries iff they are a getter+setter pair that share the
+            //     same static-ness (everything else is a duplicate).
+            let ok = match list.as_slice() {
+                [] => unreachable!(),
+                [_] => true,
+                [a, b] => matches!(
+                    (*a, *b),
+                    (
+                        PrivateEntry::Getter { is_static: s1 },
+                        PrivateEntry::Setter { is_static: s2 },
+                    ) | (
+                        PrivateEntry::Setter { is_static: s1 },
+                        PrivateEntry::Getter { is_static: s2 },
+                    ) if s1 == s2
+                ),
+                _ => false,
+            };
+            if !ok {
+                return Err(SourceLoweringError::EarlyError(format!(
+                    "Duplicate private name declaration: #{name}"
+                )));
+            }
+            Ok(())
+        };
+
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method) => {
+                    let oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) = &method.key else {
+                        continue;
+                    };
+                    let name = ident.name.as_str();
+                    let is_static = method.r#static;
+                    let entry = match method.kind {
+                        MethodDefinitionKind::Method => PrivateEntry::Method,
+                        MethodDefinitionKind::Get => PrivateEntry::Getter { is_static },
+                        MethodDefinitionKind::Set => PrivateEntry::Setter { is_static },
+                        MethodDefinitionKind::Constructor => continue,
+                    };
+                    record(name, entry)?;
+                }
+                ClassElement::PropertyDefinition(prop) => {
+                    if prop.declare
+                        || matches!(
+                            prop.r#type,
+                            PropertyDefinitionType::TSAbstractPropertyDefinition
+                        )
+                    {
+                        continue;
+                    }
+                    let oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) = &prop.key else {
+                        continue;
+                    };
+                    record(ident.name.as_str(), PrivateEntry::Field)?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(seen.keys().cloned().collect())
+    }
+
+    /// §15.7.14 / §8.3 AllPrivateNamesValid — walk the class body and verify
+    /// that every `#name` reference inside it resolves to a declaration in
+    /// either the current class or an enclosing class's private environment.
+    /// Nested classes are skipped (they validate on their own).
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-static-semantics-allprivatenamesvalid>
+    fn validate_private_name_references(
+        &self,
+        class: &Class<'_>,
+        declared_here: &std::collections::HashSet<String>,
+    ) -> Result<(), SourceLoweringError> {
+        use oxc_ast::ast::ClassElement;
+        use super::ast::{check_expression_private_refs, check_statement_private_refs};
+
+        let is_declared = |name: &str| -> bool {
+            if declared_here.contains(name) {
+                return true;
+            }
+            self.private_name_scopes
+                .iter()
+                .any(|scope| scope.contains(name))
+        };
+
+        // Heritage expression (`extends Foo`) is evaluated *before* the
+        // class body's private environment is established, so private
+        // references inside it may only resolve to outer scopes — never
+        // the current class's declarations.
+        if let Some(super_class) = class.super_class.as_ref() {
+            let is_declared_outer = |name: &str| -> bool {
+                self.private_name_scopes
+                    .iter()
+                    .any(|scope| scope.contains(name))
+            };
+            check_expression_private_refs(super_class, &is_declared_outer)?;
+        }
+
+        for element in &class.body.body {
+            match element {
+                ClassElement::PropertyDefinition(prop) => {
+                    if prop.declare {
+                        continue;
+                    }
+                    if prop.computed
+                        && let Some(key_expr) = prop.key.as_expression()
+                    {
+                        check_expression_private_refs(key_expr, &is_declared)?;
+                    }
+                    if let Some(value) = prop.value.as_ref() {
+                        check_expression_private_refs(value, &is_declared)?;
+                    }
+                }
+                ClassElement::MethodDefinition(method) => {
+                    if method.computed
+                        && let Some(key_expr) = method.key.as_expression()
+                    {
+                        check_expression_private_refs(key_expr, &is_declared)?;
+                    }
+                    if let Some(body) = method.value.body.as_ref() {
+                        for stmt in &body.statements {
+                            check_statement_private_refs(stmt, &is_declared)?;
+                        }
+                    }
+                }
+                ClassElement::StaticBlock(block) => {
+                    for stmt in &block.body {
+                        check_statement_private_refs(stmt, &is_declared)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     /// §15.7.14 ClassDefinitionEvaluation — shared implementation for class
     /// declarations and class expressions.
     /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
     pub(super) fn compile_class_body(
+        &mut self,
+        class: &Class<'_>,
+        class_name: &str,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        // §15.7.14 Static Semantics: Early Errors — PrivateBoundNames of
+        // ClassBody must not contain duplicates, unless a name is used
+        // exactly once for a getter and once for a setter with matching
+        // static-ness (and no other entries).
+        // Spec: <https://tc39.es/ecma262/#sec-static-semantics-privateboundnames>
+        let declared_private_names = self.validate_private_bound_names(class)?;
+
+        // §15.7.14 / §8.3 AllPrivateNamesValid — verify every `#name`
+        // reference inside the class body resolves against the current class
+        // or an enclosing lexical class's private environment.
+        self.validate_private_name_references(class, &declared_private_names)?;
+
+        // Push this class's declared private names so nested classes and
+        // closures compiled as part of this body see them when validating
+        // their own private references. Mirror the change onto the module
+        // compiler's pending latch so freshly constructed child
+        // `FunctionCompiler`s pick up the inherited chain too.
+        self.private_name_scopes.push(declared_private_names.clone());
+        module
+            .pending_private_name_scopes
+            .push(declared_private_names);
+        let result = self.compile_class_body_inner(class, class_name, module);
+        self.private_name_scopes.pop();
+        module.pending_private_name_scopes.pop();
+        result
+    }
+
+    /// Inner implementation of `compile_class_body` that runs after the
+    /// `PrivateNameEnvironment` has been pushed for this class.
+    fn compile_class_body_inner(
         &mut self,
         class: &Class<'_>,
         class_name: &str,
@@ -917,11 +1128,25 @@ impl<'a> FunctionCompiler<'a> {
         // constructorParent = %Function.prototype%, constructor kind = base.
         // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
         let extends_null = matches!(class.super_class.as_ref(), Some(Expression::NullLiteral(_)));
+        // §15.7.14 step 7: Evaluate ClassHeritage in the *outer*
+        // PrivateEnvironment. Temporarily pop this class's declared-names
+        // frame (pushed by `compile_class_body`) so that any nested class
+        // expressions inside the heritage expression see only the enclosing
+        // lexical classes — not the class currently being defined.
         let super_class = if let Some(super_class) = class.super_class.as_ref() {
             if extends_null {
                 None // Don't compile null as a super class value
             } else {
-                let super_value = self.compile_expression(super_class, module)?;
+                let saved_fc = self.private_name_scopes.pop();
+                let saved_mc = module.pending_private_name_scopes.pop();
+                let super_result = self.compile_expression(super_class, module);
+                if let Some(frame) = saved_fc {
+                    self.private_name_scopes.push(frame);
+                }
+                if let Some(frame) = saved_mc {
+                    module.pending_private_name_scopes.push(frame);
+                }
+                let super_value = super_result?;
                 Some(self.stabilize_binding_value(super_value)?)
             }
         } else {

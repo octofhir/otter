@@ -1,5 +1,6 @@
 use super::*;
 use oxc_ast::ast::Directive;
+use oxc_ast_visit::{Visit, walk};
 
 /// Represents a single function parameter, possibly with a default value.
 pub(super) struct ParamInfo<'a> {
@@ -37,6 +38,89 @@ pub(super) fn is_simple_parameter_list(params: &[ParamInfo<'_>]) -> bool {
             && param.default.is_none()
             && matches!(param.pattern, BindingPattern::BindingIdentifier(_))
     })
+}
+
+/// §15.7.14 / §8.3 AllPrivateNamesValid walker.
+///
+/// Visits every expression/statement in a subtree and, for each
+/// `PrivateFieldExpression` or `PrivateInExpression` node, checks that
+/// its name is valid given the caller-supplied `is_declared` predicate
+/// (current class's private bound names union with the enclosing
+/// lexical class chain). Stops descending into nested `ClassDeclaration`
+/// / `ClassExpression` nodes because they validate on their own.
+pub(super) struct PrivateNameValidator<'a> {
+    pub is_declared: &'a dyn Fn(&str) -> bool,
+    pub error: Option<SourceLoweringError>,
+}
+
+impl<'a, 'ast> Visit<'ast> for PrivateNameValidator<'a> {
+    fn visit_private_field_expression(
+        &mut self,
+        it: &oxc_ast::ast::PrivateFieldExpression<'ast>,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let name = it.field.name.as_str();
+        if !(self.is_declared)(name) {
+            self.error = Some(SourceLoweringError::EarlyError(format!(
+                "Private name #{name} is not defined"
+            )));
+            return;
+        }
+        walk::walk_expression(self, &it.object);
+    }
+
+    fn visit_private_in_expression(
+        &mut self,
+        it: &oxc_ast::ast::PrivateInExpression<'ast>,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let name = it.left.name.as_str();
+        if !(self.is_declared)(name) {
+            self.error = Some(SourceLoweringError::EarlyError(format!(
+                "Private name #{name} is not defined"
+            )));
+            return;
+        }
+        walk::walk_expression(self, &it.right);
+    }
+
+    // Nested classes have their own lexical private environment; let the
+    // recursive compile_class_body call validate them.
+    fn visit_class(&mut self, _it: &oxc_ast::ast::Class<'ast>) {}
+}
+
+pub(super) fn check_expression_private_refs<'a>(
+    expr: &Expression<'_>,
+    is_declared: &dyn Fn(&str) -> bool,
+) -> Result<(), SourceLoweringError> {
+    let mut validator = PrivateNameValidator {
+        is_declared,
+        error: None,
+    };
+    walk::walk_expression(&mut validator, expr);
+    match validator.error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn check_statement_private_refs<'a>(
+    stmt: &AstStatement<'_>,
+    is_declared: &dyn Fn(&str) -> bool,
+) -> Result<(), SourceLoweringError> {
+    let mut validator = PrivateNameValidator {
+        is_declared,
+        error: None,
+    };
+    walk::walk_statement(&mut validator, stmt);
+    match validator.error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 pub(super) fn identifier_name_for_parameter_pattern<'a>(

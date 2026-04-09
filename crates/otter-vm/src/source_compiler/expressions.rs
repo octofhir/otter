@@ -2172,6 +2172,23 @@ impl<'a> FunctionCompiler<'a> {
         argument: &Expression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // §13.5.1.1 Static Semantics: Early Errors for `delete UnaryExpression`.
+        // It is a Syntax Error if the derived UnaryExpression is a
+        // `MemberExpression . PrivateIdentifier` or a
+        // `CallExpression . PrivateIdentifier` — in either case, peeled
+        // through any ParenthesizedExpression covers.
+        // Spec: <https://tc39.es/ecma262/#sec-delete-operator-static-semantics-early-errors>
+        {
+            let mut peeled = argument;
+            while let Expression::ParenthesizedExpression(paren) = peeled {
+                peeled = &paren.expression;
+            }
+            if matches!(peeled, Expression::PrivateFieldExpression(_)) {
+                return Err(SourceLoweringError::EarlyError(
+                    "`delete` may not be applied to a private field reference".to_string(),
+                ));
+            }
+        }
         match argument {
             Expression::StaticMemberExpression(member) => {
                 let object = self.compile_expression(&member.object, module)?;

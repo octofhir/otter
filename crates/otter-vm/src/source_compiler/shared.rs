@@ -218,5 +218,12 @@ pub(super) struct FunctionCompiler<'a> {
     /// site* (e.g. `new TypeError("boom")`) rather than the last
     /// sub-expression compiled inside the argument list.
     pub(super) pending_site_span: Option<oxc_span::Span>,
+    /// §15.7.14 / §8.3 PrivateNameEnvironment — lexical stack of the set of
+    /// private names declared by each enclosing class body, innermost last.
+    /// Pushed by `compile_class_body` before the class elements are compiled
+    /// so that nested classes and closures inside methods can validate
+    /// `#name` references against the whole chain. Popped on exit.
+    /// Spec: <https://tc39.es/ecma262/#sec-class-definitions-static-semantics-early-errors>
+    pub(super) private_name_scopes: Vec<std::collections::HashSet<String>>,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

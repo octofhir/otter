@@ -29,6 +29,13 @@ pub(super) struct ModuleCompiler<'a> {
     /// `.js` files this is the literal JS; for `.ts` files this is the
     /// literal TS (not the generated JS).
     original_source: Arc<str>,
+    /// §15.7.14 PrivateNameEnvironment inheritance latch — the set of
+    /// enclosing class private-name scopes a brand-new `FunctionCompiler`
+    /// should start with. Captured by `compile_function_from_*` during
+    /// child compilation (e.g. class methods, private methods, field
+    /// initializers, static blocks) so nested classes and closures can
+    /// resolve `#name` references from outer lexical classes.
+    pub(super) pending_private_name_scopes: Vec<std::collections::HashSet<String>>,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -46,6 +53,7 @@ impl<'a> ModuleCompiler<'a> {
             exports: Vec::new(),
             source_mapper,
             original_source,
+            pending_private_name_scopes: Vec::new(),
         }
     }
 
@@ -194,6 +202,10 @@ impl<'a> ModuleCompiler<'a> {
         );
         compiler.strict_mode = inherited_strict;
         compiler.is_derived_constructor = is_derived_constructor;
+        // §15.7.14 PrivateNameEnvironment — inherit the lexically enclosing
+        // class private-name scopes so nested class bodies can resolve
+        // `#foo` references from outer classes during early-error checks.
+        compiler.private_name_scopes = self.pending_private_name_scopes.clone();
 
         compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {
@@ -263,6 +275,8 @@ impl<'a> ModuleCompiler<'a> {
             self.source_mapper.clone(),
         );
         compiler.strict_mode = inherited_strict;
+        // §15.7.14 PrivateNameEnvironment inheritance.
+        compiler.private_name_scopes = self.pending_private_name_scopes.clone();
 
         compiler.declare_parameters(params)?;
         if kind != FunctionKind::Arrow {

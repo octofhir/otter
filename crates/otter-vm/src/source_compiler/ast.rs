@@ -24,6 +24,21 @@ pub(super) fn has_use_strict_directive(directives: &[Directive<'_>]) -> bool {
         .any(|directive| directive.directive == "use strict")
 }
 
+/// §8.2.2 IsSimpleParameterList — returns `true` when FormalParameters is a
+/// list of plain `BindingIdentifier` elements with no defaults, no rest
+/// parameter, and no destructuring patterns. Used by §15.2.1.1 and friends to
+/// reject a `"use strict"` directive whose enclosing function has a
+/// non-simple parameter list.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-static-semantics-issimpleparameterlist>
+pub(super) fn is_simple_parameter_list(params: &[ParamInfo<'_>]) -> bool {
+    params.iter().all(|param| {
+        !param.is_rest
+            && param.default.is_none()
+            && matches!(param.pattern, BindingPattern::BindingIdentifier(_))
+    })
+}
+
 pub(super) fn identifier_name_for_parameter_pattern<'a>(
     pattern: &'a BindingPattern<'a>,
 ) -> Option<&'a str> {

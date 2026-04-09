@@ -961,6 +961,12 @@ enum HeapValue {
         /// (used for static private fields/methods/accessors on constructors).
         /// Spec: <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
         private_elements: Vec<(PrivateNameKey, PrivateElement)>,
+        /// §10.2.5 `[[HomeObject]]` — the object whose prototype chain is
+        /// searched for `super.foo` / `super[x]` references from within this
+        /// function. Set by `MakeMethod` during class/object-literal method
+        /// installation; unset for regular functions and arrow functions.
+        /// Spec: <https://tc39.es/ecma262/#sec-makemethod>
+        home_object: Option<ObjectHandle>,
     },
     HostFunction {
         function: HostFunctionId,
@@ -3804,9 +3810,39 @@ impl ObjectHeap {
             class_id: 0,
             private_methods: Vec::new(),
             private_elements: Vec::new(),
+            home_object: None,
             realm,
         });
         ObjectHandle(h.0)
+    }
+
+    /// §10.2.5 MakeMethod — sets the `[[HomeObject]]` slot on a closure.
+    /// Called during class/object-literal method installation so that
+    /// `super.foo` resolves against `home_object.[[Prototype]]`.
+    /// Spec: <https://tc39.es/ecma262/#sec-makemethod>
+    pub fn set_closure_home_object(
+        &mut self,
+        handle: ObjectHandle,
+        home: ObjectHandle,
+    ) -> Result<(), ObjectError> {
+        match self.object_mut(handle)? {
+            HeapValue::Closure { home_object, .. } => {
+                *home_object = Some(home);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidHandle),
+        }
+    }
+
+    /// Returns the closure's `[[HomeObject]]`, or `None` if unset.
+    pub fn closure_home_object(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure { home_object, .. } => Ok(*home_object),
+            _ => Err(ObjectError::InvalidHandle),
+        }
     }
 
     /// Allocates a host-callable native function object.

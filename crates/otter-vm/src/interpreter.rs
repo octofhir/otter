@@ -1058,6 +1058,43 @@ impl RuntimeState {
             .unwrap_or(false)
     }
 
+    /// ES2024 §10.1.13 OrdinaryCreateFromConstructor — subclass-friendly
+    /// prototype selector for builtin constructors.
+    ///
+    /// Returns the `[[Prototype]]` that a fresh exotic instance should use:
+    /// - When the native callback was invoked via `[[Construct]]` and the
+    ///   pre-allocated `receiver` is an object (which is exactly what
+    ///   `allocate_construct_receiver` hands us after reading
+    ///   `newTarget.prototype` via `GetPrototypeFromConstructor`), returns
+    ///   that object's `[[Prototype]]`. This is how `class X extends Array {}`
+    ///   + `new X()` ends up with `Object.getPrototypeOf(instance) === X.prototype`.
+    /// - Otherwise (plain call, missing receiver, unrelated this) returns
+    ///   the caller-supplied `default_prototype` — usually the builtin's own
+    ///   `%BuiltinPrototype%` intrinsic.
+    ///
+    /// Builtin constructors (Array, Map, Set, Error, RegExp, ArrayBuffer, …)
+    /// should call this helper after allocating their exotic heap object and
+    /// use the returned prototype via `set_prototype` so that subclassing
+    /// works uniformly.
+    /// Spec: <https://tc39.es/ecma262/#sec-ordinarycreatefromconstructor>
+    #[must_use]
+    pub fn subclass_prototype_or_default(
+        &self,
+        receiver: RegisterValue,
+        default_prototype: ObjectHandle,
+    ) -> ObjectHandle {
+        if !self.is_current_native_construct_call() {
+            return default_prototype;
+        }
+        let Some(receiver_handle) = receiver.as_object_handle().map(ObjectHandle) else {
+            return default_prototype;
+        };
+        match self.objects.get_prototype(receiver_handle) {
+            Ok(Some(proto)) => proto,
+            _ => default_prototype,
+        }
+    }
+
     /// Returns the function object handle of the currently executing native callback.
     #[must_use]
     pub fn current_native_callee(&self) -> Option<ObjectHandle> {
@@ -3763,6 +3800,79 @@ impl RuntimeState {
                 }
                 VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
             })
+    }
+
+    /// ES2024 §10.2.9 SetFunctionName — overrides a closure's own `name` data
+    /// property based on a runtime property key. Used when installing
+    /// computed-key class methods/getters/setters (and object-literal methods)
+    /// so their `Function.name` matches the evaluated key.
+    ///
+    /// For Symbol keys the name becomes `"[desc]"` (or `""` when the symbol
+    /// has no description). For string/numeric keys the name is the `ToString`
+    /// of the property key. An optional `prefix` (e.g. `"get"` / `"set"`) is
+    /// prepended followed by a U+0020 SPACE, matching the spec.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-setfunctionname>
+    fn update_closure_function_name(
+        &mut self,
+        closure: ObjectHandle,
+        key: RegisterValue,
+        prefix: Option<&str>,
+    ) -> Result<(), InterpreterError> {
+        // 1. Derive the base name from the property key.
+        let base_name: String = if let Some(sid) = key.as_symbol_id() {
+            match self
+                .symbol_descriptions
+                .get(&sid)
+                .and_then(|description| description.as_deref())
+            {
+                Some(description) => format!("[{description}]"),
+                None => String::new(),
+            }
+        } else if let Some(handle) = key.as_object_handle().map(ObjectHandle) {
+            // String heap values (WTF-16). Fall back to stringifying whatever
+            // the runtime considers the property key form.
+            match self.objects.string_value(handle) {
+                Ok(Some(js_string)) => js_string.to_string(),
+                _ => {
+                    // Non-string object keys should have been coerced upstream
+                    // by ToPropertyKey; treat them as empty to stay defensive.
+                    String::new()
+                }
+            }
+        } else if let Some(i) = key.as_i32() {
+            i.to_string()
+        } else if let Some(f) = key.as_number() {
+            // Numeric keys are rare as computed class-method keys — they would
+            // already be stringified by ToPropertyKey upstream. Fall back to
+            // Rust's float formatting here; it matches JS Number::toString for
+            // the common integer/decimal cases we care about.
+            format!("{f}")
+        } else {
+            String::new()
+        };
+
+        // 2. Apply the optional prefix.
+        let full_name = match prefix {
+            Some(prefix_str) => format!("{prefix_str} {base_name}"),
+            None => base_name,
+        };
+
+        // 3. Define the "name" own property. The slot installed by
+        //    `alloc_closure` is configurable, so re-defining it is legal.
+        let name_property = self.intern_property_name("name");
+        let name_value = self.alloc_string(full_name);
+        self.objects
+            .define_own_property(
+                closure,
+                name_property,
+                crate::object::PropertyValue::data_with_attrs(
+                    RegisterValue::from_object_handle(name_value.0),
+                    crate::object::PropertyAttributes::function_length(),
+                ),
+            )
+            .map_err(|_| InterpreterError::TypeError("closure name define failed".into()))?;
+        Ok(())
     }
 
     pub(crate) fn property_base_object_handle(
@@ -6489,6 +6599,265 @@ impl Interpreter {
                     return Err(InterpreterError::TypeError(
                         "object literal accessor define failed".into(),
                     ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.4.5 MethodDefinitionEvaluation for class methods — install a
+            // data method on the class prototype/constructor with
+            // [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true.
+            // Unlike SetProperty this uses [[DefineOwnProperty]] and bypasses
+            // any inherited setters.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
+            Opcode::DefineClassMethod | Opcode::DefineClassMethodComputed => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(object)?;
+                // For computed keys we also need the raw key value so we can
+                // run §10.2.9 SetFunctionName on the method closure before it
+                // is installed on the class prototype/constructor.
+                let mut computed_key: Option<RegisterValue> = None;
+                let (property, method_value) = match instruction.opcode() {
+                    Opcode::DefineClassMethod => {
+                        let method =
+                            activation.read_bytecode_register(function, instruction.b())?;
+                        (
+                            Self::resolve_property_name(function, runtime, instruction.c())?,
+                            method,
+                        )
+                    }
+                    Opcode::DefineClassMethodComputed => {
+                        let key = activation.read_bytecode_register(function, instruction.b())?;
+                        computed_key = Some(key);
+                        let method =
+                            activation.read_bytecode_register(function, instruction.c())?;
+                        (runtime.computed_property_name(key)?, method)
+                    }
+                    _ => unreachable!(),
+                };
+                // §15.4.5 MethodDefinitionEvaluation step 7 — SetFunctionName
+                // for methods created with computed keys so that e.g.
+                // `class A { [Symbol('s')]() {} }` gives the method
+                // `name === "[s]"`.
+                if let Some(key) = computed_key
+                    && let Some(closure_handle) = method_value.as_object_handle().map(ObjectHandle)
+                {
+                    runtime.update_closure_function_name(closure_handle, key, None)?;
+                }
+                let desc = crate::object::PropertyDescriptor::data(
+                    Some(method_value),
+                    Some(true),  // writable
+                    Some(false), // enumerable — §15.7.14 step 28
+                    Some(true),  // configurable
+                );
+                let defined = runtime
+                    .objects
+                    .define_own_property_from_descriptor(handle, property, desc)?;
+                if !defined {
+                    return Err(InterpreterError::TypeError(
+                        "class method define failed".into(),
+                    ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §15.7.14 — Install a non-enumerable accessor (getter/setter) on a
+            // class prototype/constructor. Mirrors DefineNamedGetter/Setter but
+            // forces [[Enumerable]]: false.
+            // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+            Opcode::DefineClassGetter
+            | Opcode::DefineClassSetter
+            | Opcode::DefineClassGetterComputed
+            | Opcode::DefineClassSetterComputed => {
+                let object = activation.read_bytecode_register(function, instruction.a())?;
+                let handle = runtime.property_base_object_handle(object)?;
+                let mut computed_key: Option<RegisterValue> = None;
+                let (property, accessor_register) = match instruction.opcode() {
+                    Opcode::DefineClassGetter | Opcode::DefineClassSetter => (
+                        Self::resolve_property_name(function, runtime, instruction.c())?,
+                        instruction.b(),
+                    ),
+                    Opcode::DefineClassGetterComputed | Opcode::DefineClassSetterComputed => {
+                        let key = activation.read_bytecode_register(function, instruction.b())?;
+                        computed_key = Some(key);
+                        (runtime.computed_property_name(key)?, instruction.c())
+                    }
+                    _ => unreachable!(),
+                };
+                let accessor = activation
+                    .read_bytecode_register(function, accessor_register)?
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                // §15.4.5 MethodDefinitionEvaluation — SetFunctionName for
+                // computed-key getters/setters with the "get"/"set" prefix.
+                if let Some(key) = computed_key {
+                    let prefix = match instruction.opcode() {
+                        Opcode::DefineClassGetterComputed => Some("get"),
+                        Opcode::DefineClassSetterComputed => Some("set"),
+                        _ => None,
+                    };
+                    runtime.update_closure_function_name(accessor, key, prefix)?;
+                }
+                let desc = match instruction.opcode() {
+                    Opcode::DefineClassGetter | Opcode::DefineClassGetterComputed => {
+                        crate::object::PropertyDescriptor::accessor(
+                            Some(Some(accessor)),
+                            None,
+                            Some(false), // enumerable
+                            Some(true),  // configurable
+                        )
+                    }
+                    Opcode::DefineClassSetter | Opcode::DefineClassSetterComputed => {
+                        crate::object::PropertyDescriptor::accessor(
+                            None,
+                            Some(Some(accessor)),
+                            Some(false),
+                            Some(true),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let defined = runtime
+                    .objects
+                    .define_own_property_from_descriptor(handle, property, desc)?;
+                if !defined {
+                    return Err(InterpreterError::TypeError(
+                        "class accessor define failed".into(),
+                    ));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §10.2.5 MakeMethod — install [[HomeObject]] on a method closure.
+            // The compiler emits this instruction for every method, getter,
+            // setter, object-literal short-method, so that subsequent
+            // `super.foo` / `super[x]` inside the method body resolves to
+            // `HomeObject.[[Prototype]]`.
+            // Spec: <https://tc39.es/ecma262/#sec-makemethod>
+            Opcode::SetHomeObject => {
+                let closure_value =
+                    activation.read_bytecode_register(function, instruction.a())?;
+                let home_value = activation.read_bytecode_register(function, instruction.b())?;
+                let closure_handle = closure_value
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                let home_handle = home_value
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .ok_or(InterpreterError::InvalidObjectValue)?;
+                runtime
+                    .objects
+                    .set_closure_home_object(closure_handle, home_handle)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.3.7 GetValue on a super reference — `super.foo` / `super[x]`.
+            // The base object is `HomeObject.[[Prototype]]`; the receiver used
+            // for accessor calls is the current `this` value.
+            // Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+            Opcode::GetSuperProperty | Opcode::GetSuperPropertyComputed => {
+                let property = match instruction.opcode() {
+                    Opcode::GetSuperProperty => {
+                        Self::resolve_property_name(function, runtime, instruction.b())?
+                    }
+                    Opcode::GetSuperPropertyComputed => {
+                        let key =
+                            activation.read_bytecode_register(function, instruction.b())?;
+                        runtime.computed_property_name(key)?
+                    }
+                    _ => unreachable!(),
+                };
+                let closure_handle = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let home = runtime
+                    .objects
+                    .closure_home_object(closure_handle)?
+                    .ok_or_else(|| {
+                        InterpreterError::TypeError(
+                            "super property access outside a method".into(),
+                        )
+                    })?;
+                let base = match runtime.objects.get_prototype(home)? {
+                    Some(proto) => proto,
+                    None => {
+                        return Err(InterpreterError::TypeError(
+                            "cannot read super property on an object with null prototype".into(),
+                        ));
+                    }
+                };
+                // Receiver for accessor calls is the current `this`.
+                let receiver = activation.receiver(function)?;
+                let value = match runtime.property_lookup(base, property)? {
+                    Some(lookup) => match lookup.value() {
+                        PropertyValue::Data { value, .. } => value,
+                        PropertyValue::Accessor { getter, .. } => {
+                            runtime.call_callable_for_accessor(getter, receiver, &[])?
+                        }
+                    },
+                    None => RegisterValue::undefined(),
+                };
+                activation.write_bytecode_register(function, instruction.a(), value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // §13.3.7 PutValue on a super reference — `super.foo = value` /
+            // `super[x] = value`. The base object is `HomeObject.[[Prototype]]`;
+            // the receiver used for the write is the current `this`.
+            Opcode::SetSuperProperty | Opcode::SetSuperPropertyComputed => {
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                let property = match instruction.opcode() {
+                    Opcode::SetSuperProperty => {
+                        Self::resolve_property_name(function, runtime, instruction.b())?
+                    }
+                    Opcode::SetSuperPropertyComputed => {
+                        let key =
+                            activation.read_bytecode_register(function, instruction.b())?;
+                        runtime.computed_property_name(key)?
+                    }
+                    _ => unreachable!(),
+                };
+                let closure_handle = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let home = runtime
+                    .objects
+                    .closure_home_object(closure_handle)?
+                    .ok_or_else(|| {
+                        InterpreterError::TypeError(
+                            "super property assignment outside a method".into(),
+                        )
+                    })?;
+                let base = match runtime.objects.get_prototype(home)? {
+                    Some(proto) => proto,
+                    None => {
+                        return Err(InterpreterError::TypeError(
+                            "cannot write super property on an object with null prototype".into(),
+                        ));
+                    }
+                };
+                let receiver = activation.receiver(function)?;
+                // If the resolved slot is an accessor, call its setter with
+                // `this` as the receiver. Otherwise, perform a regular
+                // [[Set]] on `this` (not on the base) — this is how
+                // OrdinaryObject [[Set]] with receiver=this behaves for
+                // classes.
+                match runtime.property_lookup(base, property)? {
+                    Some(lookup) => match lookup.value() {
+                        PropertyValue::Accessor { setter, .. } => {
+                            runtime.call_callable_for_accessor(setter, receiver, &[value])?;
+                        }
+                        PropertyValue::Data { .. } => {
+                            let receiver_handle =
+                                runtime.property_base_object_handle(receiver)?;
+                            runtime.objects.set_property(receiver_handle, property, value)?;
+                        }
+                    },
+                    None => {
+                        let receiver_handle = runtime.property_base_object_handle(receiver)?;
+                        runtime.objects.set_property(receiver_handle, property, value)?;
+                    }
                 }
                 activation.advance();
                 Ok(StepOutcome::Continue)

@@ -32,6 +32,12 @@ pub enum SourceLoweringError {
     TooManyLocals,
     /// Lowering to bytecode/module form failed.
     Lowering(lowering::LoweringError),
+    /// ECMAScript static-semantics early error (equivalent to a parse-phase
+    /// SyntaxError). Emitted for constraints the oxc parser does not enforce
+    /// on its own — e.g. `eval`/`arguments` in strict-mode formal parameters
+    /// (§15.1), or a `"use strict"` directive on a function body whose
+    /// FormalParameters are not a SimpleParameterList (§15.2.1.1).
+    EarlyError(String),
 }
 
 impl std::fmt::Display for SourceLoweringError {
@@ -55,6 +61,7 @@ impl std::fmt::Display for SourceLoweringError {
                 f.write_str("source exceeded the local-slot limit of the new VM subset")
             }
             Self::Lowering(error) => error.fmt(f),
+            Self::EarlyError(message) => write!(f, "SyntaxError: {message}"),
         }
     }
 }

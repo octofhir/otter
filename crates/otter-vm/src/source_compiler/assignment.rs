@@ -20,6 +20,28 @@ impl<'a> FunctionCompiler<'a> {
                     self.assign_to_name(identifier.name.as_str(), value)
                 }
                 AssignmentTarget::ComputedMemberExpression(member) => {
+                    // §13.3.7 — `super[key] = value`.
+                    if matches!(&member.object, Expression::Super(_)) {
+                        let key = self.compile_expression(&member.expression, module)?;
+                        let key = if key.is_temp {
+                            self.stabilize_binding_value(key)?
+                        } else {
+                            key
+                        };
+                        let value = self.compile_expression(&assignment.right, module)?;
+                        let value = if value.is_temp {
+                            self.stabilize_binding_value(value)?
+                        } else {
+                            value
+                        };
+                        self.instructions
+                            .push(Instruction::set_super_property_computed(
+                                value.register,
+                                key.register,
+                            ));
+                        self.release(key);
+                        return Ok(value);
+                    }
                     let object = self.compile_expression(&member.object, module)?;
                     let object = if object.is_temp {
                         self.stabilize_binding_value(object)?
@@ -31,6 +53,20 @@ impl<'a> FunctionCompiler<'a> {
                     Ok(value)
                 }
                 AssignmentTarget::StaticMemberExpression(member) => {
+                    // §13.3.7 — `super.foo = value`.
+                    if matches!(&member.object, Expression::Super(_)) {
+                        let property =
+                            self.intern_property_name(member.property.name.as_str())?;
+                        let value = self.compile_expression(&assignment.right, module)?;
+                        let value = if value.is_temp {
+                            self.stabilize_binding_value(value)?
+                        } else {
+                            value
+                        };
+                        self.instructions
+                            .push(Instruction::set_super_property(value.register, property));
+                        return Ok(value);
+                    }
                     let object = self.compile_expression(&member.object, module)?;
                     let object = if object.is_temp {
                         self.stabilize_binding_value(object)?

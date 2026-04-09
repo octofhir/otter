@@ -198,7 +198,7 @@ fn function_class_descriptor() -> JsClassDescriptor {
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
 fn function_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -227,6 +227,26 @@ fn function_constructor(
     // §20.2.1.1 Step 5-8: Build the source text and compile.
     let source = format!("(function anonymous({params}) {{\n{body}\n}})");
     let result = runtime.eval_source(&source, false, false)?;
+
+    // §10.1.13 OrdinaryCreateFromConstructor — when the Function constructor
+    // is reached via `super(...)` from a derived class, rewrite the freshly
+    // compiled closure's `[[Prototype]]` to `newTarget.prototype` so
+    // `class X extends Function {}; new X()` ends up with
+    // `Object.getPrototypeOf(inst) === X.prototype`.
+    if let Some(handle) = result.as_object_handle().map(ObjectHandle) {
+        let default_proto = runtime.intrinsics().function_prototype();
+        let target = runtime.subclass_prototype_or_default(*this, default_proto);
+        if target != default_proto {
+            runtime
+                .objects_mut()
+                .set_prototype(handle, Some(target))
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("Function subclass prototype install failed: {error:?}").into(),
+                    )
+                })?;
+        }
+    }
 
     Ok(result)
 }

@@ -147,7 +147,7 @@ fn install_weakref(
 /// 4. Set weakRef.[[WeakRefTarget]] to target.
 /// 5. Return weakRef.
 fn weakref_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -163,7 +163,10 @@ fn weakref_constructor(
             VmNativeCallError::Internal("WeakRef target must be an object".into()),
         )
     })?;
-    let prototype = Some(runtime.intrinsics().weakref_prototype);
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
+    let prototype = Some(
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakref_prototype),
+    );
     let handle = runtime
         .objects_mut()
         .alloc_weakref(prototype, target_handle);

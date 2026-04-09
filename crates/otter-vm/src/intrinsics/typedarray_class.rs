@@ -578,11 +578,35 @@ fn typed_array_base_constructor(
 macro_rules! concrete_typed_array_constructor {
     ($name:ident, $kind:expr) => {
         fn $name(
-            _this: &RegisterValue,
+            this: &RegisterValue,
             args: &[RegisterValue],
             runtime: &mut crate::interpreter::RuntimeState,
         ) -> Result<RegisterValue, VmNativeCallError> {
-            typed_array_construct($kind, args, runtime)
+            let result = typed_array_construct($kind, args, runtime)?;
+            // §10.1.13 OrdinaryCreateFromConstructor — if this constructor
+            // call came from a derived class via `super(...)`, honour
+            // `newTarget.prototype` by overriding the just-allocated
+            // TypedArray's [[Prototype]]. The default shared allocator
+            // always installs the builtin `%TypedArrayKindPrototype%`.
+            if let Some(handle) = result.as_object_handle().map(ObjectHandle) {
+                let default_proto = runtime
+                    .intrinsics()
+                    .typed_array_constructor_prototype($kind)
+                    .1;
+                let target = runtime.subclass_prototype_or_default(*this, default_proto);
+                if target != default_proto {
+                    runtime
+                        .objects_mut()
+                        .set_prototype(handle, Some(target))
+                        .map_err(|error| {
+                            VmNativeCallError::Internal(
+                                format!("TypedArray subclass prototype install failed: {error:?}")
+                                    .into(),
+                            )
+                        })?;
+                }
+            }
+            Ok(result)
         }
     };
 }

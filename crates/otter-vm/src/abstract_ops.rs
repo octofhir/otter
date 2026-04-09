@@ -93,11 +93,7 @@ pub fn to_property_key(
 ) -> Result<PropertyNameId, VmNativeCallError> {
     let primitive = runtime
         .js_to_primitive_with_hint(value, crate::interpreter::ToPrimitiveHint::String)
-        .map_err(|error| {
-            VmNativeCallError::Internal(
-                format!("ToPropertyKey primitive coercion failed: {error}").into(),
-            )
-        })?;
+        .map_err(|error| interpreter_error_to_thrown(runtime, error, "ToPropertyKey"))?;
 
     if let Some(symbol_id) = primitive.as_symbol_id() {
         return Ok(runtime.intern_symbol_property_name(symbol_id));
@@ -111,9 +107,33 @@ fn to_property_key_string(
     runtime: &mut RuntimeState,
     value: RegisterValue,
 ) -> Result<Box<str>, VmNativeCallError> {
-    runtime.js_to_string(value).map_err(|error| {
-        VmNativeCallError::Internal(format!("ToPropertyKey string coercion failed: {error}").into())
-    })
+    runtime
+        .js_to_string(value)
+        .map_err(|error| interpreter_error_to_thrown(runtime, error, "ToPropertyKey"))
+}
+
+/// Translate an `InterpreterError` produced during a ToPrimitive/ToString
+/// step into a JS-visible `VmNativeCallError::Thrown`. Spec abstract ops
+/// (ToPropertyKey, ToString, ToPrimitive) can raise a caller-catchable
+/// TypeError; preserving that error as `Internal` would instead surface it
+/// as an internal "native host call failed" message that cannot be caught
+/// from user code.
+fn interpreter_error_to_thrown(
+    runtime: &mut crate::interpreter::RuntimeState,
+    error: crate::interpreter::InterpreterError,
+    op: &str,
+) -> VmNativeCallError {
+    use crate::interpreter::InterpreterError;
+    match error {
+        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+        InterpreterError::TypeError(message) => match runtime.alloc_type_error(&message) {
+            Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+            Err(_) => VmNativeCallError::Internal(
+                format!("{op}: failed to allocate TypeError: {message}").into(),
+            ),
+        },
+        other => VmNativeCallError::Internal(format!("{op}: {other}").into()),
+    }
 }
 
 /// Compares two BigInt values by their decimal string representation.

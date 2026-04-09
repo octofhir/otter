@@ -312,7 +312,7 @@ fn get_max_byte_length_option(
 /// §25.1.3.1 ArrayBuffer ( length [, options] )
 /// <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
 fn array_buffer_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -340,7 +340,10 @@ fn array_buffer_constructor(
         runtime,
     )?;
 
-    let prototype = Some(runtime.intrinsics().array_buffer_prototype);
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
+    let prototype = Some(
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().array_buffer_prototype),
+    );
     // §25.1.2.1 CreateByteDataBlock — surfaces an `OutOfMemory` ObjectError
     // when the requested byte budget exceeds the configured heap cap. We
     // map it to a catchable `RangeError` here so test262's

@@ -1460,6 +1460,23 @@ impl<'a> FunctionCompiler<'a> {
                 }
             }
             Expression::StaticMemberExpression(member) => {
+                // §13.3.7 SuperProperty call target — `super.foo(args)`.
+                // Looks up `foo` via GetSuperProperty and calls it with
+                // `this` (not `base`) as the receiver.
+                if matches!(&member.object, Expression::Super(_)) {
+                    let this_value = self.compile_this_expression()?;
+                    let this_value = if this_value.is_temp {
+                        self.stabilize_binding_value(this_value)?
+                    } else {
+                        this_value
+                    };
+                    let callee_register = self.alloc_temp();
+                    let property = self.intern_property_name(member.property.name.as_str())?;
+                    self.record_location(member.span);
+                    self.instructions
+                        .push(Instruction::get_super_property(callee_register, property));
+                    return Ok((ValueLocation::temp(callee_register), Some(this_value)));
+                }
                 let receiver = self.compile_expression(&member.object, module)?;
                 // Stabilize a temp receiver before allocating the callee
                 // register. The bumper's `release` does not enforce LIFO, so
@@ -1483,6 +1500,30 @@ impl<'a> FunctionCompiler<'a> {
                 Ok((ValueLocation::temp(callee_register), Some(receiver)))
             }
             Expression::ComputedMemberExpression(member) => {
+                // §13.3.7 SuperProperty call target — `super[key](args)`.
+                if matches!(&member.object, Expression::Super(_)) {
+                    let key = self.compile_expression(&member.expression, module)?;
+                    let key = if key.is_temp {
+                        self.stabilize_binding_value(key)?
+                    } else {
+                        key
+                    };
+                    let this_value = self.compile_this_expression()?;
+                    let this_value = if this_value.is_temp {
+                        self.stabilize_binding_value(this_value)?
+                    } else {
+                        this_value
+                    };
+                    let callee_register = self.alloc_temp();
+                    self.record_location(member.span);
+                    self.instructions
+                        .push(Instruction::get_super_property_computed(
+                            callee_register,
+                            key.register,
+                        ));
+                    self.release(key);
+                    return Ok((ValueLocation::temp(callee_register), Some(this_value)));
+                }
                 let mut receiver = self.compile_expression(&member.object, module)?;
                 if receiver.is_temp {
                     receiver = self.stabilize_binding_value(receiver)?;
@@ -2037,6 +2078,16 @@ impl<'a> FunctionCompiler<'a> {
         member: &StaticMemberExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // §13.3.7 SuperProperty — `super.foo` inside a method.
+        // Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+        if matches!(&member.object, Expression::Super(_)) {
+            let property = self.intern_property_name(member.property.name.as_str())?;
+            let result = ValueLocation::temp(self.alloc_temp());
+            self.record_location(member.span);
+            self.instructions
+                .push(Instruction::get_super_property(result.register, property));
+            return Ok(result);
+        }
         let object = self.compile_expression(&member.object, module)?;
         let result = if object.is_temp {
             object
@@ -2065,6 +2116,19 @@ impl<'a> FunctionCompiler<'a> {
         member: &ComputedMemberExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // §13.3.7 SuperProperty — `super[key]` inside a method.
+        if matches!(&member.object, Expression::Super(_)) {
+            let key = self.compile_expression(&member.expression, module)?;
+            let result = ValueLocation::temp(self.alloc_temp());
+            self.record_location(member.span);
+            self.instructions
+                .push(Instruction::get_super_property_computed(
+                    result.register,
+                    key.register,
+                ));
+            self.release(key);
+            return Ok(result);
+        }
         let mut object = self.compile_expression(&member.object, module)?;
         if object.is_temp {
             object = self.stabilize_binding_value(object)?;

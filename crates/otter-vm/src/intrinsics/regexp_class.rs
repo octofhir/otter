@@ -745,7 +745,9 @@ fn regexp_constructor(
     // installs `lastIndex` as a spec-compliant data property
     // (writable, non-enumerable, non-configurable), so there is no
     // separate `set_last_index` call required here.
-    let prototype = runtime.intrinsics().regexp_prototype;
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().regexp_prototype);
     let handle = runtime.alloc_regexp(&pattern, &canonical_flags, Some(prototype));
 
     Ok(RegisterValue::from_object_handle(handle.0))

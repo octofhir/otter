@@ -394,6 +394,60 @@ pub enum Opcode {
     /// (ES2024 §15.10.2 HasCallInTailPosition).
     /// Spec: <https://tc39.es/ecma262/#sec-tail-position-calls>
     TailCallClosure = 0x78,
+
+    /// §15.4.5 MethodDefinitionEvaluation for class methods — install a data
+    /// method on the class prototype (or constructor) using
+    /// `[[DefineOwnProperty]]` with `{ [[Writable]]: true, [[Enumerable]]: false,
+    /// [[Configurable]]: true }`.
+    /// `DefineClassMethod obj, method, property_name_id`
+    /// Unlike `SetProperty`, this bypasses inherited setters and sets
+    /// `[[Enumerable]]: false` as required for class bodies (§15.7.14 step 28).
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
+    DefineClassMethod = 0x79,
+    /// Computed-key variant of `DefineClassMethod`.
+    /// `DefineClassMethodComputed obj, key, method`
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
+    DefineClassMethodComputed = 0x7A,
+    /// Define a non-enumerable named getter on a class prototype/constructor.
+    /// `DefineClassGetter obj, getter, property_name_id`
+    /// Same as `DefineNamedGetter` but with `[[Enumerable]]: false`.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    DefineClassGetter = 0x7B,
+    /// Define a non-enumerable named setter on a class prototype/constructor.
+    /// `DefineClassSetter obj, setter, property_name_id`
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    DefineClassSetter = 0x7C,
+    /// Computed-key variant of `DefineClassGetter`.
+    /// `DefineClassGetterComputed obj, key, getter`
+    DefineClassGetterComputed = 0x7D,
+    /// Computed-key variant of `DefineClassSetter`.
+    /// `DefineClassSetterComputed obj, key, setter`
+    DefineClassSetterComputed = 0x7E,
+
+    /// §10.2.5 MakeMethod — set `[[HomeObject]]` on a method closure so that
+    /// `super.foo` / `super[x]` inside the method resolves against
+    /// `HomeObject.[[Prototype]]`.
+    /// `SetHomeObject closure, home_object`
+    /// Spec: <https://tc39.es/ecma262/#sec-makemethod>
+    SetHomeObject = 0x7F,
+    /// §13.3.7.1 GetValue of a super reference with a named property.
+    /// `GetSuperProperty dst, property_name_id`
+    /// Reads the current closure's `[[HomeObject]]`, walks its prototype,
+    /// and performs `[[Get]](base, property, this)` with the active
+    /// `this` as receiver.
+    /// Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+    GetSuperProperty = 0x80,
+    /// Computed-key variant of `GetSuperProperty`.
+    /// `GetSuperPropertyComputed dst, key`
+    GetSuperPropertyComputed = 0x81,
+    /// §13.3.7.1 PutValue of a super reference with a named property.
+    /// `SetSuperProperty value, property_name_id`
+    /// Performs `[[Set]](base, property, value, this)` where `base` is
+    /// `HomeObject.[[Prototype]]` and `this` is the active receiver.
+    SetSuperProperty = 0x82,
+    /// Computed-key variant of `SetSuperProperty`.
+    /// `SetSuperPropertyComputed value, key`
+    SetSuperPropertyComputed = 0x83,
 }
 
 impl Opcode {
@@ -507,6 +561,17 @@ impl Opcode {
             0x76 => Some(Self::Exp),
             0x77 => Some(Self::CallEval),
             0x78 => Some(Self::TailCallClosure),
+            0x79 => Some(Self::DefineClassMethod),
+            0x7A => Some(Self::DefineClassMethodComputed),
+            0x7B => Some(Self::DefineClassGetter),
+            0x7C => Some(Self::DefineClassSetter),
+            0x7D => Some(Self::DefineClassGetterComputed),
+            0x7E => Some(Self::DefineClassSetterComputed),
+            0x7F => Some(Self::SetHomeObject),
+            0x80 => Some(Self::GetSuperProperty),
+            0x81 => Some(Self::GetSuperPropertyComputed),
+            0x82 => Some(Self::SetSuperProperty),
+            0x83 => Some(Self::SetSuperPropertyComputed),
             _ => None,
         }
     }
@@ -1027,6 +1092,153 @@ impl Instruction {
         setter: BytecodeRegister,
     ) -> Self {
         Self::encode_abc(Opcode::DefineComputedSetter, object, key, setter)
+    }
+
+    /// §15.4.5 Installs a data method on a class prototype/constructor with
+    /// `{ writable: true, enumerable: false, configurable: true }` using
+    /// `[[DefineOwnProperty]]`.
+    #[must_use]
+    pub const fn define_class_method(
+        object: BytecodeRegister,
+        method: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineClassMethod,
+            object,
+            method,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Computed-key variant of `define_class_method`.
+    #[must_use]
+    pub const fn define_class_method_computed(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        method: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineClassMethodComputed, object, key, method)
+    }
+
+    /// Defines a non-enumerable named getter accessor on a class prototype/constructor.
+    #[must_use]
+    pub const fn define_class_getter(
+        object: BytecodeRegister,
+        getter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineClassGetter,
+            object,
+            getter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Defines a non-enumerable named setter accessor on a class prototype/constructor.
+    #[must_use]
+    pub const fn define_class_setter(
+        object: BytecodeRegister,
+        setter: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::DefineClassSetter,
+            object,
+            setter,
+            BytecodeRegister::new(property.0),
+        )
+    }
+
+    /// Computed-key variant of `define_class_getter`.
+    #[must_use]
+    pub const fn define_class_getter_computed(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        getter: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineClassGetterComputed, object, key, getter)
+    }
+
+    /// Computed-key variant of `define_class_setter`.
+    #[must_use]
+    pub const fn define_class_setter_computed(
+        object: BytecodeRegister,
+        key: BytecodeRegister,
+        setter: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(Opcode::DefineClassSetterComputed, object, key, setter)
+    }
+
+    /// §10.2.5 MakeMethod — install a closure's `[[HomeObject]]`.
+    #[must_use]
+    pub const fn set_home_object(
+        closure: BytecodeRegister,
+        home: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetHomeObject,
+            closure,
+            home,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §13.3.7 Reads a named `super.property` reference.
+    #[must_use]
+    pub const fn get_super_property(
+        dst: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::GetSuperProperty,
+            dst,
+            BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §13.3.7 Reads a computed `super[key]` reference.
+    #[must_use]
+    pub const fn get_super_property_computed(
+        dst: BytecodeRegister,
+        key: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::GetSuperPropertyComputed,
+            dst,
+            key,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §13.3.7 Writes a named `super.property = value`.
+    #[must_use]
+    pub const fn set_super_property(
+        value: BytecodeRegister,
+        property: PropertyNameId,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetSuperProperty,
+            value,
+            BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §13.3.7 Writes a computed `super[key] = value`.
+    #[must_use]
+    pub const fn set_super_property_computed(
+        value: BytecodeRegister,
+        key: BytecodeRegister,
+    ) -> Self {
+        Self::encode_abc(
+            Opcode::SetSuperPropertyComputed,
+            value,
+            key,
+            BytecodeRegister::new(0),
+        )
     }
 
     /// Copies enumerable own properties from source to target using `[[DefineOwnProperty]]`.

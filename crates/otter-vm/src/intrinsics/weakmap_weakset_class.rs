@@ -133,12 +133,13 @@ fn install_weakmap(
 /// WeakMap([ iterable ])
 /// Spec: <https://tc39.es/ecma262/#sec-weakmap-iterable>
 fn weakmap_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = Some(runtime.intrinsics().weakmap_prototype);
-    let handle = runtime.objects_mut().alloc_weakmap(prototype);
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakmap_prototype);
+    let handle = runtime.objects_mut().alloc_weakmap(Some(prototype));
 
     // If iterable argument provided, add entries.
     if let Some(iterable) = args.first().copied()
@@ -333,12 +334,13 @@ fn install_weakset(
 /// WeakSet([ iterable ])
 /// Spec: <https://tc39.es/ecma262/#sec-weakset-iterable>
 fn weakset_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = Some(runtime.intrinsics().weakset_prototype);
-    let handle = runtime.objects_mut().alloc_weakset(prototype);
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakset_prototype);
+    let handle = runtime.objects_mut().alloc_weakset(Some(prototype));
 
     if let Some(iterable) = args.first().copied()
         && iterable != RegisterValue::undefined()

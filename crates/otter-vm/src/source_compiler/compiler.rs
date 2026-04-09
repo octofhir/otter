@@ -142,10 +142,25 @@ impl<'a> FunctionCompiler<'a> {
             None
         };
 
+        // §15.1 — Additional early errors: in strict mode it is a SyntaxError
+        // if any BoundNames element is "eval" or "arguments". Applies to every
+        // formal parameter binding, including those inside destructuring and
+        // rest patterns. (oxc's parser does not flag this on its own.)
+        let reject_strict_reserved_name =
+            |name: &str, strict: bool| -> Result<(), SourceLoweringError> {
+                if strict && (name == "eval" || name == "arguments") {
+                    return Err(SourceLoweringError::EarlyError(format!(
+                        "`{name}` cannot be used as a formal parameter name in strict mode"
+                    )));
+                }
+                Ok(())
+            };
+
         for param in params {
             if param.is_rest {
                 let register = self.allocate_local()?;
                 if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                    reject_strict_reserved_name(name, self.strict_mode)?;
                     if let Some(ref mut seen) = seen_names
                         && !seen.insert(name.to_string())
                     {
@@ -169,6 +184,7 @@ impl<'a> FunctionCompiler<'a> {
                 .ok_or(SourceLoweringError::TooManyLocals)?;
             self.next_local = self.parameter_count;
             if let Some(name) = identifier_name_for_parameter_pattern(param.pattern) {
+                reject_strict_reserved_name(name, self.strict_mode)?;
                 if let Some(ref mut seen) = seen_names
                     && !seen.insert(name.to_string())
                 {
@@ -987,6 +1003,21 @@ impl<'a> FunctionCompiler<'a> {
                 .push(Instruction::alloc_class_id(constructor_value.register));
         }
 
+        // §10.2.5 MakeMethod — set `[[HomeObject]]` on the class constructor
+        // so that `super.foo` inside the constructor body resolves against
+        // `prototype.[[Prototype]]` (which is `SuperClass.prototype`).
+        // Static methods and the constructor itself share the constructor
+        // as their HomeObject: per spec the static part of a derived class
+        // has `home_object = constructor`, so `super.foo` in a static method
+        // walks from `constructor.[[Prototype]]` (the parent class
+        // constructor). The instance constructor uses `prototype` as its
+        // HomeObject so instance `super.foo` resolves against
+        // `prototype.[[Prototype]]`.
+        self.instructions.push(Instruction::set_home_object(
+            constructor_value.register,
+            prototype.register,
+        ));
+
         // ── Second pass: install methods ────────────────────────────────────
         // §15.7.14 ClassDefinitionEvaluation step 26–28.
         for element in &class.body.body {
@@ -1329,13 +1360,27 @@ impl<'a> FunctionCompiler<'a> {
         } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
-            self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+            // §15.4.4 — private methods are MethodDefinitions; no own .prototype.
+            self.emit_new_closure_method(method_closure.register, reserved, &compiled.captures)?;
         }
 
         // Propagate class_id so the method can resolve private names.
         self.instructions.push(Instruction::copy_class_id(
             method_closure.register,
             constructor_value.register,
+        ));
+
+        // §10.2.5 MakeMethod — set `[[HomeObject]]` so `super.foo` inside the
+        // private method body resolves correctly. Static private methods
+        // use the constructor; instance private methods use the prototype.
+        let home_register = if method.r#static {
+            constructor_value.register
+        } else {
+            prototype.register
+        };
+        self.instructions.push(Instruction::set_home_object(
+            method_closure.register,
+            home_register,
         ));
 
         let prop_id = self.intern_property_name(private_name)?;
@@ -1564,6 +1609,18 @@ impl<'a> FunctionCompiler<'a> {
         let function = &method.value;
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
+        // §15.2.1.1 / §15.4.1 MethodDefinition Static Semantics: Early Errors —
+        // It is a SyntaxError if `FunctionBody` Contains `"use strict"` and
+        // `IsSimpleParameterList(FormalParameters)` is false.
+        if let Some(body) = function.body.as_ref()
+            && super::ast::has_use_strict_directive(&body.directives)
+            && !super::ast::is_simple_parameter_list(&params)
+        {
+            return Err(SourceLoweringError::EarlyError(format!(
+                "Illegal 'use strict' directive in function `{}` with non-simple parameter list",
+                display_name.as_deref().unwrap_or("<anonymous>")
+            )));
+        }
         let kind = if method.value.generator && method.value.r#async {
             super::shared::FunctionKind::AsyncGenerator
         } else if method.value.generator {
@@ -1604,26 +1661,42 @@ impl<'a> FunctionCompiler<'a> {
         } else if kind.is_async() {
             self.emit_new_closure_async(method_closure.register, reserved, &compiled.captures)?;
         } else {
-            self.emit_new_closure(method_closure.register, reserved, &compiled.captures)?;
+            // §15.4.4 — class methods, getters, and setters are
+            // MethodDefinitions and must not be constructors (§10.2 MakeMethod).
+            // Use the method closure flag so no own `.prototype` is installed.
+            self.emit_new_closure_method(method_closure.register, reserved, &compiled.captures)?;
         }
 
+        // §10.2.5 MakeMethod — set `[[HomeObject]]` on the method closure so
+        // that subsequent `super.foo` / `super[x]` references inside the body
+        // resolve against `HomeObject.[[Prototype]]`. `target` is the
+        // prototype for instance members or the constructor for static
+        // members, which is exactly what the spec wants.
+        self.instructions.push(Instruction::set_home_object(
+            method_closure.register,
+            target.register,
+        ));
+
         // Install on target: getter, setter, or data method.
+        // §15.7.14 ClassDefinitionEvaluation step 28 — class methods have
+        // `[[Enumerable]]: false` and are installed via `[[DefineOwnProperty]]`.
         match method.kind {
             MethodDefinitionKind::Get => {
                 if method.computed {
                     let key = self.compile_expression(method.key.to_expression(), module)?;
-                    self.instructions.push(Instruction::define_computed_getter(
-                        target.register,
-                        key.register,
-                        method_closure.register,
-                    ));
+                    self.instructions
+                        .push(Instruction::define_class_getter_computed(
+                            target.register,
+                            key.register,
+                            method_closure.register,
+                        ));
                     self.release(key);
                 } else {
                     let name = method_name.as_ref().ok_or_else(|| {
                         SourceLoweringError::Unsupported("unnamed class getter".to_string())
                     })?;
                     let prop = self.intern_property_name(name)?;
-                    self.instructions.push(Instruction::define_named_getter(
+                    self.instructions.push(Instruction::define_class_getter(
                         target.register,
                         method_closure.register,
                         prop,
@@ -1633,18 +1706,19 @@ impl<'a> FunctionCompiler<'a> {
             MethodDefinitionKind::Set => {
                 if method.computed {
                     let key = self.compile_expression(method.key.to_expression(), module)?;
-                    self.instructions.push(Instruction::define_computed_setter(
-                        target.register,
-                        key.register,
-                        method_closure.register,
-                    ));
+                    self.instructions
+                        .push(Instruction::define_class_setter_computed(
+                            target.register,
+                            key.register,
+                            method_closure.register,
+                        ));
                     self.release(key);
                 } else {
                     let name = method_name.as_ref().ok_or_else(|| {
                         SourceLoweringError::Unsupported("unnamed class setter".to_string())
                     })?;
                     let prop = self.intern_property_name(name)?;
-                    self.instructions.push(Instruction::define_named_setter(
+                    self.instructions.push(Instruction::define_class_setter(
                         target.register,
                         method_closure.register,
                         prop,
@@ -1654,18 +1728,19 @@ impl<'a> FunctionCompiler<'a> {
             MethodDefinitionKind::Method => {
                 if method.computed {
                     let key = self.compile_expression(method.key.to_expression(), module)?;
-                    self.instructions.push(Instruction::set_index(
-                        target.register,
-                        key.register,
-                        method_closure.register,
-                    ));
+                    self.instructions
+                        .push(Instruction::define_class_method_computed(
+                            target.register,
+                            key.register,
+                            method_closure.register,
+                        ));
                     self.release(key);
                 } else {
                     let name = method_name.as_ref().ok_or_else(|| {
                         SourceLoweringError::Unsupported("unnamed class method".to_string())
                     })?;
                     let prop = self.intern_property_name(name)?;
-                    self.instructions.push(Instruction::set_property(
+                    self.instructions.push(Instruction::define_class_method(
                         target.register,
                         method_closure.register,
                         prop,
@@ -2595,6 +2670,23 @@ impl<'a> FunctionCompiler<'a> {
             callee,
             explicit_captures,
             crate::object::ClosureFlags::arrow(),
+        )
+    }
+
+    /// §15.4.4 MethodDefinition — class/object-literal method, getter, or
+    /// setter. Not a constructor and has no `.prototype` own property.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-methoddefinitionevaluation>
+    pub(super) fn emit_new_closure_method(
+        &mut self,
+        destination: BytecodeRegister,
+        callee: FunctionIndex,
+        explicit_captures: &[CaptureSource],
+    ) -> Result<(), SourceLoweringError> {
+        self.emit_new_closure_with_flags(
+            destination,
+            callee,
+            explicit_captures,
+            crate::object::ClosureFlags::method(),
         )
     }
 

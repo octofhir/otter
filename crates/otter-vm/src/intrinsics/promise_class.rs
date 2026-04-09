@@ -167,7 +167,7 @@ fn alloc_promise_capability(runtime: &mut RuntimeState) -> PromiseCapability {
 /// 4. If executor throws, reject the promise with the thrown value.
 /// 5. Returns the promise.
 fn promise_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -182,7 +182,10 @@ fn promise_constructor(
         })?;
 
     // §27.2.3 step 3-6: Create promise and capability.
-    let capability = alloc_promise_capability(runtime);
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
+    let proto =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().promise_prototype());
+    let capability = alloc_promise_capability_with_proto(runtime, proto);
     let resolve_rv = RegisterValue::from_object_handle(capability.resolve.0);
     let reject_rv = RegisterValue::from_object_handle(capability.reject.0);
 

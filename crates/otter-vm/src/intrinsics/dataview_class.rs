@@ -280,7 +280,7 @@ fn require_not_detached(
 /// §25.3.2.1 DataView ( buffer, byteOffset, byteLength )
 /// <https://tc39.es/ecma262/#sec-dataview-constructor>
 fn data_view_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -388,7 +388,10 @@ fn data_view_constructor(
         Some(view_byte_length)
     };
 
-    let prototype = Some(runtime.intrinsics().data_view_prototype);
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
+    let prototype = Some(
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().data_view_prototype),
+    );
     let handle = runtime
         .objects_mut()
         .alloc_data_view(buffer, offset, byte_length, prototype);

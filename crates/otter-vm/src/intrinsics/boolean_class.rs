@@ -92,7 +92,11 @@ fn boolean_constructor(
     ));
 
     if this.as_object_handle().is_some() {
-        box_boolean_object(primitive, runtime)
+        box_boolean_object_with_prototype(
+            primitive,
+            runtime.subclass_prototype_or_default(*this, runtime.intrinsics().boolean_prototype()),
+            runtime,
+        )
     } else {
         Ok(primitive)
     }
@@ -220,8 +224,20 @@ pub(crate) fn box_boolean_object(
     primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let wrapper =
-        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().boolean_prototype()));
+    let proto = runtime.intrinsics().boolean_prototype();
+    box_boolean_object_with_prototype(primitive, proto, runtime)
+}
+
+/// Variant of `box_boolean_object` that installs a caller-specified prototype.
+/// Used by the `Boolean` constructor to honour `newTarget.prototype` via
+/// §10.1.13 OrdinaryCreateFromConstructor when invoked through
+/// `super(...)` from a derived class.
+pub(crate) fn box_boolean_object_with_prototype(
+    primitive: RegisterValue,
+    prototype: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let wrapper = runtime.alloc_object_with_prototype(Some(prototype));
     set_boolean_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }

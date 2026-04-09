@@ -294,11 +294,24 @@ fn array_class_descriptor() -> JsClassDescriptor {
 }
 
 fn array_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let array = runtime.alloc_array();
+    // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`
+    // so `class X extends Array {}` + `new X()` produces an instance with
+    // `Object.getPrototypeOf(inst) === X.prototype`.
+    let prototype = runtime
+        .subclass_prototype_or_default(*this, runtime.intrinsics().array_prototype());
+    runtime
+        .objects_mut()
+        .set_prototype(array, Some(prototype))
+        .map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("Array constructor prototype install failed: {error:?}").into(),
+            )
+        })?;
 
     if let [length] = args {
         if let Some(length) = length.as_i32() {

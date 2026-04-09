@@ -242,7 +242,11 @@ fn number_constructor(
     };
 
     if this.as_object_handle().is_some() {
-        box_number_object(primitive, runtime)
+        box_number_object_with_prototype(
+            primitive,
+            runtime.subclass_prototype_or_default(*this, runtime.intrinsics().number_prototype()),
+            runtime,
+        )
     } else {
         Ok(primitive)
     }
@@ -862,8 +866,19 @@ pub(crate) fn box_number_object(
     primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let wrapper =
-        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().number_prototype()));
+    let proto = runtime.intrinsics().number_prototype();
+    box_number_object_with_prototype(primitive, proto, runtime)
+}
+
+/// Variant of `box_number_object` that installs a caller-specified prototype.
+/// Used by the `Number` constructor to honour `newTarget.prototype` via
+/// §10.1.13 OrdinaryCreateFromConstructor.
+pub(crate) fn box_number_object_with_prototype(
+    primitive: RegisterValue,
+    prototype: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let wrapper = runtime.alloc_object_with_prototype(Some(prototype));
     set_number_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }

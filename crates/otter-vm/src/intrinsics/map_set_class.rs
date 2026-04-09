@@ -152,12 +152,13 @@ fn install_map(
 }
 
 fn map_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = Some(runtime.intrinsics().map_prototype);
-    let handle = runtime.objects_mut().alloc_map(prototype);
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().map_prototype);
+    let handle = runtime.objects_mut().alloc_map(Some(prototype));
 
     // If iterable argument provided, add entries.
     if let Some(iterable) = args.first().copied()
@@ -470,12 +471,13 @@ fn install_set(
 }
 
 fn set_constructor(
-    _this: &RegisterValue,
+    this: &RegisterValue,
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = Some(runtime.intrinsics().set_prototype);
-    let handle = runtime.objects_mut().alloc_set(prototype);
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().set_prototype);
+    let handle = runtime.objects_mut().alloc_set(Some(prototype));
 
     if let Some(iterable) = args.first().copied()
         && iterable != RegisterValue::undefined()

@@ -9042,6 +9042,19 @@ impl Interpreter {
                         Some(callee),
                         arguments.clone(),
                     );
+
+                    // §15.8.3 step 1-2: Run param init eagerly. The implicit
+                    // initial yield suspends after param init is complete.
+                    match Self::run_async_generator_param_init(runtime, gen_handle) {
+                        Ok(()) => {}
+                        Err(VmNativeCallError::Thrown(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(VmNativeCallError::Internal(msg)) => {
+                            return Err(InterpreterError::NativeCall(msg));
+                        }
+                    }
+
                     activation.write_bytecode_register(
                         function,
                         instruction.a(),
@@ -10848,6 +10861,128 @@ impl Interpreter {
                     runtime.restore_module(previous_module);
                     let result = runtime.create_iter_result(yielded_value, false)?;
                     return Ok(RegisterValue::from_object_handle(result.0));
+                }
+            }
+        }
+    }
+
+    /// §15.8.3 — Eagerly execute async generator param init (FDI).
+    ///
+    /// Runs the async generator from PC 0 until the implicit initial Yield
+    /// (emitted after parameter initialization). If param init throws, the
+    /// error propagates to the caller. Otherwise the generator transitions
+    /// from SuspendedStart to SuspendedYield with params initialized.
+    fn run_async_generator_param_init(
+        runtime: &mut RuntimeState,
+        generator: ObjectHandle,
+    ) -> Result<(), VmNativeCallError> {
+        use crate::object::GeneratorState;
+
+        let (module, function_index, closure_handle, arguments, _saved, _pc, _resume) = runtime
+            .objects
+            .async_generator_take_state(generator)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("async gen param init take state: {e:?}").into(),
+                )
+            })?;
+
+        let function = module
+            .function(function_index)
+            .ok_or_else(|| {
+                VmNativeCallError::Internal("async gen param init: missing function".into())
+            })?
+            .clone();
+
+        let register_count = function.frame_layout().register_count();
+        let mut act = Activation::with_context(
+            function_index,
+            register_count,
+            FrameMetadata::new(arguments.len() as u16, FrameFlags::empty()),
+            closure_handle,
+        );
+        let param_count = function.frame_layout().parameter_count();
+        for (i, &arg) in arguments.iter().enumerate() {
+            if i >= param_count as usize {
+                break;
+            }
+            let _ = act.write_bytecode_register(&function, i as u16, arg);
+        }
+
+        let interp = Interpreter::for_runtime(runtime);
+        let previous_module = runtime.enter_module(&module);
+        let mut frame_runtime = FrameRuntimeState::new(&function);
+
+        loop {
+            act.begin_step();
+            let outcome = match interp.step(
+                &function,
+                &module,
+                &mut act,
+                runtime,
+                &mut frame_runtime,
+            ) {
+                Ok(o) => o,
+                Err(InterpreterError::UncaughtThrow(v)) => StepOutcome::Throw(v),
+                Err(e) => {
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Err(VmNativeCallError::Internal(
+                        format!("async gen param init error: {e:?}").into(),
+                    ));
+                }
+            };
+
+            match outcome {
+                StepOutcome::Continue => {
+                    act.sync_written_open_upvalues(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                    act.refresh_open_upvalues_from_cells(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                }
+                StepOutcome::GeneratorYield { resume_register, .. } => {
+                    // Hit the implicit initial yield — save state.
+                    let saved_regs = act.save_registers();
+                    let pc = act.pc();
+                    runtime
+                        .objects
+                        .async_generator_save_state(generator, saved_regs, pc, resume_register)
+                        .map_err(|e| {
+                            VmNativeCallError::Internal(
+                                format!("async gen save state: {e:?}").into(),
+                            )
+                        })?;
+                    runtime.restore_module(previous_module);
+                    return Ok(());
+                }
+                StepOutcome::Throw(value) => {
+                    if interp.transfer_exception(&function, &mut act, value) {
+                        continue;
+                    }
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Err(VmNativeCallError::Thrown(value));
+                }
+                StepOutcome::Return(_) => {
+                    // Generator completed during param init (unlikely but handle it)
+                    runtime.restore_module(previous_module);
+                    runtime
+                        .objects
+                        .set_async_generator_state(generator, GeneratorState::Completed)
+                        .ok();
+                    return Ok(());
+                }
+                _ => {
+                    runtime.restore_module(previous_module);
+                    return Err(VmNativeCallError::Internal(
+                        "unexpected step outcome in async gen param init".into(),
+                    ));
                 }
             }
         }

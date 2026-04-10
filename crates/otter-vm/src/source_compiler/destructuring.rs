@@ -156,12 +156,26 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     /// Destructure an object pattern `{ a, b: c, d = default }` from `source_register`.
+    /// §14.3.3.2 — RequireObjectCoercible(value) before destructuring.
+    /// Spec: <https://tc39.es/ecma262/#sec-destructuring-binding-patterns-runtime-semantics-bindinginitialization>
     pub(super) fn compile_object_destructuring(
         &mut self,
         pattern: &oxc_ast::ast::ObjectPattern<'_>,
         source_register: BytecodeRegister,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
+        // §14.3.3.2 step 1: RequireObjectCoercible(value).
+        // Throws TypeError if value is null or undefined. For non-empty
+        // patterns this happens naturally during property access, but empty
+        // patterns `{} = null` need an explicit check.
+        // Spec: <https://tc39.es/ecma262/#sec-requireobjectcoercible>
+        if pattern.properties.is_empty() && pattern.rest.is_none() {
+            let tmp = self.alloc_temp();
+            let prop = self.intern_property_name("constructor")?;
+            self.instructions
+                .push(Instruction::get_property(tmp, source_register, prop));
+            self.release(ValueLocation::temp(tmp));
+        }
         let has_rest = pattern.rest.is_some();
         let mut excluded_keys = Vec::with_capacity(pattern.properties.len());
         for prop in &pattern.properties {

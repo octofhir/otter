@@ -244,7 +244,7 @@ impl<'a> ModuleCompiler<'a> {
         // param init so the interpreter can suspend here, separating param init
         // (runs eagerly) from body execution (deferred to first `.next()`).
         // Spec: <https://tc39.es/ecma262/#sec-generatorfunction-definitions-runtime-semantics-evaluategeneratorbody>
-        if kind == FunctionKind::Generator {
+        if kind == FunctionKind::Generator || kind == FunctionKind::AsyncGenerator {
             let resume_reg = compiler.allocate_local()?;
             let undef_reg = compiler.alloc_temp();
             compiler

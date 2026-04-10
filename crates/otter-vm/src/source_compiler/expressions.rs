@@ -748,24 +748,34 @@ impl<'a> FunctionCompiler<'a> {
         update: &oxc_ast::ast::UpdateExpression<'_>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let current = self.compile_identifier(name)?;
+        // §13.4.2 Postfix Increment: save old value BEFORE assignment,
+        // because assign_to_name may mutate the same register (for locals)
+        // and temp LIFO ordering can cause register reuse for upvalues.
+        // Use allocate_local() for old_val so it persists safely.
+        // Spec: <https://tc39.es/ecma262/#sec-postfix-increment-operator>
+        let old_val = if !update.prefix {
+            let reg = self.allocate_local()?;
+            self.instructions
+                .push(Instruction::to_number(reg, current.register));
+            Some(ValueLocation::local(reg))
+        } else {
+            None
+        };
+        let result = self.alloc_temp();
         let delta = match update.operator {
             UpdateOperator::Increment => self.load_i32(1)?,
             UpdateOperator::Decrement => self.load_i32(-1)?,
         };
-        let new_val = ValueLocation::temp(self.alloc_temp());
-        self.instructions.push(Instruction::add(
-            new_val.register,
-            current.register,
-            delta.register,
-        ));
+        self.instructions
+            .push(Instruction::add(result, current.register, delta.register));
         self.release(delta);
+        self.release(current);
+        let new_val = ValueLocation::temp(result);
         let _ = self.assign_to_name(name, new_val)?;
         if update.prefix {
-            self.release(current);
-            Ok(new_val)
+            Ok(ValueLocation::temp(result))
         } else {
-            self.release(new_val);
-            Ok(current)
+            Ok(old_val.unwrap())
         }
     }
 

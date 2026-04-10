@@ -57,9 +57,9 @@ struct Cli {
     #[arg(short = 'n', long)]
     max_tests: Option<usize>,
 
-    /// Timeout per test in milliseconds
-    #[arg(long, default_value = "5000")]
-    timeout: u64,
+    /// Timeout per test in seconds (overrides config `timeout_secs`).
+    #[arg(long)]
+    timeout: Option<u64>,
 
     /// Path for JSONL result log (one TestResult per line — streaming).
     #[arg(long)]
@@ -682,15 +682,13 @@ fn main() {
         }
     }
 
-    // Resolve timeout: CLI flag wins, then config `timeout_secs`, then
-    // the clap default (5000 ms).
-    let timeout_ms = if cli.timeout != 5000 {
-        cli.timeout
-    } else if let Some(secs) = config.timeout_secs {
-        secs.saturating_mul(1000)
-    } else {
-        cli.timeout
-    };
+    // Resolve timeout: CLI flag wins (in seconds), then config `timeout_secs`,
+    // then default 10 seconds.
+    let timeout_secs = cli
+        .timeout
+        .or(config.timeout_secs)
+        .unwrap_or(10);
+    let timeout_ms = timeout_secs.saturating_mul(1000);
 
     // Resolve heap cap the same way.
     let max_heap_bytes = if cli.max_heap_bytes != 536_870_912 {

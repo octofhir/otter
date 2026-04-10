@@ -175,6 +175,17 @@ fn number_to_precision(
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let text = format!("{number:.prec$e}", prec = (p as usize).saturating_sub(1));
+    // Rust uses `e1` for positive exponents; ES requires `e+1`.
+    let text = if let Some(pos) = text.find('e') {
+        let after_e = &text[pos + 1..];
+        if !after_e.starts_with('-') && !after_e.starts_with('+') {
+            format!("{}e+{}", &text[..pos], after_e)
+        } else {
+            text
+        }
+    } else {
+        text
+    };
     // Rust's exponential formatting differs from JS — convert to JS-style.
     // For simplicity, use the precision-based formatting for reasonable ranges.
     let text = if number.abs() < 1e-6 || number.abs() >= 1e21 {
@@ -220,6 +231,17 @@ fn number_to_exponential(
             format!("{number:.prec$e}", prec = f as usize)
         }
         None => format!("{number:e}"),
+    };
+    // Rust uses `e1` for positive exponents; ES requires `e+1`.
+    let text = if let Some(pos) = text.find('e') {
+        let after_e = &text[pos + 1..];
+        if !after_e.starts_with('-') && !after_e.starts_with('+') {
+            format!("{}e+{}", &text[..pos], after_e)
+        } else {
+            text
+        }
+    } else {
+        text
     };
     let handle = runtime.alloc_string(text);
     Ok(RegisterValue::from_object_handle(handle.0))
@@ -380,21 +402,7 @@ fn this_number_value(
 
 /// Formats a number as a decimal string per ES2024 §6.1.6.1.20 Number::toString.
 fn number_to_decimal_string(number: f64) -> String {
-    if number.is_nan() {
-        "NaN".to_string()
-    } else if number == 0.0 {
-        "0".to_string()
-    } else if number.is_infinite() {
-        if number.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if number.fract() == 0.0 && number.abs() < 1e20 {
-        format!("{number:.0}")
-    } else {
-        number.to_string()
-    }
+    crate::abstract_ops::ecma_number_to_string(number)
 }
 
 /// Formats a number as a string in the given radix (2..=36).

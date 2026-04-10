@@ -449,6 +449,14 @@ pub enum Opcode {
     /// `SetSuperPropertyComputed value, key`
     SetSuperPropertyComputed = 0x83,
 
+    /// §15.7.15 — Throw a TypeError for assignment to an immutable class
+    /// name binding at runtime.
+    /// `ThrowConstAssign string_id`
+    /// Allocates `new TypeError("Assignment to constant variable.")` and
+    /// immediately throws it. The `string_id` operand is unused (reserved
+    /// for a future message customization).
+    ThrowConstAssign = 0x85,
+
     /// §13.3.12 MetaProperty — `new.target`.
     /// `LoadNewTarget dst`
     /// For construct calls: returns the `newTarget` from the activation.
@@ -456,6 +464,20 @@ pub enum Opcode {
     /// For all other calls: returns `undefined`.
     /// Spec: <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
     LoadNewTarget = 0x84,
+    /// Store a value to a global variable by name — strict mode variant.
+    /// Throws ReferenceError at runtime if the property does not already exist
+    /// on the global object (i.e. the binding is unresolvable).
+    /// Same encoding as `SetGlobal`: `SetGlobalStrict src, property_name_id`.
+    /// Spec: <https://tc39.es/ecma262/#sec-putvalue> step 5.a
+    SetGlobalStrict = 0x86,
+
+    /// §15.7.14 step 5.f — Assert that a register value is a constructor.
+    /// Throws TypeError if `IsConstructor(value)` is false.
+    /// `AssertConstructor src`
+    /// Emitted during class definition BEFORE `.prototype` access on the
+    /// superclass, so the TypeError fires before any proxy traps.
+    /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+    AssertConstructor = 0x87,
 }
 
 impl Opcode {
@@ -581,6 +603,9 @@ impl Opcode {
             0x82 => Some(Self::SetSuperProperty),
             0x83 => Some(Self::SetSuperPropertyComputed),
             0x84 => Some(Self::LoadNewTarget),
+            0x85 => Some(Self::ThrowConstAssign),
+            0x86 => Some(Self::SetGlobalStrict),
+            0x87 => Some(Self::AssertConstructor),
             _ => None,
         }
     }
@@ -1250,6 +1275,17 @@ impl Instruction {
         )
     }
 
+    /// §15.7.15 Throw TypeError for const assignment at runtime.
+    #[must_use]
+    pub const fn throw_const_assign() -> Self {
+        Self::encode_abc(
+            Opcode::ThrowConstAssign,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
     /// §13.3.12 `new.target` meta-property.
     #[must_use]
     pub const fn load_new_target(dst: BytecodeRegister) -> Self {
@@ -1432,6 +1468,29 @@ impl Instruction {
             Opcode::SetGlobal,
             src,
             BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// Encodes a strict-mode global variable store.
+    /// Throws ReferenceError at runtime if the property does not exist on global.
+    #[must_use]
+    pub const fn set_global_strict(src: BytecodeRegister, property: PropertyNameId) -> Self {
+        Self::encode_abc(
+            Opcode::SetGlobalStrict,
+            src,
+            BytecodeRegister::new(property.0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §15.7.14 step 5.f — Assert value is a constructor.
+    #[must_use]
+    pub const fn assert_constructor(src: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::AssertConstructor,
+            src,
+            BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
     }

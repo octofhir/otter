@@ -183,12 +183,12 @@ fn string_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let coerced = coerce_to_string(
-        args.first()
-            .copied()
-            .unwrap_or_else(RegisterValue::undefined),
-        runtime,
-    )?;
+    // §22.1.1.1 step 1: If no arguments, use the empty string.
+    let coerced = if args.is_empty() {
+        Box::<str>::from("")
+    } else {
+        coerce_to_string(args[0], runtime)?
+    };
     let primitive = runtime.alloc_string(coerced);
 
     if let Some(receiver) = this.as_object_handle().map(ObjectHandle) {
@@ -1708,21 +1708,7 @@ fn f64_to_uint16(n: f64) -> u16 {
 }
 
 fn number_to_string(number: f64) -> String {
-    if number.is_nan() {
-        "NaN".to_string()
-    } else if number.is_infinite() {
-        if number.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if number == 0.0 {
-        "0".to_string()
-    } else if number.fract() == 0.0 {
-        format!("{number:.0}")
-    } else {
-        number.to_string()
-    }
+    crate::abstract_ops::ecma_number_to_string(number)
 }
 
 /// String.prototype\[@@iterator\]()

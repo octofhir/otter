@@ -1177,18 +1177,55 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             None
         };
-        let is_derived = super_class.is_some() && !extends_null;
+        // §15.7.14 — A class with `extends` (including `extends null`) is
+        // derived. `extends null` means the constructor CAN contain `super()`
+        // but the call will throw TypeError at runtime because null is not
+        // a constructor.
+        let is_derived = class.super_class.is_some();
+
+        // §15.7.14 step 5.f: if superclass is not null and not a
+        // constructor, throw TypeError BEFORE reading `.prototype`.
+        if let Some(ref sc) = super_class {
+            self.instructions
+                .push(Instruction::assert_constructor(sc.register));
+        }
 
         // ── Compile constructor ─────────────────────────────────────────────
         // RunClassFieldInitializer is needed both for instance fields AND for
         // copying private methods/accessors to instances.
         let needs_field_initializer = has_instance_fields || has_private_members;
-        // class_has_self_binding is already computed earlier in this
-        // function for the TDZ inner-binding allocation.
+        // §15.7.15 — Push the class name inner binding into scope BEFORE
+        // constructor compilation so the ctor body sees the immutable
+        // binding via parent scope chain. The register holds hole at this
+        // point; it will be initialised with the constructor value below.
+        // When the immutable binding is already in scope, the constructor
+        // must NOT create its own `declare_function_binding` — it captures
+        // the class name via upvalue from the outer ImmutableRegister.
+        let saved_class_name_binding = if let Some(class_reg) = class_name_register
+            && !class_name.is_empty()
+        {
+            let old = self
+                .scope
+                .borrow_mut()
+                .bindings
+                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
+            Some(old)
+        } else {
+            None
+        };
+        // When the outer scope already has the class name as
+        // ImmutableRegister, the constructor must NOT create its own
+        // declare_function_binding — it should capture via upvalue
+        // (ImmutableUpvalue) instead, so writes trigger ThrowConstAssign.
+        let ctor_has_self_binding = if saved_class_name_binding.is_some() {
+            false
+        } else {
+            class_has_self_binding
+        };
         let constructor_value = if let Some(ctor) = constructor {
             self.compile_class_constructor_with_fields(
                 class_name,
-                class_has_self_binding,
+                ctor_has_self_binding,
                 ctor,
                 is_derived,
                 needs_field_initializer,
@@ -1197,14 +1234,14 @@ impl<'a> FunctionCompiler<'a> {
         } else if is_derived {
             self.compile_default_derived_class_constructor_with_fields(
                 class_name,
-                class_has_self_binding,
+                ctor_has_self_binding,
                 needs_field_initializer,
                 module,
             )?
         } else {
             self.compile_default_base_class_constructor_with_fields(
                 class_name,
-                class_has_self_binding,
+                ctor_has_self_binding,
                 needs_field_initializer,
                 module,
             )?
@@ -1283,23 +1320,6 @@ impl<'a> FunctionCompiler<'a> {
             constructor_value.register,
             prototype.register,
         ));
-
-        // §15.7.15 — Temporarily shadow the class name in the current scope
-        // with an immutable inner binding visible to child compilations
-        // (methods, field initialisers, static blocks). Save the previous
-        // binding (if any) so we can restore it when the class body ends.
-        let saved_class_name_binding = if let Some(class_reg) = class_name_register
-            && !class_name.is_empty()
-        {
-            let old = self
-                .scope
-                .borrow_mut()
-                .bindings
-                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
-            Some(old)
-        } else {
-            None
-        };
 
         // ── Second pass: install methods ────────────────────────────────────
         // §15.7.14 ClassDefinitionEvaluation step 26–28.
@@ -3116,6 +3136,13 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
         value: ValueLocation,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // §12.1.1 — In strict mode, `yield` and `let` are reserved and
+        // cannot appear as assignment targets. oxc doesn't enforce this.
+        if self.strict_mode && (name == "yield" || name == "let") {
+            return Err(SourceLoweringError::EarlyError(format!(
+                "'{name}' is a reserved identifier in strict mode"
+            )));
+        }
         match self.resolve_binding(name) {
             Ok(Binding::Register(register)) => {
                 if register != value.register {
@@ -3153,19 +3180,28 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::set_upvalue(value.register, upvalue));
                 Ok(value)
             }
-            // Immutable bindings should have been caught by the pre-check
-            // above; match them here to satisfy exhaustiveness.
+            // §15.7.15 — Immutable class name binding. Emit a runtime
+            // TypeError throw so `assert.throws(TypeError, ...)` catches it.
             Ok(Binding::ImmutableRegister(_) | Binding::ImmutableUpvalue(_)) => {
-                Err(SourceLoweringError::EarlyError(format!(
-                    "Assignment to constant variable '{name}'"
-                )))
+                self.release(value);
+                self.instructions.push(Instruction::throw_const_assign());
+                // Unreachable after throw — return a dummy value for types.
+                self.load_undefined()
             }
             // Undeclared identifier → assign to global property
             // Mirrors the read-path fallback in `compile_identifier`.
+            // In strict mode, use SetGlobalStrict which throws ReferenceError
+            // at runtime if the property does not already exist on global.
+            // Spec: <https://tc39.es/ecma262/#sec-putvalue> step 5.a
             Err(SourceLoweringError::UnknownBinding(_)) => {
                 let property = self.intern_property_name(name)?;
-                self.instructions
-                    .push(Instruction::set_global(value.register, property));
+                if self.strict_mode {
+                    self.instructions
+                        .push(Instruction::set_global_strict(value.register, property));
+                } else {
+                    self.instructions
+                        .push(Instruction::set_global(value.register, property));
+                }
                 Ok(value)
             }
             Err(e) => Err(e),

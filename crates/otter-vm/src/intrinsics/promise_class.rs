@@ -178,7 +178,14 @@ fn promise_constructor(
         .as_object_handle()
         .map(ObjectHandle)
         .ok_or_else(|| {
-            VmNativeCallError::Internal("Promise resolver undefined is not a function".into())
+            match runtime.alloc_type_error("Promise resolver undefined is not a function") {
+                Ok(handle) => VmNativeCallError::Thrown(
+                    RegisterValue::from_object_handle(handle.0),
+                ),
+                Err(_) => VmNativeCallError::Internal(
+                    "Promise resolver undefined is not a function".into(),
+                ),
+            }
         })?;
 
     // §27.2.3 step 3-6: Create promise and capability.

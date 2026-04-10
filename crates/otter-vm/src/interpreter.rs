@@ -2883,6 +2883,19 @@ impl RuntimeState {
         handle
     }
 
+    /// ES2024 §7.2.1 Type — returns `true` when the value is an ECMAScript
+    /// Object (not a primitive). In our VM, strings and BigInts are heap-
+    /// allocated but are still primitives per the spec.
+    pub fn is_ecma_object(&self, value: RegisterValue) -> bool {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return false;
+        };
+        !matches!(
+            self.objects.kind(handle),
+            Ok(HeapValueKind::String | HeapValueKind::BigInt)
+        )
+    }
+
     /// ES2024 §7.2.4 IsConstructor — checks if a value has `[[Construct]]`.
     pub fn is_constructible(&self, handle: ObjectHandle) -> bool {
         match self.objects.kind(handle) {
@@ -3620,7 +3633,7 @@ impl RuntimeState {
                     })?;
                 if is_derived_constructor {
                     match completion {
-                        Completion::Return(value) if value.as_object_handle().is_some() => {
+                        Completion::Return(value) if self.is_ecma_object(value) => {
                             Completion::Return(value)
                         }
                         Completion::Return(value) if value != RegisterValue::undefined() => {
@@ -3648,12 +3661,9 @@ impl RuntimeState {
                                 let recv = activation.receiver(callee_function).map_err(|error| {
                                     VmNativeCallError::Internal(format!("{error}").into())
                                 })?;
-                                if recv.as_object_handle().is_some() {
+                                if self.is_ecma_object(recv) {
                                     this_value = recv;
                                 } else {
-                                    // Scan the first local for the "this"
-                                    // binding register (always allocated as the
-                                    // first local by `declare_this_binding`).
                                     let local_range = callee_function.frame_layout().local_range();
                                     if local_range.len() > 0 {
                                         if let Ok(val) = activation.register(
@@ -3666,14 +3676,14 @@ impl RuntimeState {
                                                 )
                                                 .unwrap_or(0),
                                         ) {
-                                            if val.as_object_handle().is_some() {
+                                            if self.is_ecma_object(val) {
                                                 this_value = val;
                                             }
                                         }
                                     }
                                 }
                             }
-                            if this_value.as_object_handle().is_some() {
+                            if self.is_ecma_object(this_value) {
                                 Completion::Return(this_value)
                             } else {
                                 let error = self
@@ -6822,6 +6832,33 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §15.7.15 — Runtime TypeError for assignment to immutable
+            // class name binding (`class C { m() { C = 42; } }`).
+            Opcode::ThrowConstAssign => {
+                let error = runtime
+                    .alloc_type_error("Assignment to constant variable.")?;
+                Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                    error.0,
+                )))
+            }
+            // §15.7.14 step 5.f — Assert superclass is a constructor.
+            Opcode::AssertConstructor => {
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                let is_ctor = value
+                    .as_object_handle()
+                    .map(ObjectHandle)
+                    .is_some_and(|h| runtime.is_constructible(h));
+                if !is_ctor {
+                    let error = runtime.alloc_type_error(
+                        "Class extends value is not a constructor or null",
+                    )?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error.0,
+                    )));
+                }
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::SetHomeObject => {
                 let closure_value =
                     activation.read_bytecode_register(function, instruction.a())?;
@@ -8618,6 +8655,30 @@ impl Interpreter {
                 let property = Self::resolve_property_name(function, runtime, instruction.b())?;
                 let value = activation.read_bytecode_register(function, instruction.a())?;
                 let global_handle = runtime.intrinsics().global_object();
+                runtime
+                    .objects
+                    .set_property(global_handle, property, value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
+            // Strict-mode SetGlobal: throws ReferenceError if the property
+            // does not already exist on the global object (including prototype
+            // chain). This implements ES2024 §6.2.5.6 PutValue step 5.a:
+            // "If IsUnresolvableReference(V) is true, throw a ReferenceError."
+            Opcode::SetGlobalStrict => {
+                let property = Self::resolve_property_name(function, runtime, instruction.b())?;
+                let global_handle = runtime.intrinsics().global_object();
+                // Check if the property exists on the global object (own or inherited).
+                let exists = runtime.objects.get_property(global_handle, property)?;
+                if exists.is_none() {
+                    let name = runtime.property_names().get(property).unwrap_or("?");
+                    let msg = format!("{name} is not defined");
+                    let error_obj = runtime.alloc_reference_error(&msg)?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                        error_obj.0,
+                    )));
+                }
+                let value = activation.read_bytecode_register(function, instruction.a())?;
                 runtime
                     .objects
                     .set_property(global_handle, property, value)?;

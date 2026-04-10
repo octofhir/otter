@@ -494,7 +494,9 @@ pub(super) fn non_computed_property_key_name(key: &PropertyKey<'_>) -> Option<St
         PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
         PropertyKey::Identifier(identifier) => Some(identifier.name.to_string()),
         PropertyKey::StringLiteral(literal) => Some(literal.value.to_string()),
-        PropertyKey::NumericLiteral(literal) => Some(literal.value.to_string()),
+        PropertyKey::NumericLiteral(literal) => {
+            Some(crate::abstract_ops::ecma_number_to_string(literal.value))
+        }
         PropertyKey::BooleanLiteral(literal) => Some(if literal.value {
             "true".to_string()
         } else {

@@ -202,6 +202,146 @@ fn number_same_value_zero(lhs: f64, rhs: f64) -> bool {
     lhs == rhs
 }
 
+/// ES2024 §6.1.6.1.20 Number::toString(x)
+/// <https://tc39.es/ecma262/#sec-numeric-types-number-tostring>
+///
+/// Converts an `f64` to its ECMAScript string representation (radix 10).
+/// This differs from Rust's `f64::to_string()` in several ways:
+/// - `0.0000001` becomes `"1e-7"` (not `"0.0000001"`)
+/// - `-0.0` becomes `"0"` (not `"-0"`)
+/// - Integer-valued floats never have a decimal point (`"100"`, not `"100.0"`)
+/// - Large integers use exponential notation at 10^21 (`"1e+21"`)
+pub(crate) fn ecma_number_to_string(x: f64) -> String {
+    // Step 1: NaN
+    if x.is_nan() {
+        return "NaN".to_string();
+    }
+    // Step 2: +0 or -0
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    // Step 3: negative
+    if x < 0.0 {
+        return format!("-{}", ecma_number_to_string(-x));
+    }
+    // Step 4: +Infinity
+    if x.is_infinite() {
+        return "Infinity".to_string();
+    }
+
+    // Use ryu to get the shortest decimal representation of x.
+    // ryu gives us a string like "1.5", "100.0", "1e10", "1.5e10", "1e-7".
+    // We parse out the significand digits and exponent, then format per spec.
+    let ryu_str = ryu::Buffer::new().format(x).to_string();
+    let (significand_digits, exponent) = parse_ryu_output(&ryu_str);
+
+    // significand_digits = the significant digits (no leading zeros, no trailing
+    // zeros), e.g. for 1.5 => "15", for 100 => "1", for 123.456 => "123456"
+    // exponent n = position of decimal point relative to the first digit
+    //   such that value = 0.<significand_digits> * 10^n
+    //   or equivalently: first digit is in the 10^(n-1) place.
+    let k = significand_digits.len() as i32; // number of significant digits
+    let n = exponent; // power of 10 for the leading digit + 1
+
+    // Step 5a: k <= n <= 21 → integer with trailing zeros
+    if k <= n && n <= 21 {
+        let mut result = significand_digits;
+        for _ in 0..(n - k) {
+            result.push('0');
+        }
+        return result;
+    }
+
+    // Step 5b: 0 < n <= 21 → decimal point within the digits
+    if 0 < n && n <= 21 {
+        let mut result = String::with_capacity(k as usize + 1);
+        result.push_str(&significand_digits[..n as usize]);
+        result.push('.');
+        result.push_str(&significand_digits[n as usize..]);
+        return result;
+    }
+
+    // Step 5c: -6 < n <= 0 → leading "0." with -n zeros
+    if -6 < n && n <= 0 {
+        let mut result = String::with_capacity(2 + (-n) as usize + k as usize);
+        result.push_str("0.");
+        for _ in 0..(-n) {
+            result.push('0');
+        }
+        result.push_str(&significand_digits);
+        return result;
+    }
+
+    // Step 5d/5e: exponential notation
+    let exp = n - 1;
+    let exp_str = if exp > 0 {
+        format!("e+{exp}")
+    } else {
+        format!("e{exp}") // negative sign included by Display
+    };
+    if k == 1 {
+        // Step 5d: single digit + exponent
+        return format!("{}{}", significand_digits, exp_str);
+    }
+    // Step 5e: first digit, ".", rest, exponent
+    let mut result = String::with_capacity(k as usize + exp_str.len() + 1);
+    result.push_str(&significand_digits[..1]);
+    result.push('.');
+    result.push_str(&significand_digits[1..]);
+    result.push_str(&exp_str);
+    result
+}
+
+/// Parse ryu output into (significand digits, exponent n) where
+/// the number equals `s * 10^(n - k)` with `k = significand.len()`.
+///
+/// ryu formats as one of: `"1.5"`, `"100.0"`, `"1e10"`, `"1.5e-10"`
+fn parse_ryu_output(s: &str) -> (String, i32) {
+    // Split on 'e' or 'E' to get mantissa and optional exponent
+    let (mantissa_str, ryu_exp) = if let Some(pos) = s.find('e') {
+        let exp: i32 = s[pos + 1..].parse().unwrap_or(0);
+        (&s[..pos], exp)
+    } else if let Some(pos) = s.find('E') {
+        let exp: i32 = s[pos + 1..].parse().unwrap_or(0);
+        (&s[..pos], exp)
+    } else {
+        (s, 0)
+    };
+
+    // Parse the mantissa: collect digits and find decimal point position
+    let mut digits = String::new();
+    let mut decimal_offset: i32 = 0;
+    let mut found_dot = false;
+    for ch in mantissa_str.chars() {
+        if ch == '.' {
+            found_dot = true;
+        } else if ch.is_ascii_digit() {
+            digits.push(ch);
+            if found_dot {
+                decimal_offset += 1;
+            }
+        }
+    }
+
+    // n = number of integer-part digits + ryu exponent.
+    // This is the position of the leading digit: the value's magnitude
+    // is 10^(n-1) .. 10^n.
+    let digits_before_dot = mantissa_str.len() as i32
+        - if found_dot { 1 } else { 0 }
+        - decimal_offset;
+    let n = digits_before_dot + ryu_exp;
+
+    // Remove trailing zeros from digits (they don't carry information).
+    let trimmed = digits.trim_end_matches('0');
+    let digits = if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    (digits, n)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::object::ObjectHeap;
@@ -270,5 +410,53 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn ecma_number_to_string_special_values() {
+        use super::ecma_number_to_string;
+        assert_eq!(ecma_number_to_string(f64::NAN), "NaN");
+        assert_eq!(ecma_number_to_string(f64::INFINITY), "Infinity");
+        assert_eq!(ecma_number_to_string(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(ecma_number_to_string(0.0), "0");
+        assert_eq!(ecma_number_to_string(-0.0), "0");
+    }
+
+    #[test]
+    fn ecma_number_to_string_integers() {
+        use super::ecma_number_to_string;
+        assert_eq!(ecma_number_to_string(1.0), "1");
+        assert_eq!(ecma_number_to_string(100.0), "100");
+        assert_eq!(ecma_number_to_string(-42.0), "-42");
+        assert_eq!(ecma_number_to_string(1e20), "100000000000000000000");
+        assert_eq!(ecma_number_to_string(1e21), "1e+21");
+        assert_eq!(ecma_number_to_string(1e+100), "1e+100");
+    }
+
+    #[test]
+    fn ecma_number_to_string_decimals() {
+        use super::ecma_number_to_string;
+        assert_eq!(ecma_number_to_string(0.1), "0.1");
+        assert_eq!(ecma_number_to_string(0.5), "0.5");
+        assert_eq!(ecma_number_to_string(1.5), "1.5");
+        assert_eq!(ecma_number_to_string(123.456), "123.456");
+    }
+
+    #[test]
+    fn ecma_number_to_string_small_numbers() {
+        use super::ecma_number_to_string;
+        assert_eq!(ecma_number_to_string(0.0000001), "1e-7");
+        assert_eq!(ecma_number_to_string(0.000001), "0.000001");
+        assert_eq!(ecma_number_to_string(5e-7), "5e-7");
+        assert_eq!(ecma_number_to_string(1.5e-7), "1.5e-7");
+    }
+
+    #[test]
+    fn ecma_number_to_string_negative() {
+        use super::ecma_number_to_string;
+        assert_eq!(ecma_number_to_string(-1.0), "-1");
+        assert_eq!(ecma_number_to_string(-0.1), "-0.1");
+        assert_eq!(ecma_number_to_string(-1e21), "-1e+21");
+        assert_eq!(ecma_number_to_string(-0.0000001), "-1e-7");
     }
 }

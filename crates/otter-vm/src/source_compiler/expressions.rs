@@ -1796,6 +1796,18 @@ impl<'a> FunctionCompiler<'a> {
         inferred_name: Option<&str>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
+        // §12.1.1 / §14.1.1 — In strict mode, `yield` and `let` cannot
+        // be used as function binding identifiers. oxc doesn't enforce this.
+        if self.strict_mode {
+            if let Some(id) = &function.id {
+                let name = id.name.as_str();
+                if name == "yield" || name == "let" {
+                    return Err(SourceLoweringError::EarlyError(format!(
+                        "'{name}' is not allowed as a function name in strict mode"
+                    )));
+                }
+            }
+        }
         let fn_name = function.id.as_ref().map(|id| id.name.to_string());
         let public_name = fn_name
             .clone()

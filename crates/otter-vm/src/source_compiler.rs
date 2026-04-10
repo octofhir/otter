@@ -29,7 +29,7 @@ use crate::source_map::SourceMap;
 use crate::string::{StringId, StringTable};
 
 mod assignment;
-mod ast;
+pub(crate) mod ast;
 mod compiler;
 mod destructuring;
 mod expressions;

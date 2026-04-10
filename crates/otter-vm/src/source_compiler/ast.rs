@@ -54,10 +54,7 @@ pub(super) struct PrivateNameValidator<'a> {
 }
 
 impl<'a, 'ast> Visit<'ast> for PrivateNameValidator<'a> {
-    fn visit_private_field_expression(
-        &mut self,
-        it: &oxc_ast::ast::PrivateFieldExpression<'ast>,
-    ) {
+    fn visit_private_field_expression(&mut self, it: &oxc_ast::ast::PrivateFieldExpression<'ast>) {
         if self.error.is_some() {
             return;
         }
@@ -71,10 +68,7 @@ impl<'a, 'ast> Visit<'ast> for PrivateNameValidator<'a> {
         walk::walk_expression(self, &it.object);
     }
 
-    fn visit_private_in_expression(
-        &mut self,
-        it: &oxc_ast::ast::PrivateInExpression<'ast>,
-    ) {
+    fn visit_private_in_expression(&mut self, it: &oxc_ast::ast::PrivateInExpression<'ast>) {
         if self.error.is_some() {
             return;
         }
@@ -93,7 +87,7 @@ impl<'a, 'ast> Visit<'ast> for PrivateNameValidator<'a> {
     fn visit_class(&mut self, _it: &oxc_ast::ast::Class<'ast>) {}
 }
 
-pub(super) fn check_expression_private_refs<'a>(
+pub(super) fn check_expression_private_refs(
     expr: &Expression<'_>,
     is_declared: &dyn Fn(&str) -> bool,
 ) -> Result<(), SourceLoweringError> {
@@ -108,7 +102,7 @@ pub(super) fn check_expression_private_refs<'a>(
     }
 }
 
-pub(super) fn check_statement_private_refs<'a>(
+pub(super) fn check_statement_private_refs(
     stmt: &AstStatement<'_>,
     is_declared: &dyn Fn(&str) -> bool,
 ) -> Result<(), SourceLoweringError> {
@@ -117,6 +111,146 @@ pub(super) fn check_statement_private_refs<'a>(
         error: None,
     };
     walk::walk_statement(&mut validator, stmt);
+    match validator.error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+// ── ContainsArguments / Contains SuperCall check for field initializers ──────
+//
+// §15.7 Static Semantics: Early Errors for FieldDefinition:
+//   - It is a Syntax Error if ContainsArguments of Initializer is true.
+//   - It is a Syntax Error if Initializer Contains SuperCall is true.
+//
+// ContainsArguments recurses into arrow functions but NOT into regular
+// function/generator/async expressions (they have their own `arguments`).
+// Contains SuperCall similarly does NOT recurse into regular functions
+// (but DOES recurse into arrow functions since they inherit `super`).
+//
+// Spec: <https://tc39.es/ecma262/#sec-static-semantics-containsarguments>
+//       <https://tc39.es/ecma262/#sec-class-definitions-static-semantics-early-errors>
+struct FieldInitializerValidator {
+    error: Option<SourceLoweringError>,
+}
+
+impl<'ast> Visit<'ast> for FieldInitializerValidator {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'ast>) {
+        if self.error.is_some() {
+            return;
+        }
+        if it.name == "arguments" {
+            self.error = Some(SourceLoweringError::EarlyError(
+                "'arguments' is not allowed in class field initializer or computed property name"
+                    .to_string(),
+            ));
+        }
+    }
+
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'ast>) {
+        if self.error.is_some() {
+            return;
+        }
+        if matches!(&it.callee, Expression::Super(_)) {
+            self.error = Some(SourceLoweringError::EarlyError(
+                "'super()' is not allowed in class field initializer".to_string(),
+            ));
+            return;
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    // Arrow functions inherit `arguments` and `super` from enclosing scope,
+    // so we DO recurse into them — the default walk does this automatically.
+
+    // Regular function expressions have their own `arguments` and `super`
+    // scope — do NOT recurse into them.
+    fn visit_function(
+        &mut self,
+        _it: &oxc_ast::ast::Function<'ast>,
+        _flags: oxc_semantic::ScopeFlags,
+    ) {
+        // Skip — regular functions have their own arguments/super scope.
+    }
+
+    // Nested classes validate on their own.
+    fn visit_class(&mut self, _it: &oxc_ast::ast::Class<'ast>) {}
+}
+
+/// Check a class field initializer for forbidden `arguments` and `super()`.
+pub(super) fn check_field_initializer(expr: &Expression<'_>) -> Result<(), SourceLoweringError> {
+    let mut validator = FieldInitializerValidator { error: None };
+    walk::walk_expression(&mut validator, expr);
+    match validator.error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+// ── Eval-in-field-initializer validator ──────────────────────────────────
+// §B.3.5.2 Additional Early Error Rules for Eval Inside Initializer:
+// eval'd code in a field initializer must NOT contain `arguments`,
+// `new.target`, or `super()`. Same recursion rules as FieldInitializerValidator
+// but with the additional `new.target` restriction.
+// Spec: <https://tc39.es/ecma262/#sec-performeval-rules-in-initializer>
+struct EvalFieldInitializerValidator {
+    error: Option<SourceLoweringError>,
+}
+
+impl<'ast> Visit<'ast> for EvalFieldInitializerValidator {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'ast>) {
+        if self.error.is_some() {
+            return;
+        }
+        if it.name == "arguments" {
+            self.error = Some(SourceLoweringError::EarlyError(
+                "'arguments' is not allowed in class field initializer or computed property name"
+                    .to_string(),
+            ));
+        }
+    }
+
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'ast>) {
+        if self.error.is_some() {
+            return;
+        }
+        if matches!(&it.callee, Expression::Super(_)) {
+            self.error = Some(SourceLoweringError::EarlyError(
+                "'super()' is not allowed in class field initializer".to_string(),
+            ));
+            return;
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    // NOTE: `new.target` in direct eval inside field initializer is ALLOWED
+    // (evaluates to undefined). Only `arguments` and `super()` are restricted.
+    // §B.3.5.2: "The remaining eval rules apply as outside a constructor,
+    // inside a method, and inside a function."
+
+    fn visit_function(
+        &mut self,
+        _it: &oxc_ast::ast::Function<'ast>,
+        _flags: oxc_semantic::ScopeFlags,
+    ) {
+    }
+
+    fn visit_class(&mut self, _it: &oxc_ast::ast::Class<'ast>) {}
+}
+
+/// Check eval'd code inside a field initializer for forbidden constructs.
+/// §B.3.5.2 Additional Early Error Rules for Eval Inside Initializer.
+/// Spec: <https://tc39.es/ecma262/#sec-performeval-rules-in-initializer>
+pub(crate) fn check_eval_field_initializer_program(
+    program: &oxc_ast::ast::Program<'_>,
+) -> Result<(), SourceLoweringError> {
+    let mut validator = EvalFieldInitializerValidator { error: None };
+    for stmt in &program.body {
+        walk::walk_statement(&mut validator, stmt);
+        if validator.error.is_some() {
+            break;
+        }
+    }
     match validator.error {
         Some(err) => Err(err),
         None => Ok(()),

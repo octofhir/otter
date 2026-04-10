@@ -63,6 +63,7 @@ impl<'a> FunctionCompiler<'a> {
             last_recorded_location: None,
             pending_site_span: None,
             private_name_scopes: Vec::new(),
+            has_class_private_context: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -412,6 +413,9 @@ impl<'a> FunctionCompiler<'a> {
                 )
             })?;
 
+            // Propagate private name context to function declarations.
+            let saved_private_ctx = module.pending_has_class_private_context;
+            module.pending_has_class_private_context = self.has_class_private_context;
             let compiled = module.compile_function_from_statements(
                 pending.reserved,
                 FunctionIdentity {
@@ -448,6 +452,7 @@ impl<'a> FunctionCompiler<'a> {
                             .unwrap_or(&[]),
                     ),
             )?;
+            module.pending_has_class_private_context = saved_private_ctx;
             module.set_function(pending.reserved, compiled.function);
             self.hoisted_functions.push(PendingFunction {
                 captures: compiled.captures,
@@ -487,6 +492,11 @@ impl<'a> FunctionCompiler<'a> {
                     pending.reserved,
                     &pending.captures,
                 )?;
+            }
+            // Propagate class_id to hoisted function declarations inside
+            // class methods/field initializers for private field access.
+            if self.has_class_private_context {
+                self.emit_copy_class_id_from_current(pending.closure_register);
             }
             self.mirror_script_binding_to_global_by_register(pending.closure_register)?;
         }
@@ -881,9 +891,7 @@ impl<'a> FunctionCompiler<'a> {
         let mut seen: std::collections::HashMap<String, Vec<PrivateEntry>> =
             std::collections::HashMap::new();
 
-        let mut record = |name: &str,
-                          entry: PrivateEntry|
-         -> Result<(), SourceLoweringError> {
+        let mut record = |name: &str, entry: PrivateEntry| -> Result<(), SourceLoweringError> {
             let list = seen.entry(name.to_string()).or_default();
             list.push(entry);
             // Allowed multiplicities:
@@ -961,8 +969,8 @@ impl<'a> FunctionCompiler<'a> {
         class: &Class<'_>,
         declared_here: &std::collections::HashSet<String>,
     ) -> Result<(), SourceLoweringError> {
-        use oxc_ast::ast::ClassElement;
         use super::ast::{check_expression_private_refs, check_statement_private_refs};
+        use oxc_ast::ast::ClassElement;
 
         let is_declared = |name: &str| -> bool {
             if declared_here.contains(name) {
@@ -1051,7 +1059,8 @@ impl<'a> FunctionCompiler<'a> {
         // their own private references. Mirror the change onto the module
         // compiler's pending latch so freshly constructed child
         // `FunctionCompiler`s pick up the inherited chain too.
-        self.private_name_scopes.push(declared_private_names.clone());
+        self.private_name_scopes
+            .push(declared_private_names.clone());
         module
             .pending_private_name_scopes
             .push(declared_private_names);
@@ -1107,6 +1116,11 @@ impl<'a> FunctionCompiler<'a> {
                     ) {
                         continue;
                     }
+                    // §15.7 Static Semantics: Early Errors — FieldDefinition
+                    // ContainsArguments and Contains SuperCall checks.
+                    if let Some(init_expr) = &prop.value {
+                        super::ast::check_field_initializer(init_expr)?;
+                    }
                     if !prop.r#static {
                         has_instance_fields = true;
                     }
@@ -1160,11 +1174,10 @@ impl<'a> FunctionCompiler<'a> {
         let saved_class_name_binding = if let Some(class_reg) = class_name_register
             && !class_name.is_empty()
         {
-            let old = self
-                .scope
-                .borrow_mut()
-                .bindings
-                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
+            let old = self.scope.borrow_mut().bindings.insert(
+                class_name.to_string(),
+                Binding::ImmutableRegister(class_reg),
+            );
             Some(old)
         } else {
             None
@@ -1268,11 +1281,11 @@ impl<'a> FunctionCompiler<'a> {
         // Now that the constructor closure exists, move its value into the
         // TDZ register allocated earlier so the body scope sees the live
         // constructor instead of the initial hole sentinel.
-        if let Some(class_reg) = class_name_register {
-            if class_reg != constructor_value.register {
-                self.instructions
-                    .push(Instruction::move_(class_reg, constructor_value.register));
-            }
+        if let Some(class_reg) = class_name_register
+            && class_reg != constructor_value.register
+        {
+            self.instructions
+                .push(Instruction::move_(class_reg, constructor_value.register));
         }
 
         // ── Set up prototype chain ──────────────────────────────────────────
@@ -1366,6 +1379,49 @@ impl<'a> FunctionCompiler<'a> {
 
         self.emit_make_class_prototype_non_writable(constructor_value, module)?;
 
+        // ── Pre-evaluate computed instance field keys ────────────────────
+        // §15.7.14 step 27: ClassElementEvaluation evaluates computed
+        // property names at class definition time. Errors in key expressions
+        // (ReferenceError, ToPrimitive throws, etc.) must fire here, not
+        // when an instance is later created.
+        // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        let mut computed_key_bindings: Vec<String> = Vec::new();
+        {
+            let mut ck_index = 0usize;
+            for element in &class.body.body {
+                if let ClassElement::PropertyDefinition(prop) = element
+                    && !prop.r#static
+                    && !prop.declare
+                    && !matches!(
+                        prop.r#type,
+                        PropertyDefinitionType::TSAbstractPropertyDefinition
+                    )
+                    && prop.computed
+                    && !matches!(&prop.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_))
+                {
+                    // Evaluate key expression at class definition time.
+                    let key = self.compile_expression(prop.key.to_expression(), module)?;
+                    let key_local = self.allocate_local()?;
+                    self.instructions
+                        .push(Instruction::move_(key_local, key.register));
+                    self.release(key);
+                    // §7.1.14 ToPropertyKey — coerce to String/Symbol now.
+                    self.instructions
+                        .push(Instruction::to_property_key(key_local));
+
+                    // Create a synthetic binding so the init function can
+                    // capture it as an upvalue.
+                    let binding_name = format!("$__ck_{ck_index}");
+                    ck_index += 1;
+                    self.scope
+                        .borrow_mut()
+                        .bindings
+                        .insert(binding_name.clone(), Binding::Register(key_local));
+                    computed_key_bindings.push(binding_name);
+                }
+            }
+        }
+
         // ── Compile instance field initializer ──────────────────────────────
         // §15.7.14 step 29: Create an initializer function for instance fields.
         if needs_field_initializer {
@@ -1373,6 +1429,7 @@ impl<'a> FunctionCompiler<'a> {
                 class,
                 constructor_value,
                 has_private_members,
+                &computed_key_bindings,
                 module,
             )?;
         }
@@ -1403,6 +1460,14 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
+        // Clean up synthetic computed-key bindings from scope.
+        for binding_name in &computed_key_bindings {
+            self.scope
+                .borrow_mut()
+                .bindings
+                .remove(binding_name.as_str());
+        }
+
         // §15.7.15 — Restore the previous class name binding (or remove
         // the temporary one if there was no prior binding).
         if let Some(old_binding) = saved_class_name_binding {
@@ -1430,6 +1495,7 @@ impl<'a> FunctionCompiler<'a> {
         class: &Class<'_>,
         constructor_value: ValueLocation,
         has_private_members: bool,
+        computed_key_bindings: &[String],
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
         use super::ast::non_computed_property_key_name;
@@ -1466,6 +1532,7 @@ impl<'a> FunctionCompiler<'a> {
             .register;
 
         // Emit field definitions in source order.
+        let mut computed_key_index = 0usize;
         for element in &class.body.body {
             if let ClassElement::PropertyDefinition(prop) = element
                 && !prop.r#static
@@ -1500,8 +1567,11 @@ impl<'a> FunctionCompiler<'a> {
                     };
 
                     if prop.computed {
-                        let key =
-                            init_compiler.compile_expression(prop.key.to_expression(), module)?;
+                        // Key was pre-evaluated at class definition time.
+                        // Resolve the captured binding (creates an upvalue).
+                        let binding_name = &computed_key_bindings[computed_key_index];
+                        computed_key_index += 1;
+                        let key = init_compiler.compile_identifier(binding_name)?;
                         init_compiler
                             .instructions
                             .push(Instruction::define_computed_field(
@@ -1961,6 +2031,10 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             super::shared::FunctionKind::Ordinary
         };
+        // Propagate private name context so inner closures can resolve
+        // private field accesses via CopyClassId at runtime.
+        let saved_private_ctx = module.pending_has_class_private_context;
+        module.pending_has_class_private_context = class_id_source.is_some();
         let compiled = module.compile_function_from_statements(
             reserved,
             super::module_compiler::FunctionIdentity {
@@ -1978,6 +2052,7 @@ impl<'a> FunctionCompiler<'a> {
             self.parent_scopes_for_child(),
             true, // class bodies are always strict
         )?;
+        module.pending_has_class_private_context = saved_private_ctx;
         module.set_function(reserved, compiled.function);
 
         let method_closure = ValueLocation::temp(self.alloc_temp());
@@ -2994,6 +3069,18 @@ impl<'a> FunctionCompiler<'a> {
         Ok(ValueLocation::temp(register))
     }
 
+    /// Emit CopyClassId from the current closure to a newly created closure.
+    /// Used to propagate the class_id for private field resolution to inner
+    /// closures (arrows, function expressions) inside class methods.
+    pub(super) fn emit_copy_class_id_from_current(&mut self, target: BytecodeRegister) {
+        let current = self.alloc_temp();
+        self.instructions
+            .push(Instruction::load_current_closure(current));
+        self.instructions
+            .push(Instruction::copy_class_id(target, current));
+        self.release(ValueLocation::temp(current));
+    }
+
     pub(super) fn emit_new_closure(
         &mut self,
         destination: BytecodeRegister,
@@ -3288,25 +3375,24 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         name: &str,
     ) -> Result<BytecodeRegister, SourceLoweringError> {
-        let closure_register =
-            if let Some(existing) = self.scope.borrow().bindings.get(name).copied() {
-                match existing {
-                    Binding::Register(register) | Binding::ImmutableRegister(register) => register,
-                    Binding::ThisRegister(register) => register,
-                    Binding::Function {
-                        closure_register, ..
-                    } => closure_register,
-                    Binding::Upvalue(_)
-                    | Binding::ThisUpvalue(_)
-                    | Binding::ImmutableUpvalue(_) => {
-                        return Err(SourceLoweringError::Unsupported(format!(
-                            "function declaration {name} conflicts with an upvalue binding"
-                        )));
-                    }
+        let closure_register = if let Some(existing) =
+            self.scope.borrow().bindings.get(name).copied()
+        {
+            match existing {
+                Binding::Register(register) | Binding::ImmutableRegister(register) => register,
+                Binding::ThisRegister(register) => register,
+                Binding::Function {
+                    closure_register, ..
+                } => closure_register,
+                Binding::Upvalue(_) | Binding::ThisUpvalue(_) | Binding::ImmutableUpvalue(_) => {
+                    return Err(SourceLoweringError::Unsupported(format!(
+                        "function declaration {name} conflicts with an upvalue binding"
+                    )));
                 }
-            } else {
-                self.allocate_local()?
-            };
+            }
+        } else {
+            self.allocate_local()?
+        };
 
         self.scope
             .borrow_mut()

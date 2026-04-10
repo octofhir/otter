@@ -110,7 +110,10 @@ fn main() {
     };
 
     if let Err(e) = merged.save(&cli.output) {
-        eprintln!("Failed to save merged report to {}: {e}", cli.output.display());
+        eprintln!(
+            "Failed to save merged report to {}: {e}",
+            cli.output.display()
+        );
         std::process::exit(1);
     }
 
@@ -162,7 +165,9 @@ fn glob_expand(pattern: &str) -> std::io::Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(&suffix) && name.len() >= prefix.len() + suffix.len()
+        if name.starts_with(&prefix)
+            && name.ends_with(&suffix)
+            && name.len() >= prefix.len() + suffix.len()
         {
             out.push(entry.path());
         }

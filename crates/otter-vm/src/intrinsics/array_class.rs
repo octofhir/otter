@@ -302,8 +302,8 @@ fn array_constructor(
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`
     // so `class X extends Array {}` + `new X()` produces an instance with
     // `Object.getPrototypeOf(inst) === X.prototype`.
-    let prototype = runtime
-        .subclass_prototype_or_default(*this, runtime.intrinsics().array_prototype());
+    let prototype =
+        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().array_prototype());
     runtime
         .objects_mut()
         .set_prototype(array, Some(prototype))
@@ -382,8 +382,8 @@ fn array_is_array(
 /// 3. Let argCount be the number of elements in items.
 /// 4. If len + argCount > 2^53 - 1, throw a TypeError exception.
 /// 5. For each element E of items, do
-///      Perform ? Set(O, ! ToString(F(len)), E, true).
-///      Set len to len + 1.
+///    Perform ? Set(O, ! ToString(F(len)), E, true).
+///    Set len to len + 1.
 /// 6. Perform ? Set(O, "length", F(len), true).
 /// 7. Return F(len).
 fn array_push(
@@ -453,7 +453,7 @@ fn array_join(
 
     let mut parts: Vec<String> = safe_with_capacity(length);
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.join")?;
@@ -537,7 +537,7 @@ fn array_index_of(
     };
 
     for index in start..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(elem) = array_index_value(receiver, index, runtime, "Array.prototype.indexOf")?
@@ -999,7 +999,7 @@ fn array_map(
     runtime.objects_mut().set_array_length(result, length).ok();
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.map")?
@@ -1031,7 +1031,7 @@ fn array_filter(
     let mut to = 0usize;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.filter")?
@@ -1066,7 +1066,7 @@ fn array_for_each(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.forEach")?;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.forEach")?
@@ -1111,7 +1111,7 @@ fn array_reduce(
         accumulator = RegisterValue::undefined();
         start = 0;
         for index in 0..length {
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             if let Some(value) =
@@ -1132,7 +1132,7 @@ fn array_reduce(
     }
 
     for index in start..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.reduce")?
@@ -1165,7 +1165,7 @@ fn array_find(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.find")?;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.find")?
@@ -1197,7 +1197,7 @@ fn array_find_index(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findIndex")?;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findIndex")?
@@ -1229,7 +1229,7 @@ fn array_some(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.some")?;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.some")?
@@ -1263,7 +1263,7 @@ fn array_every(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.every")?;
 
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.every")?
@@ -1311,7 +1311,7 @@ fn array_includes(
     };
 
     for index in start..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.includes")?
@@ -1368,7 +1368,7 @@ fn array_fill(
     // flag every few thousand iterations so the script can exit quickly
     // with a catchable `RangeError`.
     for index in start..end {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if let Err(err) = runtime.objects_mut().set_index(receiver, index, value) {
@@ -1391,7 +1391,7 @@ fn array_reverse(
     let mut lower = 0usize;
     let mut upper = length.saturating_sub(1);
     while lower < upper {
-        if lower % OOM_POLL_INTERVAL == 0 {
+        if lower.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let lower_val = array_index_value(receiver, lower, runtime, "Array.prototype.reverse")?;
@@ -1464,7 +1464,7 @@ fn array_shift(
         .unwrap_or_else(RegisterValue::undefined);
     // Shift elements left.
     for index in 1..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.shift")? {
@@ -1494,7 +1494,7 @@ fn array_unshift(
     if arg_count > 0 {
         // Shift existing elements right by arg_count.
         for index in (0..length).rev() {
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             if let Some(value) =
@@ -1570,7 +1570,7 @@ fn array_splice(
         // Shrinking: shift elements left.
         let shift = delete_count - item_count;
         for index in (actual_start + delete_count)..current_len {
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             if let Some(value) =
@@ -1595,7 +1595,7 @@ fn array_splice(
             .set_array_length(receiver, new_len)
             .ok();
         for index in (actual_start + delete_count..current_len).rev() {
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             if let Some(value) =
@@ -1655,7 +1655,7 @@ fn array_last_index_of(
     let mut index = start;
     while index >= 0 {
         let i = index as usize;
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if let Some(elem) = array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
@@ -1712,7 +1712,7 @@ fn array_from(
         let result = runtime.alloc_array();
         runtime.objects_mut().set_array_length(result, length).ok();
         for index in 0..length {
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             let value = array_index_value(source_handle, index, runtime, "Array.from")?
@@ -1741,7 +1741,7 @@ fn array_from(
     let result = runtime.alloc_array();
     runtime.objects_mut().set_array_length(result, length).ok();
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let idx_prop = runtime.intern_property_name(&index.to_string());
@@ -1845,7 +1845,7 @@ fn array_sort(
     // Collect non-hole elements.
     let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if let Some(v) = array_index_value(receiver, index, runtime, "Array.prototype.sort")? {
@@ -1855,7 +1855,7 @@ fn array_sort(
 
     // Sort with a simple insertion sort (stable, handles comparefn errors).
     for i in 1..items.len() {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let key = items[i];
@@ -1876,14 +1876,14 @@ fn array_sort(
 
     // Write back sorted items, then holes.
     for (index, value) in items.iter().copied().enumerate() {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         runtime.objects_mut().set_index(receiver, index, value).ok();
     }
     // Clear remaining slots (holes).
     for index in items.len()..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let prop = runtime.intern_property_name(&index.to_string());
@@ -1966,7 +1966,7 @@ fn array_reduce_right(
         start = length as i64 - 1;
         while start >= 0 {
             let index = start as usize;
-            if index % OOM_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(OOM_POLL_INTERVAL) {
                 check_native_loop(runtime)?;
             }
             if let Some(value) =
@@ -1989,7 +1989,7 @@ fn array_reduce_right(
 
     while start >= 0 {
         let index = start as usize;
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if let Some(value) =
@@ -2023,7 +2023,7 @@ fn array_find_last(
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.findLast")?;
 
     for index in (0..length).rev() {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findLast")?
@@ -2055,7 +2055,7 @@ fn array_find_last_index(
         callback_and_this_arg(args, runtime, "Array.prototype.findLastIndex")?;
 
     for index in (0..length).rev() {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let value = array_index_value(receiver, index, runtime, "Array.prototype.findLastIndex")?
@@ -2130,7 +2130,7 @@ fn flatten_into_array_bounded(
     }
     let length = array_length(source, runtime, "flat")?;
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(source, index, runtime, "flat")? else {
@@ -2162,7 +2162,7 @@ fn array_flat_map(
 
     let result = runtime.alloc_array();
     for index in 0..length {
-        if index % OOM_POLL_INTERVAL == 0 {
+        if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let Some(value) = array_index_value(receiver, index, runtime, "Array.prototype.flatMap")?
@@ -2209,7 +2209,7 @@ fn array_to_locale_string(
 
     let mut parts: Vec<String> = safe_with_capacity(len);
     for i in 0..len {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let prop = runtime.intern_property_name(&i.to_string());
@@ -2298,7 +2298,7 @@ fn array_copy_within(
     // Collect values first to avoid aliasing issues.
     let mut vals: Vec<Option<RegisterValue>> = safe_with_capacity(count);
     for i in 0..count {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         vals.push(array_index_value(
@@ -2337,7 +2337,7 @@ fn array_to_reversed(
 
     let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in (0..length).rev() {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toReversed")?
@@ -2370,7 +2370,7 @@ fn array_to_sorted(
     // Collect all elements (holes become undefined per spec).
     let mut items: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSorted")?
@@ -2380,7 +2380,7 @@ fn array_to_sorted(
 
     // Stable insertion sort (same as Array.prototype.sort).
     for i in 1..items.len() {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let key = items[i];
@@ -2451,7 +2451,7 @@ fn array_to_spliced(
 
     // Copy before splice point.
     for i in 0..actual_start {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
@@ -2464,7 +2464,7 @@ fn array_to_spliced(
 
     // Copy after splice point.
     for i in (actual_start + actual_delete_count)..len {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         let val = array_index_value(receiver, i, runtime, "Array.prototype.toSpliced")?
@@ -2516,7 +2516,7 @@ fn array_with(
     // Build new array with the replacement.
     let mut elements: Vec<RegisterValue> = safe_with_capacity(length);
     for i in 0..length {
-        if i % OOM_POLL_INTERVAL == 0 {
+        if i.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
         }
         if i == actual_index {

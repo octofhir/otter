@@ -15,7 +15,9 @@ pub(super) enum Binding {
     ImmutableRegister(BytecodeRegister),
     /// Captured variant of `ImmutableRegister`.
     ImmutableUpvalue(UpvalueId),
-    Function { closure_register: BytecodeRegister },
+    Function {
+        closure_register: BytecodeRegister,
+    },
     Upvalue(UpvalueId),
     ThisUpvalue(UpvalueId),
 }
@@ -34,7 +36,6 @@ impl Binding {
             | Self::ImmutableUpvalue(upvalue) => CaptureSource::Upvalue(upvalue),
         }
     }
-
 }
 
 pub(super) type CaptureSource = CaptureDescriptor;
@@ -234,5 +235,10 @@ pub(super) struct FunctionCompiler<'a> {
     /// `#name` references against the whole chain. Popped on exit.
     /// Spec: <https://tc39.es/ecma262/#sec-class-definitions-static-semantics-early-errors>
     pub(super) private_name_scopes: Vec<std::collections::HashSet<String>>,
+    /// When true, inner closures should inherit the class_id via CopyClassId.
+    /// Set when compiling a class body with private members, and propagated to
+    /// child function compilers so nested closures (arrows, functions) can
+    /// resolve private field accesses.
+    pub(super) has_class_private_context: bool,
     pub(super) _marker: std::marker::PhantomData<&'a ()>,
 }

@@ -27,9 +27,6 @@ skip_features = [
     "Atomics.pause",
     "SharedArrayBuffer",
 
-    # Decorators (Stage 3, not yet standardized)
-    "decorators",
-
     # Module system (requires module loader in test262 harness)
     "import-assertions",
     "import-attributes",

@@ -662,7 +662,10 @@ fn main() {
     // CLI flags remain authoritative — the config only provides defaults
     // the user can override.
     let config = Test262Config::load_or_default(cli.config.as_deref());
-    if !config.skip_features.is_empty() || !config.ignored_tests.is_empty() || !config.known_panics.is_empty() {
+    if !config.skip_features.is_empty()
+        || !config.ignored_tests.is_empty()
+        || !config.known_panics.is_empty()
+    {
         eprintln!(
             "Config loaded: skip_features={}, ignored_tests={}, known_panics={}",
             config.skip_features.len(),

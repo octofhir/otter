@@ -164,9 +164,8 @@ fn weakref_constructor(
         )
     })?;
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
-    let prototype = Some(
-        runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakref_prototype),
-    );
+    let prototype =
+        Some(runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakref_prototype));
     let handle = runtime
         .objects_mut()
         .alloc_weakref(prototype, target_handle);

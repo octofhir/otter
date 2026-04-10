@@ -377,9 +377,7 @@ fn array_buffer_constructor(
             runtime,
             "ArrayBuffer allocation failed: byte length exceeds heap limit",
         ),
-        other => {
-            VmNativeCallError::Internal(format!("ArrayBuffer allocation: {other:?}").into())
-        }
+        other => VmNativeCallError::Internal(format!("ArrayBuffer allocation: {other:?}").into()),
     })?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -543,7 +541,9 @@ fn array_buffer_slice(
         .as_object_handle()
         .map(ObjectHandle)
         .ok_or_else(|| {
-            VmNativeCallError::Internal("ArrayBuffer.slice: constructed value is not an object".into())
+            VmNativeCallError::Internal(
+                "ArrayBuffer.slice: constructed value is not an object".into(),
+            )
         })?;
     // Copy bytes from source to new buffer.
     if new_len > 0 {

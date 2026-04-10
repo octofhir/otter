@@ -174,19 +174,20 @@ fn promise_constructor(
     let executor = args.first().copied().unwrap_or(RegisterValue::undefined());
 
     // §27.2.3 step 2: If IsCallable(executor) is false, throw a TypeError.
-    let executor_handle = executor
-        .as_object_handle()
-        .map(ObjectHandle)
-        .ok_or_else(|| {
-            match runtime.alloc_type_error("Promise resolver undefined is not a function") {
-                Ok(handle) => VmNativeCallError::Thrown(
-                    RegisterValue::from_object_handle(handle.0),
-                ),
-                Err(_) => VmNativeCallError::Internal(
-                    "Promise resolver undefined is not a function".into(),
-                ),
-            }
-        })?;
+    let executor_handle =
+        executor
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| {
+                match runtime.alloc_type_error("Promise resolver undefined is not a function") {
+                    Ok(handle) => {
+                        VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+                    }
+                    Err(_) => VmNativeCallError::Internal(
+                        "Promise resolver undefined is not a function".into(),
+                    ),
+                }
+            })?;
 
     // §27.2.3 step 3-6: Create promise and capability.
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.

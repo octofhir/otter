@@ -234,11 +234,14 @@ fn has_property_inherited(
     name: &str,
 ) -> Result<bool, VmNativeCallError> {
     let key = runtime.intern_property_name(name);
-    runtime.property_lookup(obj, key).map(|lookup| lookup.is_some()).map_err(|error| {
-        VmNativeCallError::Internal(
-            format!("descriptor field '{name}' presence check failed: {error:?}").into(),
-        )
-    })
+    runtime
+        .property_lookup(obj, key)
+        .map(|lookup| lookup.is_some())
+        .map_err(|error| {
+            VmNativeCallError::Internal(
+                format!("descriptor field '{name}' presence check failed: {error:?}").into(),
+            )
+        })
 }
 
 fn get_descriptor_bool_field(

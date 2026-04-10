@@ -94,6 +94,37 @@ pub fn compile_eval(source: &str, source_url: &str) -> Result<Module, SourceLowe
     compile_from_transformed(transformed, source_url, LoweringMode::Eval, false)
 }
 
+/// §B.3.5.2 — Compile eval source with field-initializer restrictions.
+/// Applied when direct eval occurs inside a class field initializer:
+/// `arguments` and `super()` are SyntaxError in eval'd code.
+/// Spec: <https://tc39.es/ecma262/#sec-performeval-rules-in-initializer>
+pub fn compile_eval_field_init(
+    source: &str,
+    source_url: &str,
+) -> Result<Module, SourceLoweringError> {
+    let transformed = transform_source(source, source_url)?;
+    let TransformedSource {
+        generated_js,
+        original,
+        source_map,
+        ..
+    } = transformed;
+    let allocator = Allocator::default();
+    let ast = parse_script(&allocator, &generated_js, source_url)?;
+
+    // §B.3.5.2 Additional Early Error Rules for Eval Inside Initializer.
+    crate::source_compiler::ast::check_eval_field_initializer_program(&ast)?;
+
+    crate::source_compiler::compile_program_to_module(ProgramInput {
+        program: &ast,
+        source_url,
+        mode: LoweringMode::Eval,
+        generated_js: &generated_js,
+        original_source: original,
+        oxc_map: source_map,
+    })
+}
+
 /// Parse, lower, and compile a JS/TS module (ESM) into an `otter-vm` module.
 /// Module mode enables top-level `await` and strict mode by default.
 /// Spec: <https://tc39.es/ecma262/#sec-modules>

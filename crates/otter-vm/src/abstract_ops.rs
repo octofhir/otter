@@ -326,9 +326,8 @@ fn parse_ryu_output(s: &str) -> (String, i32) {
     // n = number of integer-part digits + ryu exponent.
     // This is the position of the leading digit: the value's magnitude
     // is 10^(n-1) .. 10^n.
-    let digits_before_dot = mantissa_str.len() as i32
-        - if found_dot { 1 } else { 0 }
-        - decimal_offset;
+    let digits_before_dot =
+        mantissa_str.len() as i32 - if found_dot { 1 } else { 0 } - decimal_offset;
     let n = digits_before_dot + ryu_exp;
 
     // Remove trailing zeros from digits (they don't carry information).

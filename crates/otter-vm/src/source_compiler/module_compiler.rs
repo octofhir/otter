@@ -1,5 +1,5 @@
 use super::ast::{ParamInfo, has_use_strict_directive};
-use super::shared::{CompiledFunction, FunctionCompiler, FunctionKind, ScopeRef};
+use super::shared::{CompiledFunction, FunctionCompiler, FunctionKind, ScopeRef, ValueLocation};
 use super::source_mapper::SourceMapper;
 use super::*;
 
@@ -42,6 +42,9 @@ pub(super) struct ModuleCompiler<'a> {
     /// derived constructor actually reaches the `CallSuper` path instead
     /// of being rejected as "super() outside derived constructor".
     pub(super) pending_is_derived_constructor: bool,
+    /// When true, the next compiled function should inherit the class_id
+    /// context so inner closures can resolve private field accesses.
+    pub(super) pending_has_class_private_context: bool,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -61,6 +64,7 @@ impl<'a> ModuleCompiler<'a> {
             original_source,
             pending_private_name_scopes: Vec::new(),
             pending_is_derived_constructor: false,
+            pending_has_class_private_context: false,
         }
     }
 
@@ -98,12 +102,11 @@ impl<'a> ModuleCompiler<'a> {
         // a completion value, so eval("'hello'") must return "hello".
         // The oxc parser lifts directives into `program.directives`, so we
         // thread them through to the entry function compile for Eval mode.
-        let eval_directives: &[oxc_ast::ast::Directive<'_>] =
-            if self.mode == LoweringMode::Eval {
-                program.directives.as_slice()
-            } else {
-                &[]
-            };
+        let eval_directives: &[oxc_ast::ast::Directive<'_>] = if self.mode == LoweringMode::Eval {
+            program.directives.as_slice()
+        } else {
+            &[]
+        };
         let compiled = self.compile_function_from_statements_with_options(
             entry,
             FunctionIdentity {
@@ -210,6 +213,7 @@ impl<'a> ModuleCompiler<'a> {
         compiler.strict_mode = inherited_strict;
         compiler.is_derived_constructor =
             is_derived_constructor || self.pending_is_derived_constructor;
+        compiler.has_class_private_context = self.pending_has_class_private_context;
         // §15.7.14 PrivateNameEnvironment — inherit the lexically enclosing
         // class private-name scopes so nested class bodies can resolve
         // `#foo` references from outer classes during early-error checks.
@@ -232,6 +236,26 @@ impl<'a> ModuleCompiler<'a> {
         }
         compiler.predeclare_function_scope(statements, self)?;
         compiler.emit_hoisted_function_initializers()?;
+
+        // §15.5.2 / §15.8.3 — Implicit initial yield for generators.
+        // FunctionDeclarationInstantiation (param init) runs synchronously at
+        // generator creation time. If it throws, the error propagates to the
+        // caller, not to the first `.next()`. We emit a synthetic Yield after
+        // param init so the interpreter can suspend here, separating param init
+        // (runs eagerly) from body execution (deferred to first `.next()`).
+        // Spec: <https://tc39.es/ecma262/#sec-generatorfunction-definitions-runtime-semantics-evaluategeneratorbody>
+        if kind == FunctionKind::Generator {
+            let resume_reg = compiler.allocate_local()?;
+            let undef_reg = compiler.alloc_temp();
+            compiler
+                .instructions
+                .push(Instruction::load_undefined(undef_reg));
+            compiler
+                .instructions
+                .push(Instruction::yield_(resume_reg, undef_reg));
+            compiler.release(ValueLocation::temp(undef_reg));
+        }
+
         // §19.2.1 — In Eval mode at the script entry, directive prologue
         // string literals (e.g. the inner `'hello'` in `eval("'hello'")`)
         // are ExpressionStatements that must contribute to the completion
@@ -284,6 +308,7 @@ impl<'a> ModuleCompiler<'a> {
         );
         compiler.strict_mode = inherited_strict;
         compiler.is_derived_constructor = self.pending_is_derived_constructor;
+        compiler.has_class_private_context = self.pending_has_class_private_context;
         // §15.7.14 PrivateNameEnvironment inheritance.
         compiler.private_name_scopes = self.pending_private_name_scopes.clone();
 

@@ -33,7 +33,7 @@ fn check_interrupt_poll(
     runtime: &crate::interpreter::RuntimeState,
     index: usize,
 ) -> Result<(), VmNativeCallError> {
-    if index % TYPED_ARRAY_INTERRUPT_POLL_INTERVAL == 0 {
+    if index.is_multiple_of(TYPED_ARRAY_INTERRUPT_POLL_INTERVAL) {
         runtime.check_interrupt()?;
     }
     Ok(())

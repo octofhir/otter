@@ -27,7 +27,7 @@ impl From<&'static str> for UriCodecError {
 }
 
 fn poll_uri_interrupt(runtime: Option<&RuntimeState>, index: usize) -> Result<(), UriCodecError> {
-    if index % URI_INTERRUPT_POLL_INTERVAL == 0
+    if index.is_multiple_of(URI_INTERRUPT_POLL_INTERVAL)
         && runtime.is_some_and(RuntimeState::is_execution_interrupted)
     {
         return Err(UriCodecError::Interrupted);

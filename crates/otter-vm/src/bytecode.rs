@@ -478,6 +478,13 @@ pub enum Opcode {
     /// superclass, so the TypeError fires before any proxy traps.
     /// Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
     AssertConstructor = 0x87,
+
+    /// §7.1.14 ToPropertyKey — convert a value to a String or Symbol.
+    /// `ToPropertyKey dst`
+    /// Calls ToPrimitive(value, string), then ToString if not a Symbol.
+    /// Used to pre-evaluate computed class field keys at class definition time.
+    /// Spec: <https://tc39.es/ecma262/#sec-topropertykey>
+    ToPropertyKey = 0x88,
 }
 
 impl Opcode {
@@ -606,6 +613,7 @@ impl Opcode {
             0x85 => Some(Self::ThrowConstAssign),
             0x86 => Some(Self::SetGlobalStrict),
             0x87 => Some(Self::AssertConstructor),
+            0x88 => Some(Self::ToPropertyKey),
             _ => None,
         }
     }
@@ -1207,10 +1215,7 @@ impl Instruction {
 
     /// §10.2.5 MakeMethod — install a closure's `[[HomeObject]]`.
     #[must_use]
-    pub const fn set_home_object(
-        closure: BytecodeRegister,
-        home: BytecodeRegister,
-    ) -> Self {
+    pub const fn set_home_object(closure: BytecodeRegister, home: BytecodeRegister) -> Self {
         Self::encode_abc(
             Opcode::SetHomeObject,
             closure,
@@ -1221,10 +1226,7 @@ impl Instruction {
 
     /// §13.3.7 Reads a named `super.property` reference.
     #[must_use]
-    pub const fn get_super_property(
-        dst: BytecodeRegister,
-        property: PropertyNameId,
-    ) -> Self {
+    pub const fn get_super_property(dst: BytecodeRegister, property: PropertyNameId) -> Self {
         Self::encode_abc(
             Opcode::GetSuperProperty,
             dst,
@@ -1235,10 +1237,7 @@ impl Instruction {
 
     /// §13.3.7 Reads a computed `super[key]` reference.
     #[must_use]
-    pub const fn get_super_property_computed(
-        dst: BytecodeRegister,
-        key: BytecodeRegister,
-    ) -> Self {
+    pub const fn get_super_property_computed(dst: BytecodeRegister, key: BytecodeRegister) -> Self {
         Self::encode_abc(
             Opcode::GetSuperPropertyComputed,
             dst,
@@ -1249,10 +1248,7 @@ impl Instruction {
 
     /// §13.3.7 Writes a named `super.property = value`.
     #[must_use]
-    pub const fn set_super_property(
-        value: BytecodeRegister,
-        property: PropertyNameId,
-    ) -> Self {
+    pub const fn set_super_property(value: BytecodeRegister, property: PropertyNameId) -> Self {
         Self::encode_abc(
             Opcode::SetSuperProperty,
             value,
@@ -1490,6 +1486,17 @@ impl Instruction {
         Self::encode_abc(
             Opcode::AssertConstructor,
             src,
+            BytecodeRegister::new(0),
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §7.1.14 ToPropertyKey — convert value in `dst` to a String or Symbol.
+    #[must_use]
+    pub const fn to_property_key(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::ToPropertyKey,
+            dst,
             BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )

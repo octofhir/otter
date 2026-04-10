@@ -591,6 +591,11 @@ pub struct RuntimeState {
     /// Per-host-run interrupt signal inherited by JS callbacks entered from
     /// microtasks, timers, host callbacks, accessors, and promise handlers.
     active_interrupt_flag: Option<Arc<AtomicBool>>,
+    /// §B.3.5.2 — Nesting depth for class field initializer execution.
+    /// When > 0, direct eval applies additional restrictions (ContainsArguments,
+    /// Contains SuperCall). Incremented by RunClassFieldInitializer, decremented
+    /// when the field init function returns.
+    field_initializer_depth: u32,
 }
 
 impl RuntimeState {
@@ -648,6 +653,7 @@ impl RuntimeState {
             pending_delegation_iterator: None,
             pending_uncaught_throw: None,
             active_interrupt_flag: None,
+            field_initializer_depth: 0,
         }
     }
 
@@ -3461,9 +3467,9 @@ impl RuntimeState {
                     // Convert TypeError to a catchable JS TypeError so
                     // `assert.throws(TypeError, ...)` can intercept it.
                     match self.alloc_type_error(&message) {
-                        Ok(handle) => VmNativeCallError::Thrown(
-                            RegisterValue::from_object_handle(handle.0),
-                        ),
+                        Ok(handle) => {
+                            VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+                        }
                         Err(_) => VmNativeCallError::Internal(message),
                     }
                 }
@@ -3670,15 +3676,16 @@ impl RuntimeState {
                             // `declare_this_binding`.
                             let mut this_value = RegisterValue::undefined();
                             if callee_function.frame_layout().receiver_slot().is_some() {
-                                let recv = activation.receiver(callee_function).map_err(|error| {
-                                    VmNativeCallError::Internal(format!("{error}").into())
-                                })?;
+                                let recv =
+                                    activation.receiver(callee_function).map_err(|error| {
+                                        VmNativeCallError::Internal(format!("{error}").into())
+                                    })?;
                                 if self.is_ecma_object(recv) {
                                     this_value = recv;
                                 } else {
                                     let local_range = callee_function.frame_layout().local_range();
-                                    if local_range.len() > 0 {
-                                        if let Ok(val) = activation.register(
+                                    if !local_range.is_empty()
+                                        && let Ok(val) = activation.register(
                                             callee_function
                                                 .frame_layout()
                                                 .resolve_user_visible(
@@ -3687,11 +3694,10 @@ impl RuntimeState {
                                                         .parameter_count(),
                                                 )
                                                 .unwrap_or(0),
-                                        ) {
-                                            if self.is_ecma_object(val) {
-                                                this_value = val;
-                                            }
-                                        }
+                                        )
+                                        && self.is_ecma_object(val)
+                                    {
+                                        this_value = val;
                                     }
                                 }
                             }
@@ -5192,7 +5198,15 @@ impl RuntimeState {
             "<indirect-eval>"
         };
 
-        let module = crate::source::compile_eval(source, source_url).map_err(|e| {
+        // §B.3.5.2 — If inside a field initializer, apply additional early
+        // error rules (ContainsArguments, Contains SuperCall).
+        let in_field_init = direct && self.field_initializer_depth > 0;
+        let module = if in_field_init {
+            crate::source::compile_eval_field_init(source, source_url)
+        } else {
+            crate::source::compile_eval(source, source_url)
+        }
+        .map_err(|e| {
             // §19.2.1.1 Step 5: If parsing fails, throw a SyntaxError.
             self.alloc_syntax_error(&format!("eval: {e}"))
         })?;
@@ -6506,10 +6520,7 @@ impl Interpreter {
                         .define_own_property(
                             args_obj,
                             key,
-                            PropertyValue::data_with_attrs(
-                                value,
-                                PropertyAttributes::data(),
-                            ),
+                            PropertyValue::data_with_attrs(value, PropertyAttributes::data()),
                         )
                         .ok();
                 }
@@ -6534,7 +6545,9 @@ impl Interpreter {
                     // §10.4.4.7 step 8: Unmapped arguments — accessor with %ThrowTypeError%.
                     // { [[Get]]: %ThrowTypeError%, [[Set]]: %ThrowTypeError%,
                     //   [[Enumerable]]: false, [[Configurable]]: false }
-                    let thrower = runtime.intrinsics().throw_type_error_function()
+                    let thrower = runtime
+                        .intrinsics()
+                        .throw_type_error_function()
                         .expect("%ThrowTypeError% intrinsic must be initialised by this point");
                     runtime
                         .objects_mut()
@@ -6839,7 +6852,7 @@ impl Interpreter {
                         .construct_new_target()
                         .or(activation.closure_handle())
                         .map(|h| RegisterValue::from_object_handle(h.0))
-                        .unwrap_or(RegisterValue::undefined())
+                        .unwrap_or_default()
                 } else if let Some(closure) = activation.closure_handle() {
                     runtime
                         .objects
@@ -6856,8 +6869,7 @@ impl Interpreter {
             // §15.7.15 — Runtime TypeError for assignment to immutable
             // class name binding (`class C { m() { C = 42; } }`).
             Opcode::ThrowConstAssign => {
-                let error = runtime
-                    .alloc_type_error("Assignment to constant variable.")?;
+                let error = runtime.alloc_type_error("Assignment to constant variable.")?;
                 Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                     error.0,
                 )))
@@ -6870,9 +6882,8 @@ impl Interpreter {
                     .map(ObjectHandle)
                     .is_some_and(|h| runtime.is_constructible(h));
                 if !is_ctor {
-                    let error = runtime.alloc_type_error(
-                        "Class extends value is not a constructor or null",
-                    )?;
+                    let error = runtime
+                        .alloc_type_error("Class extends value is not a constructor or null")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
@@ -6880,9 +6891,30 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §7.1.14 ToPropertyKey — convert value to String or Symbol.
+            // Used to pre-evaluate computed class field keys at class definition
+            // time so that ToPrimitive/ToString errors fire before any instance
+            // is created.
+            // Spec: <https://tc39.es/ecma262/#sec-topropertykey>
+            Opcode::ToPropertyKey => {
+                let value = activation.read_bytecode_register(function, instruction.a())?;
+                // ToPrimitive(value, string)
+                let primitive =
+                    runtime.js_to_primitive_with_hint(value, ToPrimitiveHint::String)?;
+                // If Symbol, keep as-is; otherwise ToString.
+                let result = if primitive.as_symbol_id().is_some() {
+                    primitive
+                } else {
+                    let s = runtime.js_to_string(primitive)?;
+                    let handle = runtime.alloc_string(s);
+                    RegisterValue::from_object_handle(handle.0)
+                };
+                activation.write_bytecode_register(function, instruction.a(), result)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::SetHomeObject => {
-                let closure_value =
-                    activation.read_bytecode_register(function, instruction.a())?;
+                let closure_value = activation.read_bytecode_register(function, instruction.a())?;
                 let home_value = activation.read_bytecode_register(function, instruction.b())?;
                 let closure_handle = closure_value
                     .as_object_handle()
@@ -6908,8 +6940,7 @@ impl Interpreter {
                         Self::resolve_property_name(function, runtime, instruction.b())?
                     }
                     Opcode::GetSuperPropertyComputed => {
-                        let key =
-                            activation.read_bytecode_register(function, instruction.b())?;
+                        let key = activation.read_bytecode_register(function, instruction.b())?;
                         runtime.computed_property_name(key)?
                     }
                     _ => unreachable!(),
@@ -6921,9 +6952,7 @@ impl Interpreter {
                     .objects
                     .closure_home_object(closure_handle)?
                     .ok_or_else(|| {
-                        InterpreterError::TypeError(
-                            "super property access outside a method".into(),
-                        )
+                        InterpreterError::TypeError("super property access outside a method".into())
                     })?;
                 let base = match runtime.objects.get_prototype(home)? {
                     Some(proto) => proto,
@@ -6958,8 +6987,7 @@ impl Interpreter {
                         Self::resolve_property_name(function, runtime, instruction.b())?
                     }
                     Opcode::SetSuperPropertyComputed => {
-                        let key =
-                            activation.read_bytecode_register(function, instruction.b())?;
+                        let key = activation.read_bytecode_register(function, instruction.b())?;
                         runtime.computed_property_name(key)?
                     }
                     _ => unreachable!(),
@@ -6995,14 +7023,17 @@ impl Interpreter {
                             runtime.call_callable_for_accessor(setter, receiver, &[value])?;
                         }
                         PropertyValue::Data { .. } => {
-                            let receiver_handle =
-                                runtime.property_base_object_handle(receiver)?;
-                            runtime.objects.set_property(receiver_handle, property, value)?;
+                            let receiver_handle = runtime.property_base_object_handle(receiver)?;
+                            runtime
+                                .objects
+                                .set_property(receiver_handle, property, value)?;
                         }
                     },
                     None => {
                         let receiver_handle = runtime.property_base_object_handle(receiver)?;
-                        runtime.objects.set_property(receiver_handle, property, value)?;
+                        runtime
+                            .objects
+                            .set_property(receiver_handle, property, value)?;
                     }
                 }
                 activation.advance();
@@ -7087,7 +7118,11 @@ impl Interpreter {
                 let initializer = runtime.objects.closure_field_initializer(closure)?;
                 if let Some(init_handle) = initializer {
                     let this_value = activation.receiver(function)?;
-                    match Self::call_function(runtime, module, init_handle, this_value, &[]) {
+                    // §B.3.5.2 — Track field initializer depth for eval restrictions.
+                    runtime.field_initializer_depth += 1;
+                    let result = Self::call_function(runtime, module, init_handle, this_value, &[]);
+                    runtime.field_initializer_depth -= 1;
+                    match result {
                         Ok(_) => {
                             activation.advance();
                             Ok(StepOutcome::Continue)
@@ -8340,19 +8375,17 @@ impl Interpreter {
                 };
                 if return_method != RegisterValue::undefined()
                     && return_method != RegisterValue::null()
+                    && let Some(callable) = return_method.as_object_handle().map(ObjectHandle)
+                    && runtime.objects.is_callable(callable)
                 {
-                    if let Some(callable) = return_method.as_object_handle().map(ObjectHandle)
-                        && runtime.objects.is_callable(callable)
-                    {
-                        // Call iterator.return() — errors propagate.
-                        match runtime.call_callable(callable, iter_val, &[]) {
-                            Ok(_) => {}
-                            Err(VmNativeCallError::Thrown(value)) => {
-                                return Ok(StepOutcome::Throw(value));
-                            }
-                            Err(VmNativeCallError::Internal(message)) => {
-                                return Err(InterpreterError::NativeCall(message));
-                            }
+                    // Call iterator.return() — errors propagate.
+                    match runtime.call_callable(callable, iter_val, &[]) {
+                        Ok(_) => {}
+                        Err(VmNativeCallError::Thrown(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(VmNativeCallError::Internal(message)) => {
+                            return Err(InterpreterError::NativeCall(message));
                         }
                     }
                 }
@@ -9018,8 +9051,12 @@ impl Interpreter {
                     return Ok(StepOutcome::Continue);
                 }
 
-                // §27.3.3.1 — Generator function call: create a generator object
-                // instead of executing the body.
+                // §27.3.3.1 / §15.5.2 — Generator function call: create a
+                // generator object and eagerly execute FunctionDeclarationInstantiation
+                // (parameter initialization). The compiler emits an implicit initial
+                // Yield after param init, so `resume_generator_impl` runs param init
+                // and suspends at that yield. If param init throws, the error
+                // propagates to the caller (not to the first `.next()`).
                 // Spec: <https://tc39.es/ecma262/#sec-generatorfunction-objects-call>
                 if matches!(runtime.objects.kind(callee), Ok(HeapValueKind::Closure))
                     && runtime
@@ -9035,6 +9072,30 @@ impl Interpreter {
                         Some(callee),
                         arguments.clone(),
                     );
+
+                    // §15.5.2 step 1-2: Run param init eagerly. The implicit
+                    // initial yield (emitted by the compiler) suspends execution
+                    // after param init is complete. Discard the yielded result
+                    // (`{value: undefined, done: false}`).
+                    match Self::resume_generator_impl(
+                        runtime,
+                        gen_handle,
+                        RegisterValue::undefined(),
+                        crate::intrinsics::GeneratorResumeKind::Next,
+                    ) {
+                        Ok(_implicit_yield_result) => {
+                            // Param init succeeded; generator suspended at
+                            // implicit yield. First `.next()` resumes body.
+                        }
+                        Err(VmNativeCallError::Thrown(value)) => {
+                            // Param init threw — propagate to caller.
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(VmNativeCallError::Internal(msg)) => {
+                            return Err(InterpreterError::NativeCall(msg));
+                        }
+                    }
+
                     activation.write_bytecode_register(
                         function,
                         instruction.a(),
@@ -9281,14 +9342,16 @@ impl Interpreter {
                         current_closure,
                         activation.construct_new_target().unwrap_or(current_closure),
                     )
-                } else if let Some(parent) =
-                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                } else if let Some(parent) = runtime
+                    .objects
+                    .closure_lexical_non_arrow_ancestor(current_closure)?
                     && runtime
                         .objects
                         .closure_flags(parent)?
                         .is_class_constructor()
-                    && let Some(captured_nt) =
-                        runtime.objects.closure_captured_new_target(current_closure)?
+                    && let Some(captured_nt) = runtime
+                        .objects
+                        .closure_captured_new_target(current_closure)?
                 {
                     (parent, captured_nt)
                 } else {
@@ -9323,15 +9386,14 @@ impl Interpreter {
                             && activation.metadata().flags().is_construct()
                         {
                             let current_this = activation.receiver(function)?;
-                            if current_this != RegisterValue::undefined()
-                                && !current_this.is_hole()
+                            if current_this != RegisterValue::undefined() && !current_this.is_hole()
                             {
                                 let error = runtime.alloc_reference_error(
                                     "Super constructor may only be called once",
                                 )?;
-                                return Ok(StepOutcome::Throw(
-                                    RegisterValue::from_object_handle(error.0),
-                                ));
+                                return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                                    error.0,
+                                )));
                             }
                         }
                         if function.frame_layout().receiver_slot().is_some() {
@@ -9367,14 +9429,16 @@ impl Interpreter {
                         current_closure,
                         activation.construct_new_target().unwrap_or(current_closure),
                     )
-                } else if let Some(parent) =
-                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                } else if let Some(parent) = runtime
+                    .objects
+                    .closure_lexical_non_arrow_ancestor(current_closure)?
                     && runtime
                         .objects
                         .closure_flags(parent)?
                         .is_class_constructor()
-                    && let Some(captured_nt) =
-                        runtime.objects.closure_captured_new_target(current_closure)?
+                    && let Some(captured_nt) = runtime
+                        .objects
+                        .closure_captured_new_target(current_closure)?
                 {
                     (parent, captured_nt)
                 } else {
@@ -9430,14 +9494,16 @@ impl Interpreter {
                         current_closure,
                         activation.construct_new_target().unwrap_or(current_closure),
                     )
-                } else if let Some(parent) =
-                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                } else if let Some(parent) = runtime
+                    .objects
+                    .closure_lexical_non_arrow_ancestor(current_closure)?
                     && runtime
                         .objects
                         .closure_flags(parent)?
                         .is_class_constructor()
-                    && let Some(captured_nt) =
-                        runtime.objects.closure_captured_new_target(current_closure)?
+                    && let Some(captured_nt) = runtime
+                        .objects
+                        .closure_captured_new_target(current_closure)?
                 {
                     (parent, captured_nt)
                 } else {

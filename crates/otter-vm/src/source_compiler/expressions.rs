@@ -1257,10 +1257,7 @@ impl<'a> FunctionCompiler<'a> {
         // `super(...)` is valid in derived-class constructors AND in arrow
         // functions lexically nested inside them (§15.3 — arrows inherit
         // `super` from their enclosing non-arrow function).
-        let allowed_by_arrow = matches!(
-            self.kind,
-            FunctionKind::Arrow | FunctionKind::AsyncArrow
-        );
+        let allowed_by_arrow = matches!(self.kind, FunctionKind::Arrow | FunctionKind::AsyncArrow);
         if !self.is_derived_constructor && !allowed_by_arrow {
             return Err(SourceLoweringError::Unsupported(
                 "super() is only supported inside derived class constructors".to_string(),
@@ -1798,14 +1795,14 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ValueLocation, SourceLoweringError> {
         // §12.1.1 / §14.1.1 — In strict mode, `yield` and `let` cannot
         // be used as function binding identifiers. oxc doesn't enforce this.
-        if self.strict_mode {
-            if let Some(id) = &function.id {
-                let name = id.name.as_str();
-                if name == "yield" || name == "let" {
-                    return Err(SourceLoweringError::EarlyError(format!(
-                        "'{name}' is not allowed as a function name in strict mode"
-                    )));
-                }
+        if self.strict_mode
+            && let Some(id) = &function.id
+        {
+            let name = id.name.as_str();
+            if name == "yield" || name == "let" {
+                return Err(SourceLoweringError::EarlyError(format!(
+                    "'{name}' is not allowed as a function name in strict mode"
+                )));
             }
         }
         let fn_name = function.id.as_ref().map(|id| id.name.to_string());
@@ -1815,6 +1812,9 @@ impl<'a> FunctionCompiler<'a> {
 
         let reserved = module.reserve_function();
         let params = extract_function_params(function)?;
+        // Propagate private name context to inner function expressions.
+        let saved_private_ctx = module.pending_has_class_private_context;
+        module.pending_has_class_private_context = self.has_class_private_context;
         let compiled = module.compile_function_from_statements(
             reserved,
             FunctionIdentity {
@@ -1855,6 +1855,7 @@ impl<'a> FunctionCompiler<'a> {
                         .unwrap_or(&[]),
                 ),
         )?;
+        module.pending_has_class_private_context = saved_private_ctx;
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
@@ -1866,6 +1867,10 @@ impl<'a> FunctionCompiler<'a> {
             self.emit_new_closure_async(destination, reserved, &compiled.captures)?;
         } else {
             self.emit_new_closure(destination, reserved, &compiled.captures)?;
+        }
+        // Propagate class_id to inner closures for private field access.
+        if self.has_class_private_context {
+            self.emit_copy_class_id_from_current(destination);
         }
         Ok(ValueLocation::temp(destination))
     }
@@ -2185,8 +2190,7 @@ impl<'a> FunctionCompiler<'a> {
                     self.resolve_binding("this")
                 {
                     let tmp = self.alloc_temp();
-                    self.instructions
-                        .push(Instruction::get_upvalue(tmp, uv));
+                    self.instructions.push(Instruction::get_upvalue(tmp, uv));
                     self.emit_assert_not_hole(tmp);
                     self.release(ValueLocation::temp(tmp));
                 }
@@ -2361,6 +2365,8 @@ impl<'a> FunctionCompiler<'a> {
         // the enclosing constructor context.
         let saved_derived = module.pending_is_derived_constructor;
         module.pending_is_derived_constructor = self.is_derived_constructor;
+        let saved_private_ctx = module.pending_has_class_private_context;
+        module.pending_has_class_private_context = self.has_class_private_context;
 
         let compiled = if arrow.expression {
             let body_statements = &arrow.body.statements;
@@ -2410,6 +2416,7 @@ impl<'a> FunctionCompiler<'a> {
             )?
         };
         module.pending_is_derived_constructor = saved_derived;
+        module.pending_has_class_private_context = saved_private_ctx;
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
@@ -2417,6 +2424,10 @@ impl<'a> FunctionCompiler<'a> {
             self.emit_new_closure_async_arrow(destination, reserved, &compiled.captures)?;
         } else {
             self.emit_new_closure_arrow(destination, reserved, &compiled.captures)?;
+        }
+        // Propagate class_id to inner closures for private field access.
+        if self.has_class_private_context {
+            self.emit_copy_class_id_from_current(destination);
         }
         Ok(ValueLocation::temp(destination))
     }
@@ -3093,8 +3104,7 @@ impl<'a> FunctionCompiler<'a> {
             // lexically inherit from the enclosing construct context.
             // Spec: <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
             let dst = self.alloc_temp();
-            self.instructions
-                .push(Instruction::load_new_target(dst));
+            self.instructions.push(Instruction::load_new_target(dst));
             Ok(ValueLocation::temp(dst))
         } else {
             Err(SourceLoweringError::Unsupported(format!(

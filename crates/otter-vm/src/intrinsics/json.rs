@@ -225,7 +225,7 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
             runtime: self.runtime,
             depth: self.depth + 1,
         })? {
-            if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(JSON_INTERRUPT_POLL_INTERVAL) {
                 check_interrupt_de::<A::Error>(self.runtime)?;
             }
             self.runtime
@@ -241,7 +241,7 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
         let handle = self.runtime.alloc_object();
         let mut index = 0usize;
         while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+            if index.is_multiple_of(JSON_INTERRUPT_POLL_INTERVAL) {
                 check_interrupt_de::<A::Error>(self.runtime)?;
             }
             let prop = self.runtime.intern_property_name(&key);

@@ -262,7 +262,10 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "isFinite",
     "parseInt",
     "parseFloat",
-    "eval",
+    // NOTE: `eval` is intentionally omitted — it's on the global object, but
+    // the compiler must NOT see it as a local binding, otherwise it emits a
+    // regular call instead of the `CallEval` opcode for direct eval detection.
+    // §19.2.1.1 PerformEval requires a compile-time direct-eval check.
     "encodeURI",
     "encodeURIComponent",
     "decodeURI",

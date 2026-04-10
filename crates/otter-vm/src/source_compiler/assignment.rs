@@ -55,8 +55,7 @@ impl<'a> FunctionCompiler<'a> {
                 AssignmentTarget::StaticMemberExpression(member) => {
                     // §13.3.7 — `super.foo = value`.
                     if matches!(&member.object, Expression::Super(_)) {
-                        let property =
-                            self.intern_property_name(member.property.name.as_str())?;
+                        let property = self.intern_property_name(member.property.name.as_str())?;
                         let value = self.compile_expression(&assignment.right, module)?;
                         let value = if value.is_temp {
                             self.stabilize_binding_value(value)?

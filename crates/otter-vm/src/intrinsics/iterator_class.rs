@@ -28,7 +28,7 @@ fn check_iterator_interrupt(
     runtime: &crate::interpreter::RuntimeState,
     index: usize,
 ) -> Result<(), VmNativeCallError> {
-    if index % ITERATOR_INTERRUPT_POLL_INTERVAL == 0 {
+    if index.is_multiple_of(ITERATOR_INTERRUPT_POLL_INTERVAL) {
         runtime.check_interrupt()?;
     }
     Ok(())

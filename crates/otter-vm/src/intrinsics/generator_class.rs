@@ -50,7 +50,8 @@ impl IntrinsicInstaller for GeneratorIntrinsic {
             generator_function_constructor,
         );
         let gen_fn_ctor_id = cx.native_functions.register(gen_fn_ctor_desc);
-        let gen_fn_ctor = cx.alloc_intrinsic_host_function(gen_fn_ctor_id, intrinsics.function_prototype())?;
+        let gen_fn_ctor =
+            cx.alloc_intrinsic_host_function(gen_fn_ctor_id, intrinsics.function_prototype())?;
         install_function_length_name(gen_fn_ctor, 1, "GeneratorFunction", cx)?;
         // Constructor.prototype = %GeneratorFunction.prototype%
         cx.heap.define_own_property(
@@ -158,9 +159,9 @@ fn generator_function_constructor(
     } else {
         let mut param_parts = Vec::with_capacity(args.len() - 1);
         for arg in &args[..args.len() - 1] {
-            let s = runtime
-                .js_to_string(*arg)
-                .map_err(|e| VmNativeCallError::Internal(format!("GeneratorFunction: {e}").into()))?;
+            let s = runtime.js_to_string(*arg).map_err(|e| {
+                VmNativeCallError::Internal(format!("GeneratorFunction: {e}").into())
+            })?;
             param_parts.push(s.to_string());
         }
         let body_str = runtime

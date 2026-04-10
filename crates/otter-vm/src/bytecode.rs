@@ -448,6 +448,14 @@ pub enum Opcode {
     /// Computed-key variant of `SetSuperProperty`.
     /// `SetSuperPropertyComputed value, key`
     SetSuperPropertyComputed = 0x83,
+
+    /// §13.3.12 MetaProperty — `new.target`.
+    /// `LoadNewTarget dst`
+    /// For construct calls: returns the `newTarget` from the activation.
+    /// For arrows inside construct: returns the lexically captured new-target.
+    /// For all other calls: returns `undefined`.
+    /// Spec: <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
+    LoadNewTarget = 0x84,
 }
 
 impl Opcode {
@@ -572,6 +580,7 @@ impl Opcode {
             0x81 => Some(Self::GetSuperPropertyComputed),
             0x82 => Some(Self::SetSuperProperty),
             0x83 => Some(Self::SetSuperPropertyComputed),
+            0x84 => Some(Self::LoadNewTarget),
             _ => None,
         }
     }
@@ -1237,6 +1246,17 @@ impl Instruction {
             Opcode::SetSuperPropertyComputed,
             value,
             key,
+            BytecodeRegister::new(0),
+        )
+    }
+
+    /// §13.3.12 `new.target` meta-property.
+    #[must_use]
+    pub const fn load_new_target(dst: BytecodeRegister) -> Self {
+        Self::encode_abc(
+            Opcode::LoadNewTarget,
+            dst,
+            BytecodeRegister::new(0),
             BytecodeRegister::new(0),
         )
     }

@@ -1213,6 +1213,32 @@ impl VmIntrinsics {
             // §10.2.4 step 3: SetIntegrityLevel(thrower, "frozen")
             cx.heap.freeze(handle)?;
             self.throw_type_error_function = Some(handle);
+
+            // §10.2.4 AddRestrictedFunctionProperties — install `.caller`
+            // and `.arguments` as %ThrowTypeError% accessors on
+            // Function.prototype. All functions inherit these via the
+            // prototype chain; accessing them throws TypeError at runtime.
+            // Spec: <https://tc39.es/ecma262/#sec-addrestrictedfunctionproperties>
+            let caller_prop = cx.property_names.intern("caller");
+            cx.heap.define_own_property(
+                self.function_prototype,
+                caller_prop,
+                crate::object::PropertyValue::Accessor {
+                    getter: Some(handle),
+                    setter: Some(handle),
+                    attributes: crate::object::PropertyAttributes::from_flags(false, false, true),
+                },
+            )?;
+            let arguments_prop = cx.property_names.intern("arguments");
+            cx.heap.define_own_property(
+                self.function_prototype,
+                arguments_prop,
+                crate::object::PropertyValue::Accessor {
+                    getter: Some(handle),
+                    setter: Some(handle),
+                    attributes: crate::object::PropertyAttributes::from_flags(false, false, true),
+                },
+            )?;
         }
 
         self.stage = IntrinsicsStage::Installed;

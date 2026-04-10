@@ -1123,6 +1123,31 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
+        // §15.7.15 ClassDefinitionEvaluation step 2-3: Create a lexical
+        // binding for the class name inside the class body scope. Named
+        // classes expose an immutable inner binding so `class C { m() { C } }`
+        // resolves `C` inside methods. The binding starts in TDZ (hole) so
+        // `class x extends x {}` throws ReferenceError from the extends
+        // expression, and is initialized after the constructor is compiled.
+        // Anonymous class expressions (via NamedEvaluation) do NOT get this
+        // binding — references to the contextual name resolve to the outer
+        // variable instead (§15.7.15).
+        let class_has_self_binding = class.id.is_some();
+        // §15.7.15 step 2-3: Named classes get a TDZ inner binding. We
+        // allocate the local in the outer FC but do NOT insert the binding
+        // into `self.scope` — instead we'll push a temporary class-scope
+        // frame that only child compilations (methods, field initialisers)
+        // see via `parent_scopes_for_child()`. This avoids leaking the
+        // immutable binding into the outer scope where `var C = class C {}`
+        // would collide with it.
+        let class_name_register = if class_has_self_binding && !class_name.is_empty() {
+            let register = self.allocate_local()?;
+            self.instructions.push(Instruction::load_hole(register));
+            Some(register)
+        } else {
+            None
+        };
+
         // ── Compile super class ─────────────────────────────────────────────
         // §15.7.14 step 5: Detect `class extends null` — protoParent = null,
         // constructorParent = %Function.prototype%, constructor kind = base.
@@ -1158,9 +1183,12 @@ impl<'a> FunctionCompiler<'a> {
         // RunClassFieldInitializer is needed both for instance fields AND for
         // copying private methods/accessors to instances.
         let needs_field_initializer = has_instance_fields || has_private_members;
+        // class_has_self_binding is already computed earlier in this
+        // function for the TDZ inner-binding allocation.
         let constructor_value = if let Some(ctor) = constructor {
             self.compile_class_constructor_with_fields(
                 class_name,
+                class_has_self_binding,
                 ctor,
                 is_derived,
                 needs_field_initializer,
@@ -1169,12 +1197,14 @@ impl<'a> FunctionCompiler<'a> {
         } else if is_derived {
             self.compile_default_derived_class_constructor_with_fields(
                 class_name,
+                class_has_self_binding,
                 needs_field_initializer,
                 module,
             )?
         } else {
             self.compile_default_base_class_constructor_with_fields(
                 class_name,
+                class_has_self_binding,
                 needs_field_initializer,
                 module,
             )?
@@ -1184,6 +1214,17 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             constructor_value
         };
+
+        // §15.7.15 step 12: Initialize the class name binding.
+        // Now that the constructor closure exists, move its value into the
+        // TDZ register allocated earlier so the body scope sees the live
+        // constructor instead of the initial hole sentinel.
+        if let Some(class_reg) = class_name_register {
+            if class_reg != constructor_value.register {
+                self.instructions
+                    .push(Instruction::move_(class_reg, constructor_value.register));
+            }
+        }
 
         // ── Set up prototype chain ──────────────────────────────────────────
         if let Some(super_class) = super_class {
@@ -1242,6 +1283,23 @@ impl<'a> FunctionCompiler<'a> {
             constructor_value.register,
             prototype.register,
         ));
+
+        // §15.7.15 — Temporarily shadow the class name in the current scope
+        // with an immutable inner binding visible to child compilations
+        // (methods, field initialisers, static blocks). Save the previous
+        // binding (if any) so we can restore it when the class body ends.
+        let saved_class_name_binding = if let Some(class_reg) = class_name_register
+            && !class_name.is_empty()
+        {
+            let old = self
+                .scope
+                .borrow_mut()
+                .bindings
+                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
+            Some(old)
+        } else {
+            None
+        };
 
         // ── Second pass: install methods ────────────────────────────────────
         // §15.7.14 ClassDefinitionEvaluation step 26–28.
@@ -1310,6 +1368,22 @@ impl<'a> FunctionCompiler<'a> {
                     self.compile_static_block(block, constructor_value, module)?;
                 }
                 _ => {} // methods & instance fields handled above
+            }
+        }
+
+        // §15.7.15 — Restore the previous class name binding (or remove
+        // the temporary one if there was no prior binding).
+        if let Some(old_binding) = saved_class_name_binding {
+            match old_binding {
+                Some(prev) => {
+                    self.scope
+                        .borrow_mut()
+                        .bindings
+                        .insert(class_name.to_string(), prev);
+                }
+                None => {
+                    self.scope.borrow_mut().bindings.remove(class_name);
+                }
             }
         }
 
@@ -1988,6 +2062,7 @@ impl<'a> FunctionCompiler<'a> {
     pub(super) fn compile_default_base_class_constructor(
         &mut self,
         class_name: &str,
+        has_self_binding: bool,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         let reserved = module.reserve_function();
@@ -1995,7 +2070,11 @@ impl<'a> FunctionCompiler<'a> {
             reserved,
             FunctionIdentity {
                 debug_name: Some(class_name.to_string()),
-                self_binding_name: Some(class_name.to_string()),
+                self_binding_name: if has_self_binding {
+                    Some(class_name.to_string())
+                } else {
+                    None
+                },
                 length: 0,
             },
             &[],
@@ -2018,6 +2097,7 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_class_constructor_with_fields(
         &mut self,
         class_name: &str,
+        has_self_binding: bool,
         constructor: &Function<'_>,
         derived: bool,
         has_instance_fields: bool,
@@ -2044,8 +2124,10 @@ impl<'a> FunctionCompiler<'a> {
         compiler.declare_this_binding()?;
         compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(&params, module)?;
-        if let Some(self_binding_name) = Some(class_name) {
-            let closure_register = compiler.declare_function_binding(self_binding_name)?;
+        // §15.7.15 step 12.b: only named classes get an inner self-binding
+        // for the class body.
+        if has_self_binding {
+            let closure_register = compiler.declare_function_binding(class_name)?;
             compiler
                 .instructions
                 .push(Instruction::load_current_closure(closure_register));
@@ -2096,11 +2178,16 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_default_base_class_constructor_with_fields(
         &mut self,
         class_name: &str,
+        has_self_binding: bool,
         has_instance_fields: bool,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
         if !has_instance_fields {
-            return self.compile_default_base_class_constructor(class_name, module);
+            return self.compile_default_base_class_constructor(
+                class_name,
+                has_self_binding,
+                module,
+            );
         }
         let reserved = module.reserve_function();
         let mut compiler = FunctionCompiler::new(
@@ -2116,10 +2203,12 @@ impl<'a> FunctionCompiler<'a> {
         compiler.declare_this_binding()?;
         compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(&[], module)?;
-        let closure_register = compiler.declare_function_binding(class_name)?;
-        compiler
-            .instructions
-            .push(Instruction::load_current_closure(closure_register));
+        if has_self_binding {
+            let closure_register = compiler.declare_function_binding(class_name)?;
+            compiler
+                .instructions
+                .push(Instruction::load_current_closure(closure_register));
+        }
 
         // Emit RunClassFieldInitializer for instance fields.
         compiler
@@ -2140,6 +2229,7 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_default_derived_class_constructor_with_fields(
         &mut self,
         class_name: &str,
+        has_self_binding: bool,
         has_instance_fields: bool,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
@@ -2158,10 +2248,12 @@ impl<'a> FunctionCompiler<'a> {
         compiler.declare_this_binding()?;
         compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(&[], module)?;
-        let closure_register = compiler.declare_function_binding(class_name)?;
-        compiler
-            .instructions
-            .push(Instruction::load_current_closure(closure_register));
+        if has_self_binding {
+            let closure_register = compiler.declare_function_binding(class_name)?;
+            compiler
+                .instructions
+                .push(Instruction::load_current_closure(closure_register));
+        }
         let forwarded = ValueLocation::temp(compiler.alloc_temp());
         compiler
             .instructions
@@ -3061,6 +3153,13 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::set_upvalue(value.register, upvalue));
                 Ok(value)
             }
+            // Immutable bindings should have been caught by the pre-check
+            // above; match them here to satisfy exhaustiveness.
+            Ok(Binding::ImmutableRegister(_) | Binding::ImmutableUpvalue(_)) => {
+                Err(SourceLoweringError::EarlyError(format!(
+                    "Assignment to constant variable '{name}'"
+                )))
+            }
             // Undeclared identifier → assign to global property
             // Mirrors the read-path fallback in `compile_identifier`.
             Err(SourceLoweringError::UnknownBinding(_)) => {
@@ -3119,7 +3218,11 @@ impl<'a> FunctionCompiler<'a> {
                         Err(SourceLoweringError::DuplicateBinding(name.to_string()))
                     }
                 }
-                Binding::ThisRegister(_) | Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
+                Binding::ThisRegister(_)
+                | Binding::Upvalue(_)
+                | Binding::ThisUpvalue(_)
+                | Binding::ImmutableRegister(_)
+                | Binding::ImmutableUpvalue(_) => {
                     Err(SourceLoweringError::DuplicateBinding(name.to_string()))
                 }
             };
@@ -3140,12 +3243,14 @@ impl<'a> FunctionCompiler<'a> {
         let closure_register =
             if let Some(existing) = self.scope.borrow().bindings.get(name).copied() {
                 match existing {
-                    Binding::Register(register) => register,
+                    Binding::Register(register) | Binding::ImmutableRegister(register) => register,
                     Binding::ThisRegister(register) => register,
                     Binding::Function {
                         closure_register, ..
                     } => closure_register,
-                    Binding::Upvalue(_) | Binding::ThisUpvalue(_) => {
+                    Binding::Upvalue(_)
+                    | Binding::ThisUpvalue(_)
+                    | Binding::ImmutableUpvalue(_) => {
                         return Err(SourceLoweringError::Unsupported(format!(
                             "function declaration {name} conflicts with an upvalue binding"
                         )));
@@ -3230,6 +3335,10 @@ impl<'a> FunctionCompiler<'a> {
                 deepest_binding,
                 Binding::ThisRegister(_) | Binding::ThisUpvalue(_)
             );
+            let is_immutable = matches!(
+                deepest_binding,
+                Binding::ImmutableRegister(_) | Binding::ImmutableUpvalue(_)
+            );
 
             // Walk DOWN from the level just below where we found the binding
             // (level - 1) toward the immediate parent (0). At each step we
@@ -3256,6 +3365,8 @@ impl<'a> FunctionCompiler<'a> {
                     frame.capture_ids.insert(name.to_string(), id);
                     let captured = if is_this {
                         Binding::ThisUpvalue(id)
+                    } else if is_immutable {
+                        Binding::ImmutableUpvalue(id)
                     } else {
                         Binding::Upvalue(id)
                     };
@@ -3264,6 +3375,8 @@ impl<'a> FunctionCompiler<'a> {
                 };
                 source_binding = if is_this {
                     Binding::ThisUpvalue(upvalue_id)
+                } else if is_immutable {
+                    Binding::ImmutableUpvalue(upvalue_id)
                 } else {
                     Binding::Upvalue(upvalue_id)
                 };
@@ -3285,6 +3398,8 @@ impl<'a> FunctionCompiler<'a> {
             };
             let captured = if is_this {
                 Binding::ThisUpvalue(upvalue)
+            } else if is_immutable {
+                Binding::ImmutableUpvalue(upvalue)
             } else {
                 Binding::Upvalue(upvalue)
             };

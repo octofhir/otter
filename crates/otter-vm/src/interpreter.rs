@@ -2879,6 +2879,7 @@ impl RuntimeState {
                 )
                 .expect("closure prototype.constructor should install");
         }
+
         handle
     }
 
@@ -3431,9 +3432,17 @@ impl RuntimeState {
         self.call_callable_for_accessor(Some(callable), receiver, arguments)
             .map_err(|error| match error {
                 InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
-                InterpreterError::NativeCall(message) | InterpreterError::TypeError(message) => {
-                    VmNativeCallError::Internal(message)
+                InterpreterError::TypeError(message) => {
+                    // Convert TypeError to a catchable JS TypeError so
+                    // `assert.throws(TypeError, ...)` can intercept it.
+                    match self.alloc_type_error(&message) {
+                        Ok(handle) => VmNativeCallError::Thrown(
+                            RegisterValue::from_object_handle(handle.0),
+                        ),
+                        Err(_) => VmNativeCallError::Internal(message),
+                    }
                 }
+                InterpreterError::NativeCall(message) => VmNativeCallError::Internal(message),
                 other => VmNativeCallError::Internal(format!("{other}").into()),
             })
     }
@@ -3625,14 +3634,45 @@ impl RuntimeState {
                             Completion::Throw(RegisterValue::from_object_handle(error.0))
                         }
                         Completion::Return(_) => {
-                            let this_value =
-                                if callee_function.frame_layout().receiver_slot().is_some() {
-                                    activation.receiver(callee_function).map_err(|error| {
-                                        VmNativeCallError::Internal(format!("{error}").into())
-                                    })?
+                            // §10.2.1.3 [[Construct]] step 11: read `this`
+                            // from the receiver slot. If `super()` was called
+                            // from inside an arrow (which writes to the lexical
+                            // "this" upvalue instead), the receiver slot may
+                            // still hold `undefined`. Fall back to scanning the
+                            // first few local registers for an initialized
+                            // object — the compile-time "this" binding is
+                            // always the first local allocated by
+                            // `declare_this_binding`.
+                            let mut this_value = RegisterValue::undefined();
+                            if callee_function.frame_layout().receiver_slot().is_some() {
+                                let recv = activation.receiver(callee_function).map_err(|error| {
+                                    VmNativeCallError::Internal(format!("{error}").into())
+                                })?;
+                                if recv.as_object_handle().is_some() {
+                                    this_value = recv;
                                 } else {
-                                    RegisterValue::undefined()
-                                };
+                                    // Scan the first local for the "this"
+                                    // binding register (always allocated as the
+                                    // first local by `declare_this_binding`).
+                                    let local_range = callee_function.frame_layout().local_range();
+                                    if local_range.len() > 0 {
+                                        if let Ok(val) = activation.register(
+                                            callee_function
+                                                .frame_layout()
+                                                .resolve_user_visible(
+                                                    callee_function
+                                                        .frame_layout()
+                                                        .parameter_count(),
+                                                )
+                                                .unwrap_or(0),
+                                        ) {
+                                            if val.as_object_handle().is_some() {
+                                                this_value = val;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if this_value.as_object_handle().is_some() {
                                 Completion::Return(this_value)
                             } else {
@@ -6375,7 +6415,19 @@ impl Interpreter {
                     upvalues.push(upvalue);
                 }
 
-                let handle = runtime.alloc_closure(template.callee(), upvalues, template.flags());
+                let flags = template.flags();
+                let handle = runtime.alloc_closure(template.callee(), upvalues, flags);
+                // §15.3 ArrowFunction lexical inheritance — arrows capture
+                // the enclosing function's closure so `super` / `new.target`
+                // resolve through the lexical chain rather than the current
+                // activation at call time.
+                if flags.is_arrow() {
+                    let parent = activation.closure_handle();
+                    let active_new_target = activation.construct_new_target();
+                    runtime
+                        .objects
+                        .set_arrow_lexical_context(handle, parent, active_new_target)?;
+                }
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -6398,28 +6450,38 @@ impl Interpreter {
             Opcode::CreateArguments => {
                 let actual_argc = activation.metadata.argument_count();
                 let param_count = function.frame_layout().parameter_count();
-                let param_range = function.frame_layout().parameter_range();
 
                 // Collect all actual arguments: formal params from registers + overflow.
+                // Parameter slots are user-visible registers 0..param_count.
                 let mut all_args = Vec::with_capacity(usize::from(actual_argc));
                 let copy_from_regs = actual_argc.min(param_count);
                 for i in 0..copy_from_regs {
-                    let value = activation
-                        .read_bytecode_register(function, param_range.start().saturating_add(i))?;
+                    let value = activation.read_bytecode_register(function, i)?;
                     all_args.push(value);
                 }
                 for overflow_val in &activation.overflow_args {
                     all_args.push(*overflow_val);
                 }
 
-                // Create arguments exotic object backed by an Array with Object.prototype.
+                // §10.4.4 — The arguments object is an ordinary object (NOT
+                // an Array exotic). Create as a regular object with
+                // %Object.prototype% and install indexed elements + length.
                 let obj_proto = runtime.intrinsics().object_prototype();
-                let args_obj = runtime.alloc_array_with_elements(&all_args);
-                // §10.4.4.6 step 4: Set prototype to %Object.prototype% (not Array.prototype).
-                runtime
-                    .objects_mut()
-                    .set_prototype(args_obj, Some(obj_proto))
-                    .ok();
+                let args_obj = runtime.alloc_object_with_prototype(Some(obj_proto));
+                for (index, &value) in all_args.iter().enumerate() {
+                    let key = runtime.intern_property_name(&index.to_string());
+                    runtime
+                        .objects_mut()
+                        .define_own_property(
+                            args_obj,
+                            key,
+                            PropertyValue::data_with_attrs(
+                                value,
+                                PropertyAttributes::data(),
+                            ),
+                        )
+                        .ok();
+                }
 
                 // §10.4.4.6 step 7: Install `length` as own data property {W:true, E:false, C:true}.
                 let length_key = runtime.intern_property_name("length");
@@ -6441,20 +6503,20 @@ impl Interpreter {
                     // §10.4.4.7 step 8: Unmapped arguments — accessor with %ThrowTypeError%.
                     // { [[Get]]: %ThrowTypeError%, [[Set]]: %ThrowTypeError%,
                     //   [[Enumerable]]: false, [[Configurable]]: false }
-                    if let Some(thrower) = runtime.intrinsics().throw_type_error_function() {
-                        runtime
-                            .objects_mut()
-                            .define_own_property(
-                                args_obj,
-                                callee_key,
-                                PropertyValue::Accessor {
-                                    getter: Some(thrower),
-                                    setter: Some(thrower),
-                                    attributes: PropertyAttributes::constant(),
-                                },
-                            )
-                            .ok();
-                    }
+                    let thrower = runtime.intrinsics().throw_type_error_function()
+                        .expect("%ThrowTypeError% intrinsic must be initialised by this point");
+                    runtime
+                        .objects_mut()
+                        .define_own_property(
+                            args_obj,
+                            callee_key,
+                            PropertyValue::Accessor {
+                                getter: Some(thrower),
+                                setter: Some(thrower),
+                                attributes: PropertyAttributes::constant(),
+                            },
+                        )
+                        .expect("strict-mode callee accessor should install");
                 } else if let Some(closure) = activation.closure_handle() {
                     // §10.4.4.6 step 13: Mapped arguments — data property with callee.
                     // { [[Value]]: func, [[Writable]]: true,
@@ -6734,6 +6796,32 @@ impl Interpreter {
             // `super.foo` / `super[x]` inside the method body resolves to
             // `HomeObject.[[Prototype]]`.
             // Spec: <https://tc39.es/ecma262/#sec-makemethod>
+            // §13.3.12 MetaProperty `new.target`.
+            // For construct calls: returns the active new-target.
+            // For arrows: returns the lexically captured new-target from
+            //   the enclosing construct context.
+            // For all other calls: returns undefined.
+            // Spec: <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
+            Opcode::LoadNewTarget => {
+                let value = if activation.metadata().flags().is_construct() {
+                    activation
+                        .construct_new_target()
+                        .or(activation.closure_handle())
+                        .map(|h| RegisterValue::from_object_handle(h.0))
+                        .unwrap_or(RegisterValue::undefined())
+                } else if let Some(closure) = activation.closure_handle() {
+                    runtime
+                        .objects
+                        .closure_captured_new_target(closure)?
+                        .map(|h| RegisterValue::from_object_handle(h.0))
+                        .unwrap_or(RegisterValue::undefined())
+                } else {
+                    RegisterValue::undefined()
+                };
+                activation.write_bytecode_register(function, instruction.a(), value)?;
+                activation.advance();
+                Ok(StepOutcome::Continue)
+            }
             Opcode::SetHomeObject => {
                 let closure_value =
                     activation.read_bytecode_register(function, instruction.a())?;
@@ -8664,6 +8752,7 @@ impl Interpreter {
                     Self::prepare_direct_call(module, function, activation, instruction.b(), call)?;
                 match self.run_completion_with_runtime(module, &mut callee_activation, runtime)? {
                     Completion::Return(value) => {
+                        activation.refresh_open_upvalues_from_cells(runtime)?;
                         activation.write_bytecode_register(function, instruction.a(), value)?;
                         activation.advance();
                         Ok(StepOutcome::Continue)
@@ -9053,25 +9142,46 @@ impl Interpreter {
                 }
             }
             Opcode::CallSuper => {
-                if !function.is_derived_constructor()
-                    || !activation.metadata().flags().is_construct()
+                // Resolve the effective derived-constructor closure and the
+                // new-target to forward to the super constructor. For direct
+                // usage inside a derived constructor body these come from the
+                // active function/activation. For `() => super()` inside the
+                // same body, walk the arrow's `lexical_parent_closure` chain
+                // up to the enclosing non-arrow closure (which must be a
+                // derived class constructor) and use its captured new-target.
+                // Spec: <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
+                let current_closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let (effective_closure, new_target) = if function.is_derived_constructor()
+                    && activation.metadata().flags().is_construct()
                 {
+                    (
+                        current_closure,
+                        activation.construct_new_target().unwrap_or(current_closure),
+                    )
+                } else if let Some(parent) =
+                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                    && runtime
+                        .objects
+                        .closure_flags(parent)?
+                        .is_class_constructor()
+                    && let Some(captured_nt) =
+                        runtime.objects.closure_captured_new_target(current_closure)?
+                {
+                    (parent, captured_nt)
+                } else {
                     let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
-                }
-
-                let closure = activation
-                    .closure_handle()
-                    .ok_or(InterpreterError::MissingClosureContext)?;
-                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                };
+                let Some(super_ctor) = runtime.objects.get_prototype(effective_closure)? else {
                     let error = runtime.alloc_type_error("Super constructor is not available")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
                 };
-                let new_target = activation.construct_new_target().unwrap_or(closure);
                 let argc = instruction.c();
                 let mut arguments = Vec::with_capacity(usize::from(argc));
                 for offset in 0..argc {
@@ -9082,6 +9192,27 @@ impl Interpreter {
 
                 match runtime.construct_callable(super_ctor, &arguments, new_target) {
                     Ok(this_value) => {
+                        // §13.3.7.1 SuperCall step 8 / §9.1.1.3.1
+                        // BindThisValue — the super constructor has already
+                        // run, but we must refuse to (re-)bind `this` when
+                        // the derived constructor already initialised it.
+                        // Spec: <https://tc39.es/ecma262/#sec-bindthisvalue>
+                        if function.frame_layout().receiver_slot().is_some()
+                            && function.is_derived_constructor()
+                            && activation.metadata().flags().is_construct()
+                        {
+                            let current_this = activation.receiver(function)?;
+                            if current_this != RegisterValue::undefined()
+                                && !current_this.is_hole()
+                            {
+                                let error = runtime.alloc_reference_error(
+                                    "Super constructor may only be called once",
+                                )?;
+                                return Ok(StepOutcome::Throw(
+                                    RegisterValue::from_object_handle(error.0),
+                                ));
+                            }
+                        }
                         if function.frame_layout().receiver_slot().is_some() {
                             activation.set_receiver(function, this_value)?;
                         }
@@ -9105,25 +9236,38 @@ impl Interpreter {
             // Same semantics as CallSuper but reads arguments from an array
             // register (B) instead of a contiguous register window.
             Opcode::CallSuperSpread => {
-                if !function.is_derived_constructor()
-                    || !activation.metadata().flags().is_construct()
+                let current_closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let (effective_closure, new_target) = if function.is_derived_constructor()
+                    && activation.metadata().flags().is_construct()
                 {
+                    (
+                        current_closure,
+                        activation.construct_new_target().unwrap_or(current_closure),
+                    )
+                } else if let Some(parent) =
+                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                    && runtime
+                        .objects
+                        .closure_flags(parent)?
+                        .is_class_constructor()
+                    && let Some(captured_nt) =
+                        runtime.objects.closure_captured_new_target(current_closure)?
+                {
+                    (parent, captured_nt)
+                } else {
                     let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
-                }
-
-                let closure = activation
-                    .closure_handle()
-                    .ok_or(InterpreterError::MissingClosureContext)?;
-                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                };
+                let Some(super_ctor) = runtime.objects.get_prototype(effective_closure)? else {
                     let error = runtime.alloc_type_error("Super constructor is not available")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
                 };
-                let new_target = activation.construct_new_target().unwrap_or(closure);
 
                 let args_array_handle =
                     Self::read_object_handle(activation, function, instruction.b())?;
@@ -9155,25 +9299,38 @@ impl Interpreter {
                 }
             }
             Opcode::CallSuperForward => {
-                if !function.is_derived_constructor()
-                    || !activation.metadata().flags().is_construct()
+                let current_closure = activation
+                    .closure_handle()
+                    .ok_or(InterpreterError::MissingClosureContext)?;
+                let (effective_closure, new_target) = if function.is_derived_constructor()
+                    && activation.metadata().flags().is_construct()
                 {
+                    (
+                        current_closure,
+                        activation.construct_new_target().unwrap_or(current_closure),
+                    )
+                } else if let Some(parent) =
+                    runtime.objects.closure_lexical_non_arrow_ancestor(current_closure)?
+                    && runtime
+                        .objects
+                        .closure_flags(parent)?
+                        .is_class_constructor()
+                    && let Some(captured_nt) =
+                        runtime.objects.closure_captured_new_target(current_closure)?
+                {
+                    (parent, captured_nt)
+                } else {
                     let error = runtime.alloc_reference_error("'super' keyword unexpected here")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
-                }
-
-                let closure = activation
-                    .closure_handle()
-                    .ok_or(InterpreterError::MissingClosureContext)?;
-                let Some(super_ctor) = runtime.objects.get_prototype(closure)? else {
+                };
+                let Some(super_ctor) = runtime.objects.get_prototype(effective_closure)? else {
                     let error = runtime.alloc_type_error("Super constructor is not available")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
                         error.0,
                     )));
                 };
-                let new_target = activation.construct_new_target().unwrap_or(closure);
                 let param_count = function.frame_layout().parameter_count();
                 let actual_argc = activation.metadata().argument_count();
                 let mut arguments = Vec::with_capacity(usize::from(actual_argc));

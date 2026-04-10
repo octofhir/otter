@@ -601,7 +601,10 @@ impl<'a> FunctionCompiler<'a> {
                 let register = if let Ok(existing) = self.resolve_binding(name) {
                     match existing {
                         Binding::Register(r) => r,
-                        Binding::ThisRegister(_) | Binding::ThisUpvalue(_) => {
+                        Binding::ThisRegister(_)
+                        | Binding::ThisUpvalue(_)
+                        | Binding::ImmutableRegister(_)
+                        | Binding::ImmutableUpvalue(_) => {
                             return Err(SourceLoweringError::Unsupported(
                                 "destructuring cannot bind the lexical this binding".to_string(),
                             ));

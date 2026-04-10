@@ -36,6 +36,12 @@ pub(super) struct ModuleCompiler<'a> {
     /// initializers, static blocks) so nested classes and closures can
     /// resolve `#name` references from outer lexical classes.
     pub(super) pending_private_name_scopes: Vec<std::collections::HashSet<String>>,
+    /// §12.3.7.1 SuperCall inheritance latch — set by arrow-function
+    /// compilation to propagate the enclosing function's
+    /// `is_derived_constructor` flag so that `() => super()` inside a
+    /// derived constructor actually reaches the `CallSuper` path instead
+    /// of being rejected as "super() outside derived constructor".
+    pub(super) pending_is_derived_constructor: bool,
 }
 
 impl<'a> ModuleCompiler<'a> {
@@ -54,6 +60,7 @@ impl<'a> ModuleCompiler<'a> {
             source_mapper,
             original_source,
             pending_private_name_scopes: Vec::new(),
+            pending_is_derived_constructor: false,
         }
     }
 
@@ -201,7 +208,8 @@ impl<'a> ModuleCompiler<'a> {
             self.source_mapper.clone(),
         );
         compiler.strict_mode = inherited_strict;
-        compiler.is_derived_constructor = is_derived_constructor;
+        compiler.is_derived_constructor =
+            is_derived_constructor || self.pending_is_derived_constructor;
         // §15.7.14 PrivateNameEnvironment — inherit the lexically enclosing
         // class private-name scopes so nested class bodies can resolve
         // `#foo` references from outer classes during early-error checks.
@@ -275,6 +283,7 @@ impl<'a> ModuleCompiler<'a> {
             self.source_mapper.clone(),
         );
         compiler.strict_mode = inherited_strict;
+        compiler.is_derived_constructor = self.pending_is_derived_constructor;
         // §15.7.14 PrivateNameEnvironment inheritance.
         compiler.private_name_scopes = self.pending_private_name_scopes.clone();
 

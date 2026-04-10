@@ -967,6 +967,18 @@ enum HeapValue {
         /// installation; unset for regular functions and arrow functions.
         /// Spec: <https://tc39.es/ecma262/#sec-makemethod>
         home_object: Option<ObjectHandle>,
+        /// §15.3 ArrowFunction lexical inheritance — pointer to the closure
+        /// that created this arrow. Used by `CallSuper` to walk up the arrow
+        /// chain until reaching the enclosing non-arrow constructor whose
+        /// `[[Prototype]]` is the super constructor. `None` for non-arrow
+        /// functions.
+        lexical_parent_closure: Option<ObjectHandle>,
+        /// §15.3 ArrowFunction — captures the enclosing derived-constructor
+        /// activation's `[[NewTarget]]` at arrow-creation time so
+        /// `() => super()` inside a derived constructor body can forward
+        /// the new-target to `construct_callable`. Always `None` for
+        /// non-arrow functions.
+        captured_new_target: Option<ObjectHandle>,
     },
     HostFunction {
         function: HostFunctionId,
@@ -3811,9 +3823,101 @@ impl ObjectHeap {
             private_methods: Vec::new(),
             private_elements: Vec::new(),
             home_object: None,
+            lexical_parent_closure: None,
+            captured_new_target: None,
             realm,
         });
         ObjectHandle(h.0)
+    }
+
+    /// §15.3 ArrowFunction — populate the lexical context fields for a
+    /// freshly allocated arrow closure by inheriting them from the
+    /// enclosing (parent) closure and, when available, from the live
+    /// construct activation. Called by the `NewClosure` interpreter handler
+    /// right after `alloc_closure` when `ClosureFlags::is_arrow()` is true.
+    pub fn set_arrow_lexical_context(
+        &mut self,
+        handle: ObjectHandle,
+        parent_closure: Option<ObjectHandle>,
+        active_construct_new_target: Option<ObjectHandle>,
+    ) -> Result<(), ObjectError> {
+        // Inherit `[[HomeObject]]` and `captured_new_target` from the parent
+        // closure first, so nested arrows carry the whole lexical chain.
+        let (parent_home, parent_nt) = if let Some(parent) = parent_closure {
+            match self.object(parent)? {
+                HeapValue::Closure {
+                    home_object,
+                    captured_new_target,
+                    ..
+                } => (*home_object, *captured_new_target),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        match self.object_mut(handle)? {
+            HeapValue::Closure {
+                home_object,
+                lexical_parent_closure,
+                captured_new_target,
+                ..
+            } => {
+                *lexical_parent_closure = parent_closure;
+                if home_object.is_none() {
+                    *home_object = parent_home;
+                }
+                *captured_new_target = parent_nt.or(active_construct_new_target);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidHandle),
+        }
+    }
+
+    /// Walks the arrow-chain of lexical parent closures until a non-arrow
+    /// closure is reached, returning that non-arrow ancestor (or `None`
+    /// when the starting handle is not a closure).
+    ///
+    /// Used by `CallSuper` to resolve the enclosing derived constructor
+    /// closure when `super()` is invoked from inside an arrow.
+    pub fn closure_lexical_non_arrow_ancestor(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        let mut current = handle;
+        loop {
+            match self.object(current)? {
+                HeapValue::Closure {
+                    flags,
+                    lexical_parent_closure,
+                    ..
+                } => {
+                    if !flags.is_arrow() {
+                        return Ok(Some(current));
+                    }
+                    match lexical_parent_closure {
+                        Some(parent) => current = *parent,
+                        None => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Returns the `captured_new_target` slot of a closure (or `None` for
+    /// non-closures).
+    pub fn closure_captured_new_target(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::Closure {
+                captured_new_target,
+                ..
+            } => Ok(*captured_new_target),
+            _ => Ok(None),
+        }
     }
 
     /// §10.2.5 MakeMethod — sets the `[[HomeObject]]` slot on a closure.

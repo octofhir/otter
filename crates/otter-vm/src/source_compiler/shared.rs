@@ -9,6 +9,12 @@ use std::rc::Rc;
 pub(super) enum Binding {
     Register(BytecodeRegister),
     ThisRegister(BytecodeRegister),
+    /// §15.7.15 — Immutable binding for the class name inside its own body.
+    /// Reads emit AssertNotHole (TDZ during class heritage evaluation).
+    /// Writes throw a compile-time error (class name is a const binding).
+    ImmutableRegister(BytecodeRegister),
+    /// Captured variant of `ImmutableRegister`.
+    ImmutableUpvalue(UpvalueId),
     Function { closure_register: BytecodeRegister },
     Upvalue(UpvalueId),
     ThisUpvalue(UpvalueId),
@@ -17,15 +23,18 @@ pub(super) enum Binding {
 impl Binding {
     pub(super) fn capture_source(self) -> CaptureSource {
         match self {
-            Self::Register(register) => CaptureSource::Register(register),
-            Self::ThisRegister(register) => CaptureSource::Register(register),
+            Self::Register(register)
+            | Self::ThisRegister(register)
+            | Self::ImmutableRegister(register) => CaptureSource::Register(register),
             Self::Function {
                 closure_register, ..
             } => CaptureSource::Register(closure_register),
-            Self::Upvalue(upvalue) => CaptureSource::Upvalue(upvalue),
-            Self::ThisUpvalue(upvalue) => CaptureSource::Upvalue(upvalue),
+            Self::Upvalue(upvalue)
+            | Self::ThisUpvalue(upvalue)
+            | Self::ImmutableUpvalue(upvalue) => CaptureSource::Upvalue(upvalue),
         }
     }
+
 }
 
 pub(super) type CaptureSource = CaptureDescriptor;

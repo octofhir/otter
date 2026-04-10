@@ -20,6 +20,14 @@ impl<'a> FunctionCompiler<'a> {
             Expression::ArrowFunctionExpression(arrow) => {
                 self.compile_arrow_function_expression(arrow, inferred_name, module)
             }
+            // §13.2.5.5 NamedEvaluation — when an anonymous class expression
+            // appears in a binding/assignment target, the class should take
+            // the contextual name instead of the default "anonymous"
+            // placeholder. Fall through to the normal path when the class is
+            // already named.
+            Expression::ClassExpression(class) if class.id.is_none() => {
+                self.compile_class_expression_with_name(class, inferred_name, module)
+            }
             _ => self.compile_expression(expression, module),
         }
     }
@@ -237,7 +245,15 @@ impl<'a> FunctionCompiler<'a> {
 
     fn compile_this_expression(&mut self) -> Result<ValueLocation, SourceLoweringError> {
         // Arrow functions capture `this` lexically — resolve via the "this" binding.
-        if self.kind == FunctionKind::Arrow {
+        // Derived constructors also use the local "this" binding so that the
+        // value is upvalue-capturable by nested arrows. This ensures that
+        // `() => super()` inside a derived ctor can write `this` back through
+        // the shared UpvalueCell and the constructor body sees it.
+        // Spec: <https://tc39.es/ecma262/#sec-getthisenvironment>
+        if self.kind == FunctionKind::Arrow
+            || self.kind == FunctionKind::AsyncArrow
+            || self.is_derived_constructor
+        {
             return self.compile_identifier("this");
         }
         let register = self.alloc_temp();
@@ -279,12 +295,16 @@ impl<'a> FunctionCompiler<'a> {
                     .push(Instruction::get_upvalue(register, upvalue));
                 Ok(ValueLocation::temp(register))
             }
-            Ok(Binding::ThisUpvalue(upvalue)) => {
+            Ok(Binding::ThisUpvalue(upvalue)) | Ok(Binding::ImmutableUpvalue(upvalue)) => {
                 let register = self.alloc_temp();
                 self.instructions
                     .push(Instruction::get_upvalue(register, upvalue));
                 self.emit_assert_not_hole(register);
                 Ok(ValueLocation::temp(register))
+            }
+            Ok(Binding::ImmutableRegister(register)) => {
+                self.emit_assert_not_hole(register);
+                Ok(ValueLocation::local(register))
             }
             Err(SourceLoweringError::UnknownBinding(_)) => {
                 // Undeclared variable → runtime global lookup (V8's LdaGlobal).
@@ -1234,7 +1254,14 @@ impl<'a> FunctionCompiler<'a> {
         call: &oxc_ast::ast::CallExpression<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        if !self.is_derived_constructor {
+        // `super(...)` is valid in derived-class constructors AND in arrow
+        // functions lexically nested inside them (§15.3 — arrows inherit
+        // `super` from their enclosing non-arrow function).
+        let allowed_by_arrow = matches!(
+            self.kind,
+            FunctionKind::Arrow | FunctionKind::AsyncArrow
+        );
+        if !self.is_derived_constructor && !allowed_by_arrow {
             return Err(SourceLoweringError::Unsupported(
                 "super() is only supported inside derived class constructors".to_string(),
             ));
@@ -1295,12 +1322,23 @@ impl<'a> FunctionCompiler<'a> {
             arg_start,
             argument_count,
         ));
-        if let Some(Binding::ThisRegister(this_register)) =
-            self.scope.borrow().bindings.get("this").copied()
-            && this_register != result.register
-        {
-            self.instructions
-                .push(Instruction::move_(this_register, result.register));
+        // §9.1.1.3.1 BindThisValue — write back the newly-constructed
+        // `this` to the lexical "this" binding. For direct ctor use this
+        // is a local register Move. For arrows inside derived ctors this
+        // is a SetUpvalue that propagates through the UpvalueCell to the
+        // enclosing constructor's local "this" register.
+        // Use resolve_binding (not scope lookup) so arrows capture from
+        // the parent scope chain correctly.
+        match self.resolve_binding("this") {
+            Ok(Binding::ThisRegister(this_register)) if this_register != result.register => {
+                self.instructions
+                    .push(Instruction::move_(this_register, result.register));
+            }
+            Ok(Binding::ThisUpvalue(upvalue)) => {
+                self.instructions
+                    .push(Instruction::set_upvalue(result.register, upvalue));
+            }
+            _ => {}
         }
 
         // §15.7.14 — Run instance field initializers after super() binds `this`.
@@ -1378,12 +1416,17 @@ impl<'a> FunctionCompiler<'a> {
         ));
         self.release(args_array);
 
-        if let Some(Binding::ThisRegister(this_register)) =
-            self.scope.borrow().bindings.get("this").copied()
-            && this_register != result.register
-        {
-            self.instructions
-                .push(Instruction::move_(this_register, result.register));
+        // §9.1.1.3.1 BindThisValue write-back (same as static path).
+        match self.resolve_binding("this") {
+            Ok(Binding::ThisRegister(this_register)) if this_register != result.register => {
+                self.instructions
+                    .push(Instruction::move_(this_register, result.register));
+            }
+            Ok(Binding::ThisUpvalue(upvalue)) => {
+                self.instructions
+                    .push(Instruction::set_upvalue(result.register, upvalue));
+            }
+            _ => {}
         }
 
         // §15.7.14 — Run instance field initializers after super() binds `this`.
@@ -2282,6 +2325,13 @@ impl<'a> FunctionCompiler<'a> {
             FunctionKind::Arrow
         };
 
+        // §15.3 ArrowFunction — inherits `this`, `super`, `new.target` from
+        // the enclosing function. Propagate derived-constructor status so the
+        // child FC allows `super()` compilation and the runtime can resolve
+        // the enclosing constructor context.
+        let saved_derived = module.pending_is_derived_constructor;
+        module.pending_is_derived_constructor = self.is_derived_constructor;
+
         let compiled = if arrow.expression {
             let body_statements = &arrow.body.statements;
             let expression = match body_statements.first() {
@@ -2329,6 +2379,7 @@ impl<'a> FunctionCompiler<'a> {
                     || super::ast::has_use_strict_directive(arrow.body.directives.as_slice()),
             )?
         };
+        module.pending_is_derived_constructor = saved_derived;
         module.set_function(reserved, compiled.function);
 
         let destination = self.alloc_temp();
@@ -2652,11 +2703,25 @@ impl<'a> FunctionCompiler<'a> {
         class: &oxc_ast::ast::Class<'_>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<ValueLocation, SourceLoweringError> {
-        let class_name = class
-            .id
-            .as_ref()
-            .map(|id| id.name.as_str())
-            .unwrap_or("anonymous");
+        self.compile_class_expression_with_name(class, None, module)
+    }
+
+    /// §13.2.5.5 NamedEvaluation + §15.7 ClassExpression.
+    ///
+    /// When an anonymous class expression occurs in a NamedEvaluation
+    /// context (e.g. `var E = class {}` or `obj.x = class {}`), the class
+    /// constructor's `.name` should reflect the contextual binding name
+    /// instead of the `"anonymous"` placeholder.
+    pub(super) fn compile_class_expression_with_name(
+        &mut self,
+        class: &oxc_ast::ast::Class<'_>,
+        inferred_name: Option<&str>,
+        module: &mut ModuleCompiler<'a>,
+    ) -> Result<ValueLocation, SourceLoweringError> {
+        let class_name = match class.id.as_ref() {
+            Some(id) => id.name.as_str(),
+            None => inferred_name.unwrap_or(""),
+        };
         self.compile_class_body(class, class_name, module)
     }
 
@@ -2993,8 +3058,14 @@ impl<'a> FunctionCompiler<'a> {
             self.instructions.push(Instruction::import_meta(dst));
             Ok(ValueLocation::local(dst))
         } else if meta.meta.name == "new" && meta.property.name == "target" {
-            // new.target — not yet implemented, return undefined.
-            self.load_undefined()
+            // §13.3.12.1 `new.target` — returns the constructor being
+            // invoked via `new`, or `undefined` for regular calls. Arrows
+            // lexically inherit from the enclosing construct context.
+            // Spec: <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
+            let dst = self.alloc_temp();
+            self.instructions
+                .push(Instruction::load_new_target(dst));
+            Ok(ValueLocation::temp(dst))
         } else {
             Err(SourceLoweringError::Unsupported(format!(
                 "meta property {}.{}",

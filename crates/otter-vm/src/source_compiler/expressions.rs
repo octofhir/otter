@@ -2173,6 +2173,24 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ValueLocation, SourceLoweringError> {
         // §13.3.7 SuperProperty — `super[key]` inside a method.
         if matches!(&member.object, Expression::Super(_)) {
+            // §13.3.7.1 step 2: GetSuperBase checks [[ThisBindingStatus]]
+            // BEFORE evaluating the key expression. For derived ctors where
+            // `this` is still uninitialized (hole), this throws ReferenceError.
+            if self.is_derived_constructor {
+                if let Ok(Binding::ThisRegister(reg) | Binding::ImmutableRegister(reg)) =
+                    self.resolve_binding("this")
+                {
+                    self.emit_assert_not_hole(reg);
+                } else if let Ok(Binding::ThisUpvalue(uv) | Binding::ImmutableUpvalue(uv)) =
+                    self.resolve_binding("this")
+                {
+                    let tmp = self.alloc_temp();
+                    self.instructions
+                        .push(Instruction::get_upvalue(tmp, uv));
+                    self.emit_assert_not_hole(tmp);
+                    self.release(ValueLocation::temp(tmp));
+                }
+            }
             let key = self.compile_expression(&member.expression, module)?;
             let result = ValueLocation::temp(self.alloc_temp());
             self.record_location(member.span);

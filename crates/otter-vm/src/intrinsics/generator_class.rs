@@ -42,6 +42,35 @@ impl IntrinsicInstaller for GeneratorIntrinsic {
         // %GeneratorFunction.prototype%[@@toStringTag] = "GeneratorFunction"
         install_to_string_tag(gen_fn_proto, "GeneratorFunction", cx)?;
 
+        // §25.2.1 The GeneratorFunction Constructor
+        let constructor_prop = cx.property_names.intern("constructor");
+        let gen_fn_ctor_desc = NativeFunctionDescriptor::constructor(
+            "GeneratorFunction",
+            1,
+            generator_function_constructor,
+        );
+        let gen_fn_ctor_id = cx.native_functions.register(gen_fn_ctor_desc);
+        let gen_fn_ctor = cx.alloc_intrinsic_host_function(gen_fn_ctor_id, intrinsics.function_prototype())?;
+        install_function_length_name(gen_fn_ctor, 1, "GeneratorFunction", cx)?;
+        // Constructor.prototype = %GeneratorFunction.prototype%
+        cx.heap.define_own_property(
+            gen_fn_ctor,
+            prototype_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(gen_fn_proto.0),
+                PropertyAttributes::from_flags(false, false, false),
+            ),
+        )?;
+        // %GeneratorFunction.prototype%.constructor = GeneratorFunction
+        cx.heap.define_own_property(
+            gen_fn_proto,
+            constructor_prop,
+            PropertyValue::data_with_attrs(
+                RegisterValue::from_object_handle(gen_fn_ctor.0),
+                PropertyAttributes::from_flags(false, false, true),
+            ),
+        )?;
+
         // ─── §27.5.1 %GeneratorPrototype% ─────────────────────────────
         // %GeneratorPrototype%.constructor = %GeneratorFunction.prototype%
         let constructor_prop = cx.property_names.intern("constructor");
@@ -110,6 +139,58 @@ type NativeFn = fn(
     &[RegisterValue],
     &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError>;
+
+/// §25.2.1.1 GeneratorFunction(p1, p2, ..., pn, body)
+/// Same as Function constructor but wraps source as `function*`.
+/// Spec: <https://tc39.es/ecma262/#sec-generatorfunction>
+fn generator_function_constructor(
+    this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let (params, body) = if args.is_empty() {
+        (String::new(), String::new())
+    } else if args.len() == 1 {
+        let body_str = runtime
+            .js_to_string(args[0])
+            .map_err(|e| VmNativeCallError::Internal(format!("GeneratorFunction: {e}").into()))?;
+        (String::new(), body_str.to_string())
+    } else {
+        let mut param_parts = Vec::with_capacity(args.len() - 1);
+        for arg in &args[..args.len() - 1] {
+            let s = runtime
+                .js_to_string(*arg)
+                .map_err(|e| VmNativeCallError::Internal(format!("GeneratorFunction: {e}").into()))?;
+            param_parts.push(s.to_string());
+        }
+        let body_str = runtime
+            .js_to_string(args[args.len() - 1])
+            .map_err(|e| VmNativeCallError::Internal(format!("GeneratorFunction: {e}").into()))?;
+        (param_parts.join(","), body_str.to_string())
+    };
+
+    let source = format!("(function* anonymous({params}) {{\n{body}\n}})");
+    let result = runtime.eval_source(&source, false, false)?;
+
+    // §10.1.13 OrdinaryCreateFromConstructor — honour newTarget.prototype
+    if let Some(handle) = result.as_object_handle().map(ObjectHandle) {
+        let default_proto = runtime.intrinsics().generator_function_prototype();
+        let target = runtime.subclass_prototype_or_default(*this, default_proto);
+        if target != default_proto {
+            runtime
+                .objects_mut()
+                .set_prototype(handle, Some(target))
+                .map_err(|error| {
+                    VmNativeCallError::Internal(
+                        format!("GeneratorFunction subclass prototype install failed: {error:?}")
+                            .into(),
+                    )
+                })?;
+        }
+    }
+
+    Ok(result)
+}
 
 /// ES2024 §27.5.1.2 %GeneratorPrototype%.next(value)
 /// Spec: <https://tc39.es/ecma262/#sec-generator.prototype.next>

@@ -176,14 +176,17 @@ fn map_constructor(
             let entry = runtime.get_array_index_value(arr_handle, i)?;
             if let Some(entry_val) = entry
                 && let Some(eh) = entry_val.as_object_handle().map(ObjectHandle)
-                && matches!(runtime.objects().kind(eh), Ok(HeapValueKind::Array))
             {
+                // §24.1.1.1 step 8.d: Get "0" and "1" from entry object.
+                // Entry can be any object (not just Array).
+                let key_prop = runtime.intern_property_name("0");
                 let key = runtime
-                    .get_array_index_value(eh, 0)?
-                    .unwrap_or_else(RegisterValue::undefined);
+                    .ordinary_get(eh, key_prop, entry_val)
+                    .unwrap_or_else(|_| RegisterValue::undefined());
+                let val_prop = runtime.intern_property_name("1");
                 let value = runtime
-                    .get_array_index_value(eh, 1)?
-                    .unwrap_or_else(RegisterValue::undefined);
+                    .ordinary_get(eh, val_prop, entry_val)
+                    .unwrap_or_else(|_| RegisterValue::undefined());
                 runtime
                     .objects_mut()
                     .map_set(handle, key, value)

@@ -2274,6 +2274,36 @@ impl ObjectHeap {
         Ok(self.alloc_array_buffer_with_data(bytes, prototype))
     }
 
+    /// Copies bytes from one ArrayBuffer to another.
+    /// `src_handle[src_offset..src_offset+count]` → `dst_handle[dst_offset..]`
+    pub fn array_buffer_copy_bytes(
+        &mut self,
+        src: ObjectHandle,
+        src_offset: usize,
+        dst: ObjectHandle,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<(), ObjectError> {
+        // Read source bytes first (to avoid borrow issues).
+        let bytes = match self.object(src)? {
+            HeapValue::ArrayBuffer { data, .. } => {
+                let end = (src_offset + count).min(data.len());
+                let start = src_offset.min(end);
+                data[start..end].to_vec()
+            }
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        // Write to destination.
+        match self.object_mut(dst)? {
+            HeapValue::ArrayBuffer { data, .. } => {
+                let copy_len = bytes.len().min(data.len().saturating_sub(dst_offset));
+                data[dst_offset..dst_offset + copy_len].copy_from_slice(&bytes[..copy_len]);
+                Ok(())
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Returns the current byte length of a SharedArrayBuffer.
     pub fn shared_array_buffer_byte_length(
         &self,
@@ -5495,6 +5525,12 @@ impl ObjectHeap {
         key: PrivateNameKey,
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
+        // §7.3.31 step 4: If O is not extensible, throw a TypeError.
+        if !self.is_extensible(handle)? {
+            return Err(ObjectError::TypeError(
+                "Cannot define private field on a non-extensible object".into(),
+            ));
+        }
         let elements = self.private_elements_mut(handle)?;
         if elements.iter().any(|(k, _)| *k == key) {
             return Err(ObjectError::TypeError(
@@ -5513,6 +5549,12 @@ impl ObjectHeap {
         key: PrivateNameKey,
         element: PrivateElement,
     ) -> Result<(), ObjectError> {
+        // §7.3.31 step 4: If O is not extensible, throw a TypeError.
+        if !self.is_extensible(handle)? {
+            return Err(ObjectError::TypeError(
+                "Cannot define private element on a non-extensible object".into(),
+            ));
+        }
         let elements = self.private_elements_mut(handle)?;
         // Merge accessor pairs.
         if let PrivateElement::Accessor { getter, setter } = &element {

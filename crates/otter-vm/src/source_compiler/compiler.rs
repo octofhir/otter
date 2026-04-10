@@ -737,9 +737,15 @@ impl<'a> FunctionCompiler<'a> {
 
             // §14.11 — with statement: forbidden in strict mode
             AstStatement::WithStatement(_with) => {
-                // oxc parser already rejects `with` in strict mode. In sloppy mode
-                // we compile the body ignoring the with-object (partial semantics —
-                // full scope chain injection not yet implemented).
+                // §13.11.1 — `with` is a SyntaxError in strict mode.
+                // oxc doesn't always enforce this, so check here.
+                if self.strict_mode {
+                    return Err(SourceLoweringError::EarlyError(
+                        "Strict mode code may not include a with statement".to_string(),
+                    ));
+                }
+                // In sloppy mode we compile the body ignoring the with-object
+                // (partial semantics — full scope chain injection not yet implemented).
                 self.compile_statement(&_with.body, module)
             }
 
@@ -1148,6 +1154,22 @@ impl<'a> FunctionCompiler<'a> {
             None
         };
 
+        // §15.7.15 — Push the class name inner binding into scope BEFORE
+        // the extends expression so `class x extends x {}` hits the TDZ
+        // (ImmutableRegister with hole → AssertNotHole → ReferenceError).
+        let saved_class_name_binding = if let Some(class_reg) = class_name_register
+            && !class_name.is_empty()
+        {
+            let old = self
+                .scope
+                .borrow_mut()
+                .bindings
+                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
+            Some(old)
+        } else {
+            None
+        };
+
         // ── Compile super class ─────────────────────────────────────────────
         // §15.7.14 step 5: Detect `class extends null` — protoParent = null,
         // constructorParent = %Function.prototype%, constructor kind = base.
@@ -1164,7 +1186,14 @@ impl<'a> FunctionCompiler<'a> {
             } else {
                 let saved_fc = self.private_name_scopes.pop();
                 let saved_mc = module.pending_private_name_scopes.pop();
+                // Class declarations/expressions create an implicitly
+                // strict context for the entire ClassTail (including the
+                // heritage expression). Force strict so `with` statements
+                // inside heritage functions are rejected as SyntaxError.
+                let saved_strict = self.strict_mode;
+                self.strict_mode = true;
                 let super_result = self.compile_expression(super_class, module);
+                self.strict_mode = saved_strict;
                 if let Some(frame) = saved_fc {
                     self.private_name_scopes.push(frame);
                 }
@@ -1194,25 +1223,8 @@ impl<'a> FunctionCompiler<'a> {
         // RunClassFieldInitializer is needed both for instance fields AND for
         // copying private methods/accessors to instances.
         let needs_field_initializer = has_instance_fields || has_private_members;
-        // §15.7.15 — Push the class name inner binding into scope BEFORE
-        // constructor compilation so the ctor body sees the immutable
-        // binding via parent scope chain. The register holds hole at this
-        // point; it will be initialised with the constructor value below.
-        // When the immutable binding is already in scope, the constructor
-        // must NOT create its own `declare_function_binding` — it captures
-        // the class name via upvalue from the outer ImmutableRegister.
-        let saved_class_name_binding = if let Some(class_reg) = class_name_register
-            && !class_name.is_empty()
-        {
-            let old = self
-                .scope
-                .borrow_mut()
-                .bindings
-                .insert(class_name.to_string(), Binding::ImmutableRegister(class_reg));
-            Some(old)
-        } else {
-            None
-        };
+        // The ImmutableRegister binding was already pushed BEFORE extends
+        // evaluation (above). No second push needed here.
         // When the outer scope already has the class name as
         // ImmutableRegister, the constructor must NOT create its own
         // declare_function_binding — it should capture via upvalue

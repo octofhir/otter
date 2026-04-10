@@ -516,12 +516,43 @@ fn array_buffer_slice(
     } else {
         final_ as usize
     };
-    let prototype = Some(runtime.intrinsics().array_buffer_prototype);
-    let result = runtime
-        .objects_mut()
-        .array_buffer_slice(handle, first, final_, prototype)
-        .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
-    Ok(RegisterValue::from_object_handle(result.0))
+    // §25.1.5.4 step 14: Let ctor = ? SpeciesConstructor(O, %ArrayBuffer%).
+    // Use the instance's constructor (via .constructor property) for
+    // subclass-aware slicing.
+    let new_len = final_.saturating_sub(first);
+    let ctor_prop = runtime.intern_property_name("constructor");
+    let this_val = *this;
+    let ctor_value = runtime.ordinary_get(handle, ctor_prop, this_val)?;
+    let ctor = if ctor_value != RegisterValue::undefined()
+        && let Some(ctor_handle) = ctor_value.as_object_handle().map(ObjectHandle)
+        && runtime.is_constructible(ctor_handle)
+    {
+        ctor_handle
+    } else {
+        // Fallback to the intrinsic %ArrayBuffer% constructor.
+        runtime.intrinsics().array_buffer_constructor()
+    };
+    let len_arg = RegisterValue::from_i32(new_len as i32);
+    let new_buf = runtime
+        .construct_callable(ctor, &[len_arg], ctor)
+        .map_err(|e| match e {
+            VmNativeCallError::Thrown(v) => VmNativeCallError::Thrown(v),
+            other => other,
+        })?;
+    let new_handle = new_buf
+        .as_object_handle()
+        .map(ObjectHandle)
+        .ok_or_else(|| {
+            VmNativeCallError::Internal("ArrayBuffer.slice: constructed value is not an object".into())
+        })?;
+    // Copy bytes from source to new buffer.
+    if new_len > 0 {
+        runtime
+            .objects_mut()
+            .array_buffer_copy_bytes(handle, first, new_handle, 0, new_len)
+            .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?;
+    }
+    Ok(RegisterValue::from_object_handle(new_handle.0))
 }
 
 /// §25.1.5.6 ArrayBuffer.prototype.resize ( newLength )

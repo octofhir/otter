@@ -2805,7 +2805,13 @@ impl RuntimeState {
         upvalues: Vec<ObjectHandle>,
         flags: ObjectClosureFlags,
     ) -> ObjectHandle {
-        let prototype = self.intrinsics().function_prototype();
+        // Generator functions should have %GeneratorFunction.prototype%
+        // as their [[Prototype]], not %Function.prototype%.
+        let prototype = if flags.is_generator() {
+            self.intrinsics().generator_function_prototype()
+        } else {
+            self.intrinsics().function_prototype()
+        };
         let module = self
             .current_module
             .clone()
@@ -2853,8 +2859,10 @@ impl RuntimeState {
                 ),
             )
             .expect("closure name should install");
-        // Only constructable closures get a .prototype property (§10.2.6).
-        if flags.is_constructable() {
+        // §10.2.6 MakeConstructor + §27.3.3 — Constructable closures AND
+        // generator functions get a `.prototype` own property. Generators
+        // are not constructable but still get `.prototype` per §27.3.3.
+        if flags.is_constructable() || flags.is_generator() {
             let prototype_property = self.intern_property_name("prototype");
             let constructor_property = self.intern_property_name("constructor");
             let instance_prototype = self.alloc_object();
@@ -2868,16 +2876,20 @@ impl RuntimeState {
                     ),
                 )
                 .expect("closure prototype object should install");
-            self.objects
-                .define_own_property(
-                    instance_prototype,
-                    constructor_property,
-                    PropertyValue::data_with_attrs(
-                        RegisterValue::from_object_handle(handle.0),
-                        PropertyAttributes::constructor_link(),
-                    ),
-                )
-                .expect("closure prototype.constructor should install");
+            // §27.3.3 — Generator function prototypes do NOT get a
+            // `.constructor` back-link. Only regular constructors do.
+            if !flags.is_generator() {
+                self.objects
+                    .define_own_property(
+                        instance_prototype,
+                        constructor_property,
+                        PropertyValue::data_with_attrs(
+                            RegisterValue::from_object_handle(handle.0),
+                            PropertyAttributes::constructor_link(),
+                        ),
+                    )
+                    .expect("closure prototype.constructor should install");
+            }
         }
 
         handle
@@ -4833,7 +4845,16 @@ impl RuntimeState {
             return Ok(RegisterValue::from_number(lhs_number + rhs_number));
         }
 
-        lprim.add_i32(rprim).map_err(InterpreterError::InvalidValue)
+        // i32 fast-path — only valid when both operands are integers.
+        if lprim.as_i32().is_some() && rprim.as_i32().is_some() {
+            return lprim.add_i32(rprim).map_err(InterpreterError::InvalidValue);
+        }
+
+        // General case: coerce to Number (ToNumber). Undefined → NaN,
+        // null → 0, bool → 0/1.
+        let lhs_num = self.js_to_number(lprim)?;
+        let rhs_num = self.js_to_number(rprim)?;
+        Ok(RegisterValue::from_number(lhs_num + rhs_num))
     }
 
     fn js_typeof(&mut self, value: RegisterValue) -> Result<RegisterValue, InterpreterError> {
@@ -8293,9 +8314,48 @@ impl Interpreter {
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
+            // §7.4.7 IteratorClose — close an iterator by calling its
+            // `.return()` method if present. Built-in iterators (Array,
+            // String, Map, Set) use a fast-path `closed` flag. Custom
+            // iterators get a full `.return()` method call.
+            // Spec: <https://tc39.es/ecma262/#sec-iteratorclose>
             Opcode::IteratorClose => {
                 let iterator = Self::read_object_handle(activation, function, instruction.a())?;
-                runtime.objects.iterator_close(iterator)?;
+                // Fast-path for built-in iterators.
+                if runtime.objects.iterator_close(iterator).is_ok() {
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                // Custom iterator — look up `.return` and call it.
+                let return_prop = runtime.intern_property_name("return");
+                let iter_val = RegisterValue::from_object_handle(iterator.0);
+                let return_method = match runtime.property_lookup(iterator, return_prop)? {
+                    Some(lookup) => match lookup.value() {
+                        PropertyValue::Data { value, .. } => value,
+                        PropertyValue::Accessor { getter, .. } => {
+                            runtime.call_callable_for_accessor(getter, iter_val, &[])?
+                        }
+                    },
+                    None => RegisterValue::undefined(),
+                };
+                if return_method != RegisterValue::undefined()
+                    && return_method != RegisterValue::null()
+                {
+                    if let Some(callable) = return_method.as_object_handle().map(ObjectHandle)
+                        && runtime.objects.is_callable(callable)
+                    {
+                        // Call iterator.return() — errors propagate.
+                        match runtime.call_callable(callable, iter_val, &[]) {
+                            Ok(_) => {}
+                            Err(VmNativeCallError::Thrown(value)) => {
+                                return Ok(StepOutcome::Throw(value));
+                            }
+                            Err(VmNativeCallError::Internal(message)) => {
+                                return Err(InterpreterError::NativeCall(message));
+                            }
+                        }
+                    }
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
@@ -11296,7 +11356,7 @@ mod tests {
     use crate::property::PropertyNameTable;
     use crate::source_map::SourceMap;
     use crate::string::StringTable;
-    use crate::value::{RegisterValue, ValueError};
+    use crate::value::RegisterValue;
 
     use super::{Activation, ExecutionResult, Interpreter, InterpreterError, RuntimeState};
 
@@ -11700,7 +11760,8 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_rejects_invalid_arithmetic_operands() {
+    fn interpreter_adds_boolean_and_number() {
+        // ES2024 §13.15.3: `true + 1` → ToNumber(true) + 1 = 2.
         let layout = FrameLayout::new(0, 0, 0, 3).expect("frame layout should be valid");
         let function = Function::with_bytecode(
             Some("entry"),
@@ -11713,17 +11774,14 @@ mod tests {
                     BytecodeRegister::new(0),
                     BytecodeRegister::new(1),
                 ),
+                Instruction::ret(BytecodeRegister::new(2)),
             ]),
         );
-        let module = Module::new(Some("invalid-add"), vec![function], FunctionIndex(0))
+        let module = Module::new(Some("bool-add"), vec![function], FunctionIndex(0))
             .expect("module should be valid");
 
         let result = Interpreter::new().execute(&module);
-
-        assert_eq!(
-            result,
-            Err(InterpreterError::InvalidValue(ValueError::ExpectedI32))
-        );
+        assert!(result.is_ok(), "true + 1 should succeed");
     }
 
     #[test]

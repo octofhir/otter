@@ -123,7 +123,7 @@ impl ModuleLoader {
 fn scan_dependency_records(
     module: &ResolvedModule,
 ) -> Result<Vec<DependencyRecord>, ModuleGraphError> {
-    if module.url.starts_with("otter:") || module.source.is_empty() {
+    if module.source.is_empty() {
         return Ok(Vec::new());
     }
 

@@ -2,20 +2,24 @@
 name = "otter-node-compat"
 version = "0.1.0"
 edition = "2024"
-description = "Parked Node.js compatibility runner shim"
+description = "Node.js compatibility runner for the active Otter runtime stack"
 license = "MIT"
 autotests = false
 publish = false
 
 [lib]
-test = false
 doctest = false
-
-[workspace]
 
 [[bin]]
 name = "node-compat"
 path = "src/main.rs"
-test = false
 
 [dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"

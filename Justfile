@@ -106,8 +106,17 @@ test262-full *args:
 test262-conformance:
     cargo run --profile test262 -p otter-test262 --bin gen-conformance
 
-# === Parked Tooling ===
+# === Node Compatibility Tests ===
 
-# Node.js compatibility runner is parked until it is ported to the target stack.
-node-compat:
-    @echo "node-compat is parked during the legacy stack freeze"
+# Fetch the official Node.js test suite used by the node-compat runner.
+node-compat-fetch:
+    bash scripts/fetch-node-tests.sh
+
+# Run Node.js compatibility tests. Pass extra args, for example:
+#   just node-compat process --limit 25
+node-compat *args:
+    cargo run -p otter-node-compat -- {{args}}
+
+# Run Node.js compatibility tests with a substring filter.
+node-compat-filter filter *modules:
+    cargo run -p otter-node-compat -- {{modules}} --filter {{filter}}

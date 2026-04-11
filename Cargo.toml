@@ -5,6 +5,8 @@ members = [
     "crates/otter-runtime",
     "crates/otter-vm",
     "crates/otter-jit",
+    "crates/otter-nodejs",
+    "crates/otter-node-compat",
     "crates/otter-modules",
     "crates/otter-web",
     "crates/otter-pm",

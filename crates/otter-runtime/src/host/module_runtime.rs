@@ -119,9 +119,7 @@ pub(crate) fn preload_module_graph(
         if payload.modules.contains_key(&node.module.url) {
             continue;
         }
-        if node.module.url.starts_with("otter:")
-            && !payload.native_modules.contains(&node.module.url)
-        {
+        if node.module.source.is_empty() && !payload.native_modules.contains(&node.module.url) {
             return Err(format!(
                 "native hosted module '{}' is not registered on this runtime",
                 node.module.url
@@ -444,7 +442,12 @@ fn evaluate_loaded_module(
         }
     }
 
-    if url.starts_with("otter:") {
+    let is_native_module = runtime
+        .native_payload::<ModuleRuntimePayload>(helper)
+        .map_err(native_internal)?
+        .native_modules
+        .contains(url);
+    if is_native_module {
         return evaluate_native_module(runtime, helper, url);
     }
 
@@ -816,8 +819,7 @@ fn transform_module_source(
     loader: &ModuleLoader,
     node: &ModuleGraphNode,
 ) -> Result<String, String> {
-    if node.module.url.starts_with("otter:") || matches!(node.module.source_type, SourceType::Json)
-    {
+    if node.module.source.is_empty() || matches!(node.module.source_type, SourceType::Json) {
         return Ok(node.module.source.clone());
     }
 

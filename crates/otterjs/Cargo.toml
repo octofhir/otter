@@ -18,6 +18,7 @@ test = false
 
 [dependencies]
 # Target runtime stack
+otter-nodejs = { path = "../otter-nodejs", version = "0.1.0" }
 otter-modules = { path = "../otter-modules", version = "0.1.0" }
 otter-web = { path = "../otter-web", version = "0.1.0" }
 otter-runtime = { path = "../otter-runtime", version = "0.1.0" }

@@ -7,6 +7,7 @@ mod module_loader;
 mod module_runtime;
 mod native_modules;
 mod runtime_capabilities;
+mod runtime_process;
 mod state;
 
 pub use capabilities::{Capabilities, CapabilitiesBuilder, PermissionDenied};
@@ -28,4 +29,6 @@ pub use native_modules::{
 };
 pub use runtime_capabilities::current_capabilities;
 pub(crate) use runtime_capabilities::install_runtime_capabilities;
+pub(crate) use runtime_process::install_runtime_process;
+pub use runtime_process::{HostProcessConfig, current_process};
 pub(crate) use state::HostState;

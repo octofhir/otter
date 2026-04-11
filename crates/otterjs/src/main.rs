@@ -84,10 +84,6 @@ struct Cli {
     #[arg(long = "allow-ffi", global = true)]
     allow_ffi: bool,
 
-    /// Node.js API profile (`none`, `safe-core`, `full`)
-    #[arg(long = "node-api", value_enum, global = true, default_value_t = NodeApiMode::Full)]
-    node_api: NodeApiMode,
-
     /// Execution timeout in seconds (0 = no timeout)
     #[arg(long, global = true, default_value = "30")]
     timeout: u64,
@@ -174,13 +170,6 @@ struct Cli {
     /// Dump allocation category counts on exit
     #[arg(long, global = true)]
     alloc_stats: bool,
-}
-
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum NodeApiMode {
-    None,
-    SafeCore,
-    Full,
 }
 
 #[derive(Subcommand)]
@@ -393,12 +382,22 @@ fn report_run_error(err: RunError) -> ExitCode {
     }
 }
 
-async fn run_file(path: &Path, _script_args: &[String], cli: &Cli) -> ExitCode {
+async fn run_file(path: &Path, script_args: &[String], cli: &Cli) -> ExitCode {
     let Some(path_str) = path.to_str() else {
         eprintln!("error: invalid file path: {}", path.display());
         return ExitCode::from(1);
     };
-    let mut rt = match build_runtime_for_cli(cli) {
+    let argv = std::iter::once(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("otter")))
+        .map(|path| path.to_string_lossy().to_string())
+        .chain(std::iter::once(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .to_string(),
+        ))
+        .chain(script_args.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut rt = match build_runtime_for_cli(cli, argv) {
         Ok(rt) => rt,
         Err(error) => {
             eprintln!("error: {error}");
@@ -412,7 +411,14 @@ async fn run_file(path: &Path, _script_args: &[String], cli: &Cli) -> ExitCode {
 }
 
 fn run_eval(source: &str, print_result: bool, cli: &Cli) -> ExitCode {
-    let mut rt = match build_runtime_for_cli(cli) {
+    let argv = vec![
+        std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("otter"))
+            .to_string_lossy()
+            .to_string(),
+        "[eval]".to_string(),
+    ];
+    let mut rt = match build_runtime_for_cli(cli, argv) {
         Ok(rt) => rt,
         Err(error) => {
             eprintln!("error: {error}");
@@ -432,7 +438,7 @@ fn run_eval(source: &str, print_result: bool, cli: &Cli) -> ExitCode {
     }
 }
 
-fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
+fn build_runtime_for_cli(cli: &Cli, argv: Vec<String>) -> Result<otter_runtime::OtterRuntime> {
     let capabilities = if cli.allow_all {
         otter_runtime::Capabilities::all()
     } else {
@@ -458,23 +464,32 @@ fn build_runtime_for_cli(cli: &Cli) -> Result<otter_runtime::OtterRuntime> {
         builder.build()
     };
 
+    let env_store = if cli.allow_all || cli.allow_env {
+        Some(std::env::vars().fold(
+            otter_runtime::EnvStoreBuilder::new(),
+            |builder, (key, _)| builder.passthrough_var(key),
+        ))
+    } else {
+        None
+    };
+
     let loader = otter_runtime::ModuleLoaderConfig {
         base_dir: std::env::current_dir()?,
         ..Default::default()
     };
 
-    let profile = match cli.node_api {
-        NodeApiMode::None => otter_runtime::RuntimeProfile::Core,
-        NodeApiMode::SafeCore => otter_runtime::RuntimeProfile::SafeCore,
-        NodeApiMode::Full => otter_runtime::RuntimeProfile::Full,
-    };
-
     let mut builder = otter_runtime::OtterRuntime::builder()
-        .profile(profile)
+        .profile(otter_runtime::RuntimeProfile::Full)
         .capabilities(capabilities)
+        .process_argv(argv)
         .module_loader(loader)
+        .extension(otter_nodejs::nodejs_extension())
         .extension(otter_modules::modules_extension())
         .extension(otter_web::web_extension());
+
+    if let Some(env_store) = env_store {
+        builder = builder.env(|_| env_store);
+    }
 
     if cli.timeout > 0 {
         builder = builder.timeout(Duration::from_secs(cli.timeout));

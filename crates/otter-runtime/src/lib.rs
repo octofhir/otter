@@ -44,12 +44,12 @@ pub use builder::RuntimeBuilder;
 pub use diagnostic::{DiagnosticFrame, JsRuntimeDiagnostic};
 pub use host::{
     Capabilities, CapabilitiesBuilder, DEFAULT_DENY_PATTERNS, EnvFileError, EnvStoreBuilder,
-    EnvWriteError, HostConfig, HostedExtension, HostedExtensionModule, HostedExtensionRegistry,
-    HostedNativeModule, HostedNativeModuleKind, HostedNativeModuleLoader,
+    EnvWriteError, HostConfig, HostProcessConfig, HostedExtension, HostedExtensionModule,
+    HostedExtensionRegistry, HostedNativeModule, HostedNativeModuleKind, HostedNativeModuleLoader,
     HostedNativeModuleRegistry, ImportContext, IsolatedEnvStore, ModuleDependency, ModuleGraph,
     ModuleGraphError, ModuleGraphNode, ModuleLoader, ModuleLoaderConfig, ModuleLoaderError,
     ModuleType, PermissionDenied, ResolvedModule, RuntimeProfile, SourceType, current_capabilities,
-    parse_env_file,
+    current_process, parse_env_file,
 };
 pub use runtime::{OtterRuntime, RunError};
 

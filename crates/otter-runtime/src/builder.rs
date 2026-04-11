@@ -26,8 +26,9 @@ use otter_vm::value::RegisterValue;
 use std::sync::Arc;
 
 use crate::host::{
-    Capabilities, EnvStoreBuilder, HostConfig, HostedExtension, HostedNativeModuleLoader,
-    IsolatedEnvStore, ModuleLoaderConfig, RuntimeProfile, install_runtime_capabilities,
+    Capabilities, EnvStoreBuilder, HostConfig, HostProcessConfig, HostedExtension,
+    HostedNativeModuleLoader, IsolatedEnvStore, ModuleLoaderConfig, RuntimeProfile,
+    install_runtime_capabilities, install_runtime_process,
 };
 use crate::runtime::OtterRuntime;
 
@@ -132,6 +133,28 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the process metadata exposed to hosted Node-like surfaces.
+    pub fn process(mut self, process: HostProcessConfig) -> Self {
+        self.host.set_process(process);
+        self
+    }
+
+    /// Overrides `process.argv`.
+    pub fn process_argv(mut self, argv: impl IntoIterator<Item = String>) -> Self {
+        let mut process = self.host.process().clone();
+        process.argv = argv.into_iter().collect();
+        self.host.set_process(process);
+        self
+    }
+
+    /// Overrides `process.execArgv`.
+    pub fn process_exec_argv(mut self, exec_argv: impl IntoIterator<Item = String>) -> Self {
+        let mut process = self.host.process().clone();
+        process.exec_argv = exec_argv.into_iter().collect();
+        self.host.set_process(process);
+        self
+    }
+
     /// Sets the runtime host profile.
     pub fn profile(mut self, profile: RuntimeProfile) -> Self {
         self.host.set_profile(profile);
@@ -186,6 +209,7 @@ impl RuntimeBuilder {
         // Install performance.now() on the global object.
         install_performance_global(&mut state);
         install_runtime_capabilities(&mut state, host.capabilities().clone());
+        install_runtime_process(&mut state, host.process().clone(), host.env_store().clone());
 
         host.extensions()
             .bootstrap(&mut state, host.profile())
@@ -202,6 +226,9 @@ impl RuntimeBuilder {
                 .expect("extension/native module specifiers should not conflict");
         }
         host.set_native_modules(native_modules);
+        let mut loader_config = host.loader().clone();
+        loader_config.native_specifiers = host.native_modules().specifiers().into_iter().collect();
+        host.set_loader(loader_config);
 
         OtterRuntime::from_state(state, self.timeout, host)
     }

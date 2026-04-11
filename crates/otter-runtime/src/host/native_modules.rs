@@ -76,6 +76,11 @@ impl HostedNativeModuleRegistry {
     }
 
     #[must_use]
+    pub fn specifiers(&self) -> Vec<String> {
+        self.modules.keys().cloned().collect()
+    }
+
+    #[must_use]
     pub fn into_entries(self) -> BTreeMap<String, Arc<dyn HostedNativeModuleLoader>> {
         self.modules
     }

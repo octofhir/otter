@@ -20,6 +20,13 @@ lodge!(
     values = [("answer", RegisterValue::from_i32(42))],
 );
 
+lodge!(
+    demo_commonjs_module,
+    module_specifiers = ["node:demo-commonjs"],
+    kind = commonjs,
+    default = value(RegisterValue::from_i32(42)),
+);
+
 #[test]
 fn lodge_generates_hosted_module_loader_for_active_runtime() {
     let entries = demo_module_entries();
@@ -86,4 +93,17 @@ fn lodge_generates_hosted_module_loader_for_active_runtime() {
             .into_string(),
         "ping"
     );
+}
+
+#[test]
+fn lodge_can_generate_commonjs_loader() {
+    let mut runtime = RuntimeState::new();
+    let module = DemoCommonjsModule;
+    let HostedNativeModule::CommonJs(exports) =
+        module.load(&mut runtime).expect("module should load")
+    else {
+        panic!("expected commonjs module");
+    };
+
+    assert_eq!(exports, RegisterValue::from_i32(42));
 }

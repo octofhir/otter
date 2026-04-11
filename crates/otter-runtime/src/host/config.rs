@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::{
-    Capabilities, HostedExtensionRegistry, HostedNativeModuleRegistry, IsolatedEnvStore,
-    ModuleLoaderConfig,
+    Capabilities, HostProcessConfig, HostedExtensionRegistry, HostedNativeModuleRegistry,
+    IsolatedEnvStore, ModuleLoaderConfig,
 };
 
 /// Runtime host feature profile.
@@ -22,6 +22,7 @@ pub enum RuntimeProfile {
 pub struct HostConfig {
     capabilities: Capabilities,
     env_store: Arc<IsolatedEnvStore>,
+    process: HostProcessConfig,
     profile: RuntimeProfile,
     loader: ModuleLoaderConfig,
     native_modules: HostedNativeModuleRegistry,
@@ -52,6 +53,16 @@ impl HostConfig {
     /// Replaces the environment store.
     pub fn set_env_store(&mut self, env_store: Arc<IsolatedEnvStore>) {
         self.env_store = env_store;
+    }
+
+    /// Returns the process metadata exposed through the host layer.
+    pub fn process(&self) -> &HostProcessConfig {
+        &self.process
+    }
+
+    /// Replaces the process metadata exposed through the host layer.
+    pub fn set_process(&mut self, process: HostProcessConfig) {
+        self.process = process;
     }
 
     /// Returns the configured host profile.
@@ -100,6 +111,7 @@ impl Default for HostConfig {
         Self {
             capabilities: Capabilities::none(),
             env_store: Arc::new(IsolatedEnvStore::default()),
+            process: HostProcessConfig::default(),
             profile: RuntimeProfile::Core,
             loader: ModuleLoaderConfig::default(),
             native_modules: HostedNativeModuleRegistry::default(),

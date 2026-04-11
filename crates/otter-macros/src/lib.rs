@@ -414,6 +414,12 @@ struct LodgeDefaultFunction {
     js_name: Option<LitStr>,
 }
 
+#[derive(Clone, Copy)]
+enum LodgeModuleKind {
+    Esm,
+    CommonJs,
+}
+
 #[derive(Clone)]
 enum LodgeDefault {
     Object,
@@ -427,6 +433,7 @@ struct LodgeInput {
     module_specifiers: Vec<LitStr>,
     functions: Vec<LodgeFunctionExport>,
     values: Vec<LodgeValueExport>,
+    kind: LodgeModuleKind,
     default: Option<LodgeDefault>,
 }
 
@@ -438,6 +445,7 @@ impl Parse for LodgeInput {
         let mut module_specifiers = Vec::new();
         let mut functions = Vec::new();
         let mut values = Vec::new();
+        let mut kind = LodgeModuleKind::Esm;
         let mut default = None;
 
         while !input.is_empty() {
@@ -467,6 +475,21 @@ impl Parse for LodgeInput {
                     values = Punctuated::<LodgeValueExport, Token![,]>::parse_terminated(&content)?
                         .into_iter()
                         .collect();
+                }
+                "kind" => {
+                    let mode: Ident = input.parse()?;
+                    kind = match mode.to_string().as_str() {
+                        "esm" => LodgeModuleKind::Esm,
+                        "commonjs" => LodgeModuleKind::CommonJs,
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                mode,
+                                format!(
+                                    "Unknown lodge! kind '{other}'. Expected: esm or commonjs."
+                                ),
+                            ));
+                        }
+                    };
                 }
                 "default" => {
                     let mode: Ident = input.parse()?;
@@ -503,7 +526,7 @@ impl Parse for LodgeInput {
                     return Err(syn::Error::new_spanned(
                         &key,
                         format!(
-                            "Unknown lodge! option '{}'. Expected: module_specifiers, functions, values, default.",
+                            "Unknown lodge! option '{}'. Expected: module_specifiers, functions, values, kind, default.",
                             other
                         ),
                     ));
@@ -520,6 +543,7 @@ impl Parse for LodgeInput {
             module_specifiers,
             functions,
             values,
+            kind,
             default,
         })
     }
@@ -669,6 +693,7 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
     let alloc_fn = format_ident!("{}_alloc_exported_function", input.name);
     let install_fn = format_ident!("{}_install_export", input.name);
     let default = input.default.clone();
+    let kind = input.kind;
 
     let specifiers: Vec<_> = input.module_specifiers.iter().collect();
 
@@ -767,6 +792,28 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
         },
     };
 
+    let return_value = match kind {
+        LodgeModuleKind::Esm => quote! {
+            Ok(::otter_runtime::HostedNativeModule::Esm(namespace))
+        },
+        LodgeModuleKind::CommonJs => quote! {
+            let exports = if let Some(default_object) = default_object {
+                ::otter_runtime::RegisterValue::from_object_handle(default_object.0)
+            } else if let Some(default_value) = default_value {
+                default_value
+            } else {
+                ::otter_runtime::RegisterValue::from_object_handle(namespace.0)
+            };
+            Ok(::otter_runtime::HostedNativeModule::CommonJs(exports))
+        },
+    };
+    let module_kind = match kind {
+        LodgeModuleKind::Esm => quote! { ::otter_runtime::HostedNativeModuleKind::Esm },
+        LodgeModuleKind::CommonJs => {
+            quote! { ::otter_runtime::HostedNativeModuleKind::CommonJs }
+        }
+    };
+
     quote! {
         #[derive(Debug, Clone, Copy, Default)]
         pub(crate) struct #struct_name;
@@ -823,6 +870,10 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
         }
 
         impl ::otter_runtime::HostedNativeModuleLoader for #struct_name {
+            fn kind(&self) -> ::otter_runtime::HostedNativeModuleKind {
+                #module_kind
+            }
+
             fn load(
                 &self,
                 runtime: &mut ::otter_runtime::RuntimeState,
@@ -832,7 +883,7 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
                 #(#function_exports)*
                 #(#value_exports)*
                 #finalize_default
-                Ok(::otter_runtime::HostedNativeModule::Esm(namespace))
+                #return_value
             }
         }
 

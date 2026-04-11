@@ -1,5 +1,5 @@
 use oxc_resolver::{ResolveOptions, Resolver};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -23,6 +23,8 @@ pub struct ModuleLoaderConfig {
     pub esm_conditions: Vec<String>,
     /// Condition names for CommonJS requires.
     pub cjs_conditions: Vec<String>,
+    /// Runtime-registered native hosted module specifiers.
+    pub native_specifiers: BTreeSet<String>,
 }
 
 impl Default for ModuleLoaderConfig {
@@ -54,6 +56,7 @@ impl Default for ModuleLoaderConfig {
                 "default".into(),
             ],
             cjs_conditions: vec!["require".into(), "node".into(), "default".into()],
+            native_specifiers: BTreeSet::new(),
         }
     }
 }
@@ -197,6 +200,9 @@ impl ModuleLoader {
             return self.resolve_with_context(mapped, referrer, context);
         }
 
+        if self.config.native_specifiers.contains(specifier) {
+            return Ok(specifier.to_string());
+        }
         if specifier.starts_with("otter:") {
             return Ok(specifier.to_string());
         }
@@ -291,6 +297,16 @@ impl ModuleLoader {
     }
 
     fn load_url(&self, url: &str) -> Result<ResolvedModule, ModuleLoaderError> {
+        if self.config.native_specifiers.contains(url) {
+            return Ok(ResolvedModule {
+                specifier: url.to_string(),
+                url: url.to_string(),
+                source: String::new(),
+                source_type: SourceType::JavaScript,
+                module_type: ModuleType::Esm,
+            });
+        }
+
         if let Some(name) = url.strip_prefix("otter:") {
             return Ok(ResolvedModule {
                 specifier: format!("otter:{name}"),

@@ -2,15 +2,11 @@
 name = "otter-nodejs"
 version = "0.1.0"
 edition = "2024"
-description = "Parked Node.js API compatibility shim for the new Otter runtime stack"
+description = "Node.js compatibility surfaces for the active Otter runtime stack"
 license = "MIT"
-autotests = false
-
-[lib]
-test = false
-doctest = false
-
-[workspace]
 
 [dependencies]
 otter-runtime = { path = "../otter-runtime" }
+otter-macros = { path = "../otter-macros" }
+otter-vm = { path = "../otter-vm" }
+libc = "0.2"

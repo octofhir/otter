@@ -324,7 +324,7 @@ impl OtterRuntime {
         })?;
         let module = &entry.module;
 
-        if module.url.starts_with("otter:") {
+        if module.source.is_empty() {
             let has_native_module = self.host.native_modules().contains(&module.url);
             if !has_native_module {
                 return Err(RunError::Runtime(format!(

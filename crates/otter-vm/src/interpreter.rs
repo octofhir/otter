@@ -5421,6 +5421,83 @@ impl Interpreter {
         self.run_with_runtime(module, &mut activation, runtime)
     }
 
+    /// §19.2.1.1 PerformEval for direct eval with an enclosing closure
+    /// context. The eval'd code is compiled into a module and executed via
+    /// a closure that inherits the caller's `class_id` (for private name
+    /// resolution), `home_object` (for `super.x`), and `this` binding.
+    ///
+    /// This makes `this.#f` / `super.x` / `this.foo` work inside direct
+    /// eval even though the eval code is compiled as a separate module.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-performeval>
+    pub fn eval_source_direct(
+        runtime: &mut RuntimeState,
+        source: &str,
+        caller_closure: Option<ObjectHandle>,
+        caller_this: RegisterValue,
+    ) -> Result<RegisterValue, VmNativeCallError> {
+        let source_url = "<direct-eval>";
+
+        // §B.3.5.2 — If inside a field initializer, apply additional early
+        // error rules (ContainsArguments, Contains SuperCall).
+        let in_field_init = runtime.field_initializer_depth > 0;
+        let module = if in_field_init {
+            crate::source::compile_eval_field_init(source, source_url)
+        } else {
+            crate::source::compile_eval(source, source_url)
+        }
+        .map_err(|e| runtime.alloc_syntax_error(&format!("eval: {e}")))?;
+
+        // §19.2.1.1 — When eval runs in the context of a function, the
+        // eval'd code inherits that function's execution context. Create a
+        // closure for the eval entry function and copy the caller's
+        // closure state (class_id, home_object) into it. Then invoke the
+        // closure via call_function with the caller's `this` as receiver.
+        if let Some(caller) = caller_closure {
+            let caller_class_id = runtime.objects.closure_class_id(caller).unwrap_or(0);
+            let caller_home = runtime.objects.closure_home_object(caller).unwrap_or(None);
+            let caller_realm = runtime
+                .objects
+                .function_realm(caller)
+                .unwrap_or(None)
+                .unwrap_or(runtime.current_realm);
+
+            let entry_index = module.entry();
+            let eval_closure = runtime.objects.alloc_closure(
+                module.clone(),
+                entry_index,
+                Vec::new(),
+                crate::object::ClosureFlags::normal(),
+                caller_realm,
+            );
+            if caller_class_id != 0 {
+                let _ = runtime
+                    .objects
+                    .set_closure_class_id(eval_closure, caller_class_id);
+            }
+            if let Some(home) = caller_home {
+                let _ = runtime.objects.set_closure_home_object(eval_closure, home);
+            }
+
+            return Self::call_function(runtime, &module, eval_closure, caller_this, &[]).map_err(
+                |e| match e {
+                    InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                    other => VmNativeCallError::Internal(format!("eval: {other}").into()),
+                },
+            );
+        }
+
+        // Fallback (no caller closure): run as standalone module.
+        let interpreter = Interpreter::for_runtime(runtime);
+        let result = interpreter
+            .execute_module(&module, runtime)
+            .map_err(|e| match e {
+                InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                other => VmNativeCallError::Internal(format!("eval: {other}").into()),
+            })?;
+        Ok(result.return_value())
+    }
+
     /// Calls a JS function (host function or closure) by ObjectHandle.
     ///
     /// This is the entry point for the event loop to invoke timer callbacks,
@@ -9775,8 +9852,10 @@ impl Interpreter {
             // §19.2.1.1 PerformEval — direct eval.
             // `CallEval dst, code`
             // If code is not a string, returns it unchanged.
-            // Otherwise compiles and executes the source in the current runtime,
-            // returning the completion value.
+            // Otherwise compiles and executes the source in the current
+            // runtime, inheriting the caller's `this`, HomeObject, and
+            // PrivateNameEnvironment so that `this.#f`, `super.x`, and
+            // `this` references work inside the eval'd code.
             // Spec: <https://tc39.es/ecma262/#sec-performeval>
             Opcode::CallEval => {
                 let dst_reg = instruction.a();
@@ -9785,9 +9864,14 @@ impl Interpreter {
 
                 // §19.2.1 Step 1: If x is not a String, return x.
                 let result = if let Some(source) = runtime.value_as_string(code_value) {
-                    // §19.2.1.1 PerformEval(x, strictCaller=from_frame, direct=true)
-                    runtime
-                        .eval_source(&source, true, false)
+                    // Capture caller context for private names and super access.
+                    let caller_closure = activation.closure_handle();
+                    let caller_this = activation
+                        .receiver(function)
+                        .unwrap_or(RegisterValue::undefined());
+                    // §19.2.1.1 PerformEval(x, strictCaller, direct=true) with
+                    // caller's closure context for private/super/this.
+                    Self::eval_source_direct(runtime, &source, caller_closure, caller_this)
                         .map_err(|e| match e {
                             VmNativeCallError::Thrown(value) => {
                                 InterpreterError::UncaughtThrow(value)
@@ -10915,26 +10999,27 @@ impl Interpreter {
 
         loop {
             act.begin_step();
-            let outcome = match interp.step(
-                &function,
-                &module,
-                &mut act,
-                runtime,
-                &mut frame_runtime,
-            ) {
-                Ok(o) => o,
-                Err(InterpreterError::UncaughtThrow(v)) => StepOutcome::Throw(v),
-                Err(e) => {
-                    runtime.restore_module(previous_module);
-                    runtime
-                        .objects
-                        .set_async_generator_state(generator, GeneratorState::Completed)
-                        .ok();
-                    return Err(VmNativeCallError::Internal(
-                        format!("async gen param init error: {e:?}").into(),
-                    ));
-                }
-            };
+            let outcome =
+                match interp.step(&function, &module, &mut act, runtime, &mut frame_runtime) {
+                    Ok(o) => o,
+                    Err(InterpreterError::UncaughtThrow(v)) => StepOutcome::Throw(v),
+                    Err(InterpreterError::TypeError(message)) => {
+                        let error = runtime
+                            .alloc_type_error(&message)
+                            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+                        StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
+                    }
+                    Err(e) => {
+                        runtime.restore_module(previous_module);
+                        runtime
+                            .objects
+                            .set_async_generator_state(generator, GeneratorState::Completed)
+                            .ok();
+                        return Err(VmNativeCallError::Internal(
+                            format!("async gen param init error: {e:?}").into(),
+                        ));
+                    }
+                };
 
             match outcome {
                 StepOutcome::Continue => {
@@ -10943,7 +11028,9 @@ impl Interpreter {
                     act.refresh_open_upvalues_from_cells(runtime)
                         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
                 }
-                StepOutcome::GeneratorYield { resume_register, .. } => {
+                StepOutcome::GeneratorYield {
+                    resume_register, ..
+                } => {
                     // Hit the implicit initial yield — save state.
                     let saved_regs = act.save_registers();
                     let pc = act.pc();

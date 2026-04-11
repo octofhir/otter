@@ -1270,6 +1270,10 @@ enum HeapValue {
         handler: ObjectHandle,
         /// `true` after `Proxy.revocable().revoke()` has been called.
         revoked: bool,
+        /// §7.3.32 [[PrivateElements]] — private fields/methods stored directly
+        /// on the Proxy object. Per spec, PrivateFieldGet/Set bypass proxy
+        /// traps and access this list directly.
+        private_elements: Vec<(PrivateNameKey, PrivateElement)>,
     },
 }
 
@@ -1768,10 +1772,14 @@ impl Traceable for HeapValue {
                 }
             }
             HeapValue::Proxy {
-                target, handler, ..
+                target,
+                handler,
+                private_elements,
+                ..
             } => {
                 trace_handle(*target, visitor);
                 trace_handle(*handler, visitor);
+                trace_private_elements(private_elements, visitor);
             }
             HeapValue::BigInt { .. } => {}
             HeapValue::ErrorStackFrames { .. } => {
@@ -4120,6 +4128,7 @@ impl ObjectHeap {
             target,
             handler,
             revoked: false,
+            private_elements: Vec::new(),
         });
         ObjectHandle(h.0)
     }
@@ -4140,6 +4149,7 @@ impl ObjectHeap {
                 target,
                 handler,
                 revoked: false,
+                ..
             } => Ok((*target, *handler)),
             HeapValue::Proxy { revoked: true, .. } => Err(ObjectError::InvalidKind), // caller must check
             _ => Err(ObjectError::InvalidKind),
@@ -5525,7 +5535,13 @@ impl ObjectHeap {
         key: PrivateNameKey,
         value: RegisterValue,
     ) -> Result<(), ObjectError> {
-        // §7.3.31 step 4: If O is not extensible, throw a TypeError.
+        // §7.3.32 PrivateFieldAdd step 1: If O.[[Extensible]] is false,
+        // throw a TypeError. Proxies defer to their target's [[IsExtensible]];
+        // non-proxy extensible objects pass the check. This ensures
+        // `Object.preventExtensions({})` can't receive private fields via
+        // return override, while extensible proxies still work because
+        // `private_elements_mut` stores the element on the proxy itself.
+        // Spec: <https://tc39.es/ecma262/#sec-privatefieldadd>
         if !self.is_extensible(handle)? {
             return Err(ObjectError::TypeError(
                 "Cannot define private field on a non-extensible object".into(),
@@ -5541,7 +5557,7 @@ impl ObjectHeap {
         Ok(())
     }
 
-    /// §7.3.31 PrivateMethodOrAccessorAdd — append a method/accessor to `[[PrivateElements]]`.
+    /// §7.3.33 PrivateMethodOrAccessorAdd — append a method/accessor to `[[PrivateElements]]`.
     /// Spec: <https://tc39.es/ecma262/#sec-privatemethodoraccessoradd>
     pub fn private_method_or_accessor_add(
         &mut self,
@@ -5549,7 +5565,6 @@ impl ObjectHeap {
         key: PrivateNameKey,
         element: PrivateElement,
     ) -> Result<(), ObjectError> {
-        // §7.3.31 step 4: If O is not extensible, throw a TypeError.
         if !self.is_extensible(handle)? {
             return Err(ObjectError::TypeError(
                 "Cannot define private element on a non-extensible object".into(),
@@ -5678,6 +5693,9 @@ impl ObjectHeap {
             }
             | HeapValue::Closure {
                 private_elements, ..
+            }
+            | HeapValue::Proxy {
+                private_elements, ..
             } => Ok(private_elements),
             _ => Ok(&[]),
         }
@@ -5693,6 +5711,9 @@ impl ObjectHeap {
                 private_elements, ..
             }
             | HeapValue::Closure {
+                private_elements, ..
+            }
+            | HeapValue::Proxy {
                 private_elements, ..
             } => Ok(private_elements),
             _ => Err(ObjectError::TypeError(
@@ -7073,6 +7094,10 @@ impl ObjectHeap {
             | HeapValue::FinalizationRegistry { .. }
             // Generators are extensible (can have own properties).
             | HeapValue::Generator { .. } => Ok(true),
+            // §10.5.3 Proxy [[IsExtensible]]: delegate to target when the
+            // handler lacks an `isExtensible` trap. The default behaviour
+            // returns Reflect.isExtensible(target).
+            HeapValue::Proxy { target, .. } => self.is_extensible(*target),
             // Strings, promises, upvalue cells are not extensible objects.
             _ => Ok(false),
         }

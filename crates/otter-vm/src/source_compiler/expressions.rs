@@ -1027,9 +1027,6 @@ impl<'a> FunctionCompiler<'a> {
     /// The interpreter will compile and execute the source code in the caller's
     /// context, inheriting strict mode.
     ///
-    /// If no arguments are provided, loads undefined as the code argument
-    /// (which eval will return unchanged per §19.2.1 step 1).
-    ///
     /// Spec: <https://tc39.es/ecma262/#sec-performeval>
     fn compile_direct_eval_call(
         &mut self,

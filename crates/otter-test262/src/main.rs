@@ -684,10 +684,7 @@ fn main() {
 
     // Resolve timeout: CLI flag wins (in seconds), then config `timeout_secs`,
     // then default 10 seconds.
-    let timeout_secs = cli
-        .timeout
-        .or(config.timeout_secs)
-        .unwrap_or(10);
+    let timeout_secs = cli.timeout.or(config.timeout_secs).unwrap_or(10);
     let timeout_ms = timeout_secs.saturating_mul(1000);
 
     // Resolve heap cap the same way.

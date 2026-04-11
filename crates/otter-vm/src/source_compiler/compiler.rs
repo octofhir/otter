@@ -354,8 +354,18 @@ impl<'a> FunctionCompiler<'a> {
         statements: &[AstStatement<'_>],
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
-        for name in collect_var_names(statements) {
-            self.declare_variable_binding(&name, true)?;
+        // §10.1.9 Script Global Object Environment Records: `var` at the
+        // script level is stored on the global object, NOT in a local
+        // register. This ensures that `eval()` inside a function can modify
+        // the outer script's `var` bindings via [[Set]] on the global.
+        // Reads of top-level `var` fall through to GetGlobal via
+        // `compile_identifier`'s unknown-binding fallback, and `var x = 1`
+        // compiles to SetGlobal directly (see compile_variable_declaration).
+        // Spec: <https://tc39.es/ecma262/#sec-globaldeclarationinstantiation>
+        if self.kind != FunctionKind::Script {
+            for name in collect_var_names(statements) {
+                self.declare_variable_binding(&name, true)?;
+            }
         }
 
         // §9.1.2 GetIdentifierReference + §10.2.11 FunctionDeclarationInstantiation:
@@ -787,29 +797,36 @@ impl<'a> FunctionCompiler<'a> {
         for declarator in &declaration.declarations {
             match &declarator.id {
                 BindingPattern::BindingIdentifier(identifier) => {
-                    let register =
-                        self.declare_variable_binding(identifier.name.as_str(), is_var)?;
-                    if let Some(init) = &declarator.init {
-                        let value = self.compile_expression_with_inferred_name(
-                            init,
-                            Some(identifier.name.as_str()),
-                            module,
-                        )?;
-                        self.assign_binding(identifier.name.as_str(), register, value)?;
-                        if is_var {
-                            self.mirror_script_binding_to_global(
-                                identifier.name.as_str(),
-                                register,
+                    // §10.1.9 Script-level `var` is stored on the global
+                    // object, not in a local register. For `var x = 1` at
+                    // the top level, emit SetGlobal directly without a
+                    // local binding, so that eval() can modify x through
+                    // GetGlobal/SetGlobal.
+                    if is_var && self.kind == FunctionKind::Script {
+                        let value = if let Some(init) = &declarator.init {
+                            self.compile_expression_with_inferred_name(
+                                init,
+                                Some(identifier.name.as_str()),
+                                module,
+                            )?
+                        } else {
+                            self.load_undefined()?
+                        };
+                        let property = self.intern_property_name(identifier.name.as_str())?;
+                        self.instructions
+                            .push(Instruction::set_global(value.register, property));
+                        self.release(value);
+                    } else {
+                        let register =
+                            self.declare_variable_binding(identifier.name.as_str(), is_var)?;
+                        if let Some(init) = &declarator.init {
+                            let value = self.compile_expression_with_inferred_name(
+                                init,
+                                Some(identifier.name.as_str()),
+                                module,
                             )?;
+                            self.assign_binding(identifier.name.as_str(), register, value)?;
                         }
-                    } else if is_var && self.kind == FunctionKind::Script {
-                        let undefined = self.load_undefined()?;
-                        if undefined.register != register {
-                            self.instructions
-                                .push(Instruction::move_(register, undefined.register));
-                        }
-                        self.release(undefined);
-                        self.mirror_script_binding_to_global(identifier.name.as_str(), register)?;
                     }
                 }
                 BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {
@@ -1379,18 +1396,26 @@ impl<'a> FunctionCompiler<'a> {
 
         self.emit_make_class_prototype_non_writable(constructor_value, module)?;
 
-        // ── Pre-evaluate computed instance field keys ────────────────────
+        // ── Pre-evaluate ALL computed field keys in source order ─────────
         // §15.7.14 step 27: ClassElementEvaluation evaluates computed
-        // property names at class definition time. Errors in key expressions
+        // property names at class definition time, in source order, for
+        // BOTH static and instance fields. Errors in key expressions
         // (ReferenceError, ToPrimitive throws, etc.) must fire here, not
         // when an instance is later created.
         // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-        let mut computed_key_bindings: Vec<String> = Vec::new();
+        //
+        // `computed_key_bindings_per_element` maps class body element index
+        // (source order) → Some(binding_name) if that element is a computed
+        // field (static or instance). `instance_computed_key_bindings` is
+        // the ordered sublist of instance-only bindings, used by the
+        // field_initializer loop which only iterates instance fields.
+        let mut computed_key_bindings_per_element: Vec<Option<String>> =
+            vec![None; class.body.body.len()];
+        let mut instance_computed_key_bindings: Vec<String> = Vec::new();
         {
             let mut ck_index = 0usize;
-            for element in &class.body.body {
+            for (elem_idx, element) in class.body.body.iter().enumerate() {
                 if let ClassElement::PropertyDefinition(prop) = element
-                    && !prop.r#static
                     && !prop.declare
                     && !matches!(
                         prop.r#type,
@@ -1409,18 +1434,22 @@ impl<'a> FunctionCompiler<'a> {
                     self.instructions
                         .push(Instruction::to_property_key(key_local));
 
-                    // Create a synthetic binding so the init function can
-                    // capture it as an upvalue.
+                    // Create a synthetic binding so child compilers (field
+                    // init function) can capture it as an upvalue.
                     let binding_name = format!("$__ck_{ck_index}");
                     ck_index += 1;
                     self.scope
                         .borrow_mut()
                         .bindings
                         .insert(binding_name.clone(), Binding::Register(key_local));
-                    computed_key_bindings.push(binding_name);
+                    computed_key_bindings_per_element[elem_idx] = Some(binding_name.clone());
+                    if !prop.r#static {
+                        instance_computed_key_bindings.push(binding_name);
+                    }
                 }
             }
         }
+        let computed_key_bindings = instance_computed_key_bindings;
 
         // ── Compile instance field initializer ──────────────────────────────
         // §15.7.14 step 29: Create an initializer function for instance fields.
@@ -1428,6 +1457,7 @@ impl<'a> FunctionCompiler<'a> {
             self.compile_class_field_initializer(
                 class,
                 constructor_value,
+                prototype,
                 has_private_members,
                 &computed_key_bindings,
                 module,
@@ -1436,10 +1466,22 @@ impl<'a> FunctionCompiler<'a> {
 
         // ── Third pass: static fields and static blocks ─────────────────────
         // §15.7.14 step 34: Evaluate static field initializers in order.
+        // Computed keys are already pre-evaluated in source order above.
+        // Filter must match the pre-evaluation loop exactly (same skip rules
+        // for `declare` and TS abstract properties) so that
+        // `computed_key_bindings_per_element[idx]` is always populated for
+        // every computed static field this loop processes.
         // Spec: <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-        for element in &class.body.body {
+        for (elem_idx, element) in class.body.body.iter().enumerate() {
             match element {
-                ClassElement::PropertyDefinition(prop) if prop.r#static && !prop.declare => {
+                ClassElement::PropertyDefinition(prop)
+                    if prop.r#static
+                        && !prop.declare
+                        && !matches!(
+                            prop.r#type,
+                            PropertyDefinitionType::TSAbstractPropertyDefinition
+                        ) =>
+                {
                     if let oxc_ast::ast::PropertyKey::PrivateIdentifier(ident) = &prop.key {
                         // Static private field: compile value and emit DefinePrivateField
                         // on the constructor.
@@ -1450,7 +1492,14 @@ impl<'a> FunctionCompiler<'a> {
                             module,
                         )?;
                     } else {
-                        self.compile_static_field(prop, constructor_value, module)?;
+                        let precomputed_key =
+                            computed_key_bindings_per_element[elem_idx].as_deref();
+                        self.compile_static_field(
+                            prop,
+                            constructor_value,
+                            precomputed_key,
+                            module,
+                        )?;
                     }
                 }
                 ClassElement::StaticBlock(block) => {
@@ -1460,8 +1509,8 @@ impl<'a> FunctionCompiler<'a> {
             }
         }
 
-        // Clean up synthetic computed-key bindings from scope.
-        for binding_name in &computed_key_bindings {
+        // Clean up ALL synthetic computed-key bindings from scope.
+        for binding_name in computed_key_bindings_per_element.iter().flatten() {
             self.scope
                 .borrow_mut()
                 .bindings
@@ -1494,6 +1543,7 @@ impl<'a> FunctionCompiler<'a> {
         &mut self,
         class: &Class<'_>,
         constructor_value: ValueLocation,
+        prototype: ValueLocation,
         has_private_members: bool,
         computed_key_bindings: &[String],
         module: &mut ModuleCompiler<'a>,
@@ -1613,6 +1663,15 @@ impl<'a> FunctionCompiler<'a> {
             ));
         }
 
+        // §10.2.5 MakeMethod — set [[HomeObject]] on the field initializer
+        // so that `super.x` inside a field initializer (or an `eval()` inside
+        // it) resolves against the class prototype.
+        // Spec: <https://tc39.es/ecma262/#sec-makemethod>
+        self.instructions.push(Instruction::set_home_object(
+            init_closure.register,
+            prototype.register,
+        ));
+
         self.instructions
             .push(Instruction::set_class_field_initializer(
                 constructor_value.register,
@@ -1626,18 +1685,30 @@ impl<'a> FunctionCompiler<'a> {
     /// §15.7.14 step 34 — Compile a single static field definition.
     /// Evaluates the initializer in a synthetic function with `this` = constructor,
     /// then defines the property on the constructor via DefineField.
+    /// `precomputed_key_binding` is the name of the synthetic binding holding
+    /// the already-coerced property key for computed fields (pre-evaluated in
+    /// source order alongside instance computed keys).
     /// Spec: <https://tc39.es/ecma262/#sec-definefield>
     fn compile_static_field(
         &mut self,
         prop: &oxc_ast::ast::PropertyDefinition<'_>,
         constructor_value: ValueLocation,
+        precomputed_key_binding: Option<&str>,
         module: &mut ModuleCompiler<'a>,
     ) -> Result<(), SourceLoweringError> {
         use super::ast::non_computed_property_key_name;
 
         if prop.computed {
-            // Computed key: evaluate key in outer scope, value in a synthetic function.
-            let key = self.compile_expression(prop.key.to_expression(), module)?;
+            // §15.7.14 step 27: computed key was already evaluated in source
+            // order by compile_class_body_inner's pre-evaluation pass, which
+            // guarantees correct interleaving of static and instance field
+            // key evaluation relative to other ClassElementEvaluation steps.
+            // The pre-evaluated value is stored in a synthetic local binding.
+            let binding_name = precomputed_key_binding.expect(
+                "compile_class_body_inner must pre-evaluate every computed \
+                 static field key before compile_static_field is called",
+            );
+            let key = self.compile_identifier(binding_name)?;
             let key = self.stabilize_binding_value(key)?;
 
             let value = self.compile_static_field_value(prop, constructor_value, module)?;
@@ -3326,6 +3397,17 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
         allow_redeclare: bool,
     ) -> Result<BytecodeRegister, SourceLoweringError> {
+        // §12.1.1 Identifiers Static Semantics: Early Errors — in strict
+        // mode, `yield`, `let`, `eval`, and `arguments` cannot appear as
+        // BindingIdentifier. oxc doesn't enforce this.
+        // Spec: <https://tc39.es/ecma262/#sec-identifiers-static-semantics-early-errors>
+        if self.strict_mode
+            && (name == "yield" || name == "let" || name == "eval" || name == "arguments")
+        {
+            return Err(SourceLoweringError::EarlyError(format!(
+                "'{name}' is a reserved identifier in strict mode"
+            )));
+        }
         if let Some(existing) = self.scope.borrow().bindings.get(name).copied() {
             // A pre-declared lexical placeholder (let/const/class hoisted by
             // `predeclare_function_scope`) gets reclaimed by the real
@@ -3399,20 +3481,6 @@ impl<'a> FunctionCompiler<'a> {
             .bindings
             .insert(name.to_string(), Binding::Function { closure_register });
         Ok(closure_register)
-    }
-
-    pub(super) fn mirror_script_binding_to_global(
-        &mut self,
-        name: &str,
-        register: BytecodeRegister,
-    ) -> Result<(), SourceLoweringError> {
-        if self.kind != FunctionKind::Script {
-            return Ok(());
-        }
-        let property = self.intern_property_name(name)?;
-        self.instructions
-            .push(Instruction::set_global(register, property));
-        Ok(())
     }
 
     pub(super) fn mirror_script_binding_to_global_by_register(

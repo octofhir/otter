@@ -1,3 +1,8 @@
+//! AST validators and pre-compile passes: early errors (strict-mode identifier
+//! rules, duplicate bindings), hoisting collection (var / function / class),
+//! private-name scope checks, parameter-info extraction, and test262 feature
+//! recognizers (`is_test262_failure_throw`, `is_test262_assert_same_value_call`).
+
 use super::*;
 use oxc_ast::ast::Directive;
 use oxc_ast_visit::{Visit, walk};

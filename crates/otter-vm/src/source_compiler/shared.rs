@@ -1,3 +1,8 @@
+//! Shared compiler types: `FunctionCompiler` struct definition with all 40+
+//! fields, `Binding`, `ScopeFrame`, `ValueLocation`, `FunctionKind`,
+//! `CompiledFunction`, `LoopScope`, `FinallyScope`, `PendingFunction`. Type-only
+//! so behaviour modules can all import from one place without cycles.
+
 use super::source_mapper::SourceMapper;
 use super::*;
 use crate::closure::CaptureDescriptor;

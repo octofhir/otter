@@ -1,3 +1,10 @@
+//! Loop, switch, try/catch/finally, labeled, break/continue statement compilation.
+//! Handles finally-scope unwinding, per-iteration lexical bindings for
+//! `for`/`for-in`/`for-of`, JumpRecord-based break/continue through finally blocks,
+//! and iterator protocol integration for `for-of` / `for await-of`.
+//!
+//! Spec: ECMA-262 §14 (Statements and Declarations).
+
 use super::module_compiler::ModuleCompiler;
 use super::shared::{Binding, FinallyScope, FunctionCompiler, LoopScope, ValueLocation};
 use super::*;

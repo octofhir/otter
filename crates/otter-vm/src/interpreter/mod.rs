@@ -1,7 +1,30 @@
 //! Interpreter entry points for the new VM.
+//!
+//! **Modularization in progress (Phase 2 of VM_REFACTOR_PLAN.md).** The
+//! interpreter is being split from its original single-file `interpreter.rs`
+//! into focused submodules. Completed extractions are listed below; the
+//! remaining bulk (RuntimeState, step(), dispatch(), tests) still lives in
+//! this `mod.rs` but will move into `runtime_state/`, `step.rs`, `dispatch.rs`,
+//! and `tests/` as Phase 2 progresses.
+//!
+//! ## Submodule index (extracted so far)
+//!
+//! | Module              | Purpose                                               |
+//! |---------------------|-------------------------------------------------------|
+//! | `error`             | `InterpreterError` enum + `From` conversions.         |
+//! | `execution_result`  | `ExecutionResult` return type.                        |
+//! | `number_conv`       | §7.1.6 / §7.1.7 f64 → i32/u32 + StringToNumber.       |
+
+mod error;
+mod execution_result;
+mod number_conv;
+
+pub use error::InterpreterError;
+pub use execution_result::ExecutionResult;
+pub(crate) use number_conv::{f64_to_int32, f64_to_uint32};
+use number_conv::{canonical_string_exotic_index, parse_string_to_number};
 
 use core::any::Any;
-use core::fmt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +51,7 @@ use crate::object::{
 use crate::payload::{NativePayloadError, NativePayloadRegistry, VmTrace, VmValueTracer};
 use crate::property::{PropertyNameId, PropertyNameRegistry};
 use crate::string::StringId;
-use crate::value::{RegisterValue, ValueError};
+use crate::value::RegisterValue;
 
 const STRING_DATA_SLOT: &str = "__otter_string_data__";
 const NUMBER_DATA_SLOT: &str = "__otter_number_data__";
@@ -36,145 +59,7 @@ const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
 const ERROR_DATA_SLOT: &str = "__otter_error_data__";
 const EXECUTION_INTERRUPTED_MESSAGE: &str = "execution interrupted";
 
-/// Errors produced by the new interpreter.
-#[derive(Debug, Clone, PartialEq)]
-pub enum InterpreterError {
-    /// The bytecode referenced a register outside the current frame layout.
-    RegisterOutOfBounds,
-    /// The interpreter reached the end of bytecode without an explicit return.
-    UnexpectedEndOfBytecode,
-    /// A branch jumped outside the valid bytecode range.
-    InvalidJumpTarget,
-    /// A constant table index was out of bounds.
-    InvalidConstant,
-    /// Execution was interrupted by an external signal (e.g. timeout watchdog).
-    Interrupted,
-    /// A TypeError was thrown at runtime.
-    TypeError(Box<str>),
-    /// Arithmetic or comparison failed because the inputs were invalid.
-    InvalidValue(ValueError),
-    /// The current register value is not an object handle.
-    InvalidObjectValue,
-    /// The current object handle does not exist in the heap.
-    InvalidObjectHandle,
-    /// The bytecode referenced a missing property-name entry.
-    UnknownPropertyName,
-    /// The bytecode referenced a missing string-literal entry.
-    UnknownStringLiteral,
-    /// The bytecode referenced a missing direct-call entry.
-    UnknownCallSite,
-    /// The direct-call entry referenced a missing callee function.
-    InvalidCallTarget,
-    /// The bytecode referenced a missing closure-creation entry.
-    UnknownClosureTemplate,
-    /// The activation attempted to access an upvalue without a closure context.
-    MissingClosureContext,
-    /// The closure/upvalue slot index is outside the valid range.
-    InvalidHeapSlot,
-    /// The heap value kind does not support the requested operation.
-    InvalidHeapValueKind,
-    /// The current handler path expected a pending exception value.
-    MissingPendingException,
-    /// Execution finished with an uncaught thrown value.
-    UncaughtThrow(RegisterValue),
-    /// A native host function failed before producing a JS-visible completion.
-    NativeCall(Box<str>),
-    /// The configured heap cap was exceeded. Raised by the GC safepoint
-    /// when the shared OOM flag is set and surfaced to the host as a
-    /// catchable `RangeError` by the outer runtime layer.
-    OutOfMemory,
-}
 
-impl fmt::Display for InterpreterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RegisterOutOfBounds => {
-                f.write_str("bytecode referenced a register outside the current frame layout")
-            }
-            Self::UnexpectedEndOfBytecode => {
-                f.write_str("interpreter reached end of bytecode without an explicit return")
-            }
-            Self::InvalidJumpTarget => {
-                f.write_str("branch target is outside the current function bytecode")
-            }
-            Self::InvalidConstant => f.write_str("constant table index is out of bounds"),
-            Self::Interrupted => f.write_str("execution interrupted"),
-            Self::TypeError(msg) => write!(f, "TypeError: {msg}"),
-            Self::InvalidValue(error) => error.fmt(f),
-            Self::InvalidObjectValue => f.write_str("operation expected an object value"),
-            Self::InvalidObjectHandle => f.write_str("object handle is outside the current heap"),
-            Self::UnknownPropertyName => {
-                f.write_str("bytecode referenced a missing property-name entry")
-            }
-            Self::UnknownStringLiteral => {
-                f.write_str("bytecode referenced a missing string-literal entry")
-            }
-            Self::UnknownCallSite => f.write_str("bytecode referenced a missing direct-call entry"),
-            Self::InvalidCallTarget => {
-                f.write_str("direct-call entry referenced a missing callee function")
-            }
-            Self::UnknownClosureTemplate => {
-                f.write_str("bytecode referenced a missing closure-creation entry")
-            }
-            Self::MissingClosureContext => {
-                f.write_str("activation attempted to access an upvalue without a closure context")
-            }
-            Self::InvalidHeapSlot => {
-                f.write_str("closure or upvalue slot is outside the valid range")
-            }
-            Self::InvalidHeapValueKind => {
-                f.write_str("operation is not supported for this heap value kind")
-            }
-            Self::MissingPendingException => {
-                f.write_str("handler expected a pending exception value")
-            }
-            Self::UncaughtThrow(value) => write!(f, "uncaught throw: {:?}", value),
-            Self::NativeCall(message) => write!(f, "native host call failed: {message}"),
-            Self::OutOfMemory => f.write_str("out of memory: heap limit exceeded"),
-        }
-    }
-}
-
-impl std::error::Error for InterpreterError {}
-
-impl From<ValueError> for InterpreterError {
-    fn from(value: ValueError) -> Self {
-        Self::InvalidValue(value)
-    }
-}
-
-impl From<ObjectError> for InterpreterError {
-    fn from(value: ObjectError) -> Self {
-        match value {
-            ObjectError::InvalidHandle => Self::InvalidObjectHandle,
-            ObjectError::InvalidIndex => Self::InvalidHeapSlot,
-            ObjectError::InvalidKind => Self::InvalidHeapValueKind,
-            ObjectError::InvalidArrayLength => Self::NativeCall("invalid array length".into()),
-            ObjectError::OutOfMemory => Self::OutOfMemory,
-            ObjectError::TypeError(msg) => Self::TypeError(msg),
-        }
-    }
-}
-
-/// Successful execution result from the interpreter.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ExecutionResult {
-    return_value: RegisterValue,
-}
-
-impl ExecutionResult {
-    /// Creates a successful execution result.
-    #[must_use]
-    pub const fn new(return_value: RegisterValue) -> Self {
-        Self { return_value }
-    }
-
-    /// Returns the raw return value.
-    #[must_use]
-    pub const fn return_value(self) -> RegisterValue {
-        self.return_value
-    }
-}
 
 /// Mutable activation state for a single executing function frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -9866,9 +9751,7 @@ impl Interpreter {
                 let result = if let Some(source) = runtime.value_as_string(code_value) {
                     // Capture caller context for private names and super access.
                     let caller_closure = activation.closure_handle();
-                    let caller_this = activation
-                        .receiver(function)
-                        .unwrap_or(RegisterValue::undefined());
+                    let caller_this = activation.receiver(function).unwrap_or_default();
                     // §19.2.1.1 PerformEval(x, strictCaller, direct=true) with
                     // caller's closure context for private/super/this.
                     Self::eval_source_direct(runtime, &source, caller_closure, caller_this)
@@ -11576,54 +11459,6 @@ impl Interpreter {
     }
 }
 
-/// ES spec 7.1.4.1 StringToNumber — parses a string to a number.
-/// ES spec 7.1.6 ToInt32(argument).
-pub(crate) fn f64_to_int32(n: f64) -> i32 {
-    if n.is_nan() || n.is_infinite() || n == 0.0 {
-        return 0;
-    }
-    // Step 3-5: modulo 2^32, then adjust to signed range.
-    let i = (n.trunc() % 4_294_967_296.0) as i64;
-    let i = if i < 0 { i + 4_294_967_296 } else { i };
-    if i >= 2_147_483_648 {
-        (i - 4_294_967_296) as i32
-    } else {
-        i as i32
-    }
-}
-
-/// ES spec 7.1.7 ToUint32(argument).
-pub(crate) fn f64_to_uint32(n: f64) -> u32 {
-    if n.is_nan() || n.is_infinite() || n == 0.0 {
-        return 0;
-    }
-    let i = (n.trunc() % 4_294_967_296.0) as i64;
-    if i < 0 {
-        (i + 4_294_967_296) as u32
-    } else {
-        i as u32
-    }
-}
-
-fn parse_string_to_number(s: &str) -> f64 {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return 0.0;
-    }
-    match trimmed {
-        "Infinity" | "+Infinity" => f64::INFINITY,
-        "-Infinity" => f64::NEG_INFINITY,
-        _ => trimmed.parse::<f64>().unwrap_or(f64::NAN),
-    }
-}
-
-fn canonical_string_exotic_index(property_name: &str) -> Option<usize> {
-    let index = property_name.parse::<u32>().ok()?;
-    if index == u32::MAX || index.to_string() != property_name {
-        return None;
-    }
-    Some(index as usize)
-}
 
 #[cfg(test)]
 mod tests {

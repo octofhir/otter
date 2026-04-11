@@ -1,3 +1,11 @@
+//! Binding and assignment pattern lowering for arrays, objects, rest elements,
+//! and defaults. Handles both BindingPattern (declaration-side, e.g.
+//! `let { a, b = 1, ...rest } = x`) and AssignmentTarget (assignment-side,
+//! e.g. `({ a, b = 1, ...rest } = x)`) with iterator-close cleanup on error.
+//!
+//! Spec: ECMA-262 §8.6.2 BindingInitialization, §13.15.5.2
+//! DestructuringAssignmentEvaluation.
+
 use super::module_compiler::ModuleCompiler;
 use super::shared::{Binding, FunctionCompiler, ValueLocation};
 use super::*;

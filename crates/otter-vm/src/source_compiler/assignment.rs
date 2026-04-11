@@ -1,3 +1,10 @@
+//! Compilation of assignment operators: simple `=`, compound arithmetic
+//! (`+=`, `-=`, `*=`, `/=`, `%=`, `**=`), bitwise (`&=`, `|=`, `^=`, `<<=`,
+//! `>>=`, `>>>=`), and short-circuit (`&&=`, `||=`, `??=`). Resolves targets
+//! through `destructuring.rs` when the LHS is a pattern.
+//!
+//! Spec: ECMA-262 §13.15 Assignment Operators.
+
 use super::ast::inferred_name_for_assignment_target;
 use super::module_compiler::ModuleCompiler;
 use super::shared::{FunctionCompiler, ValueLocation};

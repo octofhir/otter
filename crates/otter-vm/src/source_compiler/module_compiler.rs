@@ -1,3 +1,8 @@
+//! `ModuleCompiler` orchestration: top-level `FunctionCompiler` construction,
+//! module-scope binding collection, function index reservation, and the public
+//! entry point (`ModuleCompiler::compile`) that consumes a parsed
+//! `oxc_ast::Program` and returns a linked `Module` ready for the interpreter.
+
 use super::ast::{ParamInfo, has_use_strict_directive};
 use super::shared::{CompiledFunction, FunctionCompiler, FunctionKind, ScopeRef, ValueLocation};
 use super::source_mapper::SourceMapper;

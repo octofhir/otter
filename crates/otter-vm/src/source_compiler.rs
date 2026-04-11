@@ -1,12 +1,36 @@
+//! # Otter source → bytecode compiler
+//!
+//! Compiles parsed ECMAScript ASTs (via `oxc_ast`) into the VM's bytecode
+//! representation, producing linked `Module` objects ready for
+//! [`crate::interpreter::Interpreter::run`].
+//!
+//! ## Submodule index
+//!
+//! | Module                    | Purpose                                                       |
+//! |---------------------------|---------------------------------------------------------------|
+//! | `shared`                  | `FunctionCompiler` struct, `Binding`, `ScopeFrame`, shared types. |
+//! | `compiler`                | Function body compilation: statements, binding, registers.   |
+//! | `classes`                 | Class declaration lowering (body/fields/methods/ctors).       |
+//! | `statements`              | Loops, switch, try/catch/finally, break/continue, labels.     |
+//! | `expressions`             | Literals, operators, plain member access, object/array lits. |
+//! | `calls`                   | Call / super / new / member-update expressions.               |
+//! | `functions_and_classes`   | Function, arrow, and class expression code-gen.               |
+//! | `destructuring`           | Binding + assignment pattern lowering.                        |
+//! | `assignment`              | `=`, `+=`, `&&=`, `??=` and friends.                          |
+//! | `modules`                 | `import` / `export` statement lowering.                       |
+//! | `module_compiler`         | `ModuleCompiler` orchestration, top-level FunctionCompiler.   |
+//! | `ast`                     | Validators, hoisting collection, private-name checks.         |
+//! | `source_mapper`           | PC → source-location mapping.                                 |
+//! | `line_index`              | UTF-8 byte offset → (line, column) lookup.                    |
+
 use std::collections::BTreeMap;
 
 use oxc_ast::ast::{
     Argument, AssignmentOperator, AssignmentTarget, AssignmentTargetMaybeDefault,
-    AssignmentTargetProperty, BinaryOperator, BindingPattern, Class, ComputedMemberExpression,
-    Expression, ForStatementLeft, Function, LogicalOperator, MethodDefinitionKind,
-    ObjectPropertyKind, Program as AstProgram, PropertyKey, PropertyKind, SimpleAssignmentTarget,
-    Statement as AstStatement, StaticMemberExpression, UnaryOperator, UpdateOperator,
-    VariableDeclarationKind,
+    AssignmentTargetProperty, BinaryOperator, BindingPattern, ComputedMemberExpression, Expression,
+    ForStatementLeft, Function, LogicalOperator, ObjectPropertyKind, Program as AstProgram,
+    PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement as AstStatement,
+    StaticMemberExpression, UnaryOperator, UpdateOperator, VariableDeclarationKind,
 };
 
 use std::rc::Rc;
@@ -30,9 +54,12 @@ use crate::string::{StringId, StringTable};
 
 mod assignment;
 pub(crate) mod ast;
+mod calls;
+mod classes;
 mod compiler;
 mod destructuring;
 mod expressions;
+mod functions_and_classes;
 pub(crate) mod line_index;
 mod module_compiler;
 mod modules;

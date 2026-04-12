@@ -62,8 +62,6 @@ pub mod intrinsics;
 pub mod jit_abi;
 /// §6.1.4 — WTF-16 JavaScript string type.
 pub mod js_string;
-/// Tiny lowering bridge from structured subset to bytecode/module form.
-pub mod lowering;
 /// VM-internal microtask queue (promise jobs, nextTick, queueMicrotask).
 pub mod microtask;
 /// Executable module and function containers.
@@ -84,9 +82,7 @@ mod property_copy;
 pub mod realm;
 /// RegExp-literal side tables for functions.
 pub mod regexp;
-/// Small smoke harness for iterative validation.
-pub mod smoke;
-/// Tiny JS source lowering for the first new-VM migration slice.
+/// JS source compilation entry points (compile_script, compile_module, compile_eval).
 pub mod source;
 /// Primary JS source compiler for the new VM source path.
 pub(crate) mod source_compiler;

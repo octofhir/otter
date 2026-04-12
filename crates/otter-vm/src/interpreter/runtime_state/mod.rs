@@ -1,18 +1,19 @@
-//! `RuntimeState` god object — heap, realms, property names, native functions,
-//! microtasks, host callbacks, timers, console, symbols, frame info stack,
-//! plus the property / instance-of / iterator / install / closure / payload /
-//! ordinary-property / errors / proxy / alloc / call method clusters.
+//! `RuntimeState` — the shared VM heap owner. Bootstrap (new / with_gc_config),
+//! intrinsic accessors, interrupt / OOM plumbing, realm management, property-name
+//! registry, native function & payload registries, host integration (microtasks,
+//! timers, console, host callbacks), and the accessor / ordinary-property /
+//! string-exotic helpers that remain in this file.
 //!
-//! Major thematic submodules under `runtime_state/`:
+//! Thematic impl clusters are split into submodules:
 //!
 //! | Submodule    | Purpose                                                 |
 //! |--------------|---------------------------------------------------------|
-//! | `alloc`      | Heap allocation, `gc_safepoint`, install/burrow/closure helpers. |
-//! | `call`       | `call_callable` / `construct_callable` / host calls / promise allocators. |
-//! | `coercion`   | §7 abstract operations (ToPrimitive/ToString/ToNumber/=, +, instanceof, in). |
-//! | `eval`       | `eval_source` re-entry into the source compiler.        |
-//! | `iterators`  | Iterator protocol + generator/async-generator resume kernels. |
-//! | `proxy`      | ECMA-262 §10.5 Proxy traps and invariant checks.       |
+//! | `alloc`      | Heap allocation, gc_safepoint, install, closures.       |
+//! | `call`       | call_callable / construct_callable / promises.           |
+//! | `coercion`   | §7 abstract ops (ToPrimitive/ToString/ToNumber/==, +).   |
+//! | `eval`       | eval_source re-entry into the source compiler.          |
+//! | `iterators`  | Iterator protocol + generator resume kernels.           |
+//! | `proxy`      | ECMA-262 §10.5 Proxy traps.                             |
 
 mod alloc;
 mod call;

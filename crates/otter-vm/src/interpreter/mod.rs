@@ -1,22 +1,28 @@
-//! Interpreter entry points for the new VM.
+//! # Otter JS interpreter
 //!
-//! **Modularization in progress (Phase 2 of VM_REFACTOR_PLAN.md).** The
-//! interpreter is being split from its original single-file `interpreter.rs`
-//! into focused submodules. Completed extractions are listed below; the
-//! remaining bulk (RuntimeState, step(), dispatch(), tests) still lives in
-//! this `mod.rs` but will move into `runtime_state/`, `step.rs`, `dispatch.rs`,
-//! and `tests/` as Phase 2 progresses.
+//! Bytecode-level interpreter for the Otter JS VM. This module houses the
+//! `Interpreter` shell (entry points: `run`, `execute`, `resume`, `call_function`)
+//! and the `RuntimeState` god-object (heap, realms, intrinsics, native functions).
 //!
-//! ## Submodule index (extracted so far)
+//! ## Submodule index
 //!
-//! | Module              | Purpose                                               |
-//! |---------------------|-------------------------------------------------------|
-//! | `activation`        | Per-frame state: registers, PC, upvalues.             |
-//! | `error`             | `InterpreterError` enum + `From` conversions.         |
-//! | `execution_result`  | `ExecutionResult` return type.                        |
-//! | `number_conv`       | §7.1.6 / §7.1.7 f64 → i32/u32 + StringToNumber.       |
-//! | `step_outcome`      | `StepOutcome`, `Completion`, `TailCallPayload`, `ToPrimitiveHint`. |
-//! | `frame_runtime`     | Per-frame transient state (property inline cache).   |
+//! | Module                        | Purpose                                               |
+//! |-------------------------------|-------------------------------------------------------|
+//! | `activation`                  | Per-frame state (registers, PC, upvalues).            |
+//! | `dispatch`                    | `step()` match + dispatch helpers.                    |
+//! | `error`                       | `InterpreterError` enum + conversions.                |
+//! | `execution_result`            | `ExecutionResult` return type.                        |
+//! | `frame_runtime`               | Property inline-cache storage per frame.              |
+//! | `number_conv`                 | §7.1.6/7 f64 → i32/u32 + StringToNumber.              |
+//! | `runtime_state`               | `RuntimeState` struct + thematic impl submodules.     |
+//! | `runtime_state::alloc`        | Heap allocation, gc_safepoint, install, closures.     |
+//! | `runtime_state::call`         | call_callable / construct_callable / promises.         |
+//! | `runtime_state::coercion`     | §7 abstract ops (ToString, ToNumber, ==, +, etc.).     |
+//! | `runtime_state::eval`         | eval_source re-entry into the source compiler.        |
+//! | `runtime_state::iterators`    | Iterator protocol + generator resume kernels.         |
+//! | `runtime_state::proxy`        | ECMA-262 §10.5 Proxy traps.                           |
+//! | `step_outcome`                | `StepOutcome`, `Completion`, `ToPrimitiveHint`.       |
+//! | `tests`                       | `#[cfg(test)]` unit suite.                            |
 
 mod activation;
 mod dispatch;

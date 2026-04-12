@@ -10,40 +10,18 @@ use otter_vm::float::FloatTable;
 use otter_vm::frame::FrameFlags;
 use otter_vm::frame::FrameLayout;
 use otter_vm::interpreter::Interpreter;
-use otter_vm::lowering::{BinaryOp, Expr, LocalId, Program, Statement, compile_module};
+use otter_vm::source::compile_script;
 use otter_vm::module::{Function, FunctionSideTables, FunctionTables, Module};
 use otter_vm::property::{PropertyNameId, PropertyNameTable};
 use otter_vm::regexp::RegExpTable;
 use otter_vm::string::StringTable;
 
-fn arithmetic_loop_program(limit: i32) -> Program {
-    let sum = LocalId::new(0);
-    let index = LocalId::new(1);
-    let bound = LocalId::new(2);
-
-    Program::new(
-        Some("jit-tier1-loop"),
-        3,
-        vec![
-            Statement::assign(sum, Expr::i32(0)),
-            Statement::assign(index, Expr::i32(0)),
-            Statement::assign(bound, Expr::i32(limit)),
-            Statement::while_(
-                Expr::binary(BinaryOp::Lt, Expr::local(index), Expr::local(bound)),
-                vec![
-                    Statement::assign(
-                        sum,
-                        Expr::binary(BinaryOp::Add, Expr::local(sum), Expr::local(index)),
-                    ),
-                    Statement::assign(
-                        index,
-                        Expr::binary(BinaryOp::Add, Expr::local(index), Expr::i32(1)),
-                    ),
-                ],
-            ),
-            Statement::ret(Expr::local(sum)),
-        ],
+fn arithmetic_loop_module(limit: i32) -> otter_vm::module::Module {
+    compile_script(
+        &format!("var sum = 0; var i = 0; while (i < {limit}) {{ sum += i; i++; }} sum;"),
+        "<jit-tier1-loop>",
     )
+    .expect("loop script should compile")
 }
 
 fn property_loop_module() -> Module {
@@ -181,7 +159,7 @@ fn direct_call_module() -> Module {
 
 #[test]
 fn tier1_loop_smoke_matches_interpreter() {
-    let module = compile_module(&arithmetic_loop_program(128)).expect("module should lower");
+    let module = arithmetic_loop_module(128);
     let function = module.entry_function();
 
     let interpreter_result = Interpreter::new()
@@ -249,7 +227,7 @@ fn unsupported_path_deopts_and_resumes() {
 
 #[test]
 fn safepoint_interrupt_deopts_and_resumes() {
-    let module = compile_module(&arithmetic_loop_program(128)).expect("module should lower");
+    let module = arithmetic_loop_module(128);
     let function = module.entry_function();
     let mut interrupt_flag = 1_u8;
     let mut registers =

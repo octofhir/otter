@@ -68,6 +68,100 @@ pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, Jit
     compile_function_profiled(function, &[])
 }
 
+/// Compile with persistent FeedbackVector.
+///
+/// If feedback shows stable Int32 arithmetic, the compiler uses speculative
+/// typed operations instead of generic helpers. If feedback shows monomorphic
+/// property access, the compiler emits shape-guarded fast paths.
+///
+/// This is the primary production entry point — called by the runtime when
+/// feedback is available from previous interpreter runs.
+pub fn compile_function_with_feedback(
+    function: &vm::Function,
+    feedback: &vm::feedback::FeedbackVector,
+) -> Result<CompiledFunction, JitError> {
+    use crate::mir::speculative_builder;
+    use vm::feedback::{FeedbackSlotData, FeedbackSlotId};
+
+    // Determine compilation tier based on feedback quality.
+    let has_useful_feedback = (0..feedback.len()).any(|i| {
+        let id = FeedbackSlotId(i as u16);
+        matches!(
+            feedback.get(id),
+            Some(FeedbackSlotData::Arithmetic(fb)) if *fb != vm::feedback::ArithmeticFeedback::None
+        ) || matches!(
+            feedback.get(id),
+            Some(FeedbackSlotData::Property(fb)) if fb.as_monomorphic().is_some()
+        )
+    });
+
+    let tier = if has_useful_feedback {
+        crate::mir::passes::PassTier::Optimized
+    } else {
+        crate::mir::passes::PassTier::Baseline
+    };
+
+    let cfg = crate::config::jit_config();
+    let start = Instant::now();
+
+    if cfg.dump_bytecode {
+        eprintln!("[JIT] === Bytecode for {:?} ({} instructions, tier={:?}) ===",
+                  function.name(), function.bytecode().len(), tier);
+    }
+
+    // Build MIR using existing builder (property profile extracted from feedback).
+    let property_profile = extract_property_profile(function, feedback);
+    let mut graph = build_mir(
+        function,
+        if property_profile.is_empty() { None } else { Some(&property_profile) },
+    )?;
+
+    if cfg.dump_mir {
+        eprintln!("[JIT] === MIR (before passes, feedback-aware) for {:?} ===", function.name());
+        eprintln!("{}", graph);
+    }
+
+    // Run optimization passes at the chosen tier.
+    crate::mir::passes::run_passes(&mut graph, tier, cfg.dump_mir_passes);
+
+    #[cfg(debug_assertions)]
+    {
+        if let Err(errors) = verify(&graph) {
+            let msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+            return Err(JitError::MirVerification(msgs.join("; ")));
+        }
+    }
+
+    let isa = create_host_isa()?;
+    let clif_func = lower_mir_to_clif(&graph, isa.as_ref())?;
+    let compiled = compile_clif_function(clif_func, isa, &[])?;
+
+    let duration_ns = start.elapsed().as_nanos() as u64;
+    let tier_num = if tier == crate::mir::passes::PassTier::Optimized { 2 } else { 1 };
+    telemetry::record_compile_time(tier_num == 1, duration_ns);
+    telemetry::record_function_compiled(
+        function.name().unwrap_or("<anonymous>"),
+        tier_num,
+        duration_ns,
+        compiled.code_size,
+    );
+    Ok(compiled)
+}
+
+/// Extract legacy PropertyInlineCache array from FeedbackVector.
+fn extract_property_profile(
+    function: &vm::Function,
+    feedback: &vm::feedback::FeedbackVector,
+) -> Vec<Option<vm::PropertyInlineCache>> {
+    let len = function.feedback().len();
+    (0..len)
+        .map(|i| {
+            let id = vm::feedback::FeedbackSlotId(i as u16);
+            feedback.property(id).and_then(|p| p.as_monomorphic())
+        })
+        .collect()
+}
+
 /// Compile a profiled VM function into machine code for the Tier 1 subset.
 pub fn compile_function_profiled(
     function: &vm::Function,

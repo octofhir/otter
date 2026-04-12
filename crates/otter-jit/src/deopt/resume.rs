@@ -171,14 +171,62 @@ pub fn execute_module_entry_with_runtime(
         interp
     };
 
-    match execute_function_profiled_with_runtime(
-        module,
-        function_index,
-        &mut registers,
-        runtime,
-        &[],
-        interrupt_flag,
-    )? {
+    // Use persistent feedback from RuntimeState for JIT compilation.
+    // If feedback is available from previous interpreter runs, the JIT
+    // uses it for speculative optimization (Tier 2 passes).
+    let compiled_result = if let Some(feedback) = runtime.feedback_vector(function_index) {
+        crate::pipeline::compile_function_with_feedback(function, feedback)
+    } else {
+        crate::pipeline::compile_function(function)
+    };
+
+    let jit_result: Result<JitExecResult, JitError> = match compiled_result {
+        Ok(compiled) => {
+            let register_count = u32::try_from(register_count)
+                .map_err(|_| JitError::Internal("register count overflow".to_string()))?;
+            let this_raw = function
+                .frame_layout()
+                .receiver_slot()
+                .and_then(|slot| registers.get(usize::from(slot)))
+                .map_or(RegisterValue::undefined().raw_bits(), |v| v.raw_bits());
+
+            let mut ctx = crate::context::JitContext {
+                registers_base: registers.as_mut_ptr().cast::<u64>(),
+                local_count: register_count,
+                register_count,
+                constants: std::ptr::null(),
+                this_raw,
+                interrupt_flag,
+                interpreter: std::ptr::null(),
+                vm_ctx: std::ptr::null_mut(),
+                function_ptr: std::ptr::null(),
+                upvalues_ptr: std::ptr::null(),
+                upvalue_count: 0,
+                callee_raw: RegisterValue::undefined().raw_bits(),
+                home_object_raw: RegisterValue::undefined().raw_bits(),
+                proto_epoch: 0,
+                bailout_reason: 0,
+                bailout_pc: 0,
+                secondary_result: 0,
+                module_ptr: module as *const Module as *const (),
+                runtime_ptr: runtime as *mut RuntimeState as *mut (),
+            };
+
+            let raw = unsafe { compiled.call(&mut ctx) };
+            if raw == crate::BAILOUT_SENTINEL {
+                Ok(JitExecResult::Bailout {
+                    bytecode_pc: ctx.bailout_pc,
+                    reason: crate::BailoutReason::from_raw(ctx.bailout_reason)
+                        .unwrap_or(crate::BailoutReason::Unsupported),
+                })
+            } else {
+                Ok(JitExecResult::Ok(raw))
+            }
+        }
+        Err(_) => Ok(JitExecResult::NotCompiled),
+    };
+
+    match jit_result? {
         JitExecResult::Ok(raw) => {
             let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
                 JitError::Internal("jit returned invalid vm register bits".to_string())

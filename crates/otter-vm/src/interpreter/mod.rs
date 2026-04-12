@@ -120,6 +120,12 @@ pub struct RuntimeState {
     /// Contains SuperCall). Incremented by RunClassFieldInitializer, decremented
     /// when the field init function returns.
     pub(super) field_initializer_depth: u32,
+    /// Persistent FeedbackVectors per function — survives across activations.
+    /// The interpreter writes to these during execution, and the JIT reads
+    /// them for speculation decisions. Keyed by FunctionIndex.
+    ///
+    /// V8 model: FeedbackVector lives on SharedFunctionInfo, not on stack frame.
+    feedback_vectors: std::collections::HashMap<crate::FunctionIndex, crate::feedback::FeedbackVector>,
 }
 
 
@@ -217,6 +223,45 @@ impl Interpreter {
             return Err(InterpreterError::OutOfMemory);
         }
         Ok(())
+    }
+
+    /// Merge frame-local feedback into the persistent FeedbackVector on RuntimeState.
+    /// Called when a function returns or throws, so feedback accumulates across invocations.
+    fn persist_feedback(
+        runtime: &mut RuntimeState,
+        function_index: crate::FunctionIndex,
+        function: &crate::module::Function,
+        frame_runtime: &FrameRuntimeState,
+    ) {
+        let persistent = runtime.get_or_create_feedback(function_index, function);
+        // Merge: for each slot, take the max (monotonic lattice) from frame feedback.
+        let frame_fv = frame_runtime.feedback();
+        for (i, slot_data) in frame_fv.slots().iter().enumerate() {
+            let id = crate::feedback::FeedbackSlotId(i as u16);
+            match slot_data {
+                crate::feedback::FeedbackSlotData::Arithmetic(fb) => {
+                    persistent.record_arithmetic(id, *fb);
+                }
+                crate::feedback::FeedbackSlotData::Comparison(fb) => {
+                    persistent.record_comparison(id, *fb);
+                }
+                crate::feedback::FeedbackSlotData::Branch(fb) => {
+                    // Branch counters: add (saturating).
+                    for _ in 0..fb.taken { persistent.record_branch(id, true); }
+                    for _ in 0..fb.not_taken { persistent.record_branch(id, false); }
+                }
+                crate::feedback::FeedbackSlotData::Property(fb) => {
+                    if let Some(cache) = fb.as_monomorphic() {
+                        persistent.record_property(id, cache.shape_id(), cache.slot_index());
+                    }
+                }
+                crate::feedback::FeedbackSlotData::Call(fb) => {
+                    if let Some(target) = fb.as_monomorphic() {
+                        persistent.record_call(id, target);
+                    }
+                }
+            }
+        }
     }
 
     /// Creates an entry activation for the module entry function.
@@ -987,6 +1032,13 @@ impl Interpreter {
                     activation.refresh_open_upvalues_from_cells(runtime)?;
                 }
                 StepOutcome::Return(return_value) => {
+                    // Persist accumulated feedback for JIT consumption.
+                    Self::persist_feedback(
+                        runtime,
+                        activation.function_index(),
+                        &function,
+                        &frame_runtime,
+                    );
                     runtime.restore_module(previous_module);
                     runtime.truncate_frame_info_stack(shadow_baseline);
                     return Ok(Completion::Return(return_value));

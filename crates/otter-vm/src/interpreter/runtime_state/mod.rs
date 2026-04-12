@@ -107,7 +107,28 @@ impl RuntimeState {
             pending_uncaught_throw: None,
             active_interrupt_flag: None,
             field_initializer_depth: 0,
+            feedback_vectors: std::collections::HashMap::new(),
         }
+    }
+
+    /// Get or create a persistent FeedbackVector for a function.
+    /// The vector survives across activations and is shared with the JIT.
+    pub fn get_or_create_feedback(
+        &mut self,
+        function_index: crate::FunctionIndex,
+        function: &crate::module::Function,
+    ) -> &mut crate::feedback::FeedbackVector {
+        self.feedback_vectors
+            .entry(function_index)
+            .or_insert_with(|| crate::feedback::FeedbackVector::from_layout(function.feedback()))
+    }
+
+    /// Get the persistent FeedbackVector for a function (read-only, for JIT).
+    pub fn feedback_vector(
+        &self,
+        function_index: crate::FunctionIndex,
+    ) -> Option<&crate::feedback::FeedbackVector> {
+        self.feedback_vectors.get(&function_index)
     }
 
     /// Stash an uncaught-throw value so the outer host layer can later lift

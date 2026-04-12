@@ -114,16 +114,8 @@ pub fn compile_clif_function(
                 eprintln!("{vcode}");
             }
             let code = compiled.code_buffer();
-            let total_size = compiled.code_info().total_size;
-            eprintln!("[JIT] === Native code: {} bytes ===", total_size);
-            for (i, byte) in code.iter().enumerate() {
-                if i % 16 == 0 {
-                    if i > 0 { eprintln!(); }
-                    eprint!("  {:04x}: ", i);
-                }
-                eprint!("{:02x} ", byte);
-            }
-            eprintln!();
+            // Use real disassembler (iced-x86 on x86-64, hex on other arches).
+            crate::codegen::disasm::dump_disassembly(code, 0, None);
         }
     }
 
@@ -137,6 +129,14 @@ pub fn compile_clif_function(
 
     if cfg.dump_asm {
         eprintln!("[JIT] compiled function at {:p}, {} bytes", code_ptr, code_size);
+        // Disassemble the finalized (relocated) code for accurate branch targets.
+        let finalized_code =
+            unsafe { std::slice::from_raw_parts(code_ptr, code_size) };
+        crate::codegen::disasm::dump_disassembly(
+            finalized_code,
+            code_ptr as u64,
+            Some("jit_entry (finalized)"),
+        );
     }
 
     Ok(CompiledFunction {

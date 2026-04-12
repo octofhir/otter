@@ -1,7 +1,7 @@
 //! Bailout reasons shared across JIT compilation and execution paths.
 
 /// Why JIT code bailed out to the interpreter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum BailoutReason {
     /// Type guard failed (e.g., expected Int32 but got Float64).

@@ -1,6 +1,7 @@
 //! Small host helpers for the tier1 runtime path.
 
 use crate::context::JitContext;
+use crate::telemetry::{self, HelperFamily};
 use crate::{BAILOUT_SENTINEL, BailoutReason};
 use otter_vm::object::{ObjectHandle, PropertyValue};
 use otter_vm::{FunctionIndex, Module, ObjectShapeId, RegisterValue, RuntimeState};
@@ -32,6 +33,7 @@ pub extern "C" fn otter_get_prop_shaped(
     slot_index: i64,
     bytecode_pc: i64,
 ) -> i64 {
+    telemetry::record_helper_call(HelperFamily::PropertyGet);
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
@@ -65,6 +67,7 @@ pub extern "C" fn otter_set_prop_shaped(
     value_bits: i64,
     bytecode_pc: i64,
 ) -> i64 {
+    telemetry::record_helper_call(HelperFamily::PropertySet);
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
@@ -99,6 +102,7 @@ pub extern "C" fn otter_call_direct(
     callee_index: i64,
     bytecode_pc: i64,
     argc: i64,
+    // --- args below ---
     arg0: i64,
     arg1: i64,
     arg2: i64,
@@ -108,6 +112,7 @@ pub extern "C" fn otter_call_direct(
     arg6: i64,
     arg7: i64,
 ) -> i64 {
+    telemetry::record_helper_call(HelperFamily::Call);
     let Some(ctx) = (unsafe { ctx.as_mut() }) else {
         return BAILOUT_SENTINEL as i64;
     };
@@ -179,6 +184,7 @@ pub extern "C" fn otter_get_prop_generic(
     prop_id: i64,
     bytecode_pc: i64,
 ) -> i64 {
+    telemetry::record_helper_call(HelperFamily::PropertyGet);
     // Read module/property name BEFORE mutably borrowing ctx for runtime.
     let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
         let Some(ctx) = (unsafe { ctx.as_mut() }) else {
@@ -223,6 +229,7 @@ pub extern "C" fn otter_set_prop_generic(
     value_bits: i64,
     bytecode_pc: i64,
 ) -> i64 {
+    telemetry::record_helper_call(HelperFamily::PropertySet);
     let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
         let Some(ctx) = (unsafe { ctx.as_mut() }) else {
             return BAILOUT_SENTINEL as i64;

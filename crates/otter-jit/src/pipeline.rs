@@ -109,6 +109,12 @@ pub fn compile_function_profiled(
 
     let duration_ns = start.elapsed().as_nanos() as u64;
     telemetry::record_compile_time(true, duration_ns);
+    telemetry::record_function_compiled(
+        function.name().unwrap_or("<anonymous>"),
+        1, // tier 1
+        duration_ns,
+        compiled.code_size,
+    );
     Ok(compiled)
 }
 

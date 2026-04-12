@@ -441,13 +441,15 @@ mod tests {
             MirOp::Branch {
                 cond,
                 true_block: bb1,
+                true_args: vec![],
                 false_block: bb2,
+                false_args: vec![],
             },
             1,
         );
 
         // bb1 -> jump to bb2
-        graph.push_instr(bb1, MirOp::Jump(bb2), 2);
+        graph.push_instr(bb1, MirOp::Jump(bb2, vec![]), 2);
 
         // bb2 -> return
         let undef = graph.push_instr(bb2, MirOp::Undefined, 3);

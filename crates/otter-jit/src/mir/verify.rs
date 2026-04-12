@@ -138,7 +138,8 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
         MirOp::AddI32 { lhs, rhs, .. }
         | MirOp::SubI32 { lhs, rhs, .. }
         | MirOp::MulI32 { lhs, rhs, .. }
-        | MirOp::DivI32 { lhs, rhs, .. } => {
+        | MirOp::DivI32 { lhs, rhs, .. }
+        | MirOp::ModI32 { lhs, rhs, .. } => {
             ops.push(*lhs);
             ops.push(*rhs);
         }

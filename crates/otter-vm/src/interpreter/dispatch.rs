@@ -1310,6 +1310,26 @@ impl Interpreter {
             Opcode::Sub => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // i32 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    let result = match l.checked_sub(r) {
+                        Some(v) => RegisterValue::from_i32(v),
+                        None => RegisterValue::from_number(l as f64 - r as f64),
+                    };
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                // f64 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_number(l - r),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
                 // §6.1.6.2.8 BigInt::subtract
                 if lhs.is_bigint() && rhs.is_bigint() {
                     let result = runtime.bigint_binary_op(lhs, rhs, |a, b| a - b)?;
@@ -1335,6 +1355,26 @@ impl Interpreter {
             Opcode::Mul => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // i32 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    let result = match l.checked_mul(r) {
+                        Some(v) => RegisterValue::from_i32(v),
+                        None => RegisterValue::from_number(l as f64 * r as f64),
+                    };
+                    activation.write_bytecode_register(function, instruction.a(), result)?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                // f64 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_number(l * r),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
                 // §6.1.6.2.9 BigInt::multiply
                 if lhs.is_bigint() && rhs.is_bigint() {
                     let result = runtime.bigint_binary_op(lhs, rhs, |a, b| a * b)?;
@@ -1360,6 +1400,36 @@ impl Interpreter {
             Opcode::Div => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // i32 fast-path: exact integer division only (no remainder, no div-by-zero)
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    if r != 0 && l % r == 0 && !(l == 0 && r < 0) {
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            RegisterValue::from_i32(l / r),
+                        )?;
+                        activation.advance();
+                        return Ok(StepOutcome::Continue);
+                    }
+                    // Non-exact or div-by-zero: fall through to f64 path
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_number(l as f64 / r as f64),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                // f64 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_number(l / r),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
                 // §6.1.6.2.10 BigInt::divide — throws RangeError for division by zero.
                 if lhs.is_bigint() && rhs.is_bigint() {
                     let result = runtime.bigint_checked_div(lhs, rhs)?;
@@ -1409,10 +1479,15 @@ impl Interpreter {
             Opcode::Lt => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                // AbstractRelationalComparison(x, y, LeftFirst=true) → true means x < y
-                let result = runtime
-                    .js_abstract_relational_comparison(lhs, rhs, true)?
-                    .unwrap_or(false);
+                // i32 fast-path
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    l < r
+                } else {
+                    // AbstractRelationalComparison(x, y, LeftFirst=true) → true means x < y
+                    runtime
+                        .js_abstract_relational_comparison(lhs, rhs, true)?
+                        .unwrap_or(false)
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -1425,9 +1500,13 @@ impl Interpreter {
             Opcode::Gt => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let result = runtime
-                    .js_abstract_relational_comparison(rhs, lhs, false)?
-                    .unwrap_or(false);
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    l > r
+                } else {
+                    runtime
+                        .js_abstract_relational_comparison(rhs, lhs, false)?
+                        .unwrap_or(false)
+                };
                 activation.write_bytecode_register(
                     function,
                     instruction.a(),
@@ -1441,12 +1520,16 @@ impl Interpreter {
             Opcode::Gte => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                // x >= y: if AbstractRelationalComparison(x, y) is undefined or true → false
-                let less = runtime.js_abstract_relational_comparison(lhs, rhs, true)?;
-                let result = match less {
-                    None => false,       // undefined (NaN) → false
-                    Some(true) => false, // x < y → not >=
-                    Some(false) => true, // x >= y
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    l >= r
+                } else {
+                    // x >= y: if AbstractRelationalComparison(x, y) is undefined or true → false
+                    let less = runtime.js_abstract_relational_comparison(lhs, rhs, true)?;
+                    match less {
+                        None => false,       // undefined (NaN) → false
+                        Some(true) => false, // x < y → not >=
+                        Some(false) => true, // x >= y
+                    }
                 };
                 activation.write_bytecode_register(
                     function,
@@ -1460,11 +1543,15 @@ impl Interpreter {
             Opcode::Lte => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let greater = runtime.js_abstract_relational_comparison(rhs, lhs, false)?;
-                let result = match greater {
-                    None => false,
-                    Some(true) => false,
-                    Some(false) => true,
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    l <= r
+                } else {
+                    let greater = runtime.js_abstract_relational_comparison(rhs, lhs, false)?;
+                    match greater {
+                        None => false,
+                        Some(true) => false,
+                        Some(false) => true,
+                    }
                 };
                 activation.write_bytecode_register(
                     function,
@@ -1478,6 +1565,34 @@ impl Interpreter {
             Opcode::Mod => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // i32 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    if r != 0 {
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            RegisterValue::from_i32(l % r),
+                        )?;
+                    } else {
+                        activation.write_bytecode_register(
+                            function,
+                            instruction.a(),
+                            RegisterValue::from_number(f64::NAN),
+                        )?;
+                    }
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
+                // f64 fast-path
+                if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_number(l % r),
+                    )?;
+                    activation.advance();
+                    return Ok(StepOutcome::Continue);
+                }
                 if lhs.is_bigint() && rhs.is_bigint() {
                     let result = runtime.bigint_checked_rem(lhs, rhs)?;
                     activation.write_bytecode_register(function, instruction.a(), result)?;
@@ -1522,81 +1637,144 @@ impl Interpreter {
             Opcode::BitAnd => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_i32 = runtime.js_to_int32(lhs)?;
-                let rhs_i32 = runtime.js_to_int32(rhs)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_i32 & rhs_i32) as f64),
-                )?;
+                // i32 fast-path: skip js_to_int32 coercion and return i32 directly
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(l & r),
+                    )?;
+                } else {
+                    let lhs_i32 = runtime.js_to_int32(lhs)?;
+                    let rhs_i32 = runtime.js_to_int32(rhs)?;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(lhs_i32 & rhs_i32),
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::BitOr => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_i32 = runtime.js_to_int32(lhs)?;
-                let rhs_i32 = runtime.js_to_int32(rhs)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_i32 | rhs_i32) as f64),
-                )?;
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(l | r),
+                    )?;
+                } else {
+                    let lhs_i32 = runtime.js_to_int32(lhs)?;
+                    let rhs_i32 = runtime.js_to_int32(rhs)?;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(lhs_i32 | rhs_i32),
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::BitXor => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_i32 = runtime.js_to_int32(lhs)?;
-                let rhs_i32 = runtime.js_to_int32(rhs)?;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_i32 ^ rhs_i32) as f64),
-                )?;
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(l ^ r),
+                    )?;
+                } else {
+                    let lhs_i32 = runtime.js_to_int32(lhs)?;
+                    let rhs_i32 = runtime.js_to_int32(rhs)?;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(lhs_i32 ^ rhs_i32),
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::Shl => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_i32 = runtime.js_to_int32(lhs)?;
-                let rhs_u32 = runtime.js_to_uint32(rhs)?;
-                let shift = rhs_u32 & 0x1F;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_i32 << shift) as f64),
-                )?;
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    let shift = (r as u32) & 0x1F;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(l << shift),
+                    )?;
+                } else {
+                    let lhs_i32 = runtime.js_to_int32(lhs)?;
+                    let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                    let shift = rhs_u32 & 0x1F;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(lhs_i32 << shift),
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::Shr => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_i32 = runtime.js_to_int32(lhs)?;
-                let rhs_u32 = runtime.js_to_uint32(rhs)?;
-                let shift = rhs_u32 & 0x1F;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_i32 >> shift) as f64),
-                )?;
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    let shift = (r as u32) & 0x1F;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(l >> shift),
+                    )?;
+                } else {
+                    let lhs_i32 = runtime.js_to_int32(lhs)?;
+                    let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                    let shift = rhs_u32 & 0x1F;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        RegisterValue::from_i32(lhs_i32 >> shift),
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }
             Opcode::UShr => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
-                let lhs_u32 = runtime.js_to_uint32(lhs)?;
-                let rhs_u32 = runtime.js_to_uint32(rhs)?;
-                let shift = rhs_u32 & 0x1F;
-                activation.write_bytecode_register(
-                    function,
-                    instruction.a(),
-                    RegisterValue::from_number((lhs_u32 >> shift) as f64),
-                )?;
+                // UShr always produces u32, which may exceed i32::MAX,
+                // so we must use from_number for values > i32::MAX.
+                if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    let result = (l as u32) >> ((r as u32) & 0x1F);
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        if result <= i32::MAX as u32 {
+                            RegisterValue::from_i32(result as i32)
+                        } else {
+                            RegisterValue::from_number(result as f64)
+                        },
+                    )?;
+                } else {
+                    let lhs_u32 = runtime.js_to_uint32(lhs)?;
+                    let rhs_u32 = runtime.js_to_uint32(rhs)?;
+                    let shift = rhs_u32 & 0x1F;
+                    let result = lhs_u32 >> shift;
+                    activation.write_bytecode_register(
+                        function,
+                        instruction.a(),
+                        if result <= i32::MAX as u32 {
+                            RegisterValue::from_i32(result as i32)
+                        } else {
+                            RegisterValue::from_number(result as f64)
+                        },
+                    )?;
+                }
                 activation.advance();
                 Ok(StepOutcome::Continue)
             }

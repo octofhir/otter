@@ -132,6 +132,12 @@ pub enum MirOp {
         rhs: ValueId,
         deopt: DeoptId,
     },
+    /// i32 remainder (modulo). Deopt on div-by-zero.
+    ModI32 {
+        lhs: ValueId,
+        rhs: ValueId,
+        deopt: DeoptId,
+    },
     /// i32 increment (add 1) with overflow check.
     IncI32 {
         val: ValueId,
@@ -558,6 +564,7 @@ impl MirOp {
             | MirOp::SubI32 { .. }
             | MirOp::MulI32 { .. }
             | MirOp::DivI32 { .. }
+            | MirOp::ModI32 { .. }
             | MirOp::IncI32 { .. }
             | MirOp::DecI32 { .. }
             | MirOp::NegI32 { .. } => MirType::Int32,

@@ -79,6 +79,11 @@ pub fn compile_function_profiled(
         (!property_profile.is_empty()).then_some(property_profile),
     )?;
 
+    if crate::config::JIT_CONFIG.dump_mir {
+        eprintln!("[JIT] MIR for {:?}:", function.name());
+        eprintln!("{}", graph);
+    }
+
     #[cfg(debug_assertions)]
     {
         if let Err(errors) = verify(&graph) {
@@ -182,12 +187,21 @@ pub fn execute_function_profiled_with_runtime(
     let register_count = u32::try_from(required_len)
         .map_err(|_| JitError::Internal("register count does not fit into u32".to_string()))?;
 
+    // Resolve `this` from the receiver slot if the function declares one,
+    // otherwise default to `undefined`. Global scripts use a receiver slot
+    // that points to the global object.
+    let this_raw = function
+        .frame_layout()
+        .receiver_slot()
+        .and_then(|slot| registers.get(usize::from(slot)))
+        .map_or(vm::RegisterValue::undefined().raw_bits(), |v| v.raw_bits());
+
     let mut ctx = JitContext {
         registers_base: registers.as_mut_ptr().cast::<u64>(),
         local_count: register_count,
         register_count,
         constants: std::ptr::null(),
-        this_raw: vm::RegisterValue::undefined().raw_bits(),
+        this_raw,
         interrupt_flag,
         interpreter: std::ptr::null(),
         vm_ctx: std::ptr::null_mut(),

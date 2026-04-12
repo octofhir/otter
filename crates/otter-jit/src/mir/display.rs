@@ -110,6 +110,7 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::SubI32 { lhs, rhs, deopt } => write!(f, "sub.i32 {} {} {}", lhs, rhs, deopt),
         MirOp::MulI32 { lhs, rhs, deopt } => write!(f, "mul.i32 {} {} {}", lhs, rhs, deopt),
         MirOp::DivI32 { lhs, rhs, deopt } => write!(f, "div.i32 {} {} {}", lhs, rhs, deopt),
+        MirOp::ModI32 { lhs, rhs, deopt } => write!(f, "mod.i32 {} {} {}", lhs, rhs, deopt),
         MirOp::IncI32 { val, deopt } => write!(f, "inc.i32 {} {}", val, deopt),
         MirOp::DecI32 { val, deopt } => write!(f, "dec.i32 {} {}", val, deopt),
         MirOp::NegI32 { val, deopt } => write!(f, "neg.i32 {} {}", val, deopt),

@@ -52,6 +52,10 @@ pub fn create_host_isa() -> Result<OwnedTargetIsa, JitError> {
     flag_builder
         .set("is_pic", "false")
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
+    // Enable Cranelift optimizations: GVN, LICM, constant folding, etc.
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
     let isa_builder =
         cranelift_native::builder().map_err(|e| JitError::Cranelift(e.to_string()))?;
@@ -88,11 +92,43 @@ pub fn compile_clif_function(
         .declare_function("jit_entry", Linkage::Local, &sig)
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
+    // Dump CLIF IR before compilation if requested.
+    if crate::config::JIT_CONFIG.dump_asm {
+        eprintln!("[JIT] === CLIF IR ===");
+        eprintln!("{}", clif_func.display());
+    }
+
     // Compile and define.
     let mut ctx = ClifContext::for_function(clif_func);
     module
         .define_function(func_id, &mut ctx)
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
+
+    // Dump compiled code disassembly if requested.
+    if crate::config::JIT_CONFIG.dump_asm {
+        if let Some(compiled) = ctx.compiled_code() {
+            // Dump the VCode (Cranelift's near-machine-code representation)
+            if let Some(vcode) = compiled.vcode.as_ref() {
+                eprintln!("[JIT] === VCode (near-asm) ===");
+                eprintln!("{vcode}");
+            }
+            // Dump raw code bytes for external disassembly
+            let code = compiled.code_buffer();
+            let total_size = compiled.code_info().total_size;
+            eprintln!("[JIT] === Native code: {} bytes ===", total_size);
+            // Print hex dump for llvm-objdump -d
+            for (i, chunk) in code.iter().enumerate() {
+                if i % 16 == 0 {
+                    if i > 0 {
+                        eprintln!();
+                    }
+                    eprint!("  {:04x}: ", i);
+                }
+                eprint!("{:02x} ", chunk);
+            }
+            eprintln!();
+        }
+    }
 
     // Finalize — make the code executable.
     module
@@ -101,6 +137,10 @@ pub fn compile_clif_function(
 
     let code_ptr = module.get_finalized_function(func_id);
     let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
+
+    if crate::config::JIT_CONFIG.dump_asm {
+        eprintln!("[JIT] compiled function at {:p}, {} bytes", code_ptr, code_size);
+    }
 
     Ok(CompiledFunction {
         entry: code_ptr,

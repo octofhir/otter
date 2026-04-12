@@ -1094,6 +1094,21 @@ impl RuntimeState {
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
+        // i32 fast-path: both operands are already i32 → skip ToPrimitive
+        // and all type checks entirely. This is the common case in loops
+        // with integer arithmetic like `(acc + i) | 0`.
+        if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+            return match l.checked_add(r) {
+                Some(sum) => Ok(RegisterValue::from_i32(sum)),
+                None => Ok(RegisterValue::from_number(l as f64 + r as f64)),
+            };
+        }
+
+        // f64 fast-path: both operands are already numbers.
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l + r));
+        }
+
         // §13.15.3 ApplyStringOrNumericBinaryOperator — step 1-4: ToPrimitive first.
         let lprim = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
         let rprim = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
@@ -1117,15 +1132,6 @@ impl RuntimeState {
             return Err(InterpreterError::TypeError(
                 "Cannot mix BigInt and other types, use explicit conversions".into(),
             ));
-        }
-
-        if let (Some(lhs_number), Some(rhs_number)) = (lprim.as_number(), rprim.as_number()) {
-            return Ok(RegisterValue::from_number(lhs_number + rhs_number));
-        }
-
-        // i32 fast-path — only valid when both operands are integers.
-        if lprim.as_i32().is_some() && rprim.as_i32().is_some() {
-            return lprim.add_i32(rprim).map_err(InterpreterError::InvalidValue);
         }
 
         // General case: coerce to Number (ToNumber). Undefined → NaN,

@@ -5,6 +5,8 @@ use crate::{BAILOUT_SENTINEL, BailoutReason};
 use otter_vm::object::{ObjectHandle, PropertyValue};
 use otter_vm::{FunctionIndex, Module, ObjectShapeId, RegisterValue, RuntimeState};
 
+use otter_vm::property::PropertyNameId;
+
 const MAX_DIRECT_CALL_ARGS: usize = 8;
 
 fn write_bailout(ctx: &mut JitContext, reason: BailoutReason, bytecode_pc: u32) -> u64 {
@@ -149,6 +151,105 @@ pub extern "C" fn otter_call_direct(
         ctx.interrupt_flag,
     ) {
         Ok(result) => result.return_value().raw_bits() as i64,
+        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
+    }
+}
+
+/// Resolve the property name from the module's entry function side table.
+/// Must be called BEFORE borrowing ctx mutably (for runtime).
+unsafe fn resolve_property_name_from_ctx(
+    ctx: *const JitContext,
+    prop_id: u16,
+) -> Option<&'static str> {
+    let ctx_ref = unsafe { &*ctx };
+    let module_ptr = ctx_ref.module_ptr.cast::<Module>();
+    if module_ptr.is_null() {
+        return None;
+    }
+    let module = unsafe { &*module_ptr };
+    let function = module.function(module.entry())?;
+    function.property_names().get(PropertyNameId(prop_id))
+}
+
+/// Generic property GET — called from JIT code when no IC data is available.
+/// Walks the prototype chain to find the property by its interned name ID.
+pub extern "C" fn otter_get_prop_generic(
+    ctx: *mut JitContext,
+    obj_bits: i64,
+    prop_id: i64,
+    bytecode_pc: i64,
+) -> i64 {
+    // Read module/property name BEFORE mutably borrowing ctx for runtime.
+    let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return BAILOUT_SENTINEL as i64;
+        };
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+        return BAILOUT_SENTINEL as i64;
+    };
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+    let Some(obj_value) = RegisterValue::from_raw_bits(obj_bits as u64) else {
+        return write_bailout(ctx, BailoutReason::TypeGuardFailed, bytecode_pc as u32) as i64;
+    };
+    let Some(handle) = obj_value.as_object_handle().map(ObjectHandle) else {
+        return write_bailout(ctx, BailoutReason::TypeGuardFailed, bytecode_pc as u32) as i64;
+    };
+
+    let interned = runtime.intern_property_name(name_str);
+
+    match runtime.objects().get_property(handle, interned) {
+        Ok(Some(lookup)) => match lookup.value() {
+            PropertyValue::Data { value, .. } => value.raw_bits() as i64,
+            PropertyValue::Accessor { .. } => {
+                // Accessor properties are rare in prologue — deopt for simplicity
+                write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64
+            }
+        },
+        Ok(None) => RegisterValue::undefined().raw_bits() as i64,
+        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
+    }
+}
+
+/// Generic property SET — called from JIT code when no IC data is available.
+pub extern "C" fn otter_set_prop_generic(
+    ctx: *mut JitContext,
+    obj_bits: i64,
+    prop_id: i64,
+    value_bits: i64,
+    bytecode_pc: i64,
+) -> i64 {
+    let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return BAILOUT_SENTINEL as i64;
+        };
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+        return BAILOUT_SENTINEL as i64;
+    };
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+    let Some(handle) = RegisterValue::from_raw_bits(obj_bits as u64)
+        .and_then(|v| v.as_object_handle())
+        .map(ObjectHandle)
+    else {
+        return write_bailout(ctx, BailoutReason::TypeGuardFailed, bytecode_pc as u32) as i64;
+    };
+    let Some(value) = RegisterValue::from_raw_bits(value_bits as u64) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let interned = runtime.intern_property_name(name_str);
+
+    match runtime.objects_mut().set_property(handle, interned, value) {
+        Ok(_) => 0,
         Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
     }
 }

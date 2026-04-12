@@ -47,11 +47,21 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
 
     let ctx_ptr = builder.block_params(entry_clif_block)[0];
 
+    // Cache registers_base pointer once at function entry — avoids redundant
+    // loads from JitContext on every LoadLocal/StoreLocal.
+    let registers_base = builder.ins().load(
+        pointer_type,
+        MemFlags::trusted(),
+        ctx_ptr,
+        crate::context::offsets::REGISTERS_BASE,
+    );
+
     let mut value_map: HashMap<ValueId, Value> = HashMap::new();
     let mut emitted_predecessors: HashMap<BlockId, usize> = HashMap::new();
 
     let mut lowerer = OpLowerer {
         ctx_ptr,
+        registers_base,
         pointer_type,
         value_map: &mut value_map,
         block_map: &block_map,
@@ -100,6 +110,7 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
 /// Holds state for lowering operations.
 struct OpLowerer<'a> {
     ctx_ptr: Value,
+    registers_base: Value,
     pointer_type: types::Type,
     value_map: &'a mut HashMap<ValueId, Value>,
     block_map: &'a HashMap<BlockId, Block>,
@@ -234,6 +245,14 @@ impl<'a> OpLowerer<'a> {
                 self.emit_overflow_guard(builder, is_zero, deopt, crate::BailoutReason::Overflow)?;
                 Ok(Some(builder.ins().sdiv(l, r)))
             }
+            MirOp::ModI32 { lhs, rhs, deopt } => {
+                let l = self.v(lhs)?;
+                let r = self.v(rhs)?;
+                let zero = builder.ins().iconst(types::I32, 0);
+                let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
+                self.emit_overflow_guard(builder, is_zero, deopt, crate::BailoutReason::Overflow)?;
+                Ok(Some(builder.ins().srem(l, r)))
+            }
             MirOp::IncI32 { val, deopt } => {
                 let one = builder.ins().iconst(types::I32, 1);
                 let (result, overflow) = builder.ins().sadd_overflow(self.v(val)?, one);
@@ -324,40 +343,23 @@ impl<'a> OpLowerer<'a> {
 
             // ---- Variables ----
             MirOp::LoadLocal(idx) => {
-                let base = builder.ins().load(
-                    pointer_type,
-                    MemFlags::trusted(),
-                    ctx_ptr,
-                    offsets::REGISTERS_BASE,
-                );
                 let offset = (*idx as i32) * 8;
                 Ok(Some(builder.ins().load(
                     types::I64,
                     MemFlags::trusted(),
-                    base,
+                    self.registers_base,
                     offset,
                 )))
             }
             MirOp::StoreLocal { idx, val } => {
-                let base = builder.ins().load(
-                    pointer_type,
-                    MemFlags::trusted(),
-                    ctx_ptr,
-                    offsets::REGISTERS_BASE,
-                );
                 let offset = (*idx as i32) * 8;
                 builder
                     .ins()
-                    .store(MemFlags::trusted(), self.v(val)?, base, offset);
+                    .store(MemFlags::trusted(), self.v(val)?, self.registers_base, offset);
                 Ok(None)
             }
             MirOp::LoadRegister(idx) => {
-                let base = builder.ins().load(
-                    pointer_type,
-                    MemFlags::trusted(),
-                    ctx_ptr,
-                    offsets::REGISTERS_BASE,
-                );
+                let base = self.registers_base;
                 let local_count = builder.ins().load(
                     types::I32,
                     MemFlags::trusted(),
@@ -377,12 +379,7 @@ impl<'a> OpLowerer<'a> {
                 )))
             }
             MirOp::StoreRegister { idx, val } => {
-                let base = builder.ins().load(
-                    pointer_type,
-                    MemFlags::trusted(),
-                    ctx_ptr,
-                    offsets::REGISTERS_BASE,
-                );
+                let base = self.registers_base;
                 let local_count = builder.ins().load(
                     types::I32,
                     MemFlags::trusted(),
@@ -441,6 +438,42 @@ impl<'a> OpLowerer<'a> {
                     builder,
                     crate::runtime_helpers::otter_set_prop_shaped as *const () as usize,
                     &[obj, shape, offset, value, pc],
+                );
+                let _ = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(None)
+            }
+
+            // ---- Generic property access (cold path, calls runtime helper) ----
+            MirOp::GetPropConstGeneric {
+                obj,
+                name_idx,
+                ..
+            } => {
+                let obj = self.to_i64(builder, self.v(obj)?);
+                let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::runtime_helpers::otter_get_prop_generic as *const () as usize,
+                    &[obj, prop_id, pc],
+                );
+                let result = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(Some(result))
+            }
+            MirOp::SetPropConstGeneric {
+                obj,
+                name_idx,
+                val,
+                ..
+            } => {
+                let obj = self.to_i64(builder, self.v(obj)?);
+                let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
+                let value = self.to_i64(builder, self.v(val)?);
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::runtime_helpers::otter_set_prop_generic as *const () as usize,
+                    &[obj, prop_id, value, pc],
                 );
                 let _ = self.emit_return_if_bailout_sentinel(builder, result);
                 Ok(None)

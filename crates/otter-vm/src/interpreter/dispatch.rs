@@ -1302,6 +1302,11 @@ impl Interpreter {
             Opcode::Add => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                // Record arithmetic feedback for JIT.
+                frame_runtime.record_arithmetic(
+                    function, activation.pc(),
+                    Self::classify_arithmetic_operands(lhs, rhs),
+                );
                 let value = runtime.js_add(lhs, rhs)?;
                 activation.write_bytecode_register(function, instruction.a(), value)?;
                 activation.advance();
@@ -1310,6 +1315,10 @@ impl Interpreter {
             Opcode::Sub => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                frame_runtime.record_arithmetic(
+                    function, activation.pc(),
+                    Self::classify_arithmetic_operands(lhs, rhs),
+                );
                 // i32 fast-path
                 if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
                     let result = match l.checked_sub(r) {
@@ -1355,6 +1364,10 @@ impl Interpreter {
             Opcode::Mul => {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
+                frame_runtime.record_arithmetic(
+                    function, activation.pc(),
+                    Self::classify_arithmetic_operands(lhs, rhs),
+                );
                 // i32 fast-path
                 if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
                     let result = match l.checked_mul(r) {
@@ -3473,7 +3486,9 @@ impl Interpreter {
             }
             Opcode::JumpIfTrue => {
                 let condition = activation.read_bytecode_register(function, instruction.a())?;
-                if runtime.js_to_boolean(condition)? {
+                let taken = runtime.js_to_boolean(condition)?;
+                frame_runtime.record_branch(function, activation.pc(), taken);
+                if taken {
                     let offset = instruction.immediate_i32();
                     if offset < 0 {
                         self.check_interrupt()?;
@@ -3487,7 +3502,9 @@ impl Interpreter {
             }
             Opcode::JumpIfFalse => {
                 let condition = activation.read_bytecode_register(function, instruction.a())?;
-                if runtime.js_to_boolean(condition)? {
+                let truthy = runtime.js_to_boolean(condition)?;
+                frame_runtime.record_branch(function, activation.pc(), !truthy);
+                if truthy {
                     activation.advance();
                 } else {
                     let offset = instruction.immediate_i32();
@@ -5390,6 +5407,26 @@ impl Interpreter {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    // ---- Feedback classification helpers ----
+
+    /// Classify two operands for arithmetic feedback.
+    /// Returns the monotonic lattice value representing the "widest" type seen.
+    fn classify_arithmetic_operands(
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> crate::feedback::ArithmeticFeedback {
+        use crate::feedback::ArithmeticFeedback;
+        if lhs.as_i32().is_some() && rhs.as_i32().is_some() {
+            ArithmeticFeedback::Int32
+        } else if lhs.is_bigint() || rhs.is_bigint() {
+            ArithmeticFeedback::BigInt
+        } else if lhs.as_number().is_some() && rhs.as_number().is_some() {
+            ArithmeticFeedback::Number
+        } else {
+            ArithmeticFeedback::Any
         }
     }
 }

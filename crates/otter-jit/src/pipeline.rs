@@ -85,13 +85,25 @@ pub fn compile_function_profiled(
         }
     }
 
-    let graph = build_mir(
+    let mut graph = build_mir(
         function,
         (!property_profile.is_empty()).then_some(property_profile),
     )?;
 
     if cfg.dump_mir {
-        eprintln!("[JIT] === MIR for {:?} ===", function.name());
+        eprintln!("[JIT] === MIR (before passes) for {:?} ===", function.name());
+        eprintln!("{}", graph);
+    }
+
+    // Run MIR optimization passes.
+    crate::mir::passes::run_passes(
+        &mut graph,
+        crate::mir::passes::PassTier::Baseline,
+        cfg.dump_mir_passes,
+    );
+
+    if cfg.dump_mir && cfg.dump_mir_passes {
+        eprintln!("[JIT] === MIR (after passes) for {:?} ===", function.name());
         eprintln!("{}", graph);
     }
 

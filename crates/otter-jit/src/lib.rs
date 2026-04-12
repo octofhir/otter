@@ -12,6 +12,7 @@
 //! Both tiers share one ABI, one JitContext, one deopt model.
 
 pub mod abi;
+pub mod cache_ir;
 pub mod code_cache;
 pub mod code_memory;
 pub mod codegen;
@@ -19,6 +20,7 @@ pub mod config;
 pub mod context;
 pub mod deopt;
 pub mod helpers;
+pub mod ic;
 pub mod mir;
 pub mod pipeline;
 mod runtime_helpers;

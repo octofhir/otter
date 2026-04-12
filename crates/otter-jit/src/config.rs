@@ -85,6 +85,10 @@ pub struct JitConfig {
     /// Override: `OTTER_JIT_DUMP_STATS=1`.
     pub dump_jit_stats: bool,
 
+    /// Dump MIR after each optimization pass.
+    /// Override: `OTTER_JIT_DUMP_MIR_PASSES=1`.
+    pub dump_mir_passes: bool,
+
     /// Maximum compiled code cache size in bytes (0 = unlimited).
     /// Override: `OTTER_JIT_CODE_CACHE_MB=<N>`.
     pub code_cache_limit_bytes: usize,
@@ -115,6 +119,7 @@ impl Default for JitConfig {
             dump_clif: false,
             dump_asm: false,
             dump_jit_stats: false,
+            dump_mir_passes: false,
             code_cache_limit_bytes: 0,
         }
     }
@@ -155,6 +160,9 @@ impl JitConfig {
         }
         if let Ok(v) = std::env::var("OTTER_JIT_DUMP_STATS") {
             cfg.dump_jit_stats = v == "1";
+        }
+        if let Ok(v) = std::env::var("OTTER_JIT_DUMP_MIR_PASSES") {
+            cfg.dump_mir_passes = v == "1";
         }
         if let Ok(v) = std::env::var("OTTER_JIT_CODE_CACHE_MB")
             && let Ok(n) = v.parse::<usize>()

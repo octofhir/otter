@@ -585,6 +585,9 @@ impl<'a> OpLowerer<'a> {
                 Ok(None)
             }
 
+            // ---- Move (SSA identity, produced by optimization passes) ----
+            MirOp::Move(val) => Ok(Some(self.v(val)?)),
+
             // ---- Helper calls (cold exits to runtime) ----
             MirOp::HelperCall { kind, args } => {
                 let helper_name = helper_kind_to_symbol(kind);

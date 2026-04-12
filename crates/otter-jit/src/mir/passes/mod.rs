@@ -1,22 +1,31 @@
 //! MIR optimization passes.
 //!
-//! ## Pass pipeline
+//! ## Pass pipelines
 //!
-//! Tier 1 (baseline) runs a lightweight pipeline:
+//! **Tier 1** (baseline): fast, lightweight passes only.
 //!   `const_fold -> guard_elim -> repr_elim`
 //!
-//! DCE and block_layout are implemented but disabled until operand tracking
-//! and block index remapping are complete.
+//! **Tier 2** (optimized): full speculative pipeline.
+//!   `const_fold -> guard_elim (dominator-based + type-proof) -> repr_elim -> licm`
 //!
-//! Tier 2 (optimized) will add: type_analysis, repr_propagation, inline, licm, bce.
+//! Standalone analysis passes (used by other passes, not in pipeline directly):
+//! - `type_analysis`: forward dataflow type inference (AbstractType per value)
+//! - `repr_propagation`: representation selection (Int32/Float64/Tagged per value)
+//! - `dominators`: dominator tree computation (Cooper-Harvey-Kennedy)
 //!
-//! Each pass implements `fn run(graph: &mut MirGraph)` and is idempotent.
+//! ## Implemented but disabled
+//! - `dce`: operand tracking incomplete for some MIR ops
+//! - `block_layout`: needs BlockId→index remapping in lowering
 
 pub mod block_layout;
 pub mod const_fold;
 pub mod dce;
+pub mod dominators;
 pub mod guard_elim;
+pub mod licm;
 pub mod repr_elim;
+pub mod repr_propagation;
+pub mod type_analysis;
 
 use super::graph::MirGraph;
 
@@ -25,7 +34,7 @@ use super::graph::MirGraph;
 pub enum PassTier {
     /// Tier 1: lightweight passes only.
     Baseline,
-    /// Tier 2: full optimization pipeline.
+    /// Tier 2: full optimization pipeline (speculative tier).
     Optimized,
 }
 
@@ -38,16 +47,17 @@ pub fn run_passes(graph: &mut MirGraph, tier: PassTier, dump_passes: bool) {
             ("const_fold", const_fold::run),
             ("guard_elim", guard_elim::run),
             ("repr_elim", repr_elim::run),
-            // DCE disabled: operand tracking catch-all misses some ValueId refs,
-            // causing live instructions to be removed. Enable after full coverage.
-            // ("dce", dce::run),
-            // block_layout disabled: reorders blocks without updating BlockId->index.
-            // ("block_layout", block_layout::run),
         ],
         PassTier::Optimized => &[
+            // Phase 1: constant folding (cheap, reduces graph size).
             ("const_fold", const_fold::run),
+            // Phase 2: guard elimination with dominator tree + type proofs.
+            // guard_elim internally runs type_analysis + dominators.
             ("guard_elim", guard_elim::run),
+            // Phase 3: box/unbox chain elimination.
             ("repr_elim", repr_elim::run),
+            // Phase 4: loop-invariant code motion (identify invariant ops).
+            ("licm", licm::run),
         ],
     };
 

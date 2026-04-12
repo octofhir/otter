@@ -22,6 +22,8 @@ pub mod deopt;
 pub mod helpers;
 pub mod ic;
 pub mod mir;
+pub mod osr;
+pub mod osr_compile;
 pub mod pipeline;
 mod runtime_helpers;
 pub mod telemetry;

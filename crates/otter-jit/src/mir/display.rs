@@ -313,11 +313,19 @@ fn format_instr(f: &mut fmt::Formatter<'_>, instr: &MirInstr) -> fmt::Result {
         MirOp::RequireCoercible(v) => write!(f, "require_coercible {}", v),
 
         // Control flow
-        MirOp::Jump(target) => write!(f, "jump {}", target),
+        MirOp::Jump(target, args) => {
+            if args.is_empty() {
+                write!(f, "jump {}", target)
+            } else {
+                let args_str: Vec<_> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "jump {}({})", target, args_str.join(", "))
+            }
+        }
         MirOp::Branch {
             cond,
             true_block,
             false_block,
+            ..
         } => {
             write!(
                 f,

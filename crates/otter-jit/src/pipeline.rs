@@ -73,14 +73,25 @@ pub fn compile_function_profiled(
     function: &vm::Function,
     property_profile: &[Option<vm::PropertyInlineCache>],
 ) -> Result<CompiledFunction, JitError> {
+    let cfg = crate::config::jit_config();
     let start = Instant::now();
+
+    if cfg.dump_bytecode {
+        eprintln!("[JIT] === Bytecode for {:?} ({} instructions) ===",
+                  function.name(), function.bytecode().len());
+        for (pc, instr) in function.bytecode().instructions().iter().enumerate() {
+            eprintln!("  {:04}: {:?} a={} b={} c={}",
+                      pc, instr.opcode(), instr.a(), instr.b(), instr.c());
+        }
+    }
+
     let graph = build_mir(
         function,
         (!property_profile.is_empty()).then_some(property_profile),
     )?;
 
-    if crate::config::JIT_CONFIG.dump_mir {
-        eprintln!("[JIT] MIR for {:?}:", function.name());
+    if cfg.dump_mir {
+        eprintln!("[JIT] === MIR for {:?} ===", function.name());
         eprintln!("{}", graph);
     }
 

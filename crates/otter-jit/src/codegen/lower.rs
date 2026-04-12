@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
-    AbiParam, Block, Function as ClifFunction, InstBuilder, MemFlags, Signature, Value,
+    AbiParam, Block, BlockArg, Function as ClifFunction, InstBuilder, MemFlags, Signature, Value,
 };
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -19,7 +19,7 @@ use crate::codegen::value_repr;
 use crate::context::offsets;
 use crate::mir::graph::{BlockId, MirGraph, ValueId};
 use crate::mir::nodes::MirOp;
-use crate::mir::types::CmpOp;
+use crate::mir::types::{CmpOp, MirType};
 use crate::{BAILOUT_SENTINEL, JitError};
 
 /// Lower a complete MIR graph into a Cranelift IR function.
@@ -58,6 +58,21 @@ pub fn lower_mir_to_clif(graph: &MirGraph, isa: &dyn TargetIsa) -> Result<ClifFu
 
     let mut value_map: HashMap<ValueId, Value> = HashMap::new();
     let mut emitted_predecessors: HashMap<BlockId, usize> = HashMap::new();
+
+    // Pre-populate block params for all blocks (Phi nodes → Cranelift block params).
+    for mir_block in &graph.blocks {
+        let clif_block = block_map[&mir_block.id];
+        for param in &mir_block.params {
+            let clif_ty = match param.ty {
+                MirType::Int32 => types::I32,
+                MirType::Float64 => types::F64,
+                MirType::Bool => types::I8,
+                _ => types::I64,
+            };
+            let clif_val = builder.append_block_param(clif_block, clif_ty);
+            value_map.insert(param.value, clif_val);
+        }
+    }
 
     let mut lowerer = OpLowerer {
         ctx_ptr,
@@ -480,22 +495,33 @@ impl<'a> OpLowerer<'a> {
             }
 
             // ---- Control Flow ----
-            MirOp::Jump(target) => {
-                builder.ins().jump(self.b(target), &[]);
+            MirOp::Jump(target, args) => {
+                let clif_args: Vec<BlockArg> = args.iter()
+                    .map(|a| self.v(a).map(BlockArg::Value))
+                    .collect::<Result<_, _>>()?;
+                builder.ins().jump(self.b(target), &clif_args);
                 self.register_edge(builder, *target);
                 Ok(None)
             }
             MirOp::Branch {
                 cond,
                 true_block,
+                true_args,
                 false_block,
+                false_args,
             } => {
+                let t_args: Vec<BlockArg> = true_args.iter()
+                    .map(|a| self.v(a).map(BlockArg::Value))
+                    .collect::<Result<_, _>>()?;
+                let f_args: Vec<BlockArg> = false_args.iter()
+                    .map(|a| self.v(a).map(BlockArg::Value))
+                    .collect::<Result<_, _>>()?;
                 builder.ins().brif(
                     self.v(cond)?,
                     self.b(true_block),
-                    &[],
+                    &t_args,
                     self.b(false_block),
-                    &[],
+                    &f_args,
                 );
                 self.register_edge(builder, *true_block);
                 self.register_edge(builder, *false_block);

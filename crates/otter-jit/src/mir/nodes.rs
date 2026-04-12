@@ -459,13 +459,15 @@ pub enum MirOp {
     // ====================================================================
     // Control Flow
     // ====================================================================
-    /// Unconditional jump to block.
-    Jump(BlockId),
-    /// Conditional branch.
+    /// Unconditional jump to block. `args` are passed as block parameters (Phis).
+    Jump(BlockId, Vec<ValueId>),
+    /// Conditional branch. `true_args`/`false_args` are passed as block parameters.
     Branch {
         cond: ValueId,
         true_block: BlockId,
+        true_args: Vec<ValueId>,
         false_block: BlockId,
+        false_args: Vec<ValueId>,
     },
     /// Return a value from the function.
     Return(ValueId),
@@ -652,7 +654,7 @@ impl MirOp {
             MirOp::RequireCoercible(_) => MirType::Void,
 
             // Control flow produces Void (terminators)
-            MirOp::Jump(_)
+            MirOp::Jump(_, _)
             | MirOp::Branch { .. }
             | MirOp::Return(_)
             | MirOp::ReturnUndefined
@@ -689,7 +691,7 @@ impl MirOp {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            MirOp::Jump(_)
+            MirOp::Jump(_, _)
                 | MirOp::Branch { .. }
                 | MirOp::Return(_)
                 | MirOp::ReturnUndefined

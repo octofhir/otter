@@ -46,7 +46,7 @@ pub fn build_mir(
             && block != current_block
         {
             if !graph.block(current_block).is_terminated() {
-                graph.push_instr(current_block, MirOp::Jump(block), pc);
+                graph.push_instr(current_block, MirOp::Jump(block, vec![]), pc);
             }
             current_block = block;
             // Invalidate cache at block boundaries — predecessor values unknown.
@@ -553,7 +553,7 @@ fn lower_instruction(
                 graph.push_instr(block, MirOp::Safepoint { live: Vec::new() }, pc);
             }
             let target = resolve_target_block(pc, instruction.immediate_i32(), pc_to_block)?;
-            graph.push_instr(block, MirOp::Jump(target), pc);
+            graph.push_instr(block, MirOp::Jump(target, vec![]), pc);
         }
         Opcode::JumpIfTrue => {
             let cond = load_register(
@@ -575,7 +575,9 @@ fn lower_instruction(
                 MirOp::Branch {
                     cond: truthy,
                     true_block: target,
+                    true_args: vec![],
                     false_block: fallthrough,
+                    false_args: vec![],
                 },
                 pc,
             );
@@ -600,7 +602,9 @@ fn lower_instruction(
                 MirOp::Branch {
                     cond: truthy,
                     true_block: fallthrough,
+                    true_args: vec![],
                     false_block: target,
+                    false_args: vec![],
                 },
                 pc,
             );

@@ -4,6 +4,8 @@
 //! a sequence of MIR instructions. Values are identified by `ValueId` and
 //! follow SSA: each value is defined exactly once.
 
+use std::collections::HashMap;
+
 use super::nodes::MirOp;
 use super::types::MirType;
 
@@ -51,12 +53,25 @@ pub struct MirInstr {
     pub bytecode_pc: u32,
 }
 
+/// A block parameter (Phi node in SSA terminology). At merge points,
+/// each predecessor passes a value as an argument to the block's jump/branch.
+/// The block parameter receives the value from whichever predecessor was taken.
+#[derive(Debug, Clone)]
+pub struct BlockParam {
+    /// The value this parameter defines.
+    pub value: ValueId,
+    /// The type of this parameter.
+    pub ty: MirType,
+}
+
 /// A basic block: a straight-line sequence of instructions ending with
 /// a terminator (Jump, Branch, Return, Deopt, Throw).
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
     /// Block identifier.
     pub id: BlockId,
+    /// Block parameters (Phi nodes). Values passed by predecessor jumps/branches.
+    pub params: Vec<BlockParam>,
     /// Instructions in order.
     pub instrs: Vec<MirInstr>,
     /// Predecessor block IDs (populated during graph construction).
@@ -72,6 +87,7 @@ impl BasicBlock {
     pub fn new(id: BlockId) -> Self {
         Self {
             id,
+            params: Vec::new(),
             instrs: Vec::new(),
             predecessors: Vec::new(),
             successors: Vec::new(),
@@ -144,6 +160,8 @@ pub struct MirGraph {
     pub register_count: u16,
     /// Number of parameters.
     pub param_count: u16,
+    /// O(1) value → type cache, built lazily.
+    type_cache: HashMap<ValueId, MirType>,
 }
 
 impl MirGraph {
@@ -164,6 +182,7 @@ impl MirGraph {
             local_count,
             register_count,
             param_count,
+            type_cache: HashMap::new(),
         }
     }
 
@@ -192,6 +211,7 @@ impl MirGraph {
     pub fn push_instr(&mut self, block: BlockId, op: MirOp, bytecode_pc: u32) -> ValueId {
         let ty = op.result_type();
         let value = self.next_value();
+        self.type_cache.insert(value, ty);
         self.blocks[block.0 as usize].instrs.push(MirInstr {
             value,
             op,
@@ -199,6 +219,34 @@ impl MirGraph {
             bytecode_pc,
         });
         value
+    }
+
+    /// Add a block parameter (Phi node) to a block. Returns the ValueId that
+    /// the parameter defines. Predecessors must pass a matching argument in
+    /// their jump/branch instruction.
+    pub fn append_block_param(&mut self, block: BlockId, ty: MirType) -> ValueId {
+        let value = self.next_value();
+        self.type_cache.insert(value, ty);
+        self.blocks[block.0 as usize].params.push(BlockParam { value, ty });
+        value
+    }
+
+    /// Get block parameters for a block.
+    pub fn block_params(&self, block: BlockId) -> &[BlockParam] {
+        &self.blocks[block.0 as usize].params
+    }
+
+    /// Set the type of a block parameter (used by type inference).
+    pub fn set_block_param_type(&mut self, value: ValueId, ty: MirType) {
+        for block in &mut self.blocks {
+            for param in &mut block.params {
+                if param.value == value {
+                    param.ty = ty;
+                    self.type_cache.insert(value, ty);
+                    return;
+                }
+            }
+        }
     }
 
     /// Add an instruction with an explicit type override (for Phi nodes, Move).
@@ -210,6 +258,7 @@ impl MirGraph {
         bytecode_pc: u32,
     ) -> ValueId {
         let value = self.next_value();
+        self.type_cache.insert(value, ty);
         self.blocks[block.0 as usize].instrs.push(MirInstr {
             value,
             op,
@@ -241,9 +290,42 @@ impl MirGraph {
         None
     }
 
-    /// Get the type of a value.
+    /// Get the type of a value (O(1) via cache, fallback to linear scan).
     pub fn value_type(&self, val: ValueId) -> MirType {
+        if let Some(&ty) = self.type_cache.get(&val) {
+            return ty;
+        }
         self.value_def(val).map(|i| i.ty).unwrap_or(MirType::Boxed)
+    }
+
+    /// Set the type of a value in the cache (used by optimization passes).
+    pub fn set_value_type(&mut self, val: ValueId, ty: MirType) {
+        self.type_cache.insert(val, ty);
+        // Also update the instruction if it exists.
+        for block in &mut self.blocks {
+            for instr in &mut block.instrs {
+                if instr.value == val {
+                    instr.ty = ty;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Find loop back-edges: edges where a block jumps to a block with
+    /// a lower or equal block index (i.e., jumping backward in the CFG).
+    /// Returns (source_block, target_block) pairs.
+    /// Must be called after `recompute_edges()`.
+    pub fn back_edges(&self) -> Vec<(BlockId, BlockId)> {
+        let mut result = Vec::new();
+        for block in &self.blocks {
+            for &succ in &block.successors {
+                if succ.0 <= block.id.0 {
+                    result.push((block.id, succ));
+                }
+            }
+        }
+        result
     }
 
     /// Total number of values allocated.
@@ -271,7 +353,7 @@ impl MirGraph {
             let block_id = block.id;
             if let Some(term) = block.terminator() {
                 match &term.op {
-                    MirOp::Jump(target) => {
+                    MirOp::Jump(target, _) => {
                         edges.push((block_id, *target));
                     }
                     MirOp::Branch {

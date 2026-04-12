@@ -133,6 +133,11 @@ impl RunInterrupt {
 
 impl Drop for OtterRuntime {
     fn drop(&mut self) {
+        // Dump JIT telemetry before cleanup if requested.
+        if otter_jit::config::jit_config().dump_jit_stats {
+            otter_jit::telemetry::snapshot().dump();
+        }
+
         // Release all thread-local JIT state (code cache, telemetry, helper
         // symbols). Without this, every `OtterRuntime` instance leaks compiled
         // Cranelift JITModules and accumulated metrics into the thread-local

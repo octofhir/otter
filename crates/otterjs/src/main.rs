@@ -170,6 +170,28 @@ struct Cli {
     /// Dump allocation category counts on exit
     #[arg(long, global = true)]
     alloc_stats: bool,
+
+    // ---- JIT introspection flags ----
+
+    /// Dump compiled bytecodes before JIT compilation
+    #[arg(long, global = true)]
+    dump_bytecode: bool,
+
+    /// Dump MIR (middle IR) before codegen
+    #[arg(long, global = true)]
+    dump_mir: bool,
+
+    /// Dump Cranelift IR (CLIF) before native compilation
+    #[arg(long, global = true)]
+    dump_clif: bool,
+
+    /// Dump native code hex after JIT compilation
+    #[arg(long, global = true)]
+    dump_asm: bool,
+
+    /// Dump JIT telemetry on exit (compile times, bailout counts)
+    #[arg(long, global = true)]
+    dump_jit_stats: bool,
 }
 
 #[derive(Subcommand)]
@@ -501,6 +523,13 @@ fn build_runtime_for_cli(cli: &Cli, argv: Vec<String>) -> Result<otter_runtime::
         let bytes = (cli.max_old_space_size as usize).saturating_mul(1024 * 1024);
         builder = builder.max_heap_bytes(bytes);
     }
+
+    // JIT introspection flags
+    if cli.dump_bytecode { builder = builder.dump_bytecode(true); }
+    if cli.dump_mir { builder = builder.dump_mir(true); }
+    if cli.dump_clif { builder = builder.dump_clif(true); }
+    if cli.dump_asm { builder = builder.dump_asm(true); }
+    if cli.dump_jit_stats { builder = builder.dump_jit_stats(true); }
 
     Ok(builder.build())
 }

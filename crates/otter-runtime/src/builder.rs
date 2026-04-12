@@ -75,6 +75,8 @@ pub struct RuntimeBuilder {
     /// Hard cap on the total heap size, in bytes. Analogue of Node.js's
     /// `--max-old-space-size`. `None` = unlimited.
     max_heap_bytes: Option<usize>,
+    /// JIT debug flag overrides (applied on top of env-var defaults).
+    jit_overrides: otter_jit::config::JitConfigOverrides,
 }
 
 impl RuntimeBuilder {
@@ -85,6 +87,7 @@ impl RuntimeBuilder {
             timeout: None,
             host: HostConfig::default(),
             max_heap_bytes: None,
+            jit_overrides: otter_jit::config::JitConfigOverrides::default(),
         }
     }
 
@@ -191,8 +194,43 @@ impl RuntimeBuilder {
         self
     }
 
+    // ---- JIT debug dump flags ----
+
+    /// Enable `--dump-bytecode`: print compiled bytecodes before JIT compilation.
+    pub fn dump_bytecode(mut self, enabled: bool) -> Self {
+        self.jit_overrides.dump_bytecode = Some(enabled);
+        self
+    }
+
+    /// Enable `--dump-mir`: print MIR before codegen.
+    pub fn dump_mir(mut self, enabled: bool) -> Self {
+        self.jit_overrides.dump_mir = Some(enabled);
+        self
+    }
+
+    /// Enable `--dump-clif`: print Cranelift IR before native compilation.
+    pub fn dump_clif(mut self, enabled: bool) -> Self {
+        self.jit_overrides.dump_clif = Some(enabled);
+        self
+    }
+
+    /// Enable `--dump-asm`: print native code hex dump after compilation.
+    pub fn dump_asm(mut self, enabled: bool) -> Self {
+        self.jit_overrides.dump_asm = Some(enabled);
+        self
+    }
+
+    /// Enable `--dump-jit-stats`: print JIT telemetry on runtime exit.
+    pub fn dump_jit_stats(mut self, enabled: bool) -> Self {
+        self.jit_overrides.dump_jit_stats = Some(enabled);
+        self
+    }
+
     /// Builds the configured runtime.
     pub fn build(self) -> OtterRuntime {
+        // Apply JIT debug flag overrides before any compilation happens.
+        otter_jit::config::apply_overrides(&self.jit_overrides);
+
         let gc_config = otter_vm::otter_gc::heap::GcConfig {
             max_heap_bytes: self.max_heap_bytes,
             ..otter_vm::otter_gc::heap::GcConfig::default()

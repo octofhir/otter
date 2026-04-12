@@ -1,9 +1,38 @@
-//! JIT configuration: thresholds, tier budgets, and environment variable overrides.
+//! JIT configuration: thresholds, tier budgets, and debug dump flags.
+//!
+//! Configuration is read from environment variables at first access and can be
+//! overridden programmatically via [`set_jit_config`] (called by the runtime
+//! builder when CLI flags are provided).
 
-use std::sync::LazyLock;
+use std::cell::RefCell;
 
-/// JIT configuration, read once from environment variables at startup.
-pub static JIT_CONFIG: LazyLock<JitConfig> = LazyLock::new(JitConfig::from_env);
+thread_local! {
+    static JIT_CONFIG_CELL: RefCell<JitConfig> = RefCell::new(JitConfig::from_env());
+}
+
+/// Read the current thread-local JIT configuration.
+pub fn jit_config() -> JitConfig {
+    JIT_CONFIG_CELL.with(|c| c.borrow().clone())
+}
+
+/// Override the thread-local JIT configuration. Call this during runtime
+/// initialization to apply CLI flags on top of env-var defaults.
+pub fn set_jit_config(config: JitConfig) {
+    JIT_CONFIG_CELL.with(|c| *c.borrow_mut() = config);
+}
+
+/// Apply selective overrides on top of the current config. Fields that are
+/// `None` keep their current value; `Some(v)` replaces them.
+pub fn apply_overrides(overrides: &JitConfigOverrides) {
+    JIT_CONFIG_CELL.with(|c| {
+        let mut cfg = c.borrow_mut();
+        if let Some(v) = overrides.dump_bytecode { cfg.dump_bytecode = v; }
+        if let Some(v) = overrides.dump_mir { cfg.dump_mir = v; }
+        if let Some(v) = overrides.dump_clif { cfg.dump_clif = v; }
+        if let Some(v) = overrides.dump_asm { cfg.dump_asm = v; }
+        if let Some(v) = overrides.dump_jit_stats { cfg.dump_jit_stats = v; }
+    });
+}
 
 /// All tunable JIT parameters.
 #[derive(Debug, Clone)]
@@ -34,17 +63,41 @@ pub struct JitConfig {
     /// Override: `OTTER_JIT_TIER1_ONLY=1`.
     pub tier1_only: bool,
 
-    /// Whether to dump MIR to stderr before codegen.
+    // ---- Debug dump flags ----
+
+    /// Dump compiled bytecodes before JIT compilation.
+    /// Override: `OTTER_JIT_DUMP_BYTECODE=1`.
+    pub dump_bytecode: bool,
+
+    /// Dump MIR to stderr before codegen.
     /// Override: `OTTER_JIT_DUMP_MIR=1`.
     pub dump_mir: bool,
 
-    /// Whether to dump disassembled machine code to stderr.
+    /// Dump Cranelift IR (CLIF) to stderr before native compilation.
+    /// Override: `OTTER_JIT_DUMP_CLIF=1`.
+    pub dump_clif: bool,
+
+    /// Dump native code hex to stderr after compilation.
     /// Override: `OTTER_JIT_DUMP_ASM=1`.
     pub dump_asm: bool,
+
+    /// Dump JIT telemetry (compile times, bailout counts) on runtime exit.
+    /// Override: `OTTER_JIT_DUMP_STATS=1`.
+    pub dump_jit_stats: bool,
 
     /// Maximum compiled code cache size in bytes (0 = unlimited).
     /// Override: `OTTER_JIT_CODE_CACHE_MB=<N>`.
     pub code_cache_limit_bytes: usize,
+}
+
+/// Selective overrides for JIT debug flags. `None` = keep current value.
+#[derive(Debug, Clone, Default)]
+pub struct JitConfigOverrides {
+    pub dump_bytecode: Option<bool>,
+    pub dump_mir: Option<bool>,
+    pub dump_clif: Option<bool>,
+    pub dump_asm: Option<bool>,
+    pub dump_jit_stats: Option<bool>,
 }
 
 impl Default for JitConfig {
@@ -57,8 +110,11 @@ impl Default for JitConfig {
             max_deopts_before_blacklist: 20,
             tier_up_budget: 500,
             tier1_only: false,
+            dump_bytecode: false,
             dump_mir: false,
+            dump_clif: false,
             dump_asm: false,
+            dump_jit_stats: false,
             code_cache_limit_bytes: 0,
         }
     }
@@ -85,11 +141,20 @@ impl JitConfig {
         if let Ok(v) = std::env::var("OTTER_JIT_TIER1_ONLY") {
             cfg.tier1_only = v == "1";
         }
+        if let Ok(v) = std::env::var("OTTER_JIT_DUMP_BYTECODE") {
+            cfg.dump_bytecode = v == "1";
+        }
         if let Ok(v) = std::env::var("OTTER_JIT_DUMP_MIR") {
             cfg.dump_mir = v == "1";
         }
+        if let Ok(v) = std::env::var("OTTER_JIT_DUMP_CLIF") {
+            cfg.dump_clif = v == "1";
+        }
         if let Ok(v) = std::env::var("OTTER_JIT_DUMP_ASM") {
             cfg.dump_asm = v == "1";
+        }
+        if let Ok(v) = std::env::var("OTTER_JIT_DUMP_STATS") {
+            cfg.dump_jit_stats = v == "1";
         }
         if let Ok(v) = std::env::var("OTTER_JIT_CODE_CACHE_MB")
             && let Ok(n) = v.parse::<usize>()

@@ -26,6 +26,8 @@ pub mod ic;
 pub mod mir;
 pub mod osr;
 pub mod osr_compile;
+pub mod profile_cache;
+pub mod snapshot;
 pub mod watchpoint;
 pub mod pipeline;
 mod runtime_helpers;

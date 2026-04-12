@@ -68,9 +68,11 @@ pub fn run_passes(graph: &mut MirGraph, tier: PassTier, dump_passes: bool) {
             ("gvn", gvn::run),
             // Phase 6: loop-invariant code motion.
             ("licm", licm::run),
-            // Phase 7: dead code elimination (cleanup after all other passes).
+            // Phase 7: escape analysis (identify non-escaping allocations).
+            ("escape_analysis", escape_analysis::run),
+            // Phase 8: dead code elimination (cleanup after all other passes).
             ("dce", dce::run),
-            // Phase 8: block layout (deopt blocks to end, fallthrough ordering).
+            // Phase 9: block layout (deopt blocks to end, fallthrough ordering).
             ("block_layout", block_layout::run),
         ],
     };

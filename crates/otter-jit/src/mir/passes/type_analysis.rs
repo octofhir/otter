@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_type_analysis_simple() {
-        use crate::mir::graph::{MirGraph, DeoptId, DeoptInfo, ResumeMode};
+        use crate::mir::graph::{MirGraph, DeoptInfo, ResumeMode};
 
         let mut graph = MirGraph::new("test".into(), 2, 2, 0);
         let bb = graph.entry_block;
@@ -274,7 +274,7 @@ mod tests {
         // v0 = ConstInt32(42)
         let v0 = graph.push_instr(bb, MirOp::ConstInt32(42), 0);
         // v1 = ConstFloat64(3.14)
-        let v1 = graph.push_instr(bb, MirOp::ConstFloat64(3.14), 1);
+        let v1 = graph.push_instr(bb, MirOp::ConstFloat64(std::f64::consts::PI), 1);
         // v2 = True
         let v2 = graph.push_instr(bb, MirOp::True, 2);
         // v3 = BoxInt32(v0)

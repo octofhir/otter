@@ -221,6 +221,7 @@ fn store_register(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_register_cached(
     graph: &mut MirGraph,
     layout: FrameLayout,
@@ -244,6 +245,7 @@ fn store_register_cached(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_instruction(
     graph: &mut MirGraph,
     function: &Function,

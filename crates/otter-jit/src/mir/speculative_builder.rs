@@ -25,10 +25,8 @@
 //! Spec: Phase 4.1 of JIT_INCREMENTAL_PLAN.md
 
 use otter_vm::feedback::{
-    ArithmeticFeedback, ComparisonFeedback, FeedbackKind, FeedbackSlotData, FeedbackSlotId,
-    FeedbackVector,
+    ArithmeticFeedback, ComparisonFeedback, FeedbackSlotData, FeedbackSlotId, FeedbackVector,
 };
-use otter_vm::module::Function;
 
 use crate::mir::graph::{DeoptInfo, MirGraph, ResumeMode, ValueId};
 use crate::mir::nodes::MirOp;
@@ -212,7 +210,7 @@ pub fn emit_speculative_i32_cmp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mir::graph::{BlockId, MirGraph};
+    use crate::mir::graph::MirGraph;
     use crate::mir::nodes::MirOp;
     use otter_vm::feedback::*;
 

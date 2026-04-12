@@ -4,6 +4,8 @@
 //! Each compilation produces a `CompiledFunction` that can be called
 //! via a function pointer.
 
+use std::ptr::NonNull;
+
 use cranelift_codegen::Context as ClifContext;
 use cranelift_codegen::ir::Function as ClifFunction;
 use cranelift_codegen::isa::OwnedTargetIsa;
@@ -11,9 +13,130 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
+use crate::arch::CodeBuffer;
 use crate::JitError;
 use crate::abi::jit_function_signature;
 use crate::context::JitContext;
+
+/// Actual code generation backend that produced a compiled function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledCodeOrigin {
+    /// The legacy Tier 1/Tier 2 Cranelift pipeline.
+    MirBaseline,
+    /// The direct template-baseline `bytecode -> asm stencil` path.
+    TemplateBaseline,
+}
+
+enum CompiledCodeOwner {
+    Cranelift { _module: Box<JITModule> },
+    Executable { _buffer: ExecutableBuffer },
+}
+
+/// Executable memory that owns a copied machine-code buffer.
+struct ExecutableBuffer {
+    base: NonNull<u8>,
+    map_len: usize,
+}
+
+impl ExecutableBuffer {
+    #[cfg(unix)]
+    fn from_code_buffer(buf: &CodeBuffer) -> Result<Self, JitError> {
+        if !buf.relocations().is_empty() {
+            return Err(JitError::Internal(
+                "template stencil relocation install is not implemented yet".to_string(),
+            ));
+        }
+        if buf.is_empty() {
+            return Err(JitError::Internal(
+                "refusing to install an empty code buffer".to_string(),
+            ));
+        }
+
+        let map_len = round_up_to_page_size(buf.len())?;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(JitError::Internal(format!(
+                "mmap executable buffer failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let base = NonNull::new(ptr.cast::<u8>()).ok_or_else(|| {
+            JitError::Internal("mmap returned a null executable buffer".to_string())
+        })?;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.bytes().as_ptr(), base.as_ptr(), buf.len());
+            flush_instruction_cache(base.as_ptr(), buf.len());
+            if libc::mprotect(base.as_ptr().cast(), map_len, libc::PROT_READ | libc::PROT_EXEC)
+                != 0
+            {
+                let err = std::io::Error::last_os_error();
+                libc::munmap(base.as_ptr().cast(), map_len);
+                return Err(JitError::Internal(format!(
+                    "mprotect executable buffer failed: {err}"
+                )));
+            }
+        }
+
+        Ok(Self { base, map_len })
+    }
+
+    #[cfg(not(unix))]
+    fn from_code_buffer(_buf: &CodeBuffer) -> Result<Self, JitError> {
+        Err(JitError::Internal(
+            "template executable install is only implemented on unix hosts".to_string(),
+        ))
+    }
+
+    fn entry(&self) -> *const u8 {
+        self.base.as_ptr().cast_const()
+    }
+}
+
+#[cfg(unix)]
+fn round_up_to_page_size(len: usize) -> Result<usize, JitError> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(JitError::Internal(
+            "failed to query host page size for executable install".to_string(),
+        ));
+    }
+    let page_size = page_size as usize;
+    len.checked_add(page_size - 1)
+        .map(|n| n / page_size * page_size)
+        .ok_or_else(|| JitError::Internal("executable buffer size overflow".to_string()))
+}
+
+#[cfg(all(unix, target_arch = "aarch64", target_vendor = "apple"))]
+unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
+    unsafe extern "C" {
+        fn sys_icache_invalidate(start: *const libc::c_void, len: libc::size_t);
+    }
+
+    unsafe { sys_icache_invalidate(ptr.cast(), len) };
+}
+
+#[cfg(all(unix, not(all(target_arch = "aarch64", target_vendor = "apple"))))]
+unsafe fn flush_instruction_cache(_ptr: *mut u8, _len: usize) {}
+
+impl Drop for ExecutableBuffer {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.base.as_ptr().cast(), self.map_len);
+        }
+    }
+}
 
 /// A compiled function ready to execute.
 pub struct CompiledFunction {
@@ -21,8 +144,10 @@ pub struct CompiledFunction {
     pub entry: *const u8,
     /// Code size in bytes.
     pub code_size: usize,
-    /// The JIT module that owns the code memory (must stay alive).
-    _module: JITModule,
+    /// Which backend produced this machine code.
+    pub origin: CompiledCodeOrigin,
+    /// The owner that keeps the machine code alive.
+    _owner: CompiledCodeOwner,
 }
 
 // SAFETY: The compiled code is immutable after finalization.
@@ -41,6 +166,25 @@ impl CompiledFunction {
             unsafe { std::mem::transmute(self.entry) };
         unsafe { func(ctx) }
     }
+}
+
+/// Install a raw code buffer as executable machine code.
+pub fn compile_code_buffer(
+    code: &CodeBuffer,
+    origin: CompiledCodeOrigin,
+) -> Result<CompiledFunction, JitError> {
+    let executable = ExecutableBuffer::from_code_buffer(code)?;
+    let entry = executable.entry();
+    let code_size = code.len();
+
+    Ok(CompiledFunction {
+        entry,
+        code_size,
+        origin,
+        _owner: CompiledCodeOwner::Executable {
+            _buffer: executable,
+        },
+    })
 }
 
 /// Create the Cranelift target ISA for the current host platform.
@@ -107,16 +251,14 @@ pub fn compile_clif_function(
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
     // Dump native code if requested.
-    if cfg.dump_asm {
-        if let Some(compiled) = ctx.compiled_code() {
-            if let Some(vcode) = compiled.vcode.as_ref() {
-                eprintln!("[JIT] === VCode (near-asm) ===");
-                eprintln!("{vcode}");
-            }
-            let code = compiled.code_buffer();
-            // Use real disassembler (iced-x86 on x86-64, hex on other arches).
-            crate::codegen::disasm::dump_disassembly(code, 0, None);
+    if cfg.dump_asm && let Some(compiled) = ctx.compiled_code() {
+        if let Some(vcode) = compiled.vcode.as_ref() {
+            eprintln!("[JIT] === VCode (near-asm) ===");
+            eprintln!("{vcode}");
         }
+        let code = compiled.code_buffer();
+        // Use real disassembler (iced-x86 on x86-64, hex on other arches).
+        crate::codegen::disasm::dump_disassembly(code, 0, None);
     }
 
     // Finalize — make the code executable.
@@ -142,6 +284,9 @@ pub fn compile_clif_function(
     Ok(CompiledFunction {
         entry: code_ptr,
         code_size,
-        _module: module,
+        origin: CompiledCodeOrigin::MirBaseline,
+        _owner: CompiledCodeOwner::Cranelift {
+            _module: Box::new(module),
+        },
     })
 }

@@ -166,9 +166,11 @@ pub fn invalidate(func_ptr: *const otter_vm::Function) {
 pub fn stats() -> CodeCacheStats {
     CACHE.with(|cache| {
         let c = cache.borrow();
-        let mut s = CodeCacheStats::default();
-        s.function_count = c.entries.len();
-        s.total_bytes = c.total_bytes;
+        let mut s = CodeCacheStats {
+            function_count: c.entries.len(),
+            total_bytes: c.total_bytes,
+            ..CodeCacheStats::default()
+        };
         for entry in c.entries.values() {
             match entry.tier {
                 Tier::Baseline => {

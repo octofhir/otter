@@ -7,7 +7,11 @@ use std::time::Instant;
 
 use otter_vm as vm;
 
-use crate::code_memory::{CompiledFunction, compile_clif_function, create_host_isa};
+use crate::baseline::{analyze_template_candidate, emit_template_stencil};
+use crate::code_memory::{
+    CompiledCodeOrigin, CompiledFunction, compile_clif_function, compile_code_buffer,
+    create_host_isa,
+};
 use crate::codegen::lower::lower_mir_to_clif;
 use crate::context::JitContext;
 use crate::mir::builder::build_mir;
@@ -27,6 +31,15 @@ pub enum JitExecResult {
     },
     /// Function not eligible or compilation failed.
     NotCompiled,
+}
+
+/// Strategy selected for Tier 1 compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier1Strategy {
+    /// The function matches the narrow `bytecode -> asm stencil` subset.
+    TemplateBaseline,
+    /// Fall back to the existing `bytecode -> MIR -> CLIF` baseline path.
+    MirBaseline,
 }
 
 // ============================================================
@@ -68,6 +81,22 @@ pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, Jit
     compile_function_profiled(function, &[])
 }
 
+/// Choose the preferred Tier 1 strategy for a function.
+///
+/// Today this is an analysis/planning decision. Even when the template baseline
+/// path is selected, executable installation still falls back to the existing
+/// MIR/CLIF backend until raw stencil installation is wired into the runtime.
+#[must_use]
+pub fn select_tier1_strategy(function: &vm::Function) -> Tier1Strategy {
+    match analyze_template_candidate(function)
+        .ok()
+        .and_then(|program| emit_template_stencil(&program).ok().map(|_| program))
+    {
+        Some(_) => Tier1Strategy::TemplateBaseline,
+        None => Tier1Strategy::MirBaseline,
+    }
+}
+
 /// Compile with persistent FeedbackVector.
 ///
 /// If feedback shows stable Int32 arithmetic, the compiler uses speculative
@@ -80,7 +109,6 @@ pub fn compile_function_with_feedback(
     function: &vm::Function,
     feedback: &vm::feedback::FeedbackVector,
 ) -> Result<CompiledFunction, JitError> {
-    use crate::mir::speculative_builder;
     use vm::feedback::{FeedbackSlotData, FeedbackSlotId};
 
     // Determine compilation tier based on feedback quality.
@@ -169,13 +197,70 @@ pub fn compile_function_profiled(
 ) -> Result<CompiledFunction, JitError> {
     let cfg = crate::config::jit_config();
     let start = Instant::now();
+    let tier1_strategy = select_tier1_strategy(function);
+    let function_name = function.name().unwrap_or("<anonymous>");
 
     if cfg.dump_bytecode {
-        eprintln!("[JIT] === Bytecode for {:?} ({} instructions) ===",
-                  function.name(), function.bytecode().len());
+        eprintln!(
+            "[JIT] === Bytecode for {:?} ({} instructions, tier1={:?}) ===",
+            function.name(),
+            function.bytecode().len(),
+            tier1_strategy,
+        );
         for (pc, instr) in function.bytecode().instructions().iter().enumerate() {
             eprintln!("  {:04}: {:?} a={} b={} c={}",
                       pc, instr.opcode(), instr.a(), instr.b(), instr.c());
+        }
+    }
+
+    if cfg.dump_asm
+        && tier1_strategy == Tier1Strategy::TemplateBaseline
+        && let Ok(program) = analyze_template_candidate(function)
+        && let Ok(stencil) = emit_template_stencil(&program)
+    {
+        eprintln!(
+            "[JIT] === Template Baseline Stencil for {:?} ({} bytes) ===",
+            function.name(),
+            stencil.len(),
+        );
+        crate::codegen::disasm::dump_disassembly(
+            stencil.bytes(),
+            0,
+            Some("template-baseline-stencil"),
+        );
+    }
+
+    if tier1_strategy == Tier1Strategy::TemplateBaseline
+        && let Ok(program) = analyze_template_candidate(function)
+        && let Ok(stencil) = emit_template_stencil(&program)
+    {
+        match compile_code_buffer(&stencil, CompiledCodeOrigin::TemplateBaseline) {
+            Ok(compiled) => {
+                let duration_ns = start.elapsed().as_nanos() as u64;
+                telemetry::record_compile_time(true, duration_ns);
+                telemetry::record_function_compiled(
+                    function_name,
+                    1,
+                    duration_ns,
+                    compiled.code_size,
+                );
+                if cfg.dump_bytecode {
+                    eprintln!(
+                        "[JIT] tier1 backend for {:?}: {:?}",
+                        function.name(),
+                        compiled.origin,
+                    );
+                }
+                return Ok(compiled);
+            }
+            Err(err) => {
+                if cfg.dump_bytecode {
+                    eprintln!(
+                        "[JIT] template baseline install failed for {:?}: {err}; falling back to MIR baseline",
+                        function.name(),
+                    );
+                }
+            }
         }
     }
 
@@ -216,11 +301,18 @@ pub fn compile_function_profiled(
     let duration_ns = start.elapsed().as_nanos() as u64;
     telemetry::record_compile_time(true, duration_ns);
     telemetry::record_function_compiled(
-        function.name().unwrap_or("<anonymous>"),
+        function_name,
         1, // tier 1
         duration_ns,
         compiled.code_size,
     );
+    if cfg.dump_bytecode {
+        eprintln!(
+            "[JIT] tier1 backend for {:?}: {:?}",
+            function.name(),
+            compiled.origin,
+        );
+    }
     Ok(compiled)
 }
 

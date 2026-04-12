@@ -4,7 +4,7 @@
 //! JIT-with-fallback, verify both produce the same result.
 
 use otter_jit::deopt::execute_module_entry_with_runtime;
-use otter_jit::pipeline::{JitExecResult, execute_function};
+use otter_jit::pipeline::execute_function;
 use otter_vm::interpreter::Interpreter;
 use otter_vm::source::compile_script;
 use otter_vm::{RegisterValue, RuntimeState};

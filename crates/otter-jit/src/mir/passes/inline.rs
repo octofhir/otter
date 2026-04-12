@@ -16,7 +16,7 @@
 //!
 //! Spec: Phase 4.5 of JIT_INCREMENTAL_PLAN.md
 
-use otter_vm::feedback::{CallFeedback, FeedbackSlotData, FeedbackSlotId, FeedbackVector};
+use otter_vm::feedback::{CallFeedback, FeedbackSlotId, FeedbackVector};
 
 /// Maximum bytecode size of a function that can be inlined.
 pub const MAX_INLINE_BYTECODE_SIZE: usize = 50;

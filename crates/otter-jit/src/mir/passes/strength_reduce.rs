@@ -157,7 +157,7 @@ mod tests {
         let mut graph = MirGraph::new("test".into(), 0, 2, 0);
         let bb = graph.entry_block;
 
-        let x = graph.push_instr(bb, MirOp::ConstFloat64(3.14), 0);
+        let x = graph.push_instr(bb, MirOp::ConstFloat64(std::f64::consts::PI), 0);
         let zero = graph.push_instr(bb, MirOp::ConstFloat64(0.0), 1);
         let r = graph.push_instr(bb, MirOp::AddF64 { lhs: x, rhs: zero }, 2);
         graph.push_instr(bb, MirOp::Return(r), 3);

@@ -297,10 +297,10 @@ where
 /// Find the shape_field index from a preceding GuardShape for the given obj register.
 fn find_preceding_shape_field(ops: &[CacheIROp], obj: &u8) -> Option<u8> {
     for op in ops {
-        if let CacheIROp::GuardShape { obj: o, shape_field } = op {
-            if o == obj {
-                return Some(*shape_field);
-            }
+        if let CacheIROp::GuardShape { obj: o, shape_field } = op
+            && o == obj
+        {
+            return Some(*shape_field);
         }
     }
     None

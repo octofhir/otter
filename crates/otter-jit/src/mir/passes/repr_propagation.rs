@@ -195,7 +195,7 @@ mod tests {
         let bb = graph.entry_block;
 
         let v_i32 = graph.push_instr(bb, MirOp::ConstInt32(42), 0);
-        let v_f64 = graph.push_instr(bb, MirOp::ConstFloat64(3.14), 1);
+        let v_f64 = graph.push_instr(bb, MirOp::ConstFloat64(std::f64::consts::PI), 1);
         let v_true = graph.push_instr(bb, MirOp::True, 2);
         graph.push_instr(bb, MirOp::Return(v_i32), 3);
 

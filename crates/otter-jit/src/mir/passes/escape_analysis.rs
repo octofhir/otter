@@ -129,13 +129,12 @@ fn check_uses(
                 mark_escape(infos, *val, EscapeReason::StoredToHeap);
             }
             // Track field stores on the allocation itself.
-            if let MirOp::SetPropShaped { offset, .. } = op {
-                if allocs.contains(obj) {
-                    if let Some(info) = infos.get_mut(obj) {
-                        info.fields.insert(*offset, *val);
-                        info.uses.push(*val);
-                    }
-                }
+            if let MirOp::SetPropShaped { offset, .. } = op
+                && allocs.contains(obj)
+                && let Some(info) = infos.get_mut(obj)
+            {
+                info.fields.insert(*offset, *val);
+                info.uses.push(*val);
             }
         }
 

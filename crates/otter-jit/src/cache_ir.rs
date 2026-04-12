@@ -287,7 +287,7 @@ impl ICSite {
     /// Attach a new stub to this IC site.
     pub fn attach_stub(&mut self, stub: CacheIRSequence) {
         match self.state {
-            ICSiteState::Megamorphic => return, // Terminal state.
+            ICSiteState::Megamorphic => (), // Terminal state.
             ICSiteState::Uninitialized => {
                 self.stubs.push(stub);
                 self.state = ICSiteState::Monomorphic;

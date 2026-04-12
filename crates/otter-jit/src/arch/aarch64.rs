@@ -16,10 +16,21 @@
 
 use super::CodeBuffer;
 
+/// Condition code for `B.cond`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Cond {
+    Eq = 0x0,
+    Ne = 0x1,
+    Ge = 0xA,
+    Lt = 0xB,
+    Gt = 0xC,
+    Le = 0xD,
+}
+
 /// AArch64 general-purpose registers (64-bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum Reg {
     X0 = 0, X1 = 1, X2 = 2, X3 = 3,
     X4 = 4, X5 = 5, X6 = 6, X7 = 7,
@@ -47,6 +58,12 @@ pub struct Assembler<'a> {
 impl<'a> Assembler<'a> {
     pub fn new(buf: &'a mut CodeBuffer) -> Self {
         Self { buf }
+    }
+
+    /// Current byte position in the underlying code buffer.
+    #[must_use]
+    pub fn position(&self) -> u32 {
+        self.buf.position()
     }
 
     /// Emit a 32-bit instruction (little-endian).
@@ -117,6 +134,52 @@ impl<'a> Assembler<'a> {
         self.emit_insn(insn);
     }
 
+    /// `add xd, xn, xm`
+    pub fn add_rrr(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        let insn = 0x8B000000
+            | (rhs.encoding() << 16)
+            | (lhs.encoding() << 5)
+            | dst.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `sub xd, xn, xm`
+    pub fn sub_rrr(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        let insn = 0xCB000000
+            | (rhs.encoding() << 16)
+            | (lhs.encoding() << 5)
+            | dst.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `mul xd, xn, xm` via `MADD xd, xn, xm, xzr`
+    pub fn mul_rrr(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        let insn = 0x9B000000
+            | (rhs.encoding() << 16)
+            | (Reg::Xzr.encoding() << 10)
+            | (lhs.encoding() << 5)
+            | dst.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `ldr xt, [xn, #imm]` for 64-bit loads using the unsigned immediate form.
+    /// Offset must be non-negative, 8-byte aligned, and fit in 12 bits.
+    pub fn ldr_u64_imm(&mut self, dst: Reg, base: Reg, byte_offset: u32) {
+        debug_assert_eq!(byte_offset % 8, 0);
+        let imm12 = byte_offset / 8;
+        let insn = 0xF9400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `str xt, [xn, #imm]` for 64-bit stores using the unsigned immediate form.
+    /// Offset must be non-negative, 8-byte aligned, and fit in 12 bits.
+    pub fn str_u64_imm(&mut self, src: Reg, base: Reg, byte_offset: u32) {
+        debug_assert_eq!(byte_offset % 8, 0);
+        let imm12 = byte_offset / 8;
+        let insn = 0xF9000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
+        self.emit_insn(insn);
+    }
+
     /// `and dst, src, imm` — NOT a simple encoding on AArch64 (bitmask immediate).
     /// For IC stubs, we load the mask into a scratch register and use `and dst, src, scratch`.
     pub fn and_rr(&mut self, dst: Reg, src: Reg, mask_reg: Reg) {
@@ -141,6 +204,20 @@ impl<'a> Assembler<'a> {
         let imm19 = ((byte_offset >> 2) as u32) & 0x7FFFF;
         let insn = 0xB5000000 | (imm19 << 5) | reg.encoding();
         self.emit_insn(insn);
+    }
+
+    /// Emit an unconditional branch placeholder (`b`) and return its offset.
+    pub fn b_placeholder(&mut self) -> u32 {
+        let pos = self.buf.position();
+        self.emit_insn(0x14000000);
+        pos
+    }
+
+    /// Emit a conditional branch placeholder (`b.cond`) and return its offset.
+    pub fn b_cond_placeholder(&mut self, cond: Cond) -> u32 {
+        let pos = self.buf.position();
+        self.emit_insn(0x54000000 | (cond as u32));
+        pos
     }
 
     // ---- NaN-boxing helpers ----
@@ -179,15 +256,16 @@ impl<'a> Assembler<'a> {
     /// Box an i32 into NaN-boxed format.
     /// `src` has i32 in lower 32 bits. Result in `dst`.
     pub fn box_int32(&mut self, dst: Reg, src: Reg) {
+        // Keep the extracted payload in a scratch register so callers can keep
+        // long-lived pointers (for example registers_base in x9) alive.
+        self.extract_int32(Reg::X12, src);
         // dst = TAG_INT32
         self.mov_imm64(dst, 0x7FF8_0001_0000_0000);
-        // x9 = zero-extend src to 64-bit
-        self.extract_int32(Reg::X9, src);
-        // dst = dst | x9
+        // dst = dst | x12
         let insn = 0xAA000000
-            | (Reg::X9.encoding() << 16)
+            | (Reg::X12.encoding() << 16)
             | (dst.encoding() << 5)
-            | dst.encoding(); // ORR dst, dst, x9
+            | dst.encoding(); // ORR dst, dst, x12
         self.emit_insn(insn);
     }
 }
@@ -251,5 +329,19 @@ mod tests {
         asm.check_int32_tag(Reg::X1);
         // Should emit movimm64 + and + movimm64 + cmp = multiple instructions.
         assert!(buf.len() >= 20, "tag check should emit substantial code, got {} bytes", buf.len());
+    }
+
+    #[test]
+    fn test_emit_load_store_and_branch_placeholders() {
+        let mut buf = CodeBuffer::new();
+        let mut asm = Assembler::new(&mut buf);
+        asm.ldr_u64_imm(Reg::X9, Reg::X0, 0);
+        asm.str_u64_imm(Reg::X10, Reg::X9, 16);
+        let branch = asm.b_placeholder();
+        let cond = asm.b_cond_placeholder(Cond::Ge);
+
+        assert_eq!(branch, 8);
+        assert_eq!(cond, 12);
+        assert_eq!(buf.len(), 16);
     }
 }

@@ -34,6 +34,9 @@ pub mod type_analysis;
 
 use super::graph::MirGraph;
 
+type PassFn = fn(&mut MirGraph);
+type PassPipeline<'a> = &'a [(&'a str, PassFn)];
+
 /// Which tier's pass pipeline to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassTier {
@@ -47,7 +50,7 @@ pub enum PassTier {
 ///
 /// If `dump_passes` is true, prints the MIR after each pass to stderr.
 pub fn run_passes(graph: &mut MirGraph, tier: PassTier, dump_passes: bool) {
-    let passes: &[(&str, fn(&mut MirGraph))] = match tier {
+    let passes: PassPipeline<'_> = match tier {
         PassTier::Baseline => &[
             ("const_fold", const_fold::run),
             ("guard_elim", guard_elim::run),

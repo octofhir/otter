@@ -165,7 +165,6 @@ impl<'a> OpLowerer<'a> {
         bytecode_pc: u32,
     ) -> Result<Option<Value>, JitError> {
         let ctx_ptr = self.ctx_ptr;
-        let pointer_type = self.pointer_type;
 
         match op {
             // ---- Constants ----

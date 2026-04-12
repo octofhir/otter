@@ -1,18 +1,20 @@
-//! Otter JIT — Cranelift-based compilation pipeline for OtterJS.
+//! Otter JIT for OtterJS.
 //!
 //! # Architecture
 //!
 //! ```text
-//! bytecode -> MIR -> [optimize] -> CLIF -> machine code
+//! Tier 1 candidate: bytecode -> template baseline -> asm
+//! Tier 2 today:     bytecode -> MIR -> [optimize] -> CLIF -> machine code
 //! ```
 //!
-//! - **Tier 1**: Bytecode -> MIR -> CLIF (OptLevel::None) for fast compile
-//! - **Tier 2**: Bytecode -> MIR -> [passes] -> CLIF (OptLevel::Speed) for peak perf
+//! The refactor keeps the existing MIR/CLIF pipeline alive while a new
+//! template-baseline Tier 1 path is introduced incrementally.
 //!
 //! Both tiers share one ABI, one JitContext, one deopt model.
 
 pub mod abi;
 pub mod arch;
+pub mod baseline;
 pub mod cache_ir;
 pub mod code_cache;
 pub mod compile_queue;

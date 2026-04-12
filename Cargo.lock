@@ -2259,6 +2259,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "iced-x86",
+ "libc",
  "otter-vm",
  "smallvec",
  "thiserror 2.0.17",

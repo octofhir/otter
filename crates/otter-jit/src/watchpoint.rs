@@ -180,14 +180,14 @@ impl WatchpointRegistry {
 
     /// Get or create a watchpoint set for a given kind.
     pub fn get_or_create(&mut self, kind: WatchpointKind) -> &WatchpointSet {
-        self.sets.entry(kind).or_insert_with(WatchpointSet::new)
+        self.sets.entry(kind).or_default()
     }
 
     /// Watch an invariant and register a dependent compiled function.
     ///
     /// Returns false if the invariant is already invalidated.
     pub fn watch(&mut self, kind: WatchpointKind, dependent: DependentCode) -> bool {
-        let set = self.sets.entry(kind).or_insert_with(WatchpointSet::new);
+        let set = self.sets.entry(kind).or_default();
         if !set.watch() {
             return false; // Already invalidated.
         }
@@ -204,7 +204,7 @@ impl WatchpointRegistry {
     /// Creates the set in Invalidated state if it doesn't exist yet,
     /// preventing future watchers from depending on a broken invariant.
     pub fn fire(&mut self, kind: WatchpointKind) -> Vec<DependentCode> {
-        let set = self.sets.entry(kind).or_insert_with(WatchpointSet::new);
+        let set = self.sets.entry(kind).or_default();
         let was_watched = set.fire();
 
         if was_watched {

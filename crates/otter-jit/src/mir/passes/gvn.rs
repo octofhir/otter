@@ -41,9 +41,6 @@ enum GvnKey {
 }
 
 /// Opcode tags for GVN hashing (distinct u8 per operation).
-const TAG_ADD_I32: u8 = 1;
-const TAG_SUB_I32: u8 = 2;
-const TAG_MUL_I32: u8 = 3;
 const TAG_ADD_F64: u8 = 4;
 const TAG_SUB_F64: u8 = 5;
 const TAG_MUL_F64: u8 = 6;
@@ -267,7 +264,7 @@ mod tests {
         let bb = graph.entry_block;
 
         // LoadLocal is not pure → should NOT be GVN'd.
-        let v0 = graph.push_instr(bb, MirOp::LoadLocal(0), 0);
+        graph.push_instr(bb, MirOp::LoadLocal(0), 0);
         let v1 = graph.push_instr(bb, MirOp::LoadLocal(0), 1);
         graph.push_instr(bb, MirOp::Return(v1), 2);
 

@@ -133,6 +133,30 @@ impl CodeBuffer {
         self.bytes.extend_from_slice(&val.to_le_bytes());
     }
 
+    /// Read a little-endian u32 from an existing offset.
+    #[must_use]
+    pub fn read_u32_le(&self, offset: u32) -> Option<u32> {
+        let start = offset as usize;
+        let end = start.checked_add(4)?;
+        let slice = self.bytes.get(start..end)?;
+        let bytes: [u8; 4] = slice.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    /// Patch a little-endian u32 at an existing offset.
+    pub fn patch_u32_le(&mut self, offset: u32, val: u32) -> bool {
+        let start = offset as usize;
+        let end = match start.checked_add(4) {
+            Some(end) => end,
+            None => return false,
+        };
+        let Some(slice) = self.bytes.get_mut(start..end) else {
+            return false;
+        };
+        slice.copy_from_slice(&val.to_le_bytes());
+        true
+    }
+
     /// Current position (next byte offset).
     #[must_use]
     pub fn position(&self) -> u32 {

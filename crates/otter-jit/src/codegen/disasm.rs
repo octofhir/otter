@@ -86,7 +86,7 @@ fn disassemble_impl(code: &[u8], base_address: u64, output: &mut String) {
 #[cfg(target_arch = "aarch64")]
 fn disassemble_impl(code: &[u8], base_address: u64, output: &mut String) {
     // AArch64 instructions are always 4 bytes, little-endian.
-    if code.len() % 4 != 0 {
+    if !code.len().is_multiple_of(4) {
         let _ = writeln!(
             output,
             "  (warning: code size {} is not a multiple of 4)",

@@ -33,8 +33,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use otter_vm::feedback::{
-    ArithmeticFeedback, ComparisonFeedback, FeedbackKind, FeedbackSlotId, FeedbackSlotLayout,
-    FeedbackTableLayout, FeedbackVector,
+    ArithmeticFeedback, ComparisonFeedback, FeedbackKind, FeedbackTableLayout, FeedbackVector,
 };
 
 const PROFILE_MAGIC: &[u8; 8] = b"OTTRPROF";
@@ -295,6 +294,7 @@ fn read_str(r: &mut impl Read) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_vm::feedback::{FeedbackSlotId, FeedbackSlotLayout};
 
     #[test]
     fn test_profile_cache_roundtrip() {

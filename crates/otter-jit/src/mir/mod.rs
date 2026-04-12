@@ -10,5 +10,6 @@ pub mod display;
 pub mod graph;
 pub mod nodes;
 pub mod passes;
+pub mod speculative_builder;
 pub mod types;
 pub mod verify;

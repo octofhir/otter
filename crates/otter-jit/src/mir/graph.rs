@@ -162,6 +162,9 @@ pub struct MirGraph {
     pub param_count: u16,
     /// O(1) value → type cache, built lazily.
     type_cache: HashMap<ValueId, MirType>,
+    /// Recommended block emission order (set by block_layout pass).
+    /// If empty, emit blocks in index order.
+    block_order: Vec<BlockId>,
 }
 
 impl MirGraph {
@@ -183,7 +186,20 @@ impl MirGraph {
             register_count,
             param_count,
             type_cache: HashMap::new(),
+            block_order: Vec::new(),
         }
+    }
+
+    /// Set the recommended block emission order (from block_layout pass).
+    pub fn set_block_order(&mut self, order: Vec<BlockId>) {
+        self.block_order = order;
+    }
+
+    /// Get the recommended block emission order.
+    /// If empty, blocks should be emitted in index order.
+    #[must_use]
+    pub fn block_order(&self) -> &[BlockId] {
+        &self.block_order
     }
 
     /// Allocate a fresh ValueId.

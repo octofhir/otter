@@ -1,6 +1,7 @@
 //! Deoptimization metadata and bailout contracts.
 
 pub mod bailout;
+pub mod materialize;
 pub mod resume;
 
 pub use bailout::{BAILOUT_SENTINEL, BailoutReason};

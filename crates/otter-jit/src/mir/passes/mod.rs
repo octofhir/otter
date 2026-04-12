@@ -17,14 +17,19 @@
 //! - `dce`: operand tracking incomplete for some MIR ops
 //! - `block_layout`: needs BlockId→index remapping in lowering
 
+pub mod alias;
 pub mod block_layout;
 pub mod const_fold;
 pub mod dce;
 pub mod dominators;
+pub mod escape_analysis;
 pub mod guard_elim;
+pub mod gvn;
+pub mod inline;
 pub mod licm;
 pub mod repr_elim;
 pub mod repr_propagation;
+pub mod strength_reduce;
 pub mod type_analysis;
 
 use super::graph::MirGraph;
@@ -47,17 +52,26 @@ pub fn run_passes(graph: &mut MirGraph, tier: PassTier, dump_passes: bool) {
             ("const_fold", const_fold::run),
             ("guard_elim", guard_elim::run),
             ("repr_elim", repr_elim::run),
+            ("dce", dce::run),
+            ("block_layout", block_layout::run),
         ],
         PassTier::Optimized => &[
             // Phase 1: constant folding (cheap, reduces graph size).
             ("const_fold", const_fold::run),
-            // Phase 2: guard elimination with dominator tree + type proofs.
-            // guard_elim internally runs type_analysis + dominators.
+            // Phase 2: strength reduction (algebraic simplification).
+            ("strength_reduce", strength_reduce::run),
+            // Phase 3: guard elimination with dominator tree + type proofs.
             ("guard_elim", guard_elim::run),
-            // Phase 3: box/unbox chain elimination.
+            // Phase 4: box/unbox chain elimination.
             ("repr_elim", repr_elim::run),
-            // Phase 4: loop-invariant code motion (identify invariant ops).
+            // Phase 5: global value numbering (cross-block CSE).
+            ("gvn", gvn::run),
+            // Phase 6: loop-invariant code motion.
             ("licm", licm::run),
+            // Phase 7: dead code elimination (cleanup after all other passes).
+            ("dce", dce::run),
+            // Phase 8: block layout (deopt blocks to end, fallthrough ordering).
+            ("block_layout", block_layout::run),
         ],
     };
 

@@ -1,10 +1,12 @@
-//! Block layout pass (branch shaping).
+//! Block layout pass — compute optimal block ordering without reordering.
 //!
-//! Reorders blocks so that:
-//! 1. Entry block stays first.
-//! 2. Fallthrough targets are placed immediately after their predecessor
-//!    (reducing taken branches on the hot path).
-//! 3. Deopt/bailout blocks are placed at the end (cold code).
+//! Computes a recommended block emission order so that:
+//! 1. Entry block is first.
+//! 2. Fallthrough targets follow their predecessor (fewer branches).
+//! 3. Deopt/bailout blocks are last (cold code).
+//!
+//! Instead of physically reordering `graph.blocks` (which breaks BlockId indexing),
+//! this pass stores the layout order as metadata that the codegen can use.
 //!
 //! Spec: Phase 1.5 of JIT_INCREMENTAL_PLAN.md
 
@@ -13,13 +15,16 @@ use std::collections::HashSet;
 use crate::mir::graph::{BlockId, MirGraph};
 use crate::mir::nodes::MirOp;
 
-/// Run block layout optimization on the MIR graph.
-pub fn run(graph: &mut MirGraph) {
-    if graph.blocks.len() <= 2 {
-        return; // Nothing to reorder.
+/// Compute the optimal block emission order.
+///
+/// Returns a vector of BlockIds in the recommended emission order.
+/// The graph itself is NOT modified — blocks stay at their original indices.
+#[must_use]
+pub fn compute_layout(graph: &MirGraph) -> Vec<BlockId> {
+    if graph.blocks.len() <= 1 {
+        return graph.blocks.iter().map(|b| b.id).collect();
     }
 
-    // Classify blocks: deopt blocks contain only a Deopt terminator.
     let deopt_blocks: HashSet<BlockId> = graph
         .blocks
         .iter()
@@ -27,77 +32,109 @@ pub fn run(graph: &mut MirGraph) {
         .map(|b| b.id)
         .collect();
 
-    // Build a greedy layout: DFS from entry, preferring fallthrough.
     let mut ordered: Vec<BlockId> = Vec::with_capacity(graph.blocks.len());
     let mut visited: HashSet<BlockId> = HashSet::new();
-    let mut deferred_deopt: Vec<BlockId> = Vec::new();
+    let mut cold: Vec<BlockId> = Vec::new();
 
-    // Start with entry block.
+    // DFS from entry, preferring fallthrough (first successor).
     let mut worklist = vec![graph.entry_block];
-
     while let Some(block_id) = worklist.pop() {
         if !visited.insert(block_id) {
             continue;
         }
-
         if deopt_blocks.contains(&block_id) {
-            deferred_deopt.push(block_id);
+            cold.push(block_id);
             continue;
         }
-
         ordered.push(block_id);
 
-        // Get successors, prefer fallthrough (first successor = likely path).
         let block = &graph.blocks[block_id.0 as usize];
-        let succs: Vec<BlockId> = block.successors.clone();
-
-        // Push in reverse so the first successor is processed first (DFS preorder).
-        for &succ in succs.iter().rev() {
+        // Push successors in reverse so first successor is processed next (DFS).
+        for &succ in block.successors.iter().rev() {
             if !visited.contains(&succ) {
                 worklist.push(succ);
             }
         }
     }
 
-    // Append deopt blocks at the end (cold code).
-    ordered.extend(deferred_deopt);
+    // Cold blocks at end.
+    ordered.extend(cold);
 
-    // Add any unreachable blocks we missed (shouldn't happen, but be safe).
+    // Any unreachable blocks (shouldn't happen, safety net).
     for block in &graph.blocks {
         if !visited.contains(&block.id) {
             ordered.push(block.id);
         }
     }
 
-    // Reorder blocks in-place.
-    if ordered.len() != graph.blocks.len() {
-        return; // Safety: don't reorder if counts don't match.
-    }
-
-    // Build index map: new_position -> old_block_id.
-    let mut new_blocks = Vec::with_capacity(graph.blocks.len());
-    for &block_id in &ordered {
-        // Clone the block from its current position.
-        let block = graph.blocks[block_id.0 as usize].clone();
-        new_blocks.push(block);
-    }
-    graph.blocks = new_blocks;
-
-    // Update entry_block (always first after layout).
-    // The entry block should already be first, but verify.
-    if graph.blocks[0].id != graph.entry_block {
-        // Find entry and swap to front.
-        if let Some(pos) = graph.blocks.iter().position(|b| b.id == graph.entry_block) {
-            graph.blocks.swap(0, pos);
-        }
-    }
+    ordered
 }
 
-/// A block is a "deopt block" if it contains only a Deopt terminator
-/// (or possibly a few setup instructions + Deopt).
+/// Run the block layout pass.
+///
+/// Stores the computed layout as the `block_order` field on the graph.
+/// Does NOT reorder `graph.blocks` — the layout is advisory for codegen.
+pub fn run(graph: &mut MirGraph) {
+    graph.recompute_edges();
+    let layout = compute_layout(graph);
+    graph.set_block_order(layout);
+}
+
 fn is_deopt_block(block: &crate::mir::graph::BasicBlock) -> bool {
     block
         .instrs
         .last()
         .is_some_and(|i| matches!(i.op, MirOp::Deopt(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mir::graph::MirGraph;
+    use crate::mir::nodes::MirOp;
+
+    #[test]
+    fn test_layout_entry_first() {
+        let mut graph = MirGraph::new("test".into(), 0, 1, 0);
+        let bb0 = graph.entry_block;
+        let bb1 = graph.create_block();
+
+        graph.push_instr(bb0, MirOp::Jump(bb1, vec![]), 0);
+        let v = graph.push_instr(bb1, MirOp::Undefined, 1);
+        graph.push_instr(bb1, MirOp::Return(v), 2);
+        graph.recompute_edges();
+
+        let layout = compute_layout(&graph);
+        assert_eq!(layout[0], bb0);
+        assert_eq!(layout[1], bb1);
+    }
+
+    #[test]
+    fn test_layout_deopt_last() {
+        use crate::mir::graph::DeoptId;
+
+        let mut graph = MirGraph::new("test".into(), 0, 2, 0);
+        let bb0 = graph.entry_block;
+        let bb_deopt = graph.create_block();
+        let bb_normal = graph.create_block();
+
+        let cond = graph.push_instr(bb0, MirOp::True, 0);
+        graph.push_instr(bb0, MirOp::Branch {
+            cond,
+            true_block: bb_normal,
+            true_args: vec![],
+            false_block: bb_deopt,
+            false_args: vec![],
+        }, 1);
+
+        let v = graph.push_instr(bb_normal, MirOp::ConstInt32(42), 2);
+        graph.push_instr(bb_normal, MirOp::Return(v), 3);
+
+        graph.push_instr(bb_deopt, MirOp::Deopt(DeoptId(0)), 4);
+        graph.recompute_edges();
+
+        let layout = compute_layout(&graph);
+        // Deopt block should be last.
+        assert_eq!(*layout.last().unwrap(), bb_deopt);
+    }
 }

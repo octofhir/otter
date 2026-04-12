@@ -131,8 +131,57 @@ fn collect_operands(op: &MirOp, out: &mut impl Extend<ValueId>) {
         MirOp::Move(v) => { vals.push(*v); }
         MirOp::Phi(vs) => { vals.extend(vs.iter().map(|(_, v)| *v)); }
 
-        // Catch-all: conservatively keep alive (has_side_effects handles liveness).
-        _ => {}
+        // ---- Property access ----
+        MirOp::GetPropShaped { obj, .. } => { vals.push(*obj); }
+        MirOp::SetPropShaped { obj, val, .. } => { vals.push(*obj); vals.push(*val); }
+        MirOp::GetPropGeneric { obj, key, .. } => { vals.push(*obj); vals.push(*key); }
+        MirOp::SetPropGeneric { obj, key, val, .. } => { vals.push(*obj); vals.push(*key); vals.push(*val); }
+        MirOp::GetPropConstGeneric { obj, .. } => { vals.push(*obj); }
+        MirOp::SetPropConstGeneric { obj, val, .. } => { vals.push(*obj); vals.push(*val); }
+        MirOp::DeleteProp { obj, key } => { vals.push(*obj); vals.push(*key); }
+
+        // ---- Array access ----
+        MirOp::GetElemDense { arr, idx, .. } => { vals.push(*arr); vals.push(*idx); }
+        MirOp::SetElemDense { arr, idx, val, .. } => { vals.push(*arr); vals.push(*idx); vals.push(*val); }
+        MirOp::ArrayLength(v) | MirOp::ArrayPush { arr: v, .. } => { vals.push(*v); }
+        MirOp::GetElemGeneric { obj, key, .. } => { vals.push(*obj); vals.push(*key); }
+        MirOp::SetElemGeneric { obj, key, val, .. } => { vals.push(*obj); vals.push(*key); vals.push(*val); }
+
+        // ---- Calls ----
+        MirOp::CallDirect { args, .. } => { vals.extend_from_slice(args); }
+        MirOp::CallMonomorphic { callee, args, .. } => { vals.push(*callee); vals.extend_from_slice(args); }
+        MirOp::CallGeneric { callee, args, .. } => { vals.push(*callee); vals.extend_from_slice(args); }
+        MirOp::CallMethodGeneric { obj, args, .. } => { vals.push(*obj); vals.extend_from_slice(args); }
+        MirOp::ConstructGeneric { callee, args, .. } => { vals.push(*callee); vals.extend_from_slice(args); }
+
+        // ---- Object/Array creation ----
+        MirOp::NewObject | MirOp::NewArray { .. } | MirOp::LoadConstPool(_) | MirOp::Catch => {}
+        MirOp::CreateClosure { .. } | MirOp::CreateArguments => {}
+        MirOp::DefineProperty { obj, key, val, .. } => { vals.push(*obj); vals.push(*key); vals.push(*val); }
+        MirOp::SetPrototype { obj, proto } => { vals.push(*obj); vals.push(*proto); }
+
+        // ---- Type operations ----
+        MirOp::TypeOf(v) | MirOp::ToNumber(v) | MirOp::ToStringOp(v)
+        | MirOp::RequireCoercible(v) | MirOp::IsTruthy(v) => { vals.push(*v); }
+        MirOp::InstanceOf { lhs, rhs, .. } | MirOp::In { key: lhs, obj: rhs, .. } => {
+            vals.push(*lhs); vals.push(*rhs);
+        }
+
+        // ---- Exception/Iteration ----
+        MirOp::Throw(v) | MirOp::GetIterator(v) | MirOp::IteratorNext(v)
+        | MirOp::IteratorClose(v) => { vals.push(*v); }
+        MirOp::TryStart { .. } | MirOp::TryEnd => {}
+
+        // ---- GC ----
+        MirOp::Safepoint { live } => { vals.extend_from_slice(live); }
+        MirOp::WriteBarrier(v) | MirOp::Spread(v) => { vals.push(*v); }
+
+        // ---- Globals ----
+        MirOp::GetGlobal { .. } => {}
+        MirOp::SetGlobal { val, .. } => { vals.push(*val); }
+
+        // ---- Helper calls ----
+        MirOp::HelperCall { args, .. } => { vals.extend_from_slice(args); }
     }
 
     out.extend(vals);

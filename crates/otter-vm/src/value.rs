@@ -25,23 +25,24 @@ impl fmt::Display for ValueError {
 
 impl std::error::Error for ValueError {}
 
-const QUIET_NAN: u64 = 0x7FF8_0000_0000_0000;
-const OBJECT_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
-const OBJECT_PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
-const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
-const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
-const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
-const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004;
-const TAG_NAN: u64 = 0x7FFA_0000_0000_0000;
-const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
-const TAG_SYMBOL: u64 = 0x7FF8_0002_0000_0000;
-const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-const SYMBOL_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
+pub const QUIET_NAN: u64 = 0x7FF8_0000_0000_0000;
+pub const OBJECT_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+pub const OBJECT_PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+pub const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
+pub const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
+pub const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
+pub const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
+pub const TAG_HOLE: u64 = 0x7FF8_0000_0000_0004;
+pub const TAG_NAN: u64 = 0x7FFA_0000_0000_0000;
+pub const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
+pub const TAG_SYMBOL: u64 = 0x7FF8_0002_0000_0000;
+pub const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+pub const SYMBOL_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+pub const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
 /// NaN-box pointer tag for heap-allocated BigInt values (§21.2).
 /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-const TAG_PTR_BIGINT: u64 = 0x7FFD_0000_0000_0000;
+pub const TAG_PTR_BIGINT: u64 = 0x7FFD_0000_0000_0000;
+
 
 /// Shared register value cell for the new VM.
 ///

@@ -8,18 +8,12 @@ use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
-// NaN-boxing constants (must match otter-vm-bytecode/src/value_tags.rs)
-pub const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
-pub const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
-pub const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
-pub const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
-pub const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
-pub const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-pub const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
-pub const TAG_PTR_STRING: u64 = 0x7FFD_0000_0000_0000;
-pub const TAG_PTR_FUNCTION: u64 = 0x7FFE_0000_0000_0000;
-pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
-pub const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+pub use otter_vm::value::{
+    INT32_TAG_MASK, OBJECT_PAYLOAD_MASK as PAYLOAD_MASK, OBJECT_TAG_MASK as TAG_MASK, TAG_FALSE,
+    TAG_INT32, TAG_NULL, TAG_PTR_OBJECT, TAG_TRUE, TAG_UNDEFINED,
+};
+
+
 
 /// Box an i32 value into NaN-boxed u64.
 /// Result = TAG_INT32 | (val as u32)

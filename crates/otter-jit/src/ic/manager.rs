@@ -44,16 +44,13 @@ impl ICManager {
     ///
     /// Called from the slow path after a successful property lookup when we
     /// know the shape and slot offset.
-    pub fn record_prop_load(
-        &mut self,
-        bytecode_pc: u32,
-        shape_id: u64,
-        slot_offset: u32,
-    ) {
+    pub fn record_prop_load(&mut self, bytecode_pc: u32, shape_id: u64, slot_offset: u32) {
         let site = self.site_for_pc(bytecode_pc);
         // Don't attach duplicate stubs for the same shape.
         if site.stubs.iter().any(|s| {
-            s.fields.iter().any(|f| matches!(f, StubField::Shape(id) if *id == shape_id))
+            s.fields
+                .iter()
+                .any(|f| matches!(f, StubField::Shape(id) if *id == shape_id))
         }) {
             return;
         }
@@ -62,15 +59,12 @@ impl ICManager {
     }
 
     /// Record a monomorphic property store hit.
-    pub fn record_prop_store(
-        &mut self,
-        bytecode_pc: u32,
-        shape_id: u64,
-        slot_offset: u32,
-    ) {
+    pub fn record_prop_store(&mut self, bytecode_pc: u32, shape_id: u64, slot_offset: u32) {
         let site = self.site_for_pc(bytecode_pc);
         if site.stubs.iter().any(|s| {
-            s.fields.iter().any(|f| matches!(f, StubField::Shape(id) if *id == shape_id))
+            s.fields
+                .iter()
+                .any(|f| matches!(f, StubField::Shape(id) if *id == shape_id))
         }) {
             return;
         }

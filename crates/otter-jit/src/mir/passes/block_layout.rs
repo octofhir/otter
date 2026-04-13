@@ -119,13 +119,17 @@ mod tests {
         let bb_normal = graph.create_block();
 
         let cond = graph.push_instr(bb0, MirOp::True, 0);
-        graph.push_instr(bb0, MirOp::Branch {
-            cond,
-            true_block: bb_normal,
-            true_args: vec![],
-            false_block: bb_deopt,
-            false_args: vec![],
-        }, 1);
+        graph.push_instr(
+            bb0,
+            MirOp::Branch {
+                cond,
+                true_block: bb_normal,
+                true_args: vec![],
+                false_block: bb_deopt,
+                false_args: vec![],
+            },
+            1,
+        );
 
         let v = graph.push_instr(bb_normal, MirOp::ConstInt32(42), 2);
         graph.push_instr(bb_normal, MirOp::Return(v), 3);

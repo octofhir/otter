@@ -112,7 +112,7 @@ fn execute_compiled(
         interrupt_flag: std::ptr::null(),
         interpreter: std::ptr::null(),
         vm_ctx: std::ptr::null_mut(),
-        function_ptr: std::ptr::null(),
+        function_ptr: function as *const otter_vm::Function as *const (),
         upvalues_ptr: std::ptr::null(),
         upvalue_count: 0,
         callee_raw: RegisterValue::undefined().raw_bits(),
@@ -123,8 +123,11 @@ fn execute_compiled(
         secondary_result: 0,
         module_ptr: std::ptr::null(),
         runtime_ptr: std::ptr::null_mut(),
+        heap_slots_base: std::ptr::null(),
     };
 
+    crate::telemetry::record_jit_entry();
+    crate::telemetry::record_function_jit_entry(function.name().unwrap_or("<anonymous>"), 1);
     let result = unsafe { compiled.call(&mut ctx) };
     if result == crate::BAILOUT_SENTINEL {
         Ok(JitExecResult::Bailout {
@@ -181,7 +184,12 @@ mod tests {
         assert_eq!(entry.header_pc, 10);
         assert_eq!(entry.expected_types.len(), 3);
         // All tagged since no feedback.
-        assert!(entry.expected_types.iter().all(|t| *t == OsrValueType::Tagged));
+        assert!(
+            entry
+                .expected_types
+                .iter()
+                .all(|t| *t == OsrValueType::Tagged)
+        );
     }
 
     #[test]

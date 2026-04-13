@@ -1,7 +1,10 @@
-use otter_jit::deopt::{execute_function_profiled_with_fallback, execute_function_with_fallback};
-use otter_jit::pipeline::{JitExecResult, execute_function, execute_function_with_interrupt};
+use otter_jit::deopt::{
+    execute_function_profiled_with_fallback, execute_function_with_fallback, handoff_for_bailout,
+};
+use otter_jit::pipeline::{JitExecResult, execute_function_profiled_with_runtime};
 use otter_vm::FunctionIndex;
 use otter_vm::RegisterValue;
+use otter_vm::RuntimeState;
 use otter_vm::bigint::BigIntTable;
 use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
 use otter_vm::call::{CallSite, CallTable, DirectCall};
@@ -10,10 +13,11 @@ use otter_vm::float::FloatTable;
 use otter_vm::frame::FrameFlags;
 use otter_vm::frame::FrameLayout;
 use otter_vm::interpreter::Interpreter;
-use otter_vm::source::compile_script;
 use otter_vm::module::{Function, FunctionSideTables, FunctionTables, Module};
+use otter_vm::object::PropertyValue;
 use otter_vm::property::{PropertyNameId, PropertyNameTable};
 use otter_vm::regexp::RegExpTable;
+use otter_vm::source::compile_script;
 use otter_vm::string::StringTable;
 
 fn arithmetic_loop_module(limit: i32) -> otter_vm::module::Module {
@@ -22,6 +26,32 @@ fn arithmetic_loop_module(limit: i32) -> otter_vm::module::Module {
         "<jit-tier1-loop>",
     )
     .expect("loop script should compile")
+}
+
+fn init_entry_registers(function: &Function, runtime: &RuntimeState) -> Vec<RegisterValue> {
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    if let Some(receiver_slot) = function.frame_layout().receiver_slot() {
+        let global = runtime.intrinsics().global_object();
+        registers[usize::from(receiver_slot)] = RegisterValue::from_object_handle(global.0);
+    }
+    registers
+}
+
+fn read_global_i32(runtime: &mut RuntimeState, name: &str) -> i32 {
+    let global = runtime.intrinsics().global_object();
+    let property = runtime.intern_property_name(name);
+    let lookup = runtime
+        .objects()
+        .get_property(global, property)
+        .expect("global lookup should succeed")
+        .expect("global should exist");
+    match lookup.value() {
+        PropertyValue::Data { value, .. } => value
+            .as_i32()
+            .expect("global should hold an int32 loop result"),
+        PropertyValue::Accessor { .. } => panic!("global should not be an accessor"),
+    }
 }
 
 fn property_loop_module() -> Module {
@@ -162,13 +192,29 @@ fn tier1_loop_smoke_matches_interpreter() {
     let module = arithmetic_loop_module(128);
     let function = module.entry_function();
 
+    let mut interpreter_runtime = RuntimeState::new();
+    let interpreter_registers = init_entry_registers(function, &interpreter_runtime);
     let interpreter_result = Interpreter::new()
-        .execute(&module)
+        .execute_with_runtime(
+            &module,
+            module.entry(),
+            &interpreter_registers,
+            &mut interpreter_runtime,
+        )
         .expect("interpreter should execute");
+    let interpreter_sum = read_global_i32(&mut interpreter_runtime, "sum");
 
-    let mut registers =
-        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
-    let jit_result = execute_function(function, &mut registers).expect("jit should compile");
+    let mut jit_runtime = RuntimeState::new();
+    let mut registers = init_entry_registers(function, &jit_runtime);
+    let jit_result = execute_function_profiled_with_runtime(
+        &module,
+        module.entry(),
+        &mut registers,
+        &mut jit_runtime,
+        &[],
+        std::ptr::null(),
+    )
+    .expect("jit should compile");
 
     let raw = match jit_result {
         JitExecResult::Ok(raw) => raw,
@@ -186,13 +232,18 @@ fn tier1_loop_smoke_matches_interpreter() {
 
     let jit_value =
         RegisterValue::from_raw_bits(raw).expect("jit should return a valid vm register value");
+    let jit_sum = read_global_i32(&mut jit_runtime, "sum");
     println!(
-        "tier1 loop smoke: interpreter={:?} jit={:?}",
+        "tier1 loop smoke: interpreter={:?} jit={:?} interpreter_sum={} jit_sum={}",
         interpreter_result.return_value(),
-        jit_value
+        jit_value,
+        interpreter_sum,
+        jit_sum,
     );
     assert_eq!(jit_value, interpreter_result.return_value());
-    assert_eq!(jit_value, RegisterValue::from_i32(8128));
+    assert_eq!(jit_value, RegisterValue::undefined());
+    assert_eq!(jit_sum, interpreter_sum);
+    assert_eq!(jit_sum, 8128);
 }
 
 #[test]
@@ -229,13 +280,16 @@ fn unsupported_path_deopts_and_resumes() {
 fn safepoint_interrupt_deopts_and_resumes() {
     let module = arithmetic_loop_module(128);
     let function = module.entry_function();
-    let mut interrupt_flag = 1_u8;
-    let mut registers =
-        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let interrupt_flag = 1_u8;
+    let mut runtime = RuntimeState::new();
+    let mut registers = init_entry_registers(function, &runtime);
 
-    let deopt = execute_function_with_interrupt(
-        function,
+    let deopt = execute_function_profiled_with_runtime(
+        &module,
+        module.entry(),
         &mut registers,
+        &mut runtime,
+        &[],
         std::ptr::addr_of!(interrupt_flag),
     )
     .expect("jit path should execute");
@@ -250,16 +304,19 @@ fn safepoint_interrupt_deopts_and_resumes() {
     assert_eq!(reason, otter_jit::BailoutReason::Interrupted);
     assert!(bytecode_pc > 0);
 
-    interrupt_flag = 0;
-    let result = execute_function_with_fallback(
-        &module,
-        module.entry(),
-        &mut registers,
-        std::ptr::addr_of!(interrupt_flag),
-    )
-    .expect("resume after interrupt should succeed");
+    let handoff = handoff_for_bailout(function, bytecode_pc, reason);
+    let result = Interpreter::new()
+        .resume_with_runtime(
+            &module,
+            module.entry(),
+            handoff.resume_pc(),
+            &registers,
+            &mut runtime,
+        )
+        .expect("resume after interrupt should succeed");
 
-    assert_eq!(result.return_value(), RegisterValue::from_i32(8128));
+    assert_eq!(result.return_value(), RegisterValue::undefined());
+    assert_eq!(read_global_i32(&mut runtime, "sum"), 8128);
 }
 
 #[test]

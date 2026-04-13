@@ -13,9 +13,9 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::arch::CodeBuffer;
 use crate::JitError;
 use crate::abi::jit_function_signature;
+use crate::arch::CodeBuffer;
 use crate::context::JitContext;
 
 /// Actual code generation backend that produced a compiled function.
@@ -77,8 +77,11 @@ impl ExecutableBuffer {
         unsafe {
             std::ptr::copy_nonoverlapping(buf.bytes().as_ptr(), base.as_ptr(), buf.len());
             flush_instruction_cache(base.as_ptr(), buf.len());
-            if libc::mprotect(base.as_ptr().cast(), map_len, libc::PROT_READ | libc::PROT_EXEC)
-                != 0
+            if libc::mprotect(
+                base.as_ptr().cast(),
+                map_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            ) != 0
             {
                 let err = std::io::Error::last_os_error();
                 libc::munmap(base.as_ptr().cast(), map_len);
@@ -251,7 +254,9 @@ pub fn compile_clif_function(
         .map_err(|e| JitError::Cranelift(e.to_string()))?;
 
     // Dump native code if requested.
-    if cfg.dump_asm && let Some(compiled) = ctx.compiled_code() {
+    if cfg.dump_asm
+        && let Some(compiled) = ctx.compiled_code()
+    {
         if let Some(vcode) = compiled.vcode.as_ref() {
             eprintln!("[JIT] === VCode (near-asm) ===");
             eprintln!("{vcode}");
@@ -270,10 +275,12 @@ pub fn compile_clif_function(
     let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
 
     if cfg.dump_asm {
-        eprintln!("[JIT] compiled function at {:p}, {} bytes", code_ptr, code_size);
+        eprintln!(
+            "[JIT] compiled function at {:p}, {} bytes",
+            code_ptr, code_size
+        );
         // Disassemble the finalized (relocated) code for accurate branch targets.
-        let finalized_code =
-            unsafe { std::slice::from_raw_parts(code_ptr, code_size) };
+        let finalized_code = unsafe { std::slice::from_raw_parts(code_ptr, code_size) };
         crate::codegen::disasm::dump_disassembly(
             finalized_code,
             code_ptr as u64,

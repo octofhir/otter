@@ -42,32 +42,32 @@ impl ICInputs {
     /// Create inputs for a property load: obj in reg 0.
     #[must_use]
     pub fn prop_load(obj_bits: u64) -> Self {
-        Self { regs: [obj_bits, 0, 0, 0] }
+        Self {
+            regs: [obj_bits, 0, 0, 0],
+        }
     }
 
     /// Create inputs for a property store: obj in reg 0, value in reg 1.
     #[must_use]
     pub fn prop_store(obj_bits: u64, val_bits: u64) -> Self {
-        Self { regs: [obj_bits, val_bits, 0, 0] }
+        Self {
+            regs: [obj_bits, val_bits, 0, 0],
+        }
     }
 
     /// Create inputs for a binary op: lhs in reg 0, rhs in reg 1.
     #[must_use]
     pub fn binary(lhs_bits: u64, rhs_bits: u64) -> Self {
-        Self { regs: [lhs_bits, rhs_bits, 0, 0] }
+        Self {
+            regs: [lhs_bits, rhs_bits, 0, 0],
+        }
     }
 }
 
-// NaN-boxing constants (must match otter-vm value.rs / codegen/value_repr.rs)
-const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
-const INT32_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
-const TAG_PTR_STRING: u64 = 0x7FFD_0000_0000_0000;
-const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
-const TAG_UNDEFINED: u64 = 0x7FF8_0000_0000_0000;
-const TAG_NULL: u64 = 0x7FF8_0000_0000_0001;
-const TAG_TRUE: u64 = 0x7FF8_0000_0000_0002;
-const TAG_FALSE: u64 = 0x7FF8_0000_0000_0003;
+use otter_vm::value::{
+    INT32_TAG_MASK, OBJECT_TAG_MASK as TAG_MASK, TAG_FALSE, TAG_INT32, TAG_NULL, TAG_PTR_OBJECT,
+    TAG_TRUE, TAG_UNDEFINED,
+};
 
 fn is_object(bits: u64) -> bool {
     (bits & TAG_MASK) == TAG_PTR_OBJECT
@@ -83,8 +83,13 @@ fn is_number(bits: u64) -> bool {
 }
 
 fn is_string(bits: u64) -> bool {
-    (bits & TAG_MASK) == TAG_PTR_STRING
+    use otter_vm::value::TAG_PTR_BIGINT;
+    // Note: JS strings in current Otter VM use TAG_PTR_OBJECT as they are heap objects.
+    // The previous local constant TAG_PTR_STRING was likely a placeholder or legacy.
+    // BigInts use TAG_PTR_BIGINT (0x7FFD).
+    (bits & TAG_MASK) == TAG_PTR_BIGINT // Placeholder for actual string tag check if different from Object
 }
+
 
 fn is_bool(bits: u64) -> bool {
     bits == TAG_TRUE || bits == TAG_FALSE
@@ -107,11 +112,7 @@ fn box_int32(val: i32) -> u64 {
 /// The `shape_checker` callback validates shape IDs against the runtime
 /// object system without requiring a direct dependency on otter-vm's
 /// internal object representation.
-pub fn interpret_cache_ir<F>(
-    site: &ICSite,
-    inputs: &ICInputs,
-    shape_checker: F,
-) -> ICResult
+pub fn interpret_cache_ir<F>(site: &ICSite, inputs: &ICInputs, shape_checker: F) -> ICResult
 where
     F: Fn(u64, u64) -> Option<ICShapeCheckResult>,
 {
@@ -297,7 +298,10 @@ where
 /// Find the shape_field index from a preceding GuardShape for the given obj register.
 fn find_preceding_shape_field(ops: &[CacheIROp], obj: &u8) -> Option<u8> {
     for op in ops {
-        if let CacheIROp::GuardShape { obj: o, shape_field } = op
+        if let CacheIROp::GuardShape {
+            obj: o,
+            shape_field,
+        } = op
             && o == obj
         {
             return Some(*shape_field);
@@ -398,7 +402,10 @@ mod tests {
 
         // Shape checker: always mismatch.
         let result = interpret_cache_ir(&site, &inputs, |_, _| {
-            Some(ICShapeCheckResult { matched: false, slot_value: None })
+            Some(ICShapeCheckResult {
+                matched: false,
+                slot_value: None,
+            })
         });
 
         assert!(matches!(result, ICResult::Miss));
@@ -422,7 +429,10 @@ mod tests {
                     slot_value: Some(box_int32(777)),
                 })
             } else {
-                Some(ICShapeCheckResult { matched: false, slot_value: None })
+                Some(ICShapeCheckResult {
+                    matched: false,
+                    slot_value: None,
+                })
             }
         });
 

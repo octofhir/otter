@@ -1,6 +1,13 @@
 // JIT benchmark: monomorphic JS-to-JS call chains
 // Measures: call dispatch overhead, direct call fast path, return value handling
 
+function readPositiveIntArg(index: number, fallback: number): number {
+  const raw = process.argv[index];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function add(a: number, b: number): number {
   return a + b;
 }
@@ -67,15 +74,19 @@ function benchMethodCall(n: number): number {
   return calculator.value;
 }
 
-const N = 1_000_000;
-const ITERS = 50;
+const N = readPositiveIntArg(2, 1_000_000);
+const ITERS = readPositiveIntArg(3, 50);
+const FIB_ITERS = readPositiveIntArg(4, 100);
+const FIB_DEPTH = readPositiveIntArg(5, 20);
 
 const start = Date.now();
 for (let iter = 0; iter < ITERS; iter++) {
   benchDirectCall(N);
   benchCallChain(N);
-  benchFib(100, 20);
+  benchFib(FIB_ITERS, FIB_DEPTH);
   benchMethodCall(N);
 }
 const elapsed = Date.now() - start;
-console.log(`call_chain: ${elapsed}ms (${ITERS} iterations, N=${N})`);
+console.log(
+  `call_chain: ${elapsed}ms (${ITERS} iterations, N=${N}, fibIters=${FIB_ITERS}, fibDepth=${FIB_DEPTH})`,
+);

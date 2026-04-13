@@ -1,6 +1,13 @@
 // JIT benchmark: single-shape property load/store
 // Measures: shape guard efficiency, inline property access, IC monomorphic fast path
 
+function readPositiveIntArg(index: number, fallback: number): number {
+  const raw = process.argv[index];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 interface Point {
   x: number;
   y: number;
@@ -47,8 +54,8 @@ for (let i = 0; i < 100; i++) {
   points.push(createPoint(i, i * 2, i * 3));
 }
 
-const N = 1_000_000;
-const ITERS = 50;
+const N = readPositiveIntArg(2, 1_000_000);
+const ITERS = readPositiveIntArg(3, 50);
 
 const start = Date.now();
 for (let iter = 0; iter < ITERS; iter++) {

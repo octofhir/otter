@@ -87,8 +87,11 @@ pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, Jit
 /// path is selected, executable installation still falls back to the existing
 /// MIR/CLIF backend until raw stencil installation is wired into the runtime.
 #[must_use]
-pub fn select_tier1_strategy(function: &vm::Function) -> Tier1Strategy {
-    match analyze_template_candidate(function)
+pub fn select_tier1_strategy(
+    function: &vm::Function,
+    property_profile: &[Option<vm::PropertyInlineCache>],
+) -> Tier1Strategy {
+    match analyze_template_candidate(function, property_profile)
         .ok()
         .and_then(|program| emit_template_stencil(&program).ok().map(|_| program))
     {
@@ -133,19 +136,30 @@ pub fn compile_function_with_feedback(
     let start = Instant::now();
 
     if cfg.dump_bytecode {
-        eprintln!("[JIT] === Bytecode for {:?} ({} instructions, tier={:?}) ===",
-                  function.name(), function.bytecode().len(), tier);
+        eprintln!(
+            "[JIT] === Bytecode for {:?} ({} instructions, tier={:?}) ===",
+            function.name(),
+            function.bytecode().len(),
+            tier
+        );
     }
 
     // Build MIR using existing builder (property profile extracted from feedback).
     let property_profile = extract_property_profile(function, feedback);
     let mut graph = build_mir(
         function,
-        if property_profile.is_empty() { None } else { Some(&property_profile) },
+        if property_profile.is_empty() {
+            None
+        } else {
+            Some(&property_profile)
+        },
     )?;
 
     if cfg.dump_mir {
-        eprintln!("[JIT] === MIR (before passes, feedback-aware) for {:?} ===", function.name());
+        eprintln!(
+            "[JIT] === MIR (before passes, feedback-aware) for {:?} ===",
+            function.name()
+        );
         eprintln!("{}", graph);
     }
 
@@ -165,7 +179,11 @@ pub fn compile_function_with_feedback(
     let compiled = compile_clif_function(clif_func, isa, &[])?;
 
     let duration_ns = start.elapsed().as_nanos() as u64;
-    let tier_num = if tier == crate::mir::passes::PassTier::Optimized { 2 } else { 1 };
+    let tier_num = if tier == crate::mir::passes::PassTier::Optimized {
+        2
+    } else {
+        1
+    };
     telemetry::record_compile_time(tier_num == 1, duration_ns);
     telemetry::record_function_compiled(
         function.name().unwrap_or("<anonymous>"),
@@ -197,7 +215,7 @@ pub fn compile_function_profiled(
 ) -> Result<CompiledFunction, JitError> {
     let cfg = crate::config::jit_config();
     let start = Instant::now();
-    let tier1_strategy = select_tier1_strategy(function);
+    let tier1_strategy = select_tier1_strategy(function, property_profile);
     let function_name = function.name().unwrap_or("<anonymous>");
 
     if cfg.dump_bytecode {
@@ -208,14 +226,20 @@ pub fn compile_function_profiled(
             tier1_strategy,
         );
         for (pc, instr) in function.bytecode().instructions().iter().enumerate() {
-            eprintln!("  {:04}: {:?} a={} b={} c={}",
-                      pc, instr.opcode(), instr.a(), instr.b(), instr.c());
+            eprintln!(
+                "  {:04}: {:?} a={} b={} c={}",
+                pc,
+                instr.opcode(),
+                instr.a(),
+                instr.b(),
+                instr.c()
+            );
         }
     }
 
     if cfg.dump_asm
         && tier1_strategy == Tier1Strategy::TemplateBaseline
-        && let Ok(program) = analyze_template_candidate(function)
+        && let Ok(program) = analyze_template_candidate(function, property_profile)
         && let Ok(stencil) = emit_template_stencil(&program)
     {
         eprintln!(
@@ -231,7 +255,7 @@ pub fn compile_function_profiled(
     }
 
     if tier1_strategy == Tier1Strategy::TemplateBaseline
-        && let Ok(program) = analyze_template_candidate(function)
+        && let Ok(program) = analyze_template_candidate(function, property_profile)
         && let Ok(stencil) = emit_template_stencil(&program)
     {
         match compile_code_buffer(&stencil, CompiledCodeOrigin::TemplateBaseline) {
@@ -270,7 +294,10 @@ pub fn compile_function_profiled(
     )?;
 
     if cfg.dump_mir {
-        eprintln!("[JIT] === MIR (before passes) for {:?} ===", function.name());
+        eprintln!(
+            "[JIT] === MIR (before passes) for {:?} ===",
+            function.name()
+        );
         eprintln!("{}", graph);
     }
 
@@ -342,17 +369,32 @@ pub fn execute_function_with_interrupt(
     let compiled = compile_function(function)?;
     let register_count = u32::try_from(required_len)
         .map_err(|_| JitError::Internal("register count does not fit into u32".to_string()))?;
+    let mut runtime = vm::RuntimeState::new();
+    if let Some(receiver_slot) = function.frame_layout().receiver_slot()
+        && matches!(
+            registers.get(usize::from(receiver_slot)),
+            Some(value) if *value == vm::RegisterValue::undefined()
+        )
+    {
+        let global = runtime.intrinsics().global_object();
+        registers[usize::from(receiver_slot)] = vm::RegisterValue::from_object_handle(global.0);
+    }
+    let this_raw = function
+        .frame_layout()
+        .receiver_slot()
+        .and_then(|slot| registers.get(usize::from(slot)))
+        .map_or(vm::RegisterValue::undefined().raw_bits(), |v| v.raw_bits());
 
     let mut ctx = JitContext {
         registers_base: registers.as_mut_ptr().cast::<u64>(),
         local_count: register_count,
         register_count,
         constants: std::ptr::null(),
-        this_raw: vm::RegisterValue::undefined().raw_bits(),
+        this_raw,
         interrupt_flag,
         interpreter: std::ptr::null(),
         vm_ctx: std::ptr::null_mut(),
-        function_ptr: std::ptr::null(),
+        function_ptr: function as *const vm::Function as *const (),
         upvalues_ptr: std::ptr::null(),
         upvalue_count: 0,
         callee_raw: vm::RegisterValue::undefined().raw_bits(),
@@ -362,9 +404,12 @@ pub fn execute_function_with_interrupt(
         bailout_pc: 0,
         secondary_result: 0,
         module_ptr: std::ptr::null(),
-        runtime_ptr: std::ptr::null_mut(),
+        runtime_ptr: &mut runtime as *mut vm::RuntimeState as *mut (),
+        heap_slots_base: runtime.heap().slots_ptr(),
     };
 
+    telemetry::record_jit_entry();
+    telemetry::record_function_jit_entry(function.name().unwrap_or("<anonymous>"), 1);
     let result = unsafe { compiled.call(&mut ctx) };
     if result == BAILOUT_SENTINEL {
         Ok(JitExecResult::Bailout {
@@ -420,7 +465,7 @@ pub fn execute_function_profiled_with_runtime(
         interrupt_flag,
         interpreter: std::ptr::null(),
         vm_ctx: std::ptr::null_mut(),
-        function_ptr: std::ptr::null(),
+        function_ptr: function as *const vm::Function as *const (),
         upvalues_ptr: std::ptr::null(),
         upvalue_count: 0,
         callee_raw: vm::RegisterValue::undefined().raw_bits(),
@@ -431,8 +476,11 @@ pub fn execute_function_profiled_with_runtime(
         secondary_result: 0,
         module_ptr: module as *const vm::Module as *const (),
         runtime_ptr: runtime as *mut vm::RuntimeState as *mut (),
+        heap_slots_base: runtime.heap().slots_ptr(),
     };
 
+    telemetry::record_jit_entry();
+    telemetry::record_function_jit_entry(function.name().unwrap_or("<anonymous>"), 1);
     let result = unsafe { compiled.call(&mut ctx) };
     if result == BAILOUT_SENTINEL {
         Ok(JitExecResult::Bailout {

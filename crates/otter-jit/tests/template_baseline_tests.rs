@@ -5,10 +5,10 @@ use otter_jit::code_memory::CompiledCodeOrigin;
 use otter_jit::pipeline::{
     JitExecResult, Tier1Strategy, compile_function, execute_function, select_tier1_strategy,
 };
+use otter_vm::RegisterValue;
 use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset, Opcode};
 use otter_vm::frame::FrameLayout;
 use otter_vm::module::Function;
-use otter_vm::RegisterValue;
 
 #[test]
 fn template_baseline_recognizes_simple_loop_shape() {
@@ -210,7 +210,8 @@ fn template_baseline_compiles_and_executes_as_real_backend() {
 
     let mut registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
-    let result = execute_function(&function, &mut registers).expect("template execution should work");
+    let result =
+        execute_function(&function, &mut registers).expect("template execution should work");
 
     match result {
         JitExecResult::Ok(raw) => {

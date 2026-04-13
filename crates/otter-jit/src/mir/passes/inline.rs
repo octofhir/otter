@@ -111,7 +111,9 @@ impl InlineBudget {
             }
         }
 
-        InlineDecision::Inline { target_index: target }
+        InlineDecision::Inline {
+            target_index: target,
+        }
     }
 
     /// Consume budget for an inlined callee.
@@ -155,9 +157,10 @@ mod tests {
     use otter_vm::feedback::*;
 
     fn make_feedback_mono_call(target: u32) -> FeedbackVector {
-        let layout = FeedbackTableLayout::new(vec![
-            FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
-        ]);
+        let layout = FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+            FeedbackSlotId(0),
+            FeedbackKind::Call,
+        )]);
         let mut fv = FeedbackVector::from_layout(&layout);
         fv.record_call(FeedbackSlotId(0), target);
         fv
@@ -186,9 +189,10 @@ mod tests {
 
     #[test]
     fn test_dont_inline_polymorphic() {
-        let layout = FeedbackTableLayout::new(vec![
-            FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Call),
-        ]);
+        let layout = FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+            FeedbackSlotId(0),
+            FeedbackKind::Call,
+        )]);
         let mut fv = FeedbackVector::from_layout(&layout);
         fv.record_call(FeedbackSlotId(0), 5);
         fv.record_call(FeedbackSlotId(0), 6); // Now polymorphic.

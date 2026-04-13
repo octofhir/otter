@@ -67,6 +67,35 @@ otter run --alloc-stats script.ts
 otter run --trace-ic script.ts
 ```
 
+## JIT Release Gate
+
+Use the Tier 1 release gate when changing the baseline JIT or tiering path. It builds the release CLI, runs the focused JIT benchmarks, captures `--dump-jit-stats`, and writes JSON/TSV/Markdown artifacts under `benchmarks/results/jit/`.
+
+```bash
+# Run the default Tier 1 release gate set
+bash benchmarks/jit/tier1_release_gate.sh
+
+# Via just
+just jit-tier1-gate
+
+# Run a subset
+bash benchmarks/jit/tier1_release_gate.sh arithmetic_loop call_chain
+```
+
+Default checks:
+- each benchmark must execute successfully in release mode
+- benchmark output must be parseable
+- Tier 1 must compile at least once per run
+- reported Tier 1 median compile time must stay under `2.0ms` by default
+
+Thresholds are configurable through env vars:
+
+```bash
+TIER1_MAX_MEDIAN_MS=1.5 RUNS_PER_BENCH=3 bash benchmarks/jit/tier1_release_gate.sh
+```
+
+The gate uses `OTTER_TIMEOUT_SECONDS=45` by default so a stalled benchmark does not block the whole run forever.
+
 ## Benchmark Categories
 
 ### Startup (`startup/`)

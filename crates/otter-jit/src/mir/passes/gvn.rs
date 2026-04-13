@@ -228,13 +228,17 @@ mod tests {
 
         let v0 = graph.push_instr(bb0, MirOp::ConstInt32(42), 0);
         let cond = graph.push_instr(bb0, MirOp::True, 1);
-        graph.push_instr(bb0, MirOp::Branch {
-            cond,
-            true_block: bb1,
-            true_args: vec![],
-            false_block: bb2,
-            false_args: vec![],
-        }, 2);
+        graph.push_instr(
+            bb0,
+            MirOp::Branch {
+                cond,
+                true_block: bb1,
+                true_args: vec![],
+                false_block: bb2,
+                false_args: vec![],
+            },
+            2,
+        );
 
         let v1 = graph.push_instr(bb1, MirOp::ConstInt32(42), 3);
         graph.push_instr(bb1, MirOp::Return(v1), 4);

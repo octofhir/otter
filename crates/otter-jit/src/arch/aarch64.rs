@@ -32,16 +32,38 @@ pub enum Cond {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Reg {
-    X0 = 0, X1 = 1, X2 = 2, X3 = 3,
-    X4 = 4, X5 = 5, X6 = 6, X7 = 7,
-    X8 = 8, X9 = 9, X10 = 10, X11 = 11,
-    X12 = 12, X13 = 13, X14 = 14, X15 = 15,
-    X16 = 16, X17 = 17, X18 = 18, X19 = 19,
-    X20 = 20, X21 = 21, X22 = 22, X23 = 23,
-    X24 = 24, X25 = 25, X26 = 26, X27 = 27,
-    X28 = 28, X29 = 29, // FP
-    X30 = 30,            // LR
-    Xzr = 31,            // Zero register / SP (context-dependent)
+    X0 = 0,
+    X1 = 1,
+    X2 = 2,
+    X3 = 3,
+    X4 = 4,
+    X5 = 5,
+    X6 = 6,
+    X7 = 7,
+    X8 = 8,
+    X9 = 9,
+    X10 = 10,
+    X11 = 11,
+    X12 = 12,
+    X13 = 13,
+    X14 = 14,
+    X15 = 15,
+    X16 = 16,
+    X17 = 17,
+    X18 = 18,
+    X19 = 19,
+    X20 = 20,
+    X21 = 21,
+    X22 = 22,
+    X23 = 23,
+    X24 = 24,
+    X25 = 25,
+    X26 = 26,
+    X27 = 27,
+    X28 = 28,
+    X29 = 29, // FP
+    X30 = 30, // LR
+    Xzr = 31, // Zero register / SP (context-dependent)
 }
 
 impl Reg {
@@ -79,6 +101,34 @@ impl<'a> Assembler<'a> {
         self.emit_insn(0xD65F03C0);
     }
 
+    /// `blr xn` (branch with link to register)
+    pub fn blr(&mut self, reg: Reg) {
+        let insn = 0xD63F0000 | (reg.encoding() << 5);
+        self.emit_insn(insn);
+    }
+
+    /// `br xn` (branch to register)
+    pub fn br(&mut self, reg: Reg) {
+        let insn = 0xD61F0000 | (reg.encoding() << 5);
+        self.emit_insn(insn);
+    }
+
+    /// Push x19 and x30 (LR) to the stack.
+    /// `sub sp, sp, #16; str x19, [sp]; str x30, [sp, #8]`
+    pub fn push_x19_lr(&mut self) {
+        self.emit_insn(0xD10043FF); // sub sp, sp, #16
+        self.emit_insn(0xF90003F3); // str x19, [sp]
+        self.emit_insn(0xF90007FE); // str x30, [sp, #8]
+    }
+
+    /// Pop x19 and x30 (LR) from the stack.
+    /// `ldr x19, [sp]; ldr x30, [sp, #8]; add sp, sp, #16`
+    pub fn pop_x19_lr(&mut self) {
+        self.emit_insn(0xF94003F3); // ldr x19, [sp]
+        self.emit_insn(0xF94007FE); // ldr x30, [sp, #8]
+        self.emit_insn(0x910043FF); // add sp, sp, #16
+    }
+
     /// `nop`
     pub fn nop(&mut self) {
         // NOP: 0xD503201F
@@ -88,10 +138,8 @@ impl<'a> Assembler<'a> {
     /// `mov dst, src` (64-bit register move via ORR)
     /// `ORR Xd, XZR, Xm` = `MOV Xd, Xm`
     pub fn mov_rr(&mut self, dst: Reg, src: Reg) {
-        let insn = 0xAA000000
-            | (src.encoding() << 16)
-            | (Reg::Xzr.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0xAA000000 | (src.encoding() << 16) | (Reg::Xzr.encoding() << 5) | dst.encoding();
         self.emit_insn(insn);
     }
 
@@ -127,16 +175,20 @@ impl<'a> Assembler<'a> {
     /// `cmp xn, xm` (sets flags, 64-bit)
     /// Encoded as `SUBS XZR, Xn, Xm`
     pub fn cmp_rr(&mut self, a: Reg, b: Reg) {
-        let insn = 0xEB000000
-            | (b.encoding() << 16)
-            | (a.encoding() << 5)
-            | Reg::Xzr.encoding(); // Rd = XZR (discard result)
+        let insn = 0xEB000000 | (b.encoding() << 16) | (a.encoding() << 5) | Reg::Xzr.encoding(); // Rd = XZR (discard result)
         self.emit_insn(insn);
     }
 
     /// `add xd, xn, xm`
     pub fn add_rrr(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
+        let insn = 0x8B000000 | (rhs.encoding() << 16) | (lhs.encoding() << 5) | dst.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `add xd, xn, xm, lsl #shift`
+    pub fn add_rrr_lsl(&mut self, dst: Reg, lhs: Reg, rhs: Reg, shift: u8) {
         let insn = 0x8B000000
+            | ((shift as u32) << 10)
             | (rhs.encoding() << 16)
             | (lhs.encoding() << 5)
             | dst.encoding();
@@ -145,10 +197,7 @@ impl<'a> Assembler<'a> {
 
     /// `sub xd, xn, xm`
     pub fn sub_rrr(&mut self, dst: Reg, lhs: Reg, rhs: Reg) {
-        let insn = 0xCB000000
-            | (rhs.encoding() << 16)
-            | (lhs.encoding() << 5)
-            | dst.encoding();
+        let insn = 0xCB000000 | (rhs.encoding() << 16) | (lhs.encoding() << 5) | dst.encoding();
         self.emit_insn(insn);
     }
 
@@ -184,10 +233,8 @@ impl<'a> Assembler<'a> {
     /// For IC stubs, we load the mask into a scratch register and use `and dst, src, scratch`.
     pub fn and_rr(&mut self, dst: Reg, src: Reg, mask_reg: Reg) {
         // AND Xd, Xn, Xm
-        let insn = 0x8A000000
-            | (mask_reg.encoding() << 16)
-            | (src.encoding() << 5)
-            | dst.encoding();
+        let insn =
+            0x8A000000 | (mask_reg.encoding() << 16) | (src.encoding() << 5) | dst.encoding();
         self.emit_insn(insn);
     }
 
@@ -226,11 +273,12 @@ impl<'a> Assembler<'a> {
     /// After this, branch with B.EQ (ZF set if Int32).
     /// Clobbers x8, x9.
     pub fn check_int32_tag(&mut self, src: Reg) {
+        use otter_vm::value::{INT32_TAG_MASK, TAG_INT32};
         // x8 = src & INT32_TAG_MASK (upper 32 bits)
-        self.mov_imm64(Reg::X9, 0xFFFF_FFFF_0000_0000);
+        self.mov_imm64(Reg::X9, INT32_TAG_MASK);
         self.and_rr(Reg::X8, src, Reg::X9);
         // x9 = TAG_INT32
-        self.mov_imm64(Reg::X9, 0x7FF8_0001_0000_0000);
+        self.mov_imm64(Reg::X9, TAG_INT32);
         // cmp x8, x9 (ZF set if match)
         self.cmp_rr(Reg::X8, Reg::X9);
     }
@@ -238,11 +286,13 @@ impl<'a> Assembler<'a> {
     /// Check if value in `src` is an object pointer.
     /// Clobbers x8, x9.
     pub fn check_object_tag(&mut self, src: Reg) {
-        self.mov_imm64(Reg::X9, 0xFFFF_0000_0000_0000);
+        use otter_vm::value::{OBJECT_TAG_MASK, TAG_PTR_OBJECT};
+        self.mov_imm64(Reg::X9, OBJECT_TAG_MASK);
         self.and_rr(Reg::X8, src, Reg::X9);
-        self.mov_imm64(Reg::X9, 0x7FFC_0000_0000_0000);
+        self.mov_imm64(Reg::X9, TAG_PTR_OBJECT);
         self.cmp_rr(Reg::X8, Reg::X9);
     }
+
 
     /// Extract i32 payload from NaN-boxed value.
     /// Lower 32 bits of `src` are the i32.
@@ -262,10 +312,8 @@ impl<'a> Assembler<'a> {
         // dst = TAG_INT32
         self.mov_imm64(dst, 0x7FF8_0001_0000_0000);
         // dst = dst | x12
-        let insn = 0xAA000000
-            | (Reg::X12.encoding() << 16)
-            | (dst.encoding() << 5)
-            | dst.encoding(); // ORR dst, dst, x12
+        let insn =
+            0xAA000000 | (Reg::X12.encoding() << 16) | (dst.encoding() << 5) | dst.encoding(); // ORR dst, dst, x12
         self.emit_insn(insn);
     }
 }
@@ -328,7 +376,11 @@ mod tests {
         let mut asm = Assembler::new(&mut buf);
         asm.check_int32_tag(Reg::X1);
         // Should emit movimm64 + and + movimm64 + cmp = multiple instructions.
-        assert!(buf.len() >= 20, "tag check should emit substantial code, got {} bytes", buf.len());
+        assert!(
+            buf.len() >= 20,
+            "tag check should emit substantial code, got {} bytes",
+            buf.len()
+        );
     }
 
     #[test]

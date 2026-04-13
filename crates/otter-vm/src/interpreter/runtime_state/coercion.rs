@@ -308,7 +308,10 @@ impl RuntimeState {
         Err(InterpreterError::InvalidObjectValue)
     }
 
-    pub(crate) fn is_primitive_property_base(&self, value: RegisterValue) -> Result<bool, ObjectError> {
+    pub(crate) fn is_primitive_property_base(
+        &self,
+        value: RegisterValue,
+    ) -> Result<bool, ObjectError> {
         if value.as_bool().is_some() || value.as_number().is_some() || value.is_symbol() {
             return Ok(true);
         }
@@ -903,7 +906,10 @@ impl RuntimeState {
     }
 
     /// Allocate an error object with the correct prototype chain.
-    pub(crate) fn alloc_reference_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
+    pub(crate) fn alloc_reference_error(
+        &mut self,
+        message: &str,
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().reference_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype));
         let msg_handle = self.objects.alloc_string(message);
@@ -1141,7 +1147,10 @@ impl RuntimeState {
         Ok(RegisterValue::from_number(lhs_num + rhs_num))
     }
 
-    pub(crate) fn js_typeof(&mut self, value: RegisterValue) -> Result<RegisterValue, InterpreterError> {
+    pub(crate) fn js_typeof(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
         let kind = if value == RegisterValue::undefined() {
             "undefined"
         } else if value == RegisterValue::null() {

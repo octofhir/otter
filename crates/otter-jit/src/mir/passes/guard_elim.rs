@@ -127,7 +127,10 @@ fn try_eliminate_guard(
     }
 
     // Check 2: Type analysis proves the guard always succeeds.
-    let abstract_ty = type_map.get(&guarded_val).copied().unwrap_or(AbstractType::ANY);
+    let abstract_ty = type_map
+        .get(&guarded_val)
+        .copied()
+        .unwrap_or(AbstractType::ANY);
     let proved_by_type = match kind {
         GuardKind::Int32 => abstract_ty.proves_int32(),
         GuardKind::Float64 => abstract_ty.proves_float64(),

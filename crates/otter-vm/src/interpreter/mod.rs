@@ -64,7 +64,6 @@ const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
 const ERROR_DATA_SLOT: &str = "__otter_error_data__";
 const EXECUTION_INTERRUPTED_MESSAGE: &str = "execution interrupted";
 
-
 /// Shared execution runtime for one interpreter/JIT run.
 pub struct RuntimeState {
     /// §9.3 — Realm records owned by this runtime. The vector is grown only
@@ -125,9 +124,9 @@ pub struct RuntimeState {
     /// them for speculation decisions. Keyed by FunctionIndex.
     ///
     /// V8 model: FeedbackVector lives on SharedFunctionInfo, not on stack frame.
-    feedback_vectors: std::collections::HashMap<crate::FunctionIndex, crate::feedback::FeedbackVector>,
+    feedback_vectors:
+        std::collections::HashMap<crate::FunctionIndex, crate::feedback::FeedbackVector>,
 }
-
 
 /// Minimal interpreter shell for the new VM backend.
 #[derive(Debug, Clone)]
@@ -247,8 +246,12 @@ impl Interpreter {
                 }
                 crate::feedback::FeedbackSlotData::Branch(fb) => {
                     // Branch counters: add (saturating).
-                    for _ in 0..fb.taken { persistent.record_branch(id, true); }
-                    for _ in 0..fb.not_taken { persistent.record_branch(id, false); }
+                    for _ in 0..fb.taken {
+                        persistent.record_branch(id, true);
+                    }
+                    for _ in 0..fb.not_taken {
+                        persistent.record_branch(id, false);
+                    }
                 }
                 crate::feedback::FeedbackSlotData::Property(fb) => {
                     if let Some(cache) = fb.as_monomorphic() {
@@ -1267,7 +1270,4 @@ impl Interpreter {
         activation.set_pc(handler.handler_pc());
         true
     }
-
 }
-
-

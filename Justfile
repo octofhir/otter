@@ -20,6 +20,10 @@ build:
 release:
     cargo build --release -p otterjs
 
+# Run the release-mode Tier 1 JIT benchmark gate
+jit-tier1-gate *benchmarks:
+    bash benchmarks/jit/tier1_release_gate.sh {{benchmarks}}
+
 # Run CLI with arguments
 run *args:
     cargo run -p otterjs -- {{args}}

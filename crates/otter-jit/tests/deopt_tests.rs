@@ -245,8 +245,5 @@ fn telemetry_records_compilation() {
         snap.tier1_compile_times_ns[0] > 0,
         "compile time should be non-zero"
     );
-    assert!(
-        !snap.functions.is_empty(),
-        "should have per-function stats"
-    );
+    assert!(!snap.functions.is_empty(), "should have per-function stats");
 }

@@ -187,13 +187,21 @@ impl ComparisonFeedback {
     }
 
     #[must_use]
-    pub fn observe_int32(self) -> Self { self.merge(Self::Int32) }
+    pub fn observe_int32(self) -> Self {
+        self.merge(Self::Int32)
+    }
     #[must_use]
-    pub fn observe_number(self) -> Self { self.merge(Self::Number) }
+    pub fn observe_number(self) -> Self {
+        self.merge(Self::Number)
+    }
     #[must_use]
-    pub fn observe_string(self) -> Self { self.merge(Self::String) }
+    pub fn observe_string(self) -> Self {
+        self.merge(Self::String)
+    }
     #[must_use]
-    pub fn observe_any(self) -> Self { Self::Any }
+    pub fn observe_any(self) -> Self {
+        Self::Any
+    }
 }
 
 /// Branch feedback: taken/not-taken saturating counters.
@@ -218,7 +226,11 @@ impl BranchFeedback {
     #[must_use]
     pub fn taken_ratio(&self) -> f64 {
         let total = u32::from(self.taken) + u32::from(self.not_taken);
-        if total == 0 { 0.5 } else { f64::from(self.taken) / total as f64 }
+        if total == 0 {
+            0.5
+        } else {
+            f64::from(self.taken) / total as f64
+        }
     }
 }
 
@@ -436,12 +448,21 @@ impl FeedbackVector {
     /// Record a taken/not-taken branch observation.
     pub fn record_branch(&mut self, id: FeedbackSlotId, taken: bool) {
         if let Some(FeedbackSlotData::Branch(fb)) = self.get_mut(id) {
-            if taken { fb.record_taken(); } else { fb.record_not_taken(); }
+            if taken {
+                fb.record_taken();
+            } else {
+                fb.record_not_taken();
+            }
         }
     }
 
     /// Record a property access observation.
-    pub fn record_property(&mut self, id: FeedbackSlotId, shape_id: ObjectShapeId, slot_index: u16) {
+    pub fn record_property(
+        &mut self,
+        id: FeedbackSlotId,
+        shape_id: ObjectShapeId,
+        slot_index: u16,
+    ) {
         if let Some(FeedbackSlotData::Property(fb)) = self.get_mut(id) {
             fb.observe(shape_id, slot_index);
         }
@@ -561,8 +582,12 @@ mod tests {
     #[test]
     fn branch_feedback_ratio() {
         let mut fb = BranchFeedback::default();
-        for _ in 0..3 { fb.record_taken(); }
-        for _ in 0..1 { fb.record_not_taken(); }
+        for _ in 0..3 {
+            fb.record_taken();
+        }
+        for _ in 0..1 {
+            fb.record_not_taken();
+        }
         assert!((fb.taken_ratio() - 0.75).abs() < 0.01);
     }
 
@@ -577,10 +602,18 @@ mod tests {
         assert_eq!(vec.len(), 3);
 
         vec.record_arithmetic(FeedbackSlotId(0), ArithmeticFeedback::Int32);
-        assert_eq!(vec.arithmetic(FeedbackSlotId(0)), Some(ArithmeticFeedback::Int32));
+        assert_eq!(
+            vec.arithmetic(FeedbackSlotId(0)),
+            Some(ArithmeticFeedback::Int32)
+        );
 
         vec.record_property(FeedbackSlotId(1), ObjectShapeId(42), 3);
-        assert!(vec.property(FeedbackSlotId(1)).unwrap().as_monomorphic().is_some());
+        assert!(
+            vec.property(FeedbackSlotId(1))
+                .unwrap()
+                .as_monomorphic()
+                .is_some()
+        );
 
         vec.record_branch(FeedbackSlotId(2), true);
         assert_eq!(vec.branch(FeedbackSlotId(2)).unwrap().taken, 1);

@@ -17,9 +17,9 @@ pub mod arch;
 pub mod baseline;
 pub mod cache_ir;
 pub mod code_cache;
-pub mod compile_queue;
 pub mod code_memory;
 pub mod codegen;
+pub mod compile_queue;
 pub mod config;
 pub mod context;
 pub mod deopt;
@@ -28,12 +28,12 @@ pub mod ic;
 pub mod mir;
 pub mod osr;
 pub mod osr_compile;
-pub mod profile_cache;
-pub mod snapshot;
-pub mod watchpoint;
 pub mod pipeline;
+pub mod profile_cache;
 mod runtime_helpers;
+pub mod snapshot;
 pub mod telemetry;
+pub mod watchpoint;
 
 pub use deopt::{BAILOUT_SENTINEL, BailoutReason};
 

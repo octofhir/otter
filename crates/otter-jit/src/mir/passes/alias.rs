@@ -104,26 +104,49 @@ impl Effects {
 pub fn get_effects(op: &MirOp) -> Effects {
     match op {
         // ---- Pure computations ----
-        MirOp::Const(_) | MirOp::ConstInt32(_) | MirOp::ConstFloat64(_)
-        | MirOp::True | MirOp::False | MirOp::Undefined | MirOp::Null => Effects::PURE,
+        MirOp::Const(_)
+        | MirOp::ConstInt32(_)
+        | MirOp::ConstFloat64(_)
+        | MirOp::True
+        | MirOp::False
+        | MirOp::Undefined
+        | MirOp::Null => Effects::PURE,
 
-        MirOp::BoxInt32(_) | MirOp::BoxFloat64(_) | MirOp::BoxBool(_)
-        | MirOp::UnboxInt32(_) | MirOp::UnboxFloat64(_)
+        MirOp::BoxInt32(_)
+        | MirOp::BoxFloat64(_)
+        | MirOp::BoxBool(_)
+        | MirOp::UnboxInt32(_)
+        | MirOp::UnboxFloat64(_)
         | MirOp::Int32ToFloat64(_) => Effects::PURE,
 
-        MirOp::AddI32 { .. } | MirOp::SubI32 { .. } | MirOp::MulI32 { .. }
-        | MirOp::DivI32 { .. } | MirOp::ModI32 { .. }
-        | MirOp::IncI32 { .. } | MirOp::DecI32 { .. } | MirOp::NegI32 { .. } => Effects::PURE,
+        MirOp::AddI32 { .. }
+        | MirOp::SubI32 { .. }
+        | MirOp::MulI32 { .. }
+        | MirOp::DivI32 { .. }
+        | MirOp::ModI32 { .. }
+        | MirOp::IncI32 { .. }
+        | MirOp::DecI32 { .. }
+        | MirOp::NegI32 { .. } => Effects::PURE,
 
-        MirOp::AddF64 { .. } | MirOp::SubF64 { .. } | MirOp::MulF64 { .. }
-        | MirOp::DivF64 { .. } | MirOp::ModF64 { .. } | MirOp::NegF64(_) => Effects::PURE,
+        MirOp::AddF64 { .. }
+        | MirOp::SubF64 { .. }
+        | MirOp::MulF64 { .. }
+        | MirOp::DivF64 { .. }
+        | MirOp::ModF64 { .. }
+        | MirOp::NegF64(_) => Effects::PURE,
 
-        MirOp::BitAnd { .. } | MirOp::BitOr { .. } | MirOp::BitXor { .. }
-        | MirOp::Shl { .. } | MirOp::Shr { .. } | MirOp::Ushr { .. }
+        MirOp::BitAnd { .. }
+        | MirOp::BitOr { .. }
+        | MirOp::BitXor { .. }
+        | MirOp::Shl { .. }
+        | MirOp::Shr { .. }
+        | MirOp::Ushr { .. }
         | MirOp::BitNot(_) => Effects::PURE,
 
-        MirOp::CmpI32 { .. } | MirOp::CmpF64 { .. }
-        | MirOp::CmpStrictEq { .. } | MirOp::CmpStrictNe { .. }
+        MirOp::CmpI32 { .. }
+        | MirOp::CmpF64 { .. }
+        | MirOp::CmpStrictEq { .. }
+        | MirOp::CmpStrictNe { .. }
         | MirOp::LogicalNot(_) => Effects::PURE,
 
         MirOp::Move(_) | MirOp::Phi(_) => Effects::PURE,
@@ -158,12 +181,16 @@ pub fn get_effects(op: &MirOp) -> Effects {
 
         // Generic property access: conservative (may touch any slot).
         MirOp::GetPropGeneric { .. } | MirOp::GetPropConstGeneric { .. } => Effects {
-            reads: AliasSet::FIXED_SLOT.union(AliasSet::DYNAMIC_SLOT).union(AliasSet::OBJECT_FIELDS),
+            reads: AliasSet::FIXED_SLOT
+                .union(AliasSet::DYNAMIC_SLOT)
+                .union(AliasSet::OBJECT_FIELDS),
             writes: AliasSet::NONE,
         },
         MirOp::SetPropGeneric { .. } | MirOp::SetPropConstGeneric { .. } => Effects {
             reads: AliasSet::NONE,
-            writes: AliasSet::FIXED_SLOT.union(AliasSet::DYNAMIC_SLOT).union(AliasSet::OBJECT_FIELDS),
+            writes: AliasSet::FIXED_SLOT
+                .union(AliasSet::DYNAMIC_SLOT)
+                .union(AliasSet::OBJECT_FIELDS),
         },
 
         // ---- Array access ----
@@ -187,15 +214,20 @@ pub fn get_effects(op: &MirOp) -> Effects {
         },
 
         // ---- Guards: read object fields (shape checks) but don't write ----
-        MirOp::GuardShape { .. } | MirOp::GuardProtoEpoch { .. }
+        MirOp::GuardShape { .. }
+        | MirOp::GuardProtoEpoch { .. }
         | MirOp::GuardArrayDense { .. } => Effects {
             reads: AliasSet::OBJECT_FIELDS,
             writes: AliasSet::NONE,
         },
-        MirOp::GuardInt32 { .. } | MirOp::GuardFloat64 { .. }
-        | MirOp::GuardObject { .. } | MirOp::GuardString { .. }
-        | MirOp::GuardFunction { .. } | MirOp::GuardBool { .. }
-        | MirOp::GuardNotHole { .. } | MirOp::GuardBoundsCheck { .. } => Effects::PURE,
+        MirOp::GuardInt32 { .. }
+        | MirOp::GuardFloat64 { .. }
+        | MirOp::GuardObject { .. }
+        | MirOp::GuardString { .. }
+        | MirOp::GuardFunction { .. }
+        | MirOp::GuardBool { .. }
+        | MirOp::GuardNotHole { .. }
+        | MirOp::GuardBoundsCheck { .. } => Effects::PURE,
 
         // ---- Everything else: conservative ----
         _ => Effects {
@@ -213,10 +245,13 @@ mod tests {
     fn test_pure_ops() {
         assert!(get_effects(&MirOp::ConstInt32(42)).is_pure());
         assert!(get_effects(&MirOp::True).is_pure());
-        assert!(get_effects(&MirOp::AddF64 {
-            lhs: crate::mir::graph::ValueId(0),
-            rhs: crate::mir::graph::ValueId(1),
-        }).is_pure());
+        assert!(
+            get_effects(&MirOp::AddF64 {
+                lhs: crate::mir::graph::ValueId(0),
+                rhs: crate::mir::graph::ValueId(1),
+            })
+            .is_pure()
+        );
     }
 
     #[test]

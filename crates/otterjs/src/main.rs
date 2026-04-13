@@ -172,7 +172,6 @@ struct Cli {
     alloc_stats: bool,
 
     // ---- JIT introspection flags ----
-
     /// Dump compiled bytecodes before JIT compilation
     #[arg(long, global = true)]
     dump_bytecode: bool,
@@ -525,11 +524,21 @@ fn build_runtime_for_cli(cli: &Cli, argv: Vec<String>) -> Result<otter_runtime::
     }
 
     // JIT introspection flags
-    if cli.dump_bytecode { builder = builder.dump_bytecode(true); }
-    if cli.dump_mir { builder = builder.dump_mir(true); }
-    if cli.dump_clif { builder = builder.dump_clif(true); }
-    if cli.dump_asm { builder = builder.dump_asm(true); }
-    if cli.dump_jit_stats { builder = builder.dump_jit_stats(true); }
+    if cli.dump_bytecode {
+        builder = builder.dump_bytecode(true);
+    }
+    if cli.dump_mir {
+        builder = builder.dump_mir(true);
+    }
+    if cli.dump_clif {
+        builder = builder.dump_clif(true);
+    }
+    if cli.dump_asm {
+        builder = builder.dump_asm(true);
+    }
+    if cli.dump_jit_stats {
+        builder = builder.dump_jit_stats(true);
+    }
 
     Ok(builder.build())
 }

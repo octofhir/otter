@@ -255,7 +255,7 @@ impl OtterRuntime {
                     Some(interrupt_flag.clone()),
                 ) {
                     Ok(result) => result,
-                    Err(_) => interpreter.execute_module(module, &mut self.state)?
+                    Err(_) => interpreter.execute_module(module, &mut self.state)?,
                 };
 
                 // 2. Drain microtasks after top-level execution (ES spec).

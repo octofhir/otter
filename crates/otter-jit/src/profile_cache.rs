@@ -60,11 +60,11 @@ pub struct SerializedSlot {
 /// Serialized slot data.
 #[derive(Debug, Clone)]
 pub enum SlotData {
-    Arithmetic(u8),      // ArithmeticFeedback as u8
-    Comparison(u8),      // ComparisonFeedback as u8
+    Arithmetic(u8), // ArithmeticFeedback as u8
+    Comparison(u8), // ComparisonFeedback as u8
     Branch { taken: u16, not_taken: u16 },
-    Property(u8),        // 0=uninit, 1=mono, 2=poly, 3=mega (shapes not persisted)
-    Call(u8),            // 0=uninit, 1=mono, 2=poly, 3=mega (targets not persisted)
+    Property(u8), // 0=uninit, 1=mono, 2=poly, 3=mega (shapes not persisted)
+    Call(u8),     // 0=uninit, 1=mono, 2=poly, 3=mega (targets not persisted)
 }
 
 /// Profile cache: stores profiles for multiple functions.
@@ -131,7 +131,10 @@ impl ProfileCache {
                 }
                 FeedbackKind::Branch => {
                     let fb = vector.branch(id).unwrap_or_default();
-                    SlotData::Branch { taken: fb.taken, not_taken: fb.not_taken }
+                    SlotData::Branch {
+                        taken: fb.taken,
+                        not_taken: fb.not_taken,
+                    }
                 }
                 FeedbackKind::Property => {
                     let state = vector.property(id).map_or(0u8, |p| {
@@ -205,7 +208,10 @@ impl ProfileCache {
         r.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
         if version != PROFILE_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "version mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "version mismatch",
+            ));
         }
         r.read_exact(&mut buf4)?;
         let count = u32::from_le_bytes(buf4) as usize;
@@ -224,19 +230,44 @@ impl ProfileCache {
                 r.read_exact(&mut kb)?;
                 let kind = u8_to_kind(kb[0]);
                 let data = match kind {
-                    FeedbackKind::Arithmetic => { let mut b = [0u8; 1]; r.read_exact(&mut b)?; SlotData::Arithmetic(b[0]) }
-                    FeedbackKind::Comparison => { let mut b = [0u8; 1]; r.read_exact(&mut b)?; SlotData::Comparison(b[0]) }
+                    FeedbackKind::Arithmetic => {
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        SlotData::Arithmetic(b[0])
+                    }
+                    FeedbackKind::Comparison => {
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        SlotData::Comparison(b[0])
+                    }
                     FeedbackKind::Branch => {
-                        r.read_exact(&mut buf2)?; let taken = u16::from_le_bytes(buf2);
-                        r.read_exact(&mut buf2)?; let not_taken = u16::from_le_bytes(buf2);
+                        r.read_exact(&mut buf2)?;
+                        let taken = u16::from_le_bytes(buf2);
+                        r.read_exact(&mut buf2)?;
+                        let not_taken = u16::from_le_bytes(buf2);
                         SlotData::Branch { taken, not_taken }
                     }
-                    FeedbackKind::Property => { let mut b = [0u8; 1]; r.read_exact(&mut b)?; SlotData::Property(b[0]) }
-                    FeedbackKind::Call => { let mut b = [0u8; 1]; r.read_exact(&mut b)?; SlotData::Call(b[0]) }
+                    FeedbackKind::Property => {
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        SlotData::Property(b[0])
+                    }
+                    FeedbackKind::Call => {
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        SlotData::Call(b[0])
+                    }
                 };
                 slots.push(SerializedSlot { kind, data });
             }
-            entries.insert(function_name.clone(), ProfileCacheEntry { function_name, source_hash, slots });
+            entries.insert(
+                function_name.clone(),
+                ProfileCacheEntry {
+                    function_name,
+                    source_hash,
+                    slots,
+                },
+            );
         }
         Ok(Self { entries })
     }
@@ -326,7 +357,10 @@ mod tests {
         assert_eq!(loaded_entry.slots.len(), 2);
 
         // Check arithmetic slot.
-        assert!(matches!(loaded_entry.slots[0].data, SlotData::Arithmetic(1))); // Int32 = 1
+        assert!(matches!(
+            loaded_entry.slots[0].data,
+            SlotData::Arithmetic(1)
+        )); // Int32 = 1
         // Check branch slot.
         if let SlotData::Branch { taken, not_taken } = &loaded_entry.slots[1].data {
             assert_eq!(*taken, 2);

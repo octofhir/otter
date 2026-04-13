@@ -25,14 +25,14 @@ mod proxy;
 // Aliases so child submodules (coercion.rs etc.) can import via plain `super::*`
 // instead of the unergonomic `super::super::` syntax. Children of `runtime_state`
 // can see these private items via descendant visibility rules.
-use super::{
-    Activation, BOOLEAN_DATA_SLOT, ERROR_DATA_SLOT, EXECUTION_INTERRUPTED_MESSAGE, Interpreter,
-    InterpreterError, NUMBER_DATA_SLOT, RuntimeState, STRING_DATA_SLOT, ToPrimitiveHint,
-};
 use super::number_conv::{
     canonical_string_exotic_index, f64_to_int32, f64_to_uint32, parse_string_to_number,
 };
 use super::step_outcome::Completion;
+use super::{
+    Activation, BOOLEAN_DATA_SLOT, ERROR_DATA_SLOT, EXECUTION_INTERRUPTED_MESSAGE, Interpreter,
+    InterpreterError, NUMBER_DATA_SLOT, RuntimeState, STRING_DATA_SLOT, ToPrimitiveHint,
+};
 
 use core::any::Any;
 use std::collections::BTreeMap;
@@ -501,6 +501,12 @@ impl RuntimeState {
     /// Returns the current object heap.
     #[must_use]
     pub fn objects(&self) -> &ObjectHeap {
+        &self.objects
+    }
+
+    /// Alias for `objects()` used by JIT.
+    #[must_use]
+    pub fn heap(&self) -> &ObjectHeap {
         &self.objects
     }
 
@@ -1406,7 +1412,6 @@ impl RuntimeState {
             _ => Ok(false),
         }
     }
-
 }
 
 impl Default for RuntimeState {

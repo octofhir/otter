@@ -21,10 +21,18 @@ pub fn run(graph: &mut MirGraph) {
     for block in &graph.blocks {
         for instr in &block.instrs {
             match &instr.op {
-                MirOp::ConstInt32(v) => { const_i32.insert(instr.value, *v); }
-                MirOp::ConstFloat64(v) => { const_f64.insert(instr.value, *v); }
-                MirOp::True => { const_bool.insert(instr.value, true); }
-                MirOp::False => { const_bool.insert(instr.value, false); }
+                MirOp::ConstInt32(v) => {
+                    const_i32.insert(instr.value, *v);
+                }
+                MirOp::ConstFloat64(v) => {
+                    const_f64.insert(instr.value, *v);
+                }
+                MirOp::True => {
+                    const_bool.insert(instr.value, true);
+                }
+                MirOp::False => {
+                    const_bool.insert(instr.value, false);
+                }
                 _ => {}
             }
         }
@@ -38,33 +46,27 @@ pub fn run(graph: &mut MirGraph) {
             let value = instr.value;
             let new_op = match &instr.op {
                 // ---- i32 arithmetic ----
-                MirOp::AddI32 { lhs, rhs, .. } => {
-                    match (const_i32.get(lhs), const_i32.get(rhs)) {
-                        (Some(&a), Some(&b)) => a.checked_add(b).map(|r| {
-                            const_i32.insert(value, r);
-                            MirOp::ConstInt32(r)
-                        }),
-                        _ => None,
-                    }
-                }
-                MirOp::SubI32 { lhs, rhs, .. } => {
-                    match (const_i32.get(lhs), const_i32.get(rhs)) {
-                        (Some(&a), Some(&b)) => a.checked_sub(b).map(|r| {
-                            const_i32.insert(value, r);
-                            MirOp::ConstInt32(r)
-                        }),
-                        _ => None,
-                    }
-                }
-                MirOp::MulI32 { lhs, rhs, .. } => {
-                    match (const_i32.get(lhs), const_i32.get(rhs)) {
-                        (Some(&a), Some(&b)) => a.checked_mul(b).map(|r| {
-                            const_i32.insert(value, r);
-                            MirOp::ConstInt32(r)
-                        }),
-                        _ => None,
-                    }
-                }
+                MirOp::AddI32 { lhs, rhs, .. } => match (const_i32.get(lhs), const_i32.get(rhs)) {
+                    (Some(&a), Some(&b)) => a.checked_add(b).map(|r| {
+                        const_i32.insert(value, r);
+                        MirOp::ConstInt32(r)
+                    }),
+                    _ => None,
+                },
+                MirOp::SubI32 { lhs, rhs, .. } => match (const_i32.get(lhs), const_i32.get(rhs)) {
+                    (Some(&a), Some(&b)) => a.checked_sub(b).map(|r| {
+                        const_i32.insert(value, r);
+                        MirOp::ConstInt32(r)
+                    }),
+                    _ => None,
+                },
+                MirOp::MulI32 { lhs, rhs, .. } => match (const_i32.get(lhs), const_i32.get(rhs)) {
+                    (Some(&a), Some(&b)) => a.checked_mul(b).map(|r| {
+                        const_i32.insert(value, r);
+                        MirOp::ConstInt32(r)
+                    }),
+                    _ => None,
+                },
                 MirOp::IncI32 { val, .. } => {
                     const_i32.get(val).and_then(|&a| a.checked_add(1)).map(|r| {
                         const_i32.insert(value, r);
@@ -118,21 +120,17 @@ pub fn run(graph: &mut MirGraph) {
                         _ => None,
                     }
                 }
-                MirOp::NegF64(val) => {
-                    const_f64.get(val).copied().map(|a| {
-                        let r = -a;
-                        const_f64.insert(value, r);
-                        MirOp::ConstFloat64(r)
-                    })
-                }
+                MirOp::NegF64(val) => const_f64.get(val).copied().map(|a| {
+                    let r = -a;
+                    const_f64.insert(value, r);
+                    MirOp::ConstFloat64(r)
+                }),
 
                 // ---- Logical NOT ----
-                MirOp::LogicalNot(val) => {
-                    const_bool.get(val).copied().map(|b| {
-                        const_bool.insert(value, !b);
-                        if !b { MirOp::True } else { MirOp::False }
-                    })
-                }
+                MirOp::LogicalNot(val) => const_bool.get(val).copied().map(|b| {
+                    const_bool.insert(value, !b);
+                    if !b { MirOp::True } else { MirOp::False }
+                }),
 
                 // ---- Guards on known constants: always succeed → nop (Move) ----
                 MirOp::GuardInt32 { val, .. } => {
@@ -159,23 +157,26 @@ pub fn run(graph: &mut MirGraph) {
                 }
 
                 // ---- Branch on constant condition → unconditional jump ----
-                MirOp::Branch { cond, true_block, true_args, false_block, false_args, .. } => {
-                    const_bool.get(cond).map(|&b| {
-                        if b {
-                            MirOp::Jump(*true_block, true_args.clone())
-                        } else {
-                            MirOp::Jump(*false_block, false_args.clone())
-                        }
-                    })
-                }
+                MirOp::Branch {
+                    cond,
+                    true_block,
+                    true_args,
+                    false_block,
+                    false_args,
+                    ..
+                } => const_bool.get(cond).map(|&b| {
+                    if b {
+                        MirOp::Jump(*true_block, true_args.clone())
+                    } else {
+                        MirOp::Jump(*false_block, false_args.clone())
+                    }
+                }),
 
                 // ---- BoxInt32(ConstInt32) → Const (known NaN-boxed value) ----
-                MirOp::BoxInt32(val) => {
-                    const_i32.get(val).map(|&v| {
-                        let boxed = 0x7FF8_0001_0000_0000u64 | (v as u32 as u64);
-                        MirOp::Const(boxed)
-                    })
-                }
+                MirOp::BoxInt32(val) => const_i32.get(val).map(|&v| {
+                    let boxed = 0x7FF8_0001_0000_0000u64 | (v as u32 as u64);
+                    MirOp::Const(boxed)
+                }),
 
                 _ => None,
             };

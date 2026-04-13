@@ -19,8 +19,8 @@ use crate::value::RegisterValue;
 
 use super::step_outcome::{Completion, StepOutcome, TailCallPayload, YieldStarResult};
 use super::{
-    Activation, FrameRuntimeState, Interpreter, InterpreterError, RuntimeState, ToPrimitiveHint,
-    EXECUTION_INTERRUPTED_MESSAGE,
+    Activation, EXECUTION_INTERRUPTED_MESSAGE, FrameRuntimeState, Interpreter, InterpreterError,
+    RuntimeState, ToPrimitiveHint,
 };
 
 impl Interpreter {
@@ -1304,7 +1304,8 @@ impl Interpreter {
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
                 // Record arithmetic feedback for JIT.
                 frame_runtime.record_arithmetic(
-                    function, activation.pc(),
+                    function,
+                    activation.pc(),
                     Self::classify_arithmetic_operands(lhs, rhs),
                 );
                 let value = runtime.js_add(lhs, rhs)?;
@@ -1316,7 +1317,8 @@ impl Interpreter {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
                 frame_runtime.record_arithmetic(
-                    function, activation.pc(),
+                    function,
+                    activation.pc(),
                     Self::classify_arithmetic_operands(lhs, rhs),
                 );
                 // i32 fast-path
@@ -1365,7 +1367,8 @@ impl Interpreter {
                 let lhs = activation.read_bytecode_register(function, instruction.b())?;
                 let rhs = activation.read_bytecode_register(function, instruction.c())?;
                 frame_runtime.record_arithmetic(
-                    function, activation.pc(),
+                    function,
+                    activation.pc(),
                     Self::classify_arithmetic_operands(lhs, rhs),
                 );
                 // i32 fast-path

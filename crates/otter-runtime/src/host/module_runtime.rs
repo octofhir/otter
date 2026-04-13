@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use otter_jit::deopt::{DeoptError, execute_module_entry_with_runtime};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
@@ -8,7 +9,7 @@ use oxc_span::{GetSpan, SourceType as OxcSourceType};
 use otter_vm::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use otter_vm::object::ObjectHandle;
 use otter_vm::payload::VmTrace;
-use otter_vm::{Interpreter, RegisterValue, RuntimeState};
+use otter_vm::{RegisterValue, RuntimeState};
 
 use super::{
     HostedNativeModule, HostedNativeModuleRegistry, ImportContext, ModuleGraph, ModuleGraphNode,
@@ -497,9 +498,9 @@ fn evaluate_loaded_module(
     } else {
         let module =
             compile_transformed_module(&transformed_source, url, module_type, source_type)?;
-        match Interpreter::for_runtime(runtime).execute_module(&module, runtime) {
+        match execute_module_entry_with_runtime(&module, runtime, std::ptr::null(), None) {
             Ok(_) => Ok(()),
-            Err(error) => {
+            Err(DeoptError::Interpreter(error)) => {
                 // Stash the raw thrown value (when present) so the outer
                 // host runtime can promote it back into a structured
                 // `JsRuntimeDiagnostic` for the CLI reporter. The legacy
@@ -512,6 +513,7 @@ fn evaluate_loaded_module(
                 let message = crate::runtime::format_interpreter_error(&error, runtime);
                 Err(VmNativeCallError::Internal(message.into()))
             }
+            Err(error) => Err(VmNativeCallError::Internal(error.to_string().into())),
         }
     };
 

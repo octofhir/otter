@@ -6,7 +6,9 @@
 //! Spec: ECMA-262 §15.2 (FunctionExpression), §15.3 (ArrowFunction),
 //! §15.7 (ClassExpression), §13.2.5.5 (NamedEvaluation).
 
-use super::ast::{expected_function_length, extract_function_params, extract_function_params_from_formal};
+use super::ast::{
+    expected_function_length, extract_function_params, extract_function_params_from_formal,
+};
 use super::module_compiler::{FunctionIdentity, ModuleCompiler};
 use super::shared::{FunctionCompiler, FunctionKind, ValueLocation};
 use super::*;

@@ -57,7 +57,10 @@ pub fn run(graph: &mut MirGraph) {
             .iter()
             .flat_map(|&bid| {
                 let block = &graph.blocks[bid.0 as usize];
-                block.instrs.iter().map(|i| i.value)
+                block
+                    .instrs
+                    .iter()
+                    .map(|i| i.value)
                     .chain(block.params.iter().map(|p| p.value))
             })
             .collect();
@@ -175,31 +178,52 @@ fn all_operands_invariant(
     invariant: &HashSet<ValueId>,
 ) -> bool {
     let operands = collect_operands(op);
-    operands.iter().all(|v| {
-        !loop_defined.contains(v) || invariant.contains(v)
-    })
+    operands
+        .iter()
+        .all(|v| !loop_defined.contains(v) || invariant.contains(v))
 }
 
 /// Collect ValueId operands from a MirOp.
 fn collect_operands(op: &MirOp) -> Vec<ValueId> {
     let mut vals = Vec::new();
     match op {
-        MirOp::Const(_) | MirOp::ConstInt32(_) | MirOp::ConstFloat64(_)
-        | MirOp::True | MirOp::False | MirOp::Undefined | MirOp::Null => {}
+        MirOp::Const(_)
+        | MirOp::ConstInt32(_)
+        | MirOp::ConstFloat64(_)
+        | MirOp::True
+        | MirOp::False
+        | MirOp::Undefined
+        | MirOp::Null => {}
 
-        MirOp::BoxInt32(v) | MirOp::BoxFloat64(v) | MirOp::BoxBool(v)
-        | MirOp::UnboxInt32(v) | MirOp::UnboxFloat64(v) | MirOp::Int32ToFloat64(v)
-        | MirOp::NegF64(v) | MirOp::BitNot(v) | MirOp::LogicalNot(v)
-        | MirOp::Move(v) => { vals.push(*v); }
+        MirOp::BoxInt32(v)
+        | MirOp::BoxFloat64(v)
+        | MirOp::BoxBool(v)
+        | MirOp::UnboxInt32(v)
+        | MirOp::UnboxFloat64(v)
+        | MirOp::Int32ToFloat64(v)
+        | MirOp::NegF64(v)
+        | MirOp::BitNot(v)
+        | MirOp::LogicalNot(v)
+        | MirOp::Move(v) => {
+            vals.push(*v);
+        }
 
-        MirOp::AddF64 { lhs, rhs } | MirOp::SubF64 { lhs, rhs }
-        | MirOp::MulF64 { lhs, rhs } | MirOp::DivF64 { lhs, rhs }
-        | MirOp::BitAnd { lhs, rhs } | MirOp::BitOr { lhs, rhs }
-        | MirOp::BitXor { lhs, rhs } | MirOp::Shl { lhs, rhs }
-        | MirOp::Shr { lhs, rhs } | MirOp::Ushr { lhs, rhs }
-        | MirOp::CmpI32 { lhs, rhs, .. } | MirOp::CmpF64 { lhs, rhs, .. }
-        | MirOp::CmpStrictEq { lhs, rhs } | MirOp::CmpStrictNe { lhs, rhs } => {
-            vals.push(*lhs); vals.push(*rhs);
+        MirOp::AddF64 { lhs, rhs }
+        | MirOp::SubF64 { lhs, rhs }
+        | MirOp::MulF64 { lhs, rhs }
+        | MirOp::DivF64 { lhs, rhs }
+        | MirOp::BitAnd { lhs, rhs }
+        | MirOp::BitOr { lhs, rhs }
+        | MirOp::BitXor { lhs, rhs }
+        | MirOp::Shl { lhs, rhs }
+        | MirOp::Shr { lhs, rhs }
+        | MirOp::Ushr { lhs, rhs }
+        | MirOp::CmpI32 { lhs, rhs, .. }
+        | MirOp::CmpF64 { lhs, rhs, .. }
+        | MirOp::CmpStrictEq { lhs, rhs }
+        | MirOp::CmpStrictNe { lhs, rhs } => {
+            vals.push(*lhs);
+            vals.push(*rhs);
         }
 
         _ => {} // Non-pure ops won't be candidates anyway.
@@ -221,13 +245,17 @@ mod tests {
         let bb1 = graph.create_block();
 
         let cond = graph.push_instr(bb0, MirOp::True, 0);
-        graph.push_instr(bb0, MirOp::Branch {
-            cond,
-            true_block: bb1,
-            true_args: vec![],
-            false_block: bb1, // simplified
-            false_args: vec![],
-        }, 1);
+        graph.push_instr(
+            bb0,
+            MirOp::Branch {
+                cond,
+                true_block: bb1,
+                true_args: vec![],
+                false_block: bb1, // simplified
+                false_args: vec![],
+            },
+            1,
+        );
         graph.push_instr(bb1, MirOp::Jump(bb0, vec![]), 2);
 
         graph.recompute_edges();

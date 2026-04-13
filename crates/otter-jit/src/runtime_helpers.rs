@@ -4,7 +4,7 @@ use crate::context::JitContext;
 use crate::telemetry::{self, HelperFamily};
 use crate::{BAILOUT_SENTINEL, BailoutReason};
 use otter_vm::object::{ObjectHandle, PropertyValue};
-use otter_vm::{FunctionIndex, Module, ObjectShapeId, RegisterValue, RuntimeState};
+use otter_vm::{Function, FunctionIndex, Module, ObjectShapeId, RegisterValue, RuntimeState};
 
 use otter_vm::property::PropertyNameId;
 
@@ -19,6 +19,20 @@ fn write_bailout(ctx: &mut JitContext, reason: BailoutReason, bytecode_pc: u32) 
 unsafe fn module(ctx: &JitContext) -> Option<&Module> {
     let ptr = ctx.module_ptr.cast::<Module>();
     (!ptr.is_null()).then(|| unsafe { &*ptr })
+}
+
+unsafe fn active_function(ctx: &JitContext) -> Option<&Function> {
+    let function_ptr = ctx.function_ptr.cast::<Function>();
+    if !function_ptr.is_null() {
+        return Some(unsafe { &*function_ptr });
+    }
+
+    let module_ptr = ctx.module_ptr.cast::<Module>();
+    if module_ptr.is_null() {
+        return None;
+    }
+    let module = unsafe { &*module_ptr };
+    module.function(module.entry())
 }
 
 unsafe fn runtime(ctx: &mut JitContext) -> Option<&mut RuntimeState> {
@@ -96,6 +110,20 @@ pub extern "C" fn otter_set_prop_shaped(
     }
 }
 
+/// A write barrier helper for the baseline JIT.
+///
+/// Called after a direct property store in jitted code. Currently a no-op until
+/// the TypedHeap moves to a generational collection model that tracks handle
+/// stores.
+pub extern "C" fn otter_baseline_write_barrier(
+    _ctx: *mut JitContext,
+    _obj_bits: i64,
+    _value_bits: i64,
+) {
+    // TODO: Integrate with generational GC remembered set once handle-based
+    // objects move to the page-based GC.
+}
+
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn otter_call_direct(
     ctx: *mut JitContext,
@@ -160,6 +188,57 @@ pub extern "C" fn otter_call_direct(
     }
 }
 
+/// A dedicated fast path for baseline direct calls. Instead of accepting
+/// N registers through the C ABI, it reads directly from the caller's
+/// register window at `arg_base`.
+pub extern "C" fn otter_baseline_call_direct(
+    ctx: *mut JitContext,
+    callee_index: u32,
+    arg_base: u16,
+    argc: u16,
+    bytecode_pc: u32,
+) -> i64 {
+    telemetry::record_helper_call(HelperFamily::Call);
+    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+        return BAILOUT_SENTINEL as i64;
+    };
+    let Some(module) = (unsafe { module(ctx) }) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc) as i64;
+    };
+    let callee_index_id = FunctionIndex(callee_index);
+    let Some(function) = module.function(callee_index_id) else {
+        return write_bailout(ctx, BailoutReason::CallTargetMismatch, bytecode_pc) as i64;
+    };
+
+    let register_count = usize::from(function.frame_layout().register_count());
+    let mut callee_registers = vec![RegisterValue::undefined(); register_count];
+    let parameter_range = function.frame_layout().parameter_range();
+
+    // Copy args directly from caller's register array.
+    let caller_registers_ptr = ctx.registers_base.cast::<RegisterValue>();
+    for offset in 0..usize::from(argc) {
+        let src_idx = usize::from(arg_base) + offset;
+        if src_idx >= ctx.local_count as usize {
+            break;
+        }
+        let dst_idx = usize::from(parameter_range.start()) + offset;
+        if dst_idx >= usize::from(parameter_range.end()) {
+            break;
+        }
+        callee_registers[dst_idx] = unsafe { *caller_registers_ptr.add(src_idx) };
+    }
+
+    match crate::deopt::execute_function_with_fallback(
+        module,
+        callee_index_id,
+        &mut callee_registers,
+        ctx.interrupt_flag,
+    ) {
+        Ok(result) => result.return_value().raw_bits() as i64,
+        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc) as i64,
+    }
+}
+
 /// Resolve the property name from the module's entry function side table.
 /// Must be called BEFORE borrowing ctx mutably (for runtime).
 unsafe fn resolve_property_name_from_ctx(
@@ -167,12 +246,7 @@ unsafe fn resolve_property_name_from_ctx(
     prop_id: u16,
 ) -> Option<&'static str> {
     let ctx_ref = unsafe { &*ctx };
-    let module_ptr = ctx_ref.module_ptr.cast::<Module>();
-    if module_ptr.is_null() {
-        return None;
-    }
-    let module = unsafe { &*module_ptr };
-    let function = module.function(module.entry())?;
+    let function = unsafe { active_function(ctx_ref) }?;
     function.property_names().get(PropertyNameId(prop_id))
 }
 
@@ -256,6 +330,66 @@ pub extern "C" fn otter_set_prop_generic(
     let interned = runtime.intern_property_name(name_str);
 
     match runtime.objects_mut().set_property(handle, interned, value) {
+        Ok(_) => 0,
+        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
+    }
+}
+
+pub extern "C" fn otter_get_global(ctx: *mut JitContext, prop_id: i64, bytecode_pc: i64) -> i64 {
+    telemetry::record_helper_call(HelperFamily::GlobalAccess);
+    let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return BAILOUT_SENTINEL as i64;
+        };
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+        return BAILOUT_SENTINEL as i64;
+    };
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let property = runtime.intern_property_name(name_str);
+    let global = runtime.intrinsics().global_object();
+    match runtime.objects().get_property(global, property) {
+        Ok(Some(lookup)) => match lookup.value() {
+            PropertyValue::Data { value, .. } => value.raw_bits() as i64,
+            PropertyValue::Accessor { .. } => RegisterValue::undefined().raw_bits() as i64,
+        },
+        Ok(None) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
+        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
+    }
+}
+
+pub extern "C" fn otter_set_global(
+    ctx: *mut JitContext,
+    prop_id: i64,
+    value_bits: i64,
+    bytecode_pc: i64,
+) -> i64 {
+    telemetry::record_helper_call(HelperFamily::GlobalAccess);
+    let Some(name_str) = (unsafe { resolve_property_name_from_ctx(ctx, prop_id as u16) }) else {
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return BAILOUT_SENTINEL as i64;
+        };
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+        return BAILOUT_SENTINEL as i64;
+    };
+    let Some(runtime) = (unsafe { runtime(ctx) }) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+    let Some(value) = RegisterValue::from_raw_bits(value_bits as u64) else {
+        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64;
+    };
+
+    let property = runtime.intern_property_name(name_str);
+    let global = runtime.intrinsics().global_object();
+    match runtime.objects_mut().set_property(global, property, value) {
         Ok(_) => 0,
         Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc as u32) as i64,
     }

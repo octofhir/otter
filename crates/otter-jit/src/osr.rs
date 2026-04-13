@@ -245,7 +245,10 @@ impl OsrState {
         self.compile_count += 1;
         self.deopt_count = 0;
         // Reset budget with exponential backoff: base * 2^compile_count.
-        let backoff = self.budget.initial.saturating_mul(1 << self.compile_count.min(4));
+        let backoff = self
+            .budget
+            .initial
+            .saturating_mul(1 << self.compile_count.min(4));
         self.budget = InterruptBudget::new(backoff);
     }
 
@@ -305,11 +308,11 @@ mod tests {
         use otter_vm::bytecode::{Instruction, JumpOffset};
 
         let bytecodes = vec![
-            Instruction::nop(),                                    // 0
-            Instruction::nop(),                                    // 1: loop header
-            Instruction::nop(),                                    // 2
-            Instruction::jump(JumpOffset::new(-2)),                // 3: back-edge to 1
-            Instruction::nop(),                                    // 4
+            Instruction::nop(),                     // 0
+            Instruction::nop(),                     // 1: loop header
+            Instruction::nop(),                     // 2
+            Instruction::jump(JumpOffset::new(-2)), // 3: back-edge to 1
+            Instruction::nop(),                     // 4
         ];
 
         let headers = find_loop_headers(&bytecodes);
@@ -323,11 +326,11 @@ mod tests {
         use otter_vm::bytecode::{Instruction, JumpOffset};
 
         let bytecodes = vec![
-            Instruction::nop(),                                    // 0: outer header
-            Instruction::nop(),                                    // 1: inner header
-            Instruction::nop(),                                    // 2
-            Instruction::jump(JumpOffset::new(-2)),                // 3: inner back-edge → 1
-            Instruction::jump(JumpOffset::new(-4)),                // 4: outer back-edge → 0
+            Instruction::nop(),                     // 0: outer header
+            Instruction::nop(),                     // 1: inner header
+            Instruction::nop(),                     // 2
+            Instruction::jump(JumpOffset::new(-2)), // 3: inner back-edge → 1
+            Instruction::jump(JumpOffset::new(-4)), // 4: outer back-edge → 0
         ];
 
         let headers = find_loop_headers(&bytecodes);

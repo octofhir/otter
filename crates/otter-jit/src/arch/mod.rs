@@ -44,8 +44,8 @@ impl HostPlatform {
         {
             Self {
                 pointer_size: 8,
-                gp_register_count: 16,   // rax-r15
-                fp_register_count: 16,   // xmm0-xmm15
+                gp_register_count: 16,    // rax-r15
+                fp_register_count: 16,    // xmm0-xmm15
                 has_link_register: false, // Uses stack for return address.
                 name: "x86-64",
             }
@@ -56,7 +56,7 @@ impl HostPlatform {
                 pointer_size: 8,
                 gp_register_count: 31,   // x0-x30
                 fp_register_count: 32,   // v0-v31
-                has_link_register: true,  // x30 (LR)
+                has_link_register: true, // x30 (LR)
                 name: "aarch64",
             }
         }

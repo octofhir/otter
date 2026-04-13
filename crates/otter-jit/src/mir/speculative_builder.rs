@@ -116,8 +116,22 @@ pub fn emit_speculative_i32_binary(
     });
 
     // Guard both operands are Int32.
-    let lhs_i32 = graph.push_instr(block, MirOp::GuardInt32 { val: lhs_boxed, deopt }, pc);
-    let rhs_i32 = graph.push_instr(block, MirOp::GuardInt32 { val: rhs_boxed, deopt }, pc);
+    let lhs_i32 = graph.push_instr(
+        block,
+        MirOp::GuardInt32 {
+            val: lhs_boxed,
+            deopt,
+        },
+        pc,
+    );
+    let rhs_i32 = graph.push_instr(
+        block,
+        MirOp::GuardInt32 {
+            val: rhs_boxed,
+            deopt,
+        },
+        pc,
+    );
 
     // Typed operation with overflow deopt.
     graph.push_instr(block, make_op(lhs_i32, rhs_i32, deopt), pc)
@@ -138,8 +152,22 @@ pub fn emit_speculative_f64_binary(
         resume_mode: ResumeMode::ResumeAtPc,
     });
 
-    let lhs_f64 = graph.push_instr(block, MirOp::GuardFloat64 { val: lhs_boxed, deopt }, pc);
-    let rhs_f64 = graph.push_instr(block, MirOp::GuardFloat64 { val: rhs_boxed, deopt }, pc);
+    let lhs_f64 = graph.push_instr(
+        block,
+        MirOp::GuardFloat64 {
+            val: lhs_boxed,
+            deopt,
+        },
+        pc,
+    );
+    let rhs_f64 = graph.push_instr(
+        block,
+        MirOp::GuardFloat64 {
+            val: rhs_boxed,
+            deopt,
+        },
+        pc,
+    );
 
     graph.push_instr(block, make_op(lhs_f64, rhs_f64), pc)
 }
@@ -160,10 +188,25 @@ pub fn emit_speculative_prop_load(
     });
 
     // Guard that the receiver is an object.
-    let obj = graph.push_instr(block, MirOp::GuardObject { val: obj_boxed, deopt }, pc);
+    let obj = graph.push_instr(
+        block,
+        MirOp::GuardObject {
+            val: obj_boxed,
+            deopt,
+        },
+        pc,
+    );
 
     // Guard the shape matches.
-    graph.push_instr(block, MirOp::GuardShape { obj, shape_id, deopt }, pc);
+    graph.push_instr(
+        block,
+        MirOp::GuardShape {
+            obj,
+            shape_id,
+            deopt,
+        },
+        pc,
+    );
 
     // Load from the known slot offset.
     graph.push_instr(
@@ -193,8 +236,22 @@ pub fn emit_speculative_i32_cmp(
         resume_mode: ResumeMode::ResumeAtPc,
     });
 
-    let lhs_i32 = graph.push_instr(block, MirOp::GuardInt32 { val: lhs_boxed, deopt }, pc);
-    let rhs_i32 = graph.push_instr(block, MirOp::GuardInt32 { val: rhs_boxed, deopt }, pc);
+    let lhs_i32 = graph.push_instr(
+        block,
+        MirOp::GuardInt32 {
+            val: lhs_boxed,
+            deopt,
+        },
+        pc,
+    );
+    let rhs_i32 = graph.push_instr(
+        block,
+        MirOp::GuardInt32 {
+            val: rhs_boxed,
+            deopt,
+        },
+        pc,
+    );
 
     graph.push_instr(
         block,
@@ -215,9 +272,10 @@ mod tests {
     use otter_vm::feedback::*;
 
     fn make_feedback_int32_add() -> FeedbackVector {
-        let layout = FeedbackTableLayout::new(vec![
-            FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Arithmetic),
-        ]);
+        let layout = FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+            FeedbackSlotId(0),
+            FeedbackKind::Arithmetic,
+        )]);
         let mut fv = FeedbackVector::from_layout(&layout);
         fv.record_arithmetic(FeedbackSlotId(0), ArithmeticFeedback::Int32);
         fv
@@ -226,13 +284,19 @@ mod tests {
     #[test]
     fn test_decide_arithmetic_int32() {
         let fv = make_feedback_int32_add();
-        assert_eq!(decide_arithmetic(&fv, FeedbackSlotId(0)), ArithSpeculation::Int32);
+        assert_eq!(
+            decide_arithmetic(&fv, FeedbackSlotId(0)),
+            ArithSpeculation::Int32
+        );
     }
 
     #[test]
     fn test_decide_arithmetic_no_feedback() {
         let fv = FeedbackVector::empty();
-        assert_eq!(decide_arithmetic(&fv, FeedbackSlotId(0)), ArithSpeculation::Generic);
+        assert_eq!(
+            decide_arithmetic(&fv, FeedbackSlotId(0)),
+            ArithSpeculation::Generic
+        );
     }
 
     #[test]
@@ -244,16 +308,18 @@ mod tests {
         let lhs = graph.push_instr(bb, MirOp::LoadLocal(0), 0);
         let rhs = graph.push_instr(bb, MirOp::LoadLocal(1), 1);
 
-        let result = emit_speculative_i32_binary(
-            &mut graph, bb, 2, lhs, rhs,
-            |l, r, d| MirOp::AddI32 { lhs: l, rhs: r, deopt: d },
-        );
+        let result =
+            emit_speculative_i32_binary(&mut graph, bb, 2, lhs, rhs, |l, r, d| MirOp::AddI32 {
+                lhs: l,
+                rhs: r,
+                deopt: d,
+            });
 
         // Should emit: GuardInt32(lhs), GuardInt32(rhs), AddI32
         let instrs = &graph.block(bb).instrs;
         assert!(matches!(instrs[2].op, MirOp::GuardInt32 { .. })); // Guard lhs
         assert!(matches!(instrs[3].op, MirOp::GuardInt32 { .. })); // Guard rhs
-        assert!(matches!(instrs[4].op, MirOp::AddI32 { .. }));     // Typed add
+        assert!(matches!(instrs[4].op, MirOp::AddI32 { .. })); // Typed add
         assert_eq!(instrs[4].value, result);
     }
 
@@ -267,8 +333,18 @@ mod tests {
 
         let instrs = &graph.block(bb).instrs;
         assert!(matches!(instrs[1].op, MirOp::GuardObject { .. }));
-        assert!(matches!(instrs[2].op, MirOp::GuardShape { shape_id: 42, .. }));
-        assert!(matches!(instrs[3].op, MirOp::GetPropShaped { shape_id: 42, offset: 16, .. }));
+        assert!(matches!(
+            instrs[2].op,
+            MirOp::GuardShape { shape_id: 42, .. }
+        ));
+        assert!(matches!(
+            instrs[3].op,
+            MirOp::GetPropShaped {
+                shape_id: 42,
+                offset: 16,
+                ..
+            }
+        ));
         assert_eq!(instrs[3].value, result);
     }
 
@@ -290,14 +366,18 @@ mod tests {
     fn test_decide_property_monomorphic() {
         use otter_vm::object::ObjectShapeId;
 
-        let layout = FeedbackTableLayout::new(vec![
-            FeedbackSlotLayout::new(FeedbackSlotId(0), FeedbackKind::Property),
-        ]);
+        let layout = FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
+            FeedbackSlotId(0),
+            FeedbackKind::Property,
+        )]);
         let mut fv = FeedbackVector::from_layout(&layout);
         fv.record_property(FeedbackSlotId(0), ObjectShapeId(42), 3);
 
         match decide_property(&fv, FeedbackSlotId(0)) {
-            PropSpeculation::Monomorphic { shape_id, slot_index } => {
+            PropSpeculation::Monomorphic {
+                shape_id,
+                slot_index,
+            } => {
                 assert_eq!(shape_id, 42);
                 assert_eq!(slot_index, 3);
             }

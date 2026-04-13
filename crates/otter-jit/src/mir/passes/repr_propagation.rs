@@ -58,7 +58,10 @@ pub fn run(graph: &mut MirGraph) -> ReprMap {
         // Block params: use the abstract type to choose repr.
         for param in &block.params {
             let repr = abstract_type_to_repr(
-                type_map.get(&param.value).copied().unwrap_or(AbstractType::ANY),
+                type_map
+                    .get(&param.value)
+                    .copied()
+                    .unwrap_or(AbstractType::ANY),
             );
             repr_map.insert(param.value, repr);
         }
@@ -146,22 +149,37 @@ fn choose_repr(op: &MirOp, type_map: &TypeMap, value: ValueId) -> Repr {
         MirOp::Int32ToFloat64(_) => Repr::Float64,
 
         // ---- i32 arithmetic ----
-        MirOp::AddI32 { .. } | MirOp::SubI32 { .. } | MirOp::MulI32 { .. }
-        | MirOp::DivI32 { .. } | MirOp::ModI32 { .. }
-        | MirOp::IncI32 { .. } | MirOp::DecI32 { .. } | MirOp::NegI32 { .. } => Repr::Int32,
+        MirOp::AddI32 { .. }
+        | MirOp::SubI32 { .. }
+        | MirOp::MulI32 { .. }
+        | MirOp::DivI32 { .. }
+        | MirOp::ModI32 { .. }
+        | MirOp::IncI32 { .. }
+        | MirOp::DecI32 { .. }
+        | MirOp::NegI32 { .. } => Repr::Int32,
 
         // ---- f64 arithmetic ----
-        MirOp::AddF64 { .. } | MirOp::SubF64 { .. } | MirOp::MulF64 { .. }
-        | MirOp::DivF64 { .. } | MirOp::ModF64 { .. } | MirOp::NegF64(_) => Repr::Float64,
+        MirOp::AddF64 { .. }
+        | MirOp::SubF64 { .. }
+        | MirOp::MulF64 { .. }
+        | MirOp::DivF64 { .. }
+        | MirOp::ModF64 { .. }
+        | MirOp::NegF64(_) => Repr::Float64,
 
         // ---- Bitwise: always i32 ----
-        MirOp::BitAnd { .. } | MirOp::BitOr { .. } | MirOp::BitXor { .. }
-        | MirOp::Shl { .. } | MirOp::Shr { .. } | MirOp::Ushr { .. }
+        MirOp::BitAnd { .. }
+        | MirOp::BitOr { .. }
+        | MirOp::BitXor { .. }
+        | MirOp::Shl { .. }
+        | MirOp::Shr { .. }
+        | MirOp::Ushr { .. }
         | MirOp::BitNot(_) => Repr::Int32,
 
         // ---- Comparisons: result is boolean (tagged) ----
-        MirOp::CmpI32 { .. } | MirOp::CmpF64 { .. }
-        | MirOp::CmpStrictEq { .. } | MirOp::CmpStrictNe { .. }
+        MirOp::CmpI32 { .. }
+        | MirOp::CmpF64 { .. }
+        | MirOp::CmpStrictEq { .. }
+        | MirOp::CmpStrictNe { .. }
         | MirOp::LogicalNot(_) => Repr::Tagged,
 
         // ---- Move: inherit source repr ----
@@ -223,7 +241,15 @@ mod tests {
         // v2 = ConstInt32(1)
         let v2 = graph.push_instr(bb, MirOp::ConstInt32(1), 2);
         // v3 = AddI32(v1, v2) → Int32
-        let v3 = graph.push_instr(bb, MirOp::AddI32 { lhs: v1, rhs: v2, deopt }, 3);
+        let v3 = graph.push_instr(
+            bb,
+            MirOp::AddI32 {
+                lhs: v1,
+                rhs: v2,
+                deopt,
+            },
+            3,
+        );
         // v4 = BoxInt32(v3) → Tagged
         let v4 = graph.push_instr(bb, MirOp::BoxInt32(v3), 4);
         graph.push_instr(bb, MirOp::Return(v4), 5);

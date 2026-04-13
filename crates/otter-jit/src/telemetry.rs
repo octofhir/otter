@@ -259,15 +259,18 @@ pub fn record_function_compiled(
     TELEMETRY.with(|t| {
         let mut state = t.borrow_mut();
         let key = format!("{name}@tier{tier}");
-        let entry = state.functions.entry(key).or_insert_with(|| FunctionStatsEntry {
-            name: name.to_string(),
-            tier,
-            compile_time_ns: 0,
-            code_size_bytes: 0,
-            deopt_count: 0,
-            recompile_count: 0,
-            jit_entries: 0,
-        });
+        let entry = state
+            .functions
+            .entry(key)
+            .or_insert_with(|| FunctionStatsEntry {
+                name: name.to_string(),
+                tier,
+                compile_time_ns: 0,
+                code_size_bytes: 0,
+                deopt_count: 0,
+                recompile_count: 0,
+                jit_entries: 0,
+            });
         entry.compile_time_ns = compile_time_ns;
         entry.code_size_bytes = code_size_bytes;
         entry.recompile_count += 1;

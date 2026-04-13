@@ -1,6 +1,13 @@
 // JIT benchmark: int32/f64 arithmetic in tight loop
 // Measures: typed arithmetic fast paths, overflow handling, loop back-edge efficiency
 
+function readPositiveIntArg(index: number, fallback: number): number {
+  const raw = process.argv[index];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function benchInt32Add(n: number): number {
   let sum = 0;
   for (let i = 0; i < n; i++) {
@@ -37,8 +44,8 @@ function benchMixed(n: number): number {
   return floatSum;
 }
 
-const N = 1_000_000;
-const ITERS = 50;
+const N = readPositiveIntArg(2, 1_000_000);
+const ITERS = readPositiveIntArg(3, 50);
 
 const start = Date.now();
 for (let iter = 0; iter < ITERS; iter++) {

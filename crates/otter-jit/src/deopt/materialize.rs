@@ -95,9 +95,10 @@ impl FrameStateSnapshot {
         self.registers
             .iter()
             .map(|cmd| match cmd {
-                MaterializeCommand::Register(idx) => {
-                    jit_registers.get(*idx as usize).copied().unwrap_or(TAG_UNDEFINED)
-                }
+                MaterializeCommand::Register(idx) => jit_registers
+                    .get(*idx as usize)
+                    .copied()
+                    .unwrap_or(TAG_UNDEFINED),
                 MaterializeCommand::Constant(bits) => *bits,
                 MaterializeCommand::BoxInt32(idx) => {
                     let raw = jit_registers.get(*idx as usize).copied().unwrap_or(0);

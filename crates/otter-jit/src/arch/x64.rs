@@ -21,10 +21,22 @@ use super::CodeBuffer;
 #[repr(u8)]
 #[allow(dead_code)]
 pub enum Reg {
-    Rax = 0, Rcx = 1, Rdx = 2, Rbx = 3,
-    Rsp = 4, Rbp = 5, Rsi = 6, Rdi = 7,
-    R8 = 8, R9 = 9, R10 = 10, R11 = 11,
-    R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+    Rax = 0,
+    Rcx = 1,
+    Rdx = 2,
+    Rbx = 3,
+    Rsp = 4,
+    Rbp = 5,
+    Rsi = 6,
+    Rdi = 7,
+    R8 = 8,
+    R9 = 9,
+    R10 = 10,
+    R11 = 11,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
 }
 
 impl Reg {
@@ -54,9 +66,15 @@ impl<'a> Assembler<'a> {
 
     fn rex(&mut self, w: bool, r: Reg, b: Reg) {
         let mut rex = 0x40;
-        if w { rex |= 0x08; }
-        if r.is_extended() { rex |= 0x04; }
-        if b.is_extended() { rex |= 0x01; }
+        if w {
+            rex |= 0x08;
+        }
+        if r.is_extended() {
+            rex |= 0x04;
+        }
+        if b.is_extended() {
+            rex |= 0x01;
+        }
         if rex != 0x40 {
             self.buf.emit_u8(rex);
         }
@@ -155,16 +173,17 @@ impl<'a> Assembler<'a> {
     /// ; ZF set if match → je target
     /// ```
     pub fn check_int32_tag(&mut self, src: Reg) {
+        use otter_vm::value::{INT32_TAG_MASK, TAG_INT32};
         // mov rax, src
         self.mov_rr(Reg::Rax, src);
         // movabs rcx, INT32_TAG_MASK
-        self.mov_imm64(Reg::Rcx, 0xFFFF_FFFF_0000_0000);
+        self.mov_imm64(Reg::Rcx, INT32_TAG_MASK);
         // and rax, rcx
         self.rex_w(Reg::Rax, Reg::Rax);
         self.buf.emit_u8(0x21); // and r/m64, r64
         self.modrm_rr(Reg::Rcx, Reg::Rax);
         // movabs rcx, TAG_INT32
-        self.mov_imm64(Reg::Rcx, 0x7FF8_0001_0000_0000);
+        self.mov_imm64(Reg::Rcx, TAG_INT32);
         // cmp rax, rcx
         self.rex_w(Reg::Rax, Reg::Rcx);
         self.buf.emit_u8(0x39); // cmp r/m64, r64
@@ -175,12 +194,13 @@ impl<'a> Assembler<'a> {
     /// Emit a tag check: test if value in `src` is an object pointer.
     /// Sets ZF if the value IS an object.
     pub fn check_object_tag(&mut self, src: Reg) {
+        use otter_vm::value::{OBJECT_TAG_MASK, TAG_PTR_OBJECT};
         self.mov_rr(Reg::Rax, src);
-        self.mov_imm64(Reg::Rcx, 0xFFFF_0000_0000_0000); // TAG_MASK
+        self.mov_imm64(Reg::Rcx, OBJECT_TAG_MASK); // TAG_MASK
         self.rex_w(Reg::Rax, Reg::Rax);
         self.buf.emit_u8(0x21);
         self.modrm_rr(Reg::Rcx, Reg::Rax);
-        self.mov_imm64(Reg::Rcx, 0x7FFC_0000_0000_0000); // TAG_PTR_OBJECT
+        self.mov_imm64(Reg::Rcx, TAG_PTR_OBJECT); // TAG_PTR_OBJECT
         self.rex_w(Reg::Rax, Reg::Rcx);
         self.buf.emit_u8(0x39);
         self.modrm_rr(Reg::Rcx, Reg::Rax);
@@ -200,11 +220,15 @@ impl<'a> Assembler<'a> {
     /// `src` has the i32 in lower 32 bits.
     /// Result: TAG_INT32 | (src as u32)
     pub fn box_int32(&mut self, dst: Reg, src: Reg) {
+        use otter_vm::value::TAG_INT32;
         // movabs dst, TAG_INT32
-        self.mov_imm64(dst, 0x7FF8_0001_0000_0000);
+        self.mov_imm64(dst, TAG_INT32);
+
         // Zero-extend src to 64-bit in rcx.
         // mov ecx, src (32-bit mov zero-extends to 64-bit)
-        if src.is_extended() { self.buf.emit_u8(0x44); }
+        if src.is_extended() {
+            self.buf.emit_u8(0x44);
+        }
         self.buf.emit_u8(0x89);
         self.modrm_rr(src, Reg::Rcx);
         // or dst, rcx
@@ -269,6 +293,9 @@ mod tests {
         let mut asm = Assembler::new(&mut buf);
         asm.check_int32_tag(Reg::Rsi);
         // Should emit a non-trivial sequence.
-        assert!(buf.len() > 10, "tag check should emit multiple instructions");
+        assert!(
+            buf.len() > 10,
+            "tag check should emit multiple instructions"
+        );
     }
 }

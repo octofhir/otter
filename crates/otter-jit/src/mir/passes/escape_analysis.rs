@@ -146,8 +146,7 @@ fn check_uses(
         }
 
         // Calls: any allocation passed as argument escapes.
-        MirOp::CallGeneric { callee, args, .. }
-        | MirOp::ConstructGeneric { callee, args, .. } => {
+        MirOp::CallGeneric { callee, args, .. } | MirOp::ConstructGeneric { callee, args, .. } => {
             if allocs.contains(callee) {
                 mark_escape(infos, *callee, EscapeReason::PassedToCall);
             }
@@ -261,9 +260,17 @@ mod tests {
         // v1 = ConstInt32(42)
         let v1 = graph.push_instr(bb, MirOp::ConstInt32(42), 1);
         // SetPropShaped(v0, offset=0, v1) — store to the object itself
-        graph.push_instr(bb, MirOp::SetPropShaped {
-            obj: v0, shape_id: 1, offset: 0, val: v1, inline: true,
-        }, 2);
+        graph.push_instr(
+            bb,
+            MirOp::SetPropShaped {
+                obj: v0,
+                shape_id: 1,
+                offset: 0,
+                val: v1,
+                inline: true,
+            },
+            2,
+        );
         // Return v1 (NOT v0 — object doesn't escape)
         graph.push_instr(bb, MirOp::Return(v1), 3);
 
@@ -294,17 +301,23 @@ mod tests {
         let v0 = graph.push_instr(bb, MirOp::NewObject, 0);
         let callee = graph.push_instr(bb, MirOp::LoadLocal(0), 1);
         // Pass object as argument to a generic call.
-        graph.push_instr(bb, MirOp::CallGeneric {
-            callee,
-            args: vec![v0],
-            ic_index: 0,
-        }, 2);
+        graph.push_instr(
+            bb,
+            MirOp::CallGeneric {
+                callee,
+                args: vec![v0],
+                ic_index: 0,
+            },
+            2,
+        );
         let undef = graph.push_instr(bb, MirOp::Undefined, 3);
         graph.push_instr(bb, MirOp::Return(undef), 4);
 
         let results = analyze(&graph);
         let info = results.get(&v0).unwrap();
-        assert!(matches!(info.escape, EscapeState::Escapes(ref r) if r.contains(&EscapeReason::PassedToCall)));
+        assert!(
+            matches!(info.escape, EscapeState::Escapes(ref r) if r.contains(&EscapeReason::PassedToCall))
+        );
     }
 
     #[test]
@@ -316,12 +329,28 @@ mod tests {
         let v1 = graph.push_instr(bb, MirOp::ConstInt32(42), 1);
         let v2 = graph.push_instr(bb, MirOp::ConstInt32(99), 2);
         // Store two fields.
-        graph.push_instr(bb, MirOp::SetPropShaped {
-            obj: v0, shape_id: 1, offset: 0, val: v1, inline: true,
-        }, 3);
-        graph.push_instr(bb, MirOp::SetPropShaped {
-            obj: v0, shape_id: 1, offset: 8, val: v2, inline: true,
-        }, 4);
+        graph.push_instr(
+            bb,
+            MirOp::SetPropShaped {
+                obj: v0,
+                shape_id: 1,
+                offset: 0,
+                val: v1,
+                inline: true,
+            },
+            3,
+        );
+        graph.push_instr(
+            bb,
+            MirOp::SetPropShaped {
+                obj: v0,
+                shape_id: 1,
+                offset: 8,
+                val: v2,
+                inline: true,
+            },
+            4,
+        );
         graph.push_instr(bb, MirOp::Return(v1), 5);
 
         let results = analyze(&graph);

@@ -138,7 +138,10 @@ impl Activation {
         self.registers[..copy_len].copy_from_slice(&saved[..copy_len]);
     }
 
-    pub(super) fn receiver_slot(&self, function: &Function) -> Result<RegisterIndex, InterpreterError> {
+    pub(super) fn receiver_slot(
+        &self,
+        function: &Function,
+    ) -> Result<RegisterIndex, InterpreterError> {
         function
             .frame_layout()
             .receiver_slot()

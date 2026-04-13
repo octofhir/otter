@@ -202,27 +202,44 @@ impl Snapshot {
             let name = read_length_prefixed_string(r)?;
             let source_path = read_length_prefixed_string(r)?;
             let bytecode = read_length_prefixed_bytes(r)?;
-            bytecodes.push(BytecodeEntry { name, source_path, bytecode });
+            bytecodes.push(BytecodeEntry {
+                name,
+                source_path,
+                bytecode,
+            });
         }
 
         let mut profiles = Vec::with_capacity(header.profile_count as usize);
         for _ in 0..header.profile_count {
             let function_name = read_length_prefixed_string(r)?;
             let feedback_data = read_length_prefixed_bytes(r)?;
-            profiles.push(ProfileEntry { function_name, feedback_data });
+            profiles.push(ProfileEntry {
+                function_name,
+                feedback_data,
+            });
         }
 
-        Ok(Self { header, bytecodes, profiles })
+        Ok(Self {
+            header,
+            bytecodes,
+            profiles,
+        })
     }
 }
 
 fn current_arch() -> u8 {
     #[cfg(target_arch = "x86_64")]
-    { 0 }
+    {
+        0
+    }
     #[cfg(target_arch = "aarch64")]
-    { 1 }
+    {
+        1
+    }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 2 }
+    {
+        2
+    }
 }
 
 fn write_length_prefixed_string(w: &mut impl Write, s: &str) -> io::Result<()> {

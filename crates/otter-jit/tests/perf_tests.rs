@@ -5,9 +5,9 @@
 use std::time::Instant;
 
 use otter_jit::pipeline::{JitExecResult, compile_function, execute_function};
+use otter_vm::RegisterValue;
 use otter_vm::interpreter::Interpreter;
 use otter_vm::source::compile_script;
-use otter_vm::RegisterValue;
 
 // ============================================================
 // Core measurement helpers
@@ -34,7 +34,9 @@ fn measure_jit(script: &str, exec_iterations: u32) -> Option<(u64, u64, Register
     for _ in 0..exec_iterations {
         let mut runtime = RuntimeState::new();
         match execute_module_entry_with_runtime(&module, &mut runtime, std::ptr::null(), None) {
-            Ok(result) => { last_val = result.return_value(); }
+            Ok(result) => {
+                last_val = result.return_value();
+            }
             Err(_) => return None,
         }
     }
@@ -71,15 +73,21 @@ fn report(label: &str, interp_ns: u64, jit_compile_ns: u64, jit_exec_ns: u64) {
     };
     let breakeven = if interp_ns > jit_exec_ns {
         let saved_per_call = interp_ns - jit_exec_ns;
-        if saved_per_call > 0 { jit_compile_ns / saved_per_call } else { u64::MAX }
+        if saved_per_call > 0 {
+            jit_compile_ns / saved_per_call
+        } else {
+            u64::MAX
+        }
     } else {
         u64::MAX // JIT slower — never breaks even.
     };
     println!(
         "[PERF] {label:<30} interp={:>8}ns  jit_exec={:>8}ns  compile={:.1}ms  speedup={:.2}x  breakeven={} calls",
-        interp_ns, jit_exec_ns,
+        interp_ns,
+        jit_exec_ns,
         jit_compile_ns as f64 / 1_000_000.0,
-        speedup, breakeven,
+        speedup,
+        breakeven,
     );
 }
 
@@ -167,10 +175,10 @@ fn perf_sum_loop_100000() {
 /// Uses hand-crafted bytecode (no bootstrap/globals) to measure raw speedup.
 #[test]
 fn perf_pure_jit_vs_interpreter() {
+    use otter_vm::FunctionIndex;
     use otter_vm::bytecode::{Bytecode, BytecodeRegister, Instruction, JumpOffset};
     use otter_vm::frame::FrameLayout;
     use otter_vm::module::{Function, Module};
-    use otter_vm::FunctionIndex;
 
     // Build raw bytecode for: sum=0; i=0; while(i<N) { sum+=i; i++; } return sum;
     // Registers: r0=sum, r1=i, r2=limit, r3=temp(cmp), r4=temp(1)
@@ -187,10 +195,22 @@ fn perf_pure_jit_vs_interpreter() {
             Instruction::load_i32(BytecodeRegister::new(1), 0),
             Instruction::load_i32(BytecodeRegister::new(2), limit),
             Instruction::load_i32(BytecodeRegister::new(4), 1),
-            Instruction::lt(BytecodeRegister::new(3), BytecodeRegister::new(1), BytecodeRegister::new(2)),
+            Instruction::lt(
+                BytecodeRegister::new(3),
+                BytecodeRegister::new(1),
+                BytecodeRegister::new(2),
+            ),
             Instruction::jump_if_false(BytecodeRegister::new(3), JumpOffset::new(3)),
-            Instruction::add(BytecodeRegister::new(0), BytecodeRegister::new(0), BytecodeRegister::new(1)),
-            Instruction::add(BytecodeRegister::new(1), BytecodeRegister::new(1), BytecodeRegister::new(4)),
+            Instruction::add(
+                BytecodeRegister::new(0),
+                BytecodeRegister::new(0),
+                BytecodeRegister::new(1),
+            ),
+            Instruction::add(
+                BytecodeRegister::new(1),
+                BytecodeRegister::new(1),
+                BytecodeRegister::new(4),
+            ),
             Instruction::jump(JumpOffset::new(-5)),
             Instruction::ret(BytecodeRegister::new(0)),
         ]),
@@ -207,7 +227,8 @@ fn perf_pure_jit_vs_interpreter() {
         let regs = vec![RegisterValue::undefined(); reg_count];
         interp_val = Interpreter::new()
             .resume(&module2, FunctionIndex(0), 0, &regs)
-            .expect("exec").return_value();
+            .expect("exec")
+            .return_value();
     }
     let interp_per = interp_start.elapsed().as_nanos() as u64 / u64::from(iters);
 
@@ -226,7 +247,10 @@ fn perf_pure_jit_vs_interpreter() {
             JitExecResult::Ok(raw) => {
                 jit_val = RegisterValue::from_raw_bits(raw).expect("valid");
             }
-            JitExecResult::Bailout { bytecode_pc, reason } => {
+            JitExecResult::Bailout {
+                bytecode_pc,
+                reason,
+            } => {
                 println!("[PERF] BAILOUT at pc={bytecode_pc} reason={reason:?}");
                 println!("[PERF] interpreter: {interp_per}ns/iter");
                 return;
@@ -244,7 +268,8 @@ fn perf_pure_jit_vs_interpreter() {
     let speedup = interp_per as f64 / jit_per as f64;
     println!(
         "[PERF] PURE_LOOP(10K)                 interp={:>10}ns  jit={:>10}ns  compile={:.1}ms  SPEEDUP={:.1}x  code={}B",
-        interp_per, jit_per,
+        interp_per,
+        jit_per,
         compile_ns as f64 / 1_000_000.0,
         speedup,
         compiled.code_size,
@@ -256,7 +281,10 @@ fn perf_compile_latency() {
     let scripts = [
         ("tiny(1+2)", "1 + 2;"),
         ("loop(100)", "var s=0; var i=0; while(i<100){s+=i;i++;} s;"),
-        ("loop(1000)", "var s=0; var i=0; while(i<1000){s+=i;i++;} s;"),
+        (
+            "loop(1000)",
+            "var s=0; var i=0; while(i<1000){s+=i;i++;} s;",
+        ),
     ];
 
     println!("[PERF] === Compile Latency ===");

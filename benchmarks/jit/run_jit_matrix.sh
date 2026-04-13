@@ -33,9 +33,9 @@ get_cmd() {
     local rt="$1"
     case "$rt" in
         otter)
-            local bin="$REPO_ROOT/target/release/otterjs"
+            local bin="$REPO_ROOT/target/release/otter"
             if [[ -x "$bin" ]]; then echo "$bin run"; return 0; fi
-            bin="$REPO_ROOT/target/debug/otterjs"
+            bin="$REPO_ROOT/target/debug/otter"
             if [[ -x "$bin" ]]; then echo "$bin run"; return 0; fi
             return 1 ;;
         node)

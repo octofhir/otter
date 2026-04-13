@@ -230,9 +230,6 @@ impl<'a> ModuleCompiler<'a> {
         }
         compiler.reserve_arguments_binding_slot()?;
         compiler.compile_parameter_initialization(params, self)?;
-        if kind == FunctionKind::Script {
-            compiler.declare_intrinsic_globals()?;
-        }
         if let Some(self_binding_name) = identity.self_binding_name.as_deref() {
             let closure_register = compiler.declare_function_binding(self_binding_name)?;
             compiler

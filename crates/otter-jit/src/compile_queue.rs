@@ -63,10 +63,7 @@ pub enum CompileResult {
         compile_time_ns: u64,
     },
     /// Compilation failed (non-fatal — function stays in interpreter).
-    Failed {
-        function_index: u32,
-        error: String,
-    },
+    Failed { function_index: u32, error: String },
 }
 
 // ============================================================
@@ -125,9 +122,11 @@ impl CompileQueue {
         }
 
         // Don't enqueue duplicates for the same function + tier.
-        if self.pending.iter().any(|r| {
-            r.function_index == request.function_index && r.tier == request.tier
-        }) {
+        if self
+            .pending
+            .iter()
+            .any(|r| r.function_index == request.function_index && r.tier == request.tier)
+        {
             return;
         }
 

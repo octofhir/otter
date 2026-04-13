@@ -32,7 +32,7 @@ use crate::mir::nodes::MirOp;
 pub struct AbstractType(pub u8);
 
 impl AbstractType {
-    pub const BOTTOM: Self = Self(0);       // Unreachable / no info.
+    pub const BOTTOM: Self = Self(0); // Unreachable / no info.
     pub const INT32: Self = Self(1 << 0);
     pub const FLOAT64: Self = Self(1 << 1);
     pub const STRING: Self = Self(1 << 2);
@@ -40,7 +40,7 @@ impl AbstractType {
     pub const BOOL: Self = Self(1 << 4);
     pub const UNDEFINED: Self = Self(1 << 5);
     pub const NULL: Self = Self(1 << 6);
-    pub const ANY: Self = Self(0x7F);        // All bits set.
+    pub const ANY: Self = Self(0x7F); // All bits set.
 
     /// Number = Int32 | Float64
     pub const NUMBER: Self = Self(Self::INT32.0 | Self::FLOAT64.0);
@@ -96,16 +96,34 @@ impl AbstractType {
 
 impl std::fmt::Display for AbstractType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if *self == Self::BOTTOM { return write!(f, "bottom"); }
-        if *self == Self::ANY { return write!(f, "any"); }
+        if *self == Self::BOTTOM {
+            return write!(f, "bottom");
+        }
+        if *self == Self::ANY {
+            return write!(f, "any");
+        }
         let mut parts = Vec::new();
-        if self.0 & Self::INT32.0 != 0 { parts.push("i32"); }
-        if self.0 & Self::FLOAT64.0 != 0 { parts.push("f64"); }
-        if self.0 & Self::STRING.0 != 0 { parts.push("str"); }
-        if self.0 & Self::OBJECT.0 != 0 { parts.push("obj"); }
-        if self.0 & Self::BOOL.0 != 0 { parts.push("bool"); }
-        if self.0 & Self::UNDEFINED.0 != 0 { parts.push("undef"); }
-        if self.0 & Self::NULL.0 != 0 { parts.push("null"); }
+        if self.0 & Self::INT32.0 != 0 {
+            parts.push("i32");
+        }
+        if self.0 & Self::FLOAT64.0 != 0 {
+            parts.push("f64");
+        }
+        if self.0 & Self::STRING.0 != 0 {
+            parts.push("str");
+        }
+        if self.0 & Self::OBJECT.0 != 0 {
+            parts.push("obj");
+        }
+        if self.0 & Self::BOOL.0 != 0 {
+            parts.push("bool");
+        }
+        if self.0 & Self::UNDEFINED.0 != 0 {
+            parts.push("undef");
+        }
+        if self.0 & Self::NULL.0 != 0 {
+            parts.push("null");
+        }
         write!(f, "{}", parts.join("|"))
     }
 }
@@ -185,26 +203,37 @@ fn infer_type(op: &MirOp, types: &TypeMap) -> AbstractType {
         MirOp::Int32ToFloat64(_) => AbstractType::FLOAT64,
 
         // ---- i32 arithmetic: output is i32 ----
-        MirOp::AddI32 { .. } | MirOp::SubI32 { .. } | MirOp::MulI32 { .. }
-        | MirOp::DivI32 { .. } | MirOp::ModI32 { .. }
-        | MirOp::IncI32 { .. } | MirOp::DecI32 { .. } | MirOp::NegI32 { .. } => {
-            AbstractType::INT32
-        }
+        MirOp::AddI32 { .. }
+        | MirOp::SubI32 { .. }
+        | MirOp::MulI32 { .. }
+        | MirOp::DivI32 { .. }
+        | MirOp::ModI32 { .. }
+        | MirOp::IncI32 { .. }
+        | MirOp::DecI32 { .. }
+        | MirOp::NegI32 { .. } => AbstractType::INT32,
 
         // ---- f64 arithmetic: output is f64 ----
-        MirOp::AddF64 { .. } | MirOp::SubF64 { .. } | MirOp::MulF64 { .. }
-        | MirOp::DivF64 { .. } | MirOp::ModF64 { .. } | MirOp::NegF64(_) => {
-            AbstractType::FLOAT64
-        }
+        MirOp::AddF64 { .. }
+        | MirOp::SubF64 { .. }
+        | MirOp::MulF64 { .. }
+        | MirOp::DivF64 { .. }
+        | MirOp::ModF64 { .. }
+        | MirOp::NegF64(_) => AbstractType::FLOAT64,
 
         // ---- Bitwise: always i32 ----
-        MirOp::BitAnd { .. } | MirOp::BitOr { .. } | MirOp::BitXor { .. }
-        | MirOp::Shl { .. } | MirOp::Shr { .. } | MirOp::Ushr { .. }
+        MirOp::BitAnd { .. }
+        | MirOp::BitOr { .. }
+        | MirOp::BitXor { .. }
+        | MirOp::Shl { .. }
+        | MirOp::Shr { .. }
+        | MirOp::Ushr { .. }
         | MirOp::BitNot(_) => AbstractType::INT32,
 
         // ---- Comparisons: output is bool ----
-        MirOp::CmpI32 { .. } | MirOp::CmpF64 { .. }
-        | MirOp::CmpStrictEq { .. } | MirOp::CmpStrictNe { .. }
+        MirOp::CmpI32 { .. }
+        | MirOp::CmpF64 { .. }
+        | MirOp::CmpStrictEq { .. }
+        | MirOp::CmpStrictNe { .. }
         | MirOp::LogicalNot(_) => AbstractType::BOOL,
 
         // ---- Move: inherits source type ----
@@ -221,11 +250,14 @@ fn infer_type(op: &MirOp, types: &TypeMap) -> AbstractType {
         }
 
         // ---- Loads: tagged (unknown type without further analysis) ----
-        MirOp::LoadLocal(_) | MirOp::LoadRegister(_) | MirOp::LoadThis
+        MirOp::LoadLocal(_)
+        | MirOp::LoadRegister(_)
+        | MirOp::LoadThis
         | MirOp::LoadUpvalue { .. } => AbstractType::ANY,
 
         // ---- Property access: tagged result ----
-        MirOp::GetPropShaped { .. } | MirOp::GetPropGeneric { .. }
+        MirOp::GetPropShaped { .. }
+        | MirOp::GetPropGeneric { .. }
         | MirOp::GetPropConstGeneric { .. } => AbstractType::ANY,
 
         // ---- Everything else: conservatively ANY ----
@@ -266,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_type_analysis_simple() {
-        use crate::mir::graph::{MirGraph, DeoptInfo, ResumeMode};
+        use crate::mir::graph::{DeoptInfo, MirGraph, ResumeMode};
 
         let mut graph = MirGraph::new("test".into(), 2, 2, 0);
         let bb = graph.entry_block;
@@ -287,7 +319,15 @@ mod tests {
         });
         let v4 = graph.push_instr(bb, MirOp::GuardInt32 { val: v3, deopt }, 4);
         // v5 = AddI32(v0, v4)
-        let v5 = graph.push_instr(bb, MirOp::AddI32 { lhs: v0, rhs: v4, deopt }, 5);
+        let v5 = graph.push_instr(
+            bb,
+            MirOp::AddI32 {
+                lhs: v0,
+                rhs: v4,
+                deopt,
+            },
+            5,
+        );
         // terminator
         graph.push_instr(bb, MirOp::Return(v5), 6);
 

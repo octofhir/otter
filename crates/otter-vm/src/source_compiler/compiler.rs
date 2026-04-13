@@ -342,13 +342,6 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
-    pub(super) fn declare_intrinsic_globals(&mut self) -> Result<(), SourceLoweringError> {
-        for name in crate::intrinsics::CORE_INTRINSIC_GLOBAL_NAMES {
-            self.declare_intrinsic_global_binding(name)?;
-        }
-        Ok(())
-    }
-
     pub(super) fn predeclare_function_scope(
         &mut self,
         statements: &[AstStatement<'_>],
@@ -2010,25 +2003,6 @@ impl<'a> FunctionCompiler<'a> {
             self.next_temp = required;
             self.max_temp = self.max_temp.max(self.next_temp);
         }
-    }
-
-    fn declare_intrinsic_global_binding(&mut self, name: &str) -> Result<(), SourceLoweringError> {
-        if self.scope.borrow().bindings.contains_key(name) {
-            return Ok(());
-        }
-
-        let global = self.alloc_temp();
-        self.instructions.push(Instruction::load_this(global));
-        let binding = self.allocate_local()?;
-        let property = self.intern_property_name(name)?;
-        self.instructions
-            .push(Instruction::get_property(binding, global, property));
-        self.release(ValueLocation::temp(global));
-        self.scope
-            .borrow_mut()
-            .bindings
-            .insert(name.to_string(), Binding::Register(binding));
-        Ok(())
     }
 
     pub(super) fn materialize_value(&mut self, value: ValueLocation) -> ValueLocation {

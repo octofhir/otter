@@ -243,7 +243,9 @@ impl MirGraph {
     pub fn append_block_param(&mut self, block: BlockId, ty: MirType) -> ValueId {
         let value = self.next_value();
         self.type_cache.insert(value, ty);
-        self.blocks[block.0 as usize].params.push(BlockParam { value, ty });
+        self.blocks[block.0 as usize]
+            .params
+            .push(BlockParam { value, ty });
         value
     }
 

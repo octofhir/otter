@@ -73,6 +73,9 @@ pub struct JitContext {
 
     /// Pointer to the active runtime state for specialized tier1 execution.
     pub runtime_ptr: *mut (),
+
+    /// Pointer to the TypedHeap slots array base.
+    pub heap_slots_base: *const (),
 }
 
 // Compile-time offset verification. These constants are used by codegen to
@@ -107,6 +110,7 @@ assert_offset!(bailout_pc, 108);
 assert_offset!(secondary_result, 112);
 assert_offset!(module_ptr, 120);
 assert_offset!(runtime_ptr, 128);
+assert_offset!(heap_slots_base, 136);
 
 /// Byte offset constants for use in Cranelift IR codegen.
 pub mod offsets {
@@ -129,6 +133,13 @@ pub mod offsets {
     pub const SECONDARY_RESULT: i32 = 112;
     pub const MODULE_PTR: i32 = 120;
     pub const RUNTIME_PTR: i32 = 128;
+    pub const HEAP_SLOTS_BASE: i32 = 136;
+
+    /// Offsets for JsObject memory layout.
+    pub mod js_object {
+        pub const SHAPE_ID: i32 = 0;
+        pub const VALUES_PTR: i32 = 40;
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +148,6 @@ mod tests {
 
     #[test]
     fn jit_context_size() {
-        assert_eq!(std::mem::size_of::<JitContext>(), 136);
+        assert_eq!(std::mem::size_of::<JitContext>(), 144);
     }
 }

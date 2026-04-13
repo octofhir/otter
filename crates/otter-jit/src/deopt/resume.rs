@@ -199,7 +199,7 @@ pub fn execute_module_entry_with_runtime(
                 interrupt_flag,
                 interpreter: std::ptr::null(),
                 vm_ctx: std::ptr::null_mut(),
-                function_ptr: std::ptr::null(),
+                function_ptr: function as *const otter_vm::Function as *const (),
                 upvalues_ptr: std::ptr::null(),
                 upvalue_count: 0,
                 callee_raw: RegisterValue::undefined().raw_bits(),
@@ -210,8 +210,14 @@ pub fn execute_module_entry_with_runtime(
                 secondary_result: 0,
                 module_ptr: module as *const Module as *const (),
                 runtime_ptr: runtime as *mut RuntimeState as *mut (),
+                heap_slots_base: runtime.heap().slots_ptr(),
             };
 
+            crate::telemetry::record_jit_entry();
+            crate::telemetry::record_function_jit_entry(
+                function.name().unwrap_or("<anonymous>"),
+                1,
+            );
             let raw = unsafe { compiled.call(&mut ctx) };
             if raw == crate::BAILOUT_SENTINEL {
                 Ok(JitExecResult::Bailout {
@@ -237,6 +243,14 @@ pub fn execute_module_entry_with_runtime(
             bytecode_pc,
             reason,
         } => {
+            crate::telemetry::record_interpreter_entry();
+            crate::telemetry::record_deopt(
+                function.name().unwrap_or("<anonymous>"),
+                module as *const Module as usize as u64,
+                bytecode_pc,
+                reason,
+            );
+            crate::telemetry::record_function_deopt(function.name().unwrap_or("<anonymous>"), 1);
             let handoff = handoff_for_bailout(function, bytecode_pc, reason);
             Ok(make_interpreter().resume_with_runtime(
                 module,
@@ -246,11 +260,14 @@ pub fn execute_module_entry_with_runtime(
                 runtime,
             )?)
         }
-        JitExecResult::NotCompiled => Ok(make_interpreter().execute_with_runtime(
-            module,
-            function_index,
-            &registers,
-            runtime,
-        )?),
+        JitExecResult::NotCompiled => {
+            crate::telemetry::record_interpreter_entry();
+            Ok(make_interpreter().execute_with_runtime(
+                module,
+                function_index,
+                &registers,
+                runtime,
+            )?)
+        }
     }
 }

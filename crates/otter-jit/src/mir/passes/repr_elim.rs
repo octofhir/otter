@@ -34,19 +34,15 @@ pub fn run(graph: &mut MirGraph) {
             let instr = &graph.blocks[block_idx].instrs[i];
             let new_op = match &instr.op {
                 // UnboxInt32(BoxInt32(x)) → Move(x)
-                MirOp::UnboxInt32(val) => {
-                    match defs.get(val) {
-                        Some(MirOp::BoxInt32(inner)) => Some(MirOp::Move(*inner)),
-                        _ => None,
-                    }
-                }
+                MirOp::UnboxInt32(val) => match defs.get(val) {
+                    Some(MirOp::BoxInt32(inner)) => Some(MirOp::Move(*inner)),
+                    _ => None,
+                },
                 // UnboxFloat64(BoxFloat64(x)) → Move(x)
-                MirOp::UnboxFloat64(val) => {
-                    match defs.get(val) {
-                        Some(MirOp::BoxFloat64(inner)) => Some(MirOp::Move(*inner)),
-                        _ => None,
-                    }
-                }
+                MirOp::UnboxFloat64(val) => match defs.get(val) {
+                    Some(MirOp::BoxFloat64(inner)) => Some(MirOp::Move(*inner)),
+                    _ => None,
+                },
                 // BoxInt32(UnboxInt32(x)) → Move(x) if x was boxed int32
                 MirOp::BoxInt32(val) => {
                     match defs.get(val) {
@@ -59,24 +55,16 @@ pub fn run(graph: &mut MirGraph) {
                     }
                 }
                 // BoxFloat64(UnboxFloat64(x)) → Move(x) if x was boxed f64
-                MirOp::BoxFloat64(val) => {
-                    match defs.get(val) {
-                        Some(MirOp::UnboxFloat64(inner)) => Some(MirOp::Move(*inner)),
-                        Some(MirOp::GuardFloat64 { val: inner, .. }) => {
-                            Some(MirOp::Move(*inner))
-                        }
-                        _ => None,
-                    }
-                }
+                MirOp::BoxFloat64(val) => match defs.get(val) {
+                    Some(MirOp::UnboxFloat64(inner)) => Some(MirOp::Move(*inner)),
+                    Some(MirOp::GuardFloat64 { val: inner, .. }) => Some(MirOp::Move(*inner)),
+                    _ => None,
+                },
                 // BoxBool on known boolean → original boxed value
-                MirOp::BoxBool(val) => {
-                    match defs.get(val) {
-                        Some(MirOp::GuardBool { val: inner, .. }) => {
-                            Some(MirOp::Move(*inner))
-                        }
-                        _ => None,
-                    }
-                }
+                MirOp::BoxBool(val) => match defs.get(val) {
+                    Some(MirOp::GuardBool { val: inner, .. }) => Some(MirOp::Move(*inner)),
+                    _ => None,
+                },
                 _ => None,
             };
 

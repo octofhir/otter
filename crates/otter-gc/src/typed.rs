@@ -118,6 +118,7 @@ pub struct TypedHeap {
     oom_flag: Arc<AtomicBool>,
 }
 
+#[repr(C)]
 struct Slot {
     object: Box<dyn TypeErasedObject>,
     /// Size in bytes (approximate, for GC pressure tracking).
@@ -179,6 +180,12 @@ impl TypedHeap {
     #[inline]
     pub fn max_heap_bytes(&self) -> Option<usize> {
         self.max_heap_bytes
+    }
+
+    /// Returns the raw pointer to the slots array base.
+    /// Used by the Tier 1 JIT to avoid calling into a C helper for object resolution.
+    pub fn slots_ptr(&self) -> *const () {
+        self.slots.as_ptr() as *const ()
     }
 
     /// Returns the currently tracked memory footprint in bytes.

@@ -182,13 +182,17 @@ mod tests {
         let bb3 = graph.create_block();
 
         let cond = graph.push_instr(bb0, MirOp::True, 0);
-        graph.push_instr(bb0, MirOp::Branch {
-            cond,
-            true_block: bb1,
-            true_args: vec![],
-            false_block: bb2,
-            false_args: vec![],
-        }, 1);
+        graph.push_instr(
+            bb0,
+            MirOp::Branch {
+                cond,
+                true_block: bb1,
+                true_args: vec![],
+                false_block: bb2,
+                false_args: vec![],
+            },
+            1,
+        );
 
         graph.push_instr(bb1, MirOp::Jump(bb3, vec![]), 2);
         graph.push_instr(bb2, MirOp::Jump(bb3, vec![]), 3);

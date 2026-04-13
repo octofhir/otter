@@ -26,11 +26,21 @@ pub fn set_jit_config(config: JitConfig) {
 pub fn apply_overrides(overrides: &JitConfigOverrides) {
     JIT_CONFIG_CELL.with(|c| {
         let mut cfg = c.borrow_mut();
-        if let Some(v) = overrides.dump_bytecode { cfg.dump_bytecode = v; }
-        if let Some(v) = overrides.dump_mir { cfg.dump_mir = v; }
-        if let Some(v) = overrides.dump_clif { cfg.dump_clif = v; }
-        if let Some(v) = overrides.dump_asm { cfg.dump_asm = v; }
-        if let Some(v) = overrides.dump_jit_stats { cfg.dump_jit_stats = v; }
+        if let Some(v) = overrides.dump_bytecode {
+            cfg.dump_bytecode = v;
+        }
+        if let Some(v) = overrides.dump_mir {
+            cfg.dump_mir = v;
+        }
+        if let Some(v) = overrides.dump_clif {
+            cfg.dump_clif = v;
+        }
+        if let Some(v) = overrides.dump_asm {
+            cfg.dump_asm = v;
+        }
+        if let Some(v) = overrides.dump_jit_stats {
+            cfg.dump_jit_stats = v;
+        }
     });
 }
 
@@ -64,7 +74,6 @@ pub struct JitConfig {
     pub tier1_only: bool,
 
     // ---- Debug dump flags ----
-
     /// Dump compiled bytecodes before JIT compilation.
     /// Override: `OTTER_JIT_DUMP_BYTECODE=1`.
     pub dump_bytecode: bool,

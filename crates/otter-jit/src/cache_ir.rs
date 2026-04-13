@@ -37,7 +37,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheIROp {
     // ---- Type guards (fail → next stub in chain) ----
-
     /// Assert input is an object. Operand: input register index.
     GuardIsObject { input: u8 },
     /// Assert input is Int32.
@@ -54,7 +53,6 @@ pub enum CacheIROp {
     GuardIsNull { input: u8 },
 
     // ---- Shape/structure guards ----
-
     /// Assert object has a specific shape. `shape_field` indexes StubField.
     GuardShape { obj: u8, shape_field: u8 },
     /// Assert object's prototype chain hasn't changed.
@@ -65,7 +63,6 @@ pub enum CacheIROp {
     GuardBoundsCheck { obj: u8, index: u8 },
 
     // ---- Property loads ----
-
     /// Load from a fixed slot (inline property). Result stored in output reg.
     LoadFixedSlot { obj: u8, offset_field: u8 },
     /// Load from a dynamic (overflow) slot.
@@ -78,7 +75,6 @@ pub enum CacheIROp {
     LoadArrayLength { input: u8 },
 
     // ---- Property stores ----
-
     /// Store to a fixed slot (inline property).
     StoreFixedSlot { obj: u8, offset_field: u8, val: u8 },
     /// Store to a dynamic slot.
@@ -87,21 +83,18 @@ pub enum CacheIROp {
     StoreDenseElement { obj: u8, index: u8, val: u8 },
 
     // ---- Calls ----
-
     /// Call a known JS function target. `target_field` indexes StubField.
     CallScriptedFunction { target_field: u8, argc: u8 },
     /// Call a native function.
     CallNativeFunction { target_field: u8, argc: u8 },
 
     // ---- Megamorphic fallbacks (generic slow paths) ----
-
     /// Generic property load by name (hash table lookup).
     MegamorphicLoadSlot { obj: u8, name_field: u8 },
     /// Generic property store by name.
     MegamorphicStoreSlot { obj: u8, name_field: u8, val: u8 },
 
     // ---- Arithmetic fast paths ----
-
     /// Int32 add with overflow check.
     Int32Add { lhs: u8, rhs: u8 },
     /// Int32 sub with overflow check.
@@ -110,7 +103,6 @@ pub enum CacheIROp {
     Int32Mul { lhs: u8, rhs: u8 },
 
     // ---- Control ----
-
     /// Return the result from the IC (success).
     ReturnFromIC,
 }
@@ -191,8 +183,14 @@ impl CacheIRSequence {
         let shape_field = seq.add_field(StubField::Shape(shape_id));
         let offset_field = seq.add_field(StubField::Offset(slot_offset));
         seq.push(CacheIROp::GuardIsObject { input: 0 });
-        seq.push(CacheIROp::GuardShape { obj: 0, shape_field });
-        seq.push(CacheIROp::LoadFixedSlot { obj: 0, offset_field });
+        seq.push(CacheIROp::GuardShape {
+            obj: 0,
+            shape_field,
+        });
+        seq.push(CacheIROp::LoadFixedSlot {
+            obj: 0,
+            offset_field,
+        });
         seq.push(CacheIROp::ReturnFromIC);
         seq
     }
@@ -204,8 +202,15 @@ impl CacheIRSequence {
         let shape_field = seq.add_field(StubField::Shape(shape_id));
         let offset_field = seq.add_field(StubField::Offset(slot_offset));
         seq.push(CacheIROp::GuardIsObject { input: 0 });
-        seq.push(CacheIROp::GuardShape { obj: 0, shape_field });
-        seq.push(CacheIROp::StoreFixedSlot { obj: 0, offset_field, val: 1 });
+        seq.push(CacheIROp::GuardShape {
+            obj: 0,
+            shape_field,
+        });
+        seq.push(CacheIROp::StoreFixedSlot {
+            obj: 0,
+            offset_field,
+            val: 1,
+        });
         seq.push(CacheIROp::ReturnFromIC);
         seq
     }
@@ -335,7 +340,10 @@ mod tests {
         assert_eq!(seq.ops.len(), 4);
         assert!(matches!(seq.ops[0], CacheIROp::GuardIsObject { input: 0 }));
         assert!(matches!(seq.ops[1], CacheIROp::GuardShape { obj: 0, .. }));
-        assert!(matches!(seq.ops[2], CacheIROp::LoadFixedSlot { obj: 0, .. }));
+        assert!(matches!(
+            seq.ops[2],
+            CacheIROp::LoadFixedSlot { obj: 0, .. }
+        ));
         assert!(matches!(seq.ops[3], CacheIROp::ReturnFromIC));
         assert_eq!(seq.fields.len(), 2);
         assert_eq!(seq.fields[0], StubField::Shape(42));

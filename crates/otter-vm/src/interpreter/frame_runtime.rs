@@ -6,8 +6,7 @@
 
 use crate::bytecode::ProgramCounter;
 use crate::feedback::{
-    ArithmeticFeedback, ComparisonFeedback, FeedbackKind, FeedbackSlotId,
-    FeedbackVector,
+    ArithmeticFeedback, ComparisonFeedback, FeedbackKind, FeedbackSlotId, FeedbackVector,
 };
 use crate::module::Function;
 use crate::object::{ObjectShapeId, PropertyInlineCache};
@@ -92,12 +91,7 @@ impl FrameRuntimeState {
 
     /// Record branch taken/not-taken feedback.
     #[allow(dead_code)]
-    pub(super) fn record_branch(
-        &mut self,
-        function: &Function,
-        pc: ProgramCounter,
-        taken: bool,
-    ) {
+    pub(super) fn record_branch(&mut self, function: &Function, pc: ProgramCounter, taken: bool) {
         if let Some(slot) = Self::feedback_slot_of_kind(function, pc, FeedbackKind::Branch) {
             self.feedback_vector.record_branch(slot, taken);
         }
@@ -113,18 +107,14 @@ impl FrameRuntimeState {
         slot_index: u16,
     ) {
         if let Some(slot) = Self::feedback_slot_of_kind(function, pc, FeedbackKind::Property) {
-            self.feedback_vector.record_property(slot, shape_id, slot_index);
+            self.feedback_vector
+                .record_property(slot, shape_id, slot_index);
         }
     }
 
     /// Record call target feedback.
     #[allow(dead_code)]
-    pub(super) fn record_call(
-        &mut self,
-        function: &Function,
-        pc: ProgramCounter,
-        target: u32,
-    ) {
+    pub(super) fn record_call(&mut self, function: &Function, pc: ProgramCounter, target: u32) {
         if let Some(slot) = Self::feedback_slot_of_kind(function, pc, FeedbackKind::Call) {
             self.feedback_vector.record_call(slot, target);
         }

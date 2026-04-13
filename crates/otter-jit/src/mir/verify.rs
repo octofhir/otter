@@ -288,7 +288,12 @@ fn collect_operands(op: &MirOp) -> Vec<ValueId> {
 
         MirOp::Jump(_, args) => ops.extend_from_slice(args),
         MirOp::ReturnUndefined | MirOp::Deopt(_) => {}
-        MirOp::Branch { cond, true_args, false_args, .. } => {
+        MirOp::Branch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
             ops.push(*cond);
             ops.extend_from_slice(true_args);
             ops.extend_from_slice(false_args);

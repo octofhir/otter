@@ -1,6 +1,5 @@
 //! Tiny JS-to-`otter-vm` lowering for the first migration slice.
 
-
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program as AstProgram;
 use oxc_parser::Parser;
@@ -308,7 +307,6 @@ mod tests {
         assert_eq!(result, RegisterValue::from_i32(0));
     }
 
-
     #[test]
     fn compile_script_attaches_original_source_text_for_js() {
         let src = "let x = 1;\nx = x + 2;\n";
@@ -398,7 +396,6 @@ mod tests {
             .expect("script should execute");
         assert_eq!(result.return_value(), RegisterValue::undefined());
     }
-
 
     #[test]
     fn compile_test262_basic_script_passes_without_js_harness() {
@@ -3085,6 +3082,31 @@ mod tests {
         assert!(
             error.to_string().contains("uncaught throw"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn top_level_scripts_do_not_preload_intrinsic_globals_into_locals() {
+        use crate::bytecode::Opcode;
+
+        let module = compile_script(
+            "var sum = 0; var i = 0; while (i < 3) { sum += i; i++; } sum;",
+            "jit-global-loop.js",
+        )
+        .expect("script should compile");
+
+        let instructions = module.entry_function().bytecode().instructions();
+        let first_user_store = instructions
+            .iter()
+            .position(|instr| instr.opcode() == Opcode::SetGlobal)
+            .expect("script should contain global stores");
+
+        assert!(
+            instructions[..first_user_store]
+                .iter()
+                .all(|instr| instr.opcode() != Opcode::GetProperty),
+            "top-level script should not synthesize intrinsic global GetProperty prologue: {:?}",
+            &instructions[..first_user_store]
         );
     }
 

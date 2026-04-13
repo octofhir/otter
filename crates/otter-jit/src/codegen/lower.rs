@@ -367,9 +367,12 @@ impl<'a> OpLowerer<'a> {
             }
             MirOp::StoreLocal { idx, val } => {
                 let offset = (*idx as i32) * 8;
-                builder
-                    .ins()
-                    .store(MemFlags::trusted(), self.v(val)?, self.registers_base, offset);
+                builder.ins().store(
+                    MemFlags::trusted(),
+                    self.v(val)?,
+                    self.registers_base,
+                    offset,
+                );
                 Ok(None)
             }
             MirOp::LoadRegister(idx) => {
@@ -458,11 +461,7 @@ impl<'a> OpLowerer<'a> {
             }
 
             // ---- Generic property access (cold path, calls runtime helper) ----
-            MirOp::GetPropConstGeneric {
-                obj,
-                name_idx,
-                ..
-            } => {
+            MirOp::GetPropConstGeneric { obj, name_idx, .. } => {
                 let obj = self.to_i64(builder, self.v(obj)?);
                 let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
                 let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
@@ -475,10 +474,7 @@ impl<'a> OpLowerer<'a> {
                 Ok(Some(result))
             }
             MirOp::SetPropConstGeneric {
-                obj,
-                name_idx,
-                val,
-                ..
+                obj, name_idx, val, ..
             } => {
                 let obj = self.to_i64(builder, self.v(obj)?);
                 let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
@@ -493,9 +489,35 @@ impl<'a> OpLowerer<'a> {
                 Ok(None)
             }
 
+            // ---- Globals (cold path, calls runtime helper) ----
+            MirOp::GetGlobal { name_idx, .. } => {
+                let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::runtime_helpers::otter_get_global as *const () as usize,
+                    &[prop_id, pc],
+                );
+                let result = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(Some(result))
+            }
+            MirOp::SetGlobal { name_idx, val, .. } => {
+                let prop_id = builder.ins().iconst(types::I64, i64::from(*name_idx));
+                let value = self.to_i64(builder, self.v(val)?);
+                let pc = builder.ins().iconst(types::I64, i64::from(bytecode_pc));
+                let result = self.emit_direct_host_call(
+                    builder,
+                    crate::runtime_helpers::otter_set_global as *const () as usize,
+                    &[prop_id, value, pc],
+                );
+                let _ = self.emit_return_if_bailout_sentinel(builder, result);
+                Ok(None)
+            }
+
             // ---- Control Flow ----
             MirOp::Jump(target, args) => {
-                let clif_args: Vec<BlockArg> = args.iter()
+                let clif_args: Vec<BlockArg> = args
+                    .iter()
                     .map(|a| self.v(a).map(BlockArg::Value))
                     .collect::<Result<_, _>>()?;
                 builder.ins().jump(self.b(target), &clif_args);
@@ -509,10 +531,12 @@ impl<'a> OpLowerer<'a> {
                 false_block,
                 false_args,
             } => {
-                let t_args: Vec<BlockArg> = true_args.iter()
+                let t_args: Vec<BlockArg> = true_args
+                    .iter()
                     .map(|a| self.v(a).map(BlockArg::Value))
                     .collect::<Result<_, _>>()?;
-                let f_args: Vec<BlockArg> = false_args.iter()
+                let f_args: Vec<BlockArg> = false_args
+                    .iter()
                     .map(|a| self.v(a).map(BlockArg::Value))
                     .collect::<Result<_, _>>()?;
                 builder.ins().brif(

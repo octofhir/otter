@@ -98,7 +98,9 @@ impl WatchpointSet {
     /// Called when the invariant is violated (e.g., prototype chain mutated).
     /// Returns true if the watchpoint was Watched (i.e., code needs invalidation).
     pub fn fire(&self) -> bool {
-        let prev = self.state.swap(WatchpointState::Invalidated as u8, Ordering::AcqRel);
+        let prev = self
+            .state
+            .swap(WatchpointState::Invalidated as u8, Ordering::AcqRel);
         prev == WatchpointState::Watched as u8
     }
 
@@ -191,10 +193,7 @@ impl WatchpointRegistry {
         if !set.watch() {
             return false; // Already invalidated.
         }
-        self.dependents
-            .entry(kind)
-            .or_default()
-            .push(dependent);
+        self.dependents.entry(kind).or_default().push(dependent);
         true
     }
 
@@ -217,10 +216,7 @@ impl WatchpointRegistry {
     /// Check if a watchpoint is still valid.
     #[must_use]
     pub fn is_valid(&self, kind: &WatchpointKind) -> bool {
-        self.sets
-            .get(kind)
-            .map(|s| s.is_valid())
-            .unwrap_or(true) // No set = never invalidated.
+        self.sets.get(kind).map(|s| s.is_valid()).unwrap_or(true) // No set = never invalidated.
     }
 
     /// Number of active watchpoint sets.
@@ -300,9 +296,27 @@ mod tests {
         let mut reg = WatchpointRegistry::new();
         let kind = WatchpointKind::GlobalConstancy(100);
 
-        reg.watch(kind, DependentCode { function_key: 1, function_name: "f1".into() });
-        reg.watch(kind, DependentCode { function_key: 2, function_name: "f2".into() });
-        reg.watch(kind, DependentCode { function_key: 3, function_name: "f3".into() });
+        reg.watch(
+            kind,
+            DependentCode {
+                function_key: 1,
+                function_name: "f1".into(),
+            },
+        );
+        reg.watch(
+            kind,
+            DependentCode {
+                function_key: 2,
+                function_name: "f2".into(),
+            },
+        );
+        reg.watch(
+            kind,
+            DependentCode {
+                function_key: 3,
+                function_name: "f3".into(),
+            },
+        );
 
         let invalids = reg.fire(kind);
         assert_eq!(invalids.len(), 3);
@@ -327,7 +341,10 @@ mod tests {
         reg.fire(kind);
 
         // Now try to watch — should fail.
-        let dep = DependentCode { function_key: 10, function_name: "late".into() };
+        let dep = DependentCode {
+            function_key: 10,
+            function_name: "late".into(),
+        };
         assert!(!reg.watch(kind, dep));
     }
 }

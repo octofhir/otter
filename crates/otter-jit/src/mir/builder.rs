@@ -241,7 +241,13 @@ fn store_register_cached(
         },
         pc,
     );
-    cache.cache.insert(absolute, CachedRegValue { boxed: value, raw_i32 });
+    cache.cache.insert(
+        absolute,
+        CachedRegValue {
+            boxed: value,
+            raw_i32,
+        },
+    );
     Ok(())
 }
 
@@ -280,8 +286,14 @@ fn lower_instruction(
             let raw = graph.push_instr(block, MirOp::ConstInt32(instruction.immediate_i32()), pc);
             let boxed = graph.push_instr(block, MirOp::BoxInt32(raw), pc);
             store_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.a()),
-                boxed, reg_cache, Some(raw),
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+                boxed,
+                reg_cache,
+                Some(raw),
             )?;
         }
         Opcode::LoadTrue => {
@@ -308,38 +320,92 @@ fn lower_instruction(
         }
         Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div => {
             let (lhs_boxed, lhs_cached_i32) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.b()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.b()),
+                reg_cache,
             )?;
             let (rhs_boxed, rhs_cached_i32) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.c()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.c()),
+                reg_cache,
             )?;
             let deopt = create_deopt(graph, pc);
             // Skip GuardInt32 if we already know the value is i32 from the cache.
             let lhs_i32 = lhs_cached_i32.unwrap_or_else(|| {
-                graph.push_instr(block, MirOp::GuardInt32 { val: lhs_boxed, deopt }, pc)
+                graph.push_instr(
+                    block,
+                    MirOp::GuardInt32 {
+                        val: lhs_boxed,
+                        deopt,
+                    },
+                    pc,
+                )
             });
             let rhs_i32 = rhs_cached_i32.unwrap_or_else(|| {
-                graph.push_instr(block, MirOp::GuardInt32 { val: rhs_boxed, deopt }, pc)
+                graph.push_instr(
+                    block,
+                    MirOp::GuardInt32 {
+                        val: rhs_boxed,
+                        deopt,
+                    },
+                    pc,
+                )
             });
             let result = match instruction.opcode() {
                 Opcode::Add => graph.push_instr(
-                    block, MirOp::AddI32 { lhs: lhs_i32, rhs: rhs_i32, deopt }, pc,
+                    block,
+                    MirOp::AddI32 {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                        deopt,
+                    },
+                    pc,
                 ),
                 Opcode::Sub => graph.push_instr(
-                    block, MirOp::SubI32 { lhs: lhs_i32, rhs: rhs_i32, deopt }, pc,
+                    block,
+                    MirOp::SubI32 {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                        deopt,
+                    },
+                    pc,
                 ),
                 Opcode::Mul => graph.push_instr(
-                    block, MirOp::MulI32 { lhs: lhs_i32, rhs: rhs_i32, deopt }, pc,
+                    block,
+                    MirOp::MulI32 {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                        deopt,
+                    },
+                    pc,
                 ),
                 Opcode::Div => graph.push_instr(
-                    block, MirOp::DivI32 { lhs: lhs_i32, rhs: rhs_i32, deopt }, pc,
+                    block,
+                    MirOp::DivI32 {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                        deopt,
+                    },
+                    pc,
                 ),
                 _ => unreachable!(),
             };
             let boxed = graph.push_instr(block, MirOp::BoxInt32(result), pc);
             store_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.a()),
-                boxed, reg_cache, Some(result),
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+                boxed,
+                reg_cache,
+                Some(result),
             )?;
         }
         Opcode::Eq => {
@@ -523,6 +589,44 @@ fn lower_instruction(
                 pc,
             );
         }
+        Opcode::GetGlobal => {
+            let value = graph.push_instr(
+                block,
+                MirOp::GetGlobal {
+                    name_idx: u32::from(instruction.b()),
+                    ic_index: 0,
+                },
+                pc,
+            );
+            store_register_cached(
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+                value,
+                reg_cache,
+                None,
+            )?;
+        }
+        Opcode::SetGlobal => {
+            let value = load_register(
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+            )?;
+            graph.push_instr(
+                block,
+                MirOp::SetGlobal {
+                    name_idx: u32::from(instruction.b()),
+                    val: value,
+                    ic_index: 0,
+                },
+                pc,
+            );
+        }
         Opcode::CallDirect => {
             let call = resolve_direct_call(function, pc)?;
             let target = graph.push_instr(block, MirOp::ConstInt32(call.callee().0 as i32), pc);
@@ -636,10 +740,20 @@ fn lower_instruction(
         // ---- Bitwise operations (always i32 result) ----
         Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
             let (lhs, lhs_i32_cached) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.b()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.b()),
+                reg_cache,
             )?;
             let (rhs, rhs_i32_cached) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.c()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.c()),
+                reg_cache,
             )?;
             let deopt = create_deopt(graph, pc);
             let lhs_i32 = lhs_i32_cached.unwrap_or_else(|| {
@@ -649,29 +763,60 @@ fn lower_instruction(
                 graph.push_instr(block, MirOp::GuardInt32 { val: rhs, deopt }, pc)
             });
             let result = match instruction.opcode() {
-                Opcode::BitAnd => {
-                    graph.push_instr(block, MirOp::BitAnd { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
-                Opcode::BitOr => {
-                    graph.push_instr(block, MirOp::BitOr { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
-                Opcode::BitXor => {
-                    graph.push_instr(block, MirOp::BitXor { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
+                Opcode::BitAnd => graph.push_instr(
+                    block,
+                    MirOp::BitAnd {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
+                Opcode::BitOr => graph.push_instr(
+                    block,
+                    MirOp::BitOr {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
+                Opcode::BitXor => graph.push_instr(
+                    block,
+                    MirOp::BitXor {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
                 _ => unreachable!(),
             };
             let boxed = graph.push_instr(block, MirOp::BoxInt32(result), pc);
             store_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.a()),
-                boxed, reg_cache, Some(result),
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+                boxed,
+                reg_cache,
+                Some(result),
             )?;
         }
         Opcode::Shl | Opcode::Shr | Opcode::UShr => {
             let (lhs, lhs_i32_cached) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.b()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.b()),
+                reg_cache,
             )?;
             let (rhs, rhs_i32_cached) = load_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.c()), reg_cache,
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.c()),
+                reg_cache,
             )?;
             let deopt = create_deopt(graph, pc);
             let lhs_i32 = lhs_i32_cached.unwrap_or_else(|| {
@@ -681,21 +826,42 @@ fn lower_instruction(
                 graph.push_instr(block, MirOp::GuardInt32 { val: rhs, deopt }, pc)
             });
             let result = match instruction.opcode() {
-                Opcode::Shl => {
-                    graph.push_instr(block, MirOp::Shl { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
-                Opcode::Shr => {
-                    graph.push_instr(block, MirOp::Shr { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
-                Opcode::UShr => {
-                    graph.push_instr(block, MirOp::Ushr { lhs: lhs_i32, rhs: rhs_i32 }, pc)
-                }
+                Opcode::Shl => graph.push_instr(
+                    block,
+                    MirOp::Shl {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
+                Opcode::Shr => graph.push_instr(
+                    block,
+                    MirOp::Shr {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
+                Opcode::UShr => graph.push_instr(
+                    block,
+                    MirOp::Ushr {
+                        lhs: lhs_i32,
+                        rhs: rhs_i32,
+                    },
+                    pc,
+                ),
                 _ => unreachable!(),
             };
             let boxed = graph.push_instr(block, MirOp::BoxInt32(result), pc);
             store_register_cached(
-                graph, layout, block, pc, BytecodeRegister::new(instruction.a()),
-                boxed, reg_cache, Some(result),
+                graph,
+                layout,
+                block,
+                pc,
+                BytecodeRegister::new(instruction.a()),
+                boxed,
+                reg_cache,
+                Some(result),
             )?;
         }
         // ---- Comparison ops (Gt, Gte, Lte) — same pattern as Lt ----

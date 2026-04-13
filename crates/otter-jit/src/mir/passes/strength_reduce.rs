@@ -63,52 +63,82 @@ fn simplify(
     match op {
         // ---- f64 identity: x + 0.0 → x, 0.0 + x → x ----
         MirOp::AddF64 { lhs, rhs } => {
-            if is_f64_zero(rhs, defs) { return Some(MirOp::Move(*lhs)); }
-            if is_f64_zero(lhs, defs) { return Some(MirOp::Move(*rhs)); }
+            if is_f64_zero(rhs, defs) {
+                return Some(MirOp::Move(*lhs));
+            }
+            if is_f64_zero(lhs, defs) {
+                return Some(MirOp::Move(*rhs));
+            }
             None
         }
         // x - 0.0 → x
         MirOp::SubF64 { lhs, rhs } => {
-            if is_f64_zero(rhs, defs) { return Some(MirOp::Move(*lhs)); }
+            if is_f64_zero(rhs, defs) {
+                return Some(MirOp::Move(*lhs));
+            }
             None
         }
         // x * 1.0 → x, 1.0 * x → x
         MirOp::MulF64 { lhs, rhs } => {
-            if is_f64_one(rhs, defs) { return Some(MirOp::Move(*lhs)); }
-            if is_f64_one(lhs, defs) { return Some(MirOp::Move(*rhs)); }
+            if is_f64_one(rhs, defs) {
+                return Some(MirOp::Move(*lhs));
+            }
+            if is_f64_one(lhs, defs) {
+                return Some(MirOp::Move(*rhs));
+            }
             None
         }
         // x / 1.0 → x
         MirOp::DivF64 { lhs, rhs } => {
-            if is_f64_one(rhs, defs) { return Some(MirOp::Move(*lhs)); }
+            if is_f64_one(rhs, defs) {
+                return Some(MirOp::Move(*lhs));
+            }
             None
         }
 
         // ---- Bitwise identity ----
         // x | 0 → x
         MirOp::BitOr { lhs, rhs } => {
-            if consts.get(rhs) == Some(&0) { return Some(MirOp::Move(*lhs)); }
-            if consts.get(lhs) == Some(&0) { return Some(MirOp::Move(*rhs)); }
+            if consts.get(rhs) == Some(&0) {
+                return Some(MirOp::Move(*lhs));
+            }
+            if consts.get(lhs) == Some(&0) {
+                return Some(MirOp::Move(*rhs));
+            }
             None
         }
         // x & 0 → 0
         MirOp::BitAnd { lhs, rhs } => {
-            if consts.get(rhs) == Some(&0) { return Some(MirOp::Move(*rhs)); }
-            if consts.get(lhs) == Some(&0) { return Some(MirOp::Move(*lhs)); }
+            if consts.get(rhs) == Some(&0) {
+                return Some(MirOp::Move(*rhs));
+            }
+            if consts.get(lhs) == Some(&0) {
+                return Some(MirOp::Move(*lhs));
+            }
             // x & -1 (all ones) → x
-            if consts.get(rhs) == Some(&-1) { return Some(MirOp::Move(*lhs)); }
-            if consts.get(lhs) == Some(&-1) { return Some(MirOp::Move(*rhs)); }
+            if consts.get(rhs) == Some(&-1) {
+                return Some(MirOp::Move(*lhs));
+            }
+            if consts.get(lhs) == Some(&-1) {
+                return Some(MirOp::Move(*rhs));
+            }
             None
         }
         // x ^ 0 → x
         MirOp::BitXor { lhs, rhs } => {
-            if consts.get(rhs) == Some(&0) { return Some(MirOp::Move(*lhs)); }
-            if consts.get(lhs) == Some(&0) { return Some(MirOp::Move(*rhs)); }
+            if consts.get(rhs) == Some(&0) {
+                return Some(MirOp::Move(*lhs));
+            }
+            if consts.get(lhs) == Some(&0) {
+                return Some(MirOp::Move(*rhs));
+            }
             None
         }
         // x << 0 → x, x >> 0 → x, x >>> 0 → x
         MirOp::Shl { lhs, rhs } | MirOp::Shr { lhs, rhs } | MirOp::Ushr { lhs, rhs } => {
-            if consts.get(rhs) == Some(&0) { return Some(MirOp::Move(*lhs)); }
+            if consts.get(rhs) == Some(&0) {
+                return Some(MirOp::Move(*lhs));
+            }
             None
         }
 

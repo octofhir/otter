@@ -108,6 +108,9 @@ impl RuntimeState {
             active_interrupt_flag: None,
             field_initializer_depth: 0,
             feedback_vectors: std::collections::HashMap::new(),
+            tier_up_budgets: std::collections::HashMap::new(),
+            tier_up_blacklisted: std::collections::HashSet::new(),
+            tier_up_hook: None,
         }
     }
 

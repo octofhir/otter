@@ -114,6 +114,59 @@ pub fn compile_function_with_feedback(
 ) -> Result<CompiledFunction, JitError> {
     use vm::feedback::{FeedbackSlotData, FeedbackSlotId};
 
+    let function_name = function.name().unwrap_or("<anonymous>");
+    let cfg = crate::config::jit_config();
+    let start = Instant::now();
+
+    // Extract legacy PropertyInlineCache profile from the feedback vector
+    // for the MIR path (shape-guarded lowering).
+    let property_profile = extract_property_profile(function, feedback);
+
+    // Direct `bytecode → asm template baseline` fast path. JSC-Baseline
+    // model: when the analyzer accepts the function and emission succeeds,
+    // we install the dense int32-tag-guarded stencil directly; the MIR+CLIF
+    // path below is the fallback for opcodes the template doesn't yet cover
+    // (float64 arithmetic, generic property access, calls beyond
+    // `CallDirect`, etc.). We thread the persistent feedback in here so the
+    // analyzer can mark arithmetic ops with stable `Int32` feedback as
+    // guard-free, saving ~12 asm instructions per operand load.
+    if let Ok(program) =
+        crate::baseline::analyze_template_candidate_with_feedback(
+            function,
+            &property_profile,
+            Some(feedback),
+        )
+        && let Ok(stencil) = emit_template_stencil(&program)
+    {
+        if cfg.dump_asm {
+            eprintln!(
+                "[JIT] === Template Baseline Stencil (feedback) for {:?} ({} bytes) ===",
+                function.name(),
+                stencil.len(),
+            );
+            crate::codegen::disasm::dump_disassembly(
+                stencil.bytes(),
+                0,
+                Some("template-baseline-stencil-feedback"),
+            );
+        }
+        if let Ok(compiled) =
+            compile_code_buffer(&stencil, CompiledCodeOrigin::TemplateBaseline)
+        {
+            let duration_ns = start.elapsed().as_nanos() as u64;
+            telemetry::record_compile_time(true, duration_ns);
+            telemetry::record_function_compiled(function_name, 1, duration_ns, compiled.code_size);
+            if cfg.dump_bytecode {
+                eprintln!(
+                    "[JIT] tier1 (feedback-aware) backend for {:?}: {:?}",
+                    function.name(),
+                    compiled.origin,
+                );
+            }
+            return Ok(compiled);
+        }
+    }
+
     // Determine compilation tier based on feedback quality.
     let has_useful_feedback = (0..feedback.len()).any(|i| {
         let id = FeedbackSlotId(i as u16);
@@ -132,9 +185,6 @@ pub fn compile_function_with_feedback(
         crate::mir::passes::PassTier::Baseline
     };
 
-    let cfg = crate::config::jit_config();
-    let start = Instant::now();
-
     if cfg.dump_bytecode {
         eprintln!(
             "[JIT] === Bytecode for {:?} ({} instructions, tier={:?}) ===",
@@ -142,10 +192,20 @@ pub fn compile_function_with_feedback(
             function.bytecode().len(),
             tier
         );
+        for (pc, instr) in function.bytecode().instructions().iter().enumerate() {
+            eprintln!(
+                "  {:04}: {:?} a={} b={} c={}",
+                pc,
+                instr.opcode(),
+                instr.a(),
+                instr.b(),
+                instr.c()
+            );
+        }
     }
 
-    // Build MIR using existing builder (property profile extracted from feedback).
-    let property_profile = extract_property_profile(function, feedback);
+    // Build MIR using existing builder (property profile reused from the
+    // template-baseline probe above).
     let mut graph = build_mir(
         function,
         if property_profile.is_empty() {

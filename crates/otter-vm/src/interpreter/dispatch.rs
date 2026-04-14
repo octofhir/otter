@@ -3141,7 +3141,10 @@ impl Interpreter {
                         instruction.c(),
                         call,
                     )?;
-                    match self.run_completion_with_runtime(
+                    // JSC-style tier-up: if the callee is hot and has cached
+                    // native code, execute it directly; otherwise run the
+                    // interpreter and accrue hotness budget for this callee.
+                    match self.run_with_tier_up(
                         &callee_module,
                         &mut callee_activation,
                         runtime,
@@ -3483,6 +3486,11 @@ impl Interpreter {
                 if offset < 0 {
                     self.check_interrupt()?;
                     runtime.gc_safepoint(activation.registers());
+                    // JSC-style loop back-edge hotness accounting.
+                    runtime.decrement_tier_up_budget(
+                        activation.function_index(),
+                        super::TIER1_BACKEDGE_COST,
+                    );
                 }
                 activation.jump_relative(offset)?;
                 Ok(StepOutcome::Continue)
@@ -3496,6 +3504,10 @@ impl Interpreter {
                     if offset < 0 {
                         self.check_interrupt()?;
                         runtime.gc_safepoint(activation.registers());
+                        runtime.decrement_tier_up_budget(
+                            activation.function_index(),
+                            super::TIER1_BACKEDGE_COST,
+                        );
                     }
                     activation.jump_relative(offset)?;
                 } else {
@@ -3514,6 +3526,10 @@ impl Interpreter {
                     if offset < 0 {
                         self.check_interrupt()?;
                         runtime.gc_safepoint(activation.registers());
+                        runtime.decrement_tier_up_budget(
+                            activation.function_index(),
+                            super::TIER1_BACKEDGE_COST,
+                        );
                     }
                     activation.jump_relative(offset)?;
                 }

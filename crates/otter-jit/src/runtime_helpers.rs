@@ -199,15 +199,17 @@ pub extern "C" fn otter_baseline_call_direct(
     bytecode_pc: u32,
 ) -> i64 {
     telemetry::record_helper_call(HelperFamily::Call);
-    let Some(ctx) = (unsafe { ctx.as_mut() }) else {
-        return BAILOUT_SENTINEL as i64;
-    };
-    let Some(module) = (unsafe { module(ctx) }) else {
-        return write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc) as i64;
-    };
+    let ctx_ref = unsafe { &mut *ctx };
+
+    let module_ptr = ctx_ref.module_ptr.cast::<Module>();
+    if module_ptr.is_null() {
+        return write_bailout(ctx_ref, BailoutReason::Unsupported, bytecode_pc) as i64;
+    }
+    let module = unsafe { &*module_ptr };
+
     let callee_index_id = FunctionIndex(callee_index);
     let Some(function) = module.function(callee_index_id) else {
-        return write_bailout(ctx, BailoutReason::CallTargetMismatch, bytecode_pc) as i64;
+        return write_bailout(ctx_ref, BailoutReason::CallTargetMismatch, bytecode_pc) as i64;
     };
 
     let register_count = usize::from(function.frame_layout().register_count());
@@ -215,10 +217,10 @@ pub extern "C" fn otter_baseline_call_direct(
     let parameter_range = function.frame_layout().parameter_range();
 
     // Copy args directly from caller's register array.
-    let caller_registers_ptr = ctx.registers_base.cast::<RegisterValue>();
+    let caller_registers_ptr = ctx_ref.registers_base.cast::<RegisterValue>();
     for offset in 0..usize::from(argc) {
         let src_idx = usize::from(arg_base) + offset;
-        if src_idx >= ctx.local_count as usize {
+        if src_idx >= ctx_ref.local_count as usize {
             break;
         }
         let dst_idx = usize::from(parameter_range.start()) + offset;
@@ -228,14 +230,25 @@ pub extern "C" fn otter_baseline_call_direct(
         callee_registers[dst_idx] = unsafe { *caller_registers_ptr.add(src_idx) };
     }
 
-    match crate::deopt::execute_function_with_fallback(
+    let interrupt_flag = ctx_ref.interrupt_flag;
+    let runtime_ptr = ctx_ref.runtime_ptr.cast::<RuntimeState>();
+    if runtime_ptr.is_null() {
+        return write_bailout(ctx_ref, BailoutReason::Unsupported, bytecode_pc) as i64;
+    }
+    let runtime = unsafe { &mut *runtime_ptr };
+
+    match crate::deopt::execute_function_with_runtime_fallback(
         module,
         callee_index_id,
         &mut callee_registers,
-        ctx.interrupt_flag,
+        runtime,
+        interrupt_flag,
     ) {
-        Ok(result) => result.return_value().raw_bits() as i64,
-        Err(_) => write_bailout(ctx, BailoutReason::Unsupported, bytecode_pc) as i64,
+        Ok(result) => {
+            let res: otter_vm::interpreter::ExecutionResult = result;
+            res.return_value().raw_bits() as i64
+        }
+        Err(_) => write_bailout(ctx_ref, BailoutReason::Unsupported, bytecode_pc) as i64,
     }
 }
 

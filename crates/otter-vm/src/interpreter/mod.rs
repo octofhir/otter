@@ -26,12 +26,15 @@
 
 mod activation;
 mod dispatch;
+#[cfg(feature = "bytecode_v2")]
+mod dispatch_v2;
 mod error;
 mod execution_result;
 mod frame_runtime;
 mod number_conv;
 mod runtime_state;
 mod step_outcome;
+mod tier_up;
 
 #[cfg(test)]
 mod tests;
@@ -42,6 +45,9 @@ pub use execution_result::ExecutionResult;
 use frame_runtime::FrameRuntimeState;
 pub(crate) use step_outcome::ToPrimitiveHint;
 use step_outcome::{Completion, StepOutcome, TailCallPayload};
+pub use tier_up::{
+    TIER1_BACKEDGE_COST, TIER1_CALL_COST, TIER1_INITIAL_BUDGET, TierUpExecResult, TierUpHook,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,6 +132,23 @@ pub struct RuntimeState {
     /// V8 model: FeedbackVector lives on SharedFunctionInfo, not on stack frame.
     feedback_vectors:
         std::collections::HashMap<crate::FunctionIndex, crate::feedback::FeedbackVector>,
+    /// JSC-style hotness counters per function. Decremented on `CallClosure`
+    /// entry (cost: [`TIER1_CALL_COST`]) and on each loop back-edge
+    /// (cost: [`TIER1_BACKEDGE_COST`]). Tier-up compilation fires when the
+    /// counter crosses zero. Initial value: [`TIER1_INITIAL_BUDGET`].
+    ///
+    /// Reference: <https://webkit.org/blog/10308/speculation-in-javascriptcore/>.
+    pub(super) tier_up_budgets: std::collections::HashMap<crate::FunctionIndex, i32>,
+    /// Functions that failed compilation or exceeded the deopt budget.
+    /// Blacklisted functions permanently stay in the interpreter; no further
+    /// budget decrement or compile attempts occur for them.
+    pub(super) tier_up_blacklisted: std::collections::HashSet<crate::FunctionIndex>,
+    /// Tier-up bridge installed by the embedding runtime (otter-runtime).
+    /// When `None`, no tier-up happens — the interpreter runs everything.
+    ///
+    /// `Arc<dyn TierUpHook>` lets us cheaply clone the hook on the hot path
+    /// without entangling the `RuntimeState` borrow with the hook borrow.
+    pub(super) tier_up_hook: Option<Arc<dyn TierUpHook>>,
 }
 
 /// Minimal interpreter shell for the new VM backend.
@@ -952,6 +975,102 @@ impl Interpreter {
         }
     }
 
+    /// JSC-style tier-up dispatch for bytecode-closure calls.
+    ///
+    /// On every nested `CallClosure`, this function:
+    /// 1. If the callee has cached native code (installed by the tier-up
+    ///    hook), invokes it. On success, returns the value; on bailout,
+    ///    resumes the interpreter at the bailout PC with the register
+    ///    file already materialized.
+    /// 2. Otherwise runs the interpreter and decrements the callee's
+    ///    hotness budget. When the budget crosses zero, synchronously
+    ///    requests compilation via the tier-up hook, so the next call to
+    ///    the same function goes through the native path.
+    ///
+    /// If no tier-up hook is installed, this is equivalent to calling
+    /// [`Self::run_completion_with_runtime`] directly.
+    ///
+    /// Reference: <https://webkit.org/blog/10308/speculation-in-javascriptcore/>.
+    fn run_with_tier_up(
+        &self,
+        module: &Module,
+        activation: &mut Activation,
+        runtime: &mut RuntimeState,
+    ) -> Result<Completion, InterpreterError> {
+        let callee_idx = activation.function_index();
+        let hook = runtime.tier_up_hook();
+
+        // ---- Fast path: cached native code available? ----
+        if let Some(hook) = hook.as_ref() {
+            let register_count = activation.register_count();
+            // Resolve `this` from the receiver slot if the function defines
+            // one, otherwise default to undefined.
+            let this_raw = {
+                let function = module.function(callee_idx).ok_or_else(|| {
+                    InterpreterError::NativeCall(
+                        "tier-up hook called with invalid function index".into(),
+                    )
+                })?;
+                function
+                    .frame_layout()
+                    .receiver_slot()
+                    .and_then(|slot| activation.registers().get(usize::from(slot)).copied())
+                    .map(|v| v.raw_bits())
+                    .unwrap_or(RegisterValue::undefined().raw_bits())
+            };
+            let registers_base = activation.registers_mut_ptr();
+            let interrupt_ptr = self
+                .interrupt_flag
+                .as_ref()
+                .map(|f| std::sync::Arc::as_ptr(f).cast::<u8>())
+                .unwrap_or(std::ptr::null());
+
+            match hook.execute_cached(
+                module,
+                callee_idx,
+                registers_base,
+                register_count,
+                this_raw,
+                runtime as *mut RuntimeState as *mut (),
+                interrupt_ptr,
+            ) {
+                TierUpExecResult::Return(value) => {
+                    return Ok(Completion::Return(value));
+                }
+                TierUpExecResult::Bailout { resume_pc, .. } => {
+                    // Resume interpreter at bailout PC. Register window is
+                    // already coherent because JIT and interpreter share the
+                    // same frame layout (`RegisterValue` slot == JIT slot).
+                    activation.set_pc(resume_pc);
+                    return self.run_completion_with_runtime(module, activation, runtime);
+                }
+                TierUpExecResult::NotCompiled => {
+                    // Fall through to the interp+budget path below.
+                }
+            }
+        }
+
+        // ---- Slow path: interpreter + hotness budget ----
+        let should_tier_up = runtime.decrement_tier_up_budget(callee_idx, tier_up::TIER1_CALL_COST);
+        let result = self.run_completion_with_runtime(module, activation, runtime)?;
+
+        if should_tier_up && hook.is_some() && !runtime.is_tier_up_blacklisted(callee_idx) {
+            // Reset budget first so a failed compile attempt doesn't retry
+            // on every call; the hook's blacklist logic takes over on
+            // persistent failures.
+            runtime.reset_tier_up_budget(callee_idx);
+            if let Some(hook) = hook.as_ref() {
+                let _compiled = hook.try_compile(
+                    module,
+                    callee_idx,
+                    runtime as *mut RuntimeState as *mut (),
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
     fn run_completion_with_runtime(
         &self,
         module: &Module,
@@ -991,13 +1110,35 @@ impl Interpreter {
             // Update the topmost shadow stack entry's PC so a snapshot taken
             // mid-step reports the correct call site.
             runtime.update_top_frame_pc(activation.pc());
-            let outcome = match self.step(
+            // Route to the v2 dispatcher when the function carries a v2
+            // bytecode stream; fall through to the v1 `step` otherwise.
+            #[cfg(feature = "bytecode_v2")]
+            let step_fn_result = if function.bytecode_v2().is_some() {
+                self.step_v2(
+                    &function,
+                    &current_module,
+                    activation,
+                    runtime,
+                    &mut frame_runtime,
+                )
+            } else {
+                self.step(
+                    &function,
+                    &current_module,
+                    activation,
+                    runtime,
+                    &mut frame_runtime,
+                )
+            };
+            #[cfg(not(feature = "bytecode_v2"))]
+            let step_fn_result = self.step(
                 &function,
                 &current_module,
                 activation,
                 runtime,
                 &mut frame_runtime,
-            ) {
+            );
+            let outcome = match step_fn_result {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
                 Err(InterpreterError::TypeError(message)) => {

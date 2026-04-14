@@ -33,6 +33,7 @@ pub mod profile_cache;
 mod runtime_helpers;
 pub mod snapshot;
 pub mod telemetry;
+pub mod tier_up_hook;
 pub mod watchpoint;
 
 pub use deopt::{BAILOUT_SENTINEL, BailoutReason};

@@ -168,6 +168,15 @@ pub struct Function {
     deopt: DeoptTable,
     exceptions: ExceptionTable,
     source_map: SourceMap,
+    /// Optional v2 (Ignition-style) bytecode, produced by the v1→v2
+    /// transpiler or (eventually) the direct AST→v2 compiler. When
+    /// `Some`, the interpreter routes this function through the v2
+    /// dispatch path; when `None`, the v1 bytecode above is used.
+    ///
+    /// Gated on the `bytecode_v2` Cargo feature so non-feature builds
+    /// pay zero overhead.
+    #[cfg(feature = "bytecode_v2")]
+    bytecode_v2: Option<crate::bytecode_v2::Bytecode>,
 }
 
 impl Function {
@@ -217,6 +226,8 @@ impl Function {
             deopt: tables.deopt,
             exceptions: tables.exceptions,
             source_map: tables.source_map,
+            #[cfg(feature = "bytecode_v2")]
+            bytecode_v2: None,
         }
     }
 
@@ -228,6 +239,23 @@ impl Function {
         bytecode: Bytecode,
     ) -> Self {
         Self::new(name, frame_layout, bytecode, FunctionTables::default())
+    }
+
+    /// Attach a v2 (Ignition-style) bytecode stream to this function.
+    /// The interpreter will dispatch through the v2 path once the v2
+    /// bytecode is installed.
+    #[cfg(feature = "bytecode_v2")]
+    #[must_use]
+    pub fn with_bytecode_v2(mut self, v2: crate::bytecode_v2::Bytecode) -> Self {
+        self.bytecode_v2 = Some(v2);
+        self
+    }
+
+    /// Returns the attached v2 bytecode, if any.
+    #[cfg(feature = "bytecode_v2")]
+    #[must_use]
+    pub fn bytecode_v2(&self) -> Option<&crate::bytecode_v2::Bytecode> {
+        self.bytecode_v2.as_ref()
     }
 
     /// Returns the function name, if present.

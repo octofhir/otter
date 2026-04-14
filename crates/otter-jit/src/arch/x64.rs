@@ -88,6 +88,17 @@ impl<'a> Assembler<'a> {
         self.buf.emit_u8(0xC0 | (reg.low3() << 3) | rm.low3());
     }
 
+    fn modrm_rm_u32(&mut self, reg: Reg, base: Reg, offset: u32) {
+        // [base + offset32]
+        // Use Mod=2 (disp32)
+        self.buf.emit_u8(0x80 | (reg.low3() << 3) | base.low3());
+        if base == Reg::Rsp {
+            // SIB byte needed for RSP base
+            self.buf.emit_u8(0x24);
+        }
+        self.buf.emit_u32_le(offset);
+    }
+
     // ---- Basic instructions ----
 
     /// `mov reg, imm64`
@@ -135,9 +146,54 @@ impl<'a> Assembler<'a> {
         self.buf.emit_u32_le(imm as u32);
     }
 
+    /// `add dst, src` (64-bit)
+    pub fn add_rr(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(src, dst);
+        self.buf.emit_u8(0x01); // add r/m64, r64
+        self.modrm_rr(src, dst);
+    }
+
+    /// `sub dst, src` (64-bit)
+    pub fn sub_rr(&mut self, dst: Reg, src: Reg) {
+        self.rex_w(src, dst);
+        self.buf.emit_u8(0x29); // sub r/m64, r64
+        self.modrm_rr(src, dst);
+    }
+
+    /// `shl reg, imm8` (64-bit)
+    pub fn shl_ri(&mut self, reg: Reg, imm: u8) {
+        self.rex_w(Reg::Rax, reg);
+        self.buf.emit_u8(0xC1); // group 2, /4
+        self.modrm_rr(Reg::Rsp /* /4 */, reg);
+        self.buf.emit_u8(imm);
+    }
+
+    /// `mov [base + offset], src` (64-bit register to memory, 32-bit offset)
+    pub fn mov_rm_u32(&mut self, base: Reg, offset: u32, src: Reg) {
+        self.rex_w(src, base);
+        self.buf.emit_u8(0x89); // mov r/m64, r64
+        self.modrm_rm_u32(src, base, offset);
+    }
+
+    /// `mov dst, [base + offset]` (64-bit memory to register, 32-bit offset)
+    pub fn mov_mr_u32(&mut self, dst: Reg, base: Reg, offset: u32) {
+        self.rex_w(dst, base);
+        self.buf.emit_u8(0x8B); // mov r64, r/m64
+        self.modrm_rm_u32(dst, base, offset);
+    }
+
     /// `ret`
     pub fn ret(&mut self) {
         self.buf.emit_u8(0xC3);
+    }
+
+    /// `call reg` (64-bit register indirect call)
+    pub fn call_r(&mut self, reg: Reg) {
+        if reg.is_extended() {
+            self.buf.emit_u8(0x41);
+        }
+        self.buf.emit_u8(0xFF); // group 5, /2
+        self.modrm_rr(Reg::Rdx /* /2 */, reg);
     }
 
     /// `push reg`

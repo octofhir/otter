@@ -98,21 +98,26 @@ pub fn execute_function_with_fallback(
     }
 }
 
-/// Execute a profiled function on shared runtime state and fall back to the interpreter.
-pub fn execute_function_profiled_with_fallback(
+/// Execute a function in JIT code using an existing runtime and explicitly fall back to the interpreter on deopt.
+pub fn execute_function_with_runtime_fallback(
     module: &Module,
     function_index: FunctionIndex,
     registers: &mut [RegisterValue],
+    runtime: &mut RuntimeState,
     interrupt_flag: *const u8,
 ) -> Result<ExecutionResult, DeoptError> {
-    let profile = Interpreter::new().profile_property_caches(module, function_index, registers)?;
-    let mut runtime = otter_vm::RuntimeState::new();
+    let function = module
+        .function(function_index)
+        .ok_or(DeoptError::InvalidFunctionIndex)?;
+
+    // We use an empty property profile for now when jumping via this bridge;
+    // Tier 1 uses the persistent feedback vector from the runtime itself.
     match execute_function_profiled_with_runtime(
         module,
         function_index,
         registers,
-        &mut runtime,
-        &profile,
+        runtime,
+        &[],
         interrupt_flag,
     )? {
         JitExecResult::Ok(raw) => {
@@ -121,19 +126,27 @@ pub fn execute_function_profiled_with_fallback(
             })?;
             Ok(ExecutionResult::new(value))
         }
-        JitExecResult::Bailout { bytecode_pc, .. } => Ok(Interpreter::new().resume_with_runtime(
-            module,
-            function_index,
+        JitExecResult::Bailout {
             bytecode_pc,
-            registers,
-            &mut runtime,
-        )?),
-        JitExecResult::NotCompiled => Ok(Interpreter::new().execute_with_runtime(
-            module,
-            function_index,
-            registers,
-            &mut runtime,
-        )?),
+            reason,
+        } => {
+            let handoff = handoff_for_bailout(function, bytecode_pc, reason);
+            Ok(Interpreter::new().resume_with_runtime(
+                module,
+                function_index,
+                handoff.resume_pc(),
+                registers,
+                runtime,
+            )?)
+        }
+        JitExecResult::NotCompiled => {
+            Ok(Interpreter::new().execute_with_runtime(
+                module,
+                function_index,
+                registers,
+                runtime,
+            )?)
+        }
     }
 }
 

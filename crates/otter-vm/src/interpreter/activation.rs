@@ -27,6 +27,17 @@ pub struct Activation {
     /// Stored separately from the register file to avoid polluting the frame layout.
     /// Used by `CreateArguments` to populate the arguments exotic object.
     pub(super) overflow_args: Vec<RegisterValue>,
+    /// V8 Ignition-style implicit accumulator for the v2 bytecode
+    /// dispatch. Holds the transient expression value that most v2
+    /// arithmetic / comparison / property ops read and write. Unused by
+    /// the v1 dispatch loop, but kept on every `Activation` so that
+    /// generator save/resume + deopt materialization remain uniform
+    /// across both ISAs.
+    ///
+    /// Defaults to `undefined` on frame creation. Preserved as part of
+    /// `save_registers` / `restore_registers` so yield/await round-trip
+    /// the accumulator through the generator continuation.
+    pub(super) accumulator: RegisterValue,
 }
 
 impl Activation {
@@ -66,6 +77,7 @@ impl Activation {
             open_upvalues: vec![None; usize::from(register_count)].into_boxed_slice(),
             written_registers: Vec::new(),
             overflow_args: Vec::new(),
+            accumulator: RegisterValue::undefined(),
         }
     }
 
@@ -125,6 +137,38 @@ impl Activation {
     #[must_use]
     pub fn registers(&self) -> &[RegisterValue] {
         &self.registers
+    }
+
+    /// Reads the v2 accumulator. Undefined for frames running v1
+    /// bytecode; only the v2 dispatcher writes it.
+    #[must_use]
+    pub fn accumulator(&self) -> RegisterValue {
+        self.accumulator
+    }
+
+    /// Overwrites the v2 accumulator.
+    pub fn set_accumulator(&mut self, value: RegisterValue) {
+        self.accumulator = value;
+    }
+
+    /// Returns a raw mutable pointer to the register file for JIT native
+    /// execution. The pointer is valid as long as the `Activation` is not
+    /// moved or dropped.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that the register file is not aliased by any
+    /// other reference while the pointer is live and must respect the
+    /// `register_count()` bound.
+    #[must_use]
+    pub fn registers_mut_ptr(&mut self) -> *mut RegisterValue {
+        self.registers.as_mut_ptr()
+    }
+
+    /// Returns the total number of register slots in the frame.
+    #[must_use]
+    pub fn register_count(&self) -> usize {
+        self.registers.len()
     }
 
     /// Saves the entire register window as a boxed slice for generator suspension.

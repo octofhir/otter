@@ -28,6 +28,11 @@ pub mod bridge;
 pub mod builders;
 /// Runtime bytecode model.
 pub mod bytecode;
+/// Ignition-style accumulator bytecode (Phase C, v2 ISA). Gated behind
+/// the `bytecode_v2` Cargo feature until Phase 2+ wiring lands. See
+/// `docs/bytecode-v2.md` for the design document.
+#[cfg(feature = "bytecode_v2")]
+pub mod bytecode_v2;
 /// Call-site side tables for direct calls.
 pub mod call;
 /// Closure creation metadata and upvalue identifiers.

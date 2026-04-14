@@ -12,9 +12,18 @@ warnings = "deny"
 [lints.clippy]
 all = "deny"
 
+[features]
+default = []
+# Enable the in-progress Ignition-style bytecode ISA (Phase C of
+# JIT_REFACTOR_PLAN.md). Off by default — the runtime still ships v1.
+# Turning this on just compiles the `bytecode_v2` module and its unit
+# tests; no interpreter or compiler changes until Phase 2/3 land.
+bytecode_v2 = []
+
 [dependencies]
 otter-gc = { path = "../otter-gc" }
 otter-macros = { path = "../otter-macros" }
+thiserror.workspace = true
 oxc_allocator = "0.123"
 oxc_ast = "0.123"
 oxc_ast_visit = "0.123"

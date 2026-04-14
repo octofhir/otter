@@ -138,7 +138,7 @@ pub mod offsets {
     /// Offsets for JsObject memory layout.
     pub mod js_object {
         pub const SHAPE_ID: i32 = 0;
-        pub const VALUES_PTR: i32 = 40;
+        pub const VALUES_PTR: i32 = 48;
     }
 }
 

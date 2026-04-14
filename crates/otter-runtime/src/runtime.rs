@@ -155,10 +155,19 @@ impl OtterRuntime {
 
     /// Creates a runtime from pre-configured state. Called by the builder.
     pub(crate) fn from_state(
-        state: RuntimeState,
+        mut state: RuntimeState,
         timeout: Option<Duration>,
         host: HostConfig,
     ) -> Self {
+        // Install the default JSC-style tier-up hook. Enables in-process
+        // compilation of hot inner functions on `CallClosure` after the
+        // per-function hotness budget expires. Without this, only the
+        // top-level module entry reaches the JIT — inner hot loops stay
+        // fully interpreted.
+        //
+        // The hook is stateless (backed by the thread-local code cache), so
+        // one `Arc` shared across every runtime on this thread is fine.
+        state.set_tier_up_hook(otter_jit::tier_up_hook::DefaultTierUpHook::new_arc());
         Self {
             state,
             timeout,

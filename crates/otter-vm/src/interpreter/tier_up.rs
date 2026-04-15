@@ -30,8 +30,15 @@ pub enum TierUpExecResult {
     Return(RegisterValue),
     /// Native code bailed out at `resume_pc` with the given reason code.
     /// The interpreter should resume at this PC with the register file
-    /// already materialized in place.
-    Bailout { resume_pc: u32, reason: u32 },
+    /// already materialized in place. `accumulator_raw` is the NaN-boxed
+    /// v2 accumulator value captured by the bailout prologue; the
+    /// interpreter must load it into the frame's accumulator so v2 dispatch
+    /// resumes with the live value.
+    Bailout {
+        resume_pc: u32,
+        reason: u32,
+        accumulator_raw: u64,
+    },
     /// The function has no cached compiled code; caller must interpret.
     NotCompiled,
 }

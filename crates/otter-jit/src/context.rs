@@ -76,6 +76,11 @@ pub struct JitContext {
 
     /// Pointer to the TypedHeap slots array base.
     pub heap_slots_base: *const (),
+
+    /// NaN-boxed v2 accumulator spill slot. Written by the v2 baseline
+    /// stencil in its bailout prologue so the interpreter can resume with
+    /// the live accumulator value. Unused by v1 stencils.
+    pub accumulator_raw: u64,
 }
 
 // Compile-time offset verification. These constants are used by codegen to
@@ -111,6 +116,7 @@ assert_offset!(secondary_result, 112);
 assert_offset!(module_ptr, 120);
 assert_offset!(runtime_ptr, 128);
 assert_offset!(heap_slots_base, 136);
+assert_offset!(accumulator_raw, 144);
 
 /// Byte offset constants for use in Cranelift IR codegen.
 pub mod offsets {
@@ -134,6 +140,7 @@ pub mod offsets {
     pub const MODULE_PTR: i32 = 120;
     pub const RUNTIME_PTR: i32 = 128;
     pub const HEAP_SLOTS_BASE: i32 = 136;
+    pub const ACCUMULATOR_RAW: i32 = 144;
 
     /// Offsets for JsObject memory layout.
     pub mod js_object {
@@ -148,6 +155,6 @@ mod tests {
 
     #[test]
     fn jit_context_size() {
-        assert_eq!(std::mem::size_of::<JitContext>(), 144);
+        assert_eq!(std::mem::size_of::<JitContext>(), 152);
     }
 }

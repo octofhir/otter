@@ -92,10 +92,36 @@ pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, Jit
 #[cfg(feature = "bytecode_v2")]
 fn try_compile_v2_template(function: &vm::Function) -> Option<CompiledFunction> {
     if function.bytecode_v2().is_none() {
+        if std::env::var("OTTER_V2_DEBUG").is_ok() {
+            eprintln!("[v2-debug] no v2 bytecode for {:?}", function.name());
+        }
         return None;
     }
-    let program = analyze_v2_template_candidate(function).ok()?;
-    let stencil = emit_v2_template_stencil(&program).ok()?;
+    let program = match analyze_v2_template_candidate(function) {
+        Ok(p) => p,
+        Err(e) => {
+            if std::env::var("OTTER_V2_DEBUG").is_ok() {
+                eprintln!("[v2-debug] analyzer rejected {:?}: {e:?}", function.name());
+            }
+            return None;
+        }
+    };
+    let stencil = match emit_v2_template_stencil(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            if std::env::var("OTTER_V2_DEBUG").is_ok() {
+                eprintln!("[v2-debug] emitter rejected {:?}: {e:?}", function.name());
+            }
+            return None;
+        }
+    };
+    if std::env::var("OTTER_V2_DEBUG").is_ok() {
+        eprintln!(
+            "[v2-debug] v2 stencil for {:?}: {} bytes",
+            function.name(),
+            stencil.len()
+        );
+    }
     let cfg = crate::config::jit_config();
     if cfg.dump_asm {
         eprintln!(
@@ -541,6 +567,7 @@ pub fn execute_function_with_interrupt(
         module_ptr: std::ptr::null(),
         runtime_ptr: &mut runtime as *mut vm::RuntimeState as *mut (),
         heap_slots_base: runtime.heap().slots_ptr(),
+        accumulator_raw: vm::RegisterValue::undefined().raw_bits(),
     };
 
     telemetry::record_jit_entry();
@@ -612,6 +639,7 @@ pub fn execute_function_profiled_with_runtime(
         module_ptr: module as *const vm::Module as *const (),
         runtime_ptr: runtime as *mut vm::RuntimeState as *mut (),
         heap_slots_base: runtime.heap().slots_ptr(),
+        accumulator_raw: vm::RegisterValue::undefined().raw_bits(),
     };
 
     telemetry::record_jit_entry();

@@ -1037,11 +1037,23 @@ impl Interpreter {
                 TierUpExecResult::Return(value) => {
                     return Ok(Completion::Return(value));
                 }
-                TierUpExecResult::Bailout { resume_pc, .. } => {
+                TierUpExecResult::Bailout {
+                    resume_pc,
+                    accumulator_raw,
+                    ..
+                } => {
                     // Resume interpreter at bailout PC. Register window is
                     // already coherent because JIT and interpreter share the
                     // same frame layout (`RegisterValue` slot == JIT slot).
+                    // For v2 bailouts, reload the pinned accumulator from
+                    // the context spill slot so dispatch_v2 resumes with the
+                    // live value. v1 stencils leave this as undefined, which
+                    // `from_raw_bits` accepts without a mutation.
                     activation.set_pc(resume_pc);
+                    if let Some(value) = crate::value::RegisterValue::from_raw_bits(accumulator_raw)
+                    {
+                        activation.set_accumulator(value);
+                    }
                     return self.run_completion_with_runtime(module, activation, runtime);
                 }
                 TierUpExecResult::NotCompiled => {

@@ -224,6 +224,7 @@ pub fn execute_module_entry_with_runtime(
                 module_ptr: module as *const Module as *const (),
                 runtime_ptr: runtime as *mut RuntimeState as *mut (),
                 heap_slots_base: runtime.heap().slots_ptr(),
+                accumulator_raw: RegisterValue::undefined().raw_bits(),
             };
 
             crate::telemetry::record_jit_entry();

@@ -124,6 +124,7 @@ fn execute_compiled(
         module_ptr: std::ptr::null(),
         runtime_ptr: std::ptr::null_mut(),
         heap_slots_base: std::ptr::null(),
+        accumulator_raw: RegisterValue::undefined().raw_bits(),
     };
 
     crate::telemetry::record_jit_entry();

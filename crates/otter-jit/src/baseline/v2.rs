@@ -96,6 +96,33 @@ pub enum V2TemplateInstruction {
     /// Intermediate non-acc copies emitted by the v1 compiler's temp
     /// allocator; the x21-pin is unaffected.
     Mov { dst: u16, src: u16 },
+    /// `acc = acc + 1`. Maps from `Inc`.
+    IncAcc,
+    /// `acc = acc - 1`. Maps from `Dec`.
+    DecAcc,
+    /// `acc = -acc` (int32 wraparound). Maps from `Negate`.
+    NegateAcc,
+    /// `acc = ~acc` (bitwise NOT). Maps from `BitwiseNot`.
+    BitNotAcc,
+    /// `acc = acc * imm` (int32 wraparound). Maps from `MulSmi imm`.
+    MulAccI32 { imm: i32 },
+    /// `acc = acc & imm`. Maps from `BitwiseAndSmi imm`.
+    BitAndAccI32 { imm: i32 },
+    /// `acc = acc << (imm & 0x1f)`. Maps from `ShlSmi imm`.
+    ShlAccI32 { imm: i32 },
+    /// `acc = acc >> (imm & 0x1f)` (arithmetic). Maps from `ShrSmi imm`.
+    ShrAccI32 { imm: i32 },
+    /// `acc = ctx.this_raw` (NaN-boxed receiver). Maps from `LdaThis`.
+    /// The v1 source compiler emits `LoadThis` at the start of every
+    /// function to materialize the hidden receiver slot; accepting it
+    /// here keeps the full function body eligible for v2 lowering.
+    LdaThis,
+    /// `acc = ctx.callee_raw`. Maps from `LdaCurrentClosure`.
+    LdaCurrentClosure,
+    /// `acc = ToNumber(acc)`. On `AccState::Int32` this is a no-op (the
+    /// accumulator is already a JS Number). On `Raw` state we bail out
+    /// to the interpreter for the coercion-correct path.
+    ToNumberAcc,
 }
 
 /// Comparison kind carried across `CompareAcc` → `JumpIfCompareFalse`.
@@ -149,10 +176,15 @@ pub enum V2TemplateCompileError {
 
 /// Analyze a function's v2 bytecode for template-baseline compilation.
 ///
-/// Supported op set (Phase 4.1):
-/// `Ldar`, `Star`, `LdaSmi`, `Add`, `Sub`, `Mul`, `AddSmi`, `SubSmi`,
-/// `BitwiseOr`, `BitwiseOrSmi`, `TestLessThan`, `TestGreaterThan`,
-/// `TestLessThanOrEqual`, `TestGreaterThanOrEqual`, `TestEqualStrict`,
+/// Supported op set (Phase 4.5b):
+/// `Ldar`, `Star`, `Mov`, `LdaSmi`, `LdaUndefined`/`LdaNull`/`LdaTrue`/
+/// `LdaFalse`/`LdaTheHole`/`LdaNaN` (as `LdaTagConst`),
+/// `Add`/`Sub`/`Mul`/`BitwiseOr`,
+/// `AddSmi`/`SubSmi`/`MulSmi`/`BitwiseOrSmi`/`BitwiseAndSmi`/
+/// `ShlSmi`/`ShrSmi`,
+/// `Inc`/`Dec`/`Negate`/`BitwiseNot`,
+/// `TestLessThan`/`TestGreaterThan`/`TestLessThanOrEqual`/
+/// `TestGreaterThanOrEqual`/`TestEqualStrict`,
 /// `Jump`, `JumpIfToBooleanFalse`, `Return`.
 ///
 /// All other opcodes surface `UnsupportedOpcode` and prevent the
@@ -361,6 +393,29 @@ fn lower_raw_v2(
             let dst = reg(&r.operands, 1, bp)?;
             Ok(V2TemplateInstruction::Mov { dst, src })
         }
+        OpcodeV2::Inc => Ok(V2TemplateInstruction::IncAcc),
+        OpcodeV2::Dec => Ok(V2TemplateInstruction::DecAcc),
+        OpcodeV2::Negate => Ok(V2TemplateInstruction::NegateAcc),
+        OpcodeV2::BitwiseNot => Ok(V2TemplateInstruction::BitNotAcc),
+        OpcodeV2::MulSmi => {
+            let imm = imm_i32(&r.operands, 0, bp)?;
+            Ok(V2TemplateInstruction::MulAccI32 { imm })
+        }
+        OpcodeV2::BitwiseAndSmi => {
+            let imm = imm_i32(&r.operands, 0, bp)?;
+            Ok(V2TemplateInstruction::BitAndAccI32 { imm })
+        }
+        OpcodeV2::ShlSmi => {
+            let imm = imm_i32(&r.operands, 0, bp)?;
+            Ok(V2TemplateInstruction::ShlAccI32 { imm })
+        }
+        OpcodeV2::ShrSmi => {
+            let imm = imm_i32(&r.operands, 0, bp)?;
+            Ok(V2TemplateInstruction::ShrAccI32 { imm })
+        }
+        OpcodeV2::LdaThis => Ok(V2TemplateInstruction::LdaThis),
+        OpcodeV2::LdaCurrentClosure => Ok(V2TemplateInstruction::LdaCurrentClosure),
+        OpcodeV2::ToNumber => Ok(V2TemplateInstruction::ToNumberAcc),
         other => Err(V2TemplateCompileError::UnsupportedOpcode {
             byte_pc: bp,
             opcode: other,
@@ -451,20 +506,54 @@ pub enum V2TemplateEmitError {
     UnsupportedSequence { index: usize, detail: &'static str },
 }
 
-/// Emit a Phase 4.2 aarch64 stencil for a [`V2TemplateProgram`].
+/// Accumulator-state tracking for the Phase 4.5b guarded emitter.
 ///
-/// This is the **trust-int32** variant: operand loads skip tag guards
-/// and assume every slot already holds an int32-tagged value. The
-/// guarded/bailout-aware variant lives in Phase 4.2b and wires into
-/// the deopt pipeline. This form is usable today for smoke-testing
-/// the plumbing and disassembling the generated code.
+/// `x21` has two distinct representations depending on the most recent
+/// write to the accumulator:
+///
+/// - [`AccState::Int32`] — sign-extended int32 (from `LdaI32`, `Ldar`
+///   after a successful tag guard, or the output of an int32 arithmetic op).
+/// - [`AccState::Raw`] — raw NaN-boxed value (from `LdaTagConst`, written
+///   directly without any int32 coercion).
+///
+/// Every instruction has a pre- and post-state for x21. Ops that treat
+/// x21 as int32 (arithmetic, compare, Return's box-and-exit) require
+/// pre-state `Int32`; if the pre-state is `Raw`, the emitter emits an
+/// unconditional bailout at that PC instead of the op body. `Star`
+/// chooses between "box + str" (Int32) and raw "str" (Raw) so stores
+/// remain semantically correct in both states.
+///
+/// At each bailout patch site we snapshot the state of x21 so the
+/// per-site pad can spill it into `ctx.accumulator_raw` using the right
+/// representation (`box_int32` for Int32, direct `str` for Raw). The
+/// interpreter's resume path reads the spill via
+/// [`TierUpExecResult::Bailout::accumulator_raw`](otter_vm::interpreter::TierUpExecResult)
+/// and assigns it to the frame's v2 accumulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccState {
+    Int32,
+    Raw,
+}
+
+/// Emit a Phase 4.5b aarch64 stencil for a [`V2TemplateProgram`].
+///
+/// Every `ldr` that loads a slot interpreted as int32 is paired with a
+/// `eor / tst / b.ne <bailout_pad>` guard against
+/// [`TAG_INT32`](super::TAG_INT32) pinned in `x20`. On guard failure the
+/// stencil branches to a per-site pad that writes
+/// (`byte_pc`, `reason`, accumulator spill) into `JitContext` and returns
+/// [`BAILOUT_SENTINEL`](crate::BAILOUT_SENTINEL). The tier-up hook sees
+/// the sentinel and hands control back to the v2 dispatcher at
+/// `byte_pc` with the spilled accumulator materialized into the frame.
 ///
 /// Conventions baked into the stencil:
 /// - `x0` = `JitContext*` on entry (caller passes it; v1 compat).
 /// - `x9` = registers_base pointer (loaded from `JitContext` offset 0).
-/// - `x21` = pinned accumulator, live for the entire stencil as an
-///   *unboxed* sign-extended int32. No spill / no reload across opcodes.
-/// - `x10` / `x11` = scratch for operand materialization.
+/// - `x19` = pinned `JitContext*`.
+/// - `x20` = pinned `TAG_INT32` for fast tag guards.
+/// - `x21` = pinned accumulator, state tracked via [`AccState`].
+/// - `x10` / `x11` = scratch. `x10` doubles as `byte_pc` carrier into
+///   the common bailout block; `x11` carries the `reason` code.
 /// - Return boxes `x21` into the NaN-box encoding and writes it into
 ///   `x0` as the native return value.
 pub fn emit_v2_template_stencil(
@@ -498,19 +587,68 @@ fn emit_v2_template_stencil_aarch64(
         Ok(byte_offset)
     }
 
-    /// Load a boxed int32 from slot memory into `dst` and sign-extend
-    /// it to 64 bits. No tag guard — trust-int32 mode. A follow-up phase
-    /// replaces this with a guarded variant that emits a bailout patch.
-    fn load_int32_unchecked(asm: &mut Assembler, dst: Reg, slot_off: u32) {
+    /// Load a boxed slot value into `dst`, tag-guard it as int32 via
+    /// `x20 == TAG_INT32`, and sign-extend the payload. On guard
+    /// failure, control branches to the per-site bailout pad patched
+    /// in after the main body. The guard uses the 3-insn
+    /// `eor / tst / b.ne` sequence from v1's `check_int32_tag_fast`.
+    fn load_int32_guarded(
+        asm: &mut Assembler,
+        dst: Reg,
+        slot_off: u32,
+        byte_pc: u32,
+        acc_state_at_guard: AccState,
+        bailout_patches: &mut Vec<BailoutPatch>,
+    ) {
         asm.ldr_u64_imm(dst, Reg::X9, slot_off);
+        asm.check_int32_tag_fast(dst, Reg::X20);
+        let bp = asm.b_cond_placeholder(Cond::Ne);
+        bailout_patches.push(BailoutPatch {
+            source_offset: bp,
+            byte_pc,
+            reason: crate::BailoutReason::TypeGuardFailed as u32,
+            acc_state: acc_state_at_guard,
+        });
         asm.sxtw(dst, dst);
     }
 
-    /// Box the int32 in `src` (low 32 bits signed) and store the boxed
-    /// value into the slot at `slot_off`.
-    fn store_boxed_int32(asm: &mut Assembler, src_unboxed: Reg, slot_off: u32) {
-        asm.box_int32(Reg::X10, src_unboxed);
-        asm.str_u64_imm(Reg::X10, Reg::X9, slot_off);
+    /// Store x21 into a slot. If x21 holds an unboxed int32, box it
+    /// first; if it already holds raw NaN-boxed bits, write them
+    /// directly.
+    fn store_accumulator(
+        asm: &mut Assembler,
+        state: AccState,
+        slot_off: u32,
+    ) {
+        match state {
+            AccState::Int32 => {
+                asm.box_int32(Reg::X10, Reg::X21);
+                asm.str_u64_imm(Reg::X10, Reg::X9, slot_off);
+            }
+            AccState::Raw => {
+                asm.str_u64_imm(Reg::X21, Reg::X9, slot_off);
+            }
+        }
+    }
+
+    /// Emit a direct branch to a bailout pad for the given PC. Used
+    /// when an int32-requiring op sees acc_state == Raw — we can't
+    /// safely execute the op, so bail to the interpreter which will
+    /// run the coercion-correct path.
+    fn emit_unconditional_bailout(
+        asm: &mut Assembler,
+        byte_pc: u32,
+        reason: u32,
+        acc_state: AccState,
+        bailout_patches: &mut Vec<BailoutPatch>,
+    ) {
+        let bp = asm.b_placeholder();
+        bailout_patches.push(BailoutPatch {
+            source_offset: bp,
+            byte_pc,
+            reason,
+            acc_state,
+        });
     }
 
     /// Pending branch that will be patched once we know the target's
@@ -521,33 +659,56 @@ fn emit_v2_template_stencil_aarch64(
         source_offset: u32,
         /// Target byte_pc (v2 bytecode space) the branch should go to.
         target_byte_pc: u32,
-        /// `None` for `B`, `Some(cond)` for `B.cond`.
+        /// `None` for `B`, `Some(cond)` for `B.cond` (or `cbz` — treated
+        /// separately via `is_cbz`).
         cond: Option<Cond>,
+    }
+
+    /// A deferred bailout site. After the main body is emitted, each
+    /// patch gets its own pad inside the code buffer. The pad writes
+    /// the accumulator spill, pc, and reason, then branches to a
+    /// shared common epilogue that returns [`BAILOUT_SENTINEL`].
+    #[derive(Debug, Clone, Copy)]
+    struct BailoutPatch {
+        source_offset: u32,
+        byte_pc: u32,
+        reason: u32,
+        acc_state: AccState,
     }
 
     let mut buf = CodeBuffer::new();
     let mut asm = Assembler::new(&mut buf);
 
-    // Prologue: 32-byte frame saving x19 + lr + x20 (spare for future
-    // TAG_INT32 pin), same as v1 to keep call-site ABI identical.
+    // Prologue: 32-byte frame saving x19 + lr + x20. Same shape as v1
+    // so the call-site ABI stays identical.
     asm.push_x19_lr_32();
     asm.str_x20_at_sp16();
     // x19 = JitContext*
     asm.mov_rr(Reg::X19, Reg::X0);
     // x9 = registers_base (hot, reused every instruction)
     asm.ldr_u64_imm(Reg::X9, Reg::X19, 0);
-    // x20 = TAG_INT32 (preloaded for the guarded variant; harmless here)
+    // x20 = TAG_INT32 (pinned once for check_int32_tag_fast reuse)
     asm.mov_imm64(Reg::X20, TAG_INT32);
-    // x21 = accumulator, initialized to 0 so reads before the first
-    // write are deterministic. Any opcode that writes acc (LdaI32,
-    // Ldar, arithmetic) overwrites this immediately.
+    // x21 = accumulator, initialized to 0. First instruction that
+    // writes acc overwrites it, so the initial value only matters if
+    // someone reads x21 before any write — which our analyzer
+    // guarantees doesn't happen in practice.
     asm.mov_imm64(Reg::X21, 0);
 
     let mut branch_patches: Vec<BranchPatch> = Vec::new();
-    // Map from byte_pc → emitted byte offset in the CodeBuffer. Populated
-    // as we walk the IR so forward branches can be patched at the end.
+    let mut bailout_patches: Vec<BailoutPatch> = Vec::new();
+    // Map from byte_pc → emitted byte offset in the CodeBuffer.
+    // Populated as we walk the IR so forward branches can be patched
+    // at the end.
     let mut byte_pc_to_emit: Vec<(u32, u32)> =
         Vec::with_capacity(program.instructions.len());
+
+    // Post-state of x21 after each instruction. Index `i` holds the
+    // state AFTER instruction `i` has executed — used by branch fusion
+    // (peek at `i-1`) and by bailout-spill-kind selection.
+    let mut acc_states: Vec<AccState> = Vec::with_capacity(program.instructions.len());
+    // Running state: x21 initial value is 0 (Int32).
+    let mut acc_state = AccState::Int32;
 
     let n = program.instructions.len();
     let mut i = 0;
@@ -557,90 +718,229 @@ fn emit_v2_template_stencil_aarch64(
 
         match &program.instructions[i] {
             V2TemplateInstruction::LdaI32 { imm } => {
-                // Sign-extended literal into x21.
                 asm.mov_imm64(Reg::X21, *imm as i64 as u64);
+                acc_state = AccState::Int32;
             }
             V2TemplateInstruction::Star { reg } => {
-                store_boxed_int32(&mut asm, Reg::X21, slot_offset(*reg)?);
+                store_accumulator(&mut asm, acc_state, slot_offset(*reg)?);
+                // Star doesn't touch x21.
             }
             V2TemplateInstruction::Ldar { reg } => {
-                load_int32_unchecked(&mut asm, Reg::X21, slot_offset(*reg)?);
+                // The guard fires AFTER ldr has clobbered x21 with raw
+                // slot bits — so at the bailout point x21 holds raw
+                // (not yet sxtw'd). Spill as Raw.
+                load_int32_guarded(
+                    &mut asm,
+                    Reg::X21,
+                    slot_offset(*reg)?,
+                    byte_pc,
+                    AccState::Raw,
+                    &mut bailout_patches,
+                );
+                acc_state = AccState::Int32;
             }
             V2TemplateInstruction::AddAcc { rhs } => {
-                load_int32_unchecked(&mut asm, Reg::X10, slot_offset(*rhs)?);
-                asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
-                asm.sxtw(Reg::X21, Reg::X21);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X10,
+                        slot_offset(*rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
             }
             V2TemplateInstruction::SubAcc { rhs } => {
-                load_int32_unchecked(&mut asm, Reg::X10, slot_offset(*rhs)?);
-                asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
-                asm.sxtw(Reg::X21, Reg::X21);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X10,
+                        slot_offset(*rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
             }
             V2TemplateInstruction::MulAcc { rhs } => {
-                load_int32_unchecked(&mut asm, Reg::X10, slot_offset(*rhs)?);
-                asm.mul_rrr(Reg::X21, Reg::X21, Reg::X10);
-                asm.sxtw(Reg::X21, Reg::X21);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X10,
+                        slot_offset(*rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.mul_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
             }
             V2TemplateInstruction::BitOrAcc { rhs } => {
-                load_int32_unchecked(&mut asm, Reg::X10, slot_offset(*rhs)?);
-                asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X10,
+                        slot_offset(*rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
+                }
             }
             V2TemplateInstruction::AddAccI32 { imm } => {
-                asm.mov_imm64(Reg::X10, *imm as i64 as u64);
-                asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
-                asm.sxtw(Reg::X21, Reg::X21);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, *imm as i64 as u64);
+                    asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
             }
             V2TemplateInstruction::SubAccI32 { imm } => {
-                asm.mov_imm64(Reg::X10, *imm as i64 as u64);
-                asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
-                asm.sxtw(Reg::X21, Reg::X21);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, *imm as i64 as u64);
+                    asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
             }
             V2TemplateInstruction::BitOrAccI32 { imm } => {
-                asm.mov_imm64(Reg::X10, *imm as i64 as u64);
-                asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, *imm as i64 as u64);
+                    asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
+                }
             }
             V2TemplateInstruction::CompareAcc { rhs, .. } => {
-                // Load rhs and set flags. A following JumpIfAccFalse
-                // fuses with the recorded compare kind; if missing, the
-                // compare is a no-op effect on the control flow but the
-                // flags remain set (dead).
-                load_int32_unchecked(&mut asm, Reg::X10, slot_offset(*rhs)?);
-                asm.cmp_rr(Reg::X21, Reg::X10);
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X10,
+                        slot_offset(*rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.cmp_rr(Reg::X21, Reg::X10);
+                }
             }
             V2TemplateInstruction::JumpIfAccFalse { target_pc } => {
-                // Peek at previous IR op to decide whether to fuse.
-                let cond = match i.checked_sub(1).and_then(|p| program.instructions.get(p)) {
+                // Fused path requires the previous IR op to have been
+                // a CompareAcc that left NZCV set. Peek at acc_states
+                // history alongside the previous instruction.
+                let fused_cond = match i.checked_sub(1).and_then(|p| program.instructions.get(p)) {
                     Some(V2TemplateInstruction::CompareAcc { kind, .. }) => {
-                        // The JS `TestX acc rhs` followed by
-                        // `JumpIfToBooleanFalse target` means:
-                        // "if (acc OP rhs) is false then jump".
-                        // The branch fires on the NEGATION of the compare.
-                        match kind {
-                            CompareKind::Lt => Some(Cond::Ge),
-                            CompareKind::Gt => Some(Cond::Le),
-                            CompareKind::Lte => Some(Cond::Gt),
-                            CompareKind::Gte => Some(Cond::Lt),
-                            CompareKind::EqStrict => Some(Cond::Ne),
-                        }
+                        // Branch fires on the negation of the JS
+                        // compare (JumpIfToBooleanFalse semantics).
+                        Some(match kind {
+                            CompareKind::Lt => Cond::Ge,
+                            CompareKind::Gt => Cond::Le,
+                            CompareKind::Lte => Cond::Gt,
+                            CompareKind::Gte => Cond::Lt,
+                            CompareKind::EqStrict => Cond::Ne,
+                        })
                     }
                     _ => None,
                 };
-                let src = match cond {
-                    Some(c) => asm.b_cond_placeholder(c),
-                    None => {
-                        // Non-fused: branch if acc is zero (the classic
-                        // int32 falsy test). Correct for int32 results
-                        // of LogicalNot/TestX — `0` means JS-false; any
-                        // non-zero means JS-true.
-                        asm.cbz(Reg::X21, 0);
-                        asm.position().saturating_sub(4)
-                    }
-                };
-                branch_patches.push(BranchPatch {
-                    source_offset: src,
-                    target_byte_pc: *target_pc,
-                    cond,
-                });
+                if let Some(c) = fused_cond {
+                    let src = asm.b_cond_placeholder(c);
+                    branch_patches.push(BranchPatch {
+                        source_offset: src,
+                        target_byte_pc: *target_pc,
+                        cond: Some(c),
+                    });
+                } else if acc_state == AccState::Int32 {
+                    // Non-fused with int32 acc: `cbz x21, target`.
+                    let src = asm.position();
+                    asm.cbz(Reg::X21, 0);
+                    branch_patches.push(BranchPatch {
+                        source_offset: src,
+                        target_byte_pc: *target_pc,
+                        // `cond = None` — the patcher writes a CBZ,
+                        // not a B/Bcc. We encode this by setting
+                        // cond=None, but we also need to distinguish
+                        // unconditional B from CBZ. Detect via insn
+                        // word at patch time.
+                        cond: None,
+                    });
+                } else {
+                    // Can't branch on a Raw value without coercion.
+                    // Bail out.
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                }
             }
             V2TemplateInstruction::JumpIfCompareFalse {
                 target_pc,
@@ -669,35 +969,249 @@ fn emit_v2_template_stencil_aarch64(
                 });
             }
             V2TemplateInstruction::ReturnAcc => {
-                // Box x21 into x0 as the native return value, then
-                // unwind the prologue and `ret`.
-                asm.box_int32(Reg::X0, Reg::X21);
+                // Box x21 (if int32) or return raw bits (if Raw) as
+                // the native return value.
+                match acc_state {
+                    AccState::Int32 => {
+                        asm.box_int32(Reg::X0, Reg::X21);
+                    }
+                    AccState::Raw => {
+                        asm.mov_rr(Reg::X0, Reg::X21);
+                    }
+                }
                 asm.ldr_x20_at_sp16();
                 asm.pop_x19_lr_32();
                 asm.ret();
             }
             V2TemplateInstruction::LdaTagConst { value } => {
-                // Write the already-boxed tag constant straight into
-                // x21. The accumulator holds a raw 64-bit NaN-box, not
-                // an unboxed int32, for the duration of this one op —
-                // subsequent ops that expect int32 will fail the tag
-                // guard (once Phase 4.4 adds guards). In the
-                // trust-int32 variant this is a correctness hole we
-                // accept for the sum-loop benchmark.
                 asm.mov_imm64(Reg::X21, *value);
+                acc_state = AccState::Raw;
             }
             V2TemplateInstruction::Mov { dst, src } => {
-                // Raw register-to-register copy (both sides are boxed
-                // slot memory). No tag-check, no sxtw — we're just
-                // shuffling bits.
+                // Raw register-to-register copy — doesn't touch x21.
                 asm.ldr_u64_imm(Reg::X10, Reg::X9, slot_offset(*src)?);
                 asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(*dst)?);
             }
+            V2TemplateInstruction::IncAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, 1);
+                    asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::DecAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, 1);
+                    asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::NegateAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    // x21 = 0 - x21 (int32 wraparound preserved by sxtw).
+                    asm.sub_rrr(Reg::X21, Reg::Xzr, Reg::X21);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::BitNotAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    // x21 = x21 XOR 0xFFFF_FFFF_FFFF_FFFF.
+                    asm.mov_imm64(Reg::X10, u64::MAX);
+                    asm.eor_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    // Result is still sign-extended int32 (XOR with
+                    // all-ones preserves sign-extension).
+                }
+            }
+            V2TemplateInstruction::MulAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, *imm as i64 as u64);
+                    asm.mul_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::BitAndAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::X10, *imm as i64 as u64);
+                    asm.and_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    // Sign-extension preserved by AND of two sign-ext
+                    // operands.
+                }
+            }
+            V2TemplateInstruction::ShlAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    let shift = (*imm as u32) & 0x1F;
+                    asm.mov_imm64(Reg::X10, u64::from(shift));
+                    asm.lslv_w(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::ShrAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    let shift = (*imm as u32) & 0x1F;
+                    asm.mov_imm64(Reg::X10, u64::from(shift));
+                    asm.asrv_w(Reg::X21, Reg::X21, Reg::X10);
+                    asm.sxtw(Reg::X21, Reg::X21);
+                }
+            }
+            V2TemplateInstruction::LdaThis => {
+                asm.ldr_u64_imm(
+                    Reg::X21,
+                    Reg::X19,
+                    crate::context::offsets::THIS_RAW as u32,
+                );
+                acc_state = AccState::Raw;
+            }
+            V2TemplateInstruction::LdaCurrentClosure => {
+                asm.ldr_u64_imm(
+                    Reg::X21,
+                    Reg::X19,
+                    crate::context::offsets::CALLEE_RAW as u32,
+                );
+                acc_state = AccState::Raw;
+            }
+            V2TemplateInstruction::ToNumberAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                }
+                // Int32: no-op (already a Number).
+            }
         }
+        acc_states.push(acc_state);
         i += 1;
     }
 
-    // Patch branches now that we know the final layout.
+    // ----- Common bailout epilogue -----
+    //
+    // Per-site pads branch here AFTER populating: x10 = byte_pc,
+    // x11 = reason, and spilling x21 into ctx.accumulator_raw. This
+    // block writes the low-32-bit pc/reason fields and unwinds the
+    // prologue, returning BAILOUT_SENTINEL in x0.
+    let bailout_common = asm.position();
+    asm.str_u32_imm(Reg::X10, Reg::X19, crate::context::offsets::BAILOUT_PC as u32);
+    asm.str_u32_imm(Reg::X11, Reg::X19, crate::context::offsets::BAILOUT_REASON as u32);
+    asm.mov_imm64(Reg::X0, crate::BAILOUT_SENTINEL);
+    asm.ldr_x20_at_sp16();
+    asm.pop_x19_lr_32();
+    asm.ret();
+
+    // ----- Per-site bailout pads -----
+    //
+    // Each pad:
+    //   1) Spills x21 into ctx.accumulator_raw (boxed if Int32,
+    //      raw bits if Raw).
+    //   2) Loads byte_pc into x10 and reason into x11.
+    //   3) Branches to bailout_common.
+    //
+    // The pad's entry address is recorded so we can patch the
+    // original guard/branch site to jump here.
+    struct PadInfo {
+        entry_offset: u32,
+        tail_branch_offset: u32,
+    }
+    let mut pad_infos: Vec<PadInfo> = Vec::with_capacity(bailout_patches.len());
+    for patch in &bailout_patches {
+        let pad_pos = asm.position();
+        match patch.acc_state {
+            AccState::Int32 => {
+                asm.box_int32(Reg::X12, Reg::X21);
+                asm.str_u64_imm(
+                    Reg::X12,
+                    Reg::X19,
+                    crate::context::offsets::ACCUMULATOR_RAW as u32,
+                );
+            }
+            AccState::Raw => {
+                asm.str_u64_imm(
+                    Reg::X21,
+                    Reg::X19,
+                    crate::context::offsets::ACCUMULATOR_RAW as u32,
+                );
+            }
+        }
+        asm.mov_imm64(Reg::X10, u64::from(patch.byte_pc));
+        asm.mov_imm64(Reg::X11, u64::from(patch.reason));
+        let tail = asm.b_placeholder();
+        pad_infos.push(PadInfo {
+            entry_offset: pad_pos,
+            tail_branch_offset: tail,
+        });
+    }
+
+    // Drop the assembler so we can patch the buffer directly.
+    std::mem::drop(asm);
+
+    // Patch forward/backward branches to their targets inside the
+    // emitted body.
     for patch in &branch_patches {
         let Some(&(_, target_off)) = byte_pc_to_emit
             .iter()
@@ -707,9 +1221,6 @@ fn emit_v2_template_stencil_aarch64(
                 target_byte_pc: patch.target_byte_pc,
             });
         };
-        // Signed relative offset from branch-site PC to target PC,
-        // expressed in bytes. AArch64 branches encode it in multiples
-        // of 4.
         let rel_bytes = target_off as i64 - patch.source_offset as i64;
         if rel_bytes % 4 != 0 || rel_bytes < i64::from(i32::MIN) || rel_bytes > i64::from(i32::MAX)
         {
@@ -719,18 +1230,31 @@ fn emit_v2_template_stencil_aarch64(
             });
         }
         let rel = (rel_bytes / 4) as i32;
-        let insn = match patch.cond {
-            None => {
-                // Unconditional B: bits[25:0] = imm26 (signed).
-                // Reference: Arm Architecture Reference Manual — B.4.9.
-                let imm26 = (rel as u32) & 0x03FF_FFFF;
-                0x1400_0000 | imm26
-            }
-            Some(c) => {
-                // Conditional B.cond: bits[23:5] = imm19 (signed),
-                // bits[4] = 0, bits[3:0] = cond. Opcode base 0x54000000.
-                let imm19 = ((rel as u32) & 0x0007_FFFF) << 5;
-                0x5400_0000 | imm19 | (c as u32 & 0xF)
+        // Detect the original opcode class from the bytes at
+        // source_offset so we patch the right immediate layout.
+        let Some(existing) = buf.read_u32_le(patch.source_offset) else {
+            return Err(V2TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: patch.target_byte_pc,
+            });
+        };
+        let is_cbz = (existing & 0x7F00_0000) == 0x3400_0000;
+        let insn = if is_cbz {
+            // CBZ: imm19 at bits [23:5].
+            let imm19 = ((rel as u32) & 0x0007_FFFF) << 5;
+            (existing & !0x00FF_FFE0) | imm19
+        } else {
+            match patch.cond {
+                None => {
+                    // Unconditional B: imm26 at bits [25:0].
+                    let imm26 = (rel as u32) & 0x03FF_FFFF;
+                    0x1400_0000 | imm26
+                }
+                Some(c) => {
+                    // B.cond: imm19 at bits [23:5], cond at bits [3:0].
+                    let imm19 = ((rel as u32) & 0x0007_FFFF) << 5;
+                    0x5400_0000 | imm19 | (c as u32 & 0xF)
+                }
             }
         };
         if !buf.patch_u32_le(patch.source_offset, insn) {
@@ -740,6 +1264,62 @@ fn emit_v2_template_stencil_aarch64(
             });
         }
     }
+
+    // Patch guard/unconditional bailout source sites to jump to their
+    // respective pads.
+    for (patch, pad) in bailout_patches.iter().zip(pad_infos.iter()) {
+        let src = patch.source_offset;
+        let pad_entry = pad.entry_offset;
+        let delta = i64::from(pad_entry) - i64::from(src);
+        if delta % 4 != 0 {
+            return Err(V2TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: pad_entry,
+            });
+        }
+        let rel = (delta / 4) as i32;
+        let Some(existing) = buf.read_u32_le(src) else {
+            return Err(V2TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: pad_entry,
+            });
+        };
+        // Determine the kind of branch we emitted at src:
+        //   - b_cond_placeholder → 0x5400_0000 | cond (imm19 patch)
+        //   - b_placeholder      → 0x1400_0000 (imm26 patch)
+        let is_bcond = (existing & 0xFF00_0000) == 0x5400_0000;
+        let insn = if is_bcond {
+            let imm19 = ((rel as u32) & 0x0007_FFFF) << 5;
+            (existing & !0x00FF_FFE0) | imm19
+        } else {
+            let imm26 = (rel as u32) & 0x03FF_FFFF;
+            0x1400_0000 | imm26
+        };
+        if !buf.patch_u32_le(src, insn) {
+            return Err(V2TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: pad_entry,
+            });
+        }
+    }
+
+    // Patch each pad's trailing `b bailout_common`.
+    for pad in &pad_infos {
+        let src = pad.tail_branch_offset;
+        let delta = i64::from(bailout_common) - i64::from(src);
+        let imm26 = ((delta / 4) as i32 as u32) & 0x03FF_FFFF;
+        if !buf.patch_u32_le(src, 0x1400_0000 | imm26) {
+            return Err(V2TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: bailout_common,
+            });
+        }
+    }
+
+    // acc_states is used transitively by the emit loop; keep the
+    // declaration alive for downstream (and to prevent `unused_mut`
+    // lints from firing when more analyses consume it).
+    let _ = acc_states;
 
     Ok(buf)
 }
@@ -925,20 +1505,17 @@ mod tests {
         );
         assert!(mnemonics.contains(&"RET".to_string()), "missing RET: {mnemonics:?}");
 
-        // Size sanity: the Phase 4.2 sum-loop stencil should be far
-        // smaller than the Phase B.10 baseline (≈828 bytes) — acc is
-        // pinned to x21 for the whole body, eliminating per-op
-        // load/tag-check/box/store round trips. Target from the plan:
-        // "benchInt32Add stencil shrinks from 828 bytes (Phase B.10) to
-        // ≈300 bytes". Lock in a generous upper bound so future
-        // regressions are caught without flaking on minor emission
-        // tweaks.
-        // Phase 4.2 landing size is 280 bytes — a 3× reduction from the
-        // Phase B.10 v1 stencil (≈828 bytes). Lock the ceiling at 320
-        // so future emission tweaks are caught early.
+        // Size sanity: the Phase 4.5b guarded sum-loop stencil sits
+        // between the trust-int32 280 B baseline and v1's ≈828 B.
+        // Each guarded load adds `eor / tst / b.ne` (3 insns) and
+        // each bailout site adds a ~5–7 insn pad (spill + pc/reason
+        // + b). The sum loop has ~8 guarded loads and the same number
+        // of pads, so ≈280 + 8·12 + 8·32 ≈ 632 B is the expected
+        // upper bound. Lock it at 640 to catch emission regressions
+        // without flaking on minor tweaks.
         assert!(
-            bytes.len() <= 320,
-            "v2 sum-loop stencil larger than expected: {} bytes (Phase 4.2 landing = 280)",
+            bytes.len() <= 640,
+            "v2 sum-loop stencil larger than expected: {} bytes (Phase 4.5b guarded target ≤ 640)",
             bytes.len()
         );
     }

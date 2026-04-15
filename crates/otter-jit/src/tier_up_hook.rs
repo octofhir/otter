@@ -109,6 +109,7 @@ impl TierUpHook for DefaultTierUpHook {
             module_ptr: (module as *const Module).cast::<()>(),
             runtime_ptr,
             heap_slots_base,
+            accumulator_raw: RegisterValue::undefined().raw_bits(),
         };
 
         telemetry::record_jit_entry();
@@ -148,6 +149,7 @@ impl TierUpHook for DefaultTierUpHook {
             return TierUpExecResult::Bailout {
                 resume_pc: ctx.bailout_pc,
                 reason: ctx.bailout_reason,
+                accumulator_raw: ctx.accumulator_raw,
             };
         }
 

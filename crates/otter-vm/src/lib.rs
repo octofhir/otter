@@ -6,6 +6,12 @@
 
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
+// M0 transitional: several runtime helpers (generator resume, iterator
+// exhaust, property IC accessors, copy-data-properties, …) are dormant
+// until the post-M0 milestones wire their callers back in. The items
+// are still reachable via `pub(crate)` once the source compiler grows
+// past the stub, so deleting them now would churn the same code twice.
+#![allow(dead_code)]
 
 extern crate self as otter_vm;
 

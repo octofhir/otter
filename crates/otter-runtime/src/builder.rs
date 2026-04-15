@@ -2,12 +2,15 @@
 //!
 //! # Examples
 //!
-//! ```rust
+//! ```rust,no_run
 //! use otter_runtime::OtterRuntime;
 //!
 //! // Minimal:
 //! let mut rt = OtterRuntime::builder().build();
-//! rt.run_script("console.log('hello')", "main.js").unwrap();
+//! // Script execution requires the source compiler to accept the input;
+//! // during the M0 migration every script fails with `SourceLoweringError::Unsupported`,
+//! // so the example below is `no_run` until the compiler covers M1+ AST.
+//! let _ = rt.run_script("console.log('hello')", "main.js");
 //!
 //! // With custom console:
 //! // let mut rt = OtterRuntime::builder()

@@ -21,10 +21,7 @@ pub enum SourceLoweringError {
     Parse { message: String, span: Span },
     /// The input uses an AST construct the compiler does not yet lower.
     /// Callers distinguish constructs by the static `construct` tag.
-    Unsupported {
-        construct: &'static str,
-        span: Span,
-    },
+    Unsupported { construct: &'static str, span: Span },
     /// An ECMAScript static-semantics early error the parser did not catch.
     EarlyError { message: String, span: Span },
     /// The input required more locals than the current register layout

@@ -2,7 +2,7 @@
 //! overflow-arguments spill area, open-upvalue bookkeeping, and receiver /
 //! new-target plumbing. One `Activation` per active function call.
 
-use crate::bytecode::{BytecodeRegister, Instruction, ProgramCounter};
+use crate::bytecode::{BytecodeRegister, ProgramCounter};
 use crate::frame::{FrameMetadata, RegisterIndex};
 use crate::module::{Function, FunctionIndex};
 use crate::object::ObjectHandle;
@@ -338,10 +338,6 @@ impl Activation {
     ) -> Result<ObjectHandle, InterpreterError> {
         let absolute = self.resolve_bytecode_register(function, register.index())?;
         self.ensure_open_upvalue(absolute, runtime)
-    }
-
-    pub(super) fn instruction(&self, function: &Function) -> Option<Instruction> {
-        function.bytecode().get(self.pc)
     }
 
     pub(super) fn resolve_bytecode_register(

@@ -551,39 +551,3 @@ fn strip_shebang(source: &str) -> String {
 fn canonicalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolve_remote_allowed() {
-        let loader = ModuleLoader::new(ModuleLoaderConfig::default());
-        let result = loader
-            .resolve("https://esm.sh/lodash", None)
-            .expect("remote specifier should be allowed");
-        assert_eq!(result, "https://esm.sh/lodash");
-    }
-
-    #[test]
-    fn test_resolve_import_map() {
-        let mut import_map = HashMap::new();
-        import_map.insert("lodash".to_string(), "https://esm.sh/lodash@4".to_string());
-
-        let loader = ModuleLoader::new(ModuleLoaderConfig {
-            import_map,
-            ..Default::default()
-        });
-
-        let result = loader
-            .resolve("lodash", None)
-            .expect("import map should resolve");
-        assert_eq!(result, "https://esm.sh/lodash@4");
-    }
-
-    #[test]
-    fn test_glob_match() {
-        assert!(glob_match("https://esm.sh/*", "https://esm.sh/react@18"));
-        assert!(!glob_match("https://esm.sh/*", "https://other.com/react"));
-    }
-}

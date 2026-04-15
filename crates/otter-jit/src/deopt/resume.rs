@@ -1,4 +1,11 @@
 //! Explicit deopt handoff and interpreter-resume helpers for the JIT path.
+//!
+//! Public surface: [`execute_module_entry_with_runtime`] is the single
+//! entry point `otter-runtime` uses to drive a module through the JIT
+//! (when the template baseline accepts the entry function) with an
+//! interpreter fallback for bailout, non-eligible functions, and
+//! unsupported opcodes. [`handoff_for_bailout`] exposes the deopt
+//! descriptor a resume path needs.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -6,21 +13,22 @@ use std::sync::atomic::AtomicBool;
 use otter_vm::RuntimeState;
 use otter_vm::deopt::{DeoptHandoff, DeoptId, DeoptReason, DeoptSite};
 use otter_vm::interpreter::{ExecutionResult, InterpreterError};
-use otter_vm::{FunctionIndex, Interpreter, Module, RegisterValue};
+use otter_vm::{Interpreter, Module, RegisterValue};
 
 use crate::JitError;
 use crate::deopt::BailoutReason;
-use crate::pipeline::{
-    JitExecResult, execute_function_profiled_with_runtime, execute_function_with_interrupt,
-};
+use crate::pipeline::JitExecResult;
 
 /// Errors produced while deopting back into the interpreter.
 #[derive(Debug, thiserror::Error)]
 pub enum DeoptError {
+    /// The JIT raised an internal error.
     #[error("{0}")]
     Jit(#[from] JitError),
+    /// The interpreter raised an error while resuming or running the fallback.
     #[error("{0}")]
     Interpreter(#[from] InterpreterError),
+    /// The function index stored on a module was out of bounds.
     #[error("module entry function index is out of bounds")]
     InvalidFunctionIndex,
 }
@@ -41,123 +49,35 @@ fn map_bailout_reason(reason: BailoutReason) -> DeoptReason {
     }
 }
 
-/// Resolve a deopt handoff for one bailout.
+/// Build the deopt descriptor an interpreter resume needs after a JIT
+/// bailout. The descriptor carries the resume PC plus a
+/// [`DeoptSite`] shared-layout reason so the interpreter can re-enter
+/// at a spec-compliant sync point.
 #[must_use]
 pub fn handoff_for_bailout(
     function: &otter_vm::Function,
     bytecode_pc: u32,
     reason: BailoutReason,
 ) -> DeoptHandoff {
-    let site = function
+    let deopt_reason = map_bailout_reason(reason);
+    let deopt_id = function
         .deopt()
-        .site_for_pc(bytecode_pc)
-        .unwrap_or_else(|| DeoptSite::new(DeoptId(bytecode_pc), bytecode_pc));
-    DeoptHandoff::new(site, bytecode_pc, map_bailout_reason(reason))
+        .sites()
+        .iter()
+        .find(|site| site.pc() == bytecode_pc)
+        .map_or(DeoptId(0), |site| site.id());
+    let site = DeoptSite::new(deopt_id, bytecode_pc);
+    DeoptHandoff::new(site, bytecode_pc, deopt_reason)
 }
 
-/// Resume a function in the interpreter from an explicit deopt handoff.
-pub fn resume_function(
-    module: &Module,
-    function_index: FunctionIndex,
-    handoff: DeoptHandoff,
-    registers: &[RegisterValue],
-) -> Result<ExecutionResult, DeoptError> {
-    let _ = module
-        .function(function_index)
-        .ok_or(DeoptError::InvalidFunctionIndex)?;
-    Ok(Interpreter::new().resume(module, function_index, handoff.resume_pc(), registers)?)
-}
-
-/// Execute a function in JIT code and explicitly fall back to the interpreter on deopt.
-pub fn execute_function_with_fallback(
-    module: &Module,
-    function_index: FunctionIndex,
-    registers: &mut [RegisterValue],
-    interrupt_flag: *const u8,
-) -> Result<ExecutionResult, DeoptError> {
-    let function = module
-        .function(function_index)
-        .ok_or(DeoptError::InvalidFunctionIndex)?;
-    match execute_function_with_interrupt(function, registers, interrupt_flag)? {
-        JitExecResult::Ok(raw) => {
-            let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
-                JitError::Internal("jit returned invalid vm register bits".to_string())
-            })?;
-            Ok(ExecutionResult::new(value))
-        }
-        JitExecResult::Bailout {
-            bytecode_pc,
-            reason,
-        } => {
-            let handoff = handoff_for_bailout(function, bytecode_pc, reason);
-            resume_function(module, function_index, handoff, registers)
-        }
-        JitExecResult::NotCompiled => {
-            Ok(Interpreter::new().resume(module, function_index, 0, registers)?)
-        }
-    }
-}
-
-/// Execute a function in JIT code using an existing runtime and explicitly fall back to the interpreter on deopt.
-pub fn execute_function_with_runtime_fallback(
-    module: &Module,
-    function_index: FunctionIndex,
-    registers: &mut [RegisterValue],
-    runtime: &mut RuntimeState,
-    interrupt_flag: *const u8,
-) -> Result<ExecutionResult, DeoptError> {
-    let function = module
-        .function(function_index)
-        .ok_or(DeoptError::InvalidFunctionIndex)?;
-
-    // We use an empty property profile for now when jumping via this bridge;
-    // Tier 1 uses the persistent feedback vector from the runtime itself.
-    match execute_function_profiled_with_runtime(
-        module,
-        function_index,
-        registers,
-        runtime,
-        &[],
-        interrupt_flag,
-    )? {
-        JitExecResult::Ok(raw) => {
-            let value = RegisterValue::from_raw_bits(raw).ok_or_else(|| {
-                JitError::Internal("jit returned invalid vm register bits".to_string())
-            })?;
-            Ok(ExecutionResult::new(value))
-        }
-        JitExecResult::Bailout {
-            bytecode_pc,
-            reason,
-        } => {
-            let handoff = handoff_for_bailout(function, bytecode_pc, reason);
-            Ok(Interpreter::new().resume_with_runtime(
-                module,
-                function_index,
-                handoff.resume_pc(),
-                registers,
-                runtime,
-            )?)
-        }
-        JitExecResult::NotCompiled => {
-            Ok(Interpreter::new().execute_with_runtime(
-                module,
-                function_index,
-                registers,
-                runtime,
-            )?)
-        }
-    }
-}
-
-/// Execute the module entry through the JIT on an existing runtime and fall back
-/// to the interpreter on bailout or unsupported paths.
+/// Execute the module entry through the JIT on an existing runtime, and
+/// transparently fall back to the interpreter on bailout, unsupported
+/// opcodes, or a non-eligible function.
 ///
-/// `interrupt_arc`, when present, is forwarded to the bailout interpreter so
-/// the watchdog can interrupt long-running scripts that take the
-/// interpreter path. Without this, every script that fails to JIT (the
-/// vast majority of test262 tests) would silently lose its watchdog flag
-/// and infinite loops would never be cancellable.
+/// `interrupt_arc`, when present, is forwarded to the bailout
+/// interpreter so the watchdog can interrupt long-running scripts that
+/// take the interpreter path. Without it, scripts that fail to JIT lose
+/// their watchdog flag and infinite loops would never be cancellable.
 pub fn execute_module_entry_with_runtime(
     module: &Module,
     runtime: &mut RuntimeState,
@@ -184,9 +104,9 @@ pub fn execute_module_entry_with_runtime(
         interp
     };
 
-    // Use persistent feedback from RuntimeState for JIT compilation.
-    // If feedback is available from previous interpreter runs, the JIT
-    // uses it for speculative optimization (Tier 2 passes).
+    // Try the template baseline. Anything outside its int32-arithmetic
+    // subset returns `Err(JitError::UnsupportedInstruction)` and we fall
+    // through to the interpreter.
     let compiled_result = if let Some(feedback) = runtime.feedback_vector(function_index) {
         crate::pipeline::compile_function_with_feedback(function, feedback)
     } else {
@@ -232,6 +152,11 @@ pub fn execute_module_entry_with_runtime(
                 function.name().unwrap_or("<anonymous>"),
                 1,
             );
+            // SAFETY: `compiled.entry` is a JIT stencil produced by our
+            // own pipeline with the documented `extern "C" fn(*mut
+            // JitContext) -> u64` ABI. `ctx` above is fully initialised;
+            // `registers`/`runtime`/`module` outlive this call. Bailout
+            // state and return value are written into `ctx`.
             let raw = unsafe { compiled.call(&mut ctx) };
             if raw == crate::BAILOUT_SENTINEL {
                 Ok(JitExecResult::Bailout {

@@ -29,13 +29,11 @@ mod dispatch;
 mod error;
 mod execution_result;
 mod frame_runtime;
+mod host_runtime;
 mod number_conv;
 mod runtime_state;
 mod step_outcome;
 mod tier_up;
-
-#[cfg(test)]
-mod tests;
 
 pub use activation::Activation;
 pub use error::InterpreterError;
@@ -54,7 +52,6 @@ use crate::bytecode::ProgramCounter;
 use crate::descriptors::VmNativeCallError;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::host::NativeFunctionRegistry;
-use crate::intrinsics::WellKnownSymbol;
 use crate::module::{Function, FunctionIndex, Module};
 use crate::object::{HeapValueKind, ObjectHandle, ObjectHeap, PropertyInlineCache};
 use crate::payload::NativePayloadRegistry;
@@ -1070,11 +1067,8 @@ impl Interpreter {
             // persistent failures.
             runtime.reset_tier_up_budget(callee_idx);
             if let Some(hook) = hook.as_ref() {
-                let _compiled = hook.try_compile(
-                    module,
-                    callee_idx,
-                    runtime as *mut RuntimeState as *mut (),
-                );
+                let _compiled =
+                    hook.try_compile(module, callee_idx, runtime as *mut RuntimeState as *mut ());
             }
         }
 

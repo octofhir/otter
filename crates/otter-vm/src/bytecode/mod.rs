@@ -50,6 +50,39 @@ pub use operand::{Operand, OperandKind, OperandWidth};
 /// whole ISA module.
 pub type ProgramCounter = u32;
 
+/// User-visible register index referenced by bytecode operands.
+///
+/// Thin newtype around [`crate::frame::RegisterIndex`] so side-tables
+/// that record register operands (call tables, closure-capture plans,
+/// argument-binding maps) can distinguish a bytecode-relative register
+/// from an already-resolved frame-relative index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BytecodeRegister(crate::frame::RegisterIndex);
+
+impl BytecodeRegister {
+    /// Creates a bytecode-visible register operand.
+    #[must_use]
+    pub const fn new(index: crate::frame::RegisterIndex) -> Self {
+        Self(index)
+    }
+
+    /// Returns the register index as encoded in bytecode.
+    #[must_use]
+    pub const fn index(self) -> crate::frame::RegisterIndex {
+        self.0
+    }
+
+    /// Resolves the bytecode-visible register into an absolute frame
+    /// register index for the caller's [`crate::frame::FrameLayout`].
+    #[must_use]
+    pub const fn resolve(
+        self,
+        layout: crate::frame::FrameLayout,
+    ) -> Option<crate::frame::RegisterIndex> {
+        layout.resolve_user_visible(self.0)
+    }
+}
+
 /// Prefix byte values. V8 Ignition convention: `Wide` promotes operands of
 /// the next instruction to 2 bytes, `ExtraWide` to 4.
 pub const PREFIX_WIDE: u8 = 0xFE;

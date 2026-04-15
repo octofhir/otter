@@ -26,9 +26,7 @@ use super::{Bytecode, PREFIX_EXTRA_WIDE, PREFIX_WIDE};
 pub enum EncodeError {
     /// Operand kind doesn't match the opcode's declared shape at this
     /// position.
-    #[error(
-        "opcode {opcode} operand #{position} expected kind {expected:?}, got {actual:?}"
-    )]
+    #[error("opcode {opcode} operand #{position} expected kind {expected:?}, got {actual:?}")]
     OperandKindMismatch {
         opcode: &'static str,
         position: usize,
@@ -44,9 +42,7 @@ pub enum EncodeError {
     },
     /// Operand exceeds the ExtraWide range (u32 / i32). This shouldn't
     /// happen with well-formed programs.
-    #[error(
-        "opcode {opcode} operand #{position} out of representable range: {value}"
-    )]
+    #[error("opcode {opcode} operand #{position} out of representable range: {value}")]
     OperandOutOfRange {
         opcode: &'static str,
         position: usize,
@@ -146,10 +142,11 @@ impl BytecodeBuilder {
         let pending = std::mem::take(&mut state.pending);
         for p in pending {
             let offset = i64::from(target_pc) - i64::from(p.ref_pc_after);
-            let offset_i32 = i32::try_from(offset).map_err(|_| EncodeError::LabelOffsetOverflow {
-                label: label.0,
-                offset,
-            })?;
+            let offset_i32 =
+                i32::try_from(offset).map_err(|_| EncodeError::LabelOffsetOverflow {
+                    label: label.0,
+                    offset,
+                })?;
             Self::patch_signed(
                 &mut self.bytes,
                 p.operand_start as usize,
@@ -165,11 +162,7 @@ impl BytecodeBuilder {
     /// The builder picks the narrowest uniform operand width that fits
     /// every operand in `operands`, prepends a prefix byte if needed,
     /// emits the opcode, then emits each operand slot in little-endian.
-    pub fn emit(
-        &mut self,
-        opcode: Opcode,
-        operands: &[Operand],
-    ) -> Result<u32, EncodeError> {
+    pub fn emit(&mut self, opcode: Opcode, operands: &[Operand]) -> Result<u32, EncodeError> {
         let shape = opcode.shape();
         Self::validate_shape(opcode, shape, operands)?;
 
@@ -190,11 +183,7 @@ impl BytecodeBuilder {
     /// we default to `Wide` — enough for every realistic JS function —
     /// and fix up at `bind_label` time. A mismatch between the reserved
     /// width and the resolved offset raises `LabelOffsetOverflow`.
-    pub fn emit_jump_to(
-        &mut self,
-        opcode: Opcode,
-        label: Label,
-    ) -> Result<u32, EncodeError> {
+    pub fn emit_jump_to(&mut self, opcode: Opcode, label: Label) -> Result<u32, EncodeError> {
         let shape = opcode.shape();
         assert_eq!(
             shape.arity(),
@@ -324,12 +313,8 @@ impl BytecodeBuilder {
         width: OperandWidth,
     ) -> Result<(), EncodeError> {
         match operand {
-            Operand::Reg(v) | Operand::Idx(v) => {
-                self.emit_unsigned(opcode, position, v, width)
-            }
-            Operand::Imm(v) | Operand::JumpOff(v) => {
-                self.emit_signed(opcode, position, v, width)
-            }
+            Operand::Reg(v) | Operand::Idx(v) => self.emit_unsigned(opcode, position, v, width),
+            Operand::Imm(v) | Operand::JumpOff(v) => self.emit_signed(opcode, position, v, width),
             Operand::RegList { base, count } => {
                 self.emit_unsigned(opcode, position, base, width)?;
                 self.emit_unsigned(opcode, position + 1, count, width)

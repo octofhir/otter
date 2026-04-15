@@ -133,10 +133,7 @@ impl<'a> Iterator for InstructionIter<'a> {
     }
 }
 
-fn decode_prefix(
-    bytes: &[u8],
-    pc: usize,
-) -> Result<(OperandWidth, usize), DecodeError> {
+fn decode_prefix(bytes: &[u8], pc: usize) -> Result<(OperandWidth, usize), DecodeError> {
     match bytes[pc] {
         PREFIX_WIDE => {
             let next_pc = pc + 1;
@@ -171,7 +168,13 @@ fn decode_operands(
     let wire_slots: usize = shape
         .operands()
         .iter()
-        .map(|k| if matches!(k, OperandKind::RegList) { 2 } else { 1 })
+        .map(|k| {
+            if matches!(k, OperandKind::RegList) {
+                2
+            } else {
+                1
+            }
+        })
         .sum();
     let needed = per * wire_slots;
     let available = bytes.len().saturating_sub(start);
@@ -218,12 +221,9 @@ fn read_unsigned(bytes: &[u8], at: usize, width: OperandWidth) -> u32 {
     match width {
         OperandWidth::Narrow => bytes[at] as u32,
         OperandWidth::Wide => u16::from_le_bytes([bytes[at], bytes[at + 1]]) as u32,
-        OperandWidth::ExtraWide => u32::from_le_bytes([
-            bytes[at],
-            bytes[at + 1],
-            bytes[at + 2],
-            bytes[at + 3],
-        ]),
+        OperandWidth::ExtraWide => {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        }
     }
 }
 
@@ -231,11 +231,8 @@ fn read_signed(bytes: &[u8], at: usize, width: OperandWidth) -> i32 {
     match width {
         OperandWidth::Narrow => i32::from(bytes[at] as i8),
         OperandWidth::Wide => i32::from(i16::from_le_bytes([bytes[at], bytes[at + 1]])),
-        OperandWidth::ExtraWide => i32::from_le_bytes([
-            bytes[at],
-            bytes[at + 1],
-            bytes[at + 2],
-            bytes[at + 3],
-        ]),
+        OperandWidth::ExtraWide => {
+            i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        }
     }
 }

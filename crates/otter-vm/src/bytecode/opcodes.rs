@@ -208,7 +208,6 @@ pub enum Opcode {
     // §5.12 Modules
     DynamicImport = 0x98,
     ImportMeta = 0x99,
-
     // 0xFE, 0xFF are reserved for Wide / ExtraWide prefixes. Max legal
     // opcode discriminant is 0xFD.
 }
@@ -418,13 +417,13 @@ impl Opcode {
             Ldar | Star => OperandShape::of(&[Reg]),
             Mov => OperandShape::of(&[Reg, Reg]),
             LdaSmi => OperandShape::of(&[Imm]),
-            LdaUndefined | LdaNull | LdaTrue | LdaFalse | LdaTheHole | LdaNaN
-            | LdaException | LdaNewTarget | LdaCurrentClosure | LdaThis => OperandShape::of(&[]),
+            LdaUndefined | LdaNull | LdaTrue | LdaFalse | LdaTheHole | LdaNaN | LdaException
+            | LdaNewTarget | LdaCurrentClosure | LdaThis => OperandShape::of(&[]),
             LdaConstF64 | LdaConstStr | LdaConstBigInt => OperandShape::of(&[Idx]),
 
             // §5.2 binary
-            Add | Sub | Mul | Div | Mod | Exp | BitwiseAnd | BitwiseOr | BitwiseXor
-            | Shl | Shr | UShr => OperandShape::of(&[Reg]),
+            Add | Sub | Mul | Div | Mod | Exp | BitwiseAnd | BitwiseOr | BitwiseXor | Shl | Shr
+            | UShr => OperandShape::of(&[Reg]),
             // §5.2 Smi variants
             AddSmi | SubSmi | MulSmi | BitwiseOrSmi | BitwiseAndSmi | ShlSmi | ShrSmi => {
                 OperandShape::of(&[Imm])
@@ -434,27 +433,30 @@ impl Opcode {
             | ToString | ToPropertyKey => OperandShape::of(&[]),
 
             // §5.3
-            TestEqual | TestEqualStrict | TestLessThan | TestGreaterThan
-            | TestLessThanOrEqual | TestGreaterThanOrEqual | TestInstanceOf | TestIn => {
-                OperandShape::of(&[Reg])
-            }
+            TestEqual
+            | TestEqualStrict
+            | TestLessThan
+            | TestGreaterThan
+            | TestLessThanOrEqual
+            | TestGreaterThanOrEqual
+            | TestInstanceOf
+            | TestIn => OperandShape::of(&[Reg]),
             TestNull | TestUndefined | TestUndetectable => OperandShape::of(&[]),
             TestTypeOf => OperandShape::of(&[Imm]),
             InPrivate => OperandShape::of(&[Reg, Idx]),
 
             // §5.4
-            Jump | JumpIfTrue | JumpIfFalse | JumpIfNull | JumpIfNotNull
-            | JumpIfUndefined | JumpIfNotUndefined | JumpIfJSReceiver
-            | JumpIfToBooleanTrue | JumpIfToBooleanFalse => OperandShape::of(&[JumpOff]),
+            Jump | JumpIfTrue | JumpIfFalse | JumpIfNull | JumpIfNotNull | JumpIfUndefined
+            | JumpIfNotUndefined | JumpIfJSReceiver | JumpIfToBooleanTrue
+            | JumpIfToBooleanFalse => OperandShape::of(&[JumpOff]),
 
             // §5.5
-            LdaNamedProperty | StaNamedProperty | DelNamedProperty => {
-                OperandShape::of(&[Reg, Idx])
-            }
+            LdaNamedProperty | StaNamedProperty | DelNamedProperty => OperandShape::of(&[Reg, Idx]),
             LdaKeyedProperty | DelKeyedProperty => OperandShape::of(&[Reg]),
             StaKeyedProperty => OperandShape::of(&[Reg, Reg]),
-            LdaGlobal | StaGlobal | StaGlobalStrict | TypeOfGlobal | LdaUpvalue
-            | StaUpvalue => OperandShape::of(&[Idx]),
+            LdaGlobal | StaGlobal | StaGlobalStrict | TypeOfGlobal | LdaUpvalue | StaUpvalue => {
+                OperandShape::of(&[Idx])
+            }
 
             // §5.6
             CallAnyReceiver | CallProperty | CallSpread | CallEval => {
@@ -475,10 +477,14 @@ impl Opcode {
             YieldStar | Resume => OperandShape::of(&[Reg]),
 
             // §5.9
-            GetIterator | GetAsyncIterator | IteratorNext | IteratorClose
-            | ForInEnumerate | SpreadIntoArray | ArrayPush | CreateEnumerableOwnKeys => {
-                OperandShape::of(&[Reg])
-            }
+            GetIterator
+            | GetAsyncIterator
+            | IteratorNext
+            | IteratorClose
+            | ForInEnumerate
+            | SpreadIntoArray
+            | ArrayPush
+            | CreateEnumerableOwnKeys => OperandShape::of(&[Reg]),
             ForInNext => OperandShape::of(&[Reg, Reg]),
             AssertNotHole | AssertConstructor => OperandShape::of(&[]),
 
@@ -499,18 +505,17 @@ impl Opcode {
             AllocClassId => OperandShape::of(&[]),
             CopyClassId => OperandShape::of(&[Reg]),
             DefinePrivateField | GetPrivateField | SetPrivateField | DefinePrivateMethod
-            | DefinePrivateGetter | DefinePrivateSetter | PushPrivateMethod
-            | PushPrivateGetter | PushPrivateSetter => OperandShape::of(&[Reg, Idx]),
+            | DefinePrivateGetter | DefinePrivateSetter | PushPrivateMethod | PushPrivateGetter
+            | PushPrivateSetter => OperandShape::of(&[Reg, Idx]),
             DefineClassMethod | DefineClassGetter | DefineClassSetter => {
                 OperandShape::of(&[Reg, Idx])
             }
-            DefineClassMethodComputed | DefineClassGetterComputed
-            | DefineClassSetterComputed => OperandShape::of(&[Reg, Reg]),
-            SetHomeObject => OperandShape::of(&[Reg, Reg]),
-            GetSuperProperty | SetSuperProperty => OperandShape::of(&[Reg, Idx]),
-            GetSuperPropertyComputed | SetSuperPropertyComputed => {
+            DefineClassMethodComputed | DefineClassGetterComputed | DefineClassSetterComputed => {
                 OperandShape::of(&[Reg, Reg])
             }
+            SetHomeObject => OperandShape::of(&[Reg, Reg]),
+            GetSuperProperty | SetSuperProperty => OperandShape::of(&[Reg, Idx]),
+            GetSuperPropertyComputed | SetSuperPropertyComputed => OperandShape::of(&[Reg, Reg]),
             ThrowConstAssign => OperandShape::of(&[]),
 
             // §5.12

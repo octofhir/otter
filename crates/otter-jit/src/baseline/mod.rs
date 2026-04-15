@@ -75,7 +75,10 @@ pub enum TemplateInstruction {
     /// emitter uses the recorded compare kind to pick the right ARM
     /// condition code. Maps from `JumpIfToBooleanFalse` after a
     /// `TestX` op.
-    JumpIfCompareFalse { target_pc: u32, compare_kind: CompareKind },
+    JumpIfCompareFalse {
+        target_pc: u32,
+        compare_kind: CompareKind,
+    },
     /// Unconditional jump. Maps from `Jump`.
     Jump { target_pc: u32 },
     /// Return the accumulator. Maps from `Return`.
@@ -159,7 +162,10 @@ pub enum TemplateCompileError {
     #[error("unsupported v2 opcode at byte pc {byte_pc}: {opcode:?}")]
     UnsupportedOpcode { byte_pc: u32, opcode: Opcode },
     #[error("operand kind mismatch at byte pc {byte_pc}: expected {expected}")]
-    OperandKindMismatch { byte_pc: u32, expected: &'static str },
+    OperandKindMismatch {
+        byte_pc: u32,
+        expected: &'static str,
+    },
     #[error("jump target out of range at byte pc {byte_pc}: offset={offset}")]
     InvalidJumpTarget { byte_pc: u32, offset: i32 },
     #[error("compare at byte pc {byte_pc} not followed by JumpIfToBooleanFalse")]
@@ -184,10 +190,11 @@ pub enum TemplateCompileError {
 pub fn analyze_template_candidate(
     function: &Function,
 ) -> Result<TemplateProgram, TemplateCompileError> {
-    let bytecode = function
-        .bytecode()
-        .ok_or(TemplateCompileError::MissingBytecode)?;
+    let bytecode = function.bytecode();
     let bytes = bytecode.bytes();
+    if bytes.is_empty() {
+        return Err(TemplateCompileError::MissingBytecode);
+    }
 
     // Walk the v2 instruction stream, eagerly decoding each op and its
     // operands. We record the byte-PC of each instruction so later
@@ -210,9 +217,7 @@ pub fn analyze_template_candidate(
                 operands: instr.operands,
             }),
             Err(_) => {
-                return Err(TemplateCompileError::MalformedBytecode {
-                    byte_pc: iter.pc(),
-                });
+                return Err(TemplateCompileError::MalformedBytecode { byte_pc: iter.pc() });
             }
         }
     }
@@ -415,18 +420,14 @@ fn lower_raw(
     }
 }
 
-fn reg(
-    ops: &[Operand],
-    pos: usize,
-    byte_pc: u32,
-) -> Result<u16, TemplateCompileError> {
+fn reg(ops: &[Operand], pos: usize, byte_pc: u32) -> Result<u16, TemplateCompileError> {
     match ops.get(pos) {
-        Some(Operand::Reg(r)) => u16::try_from(*r).map_err(|_| {
-            TemplateCompileError::OperandKindMismatch {
+        Some(Operand::Reg(r)) => {
+            u16::try_from(*r).map_err(|_| TemplateCompileError::OperandKindMismatch {
                 byte_pc,
                 expected: "Reg fits in u16",
-            }
-        }),
+            })
+        }
         _ => Err(TemplateCompileError::OperandKindMismatch {
             byte_pc,
             expected: "Reg",
@@ -434,11 +435,7 @@ fn reg(
     }
 }
 
-fn imm_i32(
-    ops: &[Operand],
-    pos: usize,
-    byte_pc: u32,
-) -> Result<i32, TemplateCompileError> {
+fn imm_i32(ops: &[Operand], pos: usize, byte_pc: u32) -> Result<i32, TemplateCompileError> {
     match ops.get(pos) {
         Some(Operand::Imm(v)) => Ok(*v),
         _ => Err(TemplateCompileError::OperandKindMismatch {
@@ -448,11 +445,7 @@ fn imm_i32(
     }
 }
 
-fn jump_off(
-    ops: &[Operand],
-    pos: usize,
-    byte_pc: u32,
-) -> Result<i32, TemplateCompileError> {
+fn jump_off(ops: &[Operand], pos: usize, byte_pc: u32) -> Result<i32, TemplateCompileError> {
     match ops.get(pos) {
         Some(Operand::JumpOff(v)) => Ok(*v),
         _ => Err(TemplateCompileError::OperandKindMismatch {
@@ -487,14 +480,15 @@ pub enum TemplateEmitError {
     #[error(
         "branch target out of range for v2 emission: from byte_pc={source_byte_pc} to byte_pc={target_byte_pc}"
     )]
-    BranchTargetOutOfRange { source_byte_pc: u32, target_byte_pc: u32 },
+    BranchTargetOutOfRange {
+        source_byte_pc: u32,
+        target_byte_pc: u32,
+    },
     #[error("unmatched branch target byte_pc={target_byte_pc}; not in program")]
     UnresolvedBranchTarget { target_byte_pc: u32 },
     #[error("JumpIfAccFalse at instruction {index} expected a preceding CompareAcc — got {detail}")]
     UnfusedJumpIfAccFalse { index: usize, detail: &'static str },
-    #[error(
-        "emitter-level unsupported sequence at instruction {index}: {detail}"
-    )]
+    #[error("emitter-level unsupported sequence at instruction {index}: {detail}")]
     UnsupportedSequence { index: usize, detail: &'static str },
 }
 
@@ -607,11 +601,7 @@ fn emit_template_stencil_aarch64(
     /// Store x21 into a slot. If x21 holds an unboxed int32, box it
     /// first; if it already holds raw NaN-boxed bits, write them
     /// directly.
-    fn store_accumulator(
-        asm: &mut Assembler,
-        state: AccState,
-        slot_off: u32,
-    ) {
+    fn store_accumulator(asm: &mut Assembler, state: AccState, slot_off: u32) {
         match state {
             AccState::Int32 => {
                 asm.box_int32(Reg::X10, Reg::X21);
@@ -692,8 +682,7 @@ fn emit_template_stencil_aarch64(
     // Map from byte_pc → emitted byte offset in the CodeBuffer.
     // Populated as we walk the IR so forward branches can be patched
     // at the end.
-    let mut byte_pc_to_emit: Vec<(u32, u32)> =
-        Vec::with_capacity(program.instructions.len());
+    let mut byte_pc_to_emit: Vec<(u32, u32)> = Vec::with_capacity(program.instructions.len());
 
     // Post-state of x21 after each instruction. Index `i` holds the
     // state AFTER instruction `i` has executed — used by branch fusion
@@ -1110,11 +1099,7 @@ fn emit_template_stencil_aarch64(
                 }
             }
             TemplateInstruction::LdaThis => {
-                asm.ldr_u64_imm(
-                    Reg::X21,
-                    Reg::X19,
-                    crate::context::offsets::THIS_RAW as u32,
-                );
+                asm.ldr_u64_imm(Reg::X21, Reg::X19, crate::context::offsets::THIS_RAW as u32);
                 acc_state = AccState::Raw;
             }
             TemplateInstruction::LdaCurrentClosure => {
@@ -1149,8 +1134,16 @@ fn emit_template_stencil_aarch64(
     // block writes the low-32-bit pc/reason fields and unwinds the
     // prologue, returning BAILOUT_SENTINEL in x0.
     let bailout_common = asm.position();
-    asm.str_u32_imm(Reg::X10, Reg::X19, crate::context::offsets::BAILOUT_PC as u32);
-    asm.str_u32_imm(Reg::X11, Reg::X19, crate::context::offsets::BAILOUT_REASON as u32);
+    asm.str_u32_imm(
+        Reg::X10,
+        Reg::X19,
+        crate::context::offsets::BAILOUT_PC as u32,
+    );
+    asm.str_u32_imm(
+        Reg::X11,
+        Reg::X19,
+        crate::context::offsets::BAILOUT_REASON as u32,
+    );
     asm.mov_imm64(Reg::X0, crate::BAILOUT_SENTINEL);
     asm.ldr_x20_at_sp16();
     asm.pop_x19_lr_32();
@@ -1199,8 +1192,10 @@ fn emit_template_stencil_aarch64(
         });
     }
 
-    // Drop the assembler so we can patch the buffer directly.
-    std::mem::drop(asm);
+    // Drop the assembler binding so the buffer is available for
+    // direct-mutation below. `Assembler` has no Drop impl, so this just
+    // releases the name binding; the CodeBuffer captured earlier stays alive.
+    let _ = asm;
 
     // Patch forward/backward branches to their targets inside the
     // emitted body.
@@ -1362,8 +1357,7 @@ mod tests {
         let v2 = b.finish().unwrap();
 
         let layout = FrameLayout::new(0, 1, 2, 0).unwrap();
-        let function = Function::with_bytecode(Some("sum"), layout, Default::default())
-            .with_bytecode(v2);
+        let function = Function::with_empty_tables(Some("sum"), layout, v2);
 
         let program = analyze_template_candidate(&function).expect("analyze");
         // Every v2 op should have lowered to exactly one TemplateInstruction.
@@ -1400,8 +1394,7 @@ mod tests {
         b.emit(Opcode::Return, &[]).unwrap();
         let v2 = b.finish().unwrap();
         let layout = FrameLayout::new(0, 1, 0, 0).unwrap();
-        let function = Function::with_bytecode(Some("f"), layout, Default::default())
-            .with_bytecode(v2);
+        let function = Function::with_empty_tables(Some("f"), layout, v2);
 
         match analyze_template_candidate(&function) {
             Err(TemplateCompileError::UnsupportedOpcode { opcode, .. }) => {
@@ -1414,7 +1407,7 @@ mod tests {
     #[test]
     fn analyzer_refuses_function_without_bytecode() {
         let layout = FrameLayout::new(0, 0, 0, 0).unwrap();
-        let function = Function::with_bytecode(Some("f"), layout, Default::default());
+        let function = Function::with_empty_tables(Some("f"), layout, Default::default());
         match analyze_template_candidate(&function) {
             Err(TemplateCompileError::MissingBytecode) => {}
             other => panic!("expected MissingBytecode, got {other:?}"),
@@ -1454,13 +1447,16 @@ mod tests {
         let v2 = b.finish().unwrap();
 
         let layout = FrameLayout::new(0, 1, 2, 0).unwrap();
-        let function = Function::with_bytecode(Some("sum"), layout, Default::default())
-            .with_bytecode(v2);
+        let function = Function::with_empty_tables(Some("sum"), layout, v2);
         let program = analyze_template_candidate(&function).expect("analyze");
         let buf = emit_template_stencil(&program).expect("emit");
         let bytes = buf.bytes();
         assert!(!bytes.is_empty(), "emitter produced no code");
-        assert_eq!(bytes.len() % 4, 0, "emitter produced non-word-aligned bytes");
+        assert_eq!(
+            bytes.len() % 4,
+            0,
+            "emitter produced non-word-aligned bytes"
+        );
 
         // Disassemble with bad64 and collect the mnemonics so the test
         // can assert on the stencil shape without depending on the
@@ -1481,10 +1477,18 @@ mod tests {
         //   * a compare → conditional-branch pair (CMP, then Bcc).
         //   * an unconditional backward branch (B) closing the loop.
         //   * a RET epilogue.
-        assert!(mnemonics.contains(&"ADD".to_string()), "missing ADD: {mnemonics:?}");
-        assert!(mnemonics.contains(&"ORR".to_string()), "missing ORR: {mnemonics:?}");
         assert!(
-            mnemonics.iter().any(|m| m.starts_with("CMP") || m == "SUBS"),
+            mnemonics.contains(&"ADD".to_string()),
+            "missing ADD: {mnemonics:?}"
+        );
+        assert!(
+            mnemonics.contains(&"ORR".to_string()),
+            "missing ORR: {mnemonics:?}"
+        );
+        assert!(
+            mnemonics
+                .iter()
+                .any(|m| m.starts_with("CMP") || m == "SUBS"),
             "missing CMP (decoded as CMP or SUBS): {mnemonics:?}"
         );
         assert!(
@@ -1495,7 +1499,10 @@ mod tests {
             mnemonics.iter().any(|m| m.starts_with("B_")),
             "missing conditional Bcc (B_*): {mnemonics:?}"
         );
-        assert!(mnemonics.contains(&"RET".to_string()), "missing RET: {mnemonics:?}");
+        assert!(
+            mnemonics.contains(&"RET".to_string()),
+            "missing RET: {mnemonics:?}"
+        );
 
         // Size sanity: the Phase 4.5b guarded sum-loop stencil sits
         // between the trust-int32 280 B baseline and v1's ≈828 B.

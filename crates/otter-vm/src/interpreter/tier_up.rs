@@ -55,6 +55,7 @@ pub trait TierUpHook: Send + Sync {
     /// with the interpreter's active frame). `this_raw` is the NaN-boxed
     /// receiver value. `runtime_ptr` and `interrupt_flag` are forwarded to the
     /// native entry so JIT helpers can reach back into the runtime.
+    #[allow(clippy::too_many_arguments)]
     fn execute_cached(
         &self,
         module: &Module,

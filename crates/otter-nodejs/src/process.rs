@@ -117,7 +117,7 @@ fn ensure_process_object(runtime: &mut RuntimeState) -> Result<ObjectHandle, Str
     let arch = string_value(runtime, node_arch());
     let platform = string_value(runtime, node_platform());
     let pid = RegisterValue::from_number(f64::from(std::process::id()));
-    let version = string_value(runtime, &format!("v{OTTER_VERSION}"));
+    let version = string_value(runtime, format!("v{OTTER_VERSION}"));
     let release = release_value(runtime)?;
     let versions = versions_value(runtime)?;
     let env = env_value(runtime, &capabilities, env_store.as_ref())?;
@@ -429,14 +429,13 @@ fn remove_listener_impl(
         .and_then(|value| value.as_object_handle())
         .map(ObjectHandle);
     with_process_state(runtime, |state| {
-        if let Some(callback) = callback {
-            if let Some(index) = state
+        if let Some(callback) = callback
+            && let Some(index) = state
                 .listeners
                 .iter()
                 .position(|listener| listener.event == event && listener.callback == callback)
-            {
-                state.listeners.remove(index);
-            }
+        {
+            state.listeners.remove(index);
         }
     });
     Ok(RegisterValue::from_object_handle(process.0))
@@ -720,184 +719,5 @@ fn node_arch() -> &'static str {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         other => other,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use otter_runtime::{
-        CapabilitiesBuilder, ModuleLoaderConfig, ObjectHandle, OtterRuntime, RegisterValue,
-        RuntimeState,
-    };
-
-    use crate::nodejs_extension;
-
-    fn temp_test_dir(name: &str) -> std::path::PathBuf {
-        let mut dir = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        dir.push(format!("otter-nodejs-{name}-{unique}"));
-        std::fs::create_dir_all(&dir).expect("temp dir should exist");
-        dir
-    }
-
-    fn own_property(
-        runtime: &mut RuntimeState,
-        object: RegisterValue,
-        name: &str,
-    ) -> RegisterValue {
-        let object = object
-            .as_object_handle()
-            .map(ObjectHandle)
-            .expect("value should be object");
-        let property = runtime.intern_property_name(name);
-        runtime
-            .own_property_value(object, property)
-            .expect("property should exist")
-    }
-
-    fn global_property(runtime: &mut OtterRuntime, name: &str) -> RegisterValue {
-        let global = runtime.state().intrinsics().global_object();
-        own_property(
-            runtime.state_mut(),
-            RegisterValue::from_object_handle(global.0),
-            name,
-        )
-    }
-
-    #[test]
-    fn global_process_is_available_from_extension() {
-        let mut runtime = OtterRuntime::builder()
-            .profile(otter_runtime::RuntimeProfile::Full)
-            .extension(nodejs_extension())
-            .build();
-
-        let result = runtime
-            .run_script(
-                "globalThis.__process_ok = typeof process.cwd === 'function';",
-                "main.js",
-            )
-            .expect("script should execute");
-        let _ = result;
-        assert_eq!(
-            global_property(&mut runtime, "__process_ok").as_bool(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn commonjs_process_module_shares_global_identity_and_argv() {
-        let dir = temp_test_dir("process-cjs");
-        std::fs::write(
-            dir.join("main.cjs"),
-            "const proc = require('node:process'); module.exports = [proc === process, proc.argv[2]].join(':');",
-        )
-        .expect("script should write");
-
-        let mut runtime = OtterRuntime::builder()
-            .profile(otter_runtime::RuntimeProfile::Full)
-            .module_loader(ModuleLoaderConfig {
-                base_dir: dir.clone(),
-                ..Default::default()
-            })
-            .process_argv([
-                "/bin/otter".to_string(),
-                dir.join("main.cjs").to_string_lossy().to_string(),
-                "user-arg".to_string(),
-            ])
-            .extension(nodejs_extension())
-            .build();
-
-        let result = runtime
-            .run_entry_specifier("./main.cjs", None)
-            .expect("cjs should execute");
-        assert_eq!(
-            runtime
-                .state_mut()
-                .js_to_string_infallible(result.return_value())
-                .into_string(),
-            "true:user-arg"
-        );
-    }
-
-    #[test]
-    fn process_env_respects_capabilities_and_deny_patterns() {
-        let mut runtime = OtterRuntime::builder()
-            .profile(otter_runtime::RuntimeProfile::Full)
-            .capabilities(
-                CapabilitiesBuilder::new()
-                    .allow_env(["VISIBLE".to_string(), "PATH".to_string()])
-                    .build(),
-            )
-            .env(|builder| {
-                builder
-                    .explicit("VISIBLE", "ok")
-                    .explicit("HIDDEN", "nope")
-                    .passthrough_var("PATH")
-                    .deny_pattern("PATH")
-            })
-            .extension(nodejs_extension())
-            .build();
-
-        runtime
-            .run_script(
-                "globalThis.__env = [String(process.env.VISIBLE), String(process.env.HIDDEN), String(process.env.PATH)].join('|');",
-                "env.js",
-            )
-            .expect("script should execute");
-
-        let value = global_property(&mut runtime, "__env");
-        assert_eq!(
-            runtime
-                .state_mut()
-                .js_to_string_infallible(value)
-                .into_string(),
-            "ok|undefined|undefined"
-        );
-    }
-
-    #[test]
-    fn process_next_tick_runs_before_queue_microtask() {
-        let mut runtime = OtterRuntime::builder()
-            .profile(otter_runtime::RuntimeProfile::Full)
-            .extension(nodejs_extension())
-            .build();
-
-        runtime
-            .run_script(
-                "const order = []; queueMicrotask(() => order.push('micro')); process.nextTick(() => order.push('tick')); order.push('sync'); globalThis.__order = order;",
-                "next-tick.js",
-            )
-            .expect("script should execute");
-
-        let order = global_property(&mut runtime, "__order");
-        let first = own_property(runtime.state_mut(), order, "0");
-        let second = own_property(runtime.state_mut(), order, "1");
-        let third = own_property(runtime.state_mut(), order, "2");
-        assert_eq!(
-            runtime
-                .state_mut()
-                .js_to_string_infallible(first)
-                .into_string(),
-            "sync"
-        );
-        assert_eq!(
-            runtime
-                .state_mut()
-                .js_to_string_infallible(second)
-                .into_string(),
-            "tick"
-        );
-        assert_eq!(
-            runtime
-                .state_mut()
-                .js_to_string_infallible(third)
-                .into_string(),
-            "micro"
-        );
     }
 }

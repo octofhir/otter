@@ -45,11 +45,7 @@ pub enum Reg {
 
 impl Reg {
     pub fn encoding(self) -> u32 {
-        if self == Reg::Xzr {
-            31
-        } else {
-            self as u32
-        }
+        if self == Reg::Xzr { 31 } else { self as u32 }
     }
 }
 
@@ -216,28 +212,40 @@ impl<'a> Assembler<'a> {
     }
 
     pub fn str_u64_imm(&mut self, src: Reg, base: Reg, byte_offset: u32) {
-        assert!(byte_offset % 8 == 0, "64-bit offset must be 8-byte aligned");
+        assert!(
+            byte_offset.is_multiple_of(8),
+            "64-bit offset must be 8-byte aligned"
+        );
         let imm12 = byte_offset / 8;
         let insn = 0xF9000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit_insn(insn);
     }
 
     pub fn ldr_u64_imm(&mut self, dst: Reg, base: Reg, byte_offset: u32) {
-        assert!(byte_offset % 8 == 0, "64-bit offset must be 8-byte aligned");
+        assert!(
+            byte_offset.is_multiple_of(8),
+            "64-bit offset must be 8-byte aligned"
+        );
         let imm12 = byte_offset / 8;
         let insn = 0xF9400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit_insn(insn);
     }
 
     pub fn str_u32_imm(&mut self, src: Reg, base: Reg, byte_offset: u32) {
-        assert!(byte_offset % 4 == 0, "32-bit offset must be 4-byte aligned");
+        assert!(
+            byte_offset.is_multiple_of(4),
+            "32-bit offset must be 4-byte aligned"
+        );
         let imm12 = byte_offset / 4;
         let insn = 0xB9000000 | (imm12 << 10) | (base.encoding() << 5) | src.encoding();
         self.emit_insn(insn);
     }
 
     pub fn ldr_u32_imm(&mut self, dst: Reg, base: Reg, byte_offset: u32) {
-        assert!(byte_offset % 4 == 0, "32-bit offset must be 4-byte aligned");
+        assert!(
+            byte_offset.is_multiple_of(4),
+            "32-bit offset must be 4-byte aligned"
+        );
         let imm12 = byte_offset / 4;
         let insn = 0xB9400000 | (imm12 << 10) | (base.encoding() << 5) | dst.encoding();
         self.emit_insn(insn);

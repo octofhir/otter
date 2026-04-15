@@ -77,9 +77,7 @@ impl OperandWidth {
     #[must_use]
     pub const fn max(self, other: Self) -> Self {
         match (self, other) {
-            (OperandWidth::ExtraWide, _) | (_, OperandWidth::ExtraWide) => {
-                OperandWidth::ExtraWide
-            }
+            (OperandWidth::ExtraWide, _) | (_, OperandWidth::ExtraWide) => OperandWidth::ExtraWide,
             (OperandWidth::Wide, _) | (_, OperandWidth::Wide) => OperandWidth::Wide,
             _ => OperandWidth::Narrow,
         }
@@ -124,8 +122,9 @@ impl Operand {
         match self {
             Operand::Reg(v) | Operand::Idx(v) => OperandWidth::min_for_unsigned(*v),
             Operand::Imm(v) | Operand::JumpOff(v) => OperandWidth::min_for_signed(*v),
-            Operand::RegList { base, count } => OperandWidth::min_for_unsigned(*base)
-                .max(OperandWidth::min_for_unsigned(*count)),
+            Operand::RegList { base, count } => {
+                OperandWidth::min_for_unsigned(*base).max(OperandWidth::min_for_unsigned(*count))
+            }
         }
     }
 

@@ -29,7 +29,7 @@ const JSON_INTERRUPT_POLL_INTERVAL: usize = 4096;
 static MEMORY_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn check_json_interrupt(runtime: &RuntimeState, index: usize) -> Result<(), VmNativeCallError> {
-    if index % JSON_INTERRUPT_POLL_INTERVAL == 0 {
+    if index.is_multiple_of(JSON_INTERRUPT_POLL_INTERVAL) {
         runtime.check_interrupt()?;
     }
     Ok(())

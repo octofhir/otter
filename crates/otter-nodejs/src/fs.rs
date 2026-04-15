@@ -113,10 +113,10 @@ fn fs_read_file_sync(
     let bytes = std::fs::read(&path).map_err(|error| {
         VmNativeCallError::Internal(format!("fs.readFileSync({}): {error}", path.display()).into())
     })?;
-    if let Some(encoding) = encoding_arg(runtime, args.get(1).copied()) {
-        if encoding.eq_ignore_ascii_case("utf8") || encoding.eq_ignore_ascii_case("utf-8") {
-            return Ok(string_value(runtime, String::from_utf8_lossy(&bytes)));
-        }
+    if let Some(encoding) = encoding_arg(runtime, args.get(1).copied())
+        && (encoding.eq_ignore_ascii_case("utf8") || encoding.eq_ignore_ascii_case("utf-8"))
+    {
+        return Ok(string_value(runtime, String::from_utf8_lossy(&bytes)));
     }
     Ok(RegisterValue::from_object_handle(
         alloc_uint8_array(runtime, bytes).0,

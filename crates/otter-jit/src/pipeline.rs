@@ -124,10 +124,13 @@ fn compile_template_baseline(
     let buffer = emit_template_stencil(&program)
         .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?;
 
-    let compiled = compile_code_buffer(buffer, CompiledCodeOrigin::TemplateBaseline)
+    let compiled = compile_code_buffer(&buffer, CompiledCodeOrigin::TemplateBaseline)
         .map_err(|err| JitError::Internal(format!("{err:?}")))?;
 
-    telemetry::record_compile(started.elapsed().as_nanos() as u64, compiled.size());
+    let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    telemetry::record_compile_time(true, elapsed_ns);
+    let name = function.name().unwrap_or("<anonymous>");
+    telemetry::record_function_compiled(name, 1, elapsed_ns, compiled.size());
 
     Ok(compiled)
 }

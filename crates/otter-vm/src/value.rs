@@ -43,7 +43,6 @@ pub const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
 /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
 pub const TAG_PTR_BIGINT: u64 = 0x7FFD_0000_0000_0000;
 
-
 /// Shared register value cell for the new VM.
 ///
 /// The current implementation covers the primitive subset needed by the early

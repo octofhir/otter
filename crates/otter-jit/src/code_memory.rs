@@ -1,35 +1,26 @@
 //! Executable memory management for JIT-compiled code.
 //!
-//! Wraps Cranelift's `JITModule` to manage compiled function code.
-//! Each compilation produces a `CompiledFunction` that can be called
-//! via a function pointer.
+//! Owns the machine-code buffer produced by the template baseline
+//! emitter, maps it into an executable page with `mmap` + `mprotect`,
+//! and exposes a typed function pointer via [`CompiledFunction`]. The
+//! buffer is released (via `munmap`) when the `CompiledFunction` is
+//! dropped, so compiled code never outlives its wrapper.
 
 use std::ptr::NonNull;
 
-use cranelift_codegen::Context as ClifContext;
-use cranelift_codegen::ir::Function as ClifFunction;
-use cranelift_codegen::isa::OwnedTargetIsa;
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
-
 use crate::JitError;
-use crate::abi::jit_function_signature;
 use crate::arch::CodeBuffer;
 use crate::context::JitContext;
 
 /// Actual code generation backend that produced a compiled function.
+///
+/// Only one variant is currently produced — the template baseline — but
+/// the enum is retained so future backends can be distinguished in
+/// telemetry without plumbing a new type through the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledCodeOrigin {
-    /// The legacy Tier 1/Tier 2 Cranelift pipeline.
-    MirBaseline,
-    /// The direct template-baseline `bytecode -> asm stencil` path.
+    /// Direct template-baseline `bytecode -> asm stencil` path.
     TemplateBaseline,
-}
-
-enum CompiledCodeOwner {
-    Cranelift { _module: Box<JITModule> },
-    Executable { _buffer: ExecutableBuffer },
 }
 
 /// Executable memory that owns a copied machine-code buffer.
@@ -53,6 +44,9 @@ impl ExecutableBuffer {
         }
 
         let map_len = round_up_to_page_size(buf.len())?;
+        // SAFETY: Allocating an anonymous private mapping with PROT_READ |
+        // PROT_WRITE. All arguments are valid; we check the return value
+        // against MAP_FAILED and convert null into an explicit error.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -74,6 +68,12 @@ impl ExecutableBuffer {
             JitError::Internal("mmap returned a null executable buffer".to_string())
         })?;
 
+        // SAFETY: `base` is a freshly allocated, writable page-aligned
+        // buffer at least `buf.len()` bytes long, and `buf.bytes()` is a
+        // valid slice of that length. After the copy we flush I-cache
+        // (aarch64-apple requirement) before flipping the page to
+        // read+execute. If `mprotect` fails we `munmap` the page
+        // immediately to avoid leaking address space.
         unsafe {
             std::ptr::copy_nonoverlapping(buf.bytes().as_ptr(), base.as_ptr(), buf.len());
             flush_instruction_cache(base.as_ptr(), buf.len());
@@ -108,6 +108,8 @@ impl ExecutableBuffer {
 
 #[cfg(unix)]
 fn round_up_to_page_size(len: usize) -> Result<usize, JitError> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query; no memory safety
+    // concerns. We validate the return value is positive before using it.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
         return Err(JitError::Internal(
@@ -126,6 +128,8 @@ unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
         fn sys_icache_invalidate(start: *const libc::c_void, len: libc::size_t);
     }
 
+    // SAFETY: `sys_icache_invalidate` is a Darwin syscall; `ptr..ptr+len`
+    // is the freshly copied code buffer, contiguous and valid for reads.
     unsafe { sys_icache_invalidate(ptr.cast(), len) };
 }
 
@@ -135,6 +139,8 @@ unsafe fn flush_instruction_cache(_ptr: *mut u8, _len: usize) {}
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         #[cfg(unix)]
+        // SAFETY: We uniquely own the mapping; no other code can observe
+        // the address after Drop.
         unsafe {
             libc::munmap(self.base.as_ptr().cast(), self.map_len);
         }
@@ -142,29 +148,48 @@ impl Drop for ExecutableBuffer {
 }
 
 /// A compiled function ready to execute.
+///
+/// Callable via [`Self::call`] as
+/// `extern "C" fn(*mut JitContext) -> u64`. The owned executable buffer
+/// is freed when this struct is dropped, so the function pointer must
+/// not be invoked after that point.
 pub struct CompiledFunction {
-    /// The raw function pointer: `extern "C" fn(*mut JitContext) -> u64`
+    /// The raw function pointer: `extern "C" fn(*mut JitContext) -> u64`.
     pub entry: *const u8,
     /// Code size in bytes.
     pub code_size: usize,
     /// Which backend produced this machine code.
     pub origin: CompiledCodeOrigin,
-    /// The owner that keeps the machine code alive.
-    _owner: CompiledCodeOwner,
+    _owner: ExecutableBuffer,
 }
 
-// SAFETY: The compiled code is immutable after finalization.
+// SAFETY: The compiled code is immutable after finalization; the
+// underlying mapping is owned by a single `ExecutableBuffer` which
+// releases it only on Drop of the `CompiledFunction` that owns it.
 unsafe impl Send for CompiledFunction {}
 unsafe impl Sync for CompiledFunction {}
 
 impl CompiledFunction {
-    /// Call this compiled function with the given JitContext.
+    /// Machine-code size in bytes.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.code_size
+    }
+
+    /// Invoke the compiled function with `ctx` as its sole argument and
+    /// return the NaN-boxed `u64` it produced.
     ///
     /// # Safety
     /// The caller must ensure:
-    /// - `ctx` is a valid, fully initialized JitContext
-    /// - The compiled code matches the function this context was set up for
+    /// - `ctx` is a valid, fully initialized [`JitContext`].
+    /// - The compiled code was produced for the function this context
+    ///   describes (same bytecode, same register layout).
+    /// - The host architecture matches the code buffer's target arch
+    ///   (aarch64 today).
     pub unsafe fn call(&self, ctx: &mut JitContext) -> u64 {
+        // SAFETY: `entry` was produced by our own pipeline; it has the
+        // `extern "C" fn(*mut JitContext) -> u64` ABI by construction.
+        // The caller guarantees `ctx` validity above.
         let func: unsafe extern "C" fn(*mut JitContext) -> u64 =
             unsafe { std::mem::transmute(self.entry) };
         unsafe { func(ctx) }
@@ -172,6 +197,10 @@ impl CompiledFunction {
 }
 
 /// Install a raw code buffer as executable machine code.
+///
+/// On non-unix hosts returns `JitError::Internal`; this function is the
+/// single choke-point where the host-arch fallback policy lives, so the
+/// rest of the pipeline does not need platform `cfg` gates.
 pub fn compile_code_buffer(
     code: &CodeBuffer,
     origin: CompiledCodeOrigin,
@@ -184,116 +213,6 @@ pub fn compile_code_buffer(
         entry,
         code_size,
         origin,
-        _owner: CompiledCodeOwner::Executable {
-            _buffer: executable,
-        },
-    })
-}
-
-/// Create the Cranelift target ISA for the current host platform.
-pub fn create_host_isa() -> Result<OwnedTargetIsa, JitError> {
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-    flag_builder
-        .set("is_pic", "false")
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-    // Enable Cranelift optimizations: GVN, LICM, constant folding, etc.
-    flag_builder
-        .set("opt_level", "speed")
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-
-    let isa_builder =
-        cranelift_native::builder().map_err(|e| JitError::Cranelift(e.to_string()))?;
-    let flags = settings::Flags::new(flag_builder);
-    isa_builder
-        .finish(flags)
-        .map_err(|e| JitError::Cranelift(e.to_string()))
-}
-
-/// Compile a Cranelift IR function into executable machine code.
-///
-/// `helper_symbols` are (name, fn_ptr) pairs registered in the JITModule
-/// so that compiled code can call runtime helpers.
-pub fn compile_clif_function(
-    clif_func: ClifFunction,
-    isa: OwnedTargetIsa,
-    helper_symbols: &[(&str, *const u8)],
-) -> Result<CompiledFunction, JitError> {
-    let mut builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
-
-    // Register helper function symbols so compiled code can call them.
-    for &(name, ptr) in helper_symbols {
-        builder.symbol(name, ptr);
-    }
-
-    let mut module = JITModule::new(builder);
-
-    let call_conv = isa.default_call_conv();
-    let pointer_type = isa.pointer_type();
-
-    // Declare the function in the module.
-    let sig = jit_function_signature(call_conv, pointer_type);
-    let func_id = module
-        .declare_function("jit_entry", Linkage::Local, &sig)
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-
-    let cfg = crate::config::jit_config();
-
-    // Dump CLIF IR before compilation if requested.
-    if cfg.dump_clif {
-        eprintln!("[JIT] === CLIF IR ===");
-        eprintln!("{}", clif_func.display());
-    }
-
-    // Compile and define.
-    let mut ctx = ClifContext::for_function(clif_func);
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-
-    // Dump native code if requested.
-    if cfg.dump_asm
-        && let Some(compiled) = ctx.compiled_code()
-    {
-        if let Some(vcode) = compiled.vcode.as_ref() {
-            eprintln!("[JIT] === VCode (near-asm) ===");
-            eprintln!("{vcode}");
-        }
-        let code = compiled.code_buffer();
-        // Use real disassembler (iced-x86 on x86-64, hex on other arches).
-        crate::codegen::disasm::dump_disassembly(code, 0, None);
-    }
-
-    // Finalize — make the code executable.
-    module
-        .finalize_definitions()
-        .map_err(|e| JitError::Cranelift(e.to_string()))?;
-
-    let code_ptr = module.get_finalized_function(func_id);
-    let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
-
-    if cfg.dump_asm {
-        eprintln!(
-            "[JIT] compiled function at {:p}, {} bytes",
-            code_ptr, code_size
-        );
-        // Disassemble the finalized (relocated) code for accurate branch targets.
-        let finalized_code = unsafe { std::slice::from_raw_parts(code_ptr, code_size) };
-        crate::codegen::disasm::dump_disassembly(
-            finalized_code,
-            code_ptr as u64,
-            Some("jit_entry (finalized)"),
-        );
-    }
-
-    Ok(CompiledFunction {
-        entry: code_ptr,
-        code_size,
-        origin: CompiledCodeOrigin::MirBaseline,
-        _owner: CompiledCodeOwner::Cranelift {
-            _module: Box::new(module),
-        },
+        _owner: executable,
     })
 }

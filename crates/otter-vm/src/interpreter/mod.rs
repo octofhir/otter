@@ -26,8 +26,6 @@
 
 mod activation;
 mod dispatch;
-#[cfg(feature = "bytecode_v2")]
-mod dispatch_v2;
 mod error;
 mod execution_result;
 mod frame_runtime;
@@ -1046,7 +1044,7 @@ impl Interpreter {
                     // already coherent because JIT and interpreter share the
                     // same frame layout (`RegisterValue` slot == JIT slot).
                     // For v2 bailouts, reload the pinned accumulator from
-                    // the context spill slot so dispatch_v2 resumes with the
+                    // the context spill slot so dispatch resumes with the
                     // live value. v1 stencils leave this as undefined, which
                     // `from_raw_bits` accepts without a mutation.
                     activation.set_pc(resume_pc);
@@ -1122,27 +1120,6 @@ impl Interpreter {
             // Update the topmost shadow stack entry's PC so a snapshot taken
             // mid-step reports the correct call site.
             runtime.update_top_frame_pc(activation.pc());
-            // Route to the v2 dispatcher when the function carries a v2
-            // bytecode stream; fall through to the v1 `step` otherwise.
-            #[cfg(feature = "bytecode_v2")]
-            let step_fn_result = if function.bytecode_v2().is_some() {
-                self.step_v2(
-                    &function,
-                    &current_module,
-                    activation,
-                    runtime,
-                    &mut frame_runtime,
-                )
-            } else {
-                self.step(
-                    &function,
-                    &current_module,
-                    activation,
-                    runtime,
-                    &mut frame_runtime,
-                )
-            };
-            #[cfg(not(feature = "bytecode_v2"))]
             let step_fn_result = self.step(
                 &function,
                 &current_module,

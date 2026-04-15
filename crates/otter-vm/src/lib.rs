@@ -26,13 +26,9 @@ pub mod bigint;
 pub mod bridge;
 /// Builder-side adapters for descriptor-driven bootstrap.
 pub mod builders;
-/// Runtime bytecode model.
-pub mod bytecode;
-/// Ignition-style accumulator bytecode (Phase C, v2 ISA). Gated behind
-/// the `bytecode_v2` Cargo feature until Phase 2+ wiring lands. See
+/// Ignition-style accumulator bytecode ISA. See
 /// `docs/bytecode-v2.md` for the design document.
-#[cfg(feature = "bytecode_v2")]
-pub mod bytecode_v2;
+pub mod bytecode;
 /// Call-site side tables for direct calls.
 pub mod call;
 /// Closure creation metadata and upvalue identifiers.
@@ -89,12 +85,10 @@ pub mod realm;
 pub mod regexp;
 /// JS source compilation entry points (compile_script, compile_module, compile_eval).
 pub mod source;
-/// Primary JS source compiler for the new VM source path.
-pub(crate) mod source_compiler;
+/// Primary JS source compiler targeting the Ignition ISA.
+pub mod source_compiler;
 /// Source-location metadata.
 pub mod source_map;
-/// JS to JS transformation (e.g. stripping TypeScript)
-pub mod source_transform;
 /// Stack frame snapshots for V8-parity stack traces.
 pub mod stack_frame;
 /// String-literal side tables for functions.

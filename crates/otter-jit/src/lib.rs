@@ -1,53 +1,49 @@
 //! Otter JIT for OtterJS.
 //!
+//! Single-tier template-baseline compiler: Ignition bytecode is walked
+//! once and lowered into an x21-pinned aarch64 stencil (interpreter
+//! fallback on non-aarch64 hosts). Earlier iterations shipped a MIR →
+//! CLIF Tier 2 path and a v1 baseline; both have been retired.
+//!
 //! # Architecture
 //!
 //! ```text
-//! Tier 1 candidate: bytecode -> template baseline -> asm
-//! Tier 2 today:     bytecode -> MIR -> [optimize] -> CLIF -> machine code
+//! Tier 1 (only tier today): bytecode → template analyzer → arch emitter → asm
 //! ```
 //!
-//! The refactor keeps the existing MIR/CLIF pipeline alive while a new
-//! template-baseline Tier 1 path is introduced incrementally.
-//!
-//! Both tiers share one ABI, one JitContext, one deopt model.
+//! Every path shares one ABI ([`context::JitContext`]), one bailout
+//! sentinel ([`BAILOUT_SENTINEL`]), and one deopt model ([`BailoutReason`]).
 
-pub mod abi;
 pub mod arch;
 pub mod baseline;
-pub mod cache_ir;
 pub mod code_cache;
 pub mod code_memory;
-pub mod codegen;
-pub mod compile_queue;
 pub mod config;
 pub mod context;
 pub mod deopt;
-pub mod helpers;
-pub mod ic;
-pub mod mir;
-pub mod osr;
-pub mod osr_compile;
 pub mod pipeline;
-pub mod profile_cache;
-mod runtime_helpers;
-pub mod snapshot;
 pub mod telemetry;
 pub mod tier_up_hook;
-pub mod watchpoint;
 
 pub use deopt::{BAILOUT_SENTINEL, BailoutReason};
 
 /// Compilation tier for a function.
+///
+/// Only `Baseline` is produced today; `Optimized` is reserved for a
+/// future tier 2 pipeline and currently unreachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Fast compile, no MIR optimization passes.
+    /// Template baseline (`bytecode -> asm` stencil).
     Baseline,
-    /// Full optimization: guard elimination, inlining, LICM, etc.
+    /// Reserved for a future optimizing tier.
     Optimized,
 }
 
 /// Result of JIT compilation.
+///
+/// Returned by the compile pipeline so callers can distinguish a
+/// successful install, a deliberate "not our subset" skip, and a real
+/// internal error.
 #[derive(Debug)]
 pub enum CompileResult {
     /// Compilation succeeded, code is in the code cache.
@@ -63,6 +59,10 @@ pub enum CompileResult {
 }
 
 /// Result of executing JIT-compiled code.
+///
+/// Produced by the tier-up hook; the interpreter treats `Bailout` as a
+/// side-exit (resume bytecode at `bytecode_pc`) and `NotCompiled` as a
+/// cache miss.
 #[derive(Debug)]
 pub enum ExecuteResult {
     /// Execution completed, return value is NaN-boxed u64.
@@ -81,14 +81,16 @@ pub enum ExecuteResult {
 /// JIT compilation or execution error.
 #[derive(Debug, thiserror::Error)]
 pub enum JitError {
-    #[error("cranelift error: {0}")]
-    Cranelift(String),
-    #[error("MIR verification failed: {0}")]
-    MirVerification(String),
+    /// Bytecode instruction or construct the baseline does not support.
     #[error("unsupported bytecode instruction: {0}")]
     UnsupportedInstruction(String),
+    /// Code cache capacity exhausted.
     #[error("code cache full")]
     CodeCacheFull,
+    /// Host architecture has no code emitter (non-aarch64 today).
+    #[error("unsupported host architecture: {0}")]
+    UnsupportedHostArch(&'static str),
+    /// Unexpected internal error (not a correctness violation).
     #[error("internal error: {0}")]
     Internal(String),
 }

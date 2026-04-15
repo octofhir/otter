@@ -168,15 +168,6 @@ pub struct Function {
     deopt: DeoptTable,
     exceptions: ExceptionTable,
     source_map: SourceMap,
-    /// Optional v2 (Ignition-style) bytecode, produced by the v1→v2
-    /// transpiler or (eventually) the direct AST→v2 compiler. When
-    /// `Some`, the interpreter routes this function through the v2
-    /// dispatch path; when `None`, the v1 bytecode above is used.
-    ///
-    /// Gated on the `bytecode_v2` Cargo feature so non-feature builds
-    /// pay zero overhead.
-    #[cfg(feature = "bytecode_v2")]
-    bytecode_v2: Option<crate::bytecode_v2::Bytecode>,
 }
 
 impl Function {
@@ -226,14 +217,14 @@ impl Function {
             deopt: tables.deopt,
             exceptions: tables.exceptions,
             source_map: tables.source_map,
-            #[cfg(feature = "bytecode_v2")]
-            bytecode_v2: None,
         }
     }
 
     /// Creates a function with empty side tables.
+    ///
+    /// Shorthand for [`Self::new`] with [`FunctionTables::default`].
     #[must_use]
-    pub fn with_bytecode(
+    pub fn with_empty_tables(
         name: Option<impl Into<Box<str>>>,
         frame_layout: FrameLayout,
         bytecode: Bytecode,
@@ -241,21 +232,14 @@ impl Function {
         Self::new(name, frame_layout, bytecode, FunctionTables::default())
     }
 
-    /// Attach a v2 (Ignition-style) bytecode stream to this function.
-    /// The interpreter will dispatch through the v2 path once the v2
-    /// bytecode is installed.
-    #[cfg(feature = "bytecode_v2")]
+    /// Replace the function's bytecode in place.
+    ///
+    /// Used by the compiler to swap in the final bytecode after the
+    /// `Function` has been constructed with empty side tables.
     #[must_use]
-    pub fn with_bytecode_v2(mut self, v2: crate::bytecode_v2::Bytecode) -> Self {
-        self.bytecode_v2 = Some(v2);
+    pub fn with_bytecode(mut self, bytecode: Bytecode) -> Self {
+        self.bytecode = bytecode;
         self
-    }
-
-    /// Returns the attached v2 bytecode, if any.
-    #[cfg(feature = "bytecode_v2")]
-    #[must_use]
-    pub fn bytecode_v2(&self) -> Option<&crate::bytecode_v2::Bytecode> {
-        self.bytecode_v2.as_ref()
     }
 
     /// Returns the function name, if present.
@@ -331,7 +315,10 @@ impl Function {
         self.frame_layout
     }
 
-    /// Returns the immutable bytecode stream.
+    /// Returns the immutable bytecode stream attached to this function.
+    ///
+    /// The interpreter dispatches directly off this buffer; the JIT
+    /// reads it once at compile-time to produce a stencil.
     #[must_use]
     pub fn bytecode(&self) -> &Bytecode {
         &self.bytecode
@@ -528,8 +515,6 @@ impl Module {
         functions: Vec<Function>,
         entry: FunctionIndex,
     ) -> Result<Self, ModuleError> {
-        let mut functions = functions;
-        maybe_attach_v2_bytecode(&mut functions);
         let functions = functions.into_boxed_slice();
         if usize::try_from(entry.0)
             .ok()
@@ -558,8 +543,6 @@ impl Module {
         imports: Vec<ImportRecord>,
         exports: Vec<ExportRecord>,
     ) -> Result<Self, ModuleError> {
-        let mut functions = functions;
-        maybe_attach_v2_bytecode(&mut functions);
         let functions = functions.into_boxed_slice();
         if usize::try_from(entry.0)
             .ok()
@@ -654,155 +637,5 @@ impl Module {
         usize::try_from(index.0)
             .ok()
             .and_then(|position| self.functions.get(position))
-    }
-}
-
-/// When the `bytecode_v2` feature is enabled **and** the
-/// `OTTER_V2_TRANSPILE` environment variable is set to a truthy value,
-/// transpile every function's v1 bytecode to v2 at module-construction
-/// time. Functions whose opcodes aren't yet covered by the transpiler
-/// (e.g. certain class / private-field paths) silently skip v2
-/// attachment and continue running on v1 bytecode.
-///
-/// This is the bridge that lets the CLI exercise the Phase 4 v2
-/// baseline JIT without requiring a dedicated v2 source compiler:
-/// the v1 AST→bytecode pipeline keeps producing v1, and this hook
-/// overlays a parallel v2 stream so `try_compile_v2_template` in the
-/// JIT pipeline can pick it up on tier-up.
-#[cfg(feature = "bytecode_v2")]
-fn maybe_attach_v2_bytecode(functions: &mut Vec<Function>) {
-    let enabled = std::env::var("OTTER_V2_TRANSPILE")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false);
-    if !enabled {
-        return;
-    }
-    for function in functions.iter_mut() {
-        if function.bytecode_v2.is_some() {
-            continue;
-        }
-        if let Ok(v2) = crate::bytecode_v2::transpile_with_function(
-            function.bytecode(),
-            function,
-        ) {
-            function.bytecode_v2 = Some(v2);
-        }
-    }
-}
-
-#[cfg(not(feature = "bytecode_v2"))]
-#[inline]
-fn maybe_attach_v2_bytecode(_functions: &mut Vec<Function>) {}
-
-#[cfg(test)]
-mod tests {
-    use crate::bigint::BigIntTable;
-    use crate::bytecode::{Bytecode, BytecodeRegister, Instruction};
-    use crate::deopt::{DeoptId, DeoptSite, DeoptTable};
-    use crate::exception::{ExceptionHandler, ExceptionTable};
-    use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
-    use crate::float::FloatTable;
-    use crate::frame::FrameLayout;
-    use crate::property::PropertyNameTable;
-    use crate::source_map::{SourceLocation, SourceMap, SourceMapEntry};
-    use crate::string::StringTable;
-    use crate::{
-        call::{CallSite, CallTable},
-        closure::ClosureTable,
-        frame::FrameFlags,
-    };
-
-    use super::{Function, FunctionIndex, FunctionSideTables, FunctionTables, Module, ModuleError};
-
-    #[test]
-    fn function_keeps_bytecode_and_side_tables() {
-        let frame_layout = FrameLayout::new(1, 0, 0, 1).expect("frame layout should be valid");
-        let bytecode = Bytecode::from(vec![Instruction::ret(BytecodeRegister::new(0))]);
-        let feedback = FeedbackTableLayout::new(vec![FeedbackSlotLayout::new(
-            FeedbackSlotId(0),
-            FeedbackKind::Call,
-        )]);
-        let deopt = DeoptTable::new(vec![DeoptSite::new(DeoptId(7), 1)]);
-        let exceptions = ExceptionTable::new(vec![ExceptionHandler::new(1, 3, 5)]);
-        let source_map = SourceMap::new(vec![SourceMapEntry::new(0, SourceLocation::new(4, 2))]);
-        let property_names = PropertyNameTable::new(vec!["count"]);
-        let string_literals = StringTable::new(vec!["otter"]);
-        let calls = CallTable::new(vec![Some(CallSite::Direct(crate::call::DirectCall::new(
-            FunctionIndex(0),
-            1,
-            FrameFlags::empty(),
-        )))]);
-
-        let function = Function::new(
-            Some("main"),
-            frame_layout,
-            bytecode,
-            FunctionTables::new(
-                FunctionSideTables::new(
-                    property_names,
-                    string_literals,
-                    FloatTable::default(),
-                    BigIntTable::default(),
-                    ClosureTable::default(),
-                    calls,
-                    crate::regexp::RegExpTable::default(),
-                ),
-                feedback,
-                deopt,
-                exceptions,
-                source_map,
-            ),
-        );
-
-        assert_eq!(function.name(), Some("main"));
-        assert_eq!(function.bytecode().len(), 1);
-        assert_eq!(
-            function
-                .property_names()
-                .get(crate::property::PropertyNameId(0)),
-            Some("count")
-        );
-        assert_eq!(
-            function.string_literals().get(crate::string::StringId(0)),
-            Some("otter".to_string())
-        );
-        assert_eq!(
-            function.calls().get_direct(0),
-            Some(crate::call::DirectCall::new(
-                FunctionIndex(0),
-                1,
-                FrameFlags::empty()
-            ))
-        );
-        assert_eq!(function.feedback().len(), 1);
-        assert_eq!(function.deopt().len(), 1);
-        assert_eq!(function.exceptions().len(), 1);
-        assert_eq!(function.source_map().len(), 1);
-    }
-
-    #[test]
-    fn module_requires_valid_entry_function() {
-        let frame_layout = FrameLayout::default();
-        let function = Function::with_bytecode(Some("entry"), frame_layout, Bytecode::default());
-        let result = Module::new(Some("m"), vec![function], FunctionIndex(1));
-
-        assert_eq!(result, Err(ModuleError::InvalidEntryFunction));
-    }
-
-    #[test]
-    fn module_exposes_entry_function_and_count() {
-        let frame_layout = FrameLayout::default();
-        let entry = Function::with_bytecode(Some("entry"), frame_layout, Bytecode::default());
-        let helper = Function::with_bytecode(Some("helper"), frame_layout, Bytecode::default());
-        let module = Module::new(Some("m"), vec![entry, helper], FunctionIndex(0))
-            .expect("module should be valid");
-
-        assert_eq!(module.name(), Some("m"));
-        assert_eq!(module.function_count(), 2);
-        assert_eq!(module.entry_function().name(), Some("entry"));
-        assert_eq!(
-            module.function(FunctionIndex(1)).and_then(Function::name),
-            Some("helper")
-        );
     }
 }

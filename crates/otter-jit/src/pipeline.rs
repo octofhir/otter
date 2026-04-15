@@ -8,6 +8,8 @@ use std::time::Instant;
 use otter_vm as vm;
 
 use crate::baseline::{analyze_template_candidate, emit_template_stencil};
+#[cfg(feature = "bytecode_v2")]
+use crate::baseline::v2::{analyze_v2_template_candidate, emit_v2_template_stencil};
 use crate::code_memory::{
     CompiledCodeOrigin, CompiledFunction, compile_clif_function, compile_code_buffer,
     create_host_isa,
@@ -81,6 +83,41 @@ pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, Jit
     compile_function_profiled(function, &[])
 }
 
+/// Try to lower the function through the v2 (Ignition-style) template
+/// baseline. Returns `Some(compiled)` if the function carries v2
+/// bytecode and the analyzer + emitter both accept it; `None` to fall
+/// through to the v1 baseline / MIR pipelines.
+///
+/// Feature-gated: returns `None` when the `bytecode_v2` feature is off.
+#[cfg(feature = "bytecode_v2")]
+fn try_compile_v2_template(function: &vm::Function) -> Option<CompiledFunction> {
+    if function.bytecode_v2().is_none() {
+        return None;
+    }
+    let program = analyze_v2_template_candidate(function).ok()?;
+    let stencil = emit_v2_template_stencil(&program).ok()?;
+    let cfg = crate::config::jit_config();
+    if cfg.dump_asm {
+        eprintln!(
+            "[JIT] === v2 Template Baseline Stencil for {:?} ({} bytes) ===",
+            function.name(),
+            stencil.len(),
+        );
+        crate::codegen::disasm::dump_disassembly(
+            stencil.bytes(),
+            0,
+            Some("v2-template-baseline-stencil"),
+        );
+    }
+    compile_code_buffer(&stencil, CompiledCodeOrigin::TemplateBaseline).ok()
+}
+
+#[cfg(not(feature = "bytecode_v2"))]
+#[inline]
+fn try_compile_v2_template(_function: &vm::Function) -> Option<CompiledFunction> {
+    None
+}
+
 /// Choose the preferred Tier 1 strategy for a function.
 ///
 /// Today this is an analysis/planning decision. Even when the template baseline
@@ -117,6 +154,25 @@ pub fn compile_function_with_feedback(
     let function_name = function.name().unwrap_or("<anonymous>");
     let cfg = crate::config::jit_config();
     let start = Instant::now();
+
+    // v2 (Ignition-style accumulator) baseline probe. When the function
+    // carries v2 bytecode and the Phase 4.1/4.2 analyzer + emitter accept
+    // it, install the x21-pinned stencil directly — a 3× size reduction
+    // from the v1 template baseline. Feature-gated so non-feature builds
+    // pay zero cost.
+    if let Some(compiled) = try_compile_v2_template(function) {
+        let duration_ns = start.elapsed().as_nanos() as u64;
+        telemetry::record_compile_time(true, duration_ns);
+        telemetry::record_function_compiled(function_name, 1, duration_ns, compiled.code_size);
+        if cfg.dump_bytecode {
+            eprintln!(
+                "[JIT] v2 template baseline for {:?}: {:?}",
+                function.name(),
+                compiled.origin,
+            );
+        }
+        return Ok(compiled);
+    }
 
     // Extract legacy PropertyInlineCache profile from the feedback vector
     // for the MIR path (shape-guarded lowering).
@@ -275,6 +331,25 @@ pub fn compile_function_profiled(
 ) -> Result<CompiledFunction, JitError> {
     let cfg = crate::config::jit_config();
     let start = Instant::now();
+
+    // v2 (Ignition-style accumulator) baseline probe. Identical purpose
+    // to the feedback-aware path — lets unfeedback'd v2 functions hit
+    // the x21-pinned stencil directly on first compile.
+    if let Some(compiled) = try_compile_v2_template(function) {
+        let duration_ns = start.elapsed().as_nanos() as u64;
+        telemetry::record_compile_time(true, duration_ns);
+        let function_name = function.name().unwrap_or("<anonymous>");
+        telemetry::record_function_compiled(function_name, 1, duration_ns, compiled.code_size);
+        if cfg.dump_bytecode {
+            eprintln!(
+                "[JIT] v2 template baseline (profile) for {:?}: {:?}",
+                function.name(),
+                compiled.origin,
+            );
+        }
+        return Ok(compiled);
+    }
+
     let tier1_strategy = select_tier1_strategy(function, property_profile);
     let function_name = function.name().unwrap_or("<anonymous>");
 

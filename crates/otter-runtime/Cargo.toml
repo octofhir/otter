@@ -12,6 +12,13 @@ warnings = "deny"
 [lints.clippy]
 all = "deny"
 
+[features]
+default = []
+# Enable v2 (Ignition-style accumulator) bytecode path. Forwards to
+# both otter-vm (dispatch_v2, Activation::accumulator, transpiler) and
+# otter-jit (x21-pinned baseline analyzer+emitter, pipeline probe).
+bytecode_v2 = ["otter-vm/bytecode_v2", "otter-jit/bytecode_v2"]
+
 [dependencies]
 dirs = "6.0"
 dunce = "1"

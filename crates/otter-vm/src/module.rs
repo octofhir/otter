@@ -528,6 +528,8 @@ impl Module {
         functions: Vec<Function>,
         entry: FunctionIndex,
     ) -> Result<Self, ModuleError> {
+        let mut functions = functions;
+        maybe_attach_v2_bytecode(&mut functions);
         let functions = functions.into_boxed_slice();
         if usize::try_from(entry.0)
             .ok()
@@ -556,6 +558,8 @@ impl Module {
         imports: Vec<ImportRecord>,
         exports: Vec<ExportRecord>,
     ) -> Result<Self, ModuleError> {
+        let mut functions = functions;
+        maybe_attach_v2_bytecode(&mut functions);
         let functions = functions.into_boxed_slice();
         if usize::try_from(entry.0)
             .ok()
@@ -652,6 +656,43 @@ impl Module {
             .and_then(|position| self.functions.get(position))
     }
 }
+
+/// When the `bytecode_v2` feature is enabled **and** the
+/// `OTTER_V2_TRANSPILE` environment variable is set to a truthy value,
+/// transpile every function's v1 bytecode to v2 at module-construction
+/// time. Functions whose opcodes aren't yet covered by the transpiler
+/// (e.g. certain class / private-field paths) silently skip v2
+/// attachment and continue running on v1 bytecode.
+///
+/// This is the bridge that lets the CLI exercise the Phase 4 v2
+/// baseline JIT without requiring a dedicated v2 source compiler:
+/// the v1 AST→bytecode pipeline keeps producing v1, and this hook
+/// overlays a parallel v2 stream so `try_compile_v2_template` in the
+/// JIT pipeline can pick it up on tier-up.
+#[cfg(feature = "bytecode_v2")]
+fn maybe_attach_v2_bytecode(functions: &mut Vec<Function>) {
+    let enabled = std::env::var("OTTER_V2_TRANSPILE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    for function in functions.iter_mut() {
+        if function.bytecode_v2.is_some() {
+            continue;
+        }
+        if let Ok(v2) = crate::bytecode_v2::transpile_with_function(
+            function.bytecode(),
+            function,
+        ) {
+            function.bytecode_v2 = Some(v2);
+        }
+    }
+}
+
+#[cfg(not(feature = "bytecode_v2"))]
+#[inline]
+fn maybe_attach_v2_bytecode(_functions: &mut Vec<Function>) {}
 
 #[cfg(test)]
 mod tests {

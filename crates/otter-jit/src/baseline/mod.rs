@@ -8,6 +8,14 @@ use crate::arch::CodeBuffer;
 use otter_vm::bytecode::{Instruction, Opcode};
 use otter_vm::module::Function;
 
+/// v2 (Ignition-style accumulator) baseline analyzer — parallel to the
+/// v1 analyzer in this module. Lowers a `Function::bytecode_v2()` stream
+/// into the existing `TemplateInstruction` IR so the emitter can stay
+/// shared between tiers while we validate the v2→baseline plumbing.
+/// The full x21-pinned-accumulator emitter lives in Phase 4.2+.
+#[cfg(feature = "bytecode_v2")]
+pub mod v2;
+
 /// A bytecode operation supported by the template baseline path.
 ///
 /// All int32 binary ops emit a tag guard on each operand — if feedback lies

@@ -38,6 +38,15 @@ pub struct Activation {
     /// `save_registers` / `restore_registers` so yield/await round-trip
     /// the accumulator through the generator continuation.
     pub(super) accumulator: RegisterValue,
+    /// Secondary result slot for ops that produce two values in one
+    /// step — notably `IteratorNext` (acc = value, secondary = done
+    /// flag) and `PropertyIteratorNext`. Written by the producer op,
+    /// consumed by the immediately-following `JumpIfTrue` / similar
+    /// branch, so the lifetime is strictly intra-op-pair.
+    ///
+    /// Defaults to `undefined` on frame creation. Mirrors the
+    /// `secondary_result` field already present on `JitContext`.
+    pub(super) secondary_result: RegisterValue,
 }
 
 impl Activation {
@@ -78,6 +87,7 @@ impl Activation {
             written_registers: Vec::new(),
             overflow_args: Vec::new(),
             accumulator: RegisterValue::undefined(),
+            secondary_result: RegisterValue::undefined(),
         }
     }
 
@@ -149,6 +159,19 @@ impl Activation {
     /// Overwrites the v2 accumulator.
     pub fn set_accumulator(&mut self, value: RegisterValue) {
         self.accumulator = value;
+    }
+
+    /// Reads the v2 secondary-result slot. Written by ops that produce
+    /// two values in one step (e.g. `IteratorNext`) and consumed by the
+    /// immediately-following branch op.
+    #[must_use]
+    pub fn secondary_result(&self) -> RegisterValue {
+        self.secondary_result
+    }
+
+    /// Overwrites the v2 secondary-result slot.
+    pub fn set_secondary_result(&mut self, value: RegisterValue) {
+        self.secondary_result = value;
     }
 
     /// Returns a raw mutable pointer to the register file for JIT native

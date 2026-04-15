@@ -5,6 +5,14 @@ edition = "2024"
 description = "JIT compilation pipeline for Otter VM — Cranelift-based, cross-platform"
 license = "MIT"
 
+[features]
+default = []
+# Enable JIT support for the v2 (Ignition-style accumulator) bytecode
+# path. Forwards the feature to `otter-vm` so the JIT can see the
+# `Function::bytecode_v2()` / `Bytecode` / `OpcodeV2` symbols needed by
+# the v2 baseline analyzer and emitter.
+bytecode_v2 = ["otter-vm/bytecode_v2"]
+
 [dependencies]
 otter-vm = { path = "../otter-vm" }
 thiserror.workspace = true

@@ -186,12 +186,31 @@ fn rest_parameter_unsupported() {
 }
 
 #[test]
-fn non_addition_binary_unsupported() {
-    let err = compile("function f(n) { return n - 1; }").expect_err("subtract at M3");
+fn comparison_binary_unsupported() {
+    // M6 owns relational operators. Until then, `<` etc. surface as
+    // `Unsupported { construct: "comparison" }` via
+    // `binary_operator_tag`, the catch-all in `binary_op_encoding`.
+    let err = compile("function f(n) { return n < 1; }").expect_err("comparisons at M6");
     assert!(matches!(
         err,
         SourceLoweringError::Unsupported {
-            construct: "subtraction",
+            construct: "comparison",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn division_unsupported_at_m3() {
+    // `/` has no `*Smi` opcode in the v2 ISA and no Reg-form lowering
+    // for the integer-only M3 surface. Stays unsupported as
+    // `Unsupported { construct: "division" }` until later milestones
+    // introduce the float lowering path.
+    let err = compile("function f(n) { return n / 2; }").expect_err("division later");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "division",
             ..
         }
     ));
@@ -291,6 +310,173 @@ fn wide_integer_literal_on_rhs_is_unsupported() {
     // narrow width we emit. Until M4 lands locals, there is no scratch
     // slot to materialise the literal into, so this path rejects.
     let err = compile("function f(n) { return n + 200; }").expect_err("needs scratch slot");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "wide_integer_literal_on_rhs",
+            ..
+        }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// M3 — remaining int32 binary operators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subtract_literal_uses_subsmi() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n - 1; }", &[42]),
+        41
+    );
+}
+
+#[test]
+fn subtract_register_uses_sub() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n - n; }", &[42]),
+        0
+    );
+}
+
+#[test]
+fn multiply_literal_uses_mulsmi() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n * 3; }", &[7]),
+        21
+    );
+}
+
+#[test]
+fn multiply_register_uses_mul() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n * n; }", &[6]),
+        36
+    );
+}
+
+#[test]
+fn bitwise_or_literal_uses_orsmi() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n | 1; }", &[4]),
+        5
+    );
+}
+
+#[test]
+fn bitwise_or_register_uses_or() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n | n; }", &[5]),
+        5
+    );
+}
+
+#[test]
+fn bitwise_and_literal_uses_andsmi() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n & 12; }", &[7]),
+        4
+    );
+}
+
+#[test]
+fn bitwise_and_register_uses_and() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n & n; }", &[7]),
+        7
+    );
+}
+
+#[test]
+fn bitwise_xor_register_uses_xor() {
+    // No `BitwiseXorSmi` opcode in the v2 ISA — Reg form is the only
+    // path, so we exercise `n ^ n` (which collapses to 0 for any n).
+    assert_eq!(
+        run_int32_function("function f(n) { return n ^ n; }", &[42]),
+        0
+    );
+}
+
+#[test]
+fn bitwise_xor_literal_rhs_is_unsupported() {
+    // No `BitwiseXorSmi` and no scratch slot to materialise the
+    // literal — same `wide_integer_literal_on_rhs` rejection as the
+    // out-of-i8 AddSmi case. Will become supported once M4 lands
+    // local slots that can hold the materialised RHS.
+    let err = compile("function f(n) { return n ^ 1; }").expect_err("xor literal needs scratch");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "wide_integer_literal_on_rhs",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn shift_left_literal_uses_shlsmi() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n << 2; }", &[3]),
+        12
+    );
+}
+
+#[test]
+fn shift_left_register_uses_shl() {
+    // `n << n` for n=3 → 3 << 3 == 24.
+    assert_eq!(
+        run_int32_function("function f(n) { return n << n; }", &[3]),
+        24
+    );
+}
+
+#[test]
+fn shift_right_literal_uses_shrsmi() {
+    // Arithmetic shift right; for negative inputs `Shr` sign-extends.
+    assert_eq!(
+        run_int32_function("function f(n) { return n >> 1; }", &[-8]),
+        -4
+    );
+}
+
+#[test]
+fn shift_right_register_uses_shr() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n >> n; }", &[2]),
+        0
+    );
+}
+
+#[test]
+fn unsigned_shift_right_register_uses_ushr() {
+    // No `UShrSmi` opcode in the v2 ISA — Reg form only. `n >>> n`
+    // for n=4 collapses to `4 >>> 4 == 0`.
+    assert_eq!(
+        run_int32_function("function f(n) { return n >>> n; }", &[4]),
+        0
+    );
+}
+
+#[test]
+fn unsigned_shift_right_literal_rhs_is_unsupported() {
+    // Same reason as `BitwiseXor` literal RHS — no `UShrSmi` opcode
+    // and no scratch slot.
+    let err = compile("function f(n) { return n >>> 1; }").expect_err("ushr literal needs scratch");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "wide_integer_literal_on_rhs",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn wide_subsmi_literal_is_unsupported() {
+    // 200 > i8::MAX, so SubSmi can't encode it; rejects via the same
+    // tag as AddSmi. Confirms the Smi-width check applies uniformly
+    // across operators with a Smi opcode, not just `+`.
+    let err = compile("function f(n) { return n - 200; }").expect_err("needs scratch slot");
     assert!(matches!(
         err,
         SourceLoweringError::Unsupported {

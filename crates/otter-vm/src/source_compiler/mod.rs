@@ -6,7 +6,7 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M1)
+//! # Current state (M3)
 //!
 //! The compiler accepts a **single** top-level `FunctionDeclaration`
 //! and lowers a narrow slice of its body. Supported surface:
@@ -20,8 +20,14 @@
 //! - Return expression: one of
 //!   - `Identifier` (must reference the declared parameter);
 //!   - int32-safe `NumericLiteral` (integral, in `i32` range);
-//!   - `BinaryExpression` with operator `+`, where each operand is
-//!     itself int32-safe (identifier or int32-safe literal).
+//!   - `BinaryExpression` with one of the int32 binary operators
+//!     `+`, `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`, where each
+//!     operand is itself int32-safe (identifier or int32-safe literal).
+//!     Operators with a Smi opcode in the v2 ISA (`+`, `-`, `*`, `|`,
+//!     `&`, `<<`, `>>`) take the `*Smi imm` fast path when the RHS is
+//!     an `i8`-fit literal; the bitwise XOR (`^`) and unsigned right
+//!     shift (`>>>`) have no Smi opcode, so a literal RHS would need
+//!     a scratch slot the M3 frame layout does not yet allocate.
 //!
 //! Anything outside that shape surfaces as a
 //! [`SourceLoweringError::Unsupported`] with a `construct: &'static
@@ -372,48 +378,126 @@ fn lower_return_expression(
     }
 }
 
-/// Lowers `lhs + rhs` where both operands must be int32-safe. Picks
-/// `AddSmi imm` whenever the RHS is a literal that fits in `i8`; falls
-/// back to `Add reg` otherwise (with the RHS evaluated into a
-/// temporary slot only if it isn't already an identifier).
+/// Per-operator opcode pair: the Reg-RHS form and the optional
+/// `*Smi imm` fast path. `Some(smi)` means the bytecode ISA carries a
+/// dedicated immediate opcode for this operator; `None` means a
+/// literal RHS would have to be materialised into a scratch slot the
+/// M3 frame layout doesn't yet allocate (e.g. `^`, `>>>`).
+struct BinaryOpEncoding {
+    reg_opcode: Opcode,
+    smi_opcode: Option<Opcode>,
+    /// Short label used in `SourceLoweringError::Internal` messages so
+    /// encoder failures point at the right opcode without resorting to
+    /// `format!("{:?}", op)`.
+    label: &'static str,
+}
+
+/// Maps a parsed binary operator to the v2 opcode pair the lowering
+/// uses. Returns `None` for operators outside the M3 int32 surface
+/// (comparisons, equality, exponent, division, remainder, membership);
+/// callers fall back to [`binary_operator_tag`] for the diagnostic.
+fn binary_op_encoding(op: BinaryOperator) -> Option<BinaryOpEncoding> {
+    use BinaryOperator::*;
+    Some(match op {
+        Addition => BinaryOpEncoding {
+            reg_opcode: Opcode::Add,
+            smi_opcode: Some(Opcode::AddSmi),
+            label: "Add",
+        },
+        Subtraction => BinaryOpEncoding {
+            reg_opcode: Opcode::Sub,
+            smi_opcode: Some(Opcode::SubSmi),
+            label: "Sub",
+        },
+        Multiplication => BinaryOpEncoding {
+            reg_opcode: Opcode::Mul,
+            smi_opcode: Some(Opcode::MulSmi),
+            label: "Mul",
+        },
+        BitwiseOR => BinaryOpEncoding {
+            reg_opcode: Opcode::BitwiseOr,
+            smi_opcode: Some(Opcode::BitwiseOrSmi),
+            label: "BitwiseOr",
+        },
+        BitwiseAnd => BinaryOpEncoding {
+            reg_opcode: Opcode::BitwiseAnd,
+            smi_opcode: Some(Opcode::BitwiseAndSmi),
+            label: "BitwiseAnd",
+        },
+        BitwiseXOR => BinaryOpEncoding {
+            reg_opcode: Opcode::BitwiseXor,
+            smi_opcode: None,
+            label: "BitwiseXor",
+        },
+        ShiftLeft => BinaryOpEncoding {
+            reg_opcode: Opcode::Shl,
+            smi_opcode: Some(Opcode::ShlSmi),
+            label: "Shl",
+        },
+        ShiftRight => BinaryOpEncoding {
+            reg_opcode: Opcode::Shr,
+            smi_opcode: Some(Opcode::ShrSmi),
+            label: "Shr",
+        },
+        ShiftRightZeroFill => BinaryOpEncoding {
+            reg_opcode: Opcode::UShr,
+            smi_opcode: None,
+            label: "UShr",
+        },
+        _ => return None,
+    })
+}
+
+/// Lowers `lhs <op> rhs` where `<op>` is one of the M3 int32 binary
+/// operators and both operands are int32-safe. Picks the `*Smi imm`
+/// fast path whenever the RHS is a literal that fits in `i8` and the
+/// operator has a dedicated Smi opcode; falls back to the Reg form
+/// otherwise. Operators with no Smi opcode (`^`, `>>>`) reject a
+/// literal RHS until M4 introduces locals to hold it.
 fn lower_binary_expression(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
     expr: &BinaryExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    if expr.operator != BinaryOperator::Addition {
+    let Some(encoding) = binary_op_encoding(expr.operator) else {
         return Err(SourceLoweringError::unsupported(
             binary_operator_tag(expr.operator),
             expr.span,
         ));
-    }
+    };
 
     // LHS must evaluate into the accumulator. Only identifier /
     // int32-safe literal / parenthesised variants of those are allowed
-    // at M1 — nested binary expressions require a scratch slot we don't
+    // at M3 — nested binary expressions require a scratch slot we don't
     // allocate yet.
     lower_accumulator_operand(builder, ctx, &expr.left)?;
 
-    // RHS: prefer the `AddSmi` fast path if the right operand is an
-    // int32-safe literal that fits into the signed-8-bit immediate the
-    // narrow operand width accepts.
+    // RHS: prefer the `*Smi` fast path if the right operand is an
+    // int32-safe literal that fits the signed-8-bit narrow immediate
+    // **and** the operator carries a dedicated Smi opcode. Otherwise
+    // we'd need a scratch slot to materialise the literal, which the
+    // M3 frame layout does not provide.
     match &expr.right {
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;
-            if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&value) {
-                builder
-                    .emit(Opcode::AddSmi, &[Operand::Imm(value)])
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!("encode AddSmi: {err:?}"))
-                    })?;
-            } else {
-                // Wider immediate — no scratch slot in M1's frame layout
-                // to materialise it into, so reject cleanly until M4
-                // introduces locals.
-                return Err(SourceLoweringError::unsupported(
-                    "wide_integer_literal_on_rhs",
-                    literal.span,
-                ));
+            let fits_i8 = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&value);
+            match (encoding.smi_opcode, fits_i8) {
+                (Some(smi_op), true) => {
+                    builder
+                        .emit(smi_op, &[Operand::Imm(value)])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode {}Smi: {err:?}",
+                                encoding.label
+                            ))
+                        })?;
+                }
+                _ => {
+                    return Err(SourceLoweringError::unsupported(
+                        "wide_integer_literal_on_rhs",
+                        literal.span,
+                    ));
+                }
             }
         }
         Expression::Identifier(ident) => {
@@ -421,8 +505,10 @@ fn lower_binary_expression(
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
             builder
-                .emit(Opcode::Add, &[Operand::Reg(u32::from(reg))])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode Add: {err:?}")))?;
+                .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode {}: {err:?}", encoding.label))
+                })?;
         }
         Expression::ParenthesizedExpression(inner) => {
             return Err(SourceLoweringError::unsupported(

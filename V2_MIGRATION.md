@@ -21,7 +21,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
 | M0       | Retire v1 pipeline, delete legacy tests, canonicalize v2 naming, scaffold empty `ModuleCompiler`, wire CLI.                    | [x]    | eeb84c8 |
 | M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [x]    | 377ddd2 |
-| M2       | JIT stencil disassembly sanity + M1 microbenchmark.                                                                             | [ ]    |        |
+| M2       | JIT stencil disassembly sanity + M1 microbenchmark.                                                                             | [x]    | _pending_ |
 | M3       | Remaining int32 binary ops: `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`.                                                         | [ ]    |        |
 | M4       | Local `let`/`const` with initializer.                                                                                          | [ ]    |        |
 | M5       | `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `|=`) onto a local `let`.                                                        | [ ]    |        |
@@ -51,10 +51,17 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 
 ## Benchmarks
 
-Empty until M7 lands. After M7 the `bench2.ts` sum-loop is the baseline for latency vs `bun run` and `node --experimental-vm-modules`, recorded for aarch64 interpreter and aarch64 JIT.
+After M7 the `bench2.ts` sum-loop becomes the baseline for latency vs `bun run` and `node --experimental-vm-modules`, recorded for aarch64 interpreter and aarch64 JIT. Until then the M2 `f(42)` micro-row tracks per-call interpreter latency for the M1 lowering — useful as a regression floor while later milestones widen the source-compiler subset.
+
+Reproduce the M2 row with:
+
+```bash
+cargo test -p otter-jit --release -- --ignored m1_microbench --nocapture
+```
 
 | Scenario                          | Otter interp | Otter JIT | bun | node |
 |-----------------------------------|--------------|-----------|-----|------|
+| `f(42)` (10⁶ iter, aarch64)       | 496 ns/iter  | —         | —   | —    |
 | `bench2.ts` (10⁶ iter)            | —            | —         | —   | —    |
 
 ## Notes

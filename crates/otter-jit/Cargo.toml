@@ -31,3 +31,8 @@ bad64 = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Used by the M2 stencil-disassembly + microbenchmark tests, which drive
+# the analyzer + emitter end-to-end through the v2 source compiler.
+oxc_span = "0.123"

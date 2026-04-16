@@ -1541,4 +1541,216 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn stencil_invocation_smoke() {}
+
+    // -------------------------------------------------------------------
+    // M2: stencil disassembly sanity + interpreter microbenchmark.
+    // -------------------------------------------------------------------
+
+    /// End-to-end check that the M1 source `function f(n) { return n + 1 }`
+    /// round-trips through `ModuleCompiler` → `analyze_template_candidate`
+    /// → `emit_template_stencil` and yields a stencil whose aarch64
+    /// disassembly carries the expected x21-pinned shape.
+    ///
+    /// The test does **not** invoke the stencil. Direct invocation from
+    /// Rust test harnesses on macOS / Apple Silicon is the documented
+    /// hazard tracked by `stencil_invocation_smoke` above; the production
+    /// `TierUpHook::execute_cached` path handles the `MAP_JIT` /
+    /// `pthread_jit_write_protect_np` ceremony correctly, but that path
+    /// is exercised by integration tests, not here.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn m2_stencil_disassembly_sanity() {
+        use otter_vm::module::FunctionIndex;
+        use otter_vm::source_compiler::ModuleCompiler;
+        use oxc_span::SourceType;
+
+        let module = ModuleCompiler::new()
+            .compile(
+                "function f(n) { return n + 1; }",
+                "f.js",
+                SourceType::default(),
+            )
+            .expect("M1 source must compile");
+        let function = module
+            .function(FunctionIndex(0))
+            .expect("module has entry function");
+
+        let program = analyze_template_candidate(function).expect("analyze");
+        // The M1 lowering produces exactly: `Ldar r0`, `AddSmi 1`, `Return`.
+        // Lock that shape so a regression in the source compiler shows up
+        // here rather than masquerading as a stencil-size drift.
+        assert_eq!(
+            program.instructions.as_slice(),
+            &[
+                TemplateInstruction::Ldar { reg: 0 },
+                TemplateInstruction::AddAccI32 { imm: 1 },
+                TemplateInstruction::ReturnAcc,
+            ],
+            "analyzer must lower the M1 source to a Ldar / AddSmi / Return triple",
+        );
+
+        let buf = emit_template_stencil(&program).expect("emit stencil");
+        let bytes = buf.bytes();
+        assert!(!bytes.is_empty(), "emitter produced no code");
+        assert_eq!(
+            bytes.len() % 4,
+            0,
+            "emitter produced non-word-aligned bytes"
+        );
+
+        // Disassemble each 32-bit word and pin the stencil shape via
+        // mnemonic-presence checks. bad64 may pick aliases (`SUBS` for
+        // `CMP`, `SBFM` for `SXTW`, `ANDS` for `TST`, `ORR` for the
+        // `MOV xd, xn` zero-register form), so accept either side of
+        // each alias pair.
+        let mnemonics: Vec<String> = bytes
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let addr = (idx * 4) as u64;
+                let insn = bad64::decode(word, addr).expect("decode");
+                format!("{:?}", insn.op())
+            })
+            .collect();
+
+        let has = |needle: &str| mnemonics.iter().any(|m| m == needle);
+        let has_prefix = |needle: &str| mnemonics.iter().any(|m| m.starts_with(needle));
+
+        // Prologue: at least one LDR (registers_base load) and one MOV /
+        // ORR pinning x19 to the JitContext pointer.
+        assert!(
+            has("LDR"),
+            "prologue missing LDR for registers_base: {mnemonics:?}",
+        );
+        assert!(
+            has("MOV") || has("ORR"),
+            "prologue missing MOV (alias of `ORR xd, xzr, xn`): {mnemonics:?}",
+        );
+        // Tag-guard sequence emitted by `check_int32_tag_fast`.
+        assert!(has("EOR"), "guard missing EOR: {mnemonics:?}");
+        assert!(
+            has("TST") || has("ANDS"),
+            "guard missing TST (or ANDS XZR alias): {mnemonics:?}",
+        );
+        assert!(has("B_NE"), "guard missing B.NE branch: {mnemonics:?}");
+        // Sign-extension of the tag-guarded payload.
+        assert!(
+            has("SXTW") || has("SBFM"),
+            "missing SXTW (or SBFM canonical form): {mnemonics:?}",
+        );
+        // Immediate materialisation for AddSmi and TAG_INT32 / sentinel.
+        assert!(
+            has_prefix("MOV"),
+            "missing MOVZ/MOVK for immediates: {mnemonics:?}",
+        );
+        // Arithmetic op + box_int32 epilogue.
+        assert!(has("ADD"), "missing ADD: {mnemonics:?}");
+        assert!(
+            has("ORR"),
+            "missing ORR (box_int32 OR with TAG_INT32): {mnemonics:?}",
+        );
+        // Function exit.
+        assert!(has("RET"), "missing RET: {mnemonics:?}");
+
+        // Size sanity. Phase 4.5b guarded emission for `Ldar r0 / AddSmi
+        // 1 / Return` lands at ≈40 aarch64 instructions (≈160 bytes):
+        // a 32-byte prologue, one tag-guarded `Ldar` load + sxtw, a
+        // 3-insn `AddSmi` (movz / add / sxtw), the box_int32 + ret
+        // epilogue, the shared bailout-common epilogue, and one
+        // bailout pad for the Ldar guard. Lock the upper bound at
+        // 200 bytes — comfortably above the current ≈160 — to catch
+        // emitter regressions without flaking on cosmetic tweaks.
+        assert!(
+            bytes.len() <= 200,
+            "M1 stencil larger than expected: {} bytes (Phase 4.5b target ≤ 200)",
+            bytes.len(),
+        );
+    }
+
+    /// Microbenchmark for the M1 source `function f(n) { return n + 1 }`
+    /// running through the v2 interpreter. Reports `interp: <ns/iter>` to
+    /// stdout for the V2_MIGRATION.md benchmarks table.
+    ///
+    /// Invoke with:
+    /// ```text
+    /// cargo test -p otter-jit --release -- --ignored m1_microbench --nocapture
+    /// ```
+    ///
+    /// JIT-side measurement is intentionally skipped this session.
+    /// `Interpreter::execute_with_runtime` is a top-level entry — the
+    /// JSC-style tier-up hook only fires on inner `CallClosure` boundaries,
+    /// and the v2 source compiler does not yet emit calls (lands at M9).
+    /// The remaining option — direct invocation of a compiled stencil
+    /// from a Rust test harness — is the documented macOS / Apple
+    /// Silicon hazard tracked by `stencil_invocation_smoke`. The JIT
+    /// half of the benchmark therefore moves to a later milestone once
+    /// either (a) M9 + M7 give us a JS loop that calls f, or (b) the
+    /// production tier-up path can be exercised from a unit test on
+    /// macOS without UE zombies.
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "M1 microbenchmark — run manually via `--ignored m1_microbench --nocapture`"]
+    #[test]
+    fn m1_microbench() {
+        use otter_vm::module::FunctionIndex;
+        use otter_vm::source_compiler::ModuleCompiler;
+        use otter_vm::value::RegisterValue;
+        use otter_vm::{Interpreter, RuntimeState};
+        use oxc_span::SourceType;
+        use std::time::Instant;
+
+        let module = ModuleCompiler::new()
+            .compile(
+                "function f(n) { return n + 1; }",
+                "f.js",
+                SourceType::default(),
+            )
+            .expect("M1 source must compile");
+        let function = module
+            .function(FunctionIndex(0))
+            .expect("module has entry function");
+        let layout = function.frame_layout();
+        let hidden = usize::from(layout.hidden_count());
+        let mut registers = vec![RegisterValue::undefined(); usize::from(layout.register_count())];
+        registers[hidden] = RegisterValue::from_i32(42);
+
+        let interpreter = Interpreter::new();
+        let mut runtime = RuntimeState::new();
+
+        // Warmup: prime any thread-local / lazy state inside the v2
+        // interpreter and the runtime before measurement. 2000 iters is
+        // overkill for the interpreter but matches the JSC tier-up
+        // hotness budget used in the JIT path so the two halves stay
+        // comparable when the JIT half lands.
+        for _ in 0..2000 {
+            let result = interpreter
+                .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+                .expect("warmup execute");
+            let _ = result.return_value();
+        }
+
+        const ITERS: u64 = 1_000_000;
+        let started = Instant::now();
+        let mut acc: i64 = 0;
+        for _ in 0..ITERS {
+            let result = interpreter
+                .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+                .expect("measured execute");
+            // Force the result to flow through `acc` so the optimiser
+            // can't elide the call. `as_i32` is cheap and covers the
+            // happy path for `n + 1`.
+            acc = acc.wrapping_add(i64::from(result.return_value().as_i32().unwrap_or(0)));
+        }
+        let elapsed = started.elapsed();
+        // `acc` should equal 43 * ITERS — keep the assertion loose so
+        // a tiny semantic regression still prints the timing first.
+        assert_eq!(acc, 43 * (ITERS as i64), "interpreter returned wrong sum");
+
+        let total_ns = elapsed.as_nanos();
+        let per_iter_ns = total_ns / u128::from(ITERS);
+        println!(
+            "interp: {per_iter_ns} ns/iter ({} ms total over {ITERS} iter)",
+            elapsed.as_millis(),
+        );
+    }
 }

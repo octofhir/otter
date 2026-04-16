@@ -2252,6 +2252,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "otter-vm",
+ "oxc_span",
  "smallvec",
  "thiserror 2.0.17",
 ]

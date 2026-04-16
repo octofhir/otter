@@ -20,7 +20,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
 | M0       | Retire v1 pipeline, delete legacy tests, canonicalize v2 naming, scaffold empty `ModuleCompiler`, wire CLI.                    | [x]    | eeb84c8 |
-| M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [ ]    |        |
+| M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [x]    | _pending_ |
 | M2       | JIT stencil disassembly sanity + M1 microbenchmark.                                                                             | [ ]    |        |
 | M3       | Remaining int32 binary ops: `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`.                                                         | [ ]    |        |
 | M4       | Local `let`/`const` with initializer.                                                                                          | [ ]    |        |
@@ -36,11 +36,11 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 
 | Construct                         | Supported | Milestone |
 |-----------------------------------|-----------|-----------|
-| `Program`                         | no        | —         |
-| `FunctionDeclaration`             | no        | M1        |
-| `Identifier`                      | no        | M1        |
-| `NumericLiteral` (int32-safe)     | no        | M1        |
-| `BinaryExpression` `+` int32      | no        | M1        |
+| `Program` (single top-level fn)   | yes       | M1        |
+| `FunctionDeclaration`             | yes       | M1        |
+| `Identifier` (parameter ref)      | yes       | M1        |
+| `NumericLiteral` (int32-safe)     | yes       | M1        |
+| `BinaryExpression` `+` int32      | yes       | M1        |
 | `BinaryExpression` other arith    | no        | M3        |
 | `VariableDeclaration` `let/const` | no        | M4        |
 | `AssignmentExpression`            | no        | M5        |

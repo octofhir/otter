@@ -725,3 +725,262 @@ fn fractional_initializer_unsupported() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// M5 — AssignmentExpression onto a local `let`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plain_assign_overwrites_local_let() {
+    // `let x = 1; x = 5; return x;` — `let` initializes x to 1, the
+    // bare `x = 5;` statement overwrites it via Star r_x, then the
+    // return reads the updated slot.
+    assert_eq!(
+        run_int32_function("function f() { let x = 1; x = 5; return x; }", &[]),
+        5
+    );
+}
+
+#[test]
+fn add_assign_compounds_with_smi_path() {
+    // `x += 3` lowers to `Ldar r_x; AddSmi 3; Star r_x` — exercises
+    // the i8-fit `*Smi` fast path on the compound assignment.
+    assert_eq!(
+        run_int32_function("function f() { let x = 10; x += 3; return x; }", &[]),
+        13
+    );
+}
+
+#[test]
+fn add_assign_with_identifier_rhs_uses_reg_form() {
+    // `x += n` lowers to `Ldar r_x; Add r_n; Star r_x` — Reg form
+    // when the RHS is an in-scope identifier.
+    assert_eq!(
+        run_int32_function("function f(n) { let x = 10; x += n; return x; }", &[5]),
+        15
+    );
+}
+
+#[test]
+fn sub_assign_compounds() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 20; x -= 7; return x; }", &[]),
+        13
+    );
+}
+
+#[test]
+fn mul_assign_compounds() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 6; x *= 7; return x; }", &[]),
+        42
+    );
+}
+
+#[test]
+fn or_assign_compounds() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 4; x |= 1; return x; }", &[]),
+        5
+    );
+}
+
+#[test]
+fn assignment_value_flows_into_outer_let() {
+    // `let y = x = 5;` — the assignment leaves 5 in the accumulator,
+    // so the next `Star r_y` writes 5 to `y` as well.
+    assert_eq!(
+        run_int32_function("function f() { let x = 1; let y = x = 5; return y; }", &[]),
+        5
+    );
+}
+
+#[test]
+fn return_assignment_yields_assigned_value() {
+    // `return x = 7;` returns the assigned value, mirroring JS:
+    // assignment is an expression that evaluates to the RHS.
+    assert_eq!(
+        run_int32_function("function f() { let x = 1; return x = 7; }", &[]),
+        7
+    );
+}
+
+#[test]
+fn chain_of_compound_assignments_accumulates() {
+    // `x += 1; x *= 3; x -= 2; return x;` — exercises the
+    // statement-level loop with three compound assignments back-to-back.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let x = 5; x += 1; x *= 3; x -= 2; return x; }",
+            &[]
+        ),
+        16
+    );
+}
+
+#[test]
+fn assignment_after_let_chain() {
+    // Ensures the body grammar accepts `let / let / assign / return`
+    // in that order — i.e. assignments aren't required to come first.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = n; let y = x; x = y * 2; return x; }",
+            &[7]
+        ),
+        14
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M5 — negative cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn const_assignment_unsupported() {
+    // `const k = 1; k = 2;` — JS throws TypeError. M5 surfaces it at
+    // compile time so the bytecode never gets a chance to write.
+    let err = compile("function f() { const k = 1; k = 2; return k; }")
+        .expect_err("const reassignment at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_assignment",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn compound_const_assignment_unsupported() {
+    // Same rejection for `const k += 1` — the const guard fires
+    // before the lowering picks the binary op.
+    let err = compile("function f() { const k = 1; k += 2; return k; }")
+        .expect_err("const compound assign at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_assignment",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn assignment_to_param_unsupported() {
+    // `function f(n) { n = 5; }` is valid JS (parameters are
+    // mutable), but M5 rejects it: parameters live in a different
+    // slot range and the surface is intentionally minimal until M9+
+    // expands the semantics.
+    let err = compile("function f(n) { n = 5; return n; }").expect_err("param assignment at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "assignment_to_param",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn assignment_to_undeclared_unsupported() {
+    // `q = 5` where `q` is undeclared — JS implicit-global semantics
+    // are out of scope (and rejected by strict mode anyway). Surfaces
+    // as `unbound_identifier`.
+    let err = compile("function f() { q = 5; return 1; }").expect_err("implicit global at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "unbound_identifier",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn member_assignment_target_unsupported() {
+    let err =
+        compile("function f(n) { n.x = 5; return 1; }").expect_err("member assign target at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "member_assignment_target",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn destructuring_assignment_target_unsupported() {
+    let err = compile("function f() { let x = 1; [x] = [2]; return x; }")
+        .expect_err("destructuring assign at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "destructuring_assignment_target",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unsupported_compound_assign_div() {
+    // `x /= 2` — division has no `*Smi` opcode in the supported set
+    // and division isn't on the M3/M5 binary surface either, so the
+    // assignment lowering rejects with a stable per-operator tag.
+    let err = compile("function f() { let x = 6; x /= 2; return x; }").expect_err("/= at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "division_assign",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unsupported_compound_assign_xor() {
+    // `^=` lacks a `BitwiseXorSmi` opcode in the v2 ISA. M5 keeps
+    // the operator out of scope rather than falling back to a
+    // scratch-slot materialisation.
+    let err = compile("function f() { let x = 6; x ^= 1; return x; }").expect_err("^= at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "bitwise_xor_assign",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unsupported_compound_assign_shl() {
+    let err = compile("function f() { let x = 1; x <<= 2; return x; }").expect_err("<<= at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "shift_left_assign",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unsupported_compound_assign_logical_or() {
+    let err = compile("function f() { let x = 1; x ||= 2; return x; }").expect_err("||= at M5");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "logical_or_assign",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn bare_expression_statement_unsupported() {
+    // `5;` — a literal-as-statement isn't an assignment, so the
+    // body-grammar check rejects it. Surfaces via the existing
+    // expression construct tag.
+    let err = compile("function f() { 5; return 1; }").expect_err("bare expr stmt at M5");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}

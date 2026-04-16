@@ -6,7 +6,7 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M4)
+//! # Current state (M5)
 //!
 //! The compiler accepts a **single** top-level `FunctionDeclaration`
 //! and lowers a narrow slice of its body. Supported surface:
@@ -17,11 +17,18 @@
 //!   parameters. The parameter must be a plain identifier — no
 //!   destructuring, no default, no rest, no type annotation.
 //! - Body: a `BlockStatement` containing zero or more `let`/`const`
-//!   declarations followed by exactly one `ReturnStatement`. Each
+//!   declarations and/or assignment statements (`x = …;`, `x += …;`,
+//!   etc.) followed by exactly one `ReturnStatement`. Each
 //!   `let`/`const` must have a single declarator with a non-empty
 //!   initializer and a plain `BindingIdentifier` target. `var`,
 //!   destructuring patterns, and bare `let x;` (no init) are all
 //!   rejected.
+//! - Assignment: `AssignmentExpression` whose target is a plain
+//!   identifier referencing an in-scope `let`. Supported operators are
+//!   `=`, `+=`, `-=`, `*=`, `|=`. Assignment to a `const`, to a
+//!   parameter, or to a member/destructuring target is rejected. The
+//!   accumulator is left holding the assigned value so nested
+//!   assignments (`let y = x = 5;`) compose naturally.
 //! - Return expression: one of
 //!   - `Identifier` (parameter or in-scope `let`/`const`);
 //!   - int32-safe `NumericLiteral` (integral, in `i32` range);
@@ -32,7 +39,9 @@
 //!     `&`, `<<`, `>>`) take the `*Smi imm` fast path when the RHS is
 //!     an `i8`-fit literal; the bitwise XOR (`^`) and unsigned right
 //!     shift (`>>>`) have no Smi opcode, so a literal RHS would need
-//!     a scratch slot the M4 frame layout does not yet allocate.
+//!     a scratch slot the M5 frame layout does not yet allocate;
+//!   - `AssignmentExpression` (so `return x = 5;` works the same as
+//!     the statement form).
 //!
 //! ## TDZ at M4
 //!
@@ -79,9 +88,10 @@ pub use error::SourceLoweringError;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BinaryExpression, BinaryOperator, BindingPattern, Expression, FormalParameter,
-    FormalParameters, Function, FunctionBody, NumericLiteral, Program, Statement,
-    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
+    BindingPattern, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
+    NumericLiteral, Program, Statement, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -328,6 +338,23 @@ fn lower_function_body<'a>(
             Statement::VariableDeclaration(decl) => {
                 lower_let_const_declaration(&mut builder, &mut ctx, decl)?;
             }
+            Statement::ExpressionStatement(stmt) => {
+                // M5 only accepts assignment expressions at statement
+                // position. Other expressions (bare reads, calls, …)
+                // surface their own tag so future milestones can
+                // widen them one shape at a time.
+                match &stmt.expression {
+                    Expression::AssignmentExpression(assign) => {
+                        lower_assignment_expression(&mut builder, &ctx, assign)?;
+                    }
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            expression_construct_tag(other),
+                            other.span(),
+                        ));
+                    }
+                }
+            }
             Statement::ReturnStatement(ret) => {
                 let argument = ret.argument.as_ref().ok_or_else(|| {
                     SourceLoweringError::unsupported("return_without_value", ret.span)
@@ -363,27 +390,38 @@ fn lower_function_body<'a>(
 
 /// Resolved binding for a JS identifier reference. Mirrors the
 /// `[hidden | params | locals]` frame layout: `Param.reg` is the
-/// user-visible register index of the parameter (0 for the sole M4
+/// user-visible register index of the parameter (0 for the sole M5
 /// parameter), `Local.reg` is the user-visible index of the
 /// `let`/`const` slot. `initialized: false` flags a binding whose
 /// own initializer is currently being lowered — reading it would be
-/// a TDZ self-reference and is rejected at compile time.
+/// a TDZ self-reference and is rejected at compile time. `is_const`
+/// distinguishes `const` from `let`; M5's assignment lowering refuses
+/// writes to const bindings.
 #[derive(Debug, Clone, Copy)]
 enum BindingRef {
-    Param { reg: u16 },
-    Local { reg: u16, initialized: bool },
+    Param {
+        reg: u16,
+    },
+    Local {
+        reg: u16,
+        initialized: bool,
+        is_const: bool,
+    },
 }
 
 /// In-scope `let`/`const` binding. The slot is assigned at allocation
-/// time and stays stable for the binding's whole lifetime (M4 has no
+/// time and stays stable for the binding's whole lifetime (M5 has no
 /// shadowing or block scopes — those land with `IfStatement` /
 /// `WhileStatement` in M6 / M7). `initialized` flips to `true` after
-/// `Star r_slot` runs the post-init assignment.
+/// `Star r_slot` runs the post-init assignment; `is_const` is set
+/// from the declaration kind and is used by `lower_assignment_expression`
+/// to reject const writes.
 #[derive(Debug)]
 struct LocalBinding<'a> {
     name: &'a str,
     slot: u16,
     initialized: bool,
+    is_const: bool,
 }
 
 /// Per-function lowering context: tracks the sole parameter (if any)
@@ -425,13 +463,20 @@ impl<'a> LoweringContext<'a> {
     /// starts as **not yet initialized** so reads inside its own
     /// initializer surface as `tdz_self_reference`. Caller must call
     /// [`mark_initialized`](Self::mark_initialized) after emitting the
-    /// post-init `Star r_slot`.
+    /// post-init `Star r_slot`. `is_const` is captured from the
+    /// declaration kind so [`lower_assignment_expression`] can reject
+    /// writes to const bindings.
     ///
     /// Rejects:
     /// - duplicate name (already a parameter or another local in scope) →
     ///   `Unsupported { construct: "duplicate_binding" }`;
     /// - register-space exhaustion → `Internal`.
-    fn allocate_local(&mut self, name: &'a str, span: Span) -> Result<u16, SourceLoweringError> {
+    fn allocate_local(
+        &mut self,
+        name: &'a str,
+        is_const: bool,
+        span: Span,
+    ) -> Result<u16, SourceLoweringError> {
         if self.param_name == Some(name) || self.locals.iter().any(|l| l.name == name) {
             return Err(SourceLoweringError::unsupported("duplicate_binding", span));
         }
@@ -443,6 +488,7 @@ impl<'a> LoweringContext<'a> {
             name,
             slot,
             initialized: false,
+            is_const,
         });
         Ok(slot)
     }
@@ -472,13 +518,14 @@ impl<'a> LoweringContext<'a> {
 
     /// Resolves a JS identifier reference into a [`BindingRef`].
     /// Locals shadow the parameter (only matters once shadowing is
-    /// allowed in later milestones; at M4 `allocate_local` rejects
+    /// allowed in later milestones; at M5 `allocate_local` rejects
     /// duplicates so the lookup is unambiguous).
     fn resolve_identifier(&self, name: &str) -> Option<BindingRef> {
         if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
             return Some(BindingRef::Local {
                 reg: local.slot,
                 initialized: local.initialized,
+                is_const: local.is_const,
             });
         }
         match self.param_name {
@@ -505,8 +552,9 @@ fn lower_let_const_declaration<'a>(
     ctx: &mut LoweringContext<'a>,
     decl: &'a VariableDeclaration<'a>,
 ) -> Result<(), SourceLoweringError> {
-    match decl.kind {
-        VariableDeclarationKind::Let | VariableDeclarationKind::Const => {}
+    let is_const = match decl.kind {
+        VariableDeclarationKind::Let => false,
+        VariableDeclarationKind::Const => true,
         VariableDeclarationKind::Var => {
             return Err(SourceLoweringError::unsupported(
                 "var_declaration",
@@ -514,7 +562,7 @@ fn lower_let_const_declaration<'a>(
             ));
         }
         // `using` / `await using` (Stage 3 explicit resource management).
-        // Not on the M4 surface — surface a stable tag so later milestones
+        // Not on the M5 surface — surface a stable tag so later milestones
         // can pick it up without churning callers.
         VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => {
             return Err(SourceLoweringError::unsupported(
@@ -522,7 +570,7 @@ fn lower_let_const_declaration<'a>(
                 decl.span,
             ));
         }
-    }
+    };
 
     let declarator = match decl.declarations.as_slice() {
         [single] => single,
@@ -540,13 +588,14 @@ fn lower_let_const_declaration<'a>(
         }
     };
 
-    lower_single_declarator(builder, ctx, declarator)
+    lower_single_declarator(builder, ctx, declarator, is_const)
 }
 
 fn lower_single_declarator<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     declarator: &'a VariableDeclarator<'a>,
+    is_const: bool,
 ) -> Result<(), SourceLoweringError> {
     let name = match &declarator.id {
         BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
@@ -562,7 +611,7 @@ fn lower_single_declarator<'a>(
         SourceLoweringError::unsupported("uninitialized_binding", declarator.span)
     })?;
 
-    let slot = ctx.allocate_local(name, declarator.span)?;
+    let slot = ctx.allocate_local(name, is_const, declarator.span)?;
 
     // Lower the init into the accumulator. Reading the binding inside
     // its own initializer hits the `Local { initialized: false }` arm
@@ -590,6 +639,7 @@ fn lower_identifier_read(
         BindingRef::Local {
             reg,
             initialized: true,
+            ..
         } => reg,
         BindingRef::Local {
             initialized: false, ..
@@ -620,6 +670,7 @@ fn lower_identifier_as_reg_rhs(
         BindingRef::Local {
             reg,
             initialized: true,
+            ..
         } => reg,
         BindingRef::Local {
             initialized: false, ..
@@ -658,6 +709,12 @@ fn lower_return_expression(
             Ok(())
         }
         Expression::BinaryExpression(binary) => lower_binary_expression(builder, ctx, binary),
+        Expression::AssignmentExpression(assign) => {
+            // Nested assignment (`return x = 5;`, `let y = x = 5;`).
+            // The lowering leaves the assigned value in acc, so this
+            // composes as a normal accumulator-producing expression.
+            lower_assignment_expression(builder, ctx, assign)
+        }
         Expression::ParenthesizedExpression(inner) => {
             lower_return_expression(builder, ctx, &inner.expression)
         }
@@ -743,7 +800,7 @@ fn binary_op_encoding(op: BinaryOperator) -> Option<BinaryOpEncoding> {
 /// fast path whenever the RHS is a literal that fits in `i8` and the
 /// operator has a dedicated Smi opcode; falls back to the Reg form
 /// otherwise. Operators with no Smi opcode (`^`, `>>>`) reject a
-/// literal RHS until M4 introduces locals to hold it.
+/// literal RHS until a future milestone introduces locals to hold it.
 fn lower_binary_expression(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
@@ -758,16 +815,25 @@ fn lower_binary_expression(
 
     // LHS must evaluate into the accumulator. Only identifier /
     // int32-safe literal / parenthesised variants of those are allowed
-    // at M3 — nested binary expressions require a scratch slot we don't
+    // — nested binary expressions require a scratch slot we don't
     // allocate yet.
     lower_accumulator_operand(builder, ctx, &expr.left)?;
+    apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)
+}
 
-    // RHS: prefer the `*Smi` fast path if the right operand is an
-    // int32-safe literal that fits the signed-8-bit narrow immediate
-    // **and** the operator carries a dedicated Smi opcode. Otherwise
-    // we'd need a scratch slot to materialise the literal, which the
-    // M3 frame layout does not provide.
-    match &expr.right {
+/// Applies a binary operation whose LHS is already in the accumulator.
+/// Picks `*Smi imm` for int32-safe literal RHS that fits `i8` (when
+/// the operator carries a Smi opcode), or the Reg form for an
+/// in-scope identifier RHS. Used by both [`lower_binary_expression`]
+/// and the compound-assignment path in [`lower_assignment_expression`]
+/// — the bytecode shape `<load lhs into acc>; <op> <rhs>` is identical.
+fn apply_binary_op_with_acc_lhs(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    encoding: &BinaryOpEncoding,
+    rhs: &Expression<'_>,
+) -> Result<(), SourceLoweringError> {
+    match rhs {
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;
             let fits_i8 = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&value);
@@ -789,27 +855,205 @@ fn lower_binary_expression(
                     ));
                 }
             }
+            Ok(())
         }
         Expression::Identifier(ident) => {
             let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            lower_identifier_as_reg_rhs(builder, &encoding, binding, ident.span)?;
+            lower_identifier_as_reg_rhs(builder, encoding, binding, ident.span)
         }
-        Expression::ParenthesizedExpression(inner) => {
-            return Err(SourceLoweringError::unsupported(
-                "parenthesised_rhs",
-                inner.span,
-            ));
-        }
-        other => {
-            return Err(SourceLoweringError::unsupported(
-                expression_construct_tag(other),
-                other.span(),
-            ));
-        }
+        Expression::ParenthesizedExpression(inner) => Err(SourceLoweringError::unsupported(
+            "parenthesised_rhs",
+            inner.span,
+        )),
+        other => Err(SourceLoweringError::unsupported(
+            expression_construct_tag(other),
+            other.span(),
+        )),
     }
+}
+
+/// Lowers `target <op>= rhs` (or `target = rhs`) onto a local `let`
+/// slot. Leaves the assigned value in the accumulator so nested
+/// assignments (`let y = x = 5;`, `return x = 5;`) compose without
+/// extra Ldar / Star round-trips.
+///
+/// Bytecode shape:
+/// - `x = rhs` →  `<lower rhs>; Star r_x`
+/// - `x += rhs` → `Ldar r_x; <Add/AddSmi rhs>; Star r_x`
+/// - other compound forms identical, with the matching binary opcode.
+///
+/// Rejects:
+/// - non-identifier target (member, destructuring, TS-only) →
+///   stable per-shape tag;
+/// - unbound identifier → `unbound_identifier`;
+/// - parameter as target → `assignment_to_param`;
+/// - const binding as target → `const_assignment`;
+/// - in-TDZ binding as target → `tdz_self_reference`;
+/// - assignment operator outside `=`/`+=`/`-=`/`*=`/`|=` → stable
+///   per-operator tag (e.g. `division_assign`).
+fn lower_assignment_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &AssignmentExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    // 1) Resolve the assignment target. M5 only accepts a plain
+    //    identifier whose binding is a writable local `let`.
+    let (target_ident, target_span) = match &expr.left {
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => (ident.name.as_str(), ident.span),
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            return Err(SourceLoweringError::unsupported(
+                "member_assignment_target",
+                member.span,
+            ));
+        }
+        AssignmentTarget::StaticMemberExpression(member) => {
+            return Err(SourceLoweringError::unsupported(
+                "member_assignment_target",
+                member.span,
+            ));
+        }
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            return Err(SourceLoweringError::unsupported(
+                "private_field_assignment_target",
+                member.span,
+            ));
+        }
+        AssignmentTarget::ArrayAssignmentTarget(pattern) => {
+            return Err(SourceLoweringError::unsupported(
+                "destructuring_assignment_target",
+                pattern.span,
+            ));
+        }
+        AssignmentTarget::ObjectAssignmentTarget(pattern) => {
+            return Err(SourceLoweringError::unsupported(
+                "destructuring_assignment_target",
+                pattern.span,
+            ));
+        }
+        // TS-only assignment targets (`x as T = ...`, `x! = ...`,
+        // etc.). Treated as one bucket — all are out of scope until
+        // the source compiler grows TS-specific handling.
+        AssignmentTarget::TSAsExpression(_)
+        | AssignmentTarget::TSSatisfiesExpression(_)
+        | AssignmentTarget::TSNonNullExpression(_)
+        | AssignmentTarget::TSTypeAssertion(_) => {
+            return Err(SourceLoweringError::unsupported(
+                "ts_assignment_target",
+                expr.span,
+            ));
+        }
+    };
+
+    let binding = ctx
+        .resolve_identifier(target_ident)
+        .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", target_span))?;
+    let target_reg = match binding {
+        BindingRef::Local {
+            reg,
+            initialized: true,
+            is_const: false,
+        } => reg,
+        BindingRef::Local { is_const: true, .. } => {
+            return Err(SourceLoweringError::unsupported(
+                "const_assignment",
+                target_span,
+            ));
+        }
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                target_span,
+            ));
+        }
+        BindingRef::Param { .. } => {
+            return Err(SourceLoweringError::unsupported(
+                "assignment_to_param",
+                target_span,
+            ));
+        }
+    };
+
+    // 2) Compute the assignment value into the accumulator.
+    if expr.operator == AssignmentOperator::Assign {
+        // Plain `=`: just lower the RHS into acc.
+        lower_return_expression(builder, ctx, &expr.right)?;
+    } else {
+        // Compound `<op>=`: load the current value of the target into
+        // acc, then apply the binary op against the RHS.
+        let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+            SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+        })?;
+        let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+            // Unreachable in practice — every operator
+            // `compound_assign_to_binary_operator` returns has a
+            // `binary_op_encoding`. Surface as Internal so a future
+            // mismatch is visible.
+            SourceLoweringError::Internal(format!(
+                "compound assignment {bin_op:?} has no binary opcode encoding"
+            ))
+        })?;
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(target_reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (compound lhs): {err:?}"))
+            })?;
+        apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+    }
+
+    // 3) Persist acc to the target slot. acc is left holding the
+    //    assigned value so this expression composes inside a larger
+    //    expression (e.g. `let y = x = 5;` or `return x = 5;`).
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
+
     Ok(())
+}
+
+/// Maps a compound assignment operator to the binary operator whose
+/// encoding it should use. Returns `None` for `=` (handled separately,
+/// no underlying binary op) and for compound forms outside the M5
+/// surface (`/=`, `%=`, `**=`, `<<=`, `>>=`, `>>>=`, `&=`, `^=`,
+/// `||=`, `&&=`, `??=`).
+fn compound_assign_to_binary_operator(op: AssignmentOperator) -> Option<BinaryOperator> {
+    use AssignmentOperator as A;
+    use BinaryOperator as B;
+    Some(match op {
+        A::Addition => B::Addition,
+        A::Subtraction => B::Subtraction,
+        A::Multiplication => B::Multiplication,
+        A::BitwiseOR => B::BitwiseOR,
+        _ => return None,
+    })
+}
+
+/// Stable diagnostic tag for an assignment operator outside the M5
+/// supported set. Mirrors [`binary_operator_tag`] in style so callers
+/// don't have to round-trip through `Debug`.
+fn assignment_operator_tag(op: AssignmentOperator) -> &'static str {
+    use AssignmentOperator::*;
+    match op {
+        Assign => "assign",
+        Addition => "addition_assign",
+        Subtraction => "subtraction_assign",
+        Multiplication => "multiplication_assign",
+        Division => "division_assign",
+        Remainder => "remainder_assign",
+        Exponential => "exponential_assign",
+        ShiftLeft => "shift_left_assign",
+        ShiftRight => "shift_right_assign",
+        ShiftRightZeroFill => "unsigned_shift_right_assign",
+        BitwiseOR => "bitwise_or_assign",
+        BitwiseXOR => "bitwise_xor_assign",
+        BitwiseAnd => "bitwise_and_assign",
+        LogicalOr => "logical_or_assign",
+        LogicalAnd => "logical_and_assign",
+        LogicalNullish => "logical_nullish_assign",
+    }
 }
 
 fn lower_accumulator_operand(

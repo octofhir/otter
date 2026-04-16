@@ -6,7 +6,7 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M5)
+//! # Current state (M6)
 //!
 //! The compiler accepts a **single** top-level `FunctionDeclaration`
 //! and lowers a narrow slice of its body. Supported surface:
@@ -16,13 +16,18 @@
 //! - Function: named (Identifier), not async, not a generator, 0 or 1
 //!   parameters. The parameter must be a plain identifier — no
 //!   destructuring, no default, no rest, no type annotation.
-//! - Body: a `BlockStatement` containing zero or more `let`/`const`
-//!   declarations and/or assignment statements (`x = …;`, `x += …;`,
-//!   etc.) followed by exactly one `ReturnStatement`. Each
-//!   `let`/`const` must have a single declarator with a non-empty
-//!   initializer and a plain `BindingIdentifier` target. `var`,
-//!   destructuring patterns, and bare `let x;` (no init) are all
-//!   rejected.
+//! - Body: a `BlockStatement` whose last statement is a
+//!   `ReturnStatement`. Earlier statements may be any mix of
+//!   `let`/`const` declarations (top-level only — no block scoping at
+//!   M6), assignment statements (`x = …;`, `x += …;`, …), `if` /
+//!   `if`-`else` statements, nested `BlockStatement`s, and inline
+//!   `return` statements (e.g. early returns inside an `if`). The
+//!   trailing `return` is required even when every reachable path
+//!   already returns — reachability analysis lands later.
+//! - Inside an `if` branch: only assignment statements, nested `if`
+//!   statements, `return` statements, and nested blocks of the same.
+//!   `let`/`const` inside an `if` branch is rejected as
+//!   `nested_variable_declaration` until block scoping lands.
 //! - Assignment: `AssignmentExpression` whose target is a plain
 //!   identifier referencing an in-scope `let`. Supported operators are
 //!   `=`, `+=`, `-=`, `*=`, `|=`. Assignment to a `const`, to a
@@ -39,7 +44,16 @@
 //!     `&`, `<<`, `>>`) take the `*Smi imm` fast path when the RHS is
 //!     an `i8`-fit literal; the bitwise XOR (`^`) and unsigned right
 //!     shift (`>>>`) have no Smi opcode, so a literal RHS would need
-//!     a scratch slot the M5 frame layout does not yet allocate;
+//!     a scratch slot the M6 frame layout does not yet allocate;
+//!   - `BinaryExpression` with a relational operator `<`, `>`, `<=`,
+//!     `>=`, `===`, `!==`. Lowers to `TestLessThan` /
+//!     `TestGreaterThan` / `TestLessThanOrEqual` /
+//!     `TestGreaterThanOrEqual` / `TestEqualStrict` (with an extra
+//!     `LogicalNot` for `!==`). The accumulator-RHS-must-be-a-register
+//!     constraint is satisfied via operand swapping — `n < 5` lowers
+//!     as `LdaSmi 5; TestGreaterThan r_n` (i.e. `5 > n`). Two-literal
+//!     comparisons (`5 < 10`) reject because neither side reaches a
+//!     register without a scratch slot.
 //!   - `AssignmentExpression` (so `return x = 5;` works the same as
 //!     the statement form).
 //!
@@ -318,74 +332,180 @@ fn lower_function_body<'a>(
         ));
     }
 
+    // The function body must end with exactly one `ReturnStatement`
+    // — the v2 dispatcher relies on it for tier-up call exits, and
+    // M6 has no reachability analysis to synthesize a fall-through
+    // `LdaUndefined; Return` for paths that don't return on every
+    // branch. Earlier statements are processed via `lower_top_statement`
+    // (which accepts top-level `let`/`const` plus everything
+    // `lower_nested_statement` accepts).
     let mut builder = BytecodeBuilder::new();
     let mut ctx = LoweringContext::new(params, param_count);
 
-    // Walk the body. Anything before the closing `return` must be a
-    // `let`/`const` declaration; the body must end with exactly one
-    // `return`. Bare returns and missing returns are both rejected so
-    // the bytecode shape stays one-`Return` (the v2 dispatcher relies
-    // on it for tier-up call exits).
-    let mut return_seen = false;
-    for stmt in body.statements.iter() {
-        if return_seen {
-            return Err(SourceLoweringError::unsupported(
-                "statement_after_return",
-                stmt.span(),
-            ));
-        }
-        match stmt {
-            Statement::VariableDeclaration(decl) => {
-                lower_let_const_declaration(&mut builder, &mut ctx, decl)?;
-            }
-            Statement::ExpressionStatement(stmt) => {
-                // M5 only accepts assignment expressions at statement
-                // position. Other expressions (bare reads, calls, …)
-                // surface their own tag so future milestones can
-                // widen them one shape at a time.
-                match &stmt.expression {
-                    Expression::AssignmentExpression(assign) => {
-                        lower_assignment_expression(&mut builder, &ctx, assign)?;
-                    }
-                    other => {
-                        return Err(SourceLoweringError::unsupported(
-                            expression_construct_tag(other),
-                            other.span(),
-                        ));
-                    }
-                }
-            }
-            Statement::ReturnStatement(ret) => {
-                let argument = ret.argument.as_ref().ok_or_else(|| {
-                    SourceLoweringError::unsupported("return_without_value", ret.span)
-                })?;
-                lower_return_expression(&mut builder, &ctx, argument)?;
-                builder.emit(Opcode::Return, &[]).map_err(|err| {
-                    SourceLoweringError::Internal(format!("encode Return: {err:?}"))
-                })?;
-                return_seen = true;
-            }
-            other => {
-                return Err(SourceLoweringError::unsupported(
-                    statement_construct_tag(other),
-                    other.span(),
-                ));
-            }
-        }
+    let Some((last, rest)) = body.statements.split_last() else {
+        return Err(SourceLoweringError::unsupported("empty_body", body.span));
+    };
+
+    for stmt in rest {
+        lower_top_statement(&mut builder, &mut ctx, stmt)?;
     }
 
-    if !return_seen {
+    let Statement::ReturnStatement(ret) = last else {
         return Err(SourceLoweringError::unsupported(
             "missing_return",
-            body.span,
+            last.span(),
         ));
-    }
+    };
+    let argument = ret
+        .argument
+        .as_ref()
+        .ok_or_else(|| SourceLoweringError::unsupported("return_without_value", ret.span))?;
+    lower_return_expression(&mut builder, &ctx, argument)?;
+    builder
+        .emit(Opcode::Return, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
 
     let bytecode = builder
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
 
     Ok((bytecode, ctx.local_count()))
+}
+
+/// Lowers a single statement at function-body top level. Accepts the
+/// full M6 statement surface, including `let`/`const` declarations
+/// (which are not allowed inside nested blocks — those go through
+/// [`lower_nested_statement`] instead).
+fn lower_top_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    stmt: &'a Statement<'a>,
+) -> Result<(), SourceLoweringError> {
+    match stmt {
+        Statement::VariableDeclaration(decl) => lower_let_const_declaration(builder, ctx, decl),
+        _ => lower_nested_statement(builder, ctx, stmt),
+    }
+}
+
+/// Lowers a single statement in a "nested" context (inside an `if`
+/// branch or a nested `BlockStatement`). The accepted surface is a
+/// strict subset of [`lower_top_statement`]: it does **not** allow
+/// `let`/`const` declarations, since M6 has no block scoping and
+/// hoisting them to the surrounding function scope would alter
+/// observable semantics. Inline `return` statements are accepted
+/// (early-return pattern inside an `if`).
+fn lower_nested_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    stmt: &'a Statement<'a>,
+) -> Result<(), SourceLoweringError> {
+    match stmt {
+        Statement::ExpressionStatement(expr_stmt) => {
+            // Only AssignmentExpression at statement position. Bare
+            // expression reads, calls, etc. surface their own tag so
+            // a future milestone can widen them one shape at a time.
+            match &expr_stmt.expression {
+                Expression::AssignmentExpression(assign) => {
+                    lower_assignment_expression(builder, ctx, assign)
+                }
+                other => Err(SourceLoweringError::unsupported(
+                    expression_construct_tag(other),
+                    other.span(),
+                )),
+            }
+        }
+        Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
+        Statement::ReturnStatement(ret) => {
+            let argument = ret.argument.as_ref().ok_or_else(|| {
+                SourceLoweringError::unsupported("return_without_value", ret.span)
+            })?;
+            lower_return_expression(builder, ctx, argument)?;
+            builder
+                .emit(Opcode::Return, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+            Ok(())
+        }
+        Statement::BlockStatement(block) => {
+            for inner in &block.body {
+                lower_nested_statement(builder, ctx, inner)?;
+            }
+            Ok(())
+        }
+        Statement::VariableDeclaration(decl) => Err(SourceLoweringError::unsupported(
+            "nested_variable_declaration",
+            decl.span,
+        )),
+        other => Err(SourceLoweringError::unsupported(
+            statement_construct_tag(other),
+            other.span(),
+        )),
+    }
+}
+
+/// Lowers an `if (test) consequent` (with optional `else alternate`).
+/// Bytecode shape:
+///
+/// ```text
+/// without `else`:
+///   <lower test>
+///   JumpIfToBooleanFalse end_label
+///   <lower consequent>
+/// end_label:
+///
+/// with `else`:
+///   <lower test>
+///   JumpIfToBooleanFalse else_label
+///   <lower consequent>
+///   Jump end_label
+/// else_label:
+///   <lower alternate>
+/// end_label:
+/// ```
+///
+/// `JumpIfToBooleanFalse` performs JS truthy/falsy coercion so the
+/// condition can be any value, not just a strict boolean — the
+/// interpreter handles the `ToBoolean` step. Branches are lowered via
+/// [`lower_nested_statement`] so they can themselves contain `if`s,
+/// assignments, and inline `return`s.
+fn lower_if_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    if_stmt: &'a oxc_ast::ast::IfStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    // Lower the condition into the accumulator. Reuses
+    // `lower_return_expression` so any acc-producing expression
+    // already supported (identifier, literal, binary, assignment,
+    // parenthesised) works as a condition.
+    lower_return_expression(builder, ctx, &if_stmt.test)?;
+
+    let else_label = builder.new_label();
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanFalse, else_label)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse: {err:?}"))
+        })?;
+
+    lower_nested_statement(builder, ctx, &if_stmt.consequent)?;
+
+    if let Some(alternate) = &if_stmt.alternate {
+        let end_label = builder.new_label();
+        builder
+            .emit_jump_to(Opcode::Jump, end_label)
+            .map_err(|err| SourceLoweringError::Internal(format!("encode Jump: {err:?}")))?;
+        builder
+            .bind_label(else_label)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind else label: {err:?}")))?;
+        lower_nested_statement(builder, ctx, alternate)?;
+        builder
+            .bind_label(end_label)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind end label: {err:?}")))?;
+    } else {
+        builder
+            .bind_label(else_label)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind else label: {err:?}")))?;
+    }
+
+    Ok(())
 }
 
 /// Resolved binding for a JS identifier reference. Mirrors the
@@ -657,36 +777,22 @@ fn lower_identifier_read(
 }
 
 /// Emits a Reg-form binary opcode (`Add`/`Sub`/...) reading the given
-/// in-scope identifier as the RHS. Rejects TDZ self-reference for the
-/// same reason as [`lower_identifier_read`].
+/// in-scope identifier as the RHS. Thin wrapper over
+/// [`emit_identifier_as_reg_operand`] so the arithmetic and relational
+/// paths share the TDZ check + error-tag plumbing.
 fn lower_identifier_as_reg_rhs(
     builder: &mut BytecodeBuilder,
     encoding: &BinaryOpEncoding,
     binding: BindingRef,
     ident_span: Span,
 ) -> Result<(), SourceLoweringError> {
-    let reg = match binding {
-        BindingRef::Param { reg } => reg,
-        BindingRef::Local {
-            reg,
-            initialized: true,
-            ..
-        } => reg,
-        BindingRef::Local {
-            initialized: false, ..
-        } => {
-            return Err(SourceLoweringError::unsupported(
-                "tdz_self_reference",
-                ident_span,
-            ));
-        }
-    };
-    builder
-        .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(reg))])
-        .map_err(|err| {
-            SourceLoweringError::Internal(format!("encode {}: {err:?}", encoding.label))
-        })?;
-    Ok(())
+    emit_identifier_as_reg_operand(
+        builder,
+        encoding.reg_opcode,
+        encoding.label,
+        binding,
+        ident_span,
+    )
 }
 
 fn lower_return_expression(
@@ -806,19 +912,218 @@ fn lower_binary_expression(
     ctx: &LoweringContext<'_>,
     expr: &BinaryExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    let Some(encoding) = binary_op_encoding(expr.operator) else {
-        return Err(SourceLoweringError::unsupported(
-            binary_operator_tag(expr.operator),
-            expr.span,
-        ));
+    if let Some(encoding) = binary_op_encoding(expr.operator) {
+        // LHS must evaluate into the accumulator. Only identifier /
+        // int32-safe literal / parenthesised variants of those are
+        // allowed — nested binary expressions require a scratch slot
+        // we don't allocate yet.
+        lower_accumulator_operand(builder, ctx, &expr.left)?;
+        return apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right);
+    }
+    if let Some(rel_encoding) = relational_op_encoding(expr.operator) {
+        return lower_relational_expression(builder, ctx, expr, rel_encoding);
+    }
+    Err(SourceLoweringError::unsupported(
+        binary_operator_tag(expr.operator),
+        expr.span,
+    ))
+}
+
+/// Per-operator opcode pair for the M6 relational operators. The
+/// dispatcher's `Test*` opcodes all read `acc` as the LHS and a
+/// register as the RHS; literal RHS would need a scratch slot which
+/// the M6 frame layout does not yet provide. Instead, the lowering
+/// **swaps operands** for the `identifier <op> literal` shape — `n <
+/// 5` lowers as `LdaSmi 5; TestGreaterThan r_n`, which evaluates
+/// `5 > n` and is equivalent to `n < 5`. `swapped_op` carries the
+/// inverted-direction opcode for that swap; for symmetric operators
+/// (`===`, `!==`) it equals `forward_op`.
+struct RelationalOpEncoding {
+    forward_op: Opcode,
+    swapped_op: Opcode,
+    /// `true` for `!==` only — the lowering follows up the
+    /// `TestEqualStrict` with a `LogicalNot` so the accumulator
+    /// carries the negated boolean.
+    requires_inversion: bool,
+    label: &'static str,
+}
+
+fn relational_op_encoding(op: BinaryOperator) -> Option<RelationalOpEncoding> {
+    use BinaryOperator::*;
+    Some(match op {
+        LessThan => RelationalOpEncoding {
+            forward_op: Opcode::TestLessThan,
+            swapped_op: Opcode::TestGreaterThan,
+            requires_inversion: false,
+            label: "TestLessThan",
+        },
+        GreaterThan => RelationalOpEncoding {
+            forward_op: Opcode::TestGreaterThan,
+            swapped_op: Opcode::TestLessThan,
+            requires_inversion: false,
+            label: "TestGreaterThan",
+        },
+        LessEqualThan => RelationalOpEncoding {
+            forward_op: Opcode::TestLessThanOrEqual,
+            swapped_op: Opcode::TestGreaterThanOrEqual,
+            requires_inversion: false,
+            label: "TestLessThanOrEqual",
+        },
+        GreaterEqualThan => RelationalOpEncoding {
+            forward_op: Opcode::TestGreaterThanOrEqual,
+            swapped_op: Opcode::TestLessThanOrEqual,
+            requires_inversion: false,
+            label: "TestGreaterThanOrEqual",
+        },
+        StrictEquality => RelationalOpEncoding {
+            forward_op: Opcode::TestEqualStrict,
+            swapped_op: Opcode::TestEqualStrict,
+            requires_inversion: false,
+            label: "TestEqualStrict",
+        },
+        StrictInequality => RelationalOpEncoding {
+            forward_op: Opcode::TestEqualStrict,
+            swapped_op: Opcode::TestEqualStrict,
+            requires_inversion: true,
+            label: "TestEqualStrict",
+        },
+        _ => return None,
+    })
+}
+
+/// Lowers a relational binary expression. The dispatcher's `Test*`
+/// opcodes encode `acc <op> reg`, so one operand must reach a
+/// register and the other must reach the accumulator. Literal-on-RHS
+/// patterns auto-swap to literal-on-LHS form using the `swapped_op`
+/// from [`relational_op_encoding`]; two-literal comparisons reject
+/// because neither side reaches a register without a scratch slot.
+fn lower_relational_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &BinaryExpression<'_>,
+    encoding: RelationalOpEncoding,
+) -> Result<(), SourceLoweringError> {
+    // Direction:
+    //   Forward — LHS lowers to acc, RHS is an identifier whose slot
+    //              becomes the register operand.
+    //   Swap    — RHS literal lowers to acc, LHS identifier becomes
+    //              the register operand. Uses `swapped_op` so the
+    //              comparison direction is preserved (`n < 5` ≡
+    //              `5 > n`).
+    enum Direction<'a> {
+        Forward {
+            rhs_ident: &'a oxc_ast::ast::IdentifierReference<'a>,
+        },
+        Swap {
+            rhs_literal: &'a NumericLiteral<'a>,
+            lhs_ident: &'a oxc_ast::ast::IdentifierReference<'a>,
+        },
+    }
+
+    let direction = match (&expr.left, &expr.right) {
+        // identifier OP identifier — Forward
+        (Expression::Identifier(_), Expression::Identifier(rhs)) => {
+            Direction::Forward { rhs_ident: rhs }
+        }
+        // literal OP identifier — Forward
+        (Expression::NumericLiteral(_), Expression::Identifier(rhs)) => {
+            Direction::Forward { rhs_ident: rhs }
+        }
+        // identifier OP literal — Swap
+        (Expression::Identifier(lhs), Expression::NumericLiteral(rhs)) => Direction::Swap {
+            rhs_literal: rhs,
+            lhs_ident: lhs,
+        },
+        // Anything else (literal-literal, paren, nested binary, …) —
+        // a future milestone with scratch slots can extend this.
+        _ => {
+            return Err(SourceLoweringError::unsupported(
+                "relational_needs_register_operand",
+                expr.span,
+            ));
+        }
     };
 
-    // LHS must evaluate into the accumulator. Only identifier /
-    // int32-safe literal / parenthesised variants of those are allowed
-    // — nested binary expressions require a scratch slot we don't
-    // allocate yet.
-    lower_accumulator_operand(builder, ctx, &expr.left)?;
-    apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)
+    match direction {
+        Direction::Forward { rhs_ident } => {
+            lower_accumulator_operand(builder, ctx, &expr.left)?;
+            let binding = ctx
+                .resolve_identifier(rhs_ident.name.as_str())
+                .ok_or_else(|| {
+                    SourceLoweringError::unsupported("unbound_identifier", rhs_ident.span)
+                })?;
+            emit_identifier_as_reg_operand(
+                builder,
+                encoding.forward_op,
+                encoding.label,
+                binding,
+                rhs_ident.span,
+            )?;
+        }
+        Direction::Swap {
+            rhs_literal,
+            lhs_ident,
+        } => {
+            let value = int32_from_literal(rhs_literal)?;
+            builder
+                .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}")))?;
+            let binding = ctx
+                .resolve_identifier(lhs_ident.name.as_str())
+                .ok_or_else(|| {
+                    SourceLoweringError::unsupported("unbound_identifier", lhs_ident.span)
+                })?;
+            emit_identifier_as_reg_operand(
+                builder,
+                encoding.swapped_op,
+                encoding.label,
+                binding,
+                lhs_ident.span,
+            )?;
+        }
+    }
+
+    if encoding.requires_inversion {
+        builder
+            .emit(Opcode::LogicalNot, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode LogicalNot: {err:?}")))?;
+    }
+
+    Ok(())
+}
+
+/// Emits an opcode that takes an identifier-bound register as its
+/// sole operand (e.g. `Add r_n`, `TestLessThan r_n`). Performs the
+/// shared TDZ check on the binding so callers don't have to repeat
+/// the match. Used by [`lower_identifier_as_reg_rhs`] (arithmetic
+/// RHS) and [`lower_relational_expression`] (relational comparand).
+fn emit_identifier_as_reg_operand(
+    builder: &mut BytecodeBuilder,
+    opcode: Opcode,
+    label: &'static str,
+    binding: BindingRef,
+    ident_span: Span,
+) -> Result<(), SourceLoweringError> {
+    let reg = match binding {
+        BindingRef::Param { reg } => reg,
+        BindingRef::Local {
+            reg,
+            initialized: true,
+            ..
+        } => reg,
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                ident_span,
+            ));
+        }
+    };
+    builder
+        .emit(opcode, &[Operand::Reg(u32::from(reg))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode {label}: {err:?}")))?;
+    Ok(())
 }
 
 /// Applies a binary operation whose LHS is already in the accumulator.

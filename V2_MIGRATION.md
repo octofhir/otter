@@ -20,7 +20,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
 | M0       | Retire v1 pipeline, delete legacy tests, canonicalize v2 naming, scaffold empty `ModuleCompiler`, wire CLI.                    | [x]    | eeb84c8 |
-| M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [x]    | _pending_ |
+| M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [x]    | 377ddd2 |
 | M2       | JIT stencil disassembly sanity + M1 microbenchmark.                                                                             | [ ]    |        |
 | M3       | Remaining int32 binary ops: `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`.                                                         | [ ]    |        |
 | M4       | Local `let`/`const` with initializer.                                                                                          | [ ]    |        |

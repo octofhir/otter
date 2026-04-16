@@ -6,7 +6,7 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M6)
+//! # Current state (M7)
 //!
 //! The compiler accepts a **single** top-level `FunctionDeclaration`
 //! and lowers a narrow slice of its body. Supported surface:
@@ -19,15 +19,19 @@
 //! - Body: a `BlockStatement` whose last statement is a
 //!   `ReturnStatement`. Earlier statements may be any mix of
 //!   `let`/`const` declarations (top-level only — no block scoping at
-//!   M6), assignment statements (`x = …;`, `x += …;`, …), `if` /
-//!   `if`-`else` statements, nested `BlockStatement`s, and inline
-//!   `return` statements (e.g. early returns inside an `if`). The
-//!   trailing `return` is required even when every reachable path
-//!   already returns — reachability analysis lands later.
-//! - Inside an `if` branch: only assignment statements, nested `if`
-//!   statements, `return` statements, and nested blocks of the same.
-//!   `let`/`const` inside an `if` branch is rejected as
-//!   `nested_variable_declaration` until block scoping lands.
+//!   M7), assignment statements (`x = …;`, `x += …;`, …), `if` /
+//!   `if`-`else` statements, `while` loops, nested `BlockStatement`s,
+//!   and inline `return` statements (e.g. early returns inside a
+//!   branch). The trailing `return` is required even when every
+//!   reachable path already returns — reachability analysis lands
+//!   later.
+//! - `let`/`const` accept multiple declarators in one statement
+//!   (`let s = 0, i = 0;`), each with its own slot allocation.
+//! - Inside an `if` branch or a `while` body: only assignment
+//!   statements, nested `if` statements, `while` statements, `return`
+//!   statements, and nested blocks of the same. `let`/`const` inside
+//!   any nested block is rejected as `nested_variable_declaration`
+//!   until block scoping lands.
 //! - Assignment: `AssignmentExpression` whose target is a plain
 //!   identifier referencing an in-scope `let`. Supported operators are
 //!   `=`, `+=`, `-=`, `*=`, `|=`. Assignment to a `const`, to a
@@ -415,6 +419,7 @@ fn lower_nested_statement<'a>(
             }
         }
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
+        Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ReturnStatement(ret) => {
             let argument = ret.argument.as_ref().ok_or_else(|| {
                 SourceLoweringError::unsupported("return_without_value", ret.span)
@@ -504,6 +509,58 @@ fn lower_if_statement<'a>(
             .bind_label(else_label)
             .map_err(|err| SourceLoweringError::Internal(format!("bind else label: {err:?}")))?;
     }
+
+    Ok(())
+}
+
+/// Lowers a `while (test) body` statement. Bytecode shape:
+///
+/// ```text
+/// loop_header:
+///   <lower test>
+///   JumpIfToBooleanFalse loop_exit
+///   <lower body>
+///   Jump loop_header
+/// loop_exit:
+/// ```
+///
+/// The `Jump loop_header` at the bottom is a backward branch — the
+/// dispatcher's tier-up budget decrements on every backward jump, so
+/// the loop body accrues hotness exactly the way the JIT expects.
+/// `break` and `continue` are not yet supported: a future milestone
+/// will add label tracking + jump-stack plumbing for those (and for
+/// labelled loops). The body is lowered via [`lower_nested_statement`]
+/// so it can contain assignments, nested `if`/`while`, blocks, and
+/// inline `return`s — but no `let`/`const` (block scoping lands later).
+fn lower_while_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    while_stmt: &'a oxc_ast::ast::WhileStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    let loop_header = builder.new_label();
+    let loop_exit = builder.new_label();
+
+    builder
+        .bind_label(loop_header)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind loop header: {err:?}")))?;
+
+    lower_return_expression(builder, ctx, &while_stmt.test)?;
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanFalse, loop_exit)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse: {err:?}"))
+        })?;
+
+    lower_nested_statement(builder, ctx, &while_stmt.body)?;
+
+    builder
+        .emit_jump_to(Opcode::Jump, loop_header)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Jump (loop back): {err:?}"))
+        })?;
+    builder
+        .bind_label(loop_exit)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind loop exit: {err:?}")))?;
 
     Ok(())
 }
@@ -692,23 +749,22 @@ fn lower_let_const_declaration<'a>(
         }
     };
 
-    let declarator = match decl.declarations.as_slice() {
-        [single] => single,
-        [] => {
-            return Err(SourceLoweringError::unsupported(
-                "empty_variable_declaration",
-                decl.span,
-            ));
-        }
-        [_first, second, ..] => {
-            return Err(SourceLoweringError::unsupported(
-                "multi_declarator",
-                second.span,
-            ));
-        }
-    };
+    if decl.declarations.is_empty() {
+        return Err(SourceLoweringError::unsupported(
+            "empty_variable_declaration",
+            decl.span,
+        ));
+    }
 
-    lower_single_declarator(builder, ctx, declarator, is_const)
+    // Lower each declarator left-to-right. M7 lifted the
+    // "single declarator only" restriction so the bench2 shape
+    // `let s = 0, i = 0;` (two declarators) compiles directly. Each
+    // declarator allocates its own slot and runs through the same
+    // single-declarator path the M4 lowering already had.
+    for declarator in decl.declarations.iter() {
+        lower_single_declarator(builder, ctx, declarator, is_const)?;
+    }
+    Ok(())
 }
 
 fn lower_single_declarator<'a>(
@@ -1361,33 +1417,22 @@ fn assignment_operator_tag(op: AssignmentOperator) -> &'static str {
     }
 }
 
+/// Lowers an expression into the accumulator. This is the same
+/// surface as [`lower_return_expression`] — the helper exists as an
+/// alias kept for the binary/relational-LHS call sites so future
+/// readers see "the LHS lowers via the standard expression path"
+/// rather than chasing through `lower_return_expression`.
+///
+/// Accepting binary and assignment expressions on the LHS unlocks
+/// the bench2 idiom `(s + i) | 0`: the parenthesised binary lowers
+/// into acc cleanly (binary operations always produce their result
+/// in acc), and the outer `| 0` then operates against that acc.
 fn lower_accumulator_operand(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
     expr: &Expression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    match expr {
-        Expression::Identifier(ident) => {
-            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
-                SourceLoweringError::unsupported("unbound_identifier", ident.span)
-            })?;
-            lower_identifier_read(builder, binding, ident.span)
-        }
-        Expression::NumericLiteral(literal) => {
-            let value = int32_from_literal(literal)?;
-            builder
-                .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}")))?;
-            Ok(())
-        }
-        Expression::ParenthesizedExpression(inner) => {
-            lower_accumulator_operand(builder, ctx, &inner.expression)
-        }
-        other => Err(SourceLoweringError::unsupported(
-            expression_construct_tag(other),
-            other.span(),
-        )),
-    }
+    lower_return_expression(builder, ctx, expr)
 }
 
 /// Convert a parsed `NumericLiteral` into an int32. Rejects fractional

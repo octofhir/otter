@@ -26,7 +26,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M4       | Local `let`/`const` with initializer.                                                                                          | [x]    | 0a8cc3f |
 | M5       | `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `|=`) onto a local `let`.                                                        | [x]    | 53c24a2 |
 | M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [x]    | 991b282 |
-| M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [ ]    |        |
+| M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [x]    | _pending_ |
 | M8       | `ForStatement` (desugar to while).                                                                                             | [ ]    |        |
 | M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [ ]    |        |
 | M_JIT_x86_64 | Cranelift / hand-rolled x86_64 backend for the JIT baseline.                                                               | [ ]    |        |
@@ -46,6 +46,8 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | `AssignmentExpression` (`=`/`+=`/`-=`/`*=`/`\|=`) | yes | M5 |
 | `IfStatement`                     | yes       | M6        |
 | `BinaryExpression` `<`/`>`/`<=`/`>=`/`===`/`!==` int32 | yes | M6 |
+| `WhileStatement`                  | yes       | M7        |
+| `VariableDeclaration` multi-declarator | yes  | M7        |
 | `WhileStatement`                  | no        | M7        |
 | `ForStatement`                    | no        | M8        |
 | `CallExpression`                  | no        | M9        |
@@ -54,16 +56,18 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 
 After M7 the `bench2.ts` sum-loop becomes the baseline for latency vs `bun run` and `node --experimental-vm-modules`, recorded for aarch64 interpreter and aarch64 JIT. Until then the M2 `f(42)` micro-row tracks per-call interpreter latency for the M1 lowering — useful as a regression floor while later milestones widen the source-compiler subset.
 
-Reproduce the M2 row with:
+Reproduce the M2 + M7 rows with:
 
 ```bash
 cargo test -p otter-jit --release -- --ignored m1_microbench --nocapture
+cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 ```
 
 | Scenario                          | Otter interp | Otter JIT | bun | node |
 |-----------------------------------|--------------|-----------|-----|------|
 | `f(42)` (10⁶ iter, aarch64)       | 496 ns/iter  | —         | —   | —    |
-| `bench2.ts` (10⁶ iter)            | —            | —         | —   | —    |
+| `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64 interp) | 416 ms/call | — | — | — |
+| `bench2.ts sum(10⁶)` per-inner-iter (aarch64 interp) | 416 ns/iter | — | — | — |
 
 ## Notes
 

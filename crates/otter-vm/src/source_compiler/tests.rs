@@ -604,19 +604,14 @@ fn uninitialized_let_unsupported() {
 }
 
 #[test]
-fn multiple_declarators_unsupported() {
-    // `let a = 1, b = 2;` packs two declarators into one statement.
-    // M4 rejects until a future milestone teaches the lowering to
-    // process declarator lists in order.
-    let err = compile("function f() { let a = 1, b = 2; return a; }")
-        .expect_err("multi-declarator at M4");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "multi_declarator",
-            ..
-        }
-    ));
+fn multiple_declarators_compose() {
+    // M7 lifted M4's "single declarator only" restriction so the
+    // bench2 shape `let s = 0, i = 0;` compiles directly. Each
+    // declarator allocates its own slot, in source order.
+    assert_eq!(
+        run_int32_function("function f() { let a = 1, b = 2; return a + b; }", &[]),
+        3
+    );
 }
 
 #[test]
@@ -1306,4 +1301,212 @@ fn if_with_return_only_branch_still_requires_trailing_return() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// M7 — WhileStatement + bench2 sum-loop shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn while_loop_sums_zero_to_n() {
+    // The canonical M7 shape from `V2_MIGRATION_PLAN.md`. Closes
+    // bench2.ts: int32 accumulator loop with the `(s + i) | 0`
+    // truncation idiom. Validates the consolidated
+    // `lower_accumulator_operand` accepts a parenthesised binary
+    // LHS (without it, the `(s + i)` half rejects).
+    let src = "function sum(n) {
+        let s = 0, i = 0;
+        while (i < n) {
+            s = (s + i) | 0;
+            i = i + 1;
+        }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[0]), 0);
+    assert_eq!(run_int32_function(src, &[1]), 0);
+    assert_eq!(run_int32_function(src, &[10]), 45);
+    assert_eq!(run_int32_function(src, &[100]), 4950);
+}
+
+#[test]
+fn while_loop_with_compound_assign_increment() {
+    // Mixes `+=` body with a relational test condition.
+    let src = "function f(n) {
+        let i = 0;
+        while (i < n) { i += 1; }
+        return i;
+    }";
+    assert_eq!(run_int32_function(src, &[7]), 7);
+    assert_eq!(run_int32_function(src, &[0]), 0);
+}
+
+#[test]
+fn while_loop_never_enters_when_condition_false() {
+    // n=0 means the condition `i < n` is false from the start —
+    // the body never runs and the JumpIfToBooleanFalse skips
+    // straight to the loop exit on the first pass.
+    let src = "function f(n) {
+        let count = 0;
+        let i = 0;
+        while (i < n) {
+            count = count + 1;
+            i = i + 1;
+        }
+        return count;
+    }";
+    assert_eq!(run_int32_function(src, &[0]), 0);
+    assert_eq!(run_int32_function(src, &[5]), 5);
+}
+
+#[test]
+fn while_loop_inside_if_branch() {
+    // Exercises `lower_nested_statement` recursing through an
+    // `if`'s consequent into a `while` loop. Confirms the
+    // top-statement → nested-statement chain stays intact.
+    let src = "function f(n) {
+        let acc = 0;
+        if (n > 0) {
+            let mode = n;
+            return mode;
+        } else {
+            let i = n;
+            while (i < 0) {
+                acc = acc + 1;
+                i = i + 1;
+            }
+        }
+        return acc;
+    }";
+    // Wait — the if branches have nested `let`s, which M7 still
+    // rejects. Use a simpler shape that keeps the nesting but
+    // doesn't introduce inner declarations.
+    let _ = src;
+    let src = "function f(n) {
+        let acc = 0;
+        let i = 0;
+        if (n > 0) {
+            while (i < n) {
+                acc = acc + i;
+                i = i + 1;
+            }
+        }
+        return acc;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10); // 0+1+2+3+4
+    assert_eq!(run_int32_function(src, &[0]), 0); // n>0 false → skip
+}
+
+#[test]
+fn nested_while_loops() {
+    // Outer counts down, inner sums up `i`. With n=3:
+    //   outer iteration 1: inner sums 0+1+2 = 3; total += 3 → 3
+    //   outer iteration 2: inner sums 0+1+2 = 3; total += 3 → 6
+    //   outer iteration 3: inner sums 0+1+2 = 3; total += 3 → 9
+    let src = "function f(n) {
+        let total = 0;
+        let outer = 0;
+        while (outer < n) {
+            let inner = 0;
+            // ^ would need block scoping; rewrite with reset.
+            return 0;
+        }
+        return total;
+    }";
+    let _ = src;
+    // Rewrite the nested-while test to reuse a top-level local
+    // instead of declaring `inner` per iteration. Same result, no
+    // block scoping required.
+    let src = "function f(n) {
+        let total = 0;
+        let outer = 0;
+        let inner = 0;
+        while (outer < n) {
+            inner = 0;
+            while (inner < n) {
+                total = total + 1;
+                inner = inner + 1;
+            }
+            outer = outer + 1;
+        }
+        return total;
+    }";
+    // n*n iterations of `total += 1`.
+    assert_eq!(run_int32_function(src, &[3]), 9);
+    assert_eq!(run_int32_function(src, &[5]), 25);
+}
+
+#[test]
+fn while_loop_with_early_return_in_body() {
+    // The `return` inside the loop body fires when the condition is
+    // hit; without it, the loop would run to completion and return
+    // the trailing -1.
+    let src = "function f(n) {
+        let i = 0;
+        while (i < 1000) {
+            if (i === n) { return i; }
+            i = i + 1;
+        }
+        return 0;
+    }";
+    assert_eq!(run_int32_function(src, &[42]), 42);
+    assert_eq!(run_int32_function(src, &[0]), 0);
+}
+
+// ---------------------------------------------------------------------------
+// M7 — negative cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_let_inside_while_unsupported() {
+    // Same rejection as `let` inside `if` — block scoping lands
+    // later. Confirms the `lower_nested_statement` path consistently
+    // refuses both.
+    let err = compile("function f(n) { while (n > 0) { let x = 1; n = n - 1; } return n; }")
+        .expect_err("nested let inside while at M7");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "nested_variable_declaration",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn break_statement_unsupported() {
+    // `break` needs a jump-stack to track which loop it exits.
+    // Lands in a future milestone alongside `continue` and labelled
+    // loops.
+    let err = compile(
+        "function f(n) { let i = 0; while (i < n) { if (i === 5) { break; } i = i + 1; } return i; }",
+    )
+    .expect_err("break at M7");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}
+
+#[test]
+fn continue_statement_unsupported() {
+    let err =
+        compile("function f(n) { let i = 0; while (i < n) { i = i + 1; continue; } return i; }")
+            .expect_err("continue at M7");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}
+
+#[test]
+fn do_while_statement_unsupported() {
+    // `do { … } while (test)` is structurally distinct (test runs
+    // *after* the body) and isn't on the M7 plan.
+    let err = compile("function f(n) { let i = 0; do { i = i + 1; } while (i < n); return i; }")
+        .expect_err("do-while at M7");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}
+
+#[test]
+fn for_statement_unsupported() {
+    // `for` lands in M8 (desugared via while + init + update).
+    let err = compile(
+        "function f(n) { let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; }",
+    )
+    .expect_err("for at M8");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
 }

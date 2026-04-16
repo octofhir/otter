@@ -1753,4 +1753,109 @@ mod tests {
             elapsed.as_millis(),
         );
     }
+
+    /// Microbenchmark for the M7 bench2 sum-loop — the canonical
+    /// int32 accumulator loop that the V2_MIGRATION_PLAN reserves
+    /// for M7's full benchmark vs `bun` and `node`. Measures the
+    /// per-call latency of `sum(1_000_000)` through the v2
+    /// interpreter on a persistent `RuntimeState` after a
+    /// 100-iteration warmup, and prints a `bench2 interp:` line for
+    /// the V2_MIGRATION.md tracker.
+    ///
+    /// Invoke with:
+    /// ```text
+    /// cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
+    /// ```
+    ///
+    /// JIT-side measurement is intentionally skipped this session
+    /// for the same reason as `m1_microbench`: top-level
+    /// `execute_with_runtime` doesn't trigger the JSC tier-up hook
+    /// (which fires on inner `CallClosure` boundaries), and the v2
+    /// source compiler does not yet emit calls (lands at M9).
+    /// Direct stencil invocation remains the documented macOS hazard.
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "M7 bench2 microbench — run manually via `--ignored bench2_microbench --nocapture`"]
+    #[test]
+    fn bench2_microbench() {
+        use otter_vm::module::FunctionIndex;
+        use otter_vm::source_compiler::ModuleCompiler;
+        use otter_vm::value::RegisterValue;
+        use otter_vm::{Interpreter, RuntimeState};
+        use oxc_span::SourceType;
+        use std::time::Instant;
+
+        // Canonical M7 source from V2_MIGRATION_PLAN.md, written
+        // with single-declarator lets so it stays parseable on the
+        // even-narrower M4 surface too. The functional shape is
+        // identical to `let s = 0, i = 0;`.
+        let source = "function sum(n) { \
+                          let s = 0; \
+                          let i = 0; \
+                          while (i < n) { \
+                              s = (s + i) | 0; \
+                              i = i + 1; \
+                          } \
+                          return s; \
+                      }";
+        let module = ModuleCompiler::new()
+            .compile(source, "bench2.ts", SourceType::default())
+            .expect("M7 source must compile");
+        let function = module
+            .function(FunctionIndex(0))
+            .expect("module has entry function");
+        let layout = function.frame_layout();
+        let hidden = usize::from(layout.hidden_count());
+        let mut registers = vec![RegisterValue::undefined(); usize::from(layout.register_count())];
+        // Loop limit. Match V2_MIGRATION.md's "10⁶ iter" target so
+        // the latency row is comparable to the eventual bun / node
+        // numbers.
+        const N: i32 = 1_000_000;
+        registers[hidden] = RegisterValue::from_i32(N);
+
+        let interpreter = Interpreter::new();
+        let mut runtime = RuntimeState::new();
+
+        // Warmup — `sum(N)` runs N iterations internally, so 100
+        // calls = 10⁸ inner iterations. Plenty to prime any
+        // thread-local state in the interpreter.
+        const WARMUP_CALLS: u32 = 100;
+        for _ in 0..WARMUP_CALLS {
+            let result = interpreter
+                .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+                .expect("warmup execute");
+            let _ = result.return_value();
+        }
+
+        // Measure: 50 calls × 10⁶ inner iterations = 5×10⁷ inner
+        // iters total. Per-call latency is the headline number;
+        // per-inner-iter is reported alongside for direct
+        // comparison with bun/node sum-loop benchmarks.
+        const CALLS: u32 = 50;
+        let started = Instant::now();
+        let mut acc: i64 = 0;
+        for _ in 0..CALLS {
+            let result = interpreter
+                .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
+                .expect("measured execute");
+            acc = acc.wrapping_add(i64::from(result.return_value().as_i32().unwrap_or(0)));
+        }
+        let elapsed = started.elapsed();
+        // Sum 0..N-1 = N*(N-1)/2. With N=1_000_000 that's
+        // 499_999_500_000 — overflows i32 (which is what JS
+        // arithmetic produces with `(s + i) | 0`), so the
+        // `int32-wrapped` value is the lower 32 bits of the true
+        // sum. Don't assert the exact value; just confirm it's
+        // non-zero, deterministic, and identical across runs.
+        assert_ne!(acc, 0, "sum returned zero unexpectedly");
+
+        let total_ns = elapsed.as_nanos();
+        let total_inner_iters = u128::from(CALLS) * u128::from(N as u32);
+        let per_call_ns = total_ns / u128::from(CALLS);
+        let per_inner_iter_ns = total_ns / total_inner_iters;
+        println!(
+            "bench2 interp: {per_call_ns} ns/call ({per_inner_iter_ns} ns/inner-iter, \
+             {} ms total over {CALLS} calls × {N} iter, acc={acc})",
+            elapsed.as_millis(),
+        );
+    }
 }

@@ -25,7 +25,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M3       | Remaining int32 binary ops: `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`.                                                         | [x]    | 62c2760 |
 | M4       | Local `let`/`const` with initializer.                                                                                          | [x]    | 0a8cc3f |
 | M5       | `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `|=`) onto a local `let`.                                                        | [x]    | 53c24a2 |
-| M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [x]    | _pending_ |
+| M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [x]    | 991b282 |
 | M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [ ]    |        |
 | M8       | `ForStatement` (desugar to while).                                                                                             | [ ]    |        |
 | M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [ ]    |        |

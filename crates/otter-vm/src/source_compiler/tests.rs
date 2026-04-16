@@ -229,16 +229,32 @@ fn unbound_identifier_unsupported() {
 }
 
 #[test]
-fn multi_statement_body_unsupported() {
-    let err = compile("function f() { let x = 1; return x; }").expect_err("locals at M4");
-    // The body has two statements; `lower_function_body` catches the
-    // second one before looking at either. Once M4 admits `let`, the
-    // `multi_statement_body` arm will be removed and the first
-    // statement's own tag will surface.
+fn statement_after_return_unsupported() {
+    // M4 allows leading `let`/`const` then exactly one trailing return.
+    // Anything *after* the return is dead code and surfaces as
+    // `Unsupported { construct: "statement_after_return" }` until the
+    // compiler grows real reachability analysis.
+    let err = compile("function f() { return 1; let x = 2; }").expect_err("dead code after return");
     assert!(matches!(
         err,
         SourceLoweringError::Unsupported {
-            construct: "multi_statement_body",
+            construct: "statement_after_return",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn missing_return_unsupported() {
+    // M4 keeps M1's "exactly one return required" invariant — the v2
+    // dispatcher relies on every function path ending at a `Return`
+    // for the tier-up call exit. Falling off the end of the body is
+    // valid JS (returns undefined) but not yet wired here.
+    let err = compile("function f() { let x = 1; }").expect_err("body without return");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "missing_return",
             ..
         }
     ));
@@ -481,6 +497,230 @@ fn wide_subsmi_literal_is_unsupported() {
         err,
         SourceLoweringError::Unsupported {
             construct: "wide_integer_literal_on_rhs",
+            ..
+        }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// M4 — local `let`/`const` with initializer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn let_with_int_literal_initializer_returns_value() {
+    // Body: `let x = 7; return x;` — slot 1 holds `x` (after the
+    // hidden receiver + zero parameters); bytecode is `LdaSmi 7 /
+    // Star r0 / Ldar r0 / Return`. Note local-slot indexing is
+    // user-visible: with 0 params + 1 local, the local is at user
+    // register 0.
+    assert_eq!(
+        run_int32_function("function f() { let x = 7; return x; }", &[]),
+        7
+    );
+}
+
+#[test]
+fn const_with_int_literal_initializer_returns_value() {
+    // `const` shares M4's lowering path with `let` (no
+    // AssignmentExpression yet → `const` reassignment can't even be
+    // expressed; the reassignment-rejection guard is M5+).
+    assert_eq!(
+        run_int32_function("function g() { const k = 9; return k; }", &[]),
+        9
+    );
+}
+
+#[test]
+fn let_initialized_from_param_arithmetic() {
+    // `let x = n + 1; return x;` — slot layout is
+    // `[hidden | n | x]`, so `Ldar r0 / AddSmi 1 / Star r1 /
+    // Ldar r1 / Return`. Confirms the parameter is reachable from the
+    // initializer and the local lands one slot beyond the param.
+    assert_eq!(
+        run_int32_function("function f(n) { let x = n + 1; return x; }", &[42]),
+        43
+    );
+}
+
+#[test]
+fn two_lets_compose() {
+    // Both bindings live for the whole body; the second initializer
+    // reads the first.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = n + 1; let y = x * 2; return y; }",
+            &[10]
+        ),
+        22
+    );
+}
+
+#[test]
+fn let_returning_self_uses_local_slot() {
+    // Confirms the return path picks up the local (via `Ldar r0`)
+    // rather than re-reading the original initializer expression.
+    assert_eq!(
+        run_int32_function("function f() { let v = 100; return v; }", &[]),
+        100
+    );
+}
+
+#[test]
+fn let_initializer_can_combine_param_and_local() {
+    // `let acc = n; let acc2 = acc | 1; return acc2;` — exercises the
+    // BitOr Reg-form against a local slot.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let acc = n; let acc2 = acc | 1; return acc2; }",
+            &[4]
+        ),
+        5
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4 — negative cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn var_declaration_unsupported() {
+    // `var` has hoisting + function-scope semantics distinct from
+    // `let`/`const`. M4 keeps it rejected so we don't accidentally
+    // alias the two surfaces.
+    let err =
+        compile("function f() { var x = 1; return x; }").expect_err("var has different scope");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "var_declaration",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn uninitialized_let_unsupported() {
+    // M4 demands an initializer on every binding — bare `let x;` is
+    // rejected; the `let x = undefined;` workaround would also fail
+    // because `undefined` is `Identifier("undefined")` which isn't in
+    // scope.
+    let err = compile("function f() { let x; return 1; }").expect_err("let without init at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "uninitialized_binding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn multiple_declarators_unsupported() {
+    // `let a = 1, b = 2;` packs two declarators into one statement.
+    // M4 rejects until a future milestone teaches the lowering to
+    // process declarator lists in order.
+    let err = compile("function f() { let a = 1, b = 2; return a; }")
+        .expect_err("multi-declarator at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "multi_declarator",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn destructuring_binding_unsupported() {
+    let err =
+        compile("function f() { let [x] = [1]; return x; }").expect_err("destructuring later");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "destructuring_binding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn duplicate_local_binding_unsupported() {
+    // Two `let`s with the same name within one body. JS would throw
+    // SyntaxError (re-declaration); M4 surfaces the same intent at
+    // compile time.
+    let err = compile("function f() { let x = 1; let x = 2; return x; }")
+        .expect_err("duplicate local at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "duplicate_binding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn local_shadowing_param_unsupported() {
+    // Same name as the parameter — `function f(n) { let n = 1; ...}`
+    // is a SyntaxError in real JS too.
+    let err =
+        compile("function f(n) { let n = 2; return n; }").expect_err("local shadows param at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "duplicate_binding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn tdz_self_reference_in_initializer_unsupported() {
+    // `let x = x + 1;` — the binding for `x` is in scope from
+    // declaration, but reading it inside its own initializer hits
+    // the M4 compile-time TDZ check. Spec semantics throw a
+    // ReferenceError at runtime; M4 surfaces it earlier so the
+    // bytecode never even executes.
+    let err =
+        compile("function f() { let x = x + 1; return x; }").expect_err("TDZ self-reference at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "tdz_self_reference",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn tdz_self_reference_in_initializer_via_binary_rhs_unsupported() {
+    // `let x = 1 + x;` — same TDZ issue, surfaced via the Reg-form
+    // RHS path (`lower_identifier_as_reg_rhs`). Wait — `1 + x`
+    // doesn't quite work because `1` is a literal LHS so the path is
+    // `LdaSmi 1; Add r_x`. The Reg-RHS path checks initialization
+    // and rejects.
+    let err =
+        compile("function f() { let x = 1 + x; return x; }").expect_err("TDZ via binary RHS at M4");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "tdz_self_reference",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn fractional_initializer_unsupported() {
+    // Same `non_int32_literal` rejection as the M1 return path —
+    // the lowering reuses `lower_return_expression` for the init
+    // expression, so fractional literals fail there.
+    let err =
+        compile("function f() { let x = 1.5; return x; }").expect_err("non-int32 literal in init");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "non_int32_literal",
             ..
         }
     ));

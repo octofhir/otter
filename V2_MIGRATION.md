@@ -23,7 +23,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M1       | `function f(n) { return n + 1 }` end-to-end: Identifier, int32 NumericLiteral, `+` with `AddSmi`/`Add`.                         | [x]    | 377ddd2 |
 | M2       | JIT stencil disassembly sanity + M1 microbenchmark.                                                                             | [x]    | c11e064 |
 | M3       | Remaining int32 binary ops: `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`.                                                         | [x]    | 62c2760 |
-| M4       | Local `let`/`const` with initializer.                                                                                          | [ ]    |        |
+| M4       | Local `let`/`const` with initializer.                                                                                          | [x]    | _pending_ |
 | M5       | `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `|=`) onto a local `let`.                                                        | [ ]    |        |
 | M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [ ]    |        |
 | M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [ ]    |        |
@@ -42,7 +42,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | `NumericLiteral` (int32-safe)     | yes       | M1        |
 | `BinaryExpression` `+` int32      | yes       | M1        |
 | `BinaryExpression` `-`/`*`/`\|`/`&`/`^`/`<<`/`>>`/`>>>` int32 | yes | M3        |
-| `VariableDeclaration` `let/const` | no        | M4        |
+| `VariableDeclaration` `let/const` | yes       | M4        |
 | `AssignmentExpression`            | no        | M5        |
 | `IfStatement`                     | no        | M6        |
 | `WhileStatement`                  | no        | M7        |

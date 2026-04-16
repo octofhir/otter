@@ -6,7 +6,7 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M3)
+//! # Current state (M4)
 //!
 //! The compiler accepts a **single** top-level `FunctionDeclaration`
 //! and lowers a narrow slice of its body. Supported surface:
@@ -16,9 +16,14 @@
 //! - Function: named (Identifier), not async, not a generator, 0 or 1
 //!   parameters. The parameter must be a plain identifier — no
 //!   destructuring, no default, no rest, no type annotation.
-//! - Body: a `BlockStatement` with exactly one `ReturnStatement`.
+//! - Body: a `BlockStatement` containing zero or more `let`/`const`
+//!   declarations followed by exactly one `ReturnStatement`. Each
+//!   `let`/`const` must have a single declarator with a non-empty
+//!   initializer and a plain `BindingIdentifier` target. `var`,
+//!   destructuring patterns, and bare `let x;` (no init) are all
+//!   rejected.
 //! - Return expression: one of
-//!   - `Identifier` (must reference the declared parameter);
+//!   - `Identifier` (parameter or in-scope `let`/`const`);
 //!   - int32-safe `NumericLiteral` (integral, in `i32` range);
 //!   - `BinaryExpression` with one of the int32 binary operators
 //!     `+`, `-`, `*`, `|`, `&`, `^`, `<<`, `>>`, `>>>`, where each
@@ -27,7 +32,22 @@
 //!     `&`, `<<`, `>>`) take the `*Smi imm` fast path when the RHS is
 //!     an `i8`-fit literal; the bitwise XOR (`^`) and unsigned right
 //!     shift (`>>>`) have no Smi opcode, so a literal RHS would need
-//!     a scratch slot the M3 frame layout does not yet allocate.
+//!     a scratch slot the M4 frame layout does not yet allocate.
+//!
+//! ## TDZ at M4
+//!
+//! M4 enforces the temporal dead zone **at compile time**: a `let`/
+//! `const` binding becomes readable only after its own initializer is
+//! lowered. Reading the binding inside its own initializer (`let x =
+//! x + 1`) surfaces as `Unsupported { construct: "tdz_self_reference" }`
+//! rather than executing and producing a runtime ReferenceError. This
+//! is sufficient because M4 has no `AssignmentExpression` (M5), no
+//! control flow (M6+), and no closures (M10+) — all the cases where
+//! the compiler can't statically prove "the binding has been
+//! initialized by the time we read it" land in later milestones, at
+//! which point the lowering can switch to V8's pattern of
+//! `LdaTheHole; Star r_x` at scope entry plus `AssertNotHole` after
+//! every read.
 //!
 //! Anything outside that shape surfaces as a
 //! [`SourceLoweringError::Unsupported`] with a `construct: &'static
@@ -61,6 +81,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BinaryExpression, BinaryOperator, BindingPattern, Expression, FormalParameter,
     FormalParameters, Function, FunctionBody, NumericLiteral, Program, Statement,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -220,15 +241,19 @@ fn lower_function_declaration(func: &Function<'_>) -> Result<VmFunction, SourceL
         .as_ref()
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
 
-    // FrameLayout: 1 hidden slot for `this`, plus `param_count` parameter
-    // slots, zero locals / temporaries at M1. The v2 interpreter maps
+    // Lower the body first so we know the final `let`/`const` count;
+    // FrameLayout needs that up front because slot indices are stable
+    // across the function's lifetime.
+    let (bytecode, local_count) = lower_function_body(body, &func.params, param_count)?;
+
+    // FrameLayout: 1 hidden slot for `this`, then `param_count`
+    // parameter slots, then `local_count` `let`/`const` slots, then 0
+    // temporaries (M5+ owns scratch). The v2 interpreter maps
     // `Ldar r0` through `FrameLayout::resolve_user_visible(0)`, which
     // points at the first parameter (absolute index 1), so parameter
-    // access stays symmetric with v1's register semantics.
-    let layout = FrameLayout::new(1, param_count, 0, 0)
+    // and local access stays symmetric with v1's register semantics.
+    let layout = FrameLayout::new(1, param_count, local_count, 0)
         .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
-
-    let bytecode = lower_function_body(body, &func.params)?;
 
     Ok(VmFunction::with_empty_tables(Some(name), layout, bytecode).with_strict(func.id.is_some()))
 }
@@ -271,59 +296,109 @@ fn validate_simple_param(param: &FormalParameter<'_>) -> Result<(), SourceLoweri
     Ok(())
 }
 
-fn lower_function_body(
-    body: &FunctionBody<'_>,
-    params: &FormalParameters<'_>,
-) -> Result<Bytecode, SourceLoweringError> {
+fn lower_function_body<'a>(
+    body: &'a FunctionBody<'a>,
+    params: &'a FormalParameters<'a>,
+    param_count: RegisterIndex,
+) -> Result<(Bytecode, RegisterIndex), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "directive_prologue",
             body.directives[0].span,
         ));
     }
-    let only = match body.statements.as_slice() {
-        [single] => single,
-        [] => return Err(SourceLoweringError::unsupported("empty_body", body.span)),
-        [_first, second, ..] => {
-            return Err(SourceLoweringError::unsupported(
-                "multi_statement_body",
-                second.span(),
-            ));
-        }
-    };
-    let ret = match only {
-        Statement::ReturnStatement(ret) => ret,
-        other => {
-            return Err(SourceLoweringError::unsupported(
-                statement_construct_tag(other),
-                other.span(),
-            ));
-        }
-    };
-    let argument = ret
-        .argument
-        .as_ref()
-        .ok_or_else(|| SourceLoweringError::unsupported("return_without_value", ret.span))?;
 
     let mut builder = BytecodeBuilder::new();
-    let ctx = LoweringContext::new(params);
-    lower_return_expression(&mut builder, &ctx, argument)?;
-    builder
-        .emit(Opcode::Return, &[])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
-    builder
+    let mut ctx = LoweringContext::new(params, param_count);
+
+    // Walk the body. Anything before the closing `return` must be a
+    // `let`/`const` declaration; the body must end with exactly one
+    // `return`. Bare returns and missing returns are both rejected so
+    // the bytecode shape stays one-`Return` (the v2 dispatcher relies
+    // on it for tier-up call exits).
+    let mut return_seen = false;
+    for stmt in body.statements.iter() {
+        if return_seen {
+            return Err(SourceLoweringError::unsupported(
+                "statement_after_return",
+                stmt.span(),
+            ));
+        }
+        match stmt {
+            Statement::VariableDeclaration(decl) => {
+                lower_let_const_declaration(&mut builder, &mut ctx, decl)?;
+            }
+            Statement::ReturnStatement(ret) => {
+                let argument = ret.argument.as_ref().ok_or_else(|| {
+                    SourceLoweringError::unsupported("return_without_value", ret.span)
+                })?;
+                lower_return_expression(&mut builder, &ctx, argument)?;
+                builder.emit(Opcode::Return, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Return: {err:?}"))
+                })?;
+                return_seen = true;
+            }
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    statement_construct_tag(other),
+                    other.span(),
+                ));
+            }
+        }
+    }
+
+    if !return_seen {
+        return Err(SourceLoweringError::unsupported(
+            "missing_return",
+            body.span,
+        ));
+    }
+
+    let bytecode = builder
         .finish()
-        .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))
+        .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
+
+    Ok((bytecode, ctx.local_count()))
 }
 
-/// Per-function lowering context: enough to resolve a parameter
-/// identifier into a user-visible register index.
+/// Resolved binding for a JS identifier reference. Mirrors the
+/// `[hidden | params | locals]` frame layout: `Param.reg` is the
+/// user-visible register index of the parameter (0 for the sole M4
+/// parameter), `Local.reg` is the user-visible index of the
+/// `let`/`const` slot. `initialized: false` flags a binding whose
+/// own initializer is currently being lowered — reading it would be
+/// a TDZ self-reference and is rejected at compile time.
+#[derive(Debug, Clone, Copy)]
+enum BindingRef {
+    Param { reg: u16 },
+    Local { reg: u16, initialized: bool },
+}
+
+/// In-scope `let`/`const` binding. The slot is assigned at allocation
+/// time and stays stable for the binding's whole lifetime (M4 has no
+/// shadowing or block scopes — those land with `IfStatement` /
+/// `WhileStatement` in M6 / M7). `initialized` flips to `true` after
+/// `Star r_slot` runs the post-init assignment.
+#[derive(Debug)]
+struct LocalBinding<'a> {
+    name: &'a str,
+    slot: u16,
+    initialized: bool,
+}
+
+/// Per-function lowering context: tracks the sole parameter (if any)
+/// plus every `let`/`const` declared so far, with their assigned
+/// register slots and TDZ state.
 struct LoweringContext<'a> {
     param_name: Option<&'a str>,
+    /// Number of parameter slots in the frame, used to compute the
+    /// next local slot index (`param_count + locals.len()`).
+    param_count: u16,
+    locals: Vec<LocalBinding<'a>>,
 }
 
 impl<'a> LoweringContext<'a> {
-    fn new(params: &'a FormalParameters<'a>) -> Self {
+    fn new(params: &'a FormalParameters<'a>, param_count: RegisterIndex) -> Self {
         let param_name = match params.items.as_slice() {
             [single] => match &single.pattern {
                 BindingPattern::BindingIdentifier(ident) => Some(ident.name.as_str()),
@@ -331,18 +406,236 @@ impl<'a> LoweringContext<'a> {
             },
             _ => None,
         };
-        Self { param_name }
+        Self {
+            param_name,
+            param_count,
+            locals: Vec::new(),
+        }
     }
 
-    /// Resolves a JS identifier reference into a bytecode-visible
-    /// register. At M1 only the sole parameter is accessible; globals,
-    /// closures, and locals land in later milestones.
-    fn resolve_identifier(&self, name: &str) -> Option<u16> {
+    /// Number of `let`/`const` slots allocated so far. Caps at
+    /// `RegisterIndex::MAX` defensively — the M4 source compiler is
+    /// nowhere near that limit, but the cast keeps `local_count()`
+    /// total for the FrameLayout call site.
+    fn local_count(&self) -> RegisterIndex {
+        RegisterIndex::try_from(self.locals.len()).unwrap_or(RegisterIndex::MAX)
+    }
+
+    /// Allocates the next local slot for `name`. The new binding
+    /// starts as **not yet initialized** so reads inside its own
+    /// initializer surface as `tdz_self_reference`. Caller must call
+    /// [`mark_initialized`](Self::mark_initialized) after emitting the
+    /// post-init `Star r_slot`.
+    ///
+    /// Rejects:
+    /// - duplicate name (already a parameter or another local in scope) →
+    ///   `Unsupported { construct: "duplicate_binding" }`;
+    /// - register-space exhaustion → `Internal`.
+    fn allocate_local(&mut self, name: &'a str, span: Span) -> Result<u16, SourceLoweringError> {
+        if self.param_name == Some(name) || self.locals.iter().any(|l| l.name == name) {
+            return Err(SourceLoweringError::unsupported("duplicate_binding", span));
+        }
+        let slot = self
+            .param_count
+            .checked_add(self.local_count())
+            .ok_or_else(|| SourceLoweringError::Internal("local register slot overflow".into()))?;
+        self.locals.push(LocalBinding {
+            name,
+            slot,
+            initialized: false,
+        });
+        Ok(slot)
+    }
+
+    /// Marks the most recently allocated binding for `name` as
+    /// initialized — called immediately after the lowering has
+    /// emitted `Star r_slot` for the init result. A binding can only
+    /// be initialized once; calling this after the binding is already
+    /// initialized is a compiler bug, surfaced as `Internal`.
+    fn mark_initialized(&mut self, name: &str) -> Result<(), SourceLoweringError> {
+        let local = self
+            .locals
+            .iter_mut()
+            .rev()
+            .find(|l| l.name == name)
+            .ok_or_else(|| {
+                SourceLoweringError::Internal(format!("mark_initialized: no binding for {name}"))
+            })?;
+        if local.initialized {
+            return Err(SourceLoweringError::Internal(format!(
+                "mark_initialized: {name} already initialized"
+            )));
+        }
+        local.initialized = true;
+        Ok(())
+    }
+
+    /// Resolves a JS identifier reference into a [`BindingRef`].
+    /// Locals shadow the parameter (only matters once shadowing is
+    /// allowed in later milestones; at M4 `allocate_local` rejects
+    /// duplicates so the lookup is unambiguous).
+    fn resolve_identifier(&self, name: &str) -> Option<BindingRef> {
+        if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
+            return Some(BindingRef::Local {
+                reg: local.slot,
+                initialized: local.initialized,
+            });
+        }
         match self.param_name {
-            Some(param) if param == name => Some(0),
+            Some(param) if param == name => Some(BindingRef::Param { reg: 0 }),
             _ => None,
         }
     }
+}
+
+/// Lowers `let x = init;` or `const x = init;`. Emits:
+///
+/// ```text
+///   <init>            ; acc = init value
+///   Star r_x          ; locals[x] = acc
+/// ```
+///
+/// Allocates the slot for `x` **before** lowering the initializer so
+/// the binding is in scope (in TDZ); the initializer can therefore
+/// detect a self-reference (`let x = x + 1`) at compile time and
+/// reject it as `tdz_self_reference`. After the post-init `Star`,
+/// `mark_initialized` flips the binding to readable.
+fn lower_let_const_declaration<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    decl: &'a VariableDeclaration<'a>,
+) -> Result<(), SourceLoweringError> {
+    match decl.kind {
+        VariableDeclarationKind::Let | VariableDeclarationKind::Const => {}
+        VariableDeclarationKind::Var => {
+            return Err(SourceLoweringError::unsupported(
+                "var_declaration",
+                decl.span,
+            ));
+        }
+        // `using` / `await using` (Stage 3 explicit resource management).
+        // Not on the M4 surface — surface a stable tag so later milestones
+        // can pick it up without churning callers.
+        VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => {
+            return Err(SourceLoweringError::unsupported(
+                "using_declaration",
+                decl.span,
+            ));
+        }
+    }
+
+    let declarator = match decl.declarations.as_slice() {
+        [single] => single,
+        [] => {
+            return Err(SourceLoweringError::unsupported(
+                "empty_variable_declaration",
+                decl.span,
+            ));
+        }
+        [_first, second, ..] => {
+            return Err(SourceLoweringError::unsupported(
+                "multi_declarator",
+                second.span,
+            ));
+        }
+    };
+
+    lower_single_declarator(builder, ctx, declarator)
+}
+
+fn lower_single_declarator<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    declarator: &'a VariableDeclarator<'a>,
+) -> Result<(), SourceLoweringError> {
+    let name = match &declarator.id {
+        BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+        _ => {
+            return Err(SourceLoweringError::unsupported(
+                "destructuring_binding",
+                declarator.span,
+            ));
+        }
+    };
+
+    let init = declarator.init.as_ref().ok_or_else(|| {
+        SourceLoweringError::unsupported("uninitialized_binding", declarator.span)
+    })?;
+
+    let slot = ctx.allocate_local(name, declarator.span)?;
+
+    // Lower the init into the accumulator. Reading the binding inside
+    // its own initializer hits the `Local { initialized: false }` arm
+    // of `lower_identifier_read` and surfaces as `tdz_self_reference`.
+    lower_return_expression(builder, ctx, init)?;
+
+    // Persist the init result into the local's slot.
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
+
+    ctx.mark_initialized(name)
+}
+
+/// Emits `Ldar reg` for an in-scope identifier read. Rejects
+/// uninitialized locals (TDZ self-reference) at compile time so the
+/// runtime never sees a hole on this path.
+fn lower_identifier_read(
+    builder: &mut BytecodeBuilder,
+    binding: BindingRef,
+    ident_span: Span,
+) -> Result<(), SourceLoweringError> {
+    let reg = match binding {
+        BindingRef::Param { reg } => reg,
+        BindingRef::Local {
+            reg,
+            initialized: true,
+        } => reg,
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                ident_span,
+            ));
+        }
+    };
+    builder
+        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Ldar: {err:?}")))?;
+    Ok(())
+}
+
+/// Emits a Reg-form binary opcode (`Add`/`Sub`/...) reading the given
+/// in-scope identifier as the RHS. Rejects TDZ self-reference for the
+/// same reason as [`lower_identifier_read`].
+fn lower_identifier_as_reg_rhs(
+    builder: &mut BytecodeBuilder,
+    encoding: &BinaryOpEncoding,
+    binding: BindingRef,
+    ident_span: Span,
+) -> Result<(), SourceLoweringError> {
+    let reg = match binding {
+        BindingRef::Param { reg } => reg,
+        BindingRef::Local {
+            reg,
+            initialized: true,
+        } => reg,
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                ident_span,
+            ));
+        }
+    };
+    builder
+        .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(reg))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode {}: {err:?}", encoding.label))
+        })?;
+    Ok(())
 }
 
 fn lower_return_expression(
@@ -352,13 +645,10 @@ fn lower_return_expression(
 ) -> Result<(), SourceLoweringError> {
     match expr {
         Expression::Identifier(ident) => {
-            let reg = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
+            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            builder
-                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode Ldar: {err:?}")))?;
-            Ok(())
+            lower_identifier_read(builder, binding, ident.span)
         }
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;
@@ -501,14 +791,10 @@ fn lower_binary_expression(
             }
         }
         Expression::Identifier(ident) => {
-            let reg = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
+            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            builder
-                .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(reg))])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!("encode {}: {err:?}", encoding.label))
-                })?;
+            lower_identifier_as_reg_rhs(builder, &encoding, binding, ident.span)?;
         }
         Expression::ParenthesizedExpression(inner) => {
             return Err(SourceLoweringError::unsupported(
@@ -533,13 +819,10 @@ fn lower_accumulator_operand(
 ) -> Result<(), SourceLoweringError> {
     match expr {
         Expression::Identifier(ident) => {
-            let reg = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
+            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            builder
-                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode Ldar: {err:?}")))?;
-            Ok(())
+            lower_identifier_read(builder, binding, ident.span)
         }
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;

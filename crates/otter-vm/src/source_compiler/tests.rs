@@ -1468,23 +1468,43 @@ fn nested_let_inside_while_unsupported() {
 }
 
 #[test]
-fn break_statement_unsupported() {
-    // `break` needs a jump-stack to track which loop it exits.
-    // Lands in a future milestone alongside `continue` and labelled
-    // loops.
-    let err = compile(
-        "function f(n) { let i = 0; while (i < n) { if (i === 5) { break; } i = i + 1; } return i; }",
-    )
-    .expect_err("break at M7");
-    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+fn break_exits_while_at_threshold() {
+    // `break` inside the innermost while leaves the loop; `i`
+    // stops advancing at the first iteration where the condition
+    // fires.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let i = 0; while (i < n) { if (i === 5) { break; } i = i + 1; } return i; }",
+            &[10],
+        ),
+        5,
+    );
 }
 
 #[test]
-fn continue_statement_unsupported() {
-    let err =
-        compile("function f(n) { let i = 0; while (i < n) { i = i + 1; continue; } return i; }")
-            .expect_err("continue at M7");
-    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+fn continue_skips_rest_of_while_iteration() {
+    // `continue` jumps to the loop header — `i` must still be
+    // advanced before `continue` runs, otherwise the loop spins
+    // forever. This test exercises both control paths: at i=2 we
+    // take the continue branch, elsewhere we fall through to
+    // `s += i`.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { \
+                 let s = 0; \
+                 let i = 0; \
+                 while (i < n) { \
+                     i = i + 1; \
+                     if (i === 3) { continue; } \
+                     s = s + i; \
+                 } \
+                 return s; \
+             }",
+            &[5],
+        ),
+        // i takes values 1..5; skip i=3: 1+2+4+5 = 12.
+        12,
+    );
 }
 
 #[test]
@@ -2231,5 +2251,190 @@ fn update_composes_with_binary_rhs() {
     assert_eq!(
         run_int32_function("function f(n) { let x = 5; return n + x++; }", &[10]),
         15,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11: break / continue (unlabelled) in while / for
+// ---------------------------------------------------------------------------
+
+#[test]
+fn break_exits_for_loop() {
+    // `break` in a `for` jumps straight to the loop exit —
+    // skipping the update and subsequent iterations.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { \
+                 let s = 0; \
+                 for (let i = 0; i < n; i = i + 1) { \
+                     if (i === 3) { break; } \
+                     s = s + i; \
+                 } \
+                 return s; \
+             }",
+            &[10],
+        ),
+        // Body runs for i = 0, 1, 2 (breaks at 3). Sum = 0+1+2.
+        3,
+    );
+}
+
+#[test]
+fn continue_in_for_runs_update_then_test() {
+    // `continue` in a `for` lands on the update clause, not the
+    // header — the spec-mandated shape. Without the dedicated
+    // continue label, a naive `Jump loop_header` would skip the
+    // `i = i + 1` update and spin forever.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { \
+                 let s = 0; \
+                 for (let i = 0; i < n; i = i + 1) { \
+                     if (i === 2) { continue; } \
+                     s = s + i; \
+                 } \
+                 return s; \
+             }",
+            &[5],
+        ),
+        // Skip i=2: 0+1+3+4 = 8.
+        8,
+    );
+}
+
+#[test]
+fn break_in_nested_while_only_exits_innermost() {
+    // The innermost-loop-first rule: a `break` inside a nested
+    // `while` must exit only that inner loop. The outer loop
+    // continues running afterwards. `j` hoisted to the function
+    // scope because the current compiler doesn't allow `let`
+    // inside a nested body.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let s = 0; \
+                 let i = 0; \
+                 let j = 0; \
+                 while (i < 3) { \
+                     j = 0; \
+                     while (j < 10) { \
+                         if (j === 2) { break; } \
+                         s = s + 1; \
+                         j = j + 1; \
+                     } \
+                     i = i + 1; \
+                 } \
+                 return s; \
+             }",
+            &[],
+        ),
+        // Inner loop runs for j = 0, 1 before break → 2 increments
+        // per outer iteration × 3 outer iterations = 6.
+        6,
+    );
+}
+
+#[test]
+fn continue_in_nested_while_only_affects_innermost() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let s = 0; \
+                 let i = 0; \
+                 let j = 0; \
+                 while (i < 2) { \
+                     j = 0; \
+                     while (j < 4) { \
+                         j = j + 1; \
+                         if (j === 2) { continue; } \
+                         s = s + j; \
+                     } \
+                     i = i + 1; \
+                 } \
+                 return s; \
+             }",
+            &[],
+        ),
+        // Inner iter: j → 1,2,3,4; skip j=2 → 1+3+4 = 8.
+        // Two outer iters → 16.
+        16,
+    );
+}
+
+#[test]
+fn labelled_break_rejected() {
+    // `outer:` is a LabeledStatement wrapper that the compiler
+    // doesn't recognise yet — it's rejected before we even reach
+    // the labelled break. Surface any Unsupported tag so the
+    // negative expectation is robust to future label-statement
+    // support; the lowering-side check for
+    // `break_stmt.label.is_some()` is exercised indirectly by
+    // the other M11 tests which confirm unlabelled break works.
+    let err = compile("function f(n) { outer: while (n > 0) { break outer; } return n; }")
+        .expect_err("labelled break at M11");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn labelled_continue_rejected() {
+    let err = compile(
+        "function f(n) { let i = n; outer: while (i > 0) { i = i - 1; continue outer; } return i; }",
+    )
+    .expect_err("labelled continue at M11");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn break_outside_loop_rejected() {
+    // `break` at function top level has no enclosing loop. We
+    // surface a stable tag instead of emitting a dangling jump.
+    let err = compile("function f() { break; return 0; }").expect_err("break top-level at M11");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "break_outside_loop",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn continue_outside_loop_rejected() {
+    let err =
+        compile("function f() { continue; return 0; }").expect_err("continue top-level at M11");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "continue_outside_loop",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn break_after_loop_still_rejected() {
+    // Loop labels must be unregistered on loop exit — `break`
+    // after the loop body (in straight-line code following the
+    // loop) should see an empty stack.
+    // Use a local (not the parameter) as the counter because the
+    // compiler rejects assigning to parameters. The shape is
+    // equivalent for the purpose of the test.
+    let err = compile("function f(n) { let i = n; while (i > 0) { i = i - 1; } break; return i; }")
+        .expect_err("break after loop at M11");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "break_outside_loop",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
     );
 }

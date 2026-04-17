@@ -115,7 +115,7 @@ mod tests;
 
 pub use error::SourceLoweringError;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -128,7 +128,7 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 
-use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Opcode, Operand};
+use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
 use crate::frame::{FrameLayout, RegisterIndex};
 use crate::module::{Function as VmFunction, FunctionIndex, FunctionTables, Module};
@@ -518,6 +518,10 @@ fn lower_nested_statement<'a>(
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
+        Statement::BreakStatement(break_stmt) => lower_break_statement(builder, ctx, break_stmt),
+        Statement::ContinueStatement(cont_stmt) => {
+            lower_continue_statement(builder, ctx, cont_stmt)
+        }
         Statement::ReturnStatement(ret) => {
             let argument = ret.argument.as_ref().ok_or_else(|| {
                 SourceLoweringError::unsupported("return_without_value", ret.span)
@@ -625,11 +629,13 @@ fn lower_if_statement<'a>(
 /// The `Jump loop_header` at the bottom is a backward branch — the
 /// dispatcher's tier-up budget decrements on every backward jump, so
 /// the loop body accrues hotness exactly the way the JIT expects.
-/// `break` and `continue` are not yet supported: a future milestone
-/// will add label tracking + jump-stack plumbing for those (and for
-/// labelled loops). The body is lowered via [`lower_nested_statement`]
-/// so it can contain assignments, nested `if`/`while`, blocks, and
-/// inline `return`s — but no `let`/`const` (block scoping lands later).
+/// `break` and `continue` (unlabelled) are supported via the
+/// `LoopLabels` stack: `break` forward-jumps to `loop_exit`, and
+/// `continue` backward-jumps to `loop_header`. Labelled jumps are
+/// rejected. The body is lowered via [`lower_nested_statement`] so
+/// it can contain assignments, nested `if`/`while`, blocks, and
+/// inline `return`s — but no `let`/`const` (block scoping lands
+/// later).
 fn lower_while_statement<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
@@ -649,7 +655,17 @@ fn lower_while_statement<'a>(
             SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse: {err:?}"))
         })?;
 
-    lower_nested_statement(builder, ctx, &while_stmt.body)?;
+    // Register this loop's jump targets so any nested `break` /
+    // `continue` can find them. `while` uses the loop header as the
+    // continue target — re-running the test is the spec-correct
+    // semantics.
+    ctx.enter_loop(LoopLabels {
+        break_label: loop_exit,
+        continue_label: loop_header,
+    });
+    let body_result = lower_nested_statement(builder, ctx, &while_stmt.body);
+    ctx.exit_loop();
+    body_result?;
 
     builder
         .emit_jump_to(Opcode::Jump, loop_header)
@@ -723,6 +739,11 @@ fn lower_for_statement<'a>(
 
     let loop_header = builder.new_label();
     let loop_exit = builder.new_label();
+    // `continue` in a `for` jumps to the update clause (or the
+    // loop header when there's no update). Using a dedicated
+    // `loop_continue` label lets both paths share the bind sequence
+    // below without leaking the difference to callers.
+    let loop_continue = builder.new_label();
 
     builder
         .bind_label(loop_header)
@@ -746,10 +767,25 @@ fn lower_for_statement<'a>(
             SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse: {err:?}"))
         })?;
 
-    // 3) Body.
-    lower_nested_statement(builder, ctx, &for_stmt.body)?;
+    // 3) Body. Register the loop frame first so nested
+    //    `break` / `continue` pick up our labels; pop after the
+    //    body lowering completes.
+    ctx.enter_loop(LoopLabels {
+        break_label: loop_exit,
+        continue_label: loop_continue,
+    });
+    let body_result = lower_nested_statement(builder, ctx, &for_stmt.body);
+    ctx.exit_loop();
+    body_result?;
 
-    // 4) Update — runs after every iteration, before the back-jump.
+    // 4) Continue target — runs the update clause (if any) and then
+    //    falls through to the back-jump. `continue` from the body
+    //    lands here, so the update still executes per spec.
+    builder
+        .bind_label(loop_continue)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind for continue: {err:?}")))?;
+
+    // 5) Update — runs after every iteration, before the back-jump.
     //    M10 also accepts `UpdateExpression` (`i++` / `++i`),
     //    matching the canonical `for (let i = 0; i < n; i++)` idiom.
     //    The UpdateExpression's accumulator result is discarded.
@@ -778,6 +814,62 @@ fn lower_for_statement<'a>(
         .map_err(|err| SourceLoweringError::Internal(format!("bind for exit: {err:?}")))?;
 
     ctx.restore_scope(scope);
+    Ok(())
+}
+
+/// Lowers `break;` → `Jump loop_exit` for the innermost enclosing
+/// loop.
+///
+/// Labelled breaks (`break outer;`) are rejected with a stable
+/// `labelled_break` tag; the label-tracking plumbing lands with
+/// broader labelled-statement support (M11+). A bare `break`
+/// outside any loop surfaces as `break_outside_loop` so users get a
+/// clear compile-time diagnostic instead of a silent fall-through.
+fn lower_break_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    break_stmt: &'a oxc_ast::ast::BreakStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    if break_stmt.label.is_some() {
+        return Err(SourceLoweringError::unsupported(
+            "labelled_break",
+            break_stmt.span,
+        ));
+    }
+    let labels = ctx
+        .innermost_loop_labels()
+        .ok_or_else(|| SourceLoweringError::unsupported("break_outside_loop", break_stmt.span))?;
+    builder
+        .emit_jump_to(Opcode::Jump, labels.break_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (break): {err:?}")))?;
+    Ok(())
+}
+
+/// Lowers `continue;` → `Jump continue_label` for the innermost
+/// enclosing loop.
+///
+/// For `while`, `continue_label` is the loop header (the test
+/// re-runs). For `for`, it's the update clause (which then falls
+/// through to the loop header). Labelled continues and continue
+/// outside a loop surface their own stable tags for the same
+/// reasons as [`lower_break_statement`].
+fn lower_continue_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    cont_stmt: &'a oxc_ast::ast::ContinueStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    if cont_stmt.label.is_some() {
+        return Err(SourceLoweringError::unsupported(
+            "labelled_continue",
+            cont_stmt.span,
+        ));
+    }
+    let labels = ctx
+        .innermost_loop_labels()
+        .ok_or_else(|| SourceLoweringError::unsupported("continue_outside_loop", cont_stmt.span))?;
+    builder
+        .emit_jump_to(Opcode::Jump, labels.continue_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (continue): {err:?}")))?;
     Ok(())
 }
 
@@ -862,6 +954,28 @@ struct LoweringContext<'a> {
     /// `Cell` so the expression-lowering helpers that take `&self`
     /// can still allocate a slot.
     next_feedback_slot: Cell<u16>,
+    /// Innermost-loop-first stack of [`LoopLabels`] frames. Pushed on
+    /// loop entry by `lower_while_statement` / `lower_for_statement`
+    /// and popped on loop exit. `break` reads `break_label` from the
+    /// top frame; `continue` reads `continue_label`. Nested loops
+    /// stack; the outermost sits at index 0, so `.last()` resolves
+    /// the innermost.
+    ///
+    /// `RefCell` (not `Cell`) because `Label` is `Copy` but the stack
+    /// type itself isn't. `enter_loop` / `exit_loop` are the only
+    /// mutators.
+    loop_labels: RefCell<Vec<LoopLabels>>,
+}
+
+/// `break` / `continue` jump targets for one loop frame. `break_label`
+/// is bound to the instruction immediately after the loop; `continue_label`
+/// is the re-entry point — for `while`, the loop header (which re-
+/// evaluates the condition); for `for`, the update clause (which
+/// evaluates the update, then jumps back to the header).
+#[derive(Debug, Clone, Copy)]
+struct LoopLabels {
+    break_label: Label,
+    continue_label: Label,
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -896,7 +1010,33 @@ impl<'a> LoweringContext<'a> {
             peak_temp_count: Cell::new(0),
             function_names,
             next_feedback_slot: Cell::new(0),
+            loop_labels: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Push a fresh [`LoopLabels`] frame onto the stack. Paired 1:1
+    /// with [`Self::exit_loop`] — `lower_while_statement` and
+    /// `lower_for_statement` always pop before returning to their
+    /// caller.
+    fn enter_loop(&self, labels: LoopLabels) {
+        self.loop_labels.borrow_mut().push(labels);
+    }
+
+    /// Pop the most-recent [`LoopLabels`] frame. Panics in
+    /// `debug_assertions` if the stack is empty, because that would
+    /// mean an unbalanced `enter_loop` / `exit_loop` pair — a
+    /// programmer error the emitter wants to catch eagerly.
+    fn exit_loop(&self) {
+        let popped = self.loop_labels.borrow_mut().pop();
+        debug_assert!(popped.is_some(), "exit_loop called without enter_loop");
+    }
+
+    /// Returns the innermost loop's [`LoopLabels`], if any. `None`
+    /// means we're currently lowering code outside every loop — the
+    /// statement handlers use this to surface `break_outside_loop` /
+    /// `continue_outside_loop` errors.
+    fn innermost_loop_labels(&self) -> Option<LoopLabels> {
+        self.loop_labels.borrow().last().copied()
     }
 
     /// Allocates a fresh arithmetic-feedback slot id, returning the

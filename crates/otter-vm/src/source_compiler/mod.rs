@@ -1599,7 +1599,13 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        "globalThis" | "Math" => {
+        "globalThis" | "Math" | "console" => {
+            // M14 anchor: `globalThis`, `Math`.
+            // M19 anchor: `console` — the "hello world" gate. The
+            // runtime already installs a `console` object on the
+            // global with `log`/`warn`/`error`/`info`/`debug`
+            // bindings backed by the pluggable `ConsoleBackend`
+            // trait (`StdioConsoleBackend` is the CLI default).
             let idx = ctx.intern_property_name(name)?;
             builder
                 .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
@@ -3551,81 +3557,287 @@ fn lower_accumulator_operand(
     lower_return_expression(builder, ctx, expr)
 }
 
-/// Lowers a `CallExpression` whose callee is the name of a
-/// top-level `FunctionDeclaration` in the same module. Bytecode
-/// shape:
+/// Lowers a `CallExpression`. Three callee shapes are accepted:
+///
+/// - Identifier naming a top-level `FunctionDeclaration` — emits
+///   `CallDirect func_idx, argv` for the tightest invocation path
+///   (known callee, direct index, tier-up-friendly).
+/// - `o.method(args)` (StaticMemberExpression callee) — emits
+///   `CallProperty r_callee, r_receiver, argv`; `this` is bound to
+///   the member's base per §13.3.6.
+/// - `o[k](args)` (ComputedMemberExpression callee) — same opcode,
+///   key resolved via `LdaKeyedProperty`.
+///
+/// Everything else (parenthesised non-identifier, CallExpression
+/// callee, …) still rejects with `non_identifier_callee` — those
+/// require first-class function values that land in later
+/// milestones.
+///
+/// Direct-call shape:
 ///
 /// ```text
-///   <lower arg 0> ; Star r_temp0
-///   <lower arg 1> ; Star r_temp1
+///   <lower arg 0>; Star r_arg0
+///   <lower arg 1>; Star r_arg1
 ///   …
-///   CallDirect func_idx, RegList { base: temp0, count: argc }
+///   CallDirect func_idx, RegList { base: r_arg0, count: argc }
 /// ```
 ///
-/// The call result lands in the accumulator. Temps are acquired
-/// from the function-level pool ([`LoweringContext::acquire_temps`])
-/// so nested calls (e.g. `f(g(1, 2), h(3))`) get their own
-/// non-overlapping windows; the pool is released LIFO when the call
-/// completes.
+/// Method-call shape:
 ///
-/// Rejects:
-/// - non-identifier callee (member, computed, …) →
-///   `non_identifier_callee`;
-/// - identifier callee that doesn't name a top-level function →
-///   `unbound_function` (parameters and locals can't be called yet —
-///   closure values land later);
-/// - spread args (`f(...arr)`) → `spread_call_arg`;
-/// - `new f()` is a separate AST node (`NewExpression`) and falls
-///   through to `expression_construct_tag`.
+/// ```text
+///   <lower receiver>; Star r_receiver
+///   <lower callee from r_receiver>; Star r_callee
+///   <lower arg 0>; Star r_arg0
+///   …
+///   CallProperty r_callee, r_receiver, RegList { base: r_arg0, count: argc }
+/// ```
+///
+/// Temps are acquired from the function-level pool
+/// ([`LoweringContext::acquire_temps`]) so nested calls get
+/// non-overlapping windows; release is LIFO.
 fn lower_call_expression(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    use oxc_ast::ast::Argument;
-
-    // 1) Resolve callee.
-    let callee_ident = match &call.callee {
-        Expression::Identifier(ident) => ident,
-        Expression::ParenthesizedExpression(inner) => match &inner.expression {
-            Expression::Identifier(ident) => ident,
-            other => {
-                return Err(SourceLoweringError::unsupported(
-                    "non_identifier_callee",
-                    other.span(),
-                ));
-            }
-        },
-        other => {
-            return Err(SourceLoweringError::unsupported(
-                "non_identifier_callee",
-                other.span(),
-            ));
-        }
+    // Callee classification — strip a single layer of parens so
+    // `(f)()` still works, then match on the inner shape. Member
+    // callees go through the method-call path so `this` binds
+    // correctly; everything else goes through the direct-call
+    // path.
+    let inner_callee = match &call.callee {
+        Expression::ParenthesizedExpression(paren) => &paren.expression,
+        other => other,
     };
+    match inner_callee {
+        Expression::Identifier(ident) => lower_direct_call(builder, ctx, call, ident),
+        Expression::StaticMemberExpression(member) => {
+            lower_static_method_call(builder, ctx, call, member)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            lower_computed_method_call(builder, ctx, call, member)
+        }
+        other => Err(SourceLoweringError::unsupported(
+            "non_identifier_callee",
+            other.span(),
+        )),
+    }
+}
+
+/// Direct-call path: `f(args)` where `f` names a known top-level
+/// function in the same module. Emits `CallDirect` so the
+/// interpreter can resolve the callee by function index without a
+/// property lookup or an object handle.
+fn lower_direct_call<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    callee_ident: &IdentifierReference<'a>,
+) -> Result<(), SourceLoweringError> {
     let func_idx = ctx
         .resolve_function(callee_ident.name.as_str())
         .ok_or_else(|| SourceLoweringError::unsupported("unbound_function", callee_ident.span))?;
 
-    // 2) Acquire temp slots for the argument window.
     let argc = RegisterIndex::try_from(call.arguments.len())
         .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
     let base = ctx.acquire_temps(argc)?;
 
-    // 3) Lower each arg into its temp slot. Spread args are
-    //    rejected — they need iterator protocol + dynamic argc.
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_call_arguments_into_temps(builder, ctx, call, base)?;
+        builder
+            .emit(
+                Opcode::CallDirect,
+                &[
+                    Operand::Idx(func_idx.0),
+                    Operand::RegList {
+                        base: u32::from(base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| SourceLoweringError::Internal(format!("encode CallDirect: {err:?}")))?;
+        Ok(())
+    })();
+    ctx.release_temps(argc);
+    lower
+}
+
+/// Method-call path for `o.method(args)`. Receiver, callee, and
+/// each argument each go into a dedicated temp so `CallProperty`
+/// sees three register operands plus a contiguous arg window.
+/// Method name is interned into the function's
+/// `PropertyNameTable`, matching the M17 `LdaNamedProperty`
+/// lowering.
+fn lower_static_method_call<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    member: &StaticMemberExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if member.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            member.span,
+        ));
+    }
+    let argc = RegisterIndex::try_from(call.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+    let receiver_temp = ctx.acquire_temps(1)?;
+    let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let args_base = ctx
+        .acquire_temps(argc)
+        .inspect_err(|_| ctx.release_temps(2))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // Receiver → r_receiver.
+        lower_return_expression(builder, ctx, &member.object)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (method receiver): {err:?}"))
+            })?;
+        // Callee = receiver[name] → r_callee.
+        let idx = ctx.intern_property_name(member.property.name.as_str())?;
+        builder
+            .emit(
+                Opcode::LdaNamedProperty,
+                &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaNamedProperty (method callee): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (method callee): {err:?}"))
+            })?;
+        // Args → r_args[…].
+        lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+        // CallProperty r_callee, r_receiver, args.
+        builder
+            .emit(
+                Opcode::CallProperty,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(receiver_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CallProperty: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    // Release in LIFO order — args first, then (callee + receiver)
+    // collapsed into a single release since the pool is just a
+    // counter.
+    ctx.release_temps(argc);
+    ctx.release_temps(2);
+    lower
+}
+
+/// Method-call path for `o[k](args)`. Key is evaluated into acc,
+/// `LdaKeyedProperty` reads the callable from the receiver, and
+/// the `CallProperty` emission mirrors the static-method path.
+/// Receiver, key, callee, and args each occupy their own temp so
+/// the evaluation order stays spec-compliant
+/// (receiver → key → arguments → call).
+fn lower_computed_method_call<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    member: &ComputedMemberExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if member.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            member.span,
+        ));
+    }
+    let argc = RegisterIndex::try_from(call.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+    let receiver_temp = ctx.acquire_temps(1)?;
+    let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let args_base = ctx
+        .acquire_temps(argc)
+        .inspect_err(|_| ctx.release_temps(2))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // Receiver.
+        lower_return_expression(builder, ctx, &member.object)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (computed method receiver): {err:?}"
+                ))
+            })?;
+        // Key → acc; LdaKeyedProperty r_receiver → acc = receiver[key].
+        lower_return_expression(builder, ctx, &member.expression)?;
+        builder
+            .emit(
+                Opcode::LdaKeyedProperty,
+                &[Operand::Reg(u32::from(receiver_temp))],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaKeyedProperty (computed callee): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (computed callee): {err:?}"))
+            })?;
+        lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+        builder
+            .emit(
+                Opcode::CallProperty,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(receiver_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CallProperty (computed): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(argc);
+    ctx.release_temps(2);
+    lower
+}
+
+/// Lowers each `CallExpression` argument into the accumulator and
+/// spills it into the corresponding temp slot starting at `base`.
+/// Rejects spread arguments (`f(...arr)`) with a stable tag so
+/// the caller's temp-window accounting stays straight. Shared by
+/// the direct-call and method-call paths so the evaluation-order
+/// and slot-layout contract is identical.
+fn lower_call_arguments_into_temps<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    base: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
     for (offset, arg) in call.arguments.iter().enumerate() {
         let expr = match arg {
             Argument::SpreadElement(spread) => {
-                ctx.release_temps(argc);
                 return Err(SourceLoweringError::unsupported(
                     "spread_call_arg",
                     spread.span,
                 ));
             }
-            // Non-spread argument: the `Argument` enum inlines all
-            // `Expression` variants, so we can downcast to `&Expression`
-            // and reuse the standard expression-lowering path.
             other => other.to_expression(),
         };
         lower_return_expression(builder, ctx, expr)?;
@@ -3640,27 +3852,6 @@ fn lower_call_expression(
                 SourceLoweringError::Internal(format!("encode Star (call arg): {err:?}"))
             })?;
     }
-
-    // 4) Emit CallDirect — function index + the contiguous arg window.
-    builder
-        .emit(
-            Opcode::CallDirect,
-            &[
-                Operand::Idx(func_idx.0),
-                Operand::RegList {
-                    base: u32::from(base),
-                    count: u32::from(argc),
-                },
-            ],
-        )
-        .map_err(|err| SourceLoweringError::Internal(format!("encode CallDirect: {err:?}")))?;
-
-    // 5) Release the temp slots (LIFO with respect to nested
-    //    calls). The slots stay reserved by the FrameLayout's
-    //    `temporary_count` (which tracks the peak, not the live
-    //    count) so a later call at the same depth reuses them.
-    ctx.release_temps(argc);
-
     Ok(())
 }
 

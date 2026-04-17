@@ -33,28 +33,43 @@ const M0_UNSUPPORTED: &str = "runtime helper not available in M0 (source compile
 impl Interpreter {
     /// §10.4.1.1 `[[Call]]` for host-backed callables.
     ///
-    /// Placeholder in M0 — see module docs.
+    /// M19: delegate to [`RuntimeState::call_host_function`], which
+    /// already handles bound functions, promise capabilities, and
+    /// native-function descriptor dispatch. Needed so `console.log`
+    /// and other host intrinsics are actually reachable from
+    /// compiled bytecode. Returns `Completion::Return` on success
+    /// and `Completion::Throw` on a caught JS throw; internal
+    /// errors surface as `InterpreterError::NativeCall`.
     pub(super) fn invoke_host_function_handle(
-        _runtime: &mut RuntimeState,
-        _callable: ObjectHandle,
-        _receiver: RegisterValue,
-        _arguments: &[RegisterValue],
+        runtime: &mut RuntimeState,
+        callable: ObjectHandle,
+        receiver: RegisterValue,
+        arguments: &[RegisterValue],
     ) -> Result<Completion, InterpreterError> {
-        Err(InterpreterError::NativeCall(M0_UNSUPPORTED.into()))
+        match runtime.call_host_function(Some(callable), receiver, arguments) {
+            Ok(value) => Ok(Completion::Return(value)),
+            Err(VmNativeCallError::Thrown(value)) => Ok(Completion::Throw(value)),
+            Err(VmNativeCallError::Internal(message)) => Err(InterpreterError::NativeCall(message)),
+        }
     }
 
-    /// Invoke a native function resolved to a [`crate::host::HostFunctionId`].
-    ///
-    /// Placeholder in M0.
+    /// Invoke a native function resolved to a
+    /// [`crate::host::HostFunctionId`]. Falls through to the
+    /// handle-based entry point — the handle itself carries the
+    /// descriptor id, and `call_host_function` already performs
+    /// the descriptor lookup and callback dispatch. The
+    /// `is_construct` parameter is currently ignored — constructor
+    /// calls reach a different path in `construct_callable` and
+    /// shouldn't end up here in practice.
     pub(super) fn invoke_registered_host_function(
-        _runtime: &mut RuntimeState,
+        runtime: &mut RuntimeState,
         _host_function: crate::host::HostFunctionId,
-        _callable: ObjectHandle,
-        _receiver: RegisterValue,
-        _arguments: &[RegisterValue],
+        callable: ObjectHandle,
+        receiver: RegisterValue,
+        arguments: &[RegisterValue],
         _is_construct: bool,
     ) -> Result<Completion, InterpreterError> {
-        Err(InterpreterError::NativeCall(M0_UNSUPPORTED.into()))
+        Self::invoke_host_function_handle(runtime, callable, receiver, arguments)
     }
 
     /// §9.1.12 `OrdinaryCreateFromConstructor` default receiver

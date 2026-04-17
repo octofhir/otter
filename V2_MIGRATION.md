@@ -57,7 +57,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [x]    | 13dd2f8 |
 | M17      | Property access: `StaticMemberExpression` (`o.x`), `ComputedMemberExpression` (`o[k]`), read + write.                            | [x]    | 8f1c068 |
 | M18      | Template literals (simple + interpolated).                                                                                       | [x]    | f8ddb59 |
-| M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [ ]    |        |
+| M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [x]    | _pending_ |
 | M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [ ]    |        |
 | M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [ ]    |        |
 | M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [ ]    |        |
@@ -109,6 +109,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `ObjectExpression` / `ArrayExpression` literals with int/string/bool/null values | yes | M16 |
 | `StaticMemberExpression` / `ComputedMemberExpression` read + write (incl. compound `<op>=`) | yes | M17 |
 | `TemplateLiteral` (simple + interpolated; nested; escape cooked-values) | yes | M18 |
+| Method-call `CallExpression` (`o.m()`, `o[k]()`) + `console` global + host-function dispatch | yes | M19 |
 
 ## Benchmarks
 

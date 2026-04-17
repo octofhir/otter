@@ -1929,19 +1929,9 @@ fn unbound_function_call_unsupported() {
     ));
 }
 
-#[test]
-fn member_call_unsupported() {
-    // `o.m()` — callee is a MemberExpression, not an identifier.
-    // Lands when property access lands.
-    let err = compile("function main() { return main.x(); }").expect_err("member-call at M9");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "non_identifier_callee",
-            ..
-        }
-    ));
-}
+// Removed: member_call_unsupported — method-call lowering is supported
+// as of M19 (`o.m()` and `o[k]()` via CallProperty). Coverage for method
+// calls lives in the M19 test block below.
 
 #[test]
 fn spread_call_arg_unsupported() {
@@ -3845,5 +3835,209 @@ fn template_literal_in_compound_assign_rhs() {
             &[],
         ),
         "x;1",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M19: console.log + method calls — the "hello world" gate
+// ---------------------------------------------------------------------------
+
+/// Compile `source`, swap a capturing console backend into the
+/// runtime so `console.log` output can be inspected, execute the
+/// entry function, and return the captured backend + the returned
+/// RegisterValue. The capture backend is pluggable per the
+/// `ConsoleBackend` trait — `StdioConsoleBackend` is the CLI
+/// default, and tests use `CaptureConsoleBackend` here without
+/// any change to the runtime's console-delivery pipeline.
+fn compile_and_run_with_capture(
+    source: &str,
+) -> (
+    std::sync::Arc<crate::console::CaptureConsoleBackend>,
+    RegisterValue,
+) {
+    let module = compile(source).expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).expect("entry fn");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let capture = std::sync::Arc::new(crate::console::CaptureConsoleBackend::new());
+    // Wrap the shared handle in a forwarding adapter so the
+    // runtime's `Box<dyn ConsoleBackend>` owns a view onto the
+    // same buffer. `Arc` keeps the backend alive for the test to
+    // read after execution.
+    struct Shared(std::sync::Arc<crate::console::CaptureConsoleBackend>);
+    impl crate::console::ConsoleBackend for Shared {
+        fn log(&self, m: &str) {
+            self.0.log(m)
+        }
+        fn warn(&self, m: &str) {
+            self.0.warn(m)
+        }
+        fn error(&self, m: &str) {
+            self.0.error(m)
+        }
+    }
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    runtime.set_console_backend(Box::new(Shared(capture.clone())));
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    (capture, result.return_value())
+}
+
+#[test]
+fn console_is_a_global_object() {
+    // `console` must resolve through `LdaGlobal` — the M19
+    // whitelist entry. The returned value is an object handle
+    // (the runtime-installed console intrinsic).
+    let (_module, ret, _runtime) = compile_and_run("function f() { return console; }");
+    assert!(
+        ret.as_object_handle().is_some(),
+        "console must lower to an object handle",
+    );
+}
+
+#[test]
+fn console_log_method_exists_on_console() {
+    // Reading `console.log` through the StaticMember path — no
+    // call yet, just verifying the method is installed on the
+    // intrinsic console object.
+    let (_module, ret, _runtime) = compile_and_run("function f() { return console.log; }");
+    assert!(
+        ret.as_object_handle().is_some(),
+        "console.log must resolve to a host-function handle",
+    );
+}
+
+#[test]
+fn console_log_from_return_expression_captures_undefined() {
+    // `return console.log("hello world");` — `console.log` is
+    // invoked in acc-producing position, returns `undefined`,
+    // and the capture backend must see the message.
+    let (capture, ret) =
+        compile_and_run_with_capture("function main() { return console.log(\"hello world\"); }");
+    assert_eq!(ret, RegisterValue::undefined());
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].level, crate::console::ConsoleLevel::Log);
+    assert_eq!(lines[0].message, "hello world");
+}
+
+#[test]
+fn console_log_multiple_args_space_separated() {
+    // `console.log` joins its args with a single space — matches
+    // the WHATWG Console Standard.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { return console.log(\"a\", \"b\", \"c\"); }",
+    );
+    assert_eq!(capture.lines()[0].message, "a b c");
+}
+
+#[test]
+fn console_log_coerces_int_to_string() {
+    let (capture, _ret) =
+        compile_and_run_with_capture("function main() { return console.log(42); }");
+    assert_eq!(capture.lines()[0].message, "42");
+}
+
+#[test]
+fn console_log_with_template_literal_arg() {
+    // End-to-end composition: LdaGlobal console →
+    // StaticMemberExpression console.log → TemplateLiteral arg.
+    // This is the canonical M19 "hello world" shape that a user
+    // would write.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { let who = \"otter\"; return console.log(`hello, ${who}!`); }",
+    );
+    assert_eq!(capture.lines()[0].message, "hello, otter!");
+}
+
+#[test]
+fn console_warn_routes_to_warn_channel() {
+    // Separate channels (log/warn/error/info/debug) must each
+    // reach the right method on the backend — the
+    // `CaptureConsoleBackend` tags each line with its level.
+    let (capture, _ret) =
+        compile_and_run_with_capture("function main() { return console.warn(\"watch out\"); }");
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].level, crate::console::ConsoleLevel::Warn);
+    assert_eq!(lines[0].message, "watch out");
+}
+
+#[test]
+fn console_error_routes_to_error_channel() {
+    let (capture, _ret) =
+        compile_and_run_with_capture("function main() { return console.error(\"nope\"); }");
+    let lines = capture.lines();
+    assert_eq!(lines[0].level, crate::console::ConsoleLevel::Error);
+    assert_eq!(lines[0].message, "nope");
+}
+
+#[test]
+fn method_call_via_computed_key() {
+    // `console["log"]("x")` — ComputedMemberExpression callee
+    // goes through `lower_computed_method_call`, which uses
+    // LdaKeyedProperty instead of LdaNamedProperty.
+    let (capture, _ret) =
+        compile_and_run_with_capture("function main() { return console[\"log\"](\"computed\"); }");
+    assert_eq!(capture.lines()[0].message, "computed");
+}
+
+#[test]
+fn method_call_on_local_object() {
+    // `let o = { get: function… }` isn't lowerable yet (no
+    // function expressions), but we can still exercise the
+    // method-call path using a value returned by a known intrinsic.
+    // Here we verify that a computed-member call against `console`
+    // with a dynamic key also reaches the right method.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { let m = \"log\"; return console[m](\"dynamic\"); }",
+    );
+    assert_eq!(capture.lines()[0].message, "dynamic");
+}
+
+#[test]
+fn method_call_with_chained_template_literal() {
+    // Full integration: string + template + method call.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { let o = { name: \"otter\", v: 2 }; return console.log(`${o.name} v${o.v}`); }",
+    );
+    assert_eq!(capture.lines()[0].message, "otter v2");
+}
+
+#[test]
+fn method_call_preserves_acc_result_for_composition() {
+    // `console.log("x")` returns `undefined`; the caller should
+    // be able to bind that result into a local.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { let r = console.log(\"composed\"); return r; }",
+    );
+    assert_eq!(capture.lines()[0].message, "composed");
+}
+
+#[test]
+fn method_call_with_nested_member_receiver() {
+    // Receiver is itself a member access: `({c: console}).c.log(...)`.
+    // The `materialize_member_base` for the outer static-member
+    // receiver `({...}).c` drops into the temp-spill path.
+    let (capture, _ret) = compile_and_run_with_capture(
+        "function main() { let w = { c: console }; return w.c.log(\"nested\"); }",
+    );
+    assert_eq!(capture.lines()[0].message, "nested");
+}
+
+#[test]
+fn direct_call_still_uses_call_direct() {
+    // Regression: the M9 direct-call path stays intact after the
+    // refactor. `main` calls `inc(41)` which lowers to CallDirect,
+    // and the returned int32 value round-trips. (Multi-param
+    // signatures land in a later milestone.)
+    assert_eq!(
+        run_int32_function(
+            "function inc(n) { return n + 1; } function main() { return inc(41); }",
+            &[],
+        ),
+        42,
     );
 }

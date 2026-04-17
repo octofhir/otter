@@ -50,7 +50,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
 | M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`, `~x`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.         | [x]    | 4cea559 |
 | M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [x]    | 2bdb704 |
-| M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [x]    | _pending_ |
+| M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [x]    | f0df9b2 |
 | M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [ ]    |        |
 | M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [ ]    |        |
 | M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [ ]    |        |

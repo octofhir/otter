@@ -48,7 +48,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
-| M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`, `~x`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.         | [x]    | _pending_ |
+| M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`, `~x`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.         | [x]    | 4cea559 |
 | M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [ ]    |        |
 | M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [ ]    |        |
 | M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [ ]    |        |

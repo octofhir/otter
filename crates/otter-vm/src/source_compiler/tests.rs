@@ -2584,3 +2584,206 @@ fn sibling_blocks_reuse_the_same_reserved_slots() {
         30,
     );
 }
+
+// ---------------------------------------------------------------------------
+// M13: ConditionalExpression (a ? b : c) + logical &&, ||, ??
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ternary_truthy_branch() {
+    // Parameter n truthy → consequent.
+    assert_eq!(
+        run_int32_function("function f(n) { return n ? 10 : 20; }", &[5]),
+        10,
+    );
+}
+
+#[test]
+fn ternary_falsy_branch() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n ? 10 : 20; }", &[0]),
+        20,
+    );
+}
+
+#[test]
+fn ternary_negative_int_is_truthy() {
+    // Non-zero int32 (including negatives) is truthy in JS.
+    assert_eq!(
+        run_int32_function("function f(n) { return n ? 10 : 20; }", &[-3]),
+        10,
+    );
+}
+
+#[test]
+fn ternary_composes_with_binary_rhs() {
+    // `return 1 + (n ? 10 : 20);` — the ternary is the complex
+    // RHS of an Add, exercising the apply_binary_op_with_complex_rhs
+    // path.
+    assert_eq!(
+        run_int32_function("function f(n) { return 1 + (n ? 10 : 20); }", &[1]),
+        11,
+    );
+    assert_eq!(
+        run_int32_function("function f(n) { return 1 + (n ? 10 : 20); }", &[0]),
+        21,
+    );
+}
+
+#[test]
+fn nested_ternary_right_associative() {
+    // `a ? 1 : (b ? 2 : 3)` — the alternate is itself a ternary.
+    // Lowering recurses through the alternate's branch.
+    assert_eq!(
+        run_int32_function(
+            "function f(a) { let b = 1; return a ? 1 : (b ? 2 : 3); }",
+            &[0],
+        ),
+        2,
+    );
+}
+
+#[test]
+fn logical_and_short_circuits_on_falsy() {
+    // `0 && x` returns 0 — short-circuits, doesn't evaluate the
+    // right operand. We observe this via a local `x` that starts
+    // at 99 and would be reassigned by the right-hand if it ran.
+    // With short-circuit, the reassignment is skipped.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = 99; let y = n && (x = 1); return x; }",
+            &[0],
+        ),
+        99,
+    );
+}
+
+#[test]
+fn logical_and_evaluates_right_on_truthy() {
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = 99; let y = n && (x = 7); return x; }",
+            &[1],
+        ),
+        7,
+    );
+}
+
+#[test]
+fn logical_or_short_circuits_on_truthy() {
+    // `5 || x` returns 5 — short-circuits.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = 99; let y = n || (x = 1); return x; }",
+            &[5],
+        ),
+        99,
+    );
+}
+
+#[test]
+fn logical_or_evaluates_right_on_falsy() {
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let x = 99; let y = n || (x = 7); return x; }",
+            &[0],
+        ),
+        7,
+    );
+}
+
+#[test]
+fn logical_and_returns_left_value_when_falsy() {
+    // `0 && anything` returns `0`, not `false`. The test harness
+    // coerces back to i32, so returning 0 confirms we didn't
+    // coerce through ToBoolean somewhere.
+    assert_eq!(
+        run_int32_function("function f(n) { return n && 7; }", &[0]),
+        0,
+    );
+}
+
+#[test]
+fn logical_or_returns_left_value_when_truthy() {
+    assert_eq!(
+        run_int32_function("function f(n) { return n || 7; }", &[5]),
+        5,
+    );
+}
+
+#[test]
+fn nullish_coalesce_falls_through_for_null() {
+    // The int32 harness can't produce `null` directly. We rely on
+    // a local initialized from a sub-expression that returns null:
+    // `let x = (null);` — but the parser lowers `null` as
+    // `LdaNull`, so... actually we don't yet have null literal
+    // support in the source subset. Test via a value we CAN
+    // produce: the `void n` expression returns `undefined`.
+    // Confirming that `(void n) ?? 42` returns 42 verifies the
+    // undefined path of ??.
+    assert_eq!(
+        run_int32_function("function f(n) { return (void n) ?? 42; }", &[7]),
+        42,
+    );
+}
+
+#[test]
+fn nullish_coalesce_keeps_non_nullish_value() {
+    // `5 ?? 42` returns 5 — the non-null-non-undefined branch.
+    assert_eq!(
+        run_int32_function("function f() { return 5 ?? 42; }", &[]),
+        5,
+    );
+}
+
+#[test]
+fn nullish_coalesce_zero_is_not_nullish() {
+    // The whole point of `??` over `||`: `0 ?? 42` returns 0,
+    // because 0 is not null/undefined (just falsy).
+    assert_eq!(
+        run_int32_function("function f() { return 0 ?? 42; }", &[]),
+        0,
+    );
+}
+
+#[test]
+fn logical_and_in_if_condition() {
+    // `if (a && b) { ... }` — logical-expr in if-test position.
+    // a=1, b=0 → falsy → if skips.
+    assert_eq!(
+        run_int32_function(
+            "function f(a) { let b = 0; let r = 0; if (a && b) { r = 1; } return r; }",
+            &[1],
+        ),
+        0,
+    );
+    // a=1, b=1 → truthy → if fires.
+    assert_eq!(
+        run_int32_function(
+            "function f(a) { let b = 1; let r = 0; if (a && b) { r = 1; } return r; }",
+            &[1],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn logical_or_composes_with_ternary() {
+    // `(a || b) ? 1 : 0` — logical-or as the test of a ternary.
+    assert_eq!(
+        run_int32_function(
+            "function f(a) { let b = 0; return (a || b) ? 1 : 0; }",
+            &[0],
+        ),
+        // a=0, b=0 → 0 || 0 = 0 (falsy) → ternary takes alt (0).
+        0,
+    );
+    assert_eq!(
+        run_int32_function(
+            "function f(a) { let b = 0; return (a || b) ? 1 : 0; }",
+            &[5],
+        ),
+        // a=5, b=0 → 5 (truthy) → ternary takes consequent (1).
+        1,
+    );
+}

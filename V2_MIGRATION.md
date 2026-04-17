@@ -51,7 +51,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`, `~x`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.         | [x]    | 4cea559 |
 | M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [x]    | 2bdb704 |
 | M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [x]    | f0df9b2 |
-| M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [ ]    |        |
+| M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [x]    | _pending_ |
 | M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [ ]    |        |
 | M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [ ]    |        |
 | M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [ ]    |        |
@@ -101,6 +101,8 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals | yes | M10 |
 | `BreakStatement` / `ContinueStatement` (unlabelled) | yes | M11 |
 | Block scoping for `let` / `const` in `{ }` / `if` / `while` / `for` bodies | yes | M12 |
+| `ConditionalExpression` (`a ? b : c`) | yes | M13 |
+| `LogicalExpression` (`&&`, `\|\|`, `??`) | yes | M13 |
 
 ## Benchmarks
 

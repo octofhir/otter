@@ -120,10 +120,10 @@ use std::cell::{Cell, RefCell};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
-    BindingPattern, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
-    NumericLiteral, Program, SimpleAssignmentTarget, Statement, UnaryExpression, UnaryOperator,
-    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    BindingPattern, ConditionalExpression, Expression, FormalParameter, FormalParameters, Function,
+    FunctionBody, LogicalExpression, LogicalOperator, NumericLiteral, Program,
+    SimpleAssignmentTarget, Statement, UnaryExpression, UnaryOperator, UpdateExpression,
+    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -1532,6 +1532,8 @@ fn lower_return_expression(
         }
         Expression::UnaryExpression(unary) => lower_unary_expression(builder, ctx, unary),
         Expression::UpdateExpression(update) => lower_update_expression(builder, ctx, update),
+        Expression::ConditionalExpression(cond) => lower_conditional_expression(builder, ctx, cond),
+        Expression::LogicalExpression(logical) => lower_logical_expression(builder, ctx, logical),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -1746,6 +1748,173 @@ fn lower_update_expression(
             })
             .inspect_err(|_| ctx.release_temps(1))?;
         ctx.release_temps(1);
+    }
+    Ok(())
+}
+
+/// Lowers `test ? consequent : alternate` (ConditionalExpression).
+///
+/// Bytecode shape — the standard branch-and-join:
+///
+/// ```text
+///   <lower test>                ; acc = test
+///   JumpIfToBooleanFalse else_label
+///   <lower consequent>          ; acc = consequent
+///   Jump end_label
+/// else_label:
+///   <lower alternate>           ; acc = alternate
+/// end_label:
+/// ```
+///
+/// `JumpIfToBooleanFalse` takes the ToBoolean coercion path the
+/// interpreter already performs for `if` / `while` conditions, so
+/// any truthy-or-falsy JS value works as the test — not just a
+/// strict boolean. Result lands in the accumulator ready for
+/// composition with surrounding expressions.
+fn lower_conditional_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &ConditionalExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    let else_label = builder.new_label();
+    let end_label = builder.new_label();
+
+    lower_return_expression(builder, ctx, &expr.test)?;
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanFalse, else_label)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse (ternary): {err:?}"))
+        })?;
+    lower_return_expression(builder, ctx, &expr.consequent)?;
+    builder
+        .emit_jump_to(Opcode::Jump, end_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (ternary): {err:?}")))?;
+    builder
+        .bind_label(else_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind ternary else: {err:?}")))?;
+    lower_return_expression(builder, ctx, &expr.alternate)?;
+    builder
+        .bind_label(end_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind ternary end: {err:?}")))?;
+    Ok(())
+}
+
+/// Lowers `a && b` / `a || b` / `a ?? b` with the spec-mandated
+/// short-circuit semantics.
+///
+/// `&&` returns `a` if `a` is falsy (ToBoolean false), else `b`.
+/// `||` returns `a` if `a` is truthy (ToBoolean true), else `b`.
+/// `??` returns `a` if `a` is **neither** `null` nor `undefined`,
+/// else `b`. None of the operators coerce the surviving left-hand
+/// value — `0 && x` returns `0` (not `false`), `"" || x` returns
+/// `x` (after the truthy test on `""` sees falsy), and `null ?? x`
+/// returns `x`.
+///
+/// Bytecode shape (for `&&`, showing the representative
+/// branch-and-join):
+///
+/// ```text
+///   <lower left>                  ; acc = left
+///   JumpIfToBooleanFalse end      ; short-circuit: keep acc = left
+///   <lower right>                 ; acc = right
+/// end:
+/// ```
+///
+/// `||` uses `JumpIfToBooleanTrue` instead. `??` uses a two-step
+/// `JumpIfNotNull` + `JumpIfNotUndefined` sequence so the short-
+/// circuit only kicks in when `left` is not null/undefined.
+fn lower_logical_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &LogicalExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    lower_return_expression(builder, ctx, &expr.left)?;
+
+    match expr.operator {
+        LogicalOperator::And => {
+            let end_label = builder.new_label();
+            builder
+                .emit_jump_to(Opcode::JumpIfToBooleanFalse, end_label)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode JumpIfToBooleanFalse (&&): {err:?}"
+                    ))
+                })?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .bind_label(end_label)
+                .map_err(|err| SourceLoweringError::Internal(format!("bind &&: {err:?}")))?;
+        }
+        LogicalOperator::Or => {
+            let end_label = builder.new_label();
+            builder
+                .emit_jump_to(Opcode::JumpIfToBooleanTrue, end_label)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode JumpIfToBooleanTrue (||): {err:?}"
+                    ))
+                })?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .bind_label(end_label)
+                .map_err(|err| SourceLoweringError::Internal(format!("bind ||: {err:?}")))?;
+        }
+        LogicalOperator::Coalesce => {
+            // `a ?? b`: short-circuit to `end` when `a` is neither
+            // null nor undefined. Otherwise fall through to the
+            // right-hand lowering. The two-step probe exploits the
+            // existing `JumpIfNotNull` / `JumpIfNotUndefined`
+            // opcodes without introducing a new "is nullish" op.
+            //
+            // Control flow:
+            //   acc = a
+            //   if acc != null → jump check_undefined
+            //   // acc == null: fall through to lower b
+            //   <lower b>
+            //   jump end
+            //   check_undefined:
+            //   if acc != undefined → jump end (keep acc = a)
+            //   <lower b>   [reached only when acc was undefined]
+            //   end:
+            //
+            // The block below emits a simpler equivalent by sharing
+            // the right-hand lowering for both the null and
+            // undefined cases — a single `lower_right` block is
+            // used regardless of which nullish value matched.
+            let check_undefined = builder.new_label();
+            let lower_right_label = builder.new_label();
+            let end_label = builder.new_label();
+            builder
+                .emit_jump_to(Opcode::JumpIfNotNull, check_undefined)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode JumpIfNotNull (??): {err:?}"))
+                })?;
+            // `a` is null — fall through to the right-hand path.
+            builder
+                .emit_jump_to(Opcode::Jump, lower_right_label)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Jump (?? null → right): {err:?}"))
+                })?;
+            builder.bind_label(check_undefined).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind ?? check_undefined: {err:?}"))
+            })?;
+            // Not null — check undefined. If not undefined either,
+            // short-circuit to end keeping `acc = a`.
+            builder
+                .emit_jump_to(Opcode::JumpIfNotUndefined, end_label)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode JumpIfNotUndefined (??): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(lower_right_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind ?? lower_right: {err:?}"))
+            })?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .bind_label(end_label)
+                .map_err(|err| SourceLoweringError::Internal(format!("bind ?? end: {err:?}")))?;
+        }
     }
     Ok(())
 }
@@ -2132,7 +2301,9 @@ fn apply_binary_op_with_acc_lhs(
         | Expression::ParenthesizedExpression(_)
         | Expression::AssignmentExpression(_)
         | Expression::UnaryExpression(_)
-        | Expression::UpdateExpression(_) => {
+        | Expression::UpdateExpression(_)
+        | Expression::ConditionalExpression(_)
+        | Expression::LogicalExpression(_) => {
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         other => Err(SourceLoweringError::unsupported(

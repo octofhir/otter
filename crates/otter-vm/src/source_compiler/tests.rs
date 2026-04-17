@@ -1312,7 +1312,7 @@ fn if_with_return_only_branch_still_requires_trailing_return() {
 
 #[test]
 fn while_loop_sums_zero_to_n() {
-    // The canonical M7 shape from `V2_MIGRATION_PLAN.md`. Closes
+    // The canonical M7 shape (see `V2_MIGRATION.md`). Closes
     // bench2.ts: int32 accumulator loop with the `(s + i) | 0`
     // truncation idiom. Validates the consolidated
     // `lower_accumulator_operand` accepts a parenthesised binary

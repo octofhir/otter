@@ -1755,8 +1755,8 @@ mod tests {
     }
 
     /// Microbenchmark for the M7 bench2 sum-loop — the canonical
-    /// int32 accumulator loop that the V2_MIGRATION_PLAN reserves
-    /// for M7's full benchmark vs `bun` and `node`. Measures the
+    /// int32 accumulator loop reserved for M7's full benchmark vs
+    /// `bun` and `node` (see `V2_MIGRATION.md`). Measures the
     /// per-call latency of `sum(1_000_000)` through the v2
     /// interpreter on a persistent `RuntimeState` after a
     /// 100-iteration warmup, and prints a `bench2 interp:` line for
@@ -1784,8 +1784,8 @@ mod tests {
         use oxc_span::SourceType;
         use std::time::Instant;
 
-        // Canonical M7 source from V2_MIGRATION_PLAN.md, written
-        // with single-declarator lets so it stays parseable on the
+        // Canonical M7 source (see V2_MIGRATION.md), written with
+        // single-declarator lets so it stays parseable on the
         // even-narrower M4 surface too. The functional shape is
         // identical to `let s = 0, i = 0;`.
         let source = "function sum(n) { \

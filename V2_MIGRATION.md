@@ -2,7 +2,7 @@
 
 Canonicalizing OtterJS onto a single v2 bytecode pipeline. One milestone per commit; the quality gate runs green before each.
 
-Design doc: internal — see repo memory / conversation history. The prior scoping doc `V2_MIGRATION_PLAN.md` was the pre-approval draft and is retained for history only.
+Design doc: this file — it's both the tracker and the forward plan. Commit messages, `JIT_REFACTOR_PLAN.md`, and repo memory carry the fine-grained history behind each milestone.
 
 ## Quality gate (all four green before a milestone commits)
 
@@ -29,8 +29,52 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [x]    | d02fce5 |
 | M8       | `ForStatement` (desugar to while).                                                                                             | [x]    | 5ad7cfe |
 | M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [x]    | f6ea6a5 |
-| M_JIT_x86_64 | Cranelift / hand-rolled x86_64 backend for the JIT baseline.                                                               | [ ]    |        |
-| M10+     | Closures, globals, `console.log`, classes, async, generators, destructuring, property access, exceptions, exports/imports.       | [ ]    |        |
+
+### JIT track (ships first, blocks M10+)
+
+See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per milestone.
+
+| ID       | Scope                                                                                                                          | Status | Commit |
+|----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
+| M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [ ]    |        |
+| M_JIT_B  | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [ ]    |        |
+| M_JIT_C  | (deferred) OSR into hot loops + speculative int32-trust elision from persistent arithmetic feedback.                             | [ ]    |        |
+
+### Feature track (after JIT completion)
+
+Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus a `docs(v2-migration): record Mxx commit hash …` follow-up.
+
+| ID       | Scope                                                                                                                          | Status | Commit |
+|----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
+| M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.              | [ ]    |        |
+| M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [ ]    |        |
+| M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [ ]    |        |
+| M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [ ]    |        |
+| M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [ ]    |        |
+| M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [ ]    |        |
+| M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [ ]    |        |
+| M17      | Property access: `StaticMemberExpression` (`o.x`), `ComputedMemberExpression` (`o[k]`), read + write.                            | [ ]    |        |
+| M18      | Template literals (simple + interpolated).                                                                                       | [ ]    |        |
+| M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [ ]    |        |
+| M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [ ]    |        |
+| M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [ ]    |        |
+| M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [ ]    |        |
+| M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [ ]    |        |
+| M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [ ]    |        |
+| M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [ ]    |        |
+| M26      | Arrow functions + lexical `this` binding.                                                                                       | [ ]    |        |
+| M27      | Class declaration: constructor + instance methods + static methods.                                                             | [ ]    |        |
+| M28      | Class inheritance (`extends` + `super` + `super(args)` in constructor).                                                         | [ ]    |        |
+| M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [ ]    |        |
+| M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [ ]    |        |
+| M31      | `for (k in obj)` + property iteration.                                                                                         | [ ]    |        |
+| M32      | Promise runtime + microtask queue.                                                                                             | [ ]    |        |
+| M33      | `async` functions + `await` expression.                                                                                         | [ ]    |        |
+| M34      | Generators (`function*`, `yield`, `yield*`).                                                                                   | [ ]    |        |
+| M35      | ES module imports + exports.                                                                                                    | [ ]    |        |
+| M36      | `BigIntLiteral` + BigInt arithmetic + `RegExpLiteral` + basic `RegExp` match.                                                  | [ ]    |        |
+
+Ordering follows a dependency chain where possible (`console.log` after property access + strings, `extends` after class declaration), but nothing is chiselled — M15/M16 can swap, M24/M25 can swap, etc. Re-order at execution time as real blocking dependencies surface.
 
 ## AST coverage (v2 source compiler)
 

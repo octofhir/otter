@@ -154,14 +154,29 @@ impl Interpreter {
             // attached sparsely by the source compiler, so recording a
             // non-existent slot is a no-op.
             Opcode::Add => {
+                // M15: generic `+`. Int32 fast path stays on the
+                // hot path (and records `Int32` feedback so
+                // `M_JIT_C.2` trust-int32 elision continues to
+                // apply); anything non-int32 falls through to
+                // `RuntimeState::js_add`, which implements the
+                // full §13.15.3 ApplyStringOrNumericBinaryOperator
+                // sequence including string concatenation. Taking
+                // the generic path forces `ArithmeticFeedback::Any`
+                // so any later JIT recompile keeps the tag guard
+                // and bailout pad intact.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                activation.set_accumulator(
-                    activation
-                        .accumulator()
-                        .add_i32(rhs)
-                        .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
-                );
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                match acc.add_i32(rhs) {
+                    Ok(sum) => {
+                        activation.set_accumulator(sum);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                    }
+                    Err(_) => {
+                        let result = runtime.js_add(acc, rhs)?;
+                        activation.set_accumulator(result);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                    }
+                }
             }
             Opcode::Sub => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -261,10 +276,23 @@ impl Interpreter {
             // a successful Smi op necessarily saw an int32 acc, so we
             // record `ArithmeticFeedback::Int32` at each op's PC.
             Opcode::AddSmi => {
+                // M15: AddSmi mirrors Add's generic fallback — when
+                // acc isn't int32 (e.g. a string from `LdaConstStr`
+                // feeding `"px:" + 5`), fall through to
+                // `RuntimeState::js_add` against the immediate
+                // materialised as an i32 RegisterValue, and demote
+                // feedback to `Any`.
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_add(v)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                if let Some(l) = acc.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_add(v)));
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                } else {
+                    let rhs = RegisterValue::from_i32(v);
+                    let result = runtime.js_add(acc, rhs)?;
+                    activation.set_accumulator(result);
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                }
             }
             Opcode::SubSmi => {
                 let v = imm(&instr.operands, 0)?;

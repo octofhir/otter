@@ -2968,3 +2968,193 @@ fn unknown_global_identifier_still_rejected() {
         "unexpected err: {err:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// M15: StringLiteral + string concatenation (`+` on mixed operands)
+// ---------------------------------------------------------------------------
+
+/// Reads the return value as a UTF-8 `String`. Expects the return to
+/// be a heap-allocated `JsString` object handle (the only way
+/// M15-lowered programs produce strings). Panics on any other shape
+/// — the caller's test is asserting a string result.
+fn run_string_function(source: &str, args: &[RegisterValue]) -> String {
+    let module = compile(source).expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).expect("module has entry function");
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    for (i, v) in args.iter().enumerate() {
+        registers[hidden + i] = *v;
+    }
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    runtime
+        .js_to_string_infallible(result.return_value())
+        .into_string()
+}
+
+#[test]
+fn string_literal_returns_string() {
+    let module = compile("function f() { return \"hello\"; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    // The function's string-literal side table must hold exactly
+    // one entry — the literal we returned.
+    assert_eq!(function.string_literals().len(), 1);
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let ret = result.return_value();
+    assert!(
+        ret.as_object_handle().is_some(),
+        "string literal must lower to an object handle",
+    );
+    let text = runtime.js_to_string_infallible(ret);
+    assert_eq!(text.as_ref(), "hello");
+}
+
+#[test]
+fn two_literal_string_concat() {
+    assert_eq!(
+        run_string_function("function f() { return \"a\" + \"b\"; }", &[]),
+        "ab",
+    );
+}
+
+#[test]
+fn literal_plus_identifier_concat() {
+    // `"hello, " + name` where `name` is a parameter. The string
+    // literal lowers to acc via `LdaConstStr`, then `Add reg(name)`
+    // follows through `apply_binary_op_with_acc_lhs`' identifier
+    // branch — the simple path, no temp spill needed.
+    let module = compile("function greet(name) { return \"hello, \" + name; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.string_literals().len(), 1);
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    // Allocate a runtime-owned string for the parameter.
+    let arg_handle = runtime.alloc_string("otter");
+    registers[hidden] = RegisterValue::from_object_handle(arg_handle.0);
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(
+        runtime
+            .js_to_string_infallible(result.return_value())
+            .as_ref(),
+        "hello, otter",
+    );
+}
+
+#[test]
+fn identifier_plus_literal_concat_preserves_order() {
+    // `name + "!"` — identifier first, literal second. RHS is a
+    // StringLiteral which falls into the complex-RHS path; the
+    // 2-temp fallback must preserve LHS → RHS order so the result
+    // is `name + "!"`, not `"!" + name`.
+    let module = compile("function punct(name) { return name + \"!\"; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let arg_handle = runtime.alloc_string("otter");
+    registers[hidden] = RegisterValue::from_object_handle(arg_handle.0);
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(
+        runtime
+            .js_to_string_infallible(result.return_value())
+            .as_ref(),
+        "otter!",
+    );
+}
+
+#[test]
+fn int_plus_string_coerces_to_string() {
+    // `5 + "px"` — §13.15.3 step 5: once either operand is a
+    // string, both stringify and concat. The LHS lowers as
+    // `LdaSmi 5`; RHS is a StringLiteral on the complex-RHS path.
+    assert_eq!(
+        run_string_function("function f() { return 5 + \"px\"; }", &[]),
+        "5px",
+    );
+}
+
+#[test]
+fn string_plus_int_coerces_to_string() {
+    assert_eq!(
+        run_string_function("function f() { return \"px:\" + 5; }", &[]),
+        "px:5",
+    );
+}
+
+#[test]
+fn compound_plus_assign_on_string_local() {
+    // `let s = "a"; s += "b"; return s;` — `+=` desugars to a
+    // compound assignment that re-uses the Add encoding. The RHS
+    // literal goes through the complex-RHS path (two-temp
+    // preserve-order).
+    assert_eq!(
+        run_string_function("function f() { let s = \"a\"; s += \"b\"; return s; }", &[],),
+        "ab",
+    );
+}
+
+#[test]
+fn three_way_string_concat_left_associative() {
+    // `"x" + "y" + "z"` — parses as `(("x" + "y") + "z")`. The
+    // inner binary's result feeds the outer Add as acc-producing
+    // expression; the outer RHS ("z") is a StringLiteral going
+    // through the complex-RHS path.
+    assert_eq!(
+        run_string_function("function f() { return \"x\" + \"y\" + \"z\"; }", &[]),
+        "xyz",
+    );
+}
+
+#[test]
+fn string_interner_dedups_repeated_literals() {
+    // Two references to `"hello"` must share a single side-table
+    // slot. Mirrors the M14 property-name interner test.
+    let module = compile("function f() { let a = \"hello\"; let b = \"hello\"; return b; }")
+        .expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.string_literals().len(), 1);
+}
+
+#[test]
+fn int32_add_regression_after_noncommutative_marker() {
+    // Addition now advertises `commutative: false` so the
+    // complex-RHS fallback preserves evaluation order (needed for
+    // string concat). Pure int32 addition must still produce the
+    // same result it always did, including the nested
+    // conditional-RHS shape that exercises the 2-temp path.
+    assert_eq!(
+        run_int32_function("function f(n) { return 1 + (n ? 10 : 20); }", &[1]),
+        11,
+    );
+    assert_eq!(
+        run_int32_function("function f(n) { return 1 + (n ? 10 : 20); }", &[0]),
+        21,
+    );
+    // Int32 + identifier also stays int32 — feedback slot should
+    // still record `Int32` here so `M_JIT_C.2` can elide the tag
+    // guard on hot loops like bench2.
+    assert_eq!(
+        run_int32_function("function f(n) { return n + 1; }", &[41]),
+        42
+    );
+}

@@ -341,14 +341,15 @@ fn lower_function_declaration<'a>(
     // resolve `bytecode.feedback().get(pc) -> FeedbackSlot` against a
     // well-shaped `FeedbackVector`.
     let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
-    // M14: wire the accumulated property-name and float-constant
-    // interners into the function's side tables so `LdaGlobal` /
-    // `LdaConstF64` can resolve their `Idx` operands at runtime.
-    // Other tables (strings, bigints, closures, calls, regexps)
-    // stay default-empty until later milestones exercise them.
+    // M14/M15: wire the accumulated property-name, float-constant,
+    // and string-literal interners into the function's side tables
+    // so `LdaGlobal` / `LdaConstF64` / `LdaConstStr` can resolve
+    // their `Idx` operands at runtime. Other tables (bigints,
+    // closures, calls, regexps) stay default-empty until later
+    // milestones exercise them.
     let side_tables = crate::module::FunctionSideTables::new(
         body_out.property_names,
-        Default::default(),
+        body_out.string_literals,
         body_out.float_constants,
         Default::default(),
         Default::default(),
@@ -379,6 +380,7 @@ struct FunctionBodyOutput {
     feedback_slot_count: u16,
     property_names: crate::property::PropertyNameTable,
     float_constants: crate::float::FloatTable,
+    string_literals: crate::string::StringTable,
 }
 
 /// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
@@ -487,6 +489,7 @@ fn lower_function_body<'a>(
         feedback_slot_count: ctx.feedback_slot_count(),
         property_names: ctx.take_property_names(),
         float_constants: ctx.take_float_constants(),
+        string_literals: ctx.take_string_literals(),
     })
 }
 
@@ -1064,6 +1067,12 @@ struct LoweringContext<'a> {
     /// [`FloatTable::new`](crate::float::FloatTable::new) at
     /// function finalisation.
     float_constants: RefCell<Vec<f64>>,
+    /// Deduplicated string-literal interner (M15). Grows when the
+    /// compiler emits `LdaConstStr` for a string literal. Handed to
+    /// [`StringTable::new`](crate::string::StringTable::new) at
+    /// function finalisation so the dispatcher can resolve the
+    /// `Idx` operand back to a `JsString` at runtime.
+    string_literals: RefCell<Vec<String>>,
 }
 
 /// `break` / `continue` jump targets for one loop frame. `break_label`
@@ -1113,6 +1122,7 @@ impl<'a> LoweringContext<'a> {
             scope_starts: RefCell::new(Vec::new()),
             property_names: RefCell::new(Vec::new()),
             float_constants: RefCell::new(Vec::new()),
+            string_literals: RefCell::new(Vec::new()),
         }
     }
 
@@ -1154,6 +1164,25 @@ impl<'a> LoweringContext<'a> {
     /// Finalise the float-constant interner into an immutable table.
     fn take_float_constants(&self) -> crate::float::FloatTable {
         crate::float::FloatTable::new(self.float_constants.borrow().clone())
+    }
+
+    /// Intern a string literal into the function's side table,
+    /// returning its index for use as an `Idx` operand on
+    /// `LdaConstStr`. Dedup is O(N) on an already-small table.
+    fn intern_string_literal(&self, value: &str) -> Result<u32, SourceLoweringError> {
+        let mut tbl = self.string_literals.borrow_mut();
+        if let Some(pos) = tbl.iter().position(|n| n == value) {
+            return Ok(pos as u32);
+        }
+        let idx = u32::try_from(tbl.len())
+            .map_err(|_| SourceLoweringError::Internal("string literal table overflow".into()))?;
+        tbl.push(value.to_owned());
+        Ok(idx)
+    }
+
+    /// Finalise the string-literal interner into an immutable table.
+    fn take_string_literals(&self) -> crate::string::StringTable {
+        crate::string::StringTable::new(self.string_literals.borrow().clone())
     }
 
     /// Push a fresh [`LoopLabels`] frame onto the stack. Paired 1:1
@@ -1678,6 +1707,19 @@ fn lower_return_expression(
                 .map_err(|err| SourceLoweringError::Internal(format!("encode LdaBool: {err:?}")))?;
             Ok(())
         }
+        Expression::StringLiteral(lit) => {
+            // M15: intern the literal's UTF-8 value into the
+            // function's string-literal side table and emit
+            // `LdaConstStr <idx>`. The interpreter materialises a
+            // runtime-owned `JsString` on demand (§6.1.4).
+            let idx = ctx.intern_string_literal(lit.value.as_str())?;
+            builder
+                .emit(Opcode::LdaConstStr, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaConstStr: {err:?}"))
+                })?;
+            Ok(())
+        }
         Expression::BinaryExpression(binary) => lower_binary_expression(builder, ctx, binary),
         Expression::AssignmentExpression(assign) => {
             // Nested assignment (`return x = 5;`, `let y = x = 5;`).
@@ -2110,7 +2152,16 @@ fn binary_op_encoding(op: BinaryOperator) -> Option<BinaryOpEncoding> {
         Addition => BinaryOpEncoding {
             reg_opcode: Opcode::Add,
             smi_opcode: Some(Opcode::AddSmi),
-            commutative: true,
+            // M15: JS `+` is non-commutative on strings (`"a" + "b"`
+            // ≠ `"b" + "a"`) even though int32 addition is. The
+            // complex-RHS fallback must preserve LHS/RHS ordering so
+            // string concat composes correctly, so the encoding
+            // advertises `commutative: false` and takes the 2-temp
+            // path. Int32 `a + b` stays correct because it's
+            // genuinely commutative; the only cost is one extra temp
+            // slot on nested-binary RHS shapes that rarely appear in
+            // hot loops.
+            commutative: false,
             label: "Add",
         },
         Subtraction => BinaryOpEncoding {
@@ -2457,9 +2508,9 @@ fn apply_binary_op_with_acc_lhs(
         }
         // Complex RHS shapes — a call, a nested binary, a
         // parenthesised binary, an assignment expression, a unary /
-        // update expression, etc. The RHS lowering would clobber
-        // acc (which currently holds the LHS), so we spill LHS to a
-        // temp first, then re-stitch.
+        // update expression, a null/boolean/string literal, etc.
+        // The RHS lowering would clobber acc (which currently holds
+        // the LHS), so we spill LHS to a temp first, then re-stitch.
         Expression::CallExpression(_)
         | Expression::BinaryExpression(_)
         | Expression::ParenthesizedExpression(_)
@@ -2467,7 +2518,10 @@ fn apply_binary_op_with_acc_lhs(
         | Expression::UnaryExpression(_)
         | Expression::UpdateExpression(_)
         | Expression::ConditionalExpression(_)
-        | Expression::LogicalExpression(_) => {
+        | Expression::LogicalExpression(_)
+        | Expression::StringLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_) => {
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         other => Err(SourceLoweringError::unsupported(

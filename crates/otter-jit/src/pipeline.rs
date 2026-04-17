@@ -2,7 +2,7 @@
 //!
 //! The pipeline owns a single `Tier::Baseline` path: the template
 //! baseline lowers a narrow int32-arithmetic-loop subset of the Ignition
-//! bytecode into an x21-pinned aarch64 stencil. Anything outside that
+//! bytecode into a host-native baseline stencil. Anything outside that
 //! subset is rejected (returned as `JitError::UnsupportedInstruction`
 //! from the analyzer), and the caller (tier-up hook) falls back to the
 //! interpreter.
@@ -91,9 +91,9 @@ pub fn clear_helper_symbols() {
 /// Returns `Err(JitError::UnsupportedInstruction(_))` when the function
 /// does not fit the baseline subset; the tier-up hook treats that as a
 /// soft "leave running in the interpreter" signal rather than a crash.
-/// On aarch64 hosts a successful compile returns a [`CompiledFunction`]
+/// On supported hosts (`aarch64`, `x86_64`) a successful compile returns a [`CompiledFunction`]
 /// whose `entry` pointer is callable as
-/// `extern "C" fn(*mut JitContext) -> u64`. Non-aarch64 hosts always
+/// `extern "C" fn(*mut JitContext) -> u64`. Other hosts
 /// return `Err(JitError::UnsupportedHostArch(_))`.
 pub fn compile_function(function: &vm::Function) -> Result<CompiledFunction, JitError> {
     compile_template_baseline(function, None)

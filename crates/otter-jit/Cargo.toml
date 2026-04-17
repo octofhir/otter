@@ -24,7 +24,7 @@ cranelift-native = "0.129.1"
 smallvec = "1"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-iced-x86 = { version = "1", default-features = false, features = ["decoder", "intel", "gas", "nasm"] }
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 bad64 = "0.12"

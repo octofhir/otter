@@ -16,7 +16,7 @@
 //!         ↓
 //!   [emit_template_stencil]
 //!         ↓
-//!   x21-pinned aarch64 code
+//!   host-pinned accumulator baseline code
 //! ```
 
 use otter_vm::bytecode::{InstructionIter, Opcode, Operand};
@@ -129,7 +129,7 @@ pub enum TemplateInstruction {
 }
 
 /// Comparison kind carried across `CompareAcc` → `JumpIfCompareFalse`.
-/// The emitter uses this to pick the right ARM condition code.
+/// The emitter uses this to pick the right host condition code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareKind {
     Lt,
@@ -526,7 +526,7 @@ fn resolve_byte_target(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4.2 emitter: aarch64 stencil generation for a TemplateProgram.
+// Phase 4.2 emitter: host-arch stencil generation for a TemplateProgram.
 // ---------------------------------------------------------------------------
 
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
@@ -582,7 +582,7 @@ enum AccState {
     Raw,
 }
 
-/// Emit a Phase 4.5b aarch64 stencil for a [`TemplateProgram`].
+/// Emit a Phase 4.5b template-baseline stencil for a [`TemplateProgram`].
 ///
 /// Every `ldr` that loads a slot interpreted as int32 is paired with a
 /// `eor / tst / b.ne <bailout_pad>` guard against
@@ -610,7 +610,11 @@ pub fn emit_template_stencil(
     {
         emit_template_stencil_aarch64(program)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        emit_template_stencil_x64(program)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = program;
         Err(TemplateEmitError::UnsupportedHostArch(
@@ -1389,6 +1393,662 @@ fn emit_template_stencil_aarch64(
     Ok(buf)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn emit_template_stencil_x64(
+    program: &TemplateProgram,
+) -> Result<crate::arch::CodeBuffer, TemplateEmitError> {
+    use crate::arch::CodeBuffer;
+    use crate::arch::x64::{Assembler, Cond, Reg};
+
+    fn slot_offset(program: &TemplateProgram, slot: u16) -> Result<u32, TemplateEmitError> {
+        let absolute_slot = program
+            .user_visible_base
+            .checked_add(slot)
+            .ok_or(TemplateEmitError::RegisterSlotOutOfRange { slot })?;
+        let byte_offset = u32::from(absolute_slot) * 8;
+        if byte_offset > u32::MAX - 8 {
+            return Err(TemplateEmitError::RegisterSlotOutOfRange { slot });
+        }
+        Ok(byte_offset)
+    }
+
+    fn load_int32_guarded(
+        asm: &mut Assembler,
+        dst: Reg,
+        slot_off: u32,
+        byte_pc: u32,
+        acc_state_at_guard: AccState,
+        bailout_patches: &mut Vec<BailoutPatch>,
+    ) {
+        asm.mov_mr_u32(dst, Reg::R12, slot_off);
+        asm.check_int32_tag_fast(dst, Reg::Rax, Reg::R14);
+        let bp = asm.b_cond_placeholder(Cond::Ne);
+        bailout_patches.push(BailoutPatch {
+            source_offset: bp,
+            byte_pc,
+            reason: crate::BailoutReason::TypeGuardFailed as u32,
+            acc_state: acc_state_at_guard,
+        });
+        asm.sxtw(dst, dst);
+    }
+
+    fn store_accumulator(asm: &mut Assembler, state: AccState, slot_off: u32) {
+        match state {
+            AccState::Int32 => {
+                asm.box_int32(Reg::R10, Reg::R13);
+                asm.mov_rm_u32(Reg::R12, slot_off, Reg::R10);
+            }
+            AccState::Raw => {
+                asm.mov_rm_u32(Reg::R12, slot_off, Reg::R13);
+            }
+        }
+    }
+
+    fn emit_unconditional_bailout(
+        asm: &mut Assembler,
+        byte_pc: u32,
+        reason: u32,
+        acc_state: AccState,
+        bailout_patches: &mut Vec<BailoutPatch>,
+    ) {
+        let bp = asm.b_placeholder();
+        bailout_patches.push(BailoutPatch {
+            source_offset: bp,
+            byte_pc,
+            reason,
+            acc_state,
+        });
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct BranchPatch {
+        source_offset: u32,
+        target_byte_pc: u32,
+        cond: Option<Cond>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct BailoutPatch {
+        source_offset: u32,
+        byte_pc: u32,
+        reason: u32,
+        acc_state: AccState,
+    }
+
+    let mut buf = CodeBuffer::new();
+    let mut asm = Assembler::new(&mut buf);
+
+    // SysV x86_64 ABI:
+    //   rdi = JitContext* on entry
+    //   rbx = pinned JitContext*
+    //   r12 = pinned registers_base
+    //   r13 = pinned accumulator
+    //   r14 = pinned TAG_INT32
+    //   r10/r11/rax = scratch
+    asm.push_callee_saved();
+    asm.mov_rr(Reg::Rbx, Reg::Rdi);
+    asm.mov_mr_u32(
+        Reg::R12,
+        Reg::Rbx,
+        crate::context::offsets::REGISTERS_BASE as u32,
+    );
+    asm.mov_imm64(Reg::R14, TAG_INT32);
+    asm.mov_imm64(Reg::R13, 0);
+
+    let mut branch_patches: Vec<BranchPatch> = Vec::new();
+    let mut bailout_patches: Vec<BailoutPatch> = Vec::new();
+    let mut byte_pc_to_emit: Vec<(u32, u32)> = Vec::with_capacity(program.instructions.len());
+    let mut acc_states: Vec<AccState> = Vec::with_capacity(program.instructions.len());
+    let mut acc_state = AccState::Int32;
+
+    let n = program.instructions.len();
+    let mut i = 0;
+    while i < n {
+        let byte_pc = program.byte_pcs[i];
+        byte_pc_to_emit.push((byte_pc, asm.position()));
+
+        match &program.instructions[i] {
+            TemplateInstruction::LdaI32 { imm } => {
+                asm.mov_imm64(Reg::R13, *imm as i64 as u64);
+                acc_state = AccState::Int32;
+            }
+            TemplateInstruction::Star { reg } => {
+                store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
+            }
+            TemplateInstruction::Ldar { reg } => {
+                load_int32_guarded(
+                    &mut asm,
+                    Reg::R13,
+                    slot_offset(program, *reg)?,
+                    byte_pc,
+                    AccState::Raw,
+                    &mut bailout_patches,
+                );
+                acc_state = AccState::Int32;
+            }
+            TemplateInstruction::AddAcc { rhs } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R10,
+                        slot_offset(program, *rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.add_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::SubAcc { rhs } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R10,
+                        slot_offset(program, *rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.sub_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::MulAcc { rhs } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R10,
+                        slot_offset(program, *rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.mul_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::BitOrAcc { rhs } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R10,
+                        slot_offset(program, *rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.orr_rrr(Reg::R13, Reg::R13, Reg::R10);
+                }
+            }
+            TemplateInstruction::AddAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, *imm as i64 as u64);
+                    asm.add_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::SubAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, *imm as i64 as u64);
+                    asm.sub_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::BitOrAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, *imm as i64 as u64);
+                    asm.orr_rrr(Reg::R13, Reg::R13, Reg::R10);
+                }
+            }
+            TemplateInstruction::CompareAcc { rhs, .. } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R10,
+                        slot_offset(program, *rhs)?,
+                        byte_pc,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                    asm.cmp_rr(Reg::R13, Reg::R10);
+                }
+            }
+            TemplateInstruction::JumpIfAccFalse { target_pc } => {
+                let fused_cond = match i.checked_sub(1).and_then(|p| program.instructions.get(p)) {
+                    Some(TemplateInstruction::CompareAcc { kind, .. }) => Some(match kind {
+                        CompareKind::Lt => Cond::Ge,
+                        CompareKind::Gt => Cond::Le,
+                        CompareKind::Lte => Cond::Gt,
+                        CompareKind::Gte => Cond::Lt,
+                        CompareKind::EqStrict => Cond::Ne,
+                    }),
+                    _ => None,
+                };
+                if let Some(cond) = fused_cond {
+                    let src = asm.b_cond_placeholder(cond);
+                    branch_patches.push(BranchPatch {
+                        source_offset: src,
+                        target_byte_pc: *target_pc,
+                        cond: Some(cond),
+                    });
+                } else if acc_state == AccState::Int32 {
+                    asm.test_rr(Reg::R13, Reg::R13);
+                    let src = asm.b_cond_placeholder(Cond::Eq);
+                    branch_patches.push(BranchPatch {
+                        source_offset: src,
+                        target_byte_pc: *target_pc,
+                        cond: Some(Cond::Eq),
+                    });
+                } else {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                }
+            }
+            TemplateInstruction::JumpIfCompareFalse {
+                target_pc,
+                compare_kind,
+            } => {
+                let cond = match compare_kind {
+                    CompareKind::Lt => Cond::Ge,
+                    CompareKind::Gt => Cond::Le,
+                    CompareKind::Lte => Cond::Gt,
+                    CompareKind::Gte => Cond::Lt,
+                    CompareKind::EqStrict => Cond::Ne,
+                };
+                let src = asm.b_cond_placeholder(cond);
+                branch_patches.push(BranchPatch {
+                    source_offset: src,
+                    target_byte_pc: *target_pc,
+                    cond: Some(cond),
+                });
+            }
+            TemplateInstruction::Jump { target_pc } => {
+                let src = asm.b_placeholder();
+                branch_patches.push(BranchPatch {
+                    source_offset: src,
+                    target_byte_pc: *target_pc,
+                    cond: None,
+                });
+            }
+            TemplateInstruction::ReturnAcc => {
+                match acc_state {
+                    AccState::Int32 => asm.box_int32(Reg::Rax, Reg::R13),
+                    AccState::Raw => asm.mov_rr(Reg::Rax, Reg::R13),
+                }
+                asm.pop_callee_saved();
+                asm.ret();
+            }
+            TemplateInstruction::LdaTagConst { value } => {
+                asm.mov_imm64(Reg::R13, *value);
+                acc_state = AccState::Raw;
+            }
+            TemplateInstruction::Mov { dst, src } => {
+                asm.mov_mr_u32(Reg::R10, Reg::R12, slot_offset(program, *src)?);
+                asm.mov_rm_u32(Reg::R12, slot_offset(program, *dst)?, Reg::R10);
+            }
+            TemplateInstruction::IncAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, 1);
+                    asm.add_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::DecAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, 1);
+                    asm.sub_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::NegateAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, 0);
+                    asm.sub_rrr(Reg::R13, Reg::R10, Reg::R13);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::BitNotAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.not_r(Reg::R13);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::MulAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, *imm as i64 as u64);
+                    asm.mul_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::BitAndAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    asm.mov_imm64(Reg::R10, *imm as i64 as u64);
+                    asm.and_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::ShlAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    let shift = ((*imm as u32) & 0x1F) as u8;
+                    asm.shl_r32_i(Reg::R13, shift);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::ShrAccI32 { imm } => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                } else {
+                    let shift = ((*imm as u32) & 0x1F) as u8;
+                    asm.sar_r32_i(Reg::R13, shift);
+                    asm.sxtw(Reg::R13, Reg::R13);
+                }
+            }
+            TemplateInstruction::LdaThis => {
+                asm.mov_mr_u32(Reg::R13, Reg::Rbx, crate::context::offsets::THIS_RAW as u32);
+                acc_state = AccState::Raw;
+            }
+            TemplateInstruction::LdaCurrentClosure => {
+                asm.mov_mr_u32(
+                    Reg::R13,
+                    Reg::Rbx,
+                    crate::context::offsets::CALLEE_RAW as u32,
+                );
+                acc_state = AccState::Raw;
+            }
+            TemplateInstruction::ToNumberAcc => {
+                if acc_state != AccState::Int32 {
+                    emit_unconditional_bailout(
+                        &mut asm,
+                        byte_pc,
+                        crate::BailoutReason::TypeGuardFailed as u32,
+                        acc_state,
+                        &mut bailout_patches,
+                    );
+                }
+            }
+            TemplateInstruction::CallDirect {
+                callee: _,
+                arg_base: _,
+                arg_count: _,
+            } => {
+                emit_unconditional_bailout(
+                    &mut asm,
+                    byte_pc,
+                    crate::BailoutReason::Unsupported as u32,
+                    acc_state,
+                    &mut bailout_patches,
+                );
+            }
+        }
+        acc_states.push(acc_state);
+        i += 1;
+    }
+
+    let bailout_common = asm.position();
+    asm.mov_rm_u32_32(
+        Reg::Rbx,
+        crate::context::offsets::BAILOUT_PC as u32,
+        Reg::R10,
+    );
+    asm.mov_rm_u32_32(
+        Reg::Rbx,
+        crate::context::offsets::BAILOUT_REASON as u32,
+        Reg::R11,
+    );
+    asm.mov_imm64(Reg::Rax, crate::BAILOUT_SENTINEL);
+    asm.pop_callee_saved();
+    asm.ret();
+
+    struct PadInfo {
+        entry_offset: u32,
+        tail_branch_offset: u32,
+    }
+    let mut pad_infos: Vec<PadInfo> = Vec::with_capacity(bailout_patches.len());
+    for patch in &bailout_patches {
+        let pad_pos = asm.position();
+        match patch.acc_state {
+            AccState::Int32 => {
+                asm.box_int32(Reg::R10, Reg::R13);
+                asm.mov_rm_u32(
+                    Reg::Rbx,
+                    crate::context::offsets::ACCUMULATOR_RAW as u32,
+                    Reg::R10,
+                );
+            }
+            AccState::Raw => {
+                asm.mov_rm_u32(
+                    Reg::Rbx,
+                    crate::context::offsets::ACCUMULATOR_RAW as u32,
+                    Reg::R13,
+                );
+            }
+        }
+        asm.mov_imm64(Reg::R10, u64::from(patch.byte_pc));
+        asm.mov_imm64(Reg::R11, u64::from(patch.reason));
+        let tail = asm.b_placeholder();
+        pad_infos.push(PadInfo {
+            entry_offset: pad_pos,
+            tail_branch_offset: tail,
+        });
+    }
+
+    let _ = asm;
+
+    for patch in &branch_patches {
+        let Some(&(_, target_off)) = byte_pc_to_emit
+            .iter()
+            .find(|(bpc, _)| *bpc == patch.target_byte_pc)
+        else {
+            return Err(TemplateEmitError::UnresolvedBranchTarget {
+                target_byte_pc: patch.target_byte_pc,
+            });
+        };
+
+        let source_len = if patch.cond.is_some() { 6 } else { 5 };
+        let rel_bytes = target_off as i64 - (patch.source_offset as i64 + source_len);
+        if rel_bytes < i64::from(i32::MIN) || rel_bytes > i64::from(i32::MAX) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: patch.target_byte_pc,
+            });
+        }
+        let rel = rel_bytes as i32 as u32;
+        let patch_off = if patch.cond.is_some() {
+            patch.source_offset + 2
+        } else {
+            patch.source_offset + 1
+        };
+        if !buf.patch_u32_le(patch_off, rel) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: patch.target_byte_pc,
+            });
+        }
+    }
+
+    for (patch, pad) in bailout_patches.iter().zip(pad_infos.iter()) {
+        let Some(first_byte) = buf.bytes().get(patch.source_offset as usize).copied() else {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: pad.entry_offset,
+            });
+        };
+        let is_conditional = first_byte == 0x0F;
+        let source_len = if is_conditional { 6 } else { 5 };
+        let rel_bytes = pad.entry_offset as i64 - (patch.source_offset as i64 + source_len);
+        if rel_bytes < i64::from(i32::MIN) || rel_bytes > i64::from(i32::MAX) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: pad.entry_offset,
+            });
+        }
+        let rel = rel_bytes as i32 as u32;
+        let patch_off = if is_conditional {
+            patch.source_offset + 2
+        } else {
+            patch.source_offset + 1
+        };
+        if !buf.patch_u32_le(patch_off, rel) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: patch.source_offset,
+                target_byte_pc: pad.entry_offset,
+            });
+        }
+    }
+
+    for pad in &pad_infos {
+        let rel_bytes = bailout_common as i64 - (pad.tail_branch_offset as i64 + 5);
+        if rel_bytes < i64::from(i32::MIN) || rel_bytes > i64::from(i32::MAX) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: pad.tail_branch_offset,
+                target_byte_pc: bailout_common,
+            });
+        }
+        if !buf.patch_u32_le(pad.tail_branch_offset + 1, rel_bytes as i32 as u32) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: pad.tail_branch_offset,
+                target_byte_pc: bailout_common,
+            });
+        }
+    }
+
+    let _ = acc_states;
+
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,7 +2365,7 @@ mod tests {
     /// End-to-end smoke test that routes a source-compiled JS function
     /// through the production `otter` CLI, which in turn executes the
     /// hot inner function via `DefaultTierUpHook::execute_cached`.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn stencil_invocation_smoke() {
         use std::fs;
@@ -1764,7 +2424,7 @@ mod tests {
         let _ = fs::remove_file(&script_path);
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn recursion_factorial_caches_template_baseline_entry() {
         code_cache::clear();
@@ -1911,6 +2571,62 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn m2_stencil_disassembly_sanity() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+
+        let module = compile_source_module("function f(n) { return n + 1; }", "f.js");
+        let function = module
+            .function(FunctionIndex(0))
+            .expect("module has entry function");
+
+        let program = analyze_template_candidate(function).expect("analyze");
+        assert_eq!(
+            program.instructions.as_slice(),
+            &[
+                TemplateInstruction::Ldar { reg: 0 },
+                TemplateInstruction::AddAccI32 { imm: 1 },
+                TemplateInstruction::ReturnAcc,
+            ],
+            "analyzer must lower the M1 source to a Ldar / AddSmi / Return triple",
+        );
+
+        let buf = emit_template_stencil(&program).expect("emit stencil");
+        let bytes = buf.bytes();
+        assert!(!bytes.is_empty(), "emitter produced no code");
+
+        let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+        let mut mnemonics = Vec::new();
+        while decoder.can_decode() {
+            let insn = decoder.decode();
+            mnemonics.push(insn.mnemonic());
+        }
+
+        let has = |needle: Mnemonic| mnemonics.contains(&needle);
+
+        assert!(
+            has(Mnemonic::Mov),
+            "prologue/immediates missing MOV: {mnemonics:?}"
+        );
+        assert!(has(Mnemonic::Xor), "guard missing XOR: {mnemonics:?}");
+        assert!(has(Mnemonic::Shr), "guard missing SHR: {mnemonics:?}");
+        assert!(has(Mnemonic::Jne), "guard missing JNE: {mnemonics:?}");
+        assert!(
+            has(Mnemonic::Movsxd),
+            "missing MOVSXD sign-extension: {mnemonics:?}",
+        );
+        assert!(has(Mnemonic::Add), "missing ADD: {mnemonics:?}");
+        assert!(has(Mnemonic::Or), "missing OR (box_int32): {mnemonics:?}");
+        assert!(has(Mnemonic::Ret), "missing RET: {mnemonics:?}");
+
+        assert!(
+            bytes.len() <= 220,
+            "M1 x86_64 stencil larger than expected: {} bytes (target ≤ 220)",
+            bytes.len(),
+        );
+    }
+
     /// Microbenchmark for the M1 source `function f(n) { return n + 1 }`
     /// running through the v2 interpreter. Reports `interp: <ns/iter>` to
     /// stdout for the V2_MIGRATION.md benchmarks table.
@@ -1931,7 +2647,7 @@ mod tests {
     /// either (a) M9 + M7 give us a JS loop that calls f, or (b) the
     /// production tier-up path can be exercised from a unit test on
     /// macOS without UE zombies.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[ignore = "M1 microbenchmark — run manually via `--ignored m1_microbench --nocapture`"]
     #[test]
     fn m1_microbench() {
@@ -2004,7 +2720,14 @@ mod tests {
     /// `DefaultTierUpHook::execute_cached` directly so the benchmark
     /// measures the production entry path without reintroducing raw
     /// stencil calls from the harness.
-    #[cfg(target_arch = "aarch64")]
+    ///
+    /// Test-only env overrides:
+    /// `OTTER_BENCH2_N`, `OTTER_BENCH2_WARMUP_CALLS`, `OTTER_BENCH2_CALLS`.
+    /// Defaults stay pinned to the tracker rows; the overrides exist so
+    /// slower cross-target runs (for example Rosetta x86_64 on Apple
+    /// Silicon) can still produce a local comparison inside the fixed
+    /// timeout budget.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[ignore = "M7 bench2 microbench — run manually via `--ignored bench2_microbench --nocapture`"]
     #[test]
     fn bench2_microbench() {
@@ -2012,6 +2735,14 @@ mod tests {
         use otter_vm::value::RegisterValue;
         use otter_vm::{Interpreter, RuntimeState};
         use std::time::Instant;
+
+        fn env_u32(name: &str, default: u32) -> u32 {
+            std::env::var(name)
+                .ok()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        }
 
         // Canonical M7 source (see V2_MIGRATION.md), written with
         // single-declarator lets so it stays parseable on the
@@ -2036,8 +2767,8 @@ mod tests {
         // Loop limit. Match V2_MIGRATION.md's "10⁶ iter" target so
         // the latency row is comparable to the eventual bun / node
         // numbers.
-        const N: i32 = 1_000_000;
-        registers[hidden] = RegisterValue::from_i32(N);
+        let n = i32::try_from(env_u32("OTTER_BENCH2_N", 1_000_000)).unwrap_or(1_000_000);
+        registers[hidden] = RegisterValue::from_i32(n);
 
         let interpreter = Interpreter::new();
         let mut runtime = RuntimeState::new();
@@ -2045,8 +2776,8 @@ mod tests {
         // Warmup — `sum(N)` runs N iterations internally, so 100
         // calls = 10⁸ inner iterations. Plenty to prime any
         // thread-local state in the interpreter.
-        const WARMUP_CALLS: u32 = 100;
-        for _ in 0..WARMUP_CALLS {
+        let warmup_calls = env_u32("OTTER_BENCH2_WARMUP_CALLS", 100);
+        for _ in 0..warmup_calls {
             let result = interpreter
                 .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
                 .expect("warmup execute");
@@ -2057,10 +2788,10 @@ mod tests {
         // iters total. Per-call latency is the headline number;
         // per-inner-iter is reported alongside for direct
         // comparison with bun/node sum-loop benchmarks.
-        const CALLS: u32 = 50;
+        let calls = env_u32("OTTER_BENCH2_CALLS", 50);
         let started = Instant::now();
         let mut acc: i64 = 0;
-        for _ in 0..CALLS {
+        for _ in 0..calls {
             let result = interpreter
                 .execute_with_runtime(&module, FunctionIndex(0), &registers, &mut runtime)
                 .expect("measured execute");
@@ -2076,12 +2807,12 @@ mod tests {
         assert_ne!(acc, 0, "sum returned zero unexpectedly");
 
         let total_ns = elapsed.as_nanos();
-        let total_inner_iters = u128::from(CALLS) * u128::from(N as u32);
-        let per_call_ns = total_ns / u128::from(CALLS);
+        let total_inner_iters = u128::from(calls) * u128::from(n as u32);
+        let per_call_ns = total_ns / u128::from(calls);
         let per_inner_iter_ns = total_ns / total_inner_iters;
         println!(
             "bench2 interp: {per_call_ns} ns/call ({per_inner_iter_ns} ns/inner-iter, \
-             {} ms total over {CALLS} calls × {N} iter, acc={acc})",
+             {} ms total over {calls} calls × {n} iter, acc={acc})",
             elapsed.as_millis(),
         );
 
@@ -2094,8 +2825,8 @@ mod tests {
             (&mut runtime as *mut RuntimeState).cast::<()>(),
         ));
 
-        let mut jit_registers = register_window(function, &[N]);
-        for _ in 0..WARMUP_CALLS {
+        let mut jit_registers = register_window(function, &[n]);
+        for _ in 0..warmup_calls {
             match hook.execute_cached(
                 &module,
                 FunctionIndex(0),
@@ -2112,8 +2843,8 @@ mod tests {
 
         let jit_started = Instant::now();
         let mut jit_acc: i64 = 0;
-        for _ in 0..CALLS {
-            jit_registers[hidden] = RegisterValue::from_i32(N);
+        for _ in 0..calls {
+            jit_registers[hidden] = RegisterValue::from_i32(n);
             match hook.execute_cached(
                 &module,
                 FunctionIndex(0),
@@ -2133,11 +2864,11 @@ mod tests {
         assert_ne!(jit_acc, 0, "JIT sum returned zero unexpectedly");
 
         let jit_total_ns = jit_elapsed.as_nanos();
-        let jit_per_call_ns = jit_total_ns / u128::from(CALLS);
+        let jit_per_call_ns = jit_total_ns / u128::from(calls);
         let jit_per_inner_iter_ns = jit_total_ns / total_inner_iters;
         println!(
             "bench2 jit: {jit_per_call_ns} ns/call ({jit_per_inner_iter_ns} ns/inner-iter, \
-             {} ms total over {CALLS} calls × {N} iter, acc={jit_acc})",
+             {} ms total over {calls} calls × {n} iter, acc={jit_acc})",
             jit_elapsed.as_millis(),
         );
         assert!(

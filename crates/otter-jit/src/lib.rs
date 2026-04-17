@@ -1,8 +1,8 @@
 //! Otter JIT for OtterJS.
 //!
 //! Single-tier template-baseline compiler: Ignition bytecode is walked
-//! once and lowered into an x21-pinned aarch64 stencil (interpreter
-//! fallback on non-aarch64 hosts). Earlier iterations shipped a MIR →
+//! once and lowered into a host-native baseline stencil (interpreter
+//! fallback on unsupported hosts). Earlier iterations shipped a MIR →
 //! CLIF Tier 2 path and a v1 baseline; both have been retired.
 //!
 //! # Architecture
@@ -87,7 +87,7 @@ pub enum JitError {
     /// Code cache capacity exhausted.
     #[error("code cache full")]
     CodeCacheFull,
-    /// Host architecture has no code emitter (non-aarch64 today).
+    /// Host architecture has no code emitter.
     #[error("unsupported host architecture: {0}")]
     UnsupportedHostArch(&'static str),
     /// Unexpected internal error (not a correctness violation).

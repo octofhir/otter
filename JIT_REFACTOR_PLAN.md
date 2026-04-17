@@ -1,11 +1,11 @@
 # Otter JIT Refactor Plan
 
-> Status (2026-04-17): M0–M9 of the v2 migration have shipped, and
-> `M_JIT_A` has now landed on top: the aarch64 baseline runs real
-> source-compiled JS through `TierUpHook::execute_cached`, uses per-load
-> int32 tag guards + bailout pads, and caches recursive `CallDirect`
-> bodies as deopt-friendly template stencils. The next JIT milestone is
-> `M_JIT_B` (x86_64 backend parity).
+> Status (2026-04-17): M0–M9 of the v2 migration have shipped, and the
+> v2 baseline now runs on both supported native backends:
+> `M_JIT_A` landed the guarded aarch64 path and `M_JIT_B` lands x86_64
+> parity. Real source-compiled JS now flows through
+> `TierUpHook::execute_cached` on both arches; the next JIT milestone is
+> `M_JIT_C` (OSR + speculative int32-trust).
 >
 > Rule: this document tracks the **design direction** behind the JIT,
 > not the feature roadmap. Feature milestones live in `V2_MIGRATION.md`;
@@ -30,13 +30,14 @@
   `ToString`/`ToPropertyKey`), TDZ guards (`AssertNotHole`/
   `ThrowConstAssign`/`AssertConstructor`).
 - **v2 baseline JIT** ([`crates/otter-jit/src/baseline/mod.rs`](crates/otter-jit/src/baseline/mod.rs))
-  — acc-aware `TemplateInstruction` IR + x21-pinned aarch64 emitter.
-  The shipped path now translates bytecode-visible registers through the
-  frame's hidden-slot base, tag-guards every int32 load, writes
-  `(bailout_pc, bailout_reason, accumulator_raw)` on side exits, and
-  treats `CallDirect` bodies as cacheable deopt boundaries so recursive
-  functions still get template stencils. `bench2.ts sum(10⁶)` measures
-  **2 ns/inner-iter** in the release microbench.
+  — acc-aware `TemplateInstruction` IR + host-native emitters for
+  aarch64 and x86_64. Both shipped paths translate bytecode-visible
+  registers through the frame's hidden-slot base, tag-guard every int32
+  load, write `(bailout_pc, bailout_reason, accumulator_raw)` on side
+  exits, and treat `CallDirect` bodies as cacheable deopt boundaries so
+  recursive functions still get template stencils. `bench2.ts sum(10⁶)`
+  measures **2 ns/inner-iter** on native aarch64 and **3 ns/inner-iter**
+  on the Rosetta-friendly x86_64 local sample.
 - **Tier-up plumbing**: `DefaultTierUpHook` in
   [`crates/otter-jit/src/tier_up_hook.rs`](crates/otter-jit/src/tier_up_hook.rs)
   is installed into every `OtterRuntime`. Inner calls routed through
@@ -46,19 +47,20 @@
 
 ### What's still latent
 
-The remaining JIT work is now downstream of `M_JIT_A`:
+The remaining JIT work is now downstream of `M_JIT_B`:
 
-1. **x86_64 backend parity is still missing.** `M_JIT_B` ports the same
-   template-baseline subset, guard model, and bailout contract to the
-   x86_64 assembler.
-2. **Direct in-process stencil calls from Rust tests on Apple Silicon
+1. **Direct in-process stencil calls from Rust tests on Apple Silicon
    remain hostile.** The regression-safe smoke coverage therefore uses
    the real `otter` subprocess rather than reintroducing raw harness
    calls; production CLI/runtime execution is the canonical path.
+2. **Full x86_64 release microbench sampling is still expensive on
+   Apple Silicon.** The backend itself runs and the Rosetta local sample
+   proves a large JIT win, but the default 50-call `bench2_microbench`
+   exceeds the fixed 180-second timeout under Rosetta.
 3. **OSR + speculative int32-trust remain deferred.** Back-edge entry
    and feedback-driven guard elision are still the `M_JIT_C` work.
 
-### Benchmarks (M2 + M7)
+### Benchmarks (M2 + M7 + M_JIT_B)
 
 - **`f(42)` interpreter** (M1 shape): **496 ns/iter** on aarch64, 10⁶
   iterations via `Interpreter::execute_with_runtime`.
@@ -67,6 +69,12 @@ The remaining JIT work is now downstream of `M_JIT_A`:
 - **`bench2.ts sum(10⁶)` JIT**: **2 ns/inner-iter** (≈ 2.51 ms/call)
   on aarch64 via `DefaultTierUpHook::execute_cached` after
   `try_compile(sum)`.
+- **`bench2.ts sum(10⁶)` x86_64 local sample**: **1348 ns/inner-iter**
+  (≈ 1348 ms/call) in the interpreter vs **3 ns/inner-iter** (≈ 3.30
+  ms/call) in the JIT on `x86_64-apple-darwin` under Rosetta, measured
+  with `OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1` because the
+  default 50-call release benchmark exceeds the fixed 180-second local
+  timeout on Apple Silicon.
 
 Both benchmarks live in
 [`crates/otter-jit/src/baseline/mod.rs::tests`](crates/otter-jit/src/baseline/mod.rs)
@@ -77,8 +85,9 @@ cargo test -p otter-jit --release -- --ignored m1_microbench     --nocapture
 cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 ```
 
-The aarch64 JIT rows above are the `M_JIT_A` completion marker; the next
-benchmark gap is x86_64 parity (`M_JIT_B`).
+The aarch64 rows above are the `M_JIT_A` completion marker; the x86_64
+local sample above is the `M_JIT_B` completion marker on this Apple
+Silicon host.
 
 ### Regression status (post-M9)
 
@@ -86,7 +95,9 @@ benchmark gap is x86_64 parity (`M_JIT_B`).
 | --- | --- |
 | `cargo test -p otter-vm --lib` | **371 / 371** |
 | `cargo test -p otter-jit --lib` | **21 / 21** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **24 / 24** (2 ignored — `m1_microbench` + `bench2_microbench`) |
 | `cargo build --workspace` | green |
+| `cargo build --workspace --target x86_64-apple-darwin` | green |
 | `cargo clippy --workspace --all-targets -- -D warnings` | green |
 | `cargo fmt --all --check` | green |
 
@@ -149,7 +160,7 @@ Concrete tasks:
 
 1. **x86_64 macro assembler.** Port the helpers the aarch64 emitter
    relies on to
-   [`crates/otter-jit/src/arch/x86_64.rs`](crates/otter-jit/src/arch/x86_64.rs):
+   [`crates/otter-jit/src/arch/x64.rs`](crates/otter-jit/src/arch/x64.rs):
    `push_callee_saved` / `pop_callee_saved`, `mov_imm64`,
    `check_int32_tag_fast`, `eor_rrr` / `and_rrr` / `orr_rrr`,
    `add_rrr` / `sub_rrr` / `mul_rrr`, `cmp_rr`, `b_cond_placeholder`,
@@ -209,7 +220,7 @@ Deferred until M_JIT_A and M_JIT_B both ship. Work items:
 - **Source compiler**: [`crates/otter-vm/src/source_compiler/`](crates/otter-vm/src/source_compiler/) —
   `mod.rs` (lowering) + `error.rs` + `tests.rs`.
 - **JIT baseline**: [`crates/otter-jit/src/baseline/mod.rs`](crates/otter-jit/src/baseline/mod.rs)
-  (analyzer + x21-pinned aarch64 emitter).
+  (analyzer + aarch64/x86_64 emitters).
 - **Pipeline routing**: [`crates/otter-jit/src/pipeline.rs`](crates/otter-jit/src/pipeline.rs) —
   `compile_function` / `compile_function_with_feedback`.
 - **Tier-up hook**: [`crates/otter-jit/src/tier_up_hook.rs`](crates/otter-jit/src/tier_up_hook.rs)
@@ -218,6 +229,7 @@ Deferred until M_JIT_A and M_JIT_B both ship. Work items:
 - **Activation fields**: [`crates/otter-vm/src/interpreter/activation.rs`](crates/otter-vm/src/interpreter/activation.rs)
   — `accumulator`, `secondary_result`.
 - **aarch64 assembler**: [`crates/otter-jit/src/arch/aarch64.rs`](crates/otter-jit/src/arch/aarch64.rs).
+- **x86_64 assembler**: [`crates/otter-jit/src/arch/x64.rs`](crates/otter-jit/src/arch/x64.rs).
 
 ## Reproduction commands
 
@@ -312,6 +324,17 @@ guarded emitter partially wired and the invocation smoke test
   `CompiledCodeOrigin::TemplateBaseline`, and `bench2_microbench`
   reports **2 ns/inner-iter** (≈ 2.51 ms/call) on Apple Silicon.
   Commit: `96d8534`.
+- 2026-04-17: **M_JIT_B landed** — the v2 template baseline now emits
+  x86_64 SysV stencils through `arch/x64.rs`, pinning `rbx`/`r12`/`r13`
+  /`r14` to `(JitContext*, registers_base, accumulator, TAG_INT32)`,
+  mirroring the aarch64 bailout contract, and reusing the same analyzer
+  output and `TierUpHook::execute_cached` path for real JS execution.
+  x86_64 debug lib tests pass under `--target x86_64-apple-darwin`,
+  `stencil_invocation_smoke` and the `fact(7)` cache-origin check now
+  run on both supported JIT arches, and the local Rosetta bench2 sample
+  measures **1348 ns/inner-iter** in the interpreter vs **3 ns/inner-iter**
+  in the JIT (`OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1`).
+  Commit: `_pending_`.
 
 ---
 

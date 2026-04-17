@@ -37,7 +37,7 @@ See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
 | M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [x]    | 96d8534 |
-| M_JIT_B  | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [ ]    |        |
+| M_JIT_B  | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [x]    | _pending_ |
 | M_JIT_C  | (deferred) OSR into hot loops + speculative int32-trust elision from persistent arithmetic feedback.                             | [ ]    |        |
 
 ### Feature track (after JIT completion)
@@ -98,7 +98,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 
 ## Benchmarks
 
-After M7 the `bench2.ts` sum-loop becomes the baseline for latency vs `bun run` and `node --experimental-vm-modules`, recorded for aarch64 interpreter and aarch64 JIT. Until then the M2 `f(42)` micro-row tracks per-call interpreter latency for the M1 lowering — useful as a regression floor while later milestones widen the source-compiler subset.
+After M7 the `bench2.ts` sum-loop becomes the baseline for latency vs `bun run` and `node --experimental-vm-modules`, recorded first for aarch64 interpreter/JIT and then for the x86_64 baseline backend once `M_JIT_B` lands. Until then the M2 `f(42)` micro-row tracks per-call interpreter latency for the M1 lowering — useful as a regression floor while later milestones widen the source-compiler subset.
 
 Reproduce the M2 + M7 rows with:
 
@@ -112,9 +112,12 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 | `f(42)` (10⁶ iter, aarch64)       | 496 ns/iter  | —         | —   | —    |
 | `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64) | 416 ms/call | 2.51 ms/call | — | — |
 | `bench2.ts sum(10⁶)` per-inner-iter (aarch64) | 416 ns/iter | 2 ns/iter | — | — |
+| `bench2.ts sum(10⁶)` per-call (1× warmup-1, x86_64-apple-darwin under Rosetta) | 1348 ms/call | 3.30 ms/call | — | — |
+| `bench2.ts sum(10⁶)` per-inner-iter (x86_64-apple-darwin under Rosetta) | 1348 ns/iter | 3 ns/iter | — | — |
 
 ## Notes
 
 - v1 still reachable via `git show <pre-M0-commit>:<path>` for historical reference; the working tree contains only v2.
 - Until M1 lands, `otter run foo.js` returns a `SourceLoweringError::Unsupported { construct: "program", ... }` and a non-zero exit status. This is the expected post-M0 state.
 - Integration tests deleted in M0 are rebuilt incrementally — each subsequent milestone adds fresh tests for the feature it introduces.
+- The x86_64 `bench2_microbench` rows above were measured with `OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1` on Apple Silicon because the default 50-call release benchmark exceeds the fixed 180-second timeout under Rosetta; the benchmark's default path is unchanged for native x86_64 hosts.

@@ -36,7 +36,7 @@ See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per
 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
-| M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [x]    | _pending_ |
+| M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [x]    | 96d8534 |
 | M_JIT_B  | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [ ]    |        |
 | M_JIT_C  | (deferred) OSR into hot loops + speculative int32-trust elision from persistent arithmetic feedback.                             | [ ]    |        |
 

@@ -311,7 +311,7 @@ guarded emitter partially wired and the invocation smoke test
   `otter` CLI path, `fact(7)` caches as
   `CompiledCodeOrigin::TemplateBaseline`, and `bench2_microbench`
   reports **2 ns/inner-iter** (≈ 2.51 ms/call) on Apple Silicon.
-  Commit: `_pending_`.
+  Commit: `96d8534`.
 
 ---
 

@@ -3,9 +3,11 @@
 > Status (2026-04-17): M0–M9 of the v2 migration have shipped, and the
 > v2 baseline now runs on both supported native backends:
 > `M_JIT_A` landed the guarded aarch64 path and `M_JIT_B` lands x86_64
-> parity. Real source-compiled JS now flows through
-> `TierUpHook::execute_cached` on both arches; the next JIT milestone is
-> `M_JIT_C` (OSR + speculative int32-trust).
+> parity. `M_JIT_C.1` then added mid-loop OSR on top of the existing
+> tier-up hook, so a hot loop in the entry function now enters compiled
+> code at its back-edge instead of waiting for the next function call.
+> Feedback-driven int32-trust elision (`M_JIT_C.2`) and the loop-local
+> register allocator (`M_JIT_C.3`) are the remaining JIT milestones.
 >
 > Rule: this document tracks the **design direction** behind the JIT,
 > not the feature roadmap. Feature milestones live in `V2_MIGRATION.md`;
@@ -47,7 +49,7 @@
 
 ### What's still latent
 
-The remaining JIT work is now downstream of `M_JIT_B`:
+The remaining JIT work is now downstream of `M_JIT_C.1`:
 
 1. **Direct in-process stencil calls from Rust tests on Apple Silicon
    remain hostile.** The regression-safe smoke coverage therefore uses
@@ -57,10 +59,15 @@ The remaining JIT work is now downstream of `M_JIT_B`:
    Apple Silicon.** The backend itself runs and the Rosetta local sample
    proves a large JIT win, but the default 50-call `bench2_microbench`
    exceeds the fixed 180-second timeout under Rosetta.
-3. **OSR + speculative int32-trust remain deferred.** Back-edge entry
-   and feedback-driven guard elision are still the `M_JIT_C` work.
+3. **Speculative int32-trust elision (`M_JIT_C.2`) is still deferred.**
+   The `analyze_template_candidate_with_feedback` + `trust_int32` side
+   table is sketched but inactive; feedback-slot allocation on the
+   source compiler side is the wiring that remains.
+4. **Loop-local register allocator (`M_JIT_C.3`) is still deferred.**
+   Hot int32 loop-carried slots still round-trip through memory on
+   every iteration — the biggest single remaining throughput win.
 
-### Benchmarks (M2 + M7 + M_JIT_B)
+### Benchmarks (M2 + M7 + M_JIT_B + M_JIT_C.1)
 
 - **`f(42)` interpreter** (M1 shape): **496 ns/iter** on aarch64, 10⁶
   iterations via `Interpreter::execute_with_runtime`.
@@ -87,15 +94,20 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 
 The aarch64 rows above are the `M_JIT_A` completion marker; the x86_64
 local sample above is the `M_JIT_B` completion marker on this Apple
-Silicon host.
+Silicon host. `M_JIT_C.1` keeps these steady-state numbers untouched
+(the cached stencil dominates once warmup lands on function entry) and
+adds back-edge OSR for the cold-loop shape: a one-shot 100k-iter
+`main` loop that previously ran in the interpreter end-to-end now tiers
+up mid-loop after ≈1500 back-edges and finishes execution in the JIT,
+as verified by `osr_smoke`.
 
-### Regression status (post-M9)
+### Regression status (post-M_JIT_C.1)
 
 | Command | Pass / Total |
 | --- | --- |
 | `cargo test -p otter-vm --lib` | **371 / 371** |
-| `cargo test -p otter-jit --lib` | **21 / 21** (2 ignored — `m1_microbench` + `bench2_microbench`) |
-| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **24 / 24** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib` | **22 / 22** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **25 / 25** (2 ignored — `m1_microbench` + `bench2_microbench`) |
 | `cargo build --workspace` | green |
 | `cargo build --workspace --target x86_64-apple-darwin` | green |
 | `cargo clippy --workspace --all-targets -- -D warnings` | green |
@@ -189,25 +201,62 @@ Concrete tasks:
 - `bench2.ts sum(10⁶)` runs through the x86_64 JIT with measurable
   speedup vs the x86_64 interpreter.
 
-### M_JIT_C — OSR + speculative int32-trust (deferred)
+### M_JIT_C.1 — mid-loop OSR
 
-Deferred until M_JIT_A and M_JIT_B both ship. Work items:
+**Shipped.** A hot loop in the entry function (or any function that
+function-entry tier-up doesn't already cover) enters compiled code at
+its back-edge instead of waiting for the next call. The template
+baseline now emits one OSR trampoline per loop header whose first body
+op is safe to re-enter with a raw-bit accumulator reload (`Ldar`,
+`LdaI32`, `LdaTagConst`, `LdaThis`, `LdaCurrentClosure`, `Mov`); other
+loop headers stay interpreter-only. The interpreter's run loop
+snapshots PC before each `step`, detects a back-edge on `Continue`, and
+calls [`TierUpHook::execute_cached_at_pc`](crates/otter-vm/src/interpreter/tier_up.rs)
+once the back-edge budget exhausts; bailouts restore the frame and
+resume interpretation in-place.
 
-1. **Mid-loop OSR.** Sparkplug-style `pc_offsets` side table so a hot
-   loop can enter compiled code at a back-edge without waiting for the
-   next function call.
-2. **Speculative int32-trust elision.** When a PC's persistent
-   `ArithmeticFeedback` has stabilized at `Int32`, skip the tag guard
-   for that PC. The `analyze_template_candidate_with_feedback` plumbing
-   + `trust_int32: Vec<bool>` side table is already sketched;
-   activation just needs feedback wiring from the source compiler side.
-3. **Loop-local register allocator** (Sparkplug-per-function). Pin the
-   loop-carried int32 variables into callee-saved registers so the
-   body doesn't round-trip through memory on every iteration. Scope:
-   ~500 LOC in
-   [`crates/otter-jit/src/baseline/mod.rs`](crates/otter-jit/src/baseline/mod.rs).
-   Analysis pass + modified emitter. Opens the door to 10–20×
-   additional speedup on tight int32 loops.
+### M_JIT_C.2 — speculative int32-trust elision (deferred)
+
+1. **Feedback-slot allocation in the source compiler.** For every
+   arithmetic opcode emitted on the hot path (`Add`, `Sub`, `Mul`,
+   `BitwiseOr`/`And`/`Xor`, `Shl`, `Shr`, `UShr`, and their `*Smi`
+   variants), allocate a slot in the function's `FeedbackTableLayout`
+   so the interpreter has somewhere to persist `ArithmeticFeedback`.
+2. **Feedback recording in the interpreter.** Write `Int32` when both
+   operands were int32; write `NotInt32`/`Any` otherwise.
+3. **Activate `analyze_template_candidate_with_feedback`.** Wire
+   [`compile_function_with_feedback`](crates/otter-jit/src/pipeline.rs)
+   to pass the function's current `FeedbackVector` through; on recompile,
+   PCs with stable `Int32` feedback get `trust_int32[i] = true`.
+4. **Emitter elision.** When `trust_int32[i]` is true, skip
+   `check_int32_tag_fast` + the conditional bailout branch on the
+   instruction's loads. Apply on both aarch64 and x86_64.
+5. **Deopt demotes feedback.** If a guard elsewhere still fires on a
+   trust-int32 PC, demote the feedback slot and invalidate the cached
+   stencil so the next tier-up recompile goes back to the guarded
+   variant.
+6. **Stencil-size regression test.** Warm up feedback at Int32, force a
+   recompile, assert the new stencil is strictly smaller than the cold
+   stencil.
+
+### M_JIT_C.3 — loop-local register allocator (deferred)
+
+1. **Liveness + loop-carried analysis.** Identify slots that are
+   written, read, and live across the back-edge.
+2. **Register allocation pass.** Assign up to N (aarch64: 6; x86_64:
+   ~4–6) callee-saved registers to the top-N liveness-ranked candidates.
+3. **Emitter integration.** Emit a prologue that loads each pinned slot
+   on loop entry, an epilogue that stores pinned registers back on
+   fall-through and every bailout site, and rewrite reads/writes of
+   pinned slots inside the body into register ops.
+4. **Bailout spill correctness.** Extend the existing bailout prologue
+   to spill all currently-pinned registers back to their slots so the
+   interpreter resumes with a coherent frame.
+5. **Cross-arch parity.** Share the allocation decision across aarch64
+   and x86_64 emitters.
+6. **Disassembly sanity test.** Assert the inner loop of
+   `bench2.ts sum(10⁶)` no longer issues `ldr`/`str` on the pinned `s`
+   and `i` slots.
 
 ---
 
@@ -335,6 +384,18 @@ guarded emitter partially wired and the invocation smoke test
   measures **1348 ns/inner-iter** in the interpreter vs **3 ns/inner-iter**
   in the JIT (`OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1`).
   Commit: `e1b907a`.
+- 2026-04-17: **M_JIT_C.1 landed** — the v2 template baseline now emits
+  per-loop-header OSR trampolines (prologue + `accumulator_raw`
+  rehydrate + unconditional jump into the body) on both aarch64 and
+  x86_64, the code cache exposes them via `osr_native_offset`, the
+  `TierUpHook` trait grew `execute_cached_at_pc`, and the interpreter's
+  run loop detects back-edges by comparing PC before/after each `step`
+  and calls the hook once the JSC-style back-edge budget exhausts.
+  `bench2_microbench` JIT stays at **2 ns/inner-iter** on aarch64 (no
+  regression vs M_JIT_B), and the new `osr_smoke` integration test
+  confirms a single-function 100k-iter loop tiers up mid-loop through
+  the real `otter` CLI with `--dump-jit-stats` showing `1 JIT / 0
+  interpreter entries` for `main`. Commit: `_pending_`.
 
 ---
 

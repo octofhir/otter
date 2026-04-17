@@ -157,6 +157,102 @@ impl TierUpHook for DefaultTierUpHook {
         TierUpExecResult::Return(value)
     }
 
+    fn execute_cached_at_pc(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        registers_base: *mut RegisterValue,
+        register_count: usize,
+        this_raw: u64,
+        runtime_ptr: *mut (),
+        interrupt_flag: *const u8,
+        byte_pc: u32,
+        accumulator_raw: u64,
+    ) -> TierUpExecResult {
+        let function = match module.function(function_index) {
+            Some(f) => f,
+            None => return TierUpExecResult::NotCompiled,
+        };
+        let function_ptr: *const Function = function;
+
+        // Resolve the OSR trampoline offset for this PC. Returns None if
+        // the function isn't cached or this PC isn't a registered loop
+        // header.
+        let Some(osr_offset) = code_cache::osr_native_offset(function_ptr, byte_pc) else {
+            return TierUpExecResult::NotCompiled;
+        };
+        let Some(entry_base) = code_cache::get(function_ptr) else {
+            return TierUpExecResult::NotCompiled;
+        };
+
+        let register_count_u32 = u32::try_from(register_count).unwrap_or(u32::MAX);
+
+        let heap_slots_base: *const () = if runtime_ptr.is_null() {
+            std::ptr::null()
+        } else {
+            // SAFETY: `runtime_ptr` is a live `*mut RuntimeState`, provided by
+            // the interpreter immediately before invoking this hook.
+            let runtime = unsafe { &*(runtime_ptr as *const RuntimeState) };
+            runtime.heap().slots_ptr()
+        };
+
+        let mut ctx = JitContext {
+            registers_base: registers_base.cast::<u64>(),
+            local_count: register_count_u32,
+            register_count: register_count_u32,
+            constants: std::ptr::null(),
+            this_raw,
+            interrupt_flag,
+            interpreter: std::ptr::null(),
+            vm_ctx: null_mut(),
+            function_ptr: function_ptr.cast::<()>(),
+            upvalues_ptr: std::ptr::null(),
+            upvalue_count: 0,
+            callee_raw: RegisterValue::undefined().raw_bits(),
+            home_object_raw: RegisterValue::undefined().raw_bits(),
+            proto_epoch: 0,
+            bailout_reason: 0,
+            bailout_pc: 0,
+            secondary_result: 0,
+            module_ptr: (module as *const Module).cast::<()>(),
+            runtime_ptr,
+            heap_slots_base,
+            // OSR trampoline reads this and copies it into the pinned
+            // accumulator register before jumping into the loop body.
+            accumulator_raw,
+        };
+
+        telemetry::record_jit_entry();
+        telemetry::record_function_jit_entry(function.name().unwrap_or("<anonymous>"), 1);
+
+        // SAFETY: `entry_base + osr_offset` falls inside the same
+        // executable buffer as the function's main entry, owned by the
+        // `CompiledFunction` that produced both pointers. The trampoline
+        // at this offset has the same `extern "C" fn(*mut JitContext) -> u64`
+        // ABI as the main entry — it shares the prologue + body +
+        // epilogue. `ctx` is initialised above with valid pointers and
+        // a register buffer that outlives this call (held by the
+        // caller's `Activation`).
+        let raw_result = unsafe {
+            let trampoline = entry_base.add(osr_offset as usize);
+            let func: unsafe extern "C" fn(*mut JitContext) -> u64 =
+                std::mem::transmute(trampoline);
+            func(&mut ctx)
+        };
+
+        if raw_result == BAILOUT_SENTINEL {
+            code_cache::record_deopt(function_ptr);
+            return TierUpExecResult::Bailout {
+                resume_pc: ctx.bailout_pc,
+                reason: ctx.bailout_reason,
+                accumulator_raw: ctx.accumulator_raw,
+            };
+        }
+
+        let value = RegisterValue::from_raw_bits(raw_result).unwrap_or_default();
+        TierUpExecResult::Return(value)
+    }
+
     fn try_compile(
         &self,
         module: &Module,

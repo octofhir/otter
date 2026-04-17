@@ -160,6 +160,14 @@ pub struct CompiledFunction {
     pub code_size: usize,
     /// Which backend produced this machine code.
     pub origin: CompiledCodeOrigin,
+    /// Per-loop-header OSR entry offsets: `(byte_pc, native_offset)`,
+    /// sorted by `byte_pc` so cache lookups can do an O(log N) probe.
+    /// Each `native_offset` is the byte offset of an OSR trampoline
+    /// inside the executable buffer; the trampoline pins the JIT
+    /// registers, rehydrates the accumulator from
+    /// [`crate::context::JitContext::accumulator_raw`], and unconditional-
+    /// jumps into the loop header's body.
+    pub osr_entries: Vec<(u32, u32)>,
     _owner: ExecutableBuffer,
 }
 
@@ -213,6 +221,7 @@ pub fn compile_code_buffer(
         entry,
         code_size,
         origin,
+        osr_entries: Vec::new(),
         _owner: executable,
     })
 }

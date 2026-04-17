@@ -1075,6 +1075,96 @@ impl Interpreter {
         Ok(result)
     }
 
+    /// Attempts a mid-loop OSR entry into the JIT after the dispatcher
+    /// took a back-edge to an earlier PC.
+    ///
+    /// Returns `Some(StepOutcome::Return(value))` if the JIT ran the
+    /// rest of the function to completion via the OSR trampoline;
+    /// `None` if no OSR happened (no hook, blacklisted, budget not
+    /// exhausted, no cached code, or no trampoline registered for the
+    /// current PC). On a JIT bailout the activation's PC and
+    /// accumulator are restored in-place and the function returns
+    /// `None` so the interpreter resumes at the bailout PC.
+    ///
+    /// Called after the run loop observes `activation.pc() < pc_before_step`
+    /// on a `Continue`, i.e. the canonical back-edge shape.
+    fn try_back_edge_osr(
+        &self,
+        module: &Module,
+        activation: &mut Activation,
+        runtime: &mut RuntimeState,
+    ) -> Option<StepOutcome> {
+        let function_index = activation.function_index();
+        if runtime.is_tier_up_blacklisted(function_index) {
+            return None;
+        }
+        let should_tier_up =
+            runtime.decrement_tier_up_budget(function_index, tier_up::TIER1_BACKEDGE_COST);
+        if !should_tier_up {
+            return None;
+        }
+        // Reset the budget right away so a failed OSR (no cached code,
+        // no trampoline at this PC) doesn't retry compile on every
+        // back-edge until the budget exhausts again.
+        runtime.reset_tier_up_budget(function_index);
+
+        let hook = runtime.tier_up_hook()?;
+
+        // Synchronously compile if the cache doesn't have the function
+        // yet. `try_compile` is idempotent and cheap when the function
+        // is already cached.
+        let _compiled = hook.try_compile(
+            module,
+            function_index,
+            runtime as *mut RuntimeState as *mut (),
+        );
+
+        // Resolve `this` from the receiver slot if the function defines
+        // one — same convention as the function-entry tier-up path.
+        let function = module.function(function_index)?;
+        let this_raw = function
+            .frame_layout()
+            .receiver_slot()
+            .and_then(|slot| activation.registers().get(usize::from(slot)).copied())
+            .map(|v| v.raw_bits())
+            .unwrap_or(RegisterValue::undefined().raw_bits());
+        let register_count = activation.register_count();
+        let registers_base = activation.registers_mut_ptr();
+        let interrupt_ptr = self
+            .interrupt_flag
+            .as_ref()
+            .map(|f| std::sync::Arc::as_ptr(f).cast::<u8>())
+            .unwrap_or(std::ptr::null());
+        let byte_pc = activation.pc();
+        let accumulator_raw = activation.accumulator().raw_bits();
+
+        match hook.execute_cached_at_pc(
+            module,
+            function_index,
+            registers_base,
+            register_count,
+            this_raw,
+            runtime as *mut RuntimeState as *mut (),
+            interrupt_ptr,
+            byte_pc,
+            accumulator_raw,
+        ) {
+            TierUpExecResult::Return(value) => Some(StepOutcome::Return(value)),
+            TierUpExecResult::Bailout {
+                resume_pc,
+                accumulator_raw,
+                ..
+            } => {
+                activation.set_pc(resume_pc);
+                if let Some(value) = crate::value::RegisterValue::from_raw_bits(accumulator_raw) {
+                    activation.set_accumulator(value);
+                }
+                None
+            }
+            TierUpExecResult::NotCompiled => None,
+        }
+    }
+
     fn run_completion_with_runtime(
         &self,
         module: &Module,
@@ -1114,6 +1204,12 @@ impl Interpreter {
             // Update the topmost shadow stack entry's PC so a snapshot taken
             // mid-step reports the correct call site.
             runtime.update_top_frame_pc(activation.pc());
+            // Snapshot the PC before the step so we can detect back-edges
+            // (any PC change where the new PC is strictly less than the
+            // pre-step PC) for mid-loop OSR. The snapshot also lets us
+            // skip the OSR check on every non-jumping op without a
+            // separate hot-path branch.
+            let pc_before_step = activation.pc();
             let step_fn_result = self.step(
                 &function,
                 &current_module,
@@ -1121,7 +1217,7 @@ impl Interpreter {
                 runtime,
                 &mut frame_runtime,
             );
-            let outcome = match step_fn_result {
+            let mut outcome = match step_fn_result {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UncaughtThrow(value)) => StepOutcome::Throw(value),
                 Err(InterpreterError::TypeError(message)) => {
@@ -1152,6 +1248,30 @@ impl Interpreter {
                     return Err(error);
                 }
             };
+
+            // ---- Mid-loop OSR (M_JIT_C.1) ----
+            //
+            // Back-edge detection: a Continue whose post-step PC is
+            // strictly less than the pre-step PC means the dispatcher
+            // just took a backward jump (`Jump`/`JumpIf*` to an earlier
+            // PC, the canonical loop-iteration shape). We charge the
+            // back-edge against the function's hotness budget, and when
+            // the budget exhausts we synchronously compile (idempotent)
+            // and try to enter the JIT at this PC. If the cache has an
+            // OSR trampoline for the loop header we just jumped to, the
+            // JIT runs the rest of the loop natively; otherwise the
+            // interpreter keeps stepping bytecode unchanged.
+            //
+            // Bailouts from the OSR'd code update PC + accumulator on
+            // the activation in-place, so the outer loop simply resumes
+            // interpretation at the bailout PC on the next iteration.
+            if matches!(outcome, StepOutcome::Continue)
+                && activation.pc() < pc_before_step
+                && let Some(osr_outcome) =
+                    self.try_back_edge_osr(&current_module, activation, runtime)
+            {
+                outcome = osr_outcome;
+            }
 
             match outcome {
                 StepOutcome::Continue => {

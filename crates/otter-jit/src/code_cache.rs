@@ -78,6 +78,34 @@ pub fn get(func_ptr: *const otter_vm::Function) -> Option<*const u8> {
     })
 }
 
+/// Look up the OSR-entry native offset for `func_ptr` at `byte_pc`.
+///
+/// Returns `Some(native_offset)` if the compiled function has an OSR
+/// trampoline targeting `byte_pc` (i.e. the bytecode PC is a recognised
+/// loop header whose first body op passes the OSR safety filter).
+/// Returns `None` if the function isn't compiled or has no trampoline
+/// for the given PC. Bumps the entry's `last_use` clock so OSR hits
+/// keep the function alive in the cache.
+pub fn osr_native_offset(func_ptr: *const otter_vm::Function, byte_pc: u32) -> Option<u32> {
+    CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        let ts = c.tick();
+        c.entries.get_mut(&(func_ptr as usize)).and_then(|entry| {
+            let lookup = entry
+                .compiled
+                .osr_entries
+                .binary_search_by_key(&byte_pc, |(pc, _)| *pc)
+                .ok()
+                .map(|idx| entry.compiled.osr_entries[idx].1);
+            if lookup.is_some() {
+                entry.call_count += 1;
+                entry.last_use = ts;
+            }
+            lookup
+        })
+    })
+}
+
 /// Store a compiled function in the cache.
 pub fn insert(func_ptr: *const otter_vm::Function, compiled: CompiledFunction) {
     insert_with_tier(func_ptr, compiled, Tier::Baseline);

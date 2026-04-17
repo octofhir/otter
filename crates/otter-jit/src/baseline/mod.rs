@@ -531,6 +531,67 @@ fn resolve_byte_target(
 
 const TAG_INT32: u64 = 0x7FF8_0001_0000_0000;
 
+/// One on-stack-replacement entry point produced by the emitter.
+///
+/// `byte_pc` is the bytecode-space PC of a loop header that was deemed
+/// OSR-eligible (its first body op unconditionally overwrites the
+/// accumulator register, so the trampoline's raw-bit load into x21/r13
+/// is harmless). `native_offset` is the byte offset inside the emitted
+/// code buffer of the trampoline that pins the JIT registers, rehydrates
+/// the accumulator from `JitContext::accumulator_raw`, and jumps into
+/// the loop body at that PC.
+///
+/// The interpreter looks these up via [`crate::code_cache::osr_native_offset`]
+/// when a back-edge crosses the hotness budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsrEntry {
+    /// Bytecode PC of the loop header this trampoline targets.
+    pub byte_pc: u32,
+    /// Byte offset of the trampoline inside the emitted code buffer.
+    pub native_offset: u32,
+}
+
+/// Output of [`emit_template_stencil`]: the executable code buffer plus
+/// the per-loop-header OSR entry table.
+///
+/// The OSR table is empty when no loop header in the function passes the
+/// safety filter (`is_osr_safe_first_op`); the stencil still functions
+/// for normal-call entry in that case.
+#[derive(Debug)]
+pub struct EmittedStencil {
+    /// Raw machine code; ownership transferred into `compile_code_buffer`.
+    pub code: crate::arch::CodeBuffer,
+    /// `(byte_pc, native_offset)` for each emitted OSR entry trampoline.
+    /// Sorted by `byte_pc` so the cache lookup can do an O(log N) probe.
+    pub osr_entries: Vec<OsrEntry>,
+}
+
+/// Returns `true` if a loop header beginning with `op` can be safely
+/// entered via OSR.
+///
+/// The OSR trampoline loads `JitContext::accumulator_raw` (the raw spill
+/// from the interpreter's last accumulator value) into x21/r13 before
+/// jumping into the body. That's safe whenever the first op of the loop
+/// header overwrites x21/r13 without reading it, since the body never
+/// observes the OSR-loaded raw bits in any acc-state-sensitive way.
+///
+/// `Star` and the arithmetic ops are excluded — they consume x21 in an
+/// acc-state-dependent way (`box_int32` vs raw `str`, int32 ALU vs
+/// bailout). Allowing OSR there would require either a tagged
+/// rehydration path or an analyzer-driven OSR map, both of which are
+/// out of scope for M_JIT_C.1.
+fn is_osr_safe_first_op(op: &TemplateInstruction) -> bool {
+    matches!(
+        op,
+        TemplateInstruction::Ldar { .. }
+            | TemplateInstruction::LdaI32 { .. }
+            | TemplateInstruction::LdaTagConst { .. }
+            | TemplateInstruction::LdaThis
+            | TemplateInstruction::LdaCurrentClosure
+            | TemplateInstruction::Mov { .. }
+    )
+}
+
 /// Why the v2 emitter couldn't produce a stencil for a given program.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TemplateEmitError {
@@ -605,7 +666,7 @@ enum AccState {
 ///   `x0` as the native return value.
 pub fn emit_template_stencil(
     program: &TemplateProgram,
-) -> Result<crate::arch::CodeBuffer, TemplateEmitError> {
+) -> Result<EmittedStencil, TemplateEmitError> {
     #[cfg(target_arch = "aarch64")]
     {
         emit_template_stencil_aarch64(program)
@@ -623,10 +684,41 @@ pub fn emit_template_stencil(
     }
 }
 
+/// Build the sorted OSR entry list for a freshly emitted body.
+///
+/// Walks the program's loop headers, drops any that don't pass the
+/// `is_osr_safe_first_op` filter or that don't appear in `body_offsets`
+/// (defensive: the latter shouldn't happen because every analyzed
+/// instruction emits at least one byte), and produces a `Vec<OsrEntry>`
+/// sorted by `byte_pc` for the cache lookup.
+fn collect_osr_candidates(
+    program: &TemplateProgram,
+    body_offsets: &[(u32, u32)],
+) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &header_pc in &program.loop_header_byte_pcs {
+        let Some(idx) = program.byte_pcs.iter().position(|pc| *pc == header_pc) else {
+            continue;
+        };
+        let Some(op) = program.instructions.get(idx) else {
+            continue;
+        };
+        if !is_osr_safe_first_op(op) {
+            continue;
+        }
+        let Some(&(_, body_off)) = body_offsets.iter().find(|(pc, _)| *pc == header_pc) else {
+            continue;
+        };
+        out.push((header_pc, body_off));
+    }
+    out.sort_by_key(|(pc, _)| *pc);
+    out
+}
+
 #[cfg(target_arch = "aarch64")]
 fn emit_template_stencil_aarch64(
     program: &TemplateProgram,
-) -> Result<crate::arch::CodeBuffer, TemplateEmitError> {
+) -> Result<EmittedStencil, TemplateEmitError> {
     use crate::arch::CodeBuffer;
     use crate::arch::aarch64::{Assembler, Cond, Reg};
 
@@ -1274,6 +1366,47 @@ fn emit_template_stencil_aarch64(
         });
     }
 
+    // ----- Per-loop-header OSR trampolines -----
+    //
+    // For each loop header that passes the safety filter, emit a small
+    // trampoline that mirrors the main prologue (so the body's epilogue
+    // tears down the same frame), reloads the spilled accumulator from
+    // `JitContext::accumulator_raw` into x21, and unconditionally
+    // branches into the body at the loop header's emitted offset.
+    //
+    // The trampoline's tail branch uses `b_placeholder` and is patched
+    // alongside the bailout / branch patches below, since the existing
+    // patching machinery already operates on the raw `CodeBuffer`.
+    let osr_candidates = collect_osr_candidates(program, &byte_pc_to_emit);
+    let mut osr_entries: Vec<OsrEntry> = Vec::with_capacity(osr_candidates.len());
+    let mut osr_tail_patches: Vec<(u32 /* src */, u32 /* target */)> =
+        Vec::with_capacity(osr_candidates.len());
+    for (header_pc, body_off) in osr_candidates {
+        let osr_entry_offset = asm.position();
+        // Mirror the main prologue so the body's epilogue (`ldr x20 +
+        // pop x19/lr + ret`) restores the same callee-saved state we
+        // saved here.
+        asm.push_x19_lr_32();
+        asm.str_x20_at_sp16();
+        asm.mov_rr(Reg::X19, Reg::X0);
+        asm.ldr_u64_imm(Reg::X9, Reg::X19, 0);
+        asm.mov_imm64(Reg::X20, TAG_INT32);
+        // Rehydrate the accumulator from the interpreter's spill slot.
+        // Safe for the body's first op because `is_osr_safe_first_op`
+        // restricted entry to ops that overwrite x21 without reading it.
+        asm.ldr_u64_imm(
+            Reg::X21,
+            Reg::X19,
+            crate::context::offsets::ACCUMULATOR_RAW as u32,
+        );
+        let src = asm.b_placeholder();
+        osr_tail_patches.push((src, body_off));
+        osr_entries.push(OsrEntry {
+            byte_pc: header_pc,
+            native_offset: osr_entry_offset,
+        });
+    }
+
     // Drop the assembler binding so the buffer is available for
     // direct-mutation below. `Assembler` has no Drop impl, so this just
     // releases the name binding; the CodeBuffer captured earlier stays alive.
@@ -1385,18 +1518,42 @@ fn emit_template_stencil_aarch64(
         }
     }
 
+    // Patch each OSR trampoline's trailing `b body_off`. Both endpoints
+    // were known when we emitted the trampoline; the patching loop runs
+    // after the asm binding is dropped because the existing pad/branch
+    // patches are structured the same way.
+    for &(src, target) in &osr_tail_patches {
+        let delta = i64::from(target) - i64::from(src);
+        if delta % 4 != 0 || !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&delta) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: target,
+            });
+        }
+        let imm26 = ((delta / 4) as i32 as u32) & 0x03FF_FFFF;
+        if !buf.patch_u32_le(src, 0x1400_0000 | imm26) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: target,
+            });
+        }
+    }
+
     // acc_states is used transitively by the emit loop; keep the
     // declaration alive for downstream (and to prevent `unused_mut`
     // lints from firing when more analyses consume it).
     let _ = acc_states;
 
-    Ok(buf)
+    Ok(EmittedStencil {
+        code: buf,
+        osr_entries,
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
 fn emit_template_stencil_x64(
     program: &TemplateProgram,
-) -> Result<crate::arch::CodeBuffer, TemplateEmitError> {
+) -> Result<EmittedStencil, TemplateEmitError> {
     use crate::arch::CodeBuffer;
     use crate::arch::x64::{Assembler, Cond, Reg};
 
@@ -1964,6 +2121,41 @@ fn emit_template_stencil_x64(
         });
     }
 
+    // ----- Per-loop-header OSR trampolines -----
+    //
+    // Mirror the main prologue (push callee-saved + pin rbx/r12/r13/r14
+    // to the JitContext + registers_base + accumulator + TAG_INT32),
+    // reload the spilled accumulator from `JitContext::accumulator_raw`
+    // into r13, and unconditional-jump into the body offset for this
+    // loop header. The body's existing `pop_callee_saved + ret` epilogue
+    // tears down the same frame this trampoline set up.
+    let osr_candidates = collect_osr_candidates(program, &byte_pc_to_emit);
+    let mut osr_entries: Vec<OsrEntry> = Vec::with_capacity(osr_candidates.len());
+    let mut osr_tail_patches: Vec<(u32 /* src */, u32 /* target */)> =
+        Vec::with_capacity(osr_candidates.len());
+    for (header_pc, body_off) in osr_candidates {
+        let osr_entry_offset = asm.position();
+        asm.push_callee_saved();
+        asm.mov_rr(Reg::Rbx, Reg::Rdi);
+        asm.mov_mr_u32(
+            Reg::R12,
+            Reg::Rbx,
+            crate::context::offsets::REGISTERS_BASE as u32,
+        );
+        asm.mov_imm64(Reg::R14, TAG_INT32);
+        asm.mov_mr_u32(
+            Reg::R13,
+            Reg::Rbx,
+            crate::context::offsets::ACCUMULATOR_RAW as u32,
+        );
+        let src = asm.b_placeholder();
+        osr_tail_patches.push((src, body_off));
+        osr_entries.push(OsrEntry {
+            byte_pc: header_pc,
+            native_offset: osr_entry_offset,
+        });
+    }
+
     let _ = asm;
 
     for patch in &branch_patches {
@@ -2044,9 +2236,29 @@ fn emit_template_stencil_x64(
         }
     }
 
+    // Patch each OSR trampoline's trailing `jmp body_off`.
+    for &(src, target) in &osr_tail_patches {
+        let rel_bytes = i64::from(target) - (i64::from(src) + 5);
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&rel_bytes) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: target,
+            });
+        }
+        if !buf.patch_u32_le(src + 1, rel_bytes as i32 as u32) {
+            return Err(TemplateEmitError::BranchTargetOutOfRange {
+                source_byte_pc: src,
+                target_byte_pc: target,
+            });
+        }
+    }
+
     let _ = acc_states;
 
-    Ok(buf)
+    Ok(EmittedStencil {
+        code: buf,
+        osr_entries,
+    })
 }
 
 #[cfg(test)]
@@ -2292,7 +2504,16 @@ mod tests {
         let layout = FrameLayout::new(0, 1, 2, 0).unwrap();
         let function = Function::with_empty_tables(Some("sum"), layout, v2);
         let program = analyze_template_candidate(&function).expect("analyze");
-        let buf = emit_template_stencil(&program).expect("emit");
+        let stencil = emit_template_stencil(&program).expect("emit");
+        // The sum-loop has exactly one loop header, and that header
+        // begins with `Ldar r2` — an OSR-safe op — so the emitter must
+        // produce one OSR entry trampoline.
+        assert_eq!(
+            stencil.osr_entries.len(),
+            1,
+            "expected one OSR entry for the single loop header",
+        );
+        let buf = stencil.code;
         let bytes = buf.bytes();
         assert!(!bytes.is_empty(), "emitter produced no code");
         assert_eq!(
@@ -2352,12 +2573,13 @@ mod tests {
         // Each guarded load adds `eor / tst / b.ne` (3 insns) and
         // each bailout site adds a ~5–7 insn pad (spill + pc/reason
         // + b). The sum loop has ~8 guarded loads and the same number
-        // of pads, so ≈280 + 8·12 + 8·32 ≈ 632 B is the expected
-        // upper bound. Lock it at 640 to catch emission regressions
-        // without flaking on minor tweaks.
+        // of pads, so ≈280 + 8·12 + 8·32 ≈ 632 B for the body alone.
+        // M_JIT_C.1 adds one OSR trampoline (~10 insns / 40 bytes) per
+        // OSR-eligible loop header, so lock the upper bound at 720 to
+        // catch regressions while leaving headroom for the trampolines.
         assert!(
-            bytes.len() <= 640,
-            "v2 sum-loop stencil larger than expected: {} bytes (Phase 4.5b guarded target ≤ 640)",
+            bytes.len() <= 720,
+            "v2 sum-loop stencil larger than expected: {} bytes (M_JIT_C.1 target ≤ 720)",
             bytes.len()
         );
     }
@@ -2419,6 +2641,83 @@ mod tests {
         assert!(
             stderr.contains("Native ratio"),
             "expected telemetry execution summary:\n{stderr}",
+        );
+
+        let _ = fs::remove_file(&script_path);
+    }
+
+    /// End-to-end smoke test for M_JIT_C.1 mid-loop OSR.
+    ///
+    /// The script has a single top-level function (`main`) called once,
+    /// containing one int32 accumulator loop with no inner calls. Because
+    /// the function is the entry point, `run_with_tier_up` never fires
+    /// (it only intercepts inner `CallDirect`); the only path into the
+    /// JIT is the back-edge OSR added by M_JIT_C.1. We pick a loop count
+    /// well above the JSC-style `TIER1_INITIAL_BUDGET = 1500` back-edge
+    /// budget so the OSR trampoline is guaranteed to fire mid-loop.
+    ///
+    /// We assert via `--dump-jit-stats` that the telemetry shows a
+    /// non-zero JIT entry count for `main` — proving the back-edge entry
+    /// path was taken — and that the script returns the correct sum.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn osr_smoke() {
+        use std::fs;
+        use std::process::Command;
+
+        let script_path = std::env::temp_dir().join("otter-osr-smoke.js");
+        // 100_000 iterations is well above the 1500 back-edge budget;
+        // OSR must have fired by the time the loop exits.
+        // (`(s + i) | 0` keeps the accumulator int32-tagged so the JIT
+        // path stays on the trust-int32 fast path.)
+        let script = "function main() { \
+                          let s = 0; \
+                          let i = 0; \
+                          while (i < 100000) { \
+                              s = (s + i) | 0; \
+                              i = i + 1; \
+                          } \
+                          return s; \
+                      }";
+        fs::write(&script_path, script).expect("write smoke script");
+
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "-p",
+                "otterjs",
+                "--",
+                "--dump-jit-stats",
+                "run",
+                script_path.to_str().expect("utf8 temp path"),
+            ])
+            .output()
+            .expect("run otter osr smoke script");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "otter osr smoke run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        // Telemetry summary must mention `main` (the only function the
+        // hook can have entered) so we know JIT execution actually ran.
+        assert!(
+            stderr.contains("main"),
+            "expected telemetry to mention compiled main():\n{stderr}",
+        );
+        assert!(
+            stderr.contains("Native ratio"),
+            "expected telemetry execution summary:\n{stderr}",
+        );
+        // Tighter check: the Native-ratio line must report at least one
+        // JIT entry. The line shape is `Native ratio:  X%  (J JIT / I
+        // interpreter entries)`. Reject `0 JIT` to confirm the OSR path
+        // actually fired — a regression that disables back-edge OSR
+        // would still produce a Native-ratio line, but with `0 JIT`.
+        assert!(
+            !stderr.contains("0 JIT"),
+            "expected at least one JIT entry from OSR — Native ratio shows zero JIT entries:\n{stderr}",
         );
 
         let _ = fs::remove_file(&script_path);
@@ -2492,7 +2791,14 @@ mod tests {
             "analyzer must lower the M1 source to a Ldar / AddSmi / Return triple",
         );
 
-        let buf = emit_template_stencil(&program).expect("emit stencil");
+        let stencil = emit_template_stencil(&program).expect("emit stencil");
+        // The M1 source has no loops, so the emitter must not synthesize
+        // any OSR trampolines.
+        assert!(
+            stencil.osr_entries.is_empty(),
+            "M1 stencil must have no OSR entries (no loops)",
+        );
+        let buf = stencil.code;
         let bytes = buf.bytes();
         assert!(!bytes.is_empty(), "emitter produced no code");
         assert_eq!(
@@ -2592,7 +2898,12 @@ mod tests {
             "analyzer must lower the M1 source to a Ldar / AddSmi / Return triple",
         );
 
-        let buf = emit_template_stencil(&program).expect("emit stencil");
+        let stencil = emit_template_stencil(&program).expect("emit stencil");
+        assert!(
+            stencil.osr_entries.is_empty(),
+            "M1 stencil must have no OSR entries (no loops)",
+        );
+        let buf = stencil.code;
         let bytes = buf.bytes();
         assert!(!bytes.is_empty(), "emitter produced no code");
 

@@ -67,6 +67,35 @@ pub trait TierUpHook: Send + Sync {
         interrupt_flag: *const u8,
     ) -> TierUpExecResult;
 
+    /// Mid-loop OSR entry: invoke the cached native code at a back-edge
+    /// target (`byte_pc`) instead of at function entry.
+    ///
+    /// The hook is expected to:
+    /// 1. Look up `(function_index, byte_pc)` in its OSR-entry table.
+    /// 2. If found, materialise `accumulator_raw` into the JIT context's
+    ///    accumulator spill slot and dispatch into the trampoline at the
+    ///    matching native offset.
+    /// 3. Return [`TierUpExecResult::NotCompiled`] if the function isn't
+    ///    cached or has no OSR entry for `byte_pc` — the interpreter then
+    ///    keeps stepping bytecode without further attempts on this PC.
+    ///
+    /// `accumulator_raw` is the NaN-boxed v2 accumulator the interpreter
+    /// holds at the back-edge target; the JIT trampoline restores it into
+    /// the pinned accumulator register before dispatching into the body.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_cached_at_pc(
+        &self,
+        module: &Module,
+        function_index: FunctionIndex,
+        registers_base: *mut RegisterValue,
+        register_count: usize,
+        this_raw: u64,
+        runtime_ptr: *mut (),
+        interrupt_flag: *const u8,
+        byte_pc: u32,
+        accumulator_raw: u64,
+    ) -> TierUpExecResult;
+
     /// Attempts to compile a function into native code and install it in the
     /// compiled-code cache. Called synchronously from the interpreter's call
     /// path after the hotness budget is exhausted. Returns `true` if there is

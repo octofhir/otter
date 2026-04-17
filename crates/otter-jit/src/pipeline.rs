@@ -121,10 +121,19 @@ fn compile_template_baseline(
     let program = analyze_template_candidate(function)
         .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?;
 
-    let buffer = emit_template_stencil(&program)
+    let stencil = emit_template_stencil(&program)
         .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?;
 
-    let compiled = compile_code_buffer(&buffer, CompiledCodeOrigin::TemplateBaseline)
+    let osr_entries = stencil
+        .osr_entries
+        .into_iter()
+        .map(|e| (e.byte_pc, e.native_offset))
+        .collect();
+    let compiled = compile_code_buffer(&stencil.code, CompiledCodeOrigin::TemplateBaseline)
+        .map(|mut c| {
+            c.osr_entries = osr_entries;
+            c
+        })
         .map_err(|err| JitError::Internal(format!("{err:?}")))?;
 
     let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);

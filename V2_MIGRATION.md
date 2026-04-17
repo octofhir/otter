@@ -56,7 +56,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [x]    | bca0df8 |
 | M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [x]    | 13dd2f8 |
 | M17      | Property access: `StaticMemberExpression` (`o.x`), `ComputedMemberExpression` (`o[k]`), read + write.                            | [x]    | 8f1c068 |
-| M18      | Template literals (simple + interpolated).                                                                                       | [ ]    |        |
+| M18      | Template literals (simple + interpolated).                                                                                       | [x]    | _pending_ |
 | M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [ ]    |        |
 | M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [ ]    |        |
 | M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [ ]    |        |
@@ -108,6 +108,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `StringLiteral` + `+` string concatenation (mixed operands) | yes | M15 |
 | `ObjectExpression` / `ArrayExpression` literals with int/string/bool/null values | yes | M16 |
 | `StaticMemberExpression` / `ComputedMemberExpression` read + write (incl. compound `<op>=`) | yes | M17 |
+| `TemplateLiteral` (simple + interpolated; nested; escape cooked-values) | yes | M18 |
 
 ## Benchmarks
 

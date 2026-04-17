@@ -124,8 +124,8 @@ use oxc_ast::ast::{
     ConditionalExpression, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
     IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression,
     ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-    StaticMemberExpression, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
-    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression,
+    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -1750,6 +1750,7 @@ fn lower_return_expression(
         Expression::ComputedMemberExpression(member) => {
             lower_computed_member_read(builder, ctx, member)
         }
+        Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -2468,6 +2469,201 @@ fn lower_computed_member_read(
     Ok(())
 }
 
+/// Lowers a template literal (`` `hello` ``, `` `hi, ${name}` ``, …)
+/// into a running string concatenation. Tagged templates
+/// (`` tag`…` ``) are a separate AST node
+/// (`TaggedTemplateExpression`) and aren't accepted here — they need
+/// the full tag-call protocol and the raw-strings array, neither of
+/// which the current source surface supports.
+///
+/// Shape with N substitutions (quasis = `[q0, q1, …, qN]`,
+/// expressions = `[e0, …, e_{N-1}]`, so the logical sequence is
+/// `q0 ++ e0 ++ q1 ++ e1 ++ … ++ q_{N-1} ++ e_{N-1} ++ qN`):
+///
+/// Simple form (`N = 0`, single quasi, no substitutions):
+///
+/// ```text
+///   LdaConstStr q0_idx
+/// ```
+///
+/// Interpolated form — the compiler keeps a running "buffer" temp
+/// (`r_buf`) plus a scratch temp (`r_tmp`) so each concat step stays
+/// LHS-first (string `+` is non-commutative):
+///
+/// ```text
+///   LdaConstStr q0_idx         ; acc = q0
+///   Star r_buf                 ; r_buf = q0
+///   ; for each piece (expression e_i, then quasi q_{i+1} unless empty):
+///   <lower e_i into acc>
+///   Star r_tmp                 ; r_tmp = piece
+///   Ldar r_buf                 ; acc = r_buf
+///   Add r_tmp                  ; acc = r_buf + piece  (string concat)
+///   Star r_buf                 ; roll the buffer forward
+///   ; last piece leaves the result in acc without a trailing Star.
+/// ```
+///
+/// Empty non-head quasis (`` `${a}` ``'s final `""`, `` `a${x}b${y}` ``'s
+/// head `""` if the literal started with a substitution) are skipped
+/// — they're semantically a no-op concat and the Add is unnecessary.
+/// Empty `cooked` (invalid escape) is rejected with
+/// `invalid_template_escape`.
+///
+/// §13.2.8 Template Literals
+/// <https://tc39.es/ecma262/#sec-template-literals>
+fn lower_template_literal(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    tpl: &TemplateLiteral<'_>,
+) -> Result<(), SourceLoweringError> {
+    // Expressions.len() == quasis.len() - 1 by construction.
+    if tpl.quasis.len() != tpl.expressions.len() + 1 {
+        return Err(SourceLoweringError::Internal(format!(
+            "template literal has {} quasis for {} expressions",
+            tpl.quasis.len(),
+            tpl.expressions.len()
+        )));
+    }
+
+    let quasi_cooked = |index: usize| -> Result<&str, SourceLoweringError> {
+        let q = &tpl.quasis[index];
+        match q.value.cooked.as_deref() {
+            Some(s) => Ok(s),
+            None => Err(SourceLoweringError::unsupported(
+                "invalid_template_escape",
+                q.span,
+            )),
+        }
+    };
+
+    // No substitutions → just emit the head quasi. This covers the
+    // simple form `` `hello` `` and the empty form `` `` ``.
+    if tpl.expressions.is_empty() {
+        let text = quasi_cooked(0)?;
+        let idx = ctx.intern_string_literal(text)?;
+        builder
+            .emit(Opcode::LdaConstStr, &[Operand::Idx(idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaConstStr (template): {err:?}"))
+            })?;
+        return Ok(());
+    }
+
+    // Interpolated form. Keep a running result in `r_buf` and use
+    // `r_tmp` to hold each fresh piece before the `Add r_tmp`.
+    let buf = ctx.acquire_temps(1)?;
+    let tmp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // 1) Load quasi[0] into acc, spill to r_buf. Using the head
+        //    as the starting value keeps the concat LHS-first for
+        //    the first substitution — critical since every later
+        //    `Add r_tmp` computes `acc + r_tmp`, which must equal
+        //    `buf + piece` in that order.
+        let head = quasi_cooked(0)?;
+        let head_idx = ctx.intern_string_literal(head)?;
+        builder
+            .emit(Opcode::LdaConstStr, &[Operand::Idx(head_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaConstStr (head): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(buf))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (template buf): {err:?}"))
+            })?;
+
+        // 2) Walk the pieces: for each expression `e_i` emit
+        //    `<lower e_i>; Star r_tmp; Ldar r_buf; Add r_tmp;`. Then
+        //    (if the following quasi is non-empty) do the same for
+        //    `q_{i+1}`. After each concat, roll the buffer forward
+        //    via `Star r_buf` — except after the very last piece,
+        //    where we leave the result in acc for the caller.
+        let last_expr = tpl.expressions.len() - 1;
+
+        for (i, expr) in tpl.expressions.iter().enumerate() {
+            let next_quasi_text = quasi_cooked(i + 1)?;
+            let has_next_quasi = !next_quasi_text.is_empty();
+            let is_last_piece_overall = i == last_expr && !has_next_quasi;
+
+            // Append `expr` to `r_buf`.
+            lower_return_expression(builder, ctx, expr)?;
+            concat_step(builder, ctx, tmp, buf)?;
+
+            if is_last_piece_overall {
+                // Skip the trailing `Star r_buf` — acc already holds
+                // the final running result.
+                continue;
+            }
+            // Roll buffer forward so the next piece concatenates
+            // against the fresh value.
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(buf))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (template buf roll): {err:?}"
+                    ))
+                })?;
+
+            if has_next_quasi {
+                let quasi_idx = ctx.intern_string_literal(next_quasi_text)?;
+                builder
+                    .emit(Opcode::LdaConstStr, &[Operand::Idx(quasi_idx)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaConstStr (template quasi): {err:?}"
+                        ))
+                    })?;
+                concat_step(builder, ctx, tmp, buf)?;
+                if i != last_expr {
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(buf))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (template buf roll 2): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    ctx.release_temps(1); // tmp
+    ctx.release_temps(1); // buf
+    lower
+}
+
+/// Emits `Star r_tmp; Ldar r_buf; Add r_tmp` to append the value
+/// currently in the accumulator onto the running buffer in `r_buf`.
+/// Result ends up in acc (`r_buf + piece`). Attaches an arithmetic
+/// feedback slot to the `Add` so JIT baseline recompiles see the
+/// path as observed — the value will always be `Any` (string
+/// concat), which keeps the tag guards in place.
+fn concat_step(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    tmp: RegisterIndex,
+    buf: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(tmp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (template tmp): {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(buf))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Ldar (template buf): {err:?}"))
+        })?;
+    let add_pc = builder
+        .emit(Opcode::Add, &[Operand::Reg(u32::from(tmp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Add (template concat): {err:?}"))
+        })?;
+    let slot = ctx.allocate_arithmetic_feedback();
+    builder.attach_feedback(add_pc, slot);
+    Ok(())
+}
+
 /// Stable tag for unsupported `PropertyKey` shapes — surfaces in
 /// `SourceLoweringError::Unsupported { construct }`.
 fn property_key_tag(key: &PropertyKey<'_>) -> &'static str {
@@ -2886,7 +3082,8 @@ fn apply_binary_op_with_acc_lhs(
         | Expression::ObjectExpression(_)
         | Expression::ArrayExpression(_)
         | Expression::StaticMemberExpression(_)
-        | Expression::ComputedMemberExpression(_) => {
+        | Expression::ComputedMemberExpression(_)
+        | Expression::TemplateLiteral(_) => {
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         other => Err(SourceLoweringError::unsupported(

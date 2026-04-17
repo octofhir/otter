@@ -3652,3 +3652,198 @@ fn private_field_assignment_still_rejected() {
         "unexpected err: {err:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// M18: Template literals (simple + interpolated)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn simple_template_returns_string() {
+    // `` `hello` `` is equivalent to `"hello"` — single quasi, no
+    // substitutions. Should lower to a lone `LdaConstStr`.
+    assert_eq!(
+        run_string_function("function f() { return `hello`; }", &[]),
+        "hello",
+    );
+}
+
+#[test]
+fn empty_template_returns_empty_string() {
+    assert_eq!(run_string_function("function f() { return ``; }", &[]), "",);
+}
+
+#[test]
+fn simple_template_interns_string_literal() {
+    // Even though the source uses backticks, the literal should
+    // intern into the function's string-literal table the same as
+    // a regular StringLiteral would.
+    let module = compile("function f() { return `hi`; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.string_literals().len(), 1);
+}
+
+#[test]
+fn template_with_single_identifier_substitution() {
+    // `` `hello, ${name}!` `` — head quasi "hello, ", one
+    // expression, tail quasi "!".
+    let module = compile("function greet(name) { return `hello, ${name}!`; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let arg = runtime.alloc_string("otter");
+    registers[hidden] = RegisterValue::from_object_handle(arg.0);
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(
+        runtime
+            .js_to_string_infallible(result.return_value())
+            .as_ref(),
+        "hello, otter!",
+    );
+}
+
+#[test]
+fn template_with_int_substitution_coerces_via_js_add() {
+    // `` `n=${n}` `` with `n` an int32. The Add opcode's non-int32
+    // fallback funnels through `RuntimeState::js_add`, which runs
+    // ToPrimitive → ToString on non-string operands once either
+    // side is a string (the head quasi here).
+    let module = compile("function f(n) { return `n=${n}`; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(42);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(
+        runtime
+            .js_to_string_infallible(result.return_value())
+            .as_ref(),
+        "n=42",
+    );
+}
+
+#[test]
+fn template_with_multiple_substitutions() {
+    // `` `${a} + ${b} = ${c}` `` — three substitutions, four
+    // quasis. Middle quasis " + " and " = " exercise the "roll
+    // the buffer forward" path after each substitution.
+    assert_eq!(
+        run_string_function(
+            "function f() { let a = 2; let b = 3; let c = 5; return `${a} + ${b} = ${c}`; }",
+            &[],
+        ),
+        "2 + 3 = 5",
+    );
+}
+
+#[test]
+fn template_with_only_substitution_handles_empty_head_tail() {
+    // `` `${n}` `` — head = "", tail = "". The empty-quasi skip
+    // path in the lowering avoids emitting redundant `""` concats.
+    assert_eq!(
+        run_string_function("function f() { let n = 7; return `${n}`; }", &[]),
+        "7",
+    );
+}
+
+#[test]
+fn template_with_member_expression_substitution() {
+    // `` `name=${o.name}` `` — substitution is a
+    // StaticMemberExpression. Relies on the M17 read path and
+    // feeds through `lower_return_expression` inside the template
+    // lowering.
+    assert_eq!(
+        run_string_function(
+            "function f() { let o = { name: \"otter\" }; return `name=${o.name}`; }",
+            &[],
+        ),
+        "name=otter",
+    );
+}
+
+#[test]
+fn template_with_nested_binary_substitution() {
+    // `` `sum=${a + b}` `` — substitution is itself a BinaryExpression.
+    assert_eq!(
+        run_string_function(
+            "function f() { let a = 1; let b = 41; return `sum=${a + b}`; }",
+            &[],
+        ),
+        "sum=42",
+    );
+}
+
+#[test]
+fn template_composes_with_outer_binary_concat() {
+    // Outer Add between two strings, RHS is a template literal.
+    // Exercises the `TemplateLiteral` entry in the complex-RHS
+    // whitelist of `apply_binary_op_with_acc_lhs`.
+    assert_eq!(
+        run_string_function(
+            "function f() { let v = 5; return \"v: \" + `value=${v}`; }",
+            &[],
+        ),
+        "v: value=5",
+    );
+}
+
+#[test]
+fn template_with_escape_sequences_uses_cooked_value() {
+    // `` `a\nb` `` — the cooked form has a real newline. Matches
+    // the behaviour of a regular string literal with `\n`.
+    assert_eq!(
+        run_string_function("function f() { return `a\\nb`; }", &[]),
+        "a\nb",
+    );
+}
+
+#[test]
+fn template_substitution_can_itself_be_a_template() {
+    // Nested templates: `` `outer:${`inner:${n}`}` ``.
+    assert_eq!(
+        run_string_function(
+            "function f() { let n = 9; return `outer:${`inner:${n}`}`; }",
+            &[],
+        ),
+        "outer:inner:9",
+    );
+}
+
+#[test]
+fn tagged_template_rejected() {
+    // `` tag`hi` `` uses the `TaggedTemplateExpression` AST node,
+    // which is a separate variant not wired through
+    // `lower_template_literal`. Stays rejected until a future
+    // milestone adds the tagged-call protocol.
+    let err =
+        compile("function f() { let tag = 1; return tag`hi`; }").expect_err("tagged template");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn template_literal_in_compound_assign_rhs() {
+    // `o.label += `;${n}`` — compound member assign with a
+    // template literal RHS. Verifies that template literals flow
+    // through `apply_binary_op_with_acc_lhs`'s complex-RHS path
+    // for member-compound assignments too.
+    assert_eq!(
+        run_string_function(
+            "function f() { let o = { label: \"x\" }; let n = 1; o.label += `;${n}`; return o.label; }",
+            &[],
+        ),
+        "x;1",
+    );
+}

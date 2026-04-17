@@ -334,7 +334,7 @@ guarded emitter partially wired and the invocation smoke test
   run on both supported JIT arches, and the local Rosetta bench2 sample
   measures **1348 ns/inner-iter** in the interpreter vs **3 ns/inner-iter**
   in the JIT (`OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1`).
-  Commit: `_pending_`.
+  Commit: `e1b907a`.
 
 ---
 

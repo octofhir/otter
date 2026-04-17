@@ -1501,12 +1501,261 @@ fn do_while_statement_unsupported() {
     assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
 }
 
+// ---------------------------------------------------------------------------
+// M8 — ForStatement (desugared as init / while-test-with-update)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn for_statement_unsupported() {
-    // `for` lands in M8 (desugared via while + init + update).
+fn classic_for_with_let_init_sums_zero_to_n() {
+    // `for (let i = 0; i < n; i = i + 1) s = s + i;` — the canonical
+    // for-loop shape. The `let i` is scoped to the loop via the
+    // snapshot/restore plumbing in `lower_for_statement` so it
+    // doesn't collide with later top-level lets.
+    let src = "function f(n) {
+        let s = 0;
+        for (let i = 0; i < n; i = i + 1) {
+            s = s + i;
+        }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[0]), 0);
+    assert_eq!(run_int32_function(src, &[1]), 0);
+    assert_eq!(run_int32_function(src, &[10]), 45);
+    assert_eq!(run_int32_function(src, &[100]), 4950);
+}
+
+#[test]
+fn for_with_let_init_pops_after_loop() {
+    // After the for ends, `i` is out of scope. Reusing the name as
+    // a top-level `let` in the same function must succeed (no
+    // `duplicate_binding` collision) — confirms the snapshot/restore
+    // actually pops the for-init binding.
+    let src = "function f(n) {
+        let s = 0;
+        for (let i = 0; i < n; i = i + 1) { s = s + 1; }
+        let i = 100;
+        return s + i;
+    }";
+    assert_eq!(run_int32_function(src, &[3]), 103);
+}
+
+#[test]
+fn for_with_assignment_init_uses_outer_let() {
+    // `let i = 0; for (i = 0; …; …) …` — init is an assignment to a
+    // pre-declared local. Confirms init-as-AssignmentExpression
+    // works.
+    let src = "function f(n) {
+        let s = 0;
+        let i = 0;
+        for (i = 0; i < n; i = i + 1) { s = s + i; }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10); // 0+1+2+3+4
+}
+
+#[test]
+fn for_with_omitted_init_works() {
+    let src = "function f(n) {
+        let s = 0;
+        let i = 0;
+        for (; i < n; i = i + 1) { s = s + i; }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10);
+}
+
+#[test]
+fn for_with_omitted_update_works() {
+    // The body itself does the update; the for loop without an
+    // explicit update is just a while loop in disguise.
+    let src = "function f(n) {
+        let s = 0;
+        for (let i = 0; i < n;) {
+            s = s + i;
+            i = i + 1;
+        }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10);
+}
+
+#[test]
+fn for_with_omitted_test_runs_until_return() {
+    // `for (let i = 0;; i = i + 1)` — no test, the body uses an
+    // early return to terminate. Confirms the omitted-test path
+    // emits LdaTrue and the JumpIfToBooleanFalse never fires until
+    // the body returns.
+    let src = "function f(n) {
+        for (let i = 0;; i = i + 1) {
+            if (i === n) { return i; }
+        }
+        return 0;
+    }";
+    assert_eq!(run_int32_function(src, &[42]), 42);
+}
+
+#[test]
+fn for_with_compound_assign_update() {
+    // Update is `i += 1`, not `i = i + 1`. Both lower through
+    // `lower_assignment_expression`.
+    let src = "function f(n) {
+        let s = 0;
+        for (let i = 0; i < n; i += 1) { s += i; }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[6]), 15); // 0+1+2+3+4+5
+}
+
+#[test]
+fn for_with_multi_declarator_init() {
+    // `for (let i = 0, acc = 0; …)` — multi-declarator works at the
+    // for-init level too, courtesy of the M7 multi-declarator
+    // patch.
+    let src = "function f(n) {
+        let result = 0;
+        for (let i = 0, acc = 0; i < n; i = i + 1) {
+            acc = acc + i;
+            result = acc;
+        }
+        return result;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10);
+}
+
+#[test]
+fn nested_for_loops() {
+    // Two nested `for (let …)` loops with distinct loop variables.
+    // Cross-scope shadowing (using the same name `i` in both) needs
+    // real lexical-scope tracking and lands later — for now,
+    // `allocate_local` rejects it as `duplicate_binding` because both
+    // bindings are simultaneously live in the same flat scope.
+    let src = "function f(n) {
+        let total = 0;
+        for (let i = 0; i < n; i = i + 1) {
+            for (let j = 0; j < n; j = j + 1) {
+                total = total + 1;
+            }
+        }
+        return total;
+    }";
+    // n*n iterations.
+    assert_eq!(run_int32_function(src, &[3]), 9);
+    assert_eq!(run_int32_function(src, &[5]), 25);
+}
+
+#[test]
+fn nested_for_with_same_name_unsupported_until_block_scoping() {
+    // Documents the M8 limitation: nested for-init `let`s sharing a
+    // name need lexical-scope tracking (per-scope shadow lookup +
+    // proper `resolve_identifier` walk). Block scoping lands in a
+    // later milestone alongside `let`/`const` inside `if`/`while`
+    // bodies — at that point both this test and the
+    // `nested_let_inside_if_unsupported` neighbour will roll
+    // forward to positives.
     let err = compile(
-        "function f(n) { let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; }",
+        "function f(n) {
+            let total = 0;
+            for (let i = 0; i < n; i = i + 1) {
+                for (let i = 0; i < n; i = i + 1) {
+                    total = total + 1;
+                }
+            }
+            return total;
+        }",
     )
-    .expect_err("for at M8");
+    .expect_err("nested for-init shadowing at M8");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "duplicate_binding",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn for_inside_if_branch() {
+    // for-inside-if exercises `lower_nested_statement` recursing
+    // through if's consequent into a for, then the for's body
+    // back through `lower_nested_statement`.
+    let src = "function f(n) {
+        let s = 0;
+        if (n > 0) {
+            for (let i = 0; i < n; i = i + 1) {
+                s = s + i;
+            }
+        }
+        return s;
+    }";
+    assert_eq!(run_int32_function(src, &[5]), 10);
+    assert_eq!(run_int32_function(src, &[0]), 0);
+}
+
+#[test]
+fn for_with_const_init_then_update_is_unsupported() {
+    // The init binding is `const`; the update tries to reassign it.
+    // Same `const_assignment` rejection as the M5 path.
+    let err = compile("function f(n) { for (const i = 0; i < n; i = i + 1) { } return n; }")
+        .expect_err("const reassignment in for at M8");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_assignment",
+            ..
+        }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// M8 — negative cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn for_in_statement_unsupported() {
+    // `for (k in obj)` — separate AST node type. M8 doesn't touch
+    // it; lands later alongside object property iteration.
+    let err = compile("function f() { for (let k in {}) { return k; } return 0; }")
+        .expect_err("for-in at M8");
     assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}
+
+#[test]
+fn for_of_statement_unsupported() {
+    // `for (x of arr)` — separate AST node type. Lands later
+    // alongside iterator protocol.
+    let err = compile("function f() { for (let x of [1]) { return x; } return 0; }")
+        .expect_err("for-of at M8");
+    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+}
+
+#[test]
+fn for_with_bare_expression_init_unsupported() {
+    // `for (n; n > 0; n = n - 1)` — init is a bare identifier read,
+    // not an assignment. Reject with a stable per-shape tag.
+    let err = compile("function f(n) { for (n; n > 0; n = n - 1) { } return n; }")
+        .expect_err("bare init expr at M8");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "for_init_expression",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn for_with_bare_expression_update_unsupported() {
+    // `for (let i = 0; i < n; i)` — update is a bare identifier
+    // read with no observable effect. Reject so users don't ship
+    // dead-code updates by mistake; once `++` / `--` land, the same
+    // rejection lifts.
+    let err = compile("function f(n) { for (let i = 0; i < n; i) { } return n; }")
+        .expect_err("bare update expr at M8");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "for_update_expression",
+            ..
+        }
+    ));
 }

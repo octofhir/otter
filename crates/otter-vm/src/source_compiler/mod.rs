@@ -392,15 +392,22 @@ fn lower_top_statement<'a>(
 }
 
 /// Lowers a single statement in a "nested" context (inside an `if`
-/// branch or a nested `BlockStatement`). The accepted surface is a
-/// strict subset of [`lower_top_statement`]: it does **not** allow
-/// `let`/`const` declarations, since M6 has no block scoping and
-/// hoisting them to the surrounding function scope would alter
-/// observable semantics. Inline `return` statements are accepted
-/// (early-return pattern inside an `if`).
+/// branch, a `while` body, a `for` body, or a nested
+/// `BlockStatement`). The accepted surface is a strict subset of
+/// [`lower_top_statement`]: it does **not** allow `let`/`const`
+/// declarations as a statement, since the compiler has no block
+/// scoping and hoisting them to the surrounding function scope
+/// would alter observable semantics. Inline `return` statements are
+/// accepted (early-return pattern). `for (let …; …; …)` is special-
+/// cased inside [`lower_for_statement`], which uses
+/// [`LoweringContext::snapshot_scope`] / [`restore_scope`] to give
+/// the for-init `let` a real lexical lifetime.
+///
+/// Takes `&mut ctx` so a `for` whose init is a `let` can call
+/// `allocate_local` without an extra dispatch level.
 fn lower_nested_statement<'a>(
     builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
+    ctx: &mut LoweringContext<'a>,
     stmt: &'a Statement<'a>,
 ) -> Result<(), SourceLoweringError> {
     match stmt {
@@ -420,6 +427,7 @@ fn lower_nested_statement<'a>(
         }
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
+        Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
         Statement::ReturnStatement(ret) => {
             let argument = ret.argument.as_ref().ok_or_else(|| {
                 SourceLoweringError::unsupported("return_without_value", ret.span)
@@ -474,7 +482,7 @@ fn lower_nested_statement<'a>(
 /// assignments, and inline `return`s.
 fn lower_if_statement<'a>(
     builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
+    ctx: &mut LoweringContext<'a>,
     if_stmt: &'a oxc_ast::ast::IfStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
     // Lower the condition into the accumulator. Reuses
@@ -534,7 +542,7 @@ fn lower_if_statement<'a>(
 /// inline `return`s — but no `let`/`const` (block scoping lands later).
 fn lower_while_statement<'a>(
     builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
+    ctx: &mut LoweringContext<'a>,
     while_stmt: &'a oxc_ast::ast::WhileStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
     let loop_header = builder.new_label();
@@ -562,6 +570,122 @@ fn lower_while_statement<'a>(
         .bind_label(loop_exit)
         .map_err(|err| SourceLoweringError::Internal(format!("bind loop exit: {err:?}")))?;
 
+    Ok(())
+}
+
+/// Lowers a `for (init; test; update) body` statement. Bytecode shape:
+///
+/// ```text
+///   <lower init>           ; let / const / assignment / nothing
+/// loop_header:
+///   <lower test>           ; or LdaTrue when omitted
+///   JumpIfToBooleanFalse loop_exit
+///   <lower body>
+///   <lower update>         ; or no-op when omitted
+///   Jump loop_header
+/// loop_exit:
+/// ```
+///
+/// Equivalent to the standard `for → while` desugaring:
+///
+/// ```text
+///   { <init>; while (<test>) { <body>; <update>; } }
+/// ```
+///
+/// `for (let i = …; …; …)` scopes the init binding to the loop —
+/// uses [`LoweringContext::snapshot_scope`] / [`restore_scope`] to
+/// pop the binding on loop exit while keeping the FrameLayout's
+/// reservation in place. `for (;;)` is accepted; the body must
+/// contain a `return` to terminate (no `break` yet). `for (… in …)`
+/// and `for (… of …)` are separate AST node types and rejected with
+/// their own tags.
+fn lower_for_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    for_stmt: &'a oxc_ast::ast::ForStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::ForStatementInit;
+
+    // Snapshot scope so any `let` introduced by the init pops on exit.
+    let scope = ctx.snapshot_scope();
+
+    // 1) Init.
+    if let Some(init) = &for_stmt.init {
+        match init {
+            ForStatementInit::VariableDeclaration(decl) => {
+                lower_let_const_declaration(builder, ctx, decl)?;
+            }
+            // `for (i = 0; …)` — init inherits the `Expression`
+            // variants. Only an assignment expression makes sense at
+            // statement-equivalent position; anything else (bare
+            // read, call, comma) is rejected with a stable tag.
+            ForStatementInit::AssignmentExpression(assign) => {
+                lower_assignment_expression(builder, ctx, assign)?;
+            }
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    "for_init_expression",
+                    other.span(),
+                ));
+            }
+        }
+    }
+
+    let loop_header = builder.new_label();
+    let loop_exit = builder.new_label();
+
+    builder
+        .bind_label(loop_header)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind for header: {err:?}")))?;
+
+    // 2) Test. Omitted test ⇒ unconditional loop, lowered as
+    //    `LdaTrue` so the `JumpIfToBooleanFalse` path stays uniform
+    //    with `while`. The interpreter / JIT can fold the constant-
+    //    true branch later; emitting it now keeps the bytecode
+    //    shape predictable for the v2 dispatcher.
+    if let Some(test) = &for_stmt.test {
+        lower_return_expression(builder, ctx, test)?;
+    } else {
+        builder
+            .emit(Opcode::LdaTrue, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode LdaTrue: {err:?}")))?;
+    }
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanFalse, loop_exit)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfToBooleanFalse: {err:?}"))
+        })?;
+
+    // 3) Body.
+    lower_nested_statement(builder, ctx, &for_stmt.body)?;
+
+    // 4) Update — runs after every iteration, before the back-jump.
+    if let Some(update) = &for_stmt.update {
+        match update {
+            Expression::AssignmentExpression(assign) => {
+                lower_assignment_expression(builder, ctx, assign)?;
+            }
+            // Other update expressions (calls, post-increment, …)
+            // would need to be lowered as expressions whose result
+            // is discarded. Reject for now; M5+ already restricts
+            // statement-position expressions to assignments.
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    "for_update_expression",
+                    other.span(),
+                ));
+            }
+        }
+    }
+
+    builder
+        .emit_jump_to(Opcode::Jump, loop_header)
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (for back): {err:?}")))?;
+    builder
+        .bind_label(loop_exit)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind for exit: {err:?}")))?;
+
+    ctx.restore_scope(scope);
     Ok(())
 }
 
@@ -603,13 +727,32 @@ struct LocalBinding<'a> {
 
 /// Per-function lowering context: tracks the sole parameter (if any)
 /// plus every `let`/`const` declared so far, with their assigned
-/// register slots and TDZ state.
+/// register slots and TDZ state. Scoped declarations (currently only
+/// `for` init `let`s) push onto `locals` and pop on scope exit while
+/// `peak_local_count` retains the high-water mark so the
+/// [`FrameLayout`] reserves enough slots for the whole function.
 struct LoweringContext<'a> {
     param_name: Option<&'a str>,
     /// Number of parameter slots in the frame, used to compute the
     /// next local slot index (`param_count + locals.len()`).
     param_count: u16,
     locals: Vec<LocalBinding<'a>>,
+    /// High-water mark of `locals.len()`. The frame layout reserves
+    /// this many slots so a binding that came in via a scoped path
+    /// (e.g. `for (let i = 0; …)`) and was popped by
+    /// [`restore_scope`](Self::restore_scope) still has its slot
+    /// reserved for the duration of the function.
+    peak_local_count: RegisterIndex,
+}
+
+/// Snapshot of [`LoweringContext::locals`] length, returned by
+/// [`LoweringContext::snapshot_scope`] and consumed by
+/// [`LoweringContext::restore_scope`]. Used to give scoped
+/// declarations (currently only `for` init `let`s) a real lexical
+/// lifetime instead of leaking them to the surrounding function
+/// scope. The peak local count is preserved across snapshot/restore.
+struct ScopeSnapshot {
+    len: usize,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -625,15 +768,41 @@ impl<'a> LoweringContext<'a> {
             param_name,
             param_count,
             locals: Vec::new(),
+            peak_local_count: 0,
         }
     }
 
-    /// Number of `let`/`const` slots allocated so far. Caps at
-    /// `RegisterIndex::MAX` defensively — the M4 source compiler is
-    /// nowhere near that limit, but the cast keeps `local_count()`
-    /// total for the FrameLayout call site.
+    /// Number of `let`/`const` slots reserved by the frame layout —
+    /// the high-water mark of `locals.len()`, **not** the current
+    /// length. Bindings popped by [`restore_scope`] still occupy
+    /// their slots until the function returns, so the FrameLayout
+    /// must size for the peak.
     fn local_count(&self) -> RegisterIndex {
-        RegisterIndex::try_from(self.locals.len()).unwrap_or(RegisterIndex::MAX)
+        self.peak_local_count
+    }
+
+    /// Snapshots the current scope so a later [`restore_scope`] can
+    /// pop bindings that came in between the two calls. Used by
+    /// [`lower_for_statement`] to scope the for-init `let`/`const`
+    /// to the loop without leaking it to the surrounding function
+    /// scope.
+    fn snapshot_scope(&self) -> ScopeSnapshot {
+        ScopeSnapshot {
+            len: self.locals.len(),
+        }
+    }
+
+    /// Pops every binding allocated since the matching
+    /// [`snapshot_scope`]. Slots stay reserved (via
+    /// [`peak_local_count`](Self::peak_local_count)) so bindings
+    /// allocated later don't collide with the popped ones'
+    /// addresses.
+    fn restore_scope(&mut self, snapshot: ScopeSnapshot) {
+        debug_assert!(
+            snapshot.len <= self.locals.len(),
+            "scope snapshot length must not grow",
+        );
+        self.locals.truncate(snapshot.len);
     }
 
     /// Allocates the next local slot for `name`. The new binding
@@ -657,9 +826,17 @@ impl<'a> LoweringContext<'a> {
         if self.param_name == Some(name) || self.locals.iter().any(|l| l.name == name) {
             return Err(SourceLoweringError::unsupported("duplicate_binding", span));
         }
+        // The new slot lives at `param_count + locals.len()` (using the
+        // *current* length, not the peak — popped slots remain
+        // reserved but are addressed by the new binding). The peak
+        // tracks the maximum simultaneous live local count for the
+        // FrameLayout reservation; bump it whenever the current
+        // length grows past the previous peak.
+        let live_len = RegisterIndex::try_from(self.locals.len())
+            .map_err(|_| SourceLoweringError::Internal("local count overflow".into()))?;
         let slot = self
             .param_count
-            .checked_add(self.local_count())
+            .checked_add(live_len)
             .ok_or_else(|| SourceLoweringError::Internal("local register slot overflow".into()))?;
         self.locals.push(LocalBinding {
             name,
@@ -667,6 +844,12 @@ impl<'a> LoweringContext<'a> {
             initialized: false,
             is_const,
         });
+        let new_len = live_len
+            .checked_add(1)
+            .ok_or_else(|| SourceLoweringError::Internal("local count overflow".into()))?;
+        if new_len > self.peak_local_count {
+            self.peak_local_count = new_len;
+        }
         Ok(slot)
     }
 
